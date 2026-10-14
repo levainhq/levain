@@ -13,7 +13,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Cancelling a pending honours a raise of `pending_cancel`.** Cancelling your own pending is C1 and another's is that pending's tier, each lifted to the floor a signed raise of `pending_cancel` sets, in the decisions panel and when the cancel is decided; with the log refused, a cancel is refused. `levain cockpit policy raise` refuses a verb the cockpit does not know, or one that honours no floor (`token_rotate`), instead of signing a raise that protects nothing.
 - Known edge: a request admitted before a raise commits may finish at the old tier. A captured gate finishes (DESIGN §4); closing this needs admission serialized against policy appends.
 - Known edge: a direct C1 action rendered before a raise and clicked after it carries no seen tier, so it is not refused as moved: it becomes a pending at the new tier (the safe direction), or is refused `not_built` for a verb with no adapter.
-- Known edge: `levain cockpit policy raise` checks the verb against the kernel's verbs, so it refuses a downstream's own verb.
+- **A downstream's own verb can be raised.** `levain cockpit policy raise` checks the verb against the kernel's verbs and cannot see a downstream's, so a downstream verb such as `deploy` is raised by declaring it: `levain cockpit policy raise deploy T3 --downstream --signing-key <key>`. The declaration is refused for a kernel or internal verb, a broker head, or a near spelling of a kernel verb. An embedder calling `policy_raise` passes the `VerbRegistry` it serves as `registry=`, and the verb is checked against that.
+- Known edge: `--downstream` cannot check the name against the running deployment, so a downstream name the deployment does not register is signed and protects nothing.
 
 ## [0.10.2] — 2026-10-13
 

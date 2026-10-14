@@ -396,6 +396,66 @@ def test_the_cli_raise_refuses_a_verb_nothing_honours(tmp_path):
     _raisable("spore_touch")
 
 
+def test_a_downstream_verb_raises_against_the_deployments_registry_or_by_declaration(tmp_path):
+    """codex (L3 r2, MED): an embedder's ``deploy`` stayed at its base T2 because the raise checked an
+    empty kernel registry. An embedder raises it against the registry it serves; the standalone CLI,
+    which cannot load that registry, raises it only by declaring it ``--downstream``. Either way the
+    replayed policy lifts the downstream verb's tier to T3."""
+    from datetime import date, datetime, timezone
+
+    from levain import cli
+    from levain.cockpit.firejournal import CockpitDB
+    from levain.cockpit.keys import KeyError_, _raisable, policy_raise
+    from levain.cockpit.verbs import VerbRegistry
+    from levain.kernel import ActionVerb
+    from tests.cockpit_authority_rig import RealKey, enrol
+
+    now = datetime(2026, 10, 13, 0, 0, tzinfo=timezone.utc)
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    db = CockpitDB(root)
+    db.set_install_class("reported")
+    laptop, phone = (RealKey(tmp_path, n) for n in ("laptop", "phone"))
+    enrol(db, laptop, "laptop-presence", now=now)
+    enrol(db, phone, "display-phone", by=laptop, now=now)
+    served = VerbRegistry({"deploy": ActionVerb(handler=lambda p: {}, label="deploy"),
+                           "publish": ActionVerb(handler=lambda p: {}, label="publish")})
+    by_phone = {"signer_fp": phone.fingerprint, "sign": phone.sign_link, "clock": lambda: now}
+
+    # the bare kernel check still refuses it, before anything is signed
+    with pytest.raises(KeyError_, match="raised with --downstream"):
+        policy_raise(root, "deploy", "T3", **by_phone)
+    # against the registry the deployment serves: accepted, and the tier it renders is lifted
+    assert policy_raise(root, "deploy", "T3", registry=served, **by_phone)[0] == "T3"
+    with db.read() as conn:
+        policy = authority.snapshot(conn).policy
+    spec = served.get("deploy")
+    assert spec is not None and spec.rendered_tier(None, "", date(2026, 10, 13), policy=policy) == "T3"
+    with pytest.raises(KeyError_, match="not a verb this deployment registers"):
+        policy_raise(root, "deplyo", "T3", registry=served, **by_phone)
+
+    # the standalone CLI: refused without the declaration, signed with it
+    base = ["cockpit", "policy", "raise", "publish", "T3", "--signing-key", str(phone.path), "--data-root",
+            str(root)]
+    assert cli.main(base) == 1
+    assert cli.main([*base, "--downstream"]) == 0
+    with db.read() as conn:
+        assert authority.snapshot(conn).policy.raise_to["publish"] == "T3"
+
+    # what a declaration never reaches: a kernel or internal verb, a broker head, a near spelling of a
+    # kernel verb, a name no registry takes, or a declaration beside a registry
+    for verb, why in (("spore_touch", "not a downstream verb"), ("pending_cancel", "not a downstream verb"),
+                      ("harness_approve", "not a downstream verb"), ("token_rotate", "honours no standing"),
+                      ("spore_tuch", "near spelling of the kernel verb 'spore_touch'"),
+                      ("a:b", "can register under")):
+        with pytest.raises(KeyError_, match=why):
+            _raisable(verb, downstream=True)
+    with pytest.raises(KeyError_, match="not both"):
+        _raisable("deploy", registry=served, downstream=True)
+    with pytest.raises(KeyError_, match="honours no standing"):
+        _raisable("token_rotate", registry=served)
+
+
 def test_an_inactive_broker_keeps_the_shipped_tiers_only_where_no_log_was_ever_kept(home, spores):  # noqa: F811 - fixture
     """The one inactive case that is positively empty: no journal, no WAL, no anchor on the data root (by
     ``lstat``, no opener). Any trace of a log, and the policy is unknown."""
