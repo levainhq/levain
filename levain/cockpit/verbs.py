@@ -35,8 +35,11 @@ closed."""
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
@@ -430,6 +433,56 @@ class VerbRegistry:
 
     def is_downstream(self, name: str) -> bool:
         return name in self._downstream_names
+
+
+# --- the served-verbs record --------------------------------------------------------------------
+
+# The names of the verbs the last-built server serves (kernel and downstream), with the time it was
+# built: ``levain cockpit policy raise`` checks a non-kernel verb against it by exact membership, as
+# kubectl checks a resource name against the server's discovery API. It sits beside cockpit.db.
+SERVED_VERBS_NAME = "served_verbs.json"
+_SERVED_VERBS_MAX = 1024 * 1024
+
+
+def record_served_verbs(data_root: Path | str, registry: VerbRegistry, served_at: datetime) -> Path:
+    """Write ``registry``'s verb names and ``served_at`` to ``<data_root>/served_verbs.json``,
+    atomically (a temp file in the same directory, fsynced, then renamed over the record)."""
+    root = Path(data_root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    body = json.dumps({"served_at": served_at.isoformat(), "verbs": sorted(registry.names())},
+                      separators=(",", ":")).encode("utf-8")
+    path = root / SERVED_VERBS_NAME
+    tmp = root / f".{SERVED_VERBS_NAME}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def served_verbs(data_root: Path | str) -> tuple[frozenset[str], str]:
+    """The verb names and the served-at time ``record_served_verbs`` wrote under ``data_root``.
+    Raises ``FileNotFoundError`` when there is no record and ``ValueError`` when it is malformed."""
+    path = Path(data_root) / SERVED_VERBS_NAME
+    with open(path, "rb") as f:
+        raw = f.read(_SERVED_VERBS_MAX + 1)
+    if len(raw) > _SERVED_VERBS_MAX:
+        raise ValueError(f"{path} is larger than {_SERVED_VERBS_MAX} bytes")
+    try:
+        doc = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path} is not JSON: {exc}") from exc
+    verbs = doc.get("verbs") if isinstance(doc, dict) else None
+    served_at = doc.get("served_at") if isinstance(doc, dict) else None
+    if not isinstance(verbs, list) or not all(isinstance(v, str) for v in verbs) or not isinstance(served_at, str):
+        raise ValueError(f"{path} does not hold a list of verb names and a served-at time")
+    return frozenset(verbs), served_at
 
 
 # --- what a panel offers ------------------------------------------------------------------------

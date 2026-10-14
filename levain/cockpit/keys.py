@@ -260,8 +260,8 @@ def revoke(data_root: Path | str, ref: str, *, signer_fp: str, sign: Signer, clo
 
 def policy_raise(data_root: Path | str, verb: str, tier: str, *, signer_fp: str, sign: Signer,
                  clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                 marker_directory: Path | None = None, registry: VerbRegistry | None = None,
-                 downstream: bool = False) -> tuple[str, int, str | None]:
+                 marker_directory: Path | None = None,
+                 registry: VerbRegistry | None = None) -> tuple[str, int, str | None]:
     """Raise ``verb``'s floor to ``tier`` in the standing policy (trust-tiering DESIGN §4.3), by a link
     ``signer_fp`` signs. The replay classifies the change itself: a raise that tightens needs a
     display-phone key or above, one that would lower a floor is refused as a loosen, and one that
@@ -269,11 +269,10 @@ def policy_raise(data_root: Path | str, verb: str, tier: str, *, signer_fp: str,
     the link, the link's seq, and the anchor warning as :func:`enroll`.
 
     ``verb`` is checked against ``registry`` (an embedder passes the one it serves), else against the
-    kernel's verbs; ``downstream`` declares a verb the deployment registers that this process cannot
-    see (:func:`_raisable`)."""
+    kernel's verbs and the record of the verbs the deployment's server serves (:func:`_raisable`)."""
     if not isinstance(verb, str) or not verb:
         raise KeyError_("a raise names a verb")
-    _raisable(verb, registry=registry, downstream=downstream)
+    _raisable(verb, registry=registry, data_root=data_root)
     db = _journal(data_root, marker_directory=marker_directory)
     _signing_authority(_capture(db, _now(clock), ssh_keygen))     # refused before anything is signed
     new = _append(db, {"op": "raise", "verb": verb, "tier": tier}, signer_fp=signer_fp, sign=sign, clock=clock,
@@ -281,44 +280,39 @@ def policy_raise(data_root: Path | str, verb: str, tier: str, *, signer_fp: str,
     return new.policy.raise_to[verb], new.seq, new.anchor_warning
 
 
-def _raisable(verb: str, *, registry: VerbRegistry | None = None, downstream: bool = False) -> None:
-    """Refuse a raise that would be signed and then honoured by nothing: a verb the registry does not
-    know, or an internal verb that honours no floor.
+def _raisable(verb: str, *, registry: VerbRegistry | None = None, data_root: Path | str | None = None) -> None:
+    """Refuse a raise that would be signed and then honoured by nothing: a verb the deployment does not
+    serve, or an internal verb that honours no floor.
 
-    The registry is the one the deployment serves when the caller holds it (an embedder passing its
-    ``make_server(extra_verbs=)`` set), else the kernel's alone. The standalone CLI cannot load a
-    downstream's verbs, so ``downstream`` declares one: the name must then not be a kernel verb, an
-    internal verb or a broker head, must carry no ':' (no registry accepts one), and must not be a near
-    spelling of a kernel verb (difflib ratio 0.85 or above: that raise would protect nothing while
-    reading as if it protected the kernel verb). A downstream name the deployment does not register is
-    still signed and honoured by nothing; the declaration is the operator's."""
-    from difflib import get_close_matches
-
+    The verbs served are ``registry``'s when the caller holds it (an embedder passing its
+    ``make_server(extra_verbs=)`` set); else the kernel's, and for any other name the record the
+    deployment's server wrote under ``data_root`` when it was built (``served_verbs.json``,
+    :func:`levain.cockpit.verbs.record_served_verbs`), checked by exact membership. With no record the
+    raise of a non-kernel verb is refused."""
     from levain.cockpit.broker import FLOOR_INTERNAL_VERBS, INTERNAL_VERBS
-    from levain.cockpit.verbs import BROKER_HEADS, VerbRegistry
+    from levain.cockpit.verbs import SERVED_VERBS_NAME, VerbRegistry, served_verbs
 
-    if registry is not None and downstream:
-        raise KeyError_("a raise checks the registry it is given, or declares a downstream verb, not both")
-    kernel = VerbRegistry().names()
     if verb in INTERNAL_VERBS and verb not in FLOOR_INTERNAL_VERBS:
         raise KeyError_(f"{verb!r} honours no standing-policy floor (it is always T3); nothing to raise")
-    if downstream:
-        if verb in kernel or verb in INTERNAL_VERBS or verb in BROKER_HEADS:
-            raise KeyError_(f"{verb!r} is the kernel's or the broker's, not a downstream verb; raise it without "
-                            "--downstream")
-        if ":" in verb:
-            raise KeyError_(f"{verb!r} is not a name a downstream verb can register under")
-        near = get_close_matches(verb, kernel, n=1, cutoff=0.85)
-        if near:
-            raise KeyError_(f"{verb!r} is a near spelling of the kernel verb {near[0]!r}; refusing a downstream "
-                            "raise that may be a misspelling of it")
-        return
-    if verb in FLOOR_INTERNAL_VERBS or verb in (registry.names() if registry is not None else kernel):
+    if verb in FLOOR_INTERNAL_VERBS or verb in (registry if registry is not None else VerbRegistry()).names():
         return
     if registry is not None:
         raise KeyError_(f"{verb!r} is not a verb this deployment registers; a raise of it would protect nothing")
-    raise KeyError_(f"{verb!r} is not a cockpit verb; a raise of it would protect nothing (a downstream's "
-                    "own verb is raised with --downstream)")
+    if data_root is None:
+        raise KeyError_(f"{verb!r} is not a cockpit verb; a raise of it would protect nothing")
+    record = Path(data_root) / SERVED_VERBS_NAME
+    try:
+        served, served_at = served_verbs(data_root)
+    except FileNotFoundError:
+        raise KeyError_(f"{verb!r} is not a kernel verb and no record of the verbs this deployment serves is at "
+                        f"{record}: start the deployment's cockpit server once (it writes the record when it "
+                        "is built), or embed and pass registry=") from None
+    except (OSError, ValueError) as exc:
+        raise KeyError_(f"{verb!r} is not a kernel verb and the record of the verbs this deployment serves is "
+                        f"unreadable ({exc}): start the deployment's cockpit server once to rewrite it") from exc
+    if verb not in served:
+        raise KeyError_(f"{verb!r} is not a verb this deployment serves (its server recorded its verbs at "
+                        f"{served_at}); a raise of it would protect nothing")
 
 
 def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,

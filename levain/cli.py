@@ -429,13 +429,10 @@ def main(argv: list[str] | None = None) -> int:
             "every page rendered before it must render again."
         ),
     )
-    ck_raise.add_argument("verb", help="The verb's name, as the manifest's verbs map lists it, or pending_cancel.")
+    ck_raise.add_argument("verb", help="The verb's name, as the manifest's verbs map lists it, or pending_cancel. "
+                                       "A downstream verb must be in the served_verbs.json record the cockpit "
+                                       "writes under its data root when it starts.")
     ck_raise.add_argument("tier", choices=("T2", "T3"), help="The verb's new floor (C1 is no floor).")
-    ck_raise.add_argument("--downstream", action="store_true",
-                          help="VERB is a downstream verb the deployment registers (make_server extra_verbs), "
-                               "which this command cannot see. It is refused if it is a kernel or internal "
-                               "verb, or a near spelling of one; a name the deployment does not register is "
-                               "signed and protects nothing.")
     ck_raise.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                           help="An enrolled display-phone or laptop-presence key that signs the raise (its "
                                "private key file, or the .pub of a key an agent holds).")
@@ -1705,7 +1702,7 @@ def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
     try:
         signer_fp, sign = ssh_signer(args.signing_key)
         tier, seq, warning = policy_raise(_cockpit_root(args), args.verb, args.tier, signer_fp=signer_fp,
-                                          sign=sign, clock=_utc_now, downstream=args.downstream)
+                                          sign=sign, clock=_utc_now)
     except _cockpit_refusals() as exc:
         print(f"raise refused: {exc}", file=sys.stderr)
         return 1
