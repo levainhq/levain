@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from levain.team.reader import read_team
-from levain.team.transport import GitLedger, Repo
+from levain.team.transport import LEGACY_BRANCH, GitLedger, Repo
 from tests.test_team_git import BRANCH, _keys, git, record_ruling, sign_as, signed_commit, team, two  # noqa: F401,F811  (fixtures: pytest finds them by name in this module)
 
 
@@ -36,7 +36,7 @@ def test_a_ledger_that_cannot_be_judged_is_named_not_empty(two, monkeypatch):
     def boom(*a, **k):
         raise OSError(f"[Errno 13] Permission denied: {secret}")
 
-    monkeypatch.setattr(GitLedger, "snapshot", boom)
+    monkeypatch.setattr(GitLedger, "derivation", boom)
     r = read_team(gl)
     assert r.state == "unreadable" and r.model is None
     assert secret not in r.why and r.why                       # the screen text never carries the OS error
@@ -60,3 +60,35 @@ def test_an_unaccepted_merge_reads_judged_partial_with_the_judged_part_and_a_rea
     assert r.state == "judged_partial", r
     assert r.model is not None and "Per-line rounding stays." in str(r.model)     # what WAS judged is still shown
     assert "could not be fully judged" in r.why and "not accepted" in r.detail     # and the screen says it is held back
+    assert r.why.endswith(".") and "1 newer lines" not in r.why
+
+
+def test_a_legacy_only_clone_is_unreadable_with_the_legacy_message_not_no_team(tmp_path):
+    git("init", "-q", "--initial-branch=main", "old", cwd=tmp_path)
+    old = tmp_path / "old"
+    git("config", "user.email", "o@x.io", cwd=old)
+    git("config", "user.name", "o", cwd=old)
+    (old / "a.txt").write_text("a")
+    git("add", ".", cwd=old)
+    git("commit", "-qm", "init", cwd=old)
+    git("branch", LEGACY_BRANCH, cwd=old)
+    r = read_team(_gl(old))
+    assert r.state == "unreadable" and r.model is None, r
+    assert "predates strict mode" in r.why                      # a TeamError's own message reaches the screen
+
+
+def test_one_read_uses_one_derivation_for_the_team_the_judgement_and_the_handle(two, monkeypatch):
+    tmp, ana, ben = two
+    gl = _gl(ben)
+    calls = []
+    real = GitLedger.derivation
+
+    def counting(self, rev=None):
+        calls.append(rev)
+        return real(self, rev)
+
+    monkeypatch.setattr(GitLedger, "derivation", counting)
+    r = read_team(gl)
+    # the tip is resolved ONCE (rev None); the canon read names that same tip. snapshot()+handle() each resolved the tip
+    # again before, so a tip that moved between them mixed two judgements in one model
+    assert r.state == "ok" and calls.count(None) == 1 and len(set(calls) - {None}) <= 1, calls

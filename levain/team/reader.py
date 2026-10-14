@@ -43,30 +43,35 @@ class TeamRead:
 
 
 def _one_line(text: object) -> str:
-    return " ".join(str(text).split())[:_WHY_MAX]
+    """A bounded single line of ``text``; an exception whose own text raises still yields something drawable."""
+    try:
+        line = " ".join(str(text).split())
+    except Exception:  # noqa: BLE001
+        return ""
+    return line if len(line) <= _WHY_MAX else line[:_WHY_MAX - 1].rstrip() + "\u2026"
 
 
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
               ack_flag: int = DEFAULT_ACK_FLAG) -> TeamRead:
     """The team this clone's ledger describes, as one of the four states. Never raises."""
     try:
-        if gl.pinned_root is None and not gl.has_local_ledger() and not gl.has_remote_ledger():
+        if gl.pinned_root is None and not gl.legacy_only() and not gl.has_local_ledger() and not gl.has_remote_ledger():
             return TeamRead("no_team", None, _NO_TEAM)
-        sha, team, ledger = gl.snapshot()
-        d = gl.derivation(sha)     # the cache keyed by this tip: the same derivation snapshot() read
-        model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+        # ONE derivation feeds the team, the ledger, the judgement, the handle and the canon revision: a tip that
+        # moves or a trust state that changes between separate reads must not mix two judgements in one model
+        d = gl.derivation()
+        team, sha = d.team, d.tip
+        ledger = gl.ledger_of(d)
+        model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(sha), gl.state_hash(ledger, team),
                             recheck_days=recheck_days, ack_flag=ack_flag, path_filter=path_filter)
         if d.judged != "full":
             waiting = int(d.waiting or 0)
             why = ("Part of the team ledger could not be fully judged on this machine, so what follows may be out of date"
-                   + (f"; {waiting} newer line{'s' if waiting != 1 else ''} are waiting." if waiting else "."))
-            return TeamRead("judged_partial", model, why, _one_line(d.frozen_why))
+                   + (f"; {waiting} newer line{'s are' if waiting != 1 else ' is'} waiting." if waiting else "."))
+            return TeamRead("judged_partial", model, why, _one_line(d.frozen_why or ""))
         return TeamRead("ok", model)
     except TeamError as exc:
-        return TeamRead("unreadable", None, _one_line(exc) or _UNREADABLE, f"{type(exc).__name__}: {_one_line(exc)}")
+        text = _one_line(exc)
+        return TeamRead("unreadable", None, text or _UNREADABLE, f"{type(exc).__name__}: {text}")
     except Exception as exc:  # noqa: BLE001 - a surface drawing a team must get a named state, never a traceback
-        try:
-            detail = f"{type(exc).__name__}: {_one_line(exc)}"
-        except Exception:  # noqa: BLE001 - an exception whose own text raises
-            detail = type(exc).__name__
-        return TeamRead("unreadable", None, _UNREADABLE, detail)
+        return TeamRead("unreadable", None, _UNREADABLE, f"{type(exc).__name__}: {_one_line(exc)}")
