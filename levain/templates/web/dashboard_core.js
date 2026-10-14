@@ -369,7 +369,6 @@
   // Reads layout synchronously; valid because render() builds into the live #board, so the
   // .clamped max-height is actually applied (a detached board would read zero overflow).
   function measureOverflow(body) {
-    const atTop = () => body.scrollTop <= 1;
     const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 1;
     const over = body.scrollHeight > body.clientHeight + 1;
     body.classList.toggle("has-overflow", over);
@@ -385,15 +384,14 @@
       // finalizePanels builds a fresh .pbody each render, so no listener piles up across renders.
       if (!body.dataset.scrollWired) {
         body.dataset.scrollWired = "1";
-        body.addEventListener("scroll", () => { body.classList.toggle("at-top", atTop()); body.classList.toggle("at-end", atEnd()); }, { passive: true });
+        body.addEventListener("scroll", () => { body.classList.toggle("at-end", atEnd()); }, { passive: true });
       }
-      body.classList.toggle("at-top", atTop());  // recompute now (content size may have changed)
-      body.classList.toggle("at-end", atEnd());
+      body.classList.toggle("at-end", atEnd());  // recompute now (content size may have changed)
     } else {
       body.removeAttribute("tabindex");
       body.removeAttribute("role");
       body.removeAttribute("aria-label");
-      body.classList.remove("at-top", "at-end");
+      body.classList.remove("at-end");
     }
   }
 
@@ -428,8 +426,8 @@
       // a short panel stays natural height, an overflowing one scrolls inside itself.
       if (p.hasAttribute("data-clamp")) {
         body.classList.add("clamped");
-        // Overflow cue + keyboard affordance (see measureOverflow): a "more below" chevron
-        // + a focusable scroll region, shown only when the body actually exceeds the cap.
+        // Overflow cue + keyboard affordance (see measureOverflow): a "more below" fade
+        // mask + a focusable scroll region, shown only when the body actually exceeds the cap.
         measureOverflow(body);
       }
       // editable Class-A config panels get their edit affordance on its own right-
