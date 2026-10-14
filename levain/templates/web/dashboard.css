@@ -1357,8 +1357,8 @@ body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-heigh
 @media (pointer: coarse) { body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: var(--hit-min); } }
 
 /* ═══════════════════════════ PREVIEW VARIANTS A / B / C (the cockpit pass-2 colour trial; html[data-variant] is set by the preview proxy) ═══════════════════════════
-   One hue per project, carried everywhere a project shows. The hues were checked, not eyeballed: each holds >= 5.4:1 as text on the card
-   (WCAG AA for text is 4.5:1) and every pair stays >= 0.087 apart in OKLab under simulated protanopia, deuteranopia and tritanopia.
+   One hue per project, carried everywhere a project shows. The hues are checked by a script, not eyeballed (text contrast on the card and
+   pair distance under simulated protanopia, deuteranopia and tritanopia): run project_memory/1014-cockpit-pass2/hues.py; it exits 1 on a failure.
    A = hues in the graph + repo tags on rows + a 2px stripe on panels tied to a project + two signals (a Decisions halo, a failed review glowing red).
    B = A + a time-of-day tint on the clock's colon and am/pm. C = hues in the graph and the repo tags only: no stripes, no glow. */
 html[data-variant] {
