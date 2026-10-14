@@ -106,7 +106,6 @@ TITLE_MAX = 160
 SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
-POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
 # a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
 _VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched whole (fullmatch)
@@ -463,7 +462,7 @@ class Cockpit:
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
-        the revision (install class + policy) hashed into every etag, since a gesture can change with
+        the revision (install class + authority head) hashed into every etag, since a gesture can change with
         rows unchanged (design §9 K2a). Every compose already registered is checked against the
         registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
         refused one refuses the attach: the registry is known from here on."""
@@ -632,8 +631,8 @@ class Cockpit:
     def today(self) -> date:
         return ReadContext(self._clock()).today
 
-    def _verb_rev(self) -> Any:
-        return self._verb_view.revision() if self._verb_view is not None else None
+    def _verb_rev(self, auth: RequestAuthority) -> Any:
+        return self._verb_view.revision(auth) if self._verb_view is not None else None
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -1282,14 +1281,14 @@ class Cockpit:
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
                  views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
-                 face: str = "", compose: dict[str, Any] | None = None) -> str:
+                 face: str = "", compose: dict[str, Any] | None = None, *, auth: RequestAuthority) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
         return _sha({"schema": SCHEMA, "status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
-                     "verbs": self._verb_rev(),
+                     "verbs": self._verb_rev(auth),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
                      **({"views": [list(v) for v in views]} if views else {}),
                      # the face is drawn from the head, so changing it is not a 304
@@ -1303,7 +1302,8 @@ class Cockpit:
                         else {})})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
-              labels: LabelSnapshot = NO_LABELS, now: datetime | None = None) -> dict[str, Any]:
+              auth: RequestAuthority, now: datetime | None = None) -> dict[str, Any]:
+        labels = auth.labels
         listy = spec.kind in ROW_ENGINE_KINDS
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
@@ -1329,7 +1329,7 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
-        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose)
+        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, auth=auth)
         if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
             # a roster's health is read against the clock, so a tone that turns with time is content
             etag = _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
@@ -1348,7 +1348,7 @@ class Cockpit:
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
             **self._search_head(spec, count),
             "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version,
-                                                      labels.label(snap.value_label_key))
+                                                      labels.label(snap.value_label_key), auth=auth)
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
             **({"face": spec.face} if spec.face else {}),
@@ -1389,7 +1389,10 @@ class Cockpit:
         worst = "ok"
         as_ofs: list[str] = []
         snaps = snaps if snaps is not None else {}
-        labels = ctx.authority.labels if ctx.authority is not None else NO_LABELS
+        auth = ctx.authority
+        if auth is None:
+            raise ValueError("the now view renders under a request's authority (ReadContext.authority)")
+        labels = auth.labels
         labelled = False
         for s in sources:
             if s.id not in snaps:   # one read per source per cycle: the heads and this view agree
@@ -1418,7 +1421,7 @@ class Cockpit:
             "priority": "gate", "rank": -100, "status": worst, "count": len(rows) if worst != "error" else None,
             "actionable_count": len(rows) if worst != "error" else None,
             "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
-            "etag": self._etag_of(snap, None, cred, ctx.today), "error": err,
+            "etag": self._etag_of(snap, None, cred, ctx.today, auth=auth), "error": err,
             # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
             "note": _label_note(snap.note, labels if labelled else None),
             "empty": "Nothing needs you now.", "order": None, "groups": None,
@@ -1444,7 +1447,7 @@ class Cockpit:
                 union[r["group"]]["count"] += 1
         head["groups"] = list(union.values()) or None
         head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today,   # groups are content
-                                     labels=labels if labelled else None)
+                                     labels=labels if labelled else None, auth=auth)
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1576,7 +1579,7 @@ class Cockpit:
         specs_map = self._specs      # one snapshot for the whole manifest
         for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
-            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels, ctx.now)
+            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth, ctx.now)
         now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
@@ -1584,15 +1587,15 @@ class Cockpit:
         order = [NOW_ID] + [s.id for s in specs]
         # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
         etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "regions": regions,
-                     "credential": credential, "verbs": self._verb_rev(),
-                     "install_class": install_class, "policy_revision": POLICY_REVISION,
+                     "credential": credential, "verbs": self._verb_rev(auth),
+                     "install_class": install_class, "authority": auth.revision,   # DESIGN §4.2: the one counter
                      "entity": entity, "errors": errors,    # identity and manifest faults are content too
                      "transport": transport})
         out = {
             "schema": SCHEMA, "entity": entity, "generated_at": _iso(ctx.now), "etag": etag,
             "credential": credential, "regions": regions,
             "panels": {i: heads[i] for i in order},
-            "verbs": self._verb_view.verbs_map(credential["class"]) if self._verb_view is not None else {},
+            "verbs": self._verb_view.verbs_map(credential["class"], auth=auth) if self._verb_view is not None else {},
             "errors": errors,
         }
         if transport is not None:
@@ -1694,7 +1697,7 @@ class Cockpit:
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)
-            head = self._head(spec, snap, credential_class, ctx.today, auth.labels, ctx.now)
+            head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now)
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
             if snap_rows is not None:
                 snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
@@ -1708,7 +1711,7 @@ class Cockpit:
             rows_all = snap_rows or []
             if row is not None:
                 hit = [r for r in rows_all if r["id"] == row]
-                out["rows"] = self._with_actions(hit, panel_id, credential_class, ctx.today)
+                out["rows"] = self._with_actions(hit, panel_id, credential_class, ctx.today, auth)
                 if not hit:
                     raise RowNotFound(row)
                 return out
@@ -1764,13 +1767,13 @@ class Cockpit:
                 sent = {r["id"] for r in rows_all}
                 out["view_rows"] = {v: [i for i in ids if i in sent] for v, ids in view_order.items()}
             if out["rows"] is not None and not out.get("rows_by_ref"):
-                out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today)
+                out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today, auth)
         else:
             if head["kind"] in VALUE_ROW_KINDS and isinstance(value, dict):
                 if q and spec is not None:
                     value = self._search_value_rows(spec, value, q, limit, out)
                 if head["kind"] == "log":
-                    value = self._log_sentences(value, credential_class)
+                    value = self._log_sentences(value, credential_class, auth)
                 if head["kind"] == "roster":
                     value = _with_health(value, ctx.now)
             if profile == "compact":
@@ -1871,11 +1874,12 @@ class Cockpit:
                               if spec.window is not None else f"{len(keep)} of {len(rows)}")
         return {**value, "rows": keep}
 
-    def _log_sentences(self, value: dict[str, Any], cred: str) -> dict[str, Any]:
+    def _log_sentences(self, value: dict[str, Any], cred: str, auth: RequestAuthority) -> dict[str, Any]:
         """One sentence per log row from the manifest's verb LABELS ("Snoozed · spore-1238"); a verb with
         no label renders as its raw name."""
         try:
-            labels = {n: v.get("label") for n, v in (self._verb_view.verbs_map(cred) if self._verb_view else {}).items()}
+            labels = {n: v.get("label") for n, v in
+                      (self._verb_view.verbs_map(cred, auth=auth) if self._verb_view else {}).items()}
         except Exception:  # noqa: BLE001 - a label lookup never fails a read
             labels = {}
         return {**value, "rows": [
@@ -1888,7 +1892,8 @@ class Cockpit:
         ins = [RowIn(id=r["id"], title=r.get("title") or "", facets=r.get("facets") or {}) for r in rows]
         return {vid: [row.id for row, _g in apply_ordering(vorder, ins, today)] for vid, _t, vorder in spec.views}
 
-    def _with_actions(self, rows: list[dict[str, Any]], panel_id: str, cred: str, today: date) -> list[dict[str, Any]]:
+    def _with_actions(self, rows: list[dict[str, Any]], panel_id: str, cred: str, today: date,
+                      auth: RequestAuthority) -> list[dict[str, Any]]:
         """Each row's actions, rendered for this credential (design §4.1: the row's own tier and
         gesture plus the param values that escalate it). A now-view row takes its source panel's."""
         if self._verb_view is None:
@@ -1898,10 +1903,10 @@ class Cockpit:
             pid = r.get("panel_id") or panel_id
             if self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES):
                 # a broker row offers no panel verb; a pending offers its own cancel (§3)
-                acts = (self._verb_view.pending_actions(r, cred)
+                acts = (self._verb_view.pending_actions(r, cred, auth=auth)
                         if str(r["id"]).startswith(PENDING_ROW_PREFIX) else [])
             else:
-                acts = self._verb_view.row_actions(pid, r, cred, today)
+                acts = self._verb_view.row_actions(pid, r, cred, today, auth=auth)
             out.append({**r, "actions": acts})
         return out
 

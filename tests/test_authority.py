@@ -128,13 +128,13 @@ def test_replay_builds_keys_and_policy(granted, keys):
     assert snap.hash_at(4) == snap.head_hash
 
 
-def test_genesis_policy_is_the_pinned_constant(monkeypatch):
-    """F6: replay never reads live verbs.Policy(); the genesis is a constant of the format."""
+def test_genesis_policy_is_the_pinned_constant():
+    """F6: replay never reads live code; the genesis is a constant of the format (S4a deleted verbs.Policy)."""
     assert dict(auth.genesis_policy().raise_to) == dict(auth._GENESIS_RAISE_TO) == {}
     assert not auth.genesis_policy().grants and not auth.genesis_policy().timeouts
     import levain.cockpit.verbs as verbs
-    monkeypatch.setattr(verbs, "Policy", lambda: (_ for _ in ()).throw(AssertionError("read live policy")))
-    assert auth.genesis_policy() == auth.AuthorityPolicy()
+    assert not hasattr(verbs, "Policy") and not hasattr(verbs, "POLICY")
+    assert auth.genesis_policy() == auth.StandingPolicy()
 
 
 def test_raise_by_phone_applies(base, keys):
@@ -488,7 +488,7 @@ def test_noop_refused(base, keys):
 
 def test_raise_to_the_lowest_tier_on_a_verb_with_no_floor_is_a_noop(base, keys):
     """F11: no floor already means the lowest tier; the raise changes nothing, so it is refused."""
-    assert auth.classify(head(base).policy, auth.AuthorityPolicy.from_dict(
+    assert auth.classify(head(base).policy, auth.StandingPolicy.from_dict(
         {"raise_to": {"fresh": "C1"}, "timeouts": {}, "grants": {}})) == auth.NOOP
     insert(base, {"op": "raise", "verb": "fresh", "tier": "C1"}, keys["phone"])
     refused(base, "changes nothing")
@@ -603,7 +603,7 @@ def test_renew_whose_result_differs_beyond_expiry_refused(granted, keys, monkeyp
             return new
         data = new.as_dict()
         data["grants"]["g1"]["refspecs"] = sorted(data["grants"]["g1"]["refspecs"] + ["refs/heads/main"])
-        return auth.AuthorityPolicy.from_dict(data)
+        return auth.StandingPolicy.from_dict(data)
 
     monkeypatch.setattr(auth, "_apply_policy_op", widening)
     insert(granted, _renew(NOW + timedelta(days=20)), keys["phone"])
@@ -660,10 +660,10 @@ def test_a_future_dated_link_wedges_later_appends_visibly(granted, keys):
 
 
 def test_classify():
-    p0 = auth.AuthorityPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {"g1": _grant()}})
+    p0 = auth.StandingPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {"g1": _grant()}})
 
     def with_grant(**kw):
-        return auth.AuthorityPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {"g1": _grant(**kw)}})
+        return auth.StandingPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {"g1": _grant(**kw)}})
 
     assert auth.classify(p0, p0) == auth.NOOP
     assert auth.classify(p0, with_grant(expires=NOW + timedelta(days=11))) == auth.RENEW
@@ -674,7 +674,7 @@ def test_classify():
                                         verbs=("fetch", "push"))) == auth.LOOSEN
     wide = with_grant(refspecs=("refs/heads/a", "refs/heads/entity/*"))
     assert auth.classify(wide, p0) == auth.TIGHTEN
-    empty = auth.AuthorityPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {}})
+    empty = auth.StandingPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {}})
     assert auth.classify(p0, empty) == auth.GRANT_REVOKE
     assert auth.classify(empty, p0) == auth.LOOSEN
 

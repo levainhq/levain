@@ -84,6 +84,7 @@ import secrets
 import select
 import socket
 import ipaddress
+import logging
 import json
 import sys
 import threading
@@ -109,7 +110,8 @@ from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
-from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb, retier
+from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
+                                  record_served_verbs, retier)
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
@@ -188,6 +190,8 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # pile up unbounded store reads / file writes. Past the cap a request gets a clean
 # 503. Static assets (cached bytes) bypass the gate.
 _MAX_INFLIGHT = 8
+
+_log = logging.getLogger(__name__)
 
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
@@ -1150,7 +1154,8 @@ class _Handler(GuardedHandler):
 
     def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
-        ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's)."""
+        ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's, each lifted to the
+        standing policy's ``pending_cancel`` floor)."""
         if not isinstance(req, dict):
             raise EditError("bad_request", 400, "request must be a JSON object")
         unknown = sorted(set(req) - _PENDING_KEYS[action])
@@ -1661,6 +1666,19 @@ def make_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
     # Bound the expensive routes (store read + writes); past the cap → 503.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
+    # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
+    # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream
+    # verb is refused rather than checked against verbs this server may not serve (the safe direction).
+    if httpd.broker is not None:
+        try:
+            record_served_verbs(httpd.broker.data_root, verb_registry, datetime.now(timezone.utc))
+        except OSError as exc:
+            _log.warning("cockpit: served verbs not recorded under %s: %s", httpd.broker.data_root, exc)
+            try:
+                (httpd.broker.data_root / SERVED_VERBS_NAME).unlink(missing_ok=True)
+            except OSError as stale:
+                _log.warning("cockpit: an earlier served-verbs record may remain: %s", stale)
     return httpd
 
 

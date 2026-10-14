@@ -46,7 +46,7 @@ from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anch
 __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CUSTODIES", "FIDO_ATTESTED", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
-    "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
+    "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
@@ -276,7 +276,7 @@ def _thaw(value: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class AuthorityPolicy:
+class StandingPolicy:
     """The standing policy a replay derives: verb tier raises, per-kind timeout defaults (carried, their
     semantics are S4b's) and egress grants (carried, consumed by S5)."""
     raise_to: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
@@ -295,26 +295,31 @@ class AuthorityPolicy:
         return {"raise_to": _thaw(self.raise_to), "timeouts": _thaw(self.timeouts), "grants": _thaw(self.grants)}
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> AuthorityPolicy:
+    def from_dict(cls, data: Mapping[str, Any]) -> StandingPolicy:
         return cls(_freeze(dict(data["raise_to"])), _freeze(dict(data["timeouts"])),
                    _freeze(dict(data["grants"])))
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, AuthorityPolicy) and _canonical(self.as_dict()) == _canonical(other.as_dict())
+        return isinstance(other, StandingPolicy) and _canonical(self.as_dict()) == _canonical(other.as_dict())
 
     def __hash__(self) -> int:
         return hash(_canonical(self.as_dict()))
 
 
+# the S3 name, kept so code written against it still imports; one type, two names
+AuthorityPolicy = StandingPolicy
+
+
 # The policy before any policy link, pinned for this FORMAT: replay is a pure function of the log, so
-# it never reads live code (``verbs.Policy()`` may change; a log replays the same either way). These
-# are the shipped ``verbs.Policy()`` values when the format was born: no raises.
+# it never reads live code (a log replays the same whatever the code ships). These are the values the
+# retired ``verbs.Policy()`` shipped when the format was born: no raises. Every cockpit tier reads
+# this through ``RequestAuthority.policy`` and nowhere else (S4a).
 _GENESIS_RAISE_TO: Mapping[str, str] = MappingProxyType({})
 
 
-def genesis_policy() -> AuthorityPolicy:
+def genesis_policy() -> StandingPolicy:
     """The policy before any policy link: the constant pinned for :data:`FORMAT`."""
-    return AuthorityPolicy(raise_to=_freeze(dict(_GENESIS_RAISE_TO)))
+    return StandingPolicy(raise_to=_freeze(dict(_GENESIS_RAISE_TO)))
 
 
 @dataclass(frozen=True)
@@ -325,7 +330,7 @@ class AuthoritySnapshot:
     seq: int
     head_hash: str
     keys: Mapping[str, AuthorityKey]
-    policy: AuthorityPolicy
+    policy: StandingPolicy
     _hashes: tuple[str, ...] = field(repr=False, default=())
     # the head link's ``at``: the next link's ``at`` may not be earlier (an ordering rule, never a grant)
     head_at: datetime | None = None
@@ -558,7 +563,7 @@ def _validate_grant(grant: Any, what: str) -> dict[str, Any]:
     return _thaw(grant)
 
 
-def _validate_policy(data: Any) -> AuthorityPolicy:
+def _validate_policy(data: Any) -> StandingPolicy:
     if not isinstance(data, Mapping) or set(data) != {"raise_to", "timeouts", "grants"}:
         raise AuthorityError("a policy must carry exactly raise_to, timeouts and grants")
     raise_to, timeouts, grants = data["raise_to"], data["timeouts"], data["grants"]
@@ -573,7 +578,7 @@ def _validate_policy(data: Any) -> AuthorityPolicy:
         g = _validate_grant(grant, f"policy.grants[{gid!r}]")
         if g["id"] != gid:
             raise AuthorityError(f"policy.grants[{gid!r}] carries id {g['id']!r}")
-    return AuthorityPolicy.from_dict(data)
+    return StandingPolicy.from_dict(data)
 
 
 def _finite_json(value: Any) -> bool:
@@ -596,7 +601,7 @@ def _validate_timeouts(timeouts: Any) -> None:
         raise AuthorityError("timeouts values must be finite JSON (no NaN or Infinity)")
 
 
-def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> AuthorityPolicy:
+def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> StandingPolicy:
     """The policy after the declared op, refusing a malformed or impossible one. Does NOT judge the
     delta's kind: that is :func:`classify`, on the result alone."""
     op = rec["op"]
@@ -641,7 +646,7 @@ def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> Authori
             data["grants"][gid]["expires_at"] = rec["expires_at"]
     else:
         raise AuthorityError(f"{op!r} is not a policy op")
-    return AuthorityPolicy.from_dict(data)
+    return StandingPolicy.from_dict(data)
 
 
 def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
@@ -662,7 +667,7 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     return "loose"
 
 
-def classify(old: AuthorityPolicy, new: AuthorityPolicy) -> str:
+def classify(old: StandingPolicy, new: StandingPolicy) -> str:
     """The kind of the difference from ``old`` to ``new``, computed from the two policies alone (§4.3).
     :data:`NOOP` when nothing changes in effect (a missing floor and a floor at the lowest tier are the
     same). Anything else not PROVABLY narrower is :data:`LOOSEN`; a grant extended and nothing
@@ -820,7 +825,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
             need = _apply_op(rec, seq, state, keys, ssh_keygen)
-            if isinstance(need, AuthorityPolicy):
+            if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
                 if delta == NOOP:
                     raise AuthorityError(f"this {op} changes nothing")
@@ -850,7 +855,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
-              ssh_keygen: Path | str) -> int | AuthorityPolicy:
+              ssh_keygen: Path | str) -> int | StandingPolicy:
     """Applies a key op to ``keys`` and returns the signer rank it needs, or returns the new policy for
     a policy op (whose rank follows from its computed delta)."""
     op = rec["op"]

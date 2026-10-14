@@ -18,7 +18,9 @@ from typing import Any
 import pytest
 from anneal_memory.spores import SporeStore
 
+from levain.authority import AuthoritySnapshot, StandingPolicy, genesis_policy
 from levain.cockpit import verbs as verbs_mod
+from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.engine import NOW_ID, ProviderSpec
 from levain.cockpit.results import Absent, Read
 from levain.cockpit.providers import build_default_cockpit
@@ -228,7 +230,7 @@ class TestCredentialAndTiers:
         ran = []
         r = Rig(tmp_path, extra={"ping": ActionVerb(handler=lambda p: ran.append(p) or {}, label="ping")})
         spec = r.reg.get("ping")
-        assert spec is not None and spec.tier({}, None, "unverified", TODAY) == "T2"
+        assert spec is not None and spec.tier({}, None, "unverified", TODAY, policy=genesis_policy()) == "T2"
         _refused("needs_broker", dispatch, registry=r.reg, cockpit=r.ck, scope=r.src.write_scope,
                  req={"verb": "ping", "params": {}, "confirm": True}, credential=CRED,
                  install_class=INSTALL_CLASS, route="action")
@@ -467,11 +469,14 @@ class TestRenderedActions:
         assert rig.ck.panel("loops", credential_class="token")["etag"] != before
         assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": None}) == "C1"
 
-    def test_a_policy_change_changes_the_panel_etag_with_rows_unchanged(self, rig: Rig, monkeypatch) -> None:
+    def test_a_policy_change_changes_the_panel_etag_with_rows_unchanged(self, rig: Rig) -> None:
         """'a policy change that alters a panel action's gesture with rows unchanged returns a new panel
-        etag (no 304)'"""
+        etag (no 304)'. The policy is the request's snapshot's (S4a); a real signed raise is
+        ``test_cockpit_standing_policy.py``'s."""
         p1 = rig.ck.panel("tray", credential_class="token")
-        monkeypatch.setattr(verbs_mod, "POLICY", verbs_mod.Policy(revision=2, raise_to={"spore_touch": "T2"}))
+        raised = StandingPolicy.from_dict({"raise_to": {"spore_touch": "T2"}, "timeouts": {}, "grants": {}})
+        snap = AuthoritySnapshot("store0001", 1, "a" * 64, {}, raised, ("a" * 64,))
+        rig.ck.attach_authority(lambda now: RequestAuthority(now, authority=snap))
         p2 = rig.ck.panel("tray", credential_class="token")
         assert [r["version"] for r in p1["rows"]] == [r["version"] for r in p2["rows"]]
         assert p1["etag"] != p2["etag"]

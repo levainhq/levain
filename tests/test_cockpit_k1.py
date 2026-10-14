@@ -1162,8 +1162,9 @@ class TestL3R4CodexFixes:
         assert now["groups"] and now["etag"] == ck.manifest(NONE_CRED)["panels"][NOW_ID]["etag"]
         snap = _Snap(now["status"], now["rows"], None, [], [], now["as_of"], now["error"], now["note"])
         today = ck._clock().astimezone().date()
-        assert ck._etag_of(snap, None, "none", today) != ck._etag_of(snap, now["groups"], "none", today)
-        assert now["etag"] == ck._etag_of(snap, now["groups"], "none", today)
+        a = ck.authority()
+        assert ck._etag_of(snap, None, "none", today, auth=a) != ck._etag_of(snap, now["groups"], "none", today, auth=a)
+        assert now["etag"] == ck._etag_of(snap, now["groups"], "none", today, auth=a)
 
 
 class TestL3R6Freshness:

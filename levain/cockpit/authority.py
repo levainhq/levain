@@ -111,6 +111,24 @@ def unavailable(reason: str) -> LabelSnapshot:
     return _Unavailable(f"provenance unavailable: {reason}")
 
 
+class TierPolicy(Protocol):
+    """What a verb's tier reads of the standing policy: ``levain.authority.StandingPolicy``, or
+    :data:`UNKNOWN_POLICY`."""
+
+    def apply(self, verb: str, tier: str) -> str: ...
+
+
+class _UnknownPolicy:
+    """The policy of a request whose authority log could not be read or was refused: every verb at
+    T3, never lower, since a raise it cannot see may stand in the log."""
+
+    def apply(self, verb: str, tier: str) -> str:
+        return "T3"
+
+
+UNKNOWN_POLICY: TierPolicy = _UnknownPolicy()
+
+
 class Labeller(Protocol):
     def snapshot(self, conn: "sqlite3.Connection", authority: "AuthoritySnapshot | None") -> LabelSnapshot: ...
 
@@ -126,8 +144,12 @@ class RequestAuthority:
     authority_error: str | None = None
     # the journal it was captured from (its path); None when no journal was read
     source: str | None = None
-    # the log has no links (and no anchor names one): nothing signs, a token-reported fire still may
+    # the log has no links (and no anchor names one), or, with ``no_log``, no trace of a log exists on the
+    # data root (``Broker._ledger_trace``): nothing signs, a token-reported fire still may
     log_empty: bool = False
+    # no log was asked: this server's broker is not ACTIVE, so it holds no journal it may read (K2b-3b
+    # §8d row 1). Unless ``log_empty`` too, its policy is UNKNOWN_POLICY: the log it cannot read may hold a raise
+    no_log: bool = False
     # journal reads one request shares (K2b-3b §0.6: Recent edits' broker side), so a write's probes
     # through ``_scan_read_one`` read the journal once, never once per probe
     _memo: dict[str, tuple[bool, Any]] = field(default_factory=dict, compare=False, repr=False)
@@ -145,6 +167,36 @@ class RequestAuthority:
         if not ok:
             raise got
         return got
+
+    @property
+    def policy(self) -> "TierPolicy":
+        """The standing policy this request tiers under (trust-tiering DESIGN §4.1): the replay's, from
+        the one snapshot this request captured. The genesis policy (the shipped default) only when the
+        log is positively established empty, or when the cockpit has no authority system at all (no
+        broker attached: a read-only server with no data root). Otherwise what the log raises is
+        unknown (a log refused or unreadable, or a broker that is not ACTIVE, ``no_log``, on a data root
+        holding any trace of a log: STANDBY, install-disabled, failed at start), so every verb is T3
+        (:data:`UNKNOWN_POLICY`) and the inactive broker refuses it: a fire never falls back to the
+        shipped default past a signed raise it cannot see."""
+        from levain.authority import genesis_policy
+        if self.authority is not None:
+            return self.authority.policy
+        if self._genesis:
+            return genesis_policy()
+        return UNKNOWN_POLICY
+
+    @property
+    def _genesis(self) -> bool:
+        return self.log_empty or (self.authority_error is None and not self.no_log)
+
+    @property
+    def revision(self) -> list[Any]:
+        """The authority head this request's policy was read at, hashed into every etag (DESIGN §4.2:
+        one counter): the fence a record issued now would carry, or why there is no head."""
+        from levain.cockpit.firejournal import authority_fence
+        if self.authority is not None:
+            return sorted(authority_fence(self.authority).items())
+        return ["genesis"] if self._genesis else ["unknown"]
 
     @property
     def fence(self) -> dict[str, Any] | None:
