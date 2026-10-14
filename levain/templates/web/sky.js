@@ -207,7 +207,7 @@
 
     function rebuild() {
       var now = clock();
-      var narrow = host.getBoundingClientRect().width < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
+      var hw = host.getBoundingClientRect().width, narrow = hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
       opts.compact = narrow;
       model = buildModel(events, opts, now);
       var rowsH = Math.max(narrow ? 200 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 48 : ROW_H_MIN));

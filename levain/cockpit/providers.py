@@ -487,7 +487,8 @@ def _edit_origin(credential: Any) -> str:
     cred = str(credential or "")
     kind, _, rest = cred.partition(":")
     if kind == "token" and rest:
-        return f"from the {rest.rpartition(':')[0] or rest}"
+        name, _, gen = rest.rpartition(":")
+        return f"from the {name if name and gen.isdigit() else rest}"
     if kind == "device":
         return "from a signed device"
     return ""
@@ -495,9 +496,9 @@ def _edit_origin(credential: Any) -> str:
 
 def plain_edit_title(verb: str, target: str, credential: Any) -> str:
     """A broker fire as a sentence a person reads: ``resolved item spore-017, from the browser``."""
+    verb = verb if isinstance(verb, str) else ""     # a journal row's verb is a string; a malformed one must not take the panel down
     said = " ".join(x for x in (_EDIT_PHRASES.get(verb) or verb.replace("_", " "), target) if x)
-    origin = _edit_origin(credential)
-    return f"{said}, {origin}" if origin else said
+    return ", ".join(x for x in (said, _edit_origin(credential)) if x)
 
 
 def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:

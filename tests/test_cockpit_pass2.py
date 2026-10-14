@@ -79,3 +79,15 @@ def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_n
     assert plain_edit_title("pending_cancel", _edit_target("pend:xyz"), "") == "cancelled a pending change"
     assert plain_edit_title("new_verb_x", _edit_target("thing:1"), None) == "new verb x thing:1"
     assert plain_edit_title("", "", None) == ""
+    assert plain_edit_title(7, "", "token:a:b") == "from the a:b"      # a non-string verb, a colon in a surface name with no generation
+
+
+@needs_browser
+def test_a_text_editor_keeps_its_own_size_when_typed_in(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"until": "[...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''))"}, {"eval": """(() => {
+      const card = [...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''));
+      card.querySelector('.edit-btn').click(); const ta = card.querySelector('.text-editor textarea');
+      const before = ta.offsetHeight; ta.value = Array.from({length: 60}, (_, i) => 'line ' + i).join('\\n'); ta.dispatchEvent(new Event('input', {bubbles: true}));
+      return { before, after: ta.offsetHeight, inline: ta.style.height }; })()"""}])
+    got = vals[2]
+    assert got["before"] > 0 and got["after"] == got["before"] and got["inline"] == "", got

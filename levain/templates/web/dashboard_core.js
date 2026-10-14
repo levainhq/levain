@@ -2541,9 +2541,11 @@
   }
 
   // a compose box is one line until something is typed, then as tall as its text
+  // (the text editor of an identity or section card is built by the same builder, and keeps its own rows and its resize handle)
   function growToText(ta) {
+    if (ta.closest(".text-editor")) return;
     ta.style.height = "auto";
-    ta.style.height = ta.scrollHeight + "px";
+    ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px";
   }
 
   function buildActionBox(action, spec) {
