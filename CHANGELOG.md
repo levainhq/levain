@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- **The consent queue's core and its Claude Code adapter, as a library; no `levain` command installs or shows them yet.** `levain.consent` files a request for a Claude Code `PermissionRequest` gate, keeps it in a store under `<levain home>/consent`, expires it, and delivers a decision only when it verifies as a signed answer against the cockpit's authority log (the row is never the authority; a signed answer uses the reserved SSHSIG namespace `levain-consent-answer`). With no verified answer the hook decides nothing and Claude Code shows its own dialog. `levain.consent.adapters.claude_code.install(workspace, ...)` writes the hook into a workspace's `.claude/settings.json`. Any request that would edit agent configuration or hooks (Claude Code and Codex settings and hook files, `.mcp.json`, `~/.claude.json`, `.claude/agents|skills|commands|plugins`, plugin hook files, levain's own installed code) is never answered by a policy; it waits for you. Policy answers, the Codex adapter and the cockpit's queue view are not built.
+
 ### Known edges
 
 - **Installing the Claude Code consent hook replaces a `PermissionRequest` handler it takes for its own.** A reinstall removes the earlier levain handler even when it was written for another Python, by its shape: a command of exactly two words whose second is levain's installed hook script path. A handler of your own written exactly that way (any program, then levain's script path, nothing else) would be replaced too; a handler with any other command (a third word, another script) is always kept.
