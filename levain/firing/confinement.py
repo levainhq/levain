@@ -687,7 +687,9 @@ class FloorRefreshError(ConfinementError):
 # without network). A grant is gpg's only when its path is the one gpgconf names as
 # ``agent-extra-socket`` for the default home or levain's own ``$GNUPGHOME`` (:func:`_gpg_extra_sockets`),
 # the homes whose agent programs the floor write-denies; a name never makes one. Any other path named
-# ``S.gpg-agent.extra`` is another home's agent and is refused. Grants apply on Linux only (macOS gets
+# ``S.gpg-agent.extra`` is another home's agent and is refused. An ssh agent is never a grant: a path
+# that resolves to the socket the operator's ``$SSH_AUTH_SOCK`` names, or to gpg-agent's ssh socket, is
+# refused (:func:`_ssh_agent_refusal`). Grants apply on Linux only (macOS gets
 # its unix-socket rule with B2).
 GRANTS_DIR = "confinement"
 GRANTS_FILE = "grants.json"
@@ -760,6 +762,35 @@ def _gpg_extra_sockets() -> dict[str, str]:
     return out
 
 
+def _gpg_ssh_sockets() -> list[str]:
+    """gpgconf's ``agent-ssh-socket`` for the default home and levain's own absolute ``$GNUPGHOME``."""
+    out: list[str] = []
+    for kw in ({}, {"homedir": os.environ.get("GNUPGHOME")}):
+        if "homedir" in kw and not (kw["homedir"] and os.path.isabs(kw["homedir"])):
+            continue
+        got = _gpgconf_dir("agent-ssh-socket", home=str(Path.home()), **kw)
+        if got is not None and str(got) not in out:
+            out.append(str(got))
+    return out
+
+
+_SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key the agent holds; bash's ssh "
+                    "agent is levain's scoped one, keys added with `levain ssh-add <key> -h <host>`")
+
+
+def _ssh_agent_refusal(p: str) -> str | None:
+    """Why ``p`` cannot be a grant because it is an ssh agent, or None: it resolves to the socket the
+    operator's ``$SSH_AUTH_SOCK`` names now, or to gpg-agent's ssh socket (gpgconf's path, under any
+    name). Only those two are recognised; an agent at another path is not (a stated limit)."""
+    real = os.path.realpath(p)
+    ambient = os.environ.get("SSH_AUTH_SOCK")
+    if ambient and os.path.isabs(ambient) and os.path.realpath(ambient) == real:
+        return _SSH_AGENT_GRANT.format("your $SSH_AUTH_SOCK")
+    if any(os.path.realpath(s) == real for s in _gpg_ssh_sockets()):
+        return _SSH_AGENT_GRANT.format("gpg-agent's ssh socket")
+    return None
+
+
 def grants_file() -> Path:
     """``<levain home>/confinement/grants.json``, absolute (:func:`build_policy` hides its directory)."""
     home = Path(os.environ.get("LEVAIN_HOME") or Path.home() / ".levain").expanduser()
@@ -810,7 +841,7 @@ def load_operator_grants(path: Path | None = None) -> tuple[SocketGrant, ...]:
             raise ConfinementError(f"{where} ({e['path']!r}) is not an exact absolute path — fail-closed.")
         if any(c in p for c in "*?["):
             raise ConfinementError(f"{where} ({e['path']!r}) is a pattern; a grant names one socket — fail-closed.")
-        why = _GRANT_REFUSED_NAMES.get(Path(p).name)
+        why = _GRANT_REFUSED_NAMES.get(Path(p).name) or _ssh_agent_refusal(p)
         if why is not None:
             raise ConfinementError(f"{where} ({p}) {why} — fail-closed.")
         if any(g.path == p for g in out):
@@ -845,6 +876,9 @@ def resolve_grant(grant: SocketGrant, view_roots: list[Path]) -> None:
                                "(fail-closed); fix or remove it in " + str(grants_file()) + ".")
     if os.path.realpath(p) != p:
         refuse(f"is reached through a link (it resolves to {os.path.realpath(p)}); name the real path")
+    agent = _ssh_agent_refusal(p)   # again at entry: $SSH_AUTH_SOCK may name another socket by now
+    if agent is not None:
+        refuse(agent)
     try:
         if hasattr(os, "O_PATH"):   # Linux: the object itself, never through a final link
             fd = os.open(p, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
