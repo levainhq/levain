@@ -362,7 +362,7 @@
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || d.message || "That did not go through (" + code + ").";
+    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || (r.status < 500 && d.message) || "That did not go through (" + code + ").";
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
@@ -439,7 +439,7 @@
     notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
     if (notice) paintNow(notice); else clearBusy(base.row_id || null);
     const redrew = await afterWrite();
-    if (!words && redrew === false) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
+    if (!words && redrew === false && !pendingReload) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
       notice = { key: base.row_id || null, text: "Saved. The page could not refresh; reload to see it.", cls: "note" };
       paintNow(notice);
     }

@@ -1251,10 +1251,9 @@
     if (s.searchable) p.appendChild(buildFilter(s));
     p.appendChild(s.body);
     s.setQuery = (q, now) => setQuery(s, q, now);
-    s.paint = () => { paint(s); root.setTimeout(markEmptyCards, 0); };   // a repaint can empty or fill a card; the caller attaches a new one after this returns
+    s.paint = () => paint(s);
     states.add(s);
     paint(s);
-    root.setTimeout(markEmptyCards, 0);
     if (s.searchable && sendable(s.query) && sr.scope === "store") runStoreSearch(s);
     if (focusKeep && focusKeep.pid === s.pid && s.filterInput) {
       const keep = focusKeep;
@@ -1274,7 +1273,15 @@
     return d.lines || [];
   }
 
+  // every repaint (a poll, a search, a held refetch, a first fill) can empty or fill a card: the marking follows each one, once per tick
+  let emptyQueued = false;
   function paint(s) {
+    paintBody(s);
+    if (emptyQueued) return;
+    emptyQueued = true;
+    root.setTimeout(() => { emptyQueued = false; markEmptyCards(); }, 0);
+  }
+  function paintBody(s) {
     const d = s.data, sr = d.search || {};
     if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
     dropSky(s);
@@ -1448,7 +1455,7 @@
   // reason the list is short and a collapsing card would jump under the cursor.
   function markEmptyCards() {
     for (const p of document.querySelectorAll(".ck-zgrid > .panel")) {
-      const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
+      const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".xfilter, .pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
       p.classList.toggle("ck-is-empty", none);
     }
   }

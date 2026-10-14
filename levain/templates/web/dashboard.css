@@ -1242,9 +1242,9 @@ body.ke .row .verb-menu .verb-btn { text-align: left; }
   body.ke .row .verb-actions > .verb-btn::after { content: ""; position: absolute; inset: calc((var(--ctl-row) - var(--hit-min)) / 2) 0; }
   body.ke .row .verb-menu .verb-btn { height: var(--hit-min); min-height: var(--hit-min); }
 }
-/* panel chrome follows the row: the edit-class chip and the expand control show on the card you are on */
-body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
-body.ke .panel:hover .phead .chip, body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .chip, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
+/* panel chrome follows the row: the expand control shows on the card you are on */
+body.ke .panel .phead .pexpand { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
+body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
 body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }

@@ -59,3 +59,31 @@ def test_a_text_panel_reads_first_and_opens_an_editor_holding_its_text(tmp_path:
     got = vals[1]
     assert got["hidden"] is True and got["open"] is True and got["value"].strip() != "" and got["titles"] == 1, got
     assert got["label"] == "Edit this text", got
+
+
+@needs_browser
+def test_a_closed_text_editor_does_not_hold_off_a_refresh_and_a_changed_one_does(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+      const card = [...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''));
+      const ta = card.querySelector('.text-editor textarea'); const D = window.LevainDashboard;
+      const closed = D.hasUnsavedEdit();
+      card.querySelector('.edit-btn').click(); const opened = D.hasUnsavedEdit();
+      const orig = ta.value; ta.value = ''; const emptied = D.hasUnsavedEdit();
+      ta.value = orig + ' more'; const typed = D.hasUnsavedEdit();
+      card.querySelector('.verb-cancel').click(); const cancelled = D.hasUnsavedEdit();
+      return { closed, opened, emptied, typed, cancelled }; })()"""}])
+    assert vals[1] == {"closed": False, "opened": False, "emptied": True, "typed": True, "cancelled": False}, vals
+
+
+@needs_browser
+def test_a_card_with_a_filter_keeps_its_height_even_with_nothing_to_list(tmp_path: Path) -> None:
+    # no fixture card is both empty and filterable, so two stand-in cards are placed in a zone grid and a mode switch re-marks them
+    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+      const g = document.querySelector('.ck-zgrid'); const mk = (filter) => { const p = document.createElement('section'); p.className = 'panel';
+        p.innerHTML = '<div class="phead"><h2>x</h2></div>' + (filter ? '<div class="xfilter"><input class="xfilter-input"></div>' : '') + '<div class="pbody"><p class="empty">none</p></div>';
+        g.appendChild(p); return p; };
+      const plain = mk(false), filtered = mk(true);
+      document.querySelector('[data-mode-tab="morning"]').click(); document.querySelector('[data-mode-tab="board"]').click();
+      await new Promise(r => setTimeout(r, 100));
+      return [plain.classList.contains('ck-is-empty'), filtered.classList.contains('ck-is-empty')]; })()"""}])
+    assert vals[1] == [True, False], vals

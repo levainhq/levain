@@ -2505,7 +2505,7 @@
     const box = buildActionBox(Object.assign({}, act, { fields: [field] }), spec);
     box.classList.add("text-editor");
     const ta = box.querySelector("textarea");
-    if (ta) { ta.value = current; ta.rows = Math.min(14, Math.max(4, current.split("\n").length + 1)); }
+    if (ta) { ta.value = current; ta.dataset.orig = current; ta.rows = Math.min(14, Math.max(4, current.split("\n").length + 1)); }
     const save = box.querySelector(".tray-dump-btn");
     if (save) save.textContent = "save";
     const cancel = el("button", "verb-cancel", "cancel");
@@ -3269,10 +3269,13 @@
     // mid-save and flash the old name (or drop the half-typed one). The authoritative SAVE
     // reload is passive:false → NOT gated here → still rebuilds #entity (spore-280).
     if (document.querySelector(".name-editor")) return true;
-    for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta")) {
+    // a text panel's editor is prefilled with the current text: it is dirty only when it differs from that text (a closed
+    // one, or one the person has not touched, must not hold off every refresh), and it is not an empty compose box
+    for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta, .text-editor textarea")) {
       if (ta.value !== ta.dataset.orig) return true;
     }
     for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref")) {
+      if (ta.closest(".text-editor")) continue;
       if (ta.value.trim() !== "") return true;
     }
     return false;
