@@ -3175,13 +3175,14 @@ def test_linux_live_credential_file_denies_both_directions(linux_floor) -> None:
 
 @linux_live
 def test_linux_live_ssh_agent_mode(linux_floor) -> None:
-    """Key material gone; known_hosts read AND write, with the write reaching the REAL host file —
-    that last assertion is what distinguishes a live bind from a tmpfs copy that silently discards."""
+    """Key material gone; known_hosts readable but NOT writable (B2a fix 1, L1 #1 / L2 #1: a write used to
+    reach the REAL host file, so bash could plant a host key the operator's ssh then trusted)."""
     sh, _home, _ent, _j, ssh, _c = linux_floor
+    before = (ssh / "known_hosts").read_text()
     assert sh.run(f"cat {ssh}/id_ed25519").exit_code != 0
     assert sh.run(f"cat {ssh}/known_hosts").exit_code == 0
-    assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code == 0
-    assert "NEWHOST" in (ssh / "known_hosts").read_text()
+    assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code != 0
+    assert (ssh / "known_hosts").read_text() == before
 
 
 @linux_live
@@ -3494,7 +3495,7 @@ def test_linux_live_a_deny_root_strictly_inside_ssh_does_not_brick_the_shell(tmp
         # mkdir first: without it the write fails on ENOENT and proves nothing (measured: it
         # passed on the code this test was written against)
         assert sh.run(f"mkdir -p {ssh}/keys; echo POISON > {ssh}/keys/new").exit_code != 0
-        assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code == 0   # the re-allow holds
+        assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code != 0   # the re-allow is read-only (B2a fix 1)
     assert not (ssh / "keys" / "new").exists()
 
 
