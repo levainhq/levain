@@ -301,9 +301,10 @@ CSS = """\
 JS = """\
 (function () {
   "use strict";
-  // measureOverflow, as in the cockpit: a focusable scroll region plus the "more below" chevron cue.
+  // measureOverflow, as in the cockpit: a focusable scroll region plus the fade-mask "more below" cue (.at-end drops it).
   function measure(body) {
     var over = body.scrollHeight > body.clientHeight + 1;
+    var atEnd = function () { return body.scrollTop + body.clientHeight >= body.scrollHeight - 1; };
     body.classList.toggle("has-overflow", over);
     if (over) {
       body.tabIndex = 0; body.setAttribute("role", "region");
@@ -311,10 +312,10 @@ JS = """\
       body.setAttribute("aria-label", (h ? h.textContent + " — " : "") + "scrollable");
       if (!body.dataset.scrollWired) {
         body.dataset.scrollWired = "1";
-        body.addEventListener("scroll", function () { body.classList.toggle("at-top", body.scrollTop <= 1); }, { passive: true });
+        body.addEventListener("scroll", function () { body.classList.toggle("at-end", atEnd()); }, { passive: true });
       }
-      body.classList.toggle("at-top", body.scrollTop <= 1);
-    } else { body.removeAttribute("tabindex"); body.removeAttribute("role"); body.removeAttribute("aria-label"); body.classList.remove("at-top"); }
+      body.classList.toggle("at-end", atEnd());
+    } else { body.removeAttribute("tabindex"); body.removeAttribute("role"); body.removeAttribute("aria-label"); body.classList.remove("at-end"); }
   }
   function measureAll() { document.querySelectorAll(".pbody.clamped").forEach(measure); }
   measureAll(); window.addEventListener("resize", measureAll);

@@ -405,7 +405,8 @@ def anneal_import(gl: LedgerTransport, ledger: I.Ledger, tree: str, owner: str) 
 
     body = "".join(export_stream(ledger))
     try:
-        # --link-authority: only the owner's supersedes cross authors, the same rule levain's in-force view applies
+        # --link-authority: the tip owner only. levain judges owner authority as of each line (tenure, G), so a v2 store
+        # can refuse a past owner's links that levain enforces; that is why the upgrade line is printed.
         cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
                              "--link-authority", owner, "-"],
                             input=body, capture_output=True, text=True, timeout=20, env=child_env())
