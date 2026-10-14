@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Known edges
+
+- **Installing the Claude Code consent hook replaces a `PermissionRequest` handler it takes for its own.** A reinstall removes the earlier levain handler even when it was written for another Python, by its shape: a command of exactly two words whose second is levain's installed hook script path. A handler of your own written exactly that way (any program, then levain's script path, nothing else) would be replaced too; a handler with any other command (a third word, another script) is always kept.
+
 ## [0.10.2] — 2026-10-13
 
 A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if you use the cockpit's signing keys.

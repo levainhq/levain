@@ -63,7 +63,8 @@ CLEANUP_RESERVE = 60.0
 # Code never cancels the hook while a verified answer is on its way out (a cancelled hook's output is discarded).
 TIMEOUT_MARGIN = 30
 DEFAULT_MAX_HOLD = 900.0
-# A request on one of these tools whose target path is agent config or a hook is tagged agent_config.
+# A request on one of these tools (or an MCP tool, by its MCP_PATH_FIELDS) whose target path is agent config or a
+# hook is tagged agent_config.
 FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 # tier an agent_config request is filed at: an allow then needs a key class covering T3 (fail toward the human).
 AGENT_CONFIG_TIER = "T3"
@@ -127,15 +128,32 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, .
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
 
+# Under a ``.claude`` directory (the workspace's or ~'s), what Claude Code loads and runs: hooks, subagents, skills,
+# slash commands, and the plugin install tree (``~/.claude/plugins``: each plugin's hooks, MCP servers, agents).
+CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugins"})
+# MCP server definitions: a workspace's ``.mcp.json`` and the user's ``~/.claude.json``.
+CONFIG_FILE_NAMES = frozenset({".mcp.json", ".claude.json"})
+# The tool_input fields an MCP tool's target paths are read from (the reference filesystem server's names, plus
+# Claude Code's own): only these, never a value parsed out of another field.
+MCP_PATH_FIELDS = ("file_path", "path", "paths", "notebook_path", "source", "destination")
+
+
 def _is_config_path(path: Path) -> bool:
     parts = [p.lower() for p in path.parts]
+    if parts and parts[-1] in CONFIG_FILE_NAMES:
+        return True
     for i, part in enumerate(parts[:-1]):
         rest = parts[i + 1:]
         if part == ".claude":
-            if rest[0] == "hooks" or (len(rest) == 1 and rest[0].startswith("settings") and rest[0].endswith(".json")):
+            if rest[0] in CLAUDE_CONFIG_DIRS or (len(rest) == 1 and rest[0].startswith("settings")
+                                                  and rest[0].endswith(".json")):
                 return True
         if part == ".codex" and len(rest) == 1 and rest[0] in ("hooks.json", "config.toml"):
             return True
+        if part == ".claude-plugin":
+            return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
+        if part == "hooks" and i > 0 and os.path.isdir(Path(*path.parts[:i]) / ".claude-plugin"):
+            return True  # a plugin outside ~/.claude/plugins (a local marketplace, --plugin-dir): its hooks/
     return False
 
 
@@ -144,31 +162,57 @@ def _under(path: Path, roots: tuple[str, ...]) -> bool:
     return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
+def _targets(tool_name: str, tool_input: Any) -> list[Any] | None:
+    """The paths a request names, or ``None`` when it is not a tool this tags. A file tool names one
+    (``file_path``, else ``notebook_path``); an MCP tool names whatever its :data:`MCP_PATH_FIELDS` hold (a
+    ``paths`` list item by item), possibly nothing."""
+    if tool_name in FILE_TOOLS:
+        return [tool_input.get("file_path", tool_input.get("notebook_path")) if isinstance(tool_input, Mapping)
+                else None]
+    if not tool_name.startswith("mcp__") or not isinstance(tool_input, Mapping):
+        return None
+    out: list[Any] = []
+    for field in MCP_PATH_FIELDS:
+        if field in tool_input:
+            value = tool_input[field]
+            out += value if isinstance(value, list) else [value]
+    return out
+
+
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
                          protected: Iterable[Path] = ()) -> bool:
-    """True when an Edit/Write/MultiEdit/NotebookEdit request targets an agent's config or hooks: a
-    ``.claude/settings*.json``, anything under a ``.claude/hooks/``, a ``.codex/hooks.json`` or ``.codex/config.toml``,
-    in the workspace or the home directory, or any of ``protected`` (a file, or anything under a directory; the
-    adapter passes :func:`protected_paths`). The path is checked as written (``~`` expanded, joined to ``cwd``,
-    normalised) and as resolved through symlinks; either match tags it. A file tool whose target cannot be read
-    is tagged too. Other tools are never tagged: Bash is not parsed (ruling 1)."""
-    if tool_name not in FILE_TOOLS:
+    """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
+    in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
+    ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
+    ``.claude/hooks/``); a ``.mcp.json`` or ``.claude.json``; a ``.codex/hooks.json`` or ``.codex/config.toml``;
+    anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a plugin); or any of
+    ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
+    tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and nothing
+    else. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
+    symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
+    missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
+    targets = _targets(tool_name, tool_input)
+    if targets is None:
         return False
-    target = tool_input.get("file_path", tool_input.get("notebook_path")) if isinstance(tool_input, Mapping) else None
-    if not isinstance(target, str) or not target:
-        return True
     home = home if home is not None else Path.home()
-    raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
-    if not raw.is_absolute():
-        raw = Path(cwd) / raw
-    written = Path(os.path.normpath(raw))
     try:
-        resolved = Path(os.path.realpath(raw))
-        roots = tuple({s for p in protected
-                       for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())})
+        roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())})
     except (OSError, ValueError):
         return True
-    return _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots)
+    for target in targets:
+        if not isinstance(target, str) or not target:
+            return True
+        raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
+        if not raw.is_absolute():
+            raw = Path(cwd) / raw
+        written = Path(os.path.normpath(raw))
+        try:
+            resolved = Path(os.path.realpath(raw))
+        except (OSError, ValueError):
+            return True
+        if _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots):
+            return True
+    return False
 
 
 # --- the decision ------------------------------------------------------------------------------------------
@@ -191,12 +235,14 @@ def hook_output(decision: Decision) -> dict[str, Any]:
 
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: Callable[[ExternalGateRequest], Decision | None] = decide_by_policy,
+           policy: Callable[[ExternalGateRequest], Decision | None] | None = None,
            home: Path | None = None, protected: Iterable[Path] = (),
            clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
-    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it."""
+    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. ``policy``
+    (default :func:`levain.consent.decide_by_policy`) is only ever reached through :func:`guarded_policy`, and
+    never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot bypass ruling 3b item 1."""
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
@@ -220,8 +266,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     settled = False
     try:
         got: Decision | None = None
-        if not agent_config:
-            got = _verified(policy(request), request)
+        if not agent_config and request.tier != AGENT_CONFIG_TIER:
+            got = _verified(guarded_policy(request, policy), request)
         wait = min(hold, max(0.0, deadline - clock()))
         if got is None and wait > 0:
             got = _verified(queue.await_decision(request.id, wait), request)
@@ -245,8 +291,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 def guarded_policy(request: ExternalGateRequest,
                    policy: Callable[[ExternalGateRequest], Decision | None] | None = None) -> Decision | None:
     """The policy seam (default :func:`levain.consent.decide_by_policy`) with ruling 3b item 1 asserted at it:
-    a request filed as agent_config (a file tool at :data:`AGENT_CONFIG_TIER`) never reaches a policy."""
-    if request.tier == AGENT_CONFIG_TIER and request.tool_name in FILE_TOOLS:
+    a request filed as agent_config (any tool at :data:`AGENT_CONFIG_TIER`) never reaches a policy."""
+    if request.tier == AGENT_CONFIG_TIER:
         raise PolicyNotEligible(f"request {request.id} targets agent config: never eligible for a policy answer")
     return (policy or decide_by_policy)(request)
 
@@ -275,7 +321,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
         out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     policy=guarded_policy, protected=protected_paths(queue_dir, settings))
+                     protected=protected_paths(queue_dir, settings))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

@@ -232,7 +232,7 @@ def test_agent_config_targets_are_tagged(tool, path):
 
 
 @pytest.mark.parametrize("tool,inp", [
-    ("Edit", {"file_path": "src/app.py"}), ("Write", {"file_path": ".claude/agents/x.md"}),
+    ("Edit", {"file_path": "src/app.py"}), ("Write", {"file_path": "docs/agents/x.md"}),
     ("Edit", {"file_path": "docs/settings.json"}), ("Write", {"file_path": ".codex/notes.md"}),
     ("Bash", {"command": "echo {} > .claude/settings.json"}),  # Bash is never parsed (ruling 1)
 ])
@@ -532,3 +532,90 @@ def test_a_failing_stdout_is_still_exit_0(monkeypatch):
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: FakeQueue("allow"))
     monkeypatch.setattr(cc, "load_settings", lambda d: AWAY)
     assert cc.main(["--queue-dir", "/nonexistent"], stdin=io.StringIO(json.dumps(event())), stdout=Broken()) == 0
+
+
+# --- fix round 3 (L3 Q2 r2 complement-2 / complement-4; ruling 3b item 1) -------------------------------------
+
+@pytest.mark.parametrize("path", [
+    ".mcp.json", "sub/dir/.mcp.json", "~/.claude.json",
+    ".claude/agents/x.md", "~/.claude/agents/x.md", ".claude/skills/s/SKILL.md", "~/.claude/skills/s/run.py",
+    ".claude/commands/c.md", "~/.claude/commands/sub/c.md",
+    "~/.claude/plugins/cache/mkt/plug/1.0.0/hooks/hooks.json",
+    "~/.claude/plugins/marketplaces/mkt/plugins/plug/hooks/hooks.json",
+    "~/.claude/plugins/marketplaces/mkt/plugins/plug/hooks/guard.py",
+    ".claude/hooks/levain_consent.py", "~/.claude/hooks/levain_consent.py",
+])
+def test_config_execution_surfaces_are_tagged(path):
+    """complement-2: what Claude Code loads and runs (MCP servers, subagents, skills, commands, plugin hooks, the
+    adapter's own hook script) is agent config, in the workspace and in ~."""
+    for tool in ("Edit", "Write"):
+        assert cc.targets_agent_config(tool, {"file_path": path}, "/work/proj", home=HOME), (tool, path)
+
+
+def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
+    """A plugin outside ~/.claude/plugins (a local marketplace, --plugin-dir) is a directory with .claude-plugin/;
+    its hooks/ and manifest are config. The same names in a directory that is not a plugin are not."""
+    plug, other = tmp_path / "plug", tmp_path / "other"
+    (plug / ".claude-plugin").mkdir(parents=True)
+    (other / "hooks").mkdir(parents=True)
+    for rel in ("plug/hooks/hooks.json", "plug/hooks/guard.sh", "plug/.claude-plugin/plugin.json"):
+        assert cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path)), rel
+    for rel in ("other/hooks/hooks.json", "plug/src/hooks.json", "plug/README.md"):
+        assert not cc.targets_agent_config("Write", {"file_path": rel}, str(tmp_path)), rel
+
+
+@pytest.mark.parametrize("inp,tagged", [
+    ({"path": ".mcp.json", "content": "{}"}, True), ({"file_path": "~/.claude/settings.json"}, True),
+    ({"paths": ["src/a.py", ".claude/agents/x.md"]}, True), ({"destination": ".claude/hooks/h.sh"}, True),
+    ({"path": "src/a.py", "content": "x"}, False), ({"query": ".mcp.json"}, False), ({}, False),
+])
+def test_an_mcp_tool_is_tagged_by_its_named_path_fields(inp, tagged):
+    """MCP tools that write files: only what tool_input names as a path field is read, no parsing."""
+    assert cc.targets_agent_config("mcp__fs__write_file", inp, "/work/proj", home=HOME) is tagged
+
+
+def test_a_policy_that_would_allow_an_mcp_json_edit_is_never_consulted(monkeypatch):
+    calls = []
+
+    def allow_all(request):
+        calls.append(request)
+        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
+                        request_digest=request.digest)
+    for e in (event("Edit", {"file_path": ".mcp.json", "old_string": "a", "new_string": "b"}),
+              event("mcp__fs__write_file", {"path": "/work/proj/.claude/skills/s/SKILL.md", "content": "x"})):
+        q = FakeQueue(None)
+        rc, out = run_main(monkeypatch, q, json.dumps(e), settings=cc.AdapterSettings(), policy=allow_all)
+        assert (rc, out) == (0, "") and q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER
+    assert calls == []
+
+
+def test_decide_always_goes_through_the_guard(monkeypatch):
+    """complement-4: a direct decide() caller, with the default policy or its own, reaches the policy only
+    through guarded_policy (fail closed)."""
+    seen = []
+    real = cc.guarded_policy
+    monkeypatch.setattr(cc, "guarded_policy", lambda r, p=None: (seen.append(r.id), real(r, p))[1])
+    for kw in ({}, {"policy": lambda r: None}):
+        q = FakeQueue(None)
+        cc.decide(event(), q, cc.AdapterSettings(), **kw)
+        assert seen[-1] == q.requests[0].id
+    assert len(seen) == 2
+
+
+def test_a_request_filed_at_the_config_tier_never_reaches_a_direct_callers_policy():
+    """Whatever decide's own tagging said, a request the queue holds at AGENT_CONFIG_TIER gets no policy answer;
+    it still takes a signed human answer."""
+    class RaisedQueue(FakeQueue):
+        def file(self, **kw):
+            return super().file(**{**kw, "tier": cc.AGENT_CONFIG_TIER})
+    calls = []
+    q = RaisedQueue("allow")
+    out = cc.decide(event(), q, AWAY, policy=lambda r: calls.append(r))
+    assert calls == [] and out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    with pytest.raises(cc.PolicyNotEligible):
+        cc.guarded_policy(q.requests[0], lambda r: None)
+    mcp = FakeQueue(None)
+    mcp.file(agent="claude_code", agent_session_id="s", event_id=None, tool_name="mcp__fs__write_file",
+             cwd="/w", tier=cc.AGENT_CONFIG_TIER)
+    with pytest.raises(cc.PolicyNotEligible):
+        cc.guarded_policy(mcp.requests[0], lambda r: None)
