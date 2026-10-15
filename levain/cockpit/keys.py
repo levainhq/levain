@@ -641,11 +641,13 @@ def signing_public_key(key_path: Path) -> str:
     return normalise_public_key(text)
 
 
-def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> tuple[str, Signer]:
+def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+               namespace: str = NAMESPACE) -> tuple[str, Signer]:
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
     key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
-    (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in the
-    authority namespace with the terminal's stderr, so a touch or passphrase prompt reaches the operator.
+    (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in
+    ``namespace`` (default: the authority log's; a consent answer passes its own) with the terminal's
+    stderr, so a touch or passphrase prompt reaches the operator.
 
     The key's sidecar (``levain.cockpit.custody``, written by ``levain cockpit key create``) names its
     provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
@@ -670,7 +672,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
         if no_agent:
             env.pop("SSH_AUTH_SOCK", None)
         try:
-            cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", NAMESPACE],
+            cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", namespace],
                                 input=message, stdout=subprocess.PIPE, timeout=_SIGN_TIMEOUT, check=False,
                                 env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -685,7 +687,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
         # is: a cancelled Touch ID prompt lets ssh-keygen exit 0 without one (measured 2026-10-12). Left to
         # the log's replay it would read as a bad signature, which is a different failure.
         if not _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
-                                          ssh_keygen=ssh_keygen):
+                                          namespace=namespace, ssh_keygen=ssh_keygen):
             # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
             # (a hand-made key enrolled with --custody touch-id has no sidecar)
             if touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER:
