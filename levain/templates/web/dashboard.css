@@ -1114,9 +1114,9 @@ body.ke .dot.ok { background: var(--ok); }
 .w .dots { display: flex; flex-direction: column; gap: var(--sp-1); }
 .w .op { padding: var(--sp-1) 0; font-size: var(--fs-meta); }
 /* a tile whose text had to be cut says so with an ellipsis (and is a button to the whole of it), never with its bottom edge */
-.w .xbody.clamped .sub { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.w .xbody.clamped .sub { flex-shrink: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 /* ... and the reading tile's own lines, and a line tile's provider note, the same way */
-.w .xbody.clamped .wx-c, .w .xbody.clamped .rd-sub, .w .wbody.clamped .ext-note { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.w .xbody.clamped .wx-c, .w .xbody.clamped .rd-sub, .w .wbody.clamped .ext-note { flex-shrink: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 .w .xnote, .w .sub { margin-top: 0; }
 /* a row in a tile: two lines at most (the ellipsis is the cue), and no per-row expand: the tile opens the whole list */
 .w .wbody.clamped .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 2; line-clamp: 2; }

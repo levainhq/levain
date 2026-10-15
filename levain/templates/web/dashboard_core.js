@@ -636,8 +636,7 @@
         if (node.classList.contains("w-open")) open();
       });
       node.addEventListener("keydown", (ev) => { if (node.classList.contains("w-open")) onKey(ev); });
-      if (data.face === "count" && data.typed && !data.error) setOpenable(true);
-      else if (data.typed && !data.error) node.addEventListener("levain-hidden", (ev) => { if (ev.target === body) setOpenable(ev.detail > 0); });
+      if (data.typed && !data.error) node.addEventListener("levain-hidden", (ev) => { if (ev.target === body) setOpenable(ev.detail > 0); });
       else if (!data.typed && !data.error && Array.isArray(data.lines) && data.lines.length) fitLines.push(() => fitLineTile(body, setOpenable));
       cards.push(node);
     }
@@ -662,15 +661,22 @@
   function fitLineTile(body, setOpenable) {
     // the provider's notes are chrome (kept, and cut to two lines when the room is short); the rows are the items
     const all = Array.from(body.children);
-    const notes = all.filter((c) => c.classList.contains("ext-note"));
-    const rows = all.filter((c) => !c.classList.contains("ext-note"));
+    // only `.row` elements are items; a group heading is kept only with a row of its group that is shown
+    const rows = all.filter((c) => c.classList.contains("row"));
     const fit = () => {
       if (!body.isConnected) return;
       body.classList.remove("clamped");
       const fits = () => body.scrollHeight <= body.clientHeight + 1;
       let shown = rows.length;
       const draw = () => {
-        body.replaceChildren(...notes, ...rows.slice(0, shown));
+        let ri = 0;
+        const keep = [];
+        for (const c of all) {
+          if (c.classList.contains("row")) { if (ri < shown) keep.push(c); ri++; }
+          else if (c.classList.contains("ext-grouphead")) { if (ri < shown) keep.push(c); }
+          else keep.push(c);
+        }
+        body.replaceChildren(...keep);
         if (shown < rows.length) body.appendChild(el("div", "xnote", "+" + (rows.length - shown) + " more"));
       };
       draw();

@@ -123,7 +123,37 @@ def test_a_line_tile_keeps_one_observer_and_fits_a_long_note(tmp_path: Path) -> 
               for (let i = 0; i < 5; i++) { const t = tile(80, 'x'); if (i < 4) t.parentNode.remove(); }
               const watched = D.lineTileCount();
               // a long provider note over one row: the tile still fits, and is a button to the rest
-              const b = tile(60, 'a long provider note '.repeat(12));
-              return [watched, b.scrollHeight <= b.clientHeight + 1, open]; })()"""},
+              const b = tile(50, 'a long provider note '.repeat(12));
+              const n = b.querySelector('.ext-note'); const lh = parseFloat(getComputedStyle(n).lineHeight) || 0; return [watched, n.offsetHeight >= 2 * lh - 1, open]; })()"""},
         ])["values"]
     assert out[1] == [1, True, True], out
+
+
+@needs_browser
+def test_openability_is_one_rule_faults_revoke_it_and_a_heading_never_stands_alone(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": f"{HEALTH}"},
+            # 8a: a count tile faulted by a refetch is no button, and a good repaint gives the button back
+            {"eval": "(async () => { " + TILE + "const [card, p] = mk(120); const s = fillTile(p, {pid: 'cn', face: 'count', kind: 'count', count: 3, lines: [{text: 'a'}]}); const before = p.hid.slice(-1)[0]; "
+                     "s.fault = 'down'; s.paint(); const during = p.hid.slice(-1)[0]; s.fault = ''; s.paint(); return [before > 0, during, p.hid.slice(-1)[0] > 0]; })()"},
+            # 8b: a faulted status-dots tile whose fault line overflows its box is no button either (the clamp does not re-arm it)
+            {"eval": "(async () => { " + TILE + "const [card, p] = mk(14); const s = fillTile(p, {pid: 'fo', kind: 'status-dots', metrics: metrics(2)}); s.fault = 'a long reason it is down '.repeat(8); s.paint(); K.fitWidgets(document.body); "
+                     "const during = p.hid.slice(-1)[0]; room(card, 14); return [during, p.hid.slice(-1)[0], s.clamp]; })()"},
+            # 8c: the page's own count tile (Decisions) hears the same event: 0 revokes the button, a good paint's 1 gives it back
+            {"eval": "(() => { const c = [...document.querySelectorAll('.ck-widgets .ck-card.w')].find(x => x.dataset.ckKind === 'count'); const body = c.querySelector('.wbody'); const was = c.getAttribute('role'); "
+                     "body.dispatchEvent(new CustomEvent('levain-hidden', {bubbles: true, detail: 0})); const during = c.getAttribute('role'); "
+                     "body.dispatchEvent(new CustomEvent('levain-hidden', {bubbles: true, detail: 1})); return [was, during, c.getAttribute('role')]; })()"},
+            # 9: group headings and rows in a box with room for one child: never a heading alone, and "+N more" counts rows
+            {"eval": """(async () => { const D = window.LevainDashboard; let open = null;
+              const b = document.createElement('div'); b.className = 'wbody'; b.style.cssText = 'width:240px;position:absolute;left:0;top:0;display:flex;flex-direction:column;overflow:hidden';
+              for (const g of ['g1', 'g2']) { const h = document.createElement('div'); h.className = 'ext-grouphead'; h.textContent = g; const r = document.createElement('div'); r.className = 'row'; r.textContent = 'row ' + g; b.append(h, r); }
+              const c = document.createElement('div'); c.className = 'ck-card w'; c.appendChild(b); document.body.appendChild(c); const first = b.children[1].getBoundingClientRect().bottom - b.getBoundingClientRect().top; b.style.height = Math.ceil(first + 30) + 'px'; D.fitLineTile(b, (on) => { open = on; });
+              const kids = [...b.children].map(e => e.className + ':' + e.textContent);
+              return [kids, open]; })()"""},
+        ])["values"]
+    assert out[1] == [True, 0, True], out
+    assert out[2][0] == 0 and out[2][1] == 0, out
+    assert out[3] == ["button", None, "button"], out
+    assert out[4][0] == ["ext-grouphead:g1", "row:row g1", "xnote:+1 more"] and out[4][1] is True, out
