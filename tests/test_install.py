@@ -696,7 +696,8 @@ def test_init_store_requests_partnership_schema(tmp_path: Path, monkeypatch):
         stderr = ""
 
     def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
+        if "init" in cmd:           # the baton claim that follows is not the call under test
+            captured["cmd"] = cmd
         return _Result()
 
     monkeypatch.setattr("levain.install.subprocess.run", fake_run)
@@ -808,8 +809,9 @@ def test_init_store_both_candidates_carry_schema(tmp_path: Path, monkeypatch):
     ok = _init_store(store, "anneal-memory")
 
     assert ok is True
-    assert len(cmds) == 2  # fell through to the second candidate
-    for cmd in cmds:
+    inits = [c for c in cmds if "init" in c]
+    assert len(inits) == 2  # fell through to the second candidate (then claimed the baton)
+    for cmd in inits:
         i = cmd.index("init")
         assert cmd[i:i + 3] == ["init", "--schema", "partnership"]
 

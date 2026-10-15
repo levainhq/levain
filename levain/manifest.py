@@ -134,7 +134,11 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # the honest multi-episode example stays (the entry asks to keep it). No 0.9.8-0.9.25 entries.
 # 0.9.27 (AM-DURABLE-FACTS, first released in anneal 0.9.28; 0.9.27 was never published): memory.md names the optional `## Durable Facts` section and its line
 # and cue form, and leaves the rules to prepare_wrap, as the entry's suggested edit asks.
-TEMPLATES_RECONCILED_ANNEAL = "0.9.28"
+# 1.0.0 (KL-19-OPERATOR-CONSOLIDATES, 2026-10-15): a store `init` creates requires the consolidate baton.
+# No seed edit: the entry's one instruction (a downgraded `prepare_wrap` is the human's to resolve; the agent
+# never claims the baton) is in anneal's own downgrade message, and `levain init` claims the baton for
+# ANNEAL_SESSION_ID. Allowlisted no-edit in tests/test_compat_integration.py (the seed is at its byte budget).
+TEMPLATES_RECONCILED_ANNEAL = "1.0.0"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).

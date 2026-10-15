@@ -122,7 +122,7 @@ def test_init_wires_mcp_to_levains_own_interpreter(tmp_path, monkeypatch, adapte
     assert server["command"] == python_path
     # -P before -m: the client's working directory must not be able to shadow the package.
     assert server["args"][:3] == ["-P", "-m", "anneal_memory"]
-    assert server["args"][3:] == ["--db", f"{install}/.levain/memory.db", "serve"]
+    assert server["args"][3:] == ["--db", f"{install}/.levain/memory.db", "serve", "--session-id", "levain"]
     assert "/decoy/anneal-memory" not in json.dumps(server)
 
 

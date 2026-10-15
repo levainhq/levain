@@ -1915,7 +1915,10 @@ def test_headroom_stays_quiet_for_a_missing_continuity_even_after_a_wrap(tmp_pat
     from levain.doctor import _check_continuity_headroom
 
     d = _entity_with_continuity(tmp_path, None)
+    from anneal_memory import register_writer_schema
+
     con = sqlite3.connect(d / ".levain" / "memory.db")
+    register_writer_schema(con)   # anneal 1.0: a plain-sqlite3 write to its store needs this
     con.execute("INSERT INTO wraps (episodes_compressed) VALUES (3)")
     con.commit()
     con.close()
