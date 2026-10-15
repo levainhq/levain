@@ -125,12 +125,15 @@ def patch_targets(patch: Any) -> list[str] | None:
 
 
 def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
-    """The paths a Codex request names, for the consent policy's grant criteria: an ``apply_patch``'s headers
-    (:func:`patch_targets` of ``tool_input.command``; ``None``, which matches nothing, when unreadable), else any
-    tool's path fields (:func:`levain.consent.policy.grant_targets`)."""
-    if tool_name == PATCH_TOOL:
-        return patch_targets(tool_input.get("command") if isinstance(tool_input, Mapping) else None)
-    return consent_policy.grant_targets(tool_name, tool_input)
+    """The paths a Codex request names, for the consent policy's grant criteria: any tool's path fields
+    (:func:`levain.consent.policy.grant_targets`), plus an ``apply_patch``'s headers (:func:`patch_targets` of
+    ``tool_input.command``; ``None``, which matches nothing, when unreadable). A path field beside a patch is
+    checked too, so an inside header never covers an outside field."""
+    fields = consent_policy.grant_targets(tool_name, tool_input)
+    if tool_name != PATCH_TOOL:
+        return fields
+    headers = patch_targets(tool_input.get("command") if isinstance(tool_input, Mapping) else None)
+    return None if headers is None else [*headers, *fields]
 
 
 consent_policy.register_targets(AGENT, policy_targets)

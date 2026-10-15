@@ -145,9 +145,10 @@ def _within(path: str, root: str) -> bool:
 
 def _resolved(target: Any, cwd: str) -> str | None:
     """``target`` as a path (``~`` expanded, joined to ``cwd`` when relative), only when the filesystem resolves
-    it to exactly its lexical normal form: no existing component on it is a symlink (including one a ``..``
-    steps back through). ``None`` for anything else, or anything that is not a usable path."""
-    if not isinstance(target, str) or not target or "\x00" in target:
+    it to exactly its lexical normal form: no existing component on it is a symlink. A ``..`` component in the
+    target as given matches nothing, link or no link. ``None`` for anything else, or anything that is not a usable
+    path."""
+    if not isinstance(target, str) or not target or "\x00" in target or ".." in target.split(os.sep):
         return None
     raw = os.path.expanduser(target) if target == "~" or target.startswith("~/") else target
     joined = raw if os.path.isabs(raw) else os.path.join(cwd, raw)

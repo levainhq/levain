@@ -259,8 +259,9 @@ def _verified(decision: Any, request: ExternalGateRequest) -> Decision | None:
 
 def hook_output(decision: Decision) -> dict[str, Any]:
     """What Claude Code reads from a ``PermissionRequest`` hook for a verified decision. A grant's allow also
-    carries a ``systemMessage`` (shown to the operator) naming the grant, so an answer the operator did not
-    give in the moment says where it came from."""
+    carries a ``systemMessage`` naming the grant, so an answer the operator did not give in the moment says where
+    it came from. Claude Code decides whether to display it (a real 2.1.300 session showed only its own "Allowed by
+    PermissionRequest hook", Q4 RUN 2026-10-15); the receipt is the record."""
     verdict: dict[str, Any] = {"behavior": decision.decision}
     if decision.decision == "deny":
         verdict["message"] = f"Denied by a signed levain answer (key {decision.signer_fp})."

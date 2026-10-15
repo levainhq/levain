@@ -867,8 +867,9 @@ def test_a_target_through_a_symlink_inside_the_workspace_matches_nothing(tmp_pat
     os.symlink(ws / "sub", ws / "link")
     os.symlink(ws / "sub" / "real.txt", ws / "leaf")
     assert ask({"file_path": str(ws / "sub" / "a.txt"), "content": "x"}, tool="Write")[1] is not None
-    assert ask({"file_path": str(ws / "sub" / ".." / "a.txt"), "content": "x"}, tool="Write")[1] is not None
-    for target in (str(ws / "link" / "a.txt"), "link/a.txt", str(ws / "leaf"), str(ws / "escape" / ".." / "a.txt")):
+    for target in (str(ws / "link" / "a.txt"), "link/a.txt", str(ws / "leaf"), str(ws / "escape" / ".." / "a.txt"),
+                   # r2 item 2 (codex r2 #3): a `..` component matches nothing, link or no link
+                   str(ws / "link" / ".." / "a.txt"), str(ws / "sub" / ".." / "a.txt"), "sub/../a.txt"):
         r, d = ask({"file_path": target, "content": "x"}, tool="Write")
         assert d is None and q.get(r.id)[1] == "pending", target
 

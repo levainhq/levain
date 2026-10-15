@@ -134,3 +134,6 @@ def test_real_core_grant_answers_an_apply_patch_inside_its_workspace_only(tmp_pa
     assert run(patch(str(tmp_path / "outside.txt"))) == ""
     assert run({"command": "*** Begin Patch\n*** Bogus: a.txt\n*** End Patch\n"}) == ""
     assert run(patch("a.txt"), permission_mode="never") == ""
+    # r2 item 1 (codex r2 #1): an inside header does not cover an outside path field carried beside it
+    assert run({**patch("a.txt"), "path": str(tmp_path / "outside.txt")}) == ""
+    assert run({**patch("a.txt"), "file_path": str(tmp_path / "outside.txt")}) == ""
