@@ -6,6 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **A cockpit row's project tag comes from its `repo` facet when it has one.** A provider that sets `repo` on a row tags that row with that repo, in the spelling your data first used, and its words are no longer read for a repo name; so a repo named like an ordinary word (`review`) no longer tags a row that only uses the word but belongs to another repo. A row with no `repo` facet is still tagged from its words, as before.
+- Known edge: levain's own list panels set no `repo` facet yet, so their rows are still tagged from their words. A facet the page has not registered as a repo (longer than 100 characters, or past the registry's limit) is ignored and the row falls back to its words.
+
 ## [0.10.4] — 2026-10-15
 
 The consent queue's core and Claude Code adapter as a library, signed standing policy for the cockpit, doctor's hook pins, and the cockpit's phone layout, project hues and Decisions tile. No `levain` command installs the consent queue yet.
