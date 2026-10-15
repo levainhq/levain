@@ -820,7 +820,8 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
     local for it to cover yet (a first init), so what levain writes is the only content there.
     ``none``: no pin, but hook files already exist that levain did not write in this run.
     ``changed``: a pin that differs, or one that is invalid or cannot be compared. Never raises.
-    ``adapter``: the adapter an init is about to write, when the install does not attest one yet."""
+    ``adapter``: the adapter an init is about to write; read only while there is no pin yet (an existing pin
+    is compared under the adapter the install attests)."""
     ent = Path(os.path.abspath(install))
     try:
         old = _load_agent_pins(ent)
