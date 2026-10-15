@@ -710,6 +710,16 @@ def test_display_masks_by_key_token_with_a_typed_marker():
     assert '"api_key": "[redacted: str, 1 chars]"' in shown and '"passwd": "[redacted: int]"' in shown
 
 
+
+def test_display_masks_a_secret_word_inside_a_run_together_key():
+    # seen red (probe_fix2 on af2a220): whole-token masking showed accesstoken, secretkey and clienttoken
+    shown = redact_display("mcp__x__y", {"accesstoken": "k", "secretkey": "k", "clienttoken": "k",
+                                         "githubtoken": "k", "dbpassword": "k", "author": "alice",
+                                         "auth_url": "http://x", "private": False})
+    assert '"k"' not in shown
+    assert '"accesstoken": "[redacted: str, 1 chars]"' in shown
+    assert '"author": "alice"' in shown and '"auth_url": "http://x"' in shown and '"private": false' in shown
+
 def test_policy_seam_decides_nothing_without_a_grant(queue):
     """No standing grant in the log: the seam answers nothing and leaves the request pending."""
     from levain.consent.policy import decide

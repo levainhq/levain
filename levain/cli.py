@@ -1884,7 +1884,7 @@ def _filed_input(request: object) -> object:
         return _UNSHOWN
     try:
         return json.loads(request.display[len(prefix):])
-    except ValueError:
+    except (ValueError, RecursionError):            # a display nested too deep to read back is not shown either
         return _UNSHOWN
 
 
@@ -1950,7 +1950,7 @@ def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
         if named is None:
             raise AnswerRefused(f"the queue's {adapter.SETTINGS_NAME} names no cockpit_data_root for "
                                 f"{request.agent}; pass --data-root")
-        return named
+        return _holding_a_cockpit(named)
     if named is not None:
         try:
             same = os.path.samefile(named, hook)
@@ -1959,7 +1959,17 @@ def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
         if not same:
             raise AnswerRefused(f"{named} is not the cockpit the hook verifies against ({hook}, the queue's "
                                 f"{adapter.SETTINGS_NAME}): an answer verified there would never be delivered")
-    return Path(hook)
+    return _holding_a_cockpit(Path(hook))
+
+
+def _holding_a_cockpit(root: Path) -> Path:
+    """``root``, refused before anything is signed when it holds no cockpit journal: an answer verified there
+    could only be refused after the signature."""
+    from levain.consent.queue import AnswerRefused
+
+    if not (root / "cockpit.db").is_file():
+        raise AnswerRefused(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root")
+    return root
 
 
 def _cmd_consent_answer(args: argparse.Namespace) -> int:

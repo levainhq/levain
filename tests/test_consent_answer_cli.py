@@ -136,3 +136,27 @@ def test_answer_verifies_against_the_queue_settings_cockpit(scratch, capsys, tmp
                  "--queue-dir", str(queue.directory)]) == 0, capsys.readouterr().err
     got = queue.decision(request.id)
     assert got is not None and got.decision == "allow" and got.signer_fp == fp
+
+
+def test_a_display_nested_too_deep_to_read_back_is_unshown():
+    # r2 complement LOW (item 10): json.loads raised RecursionError out of the refusal path
+    from types import SimpleNamespace
+
+    from levain.cli import _UNSHOWN, _filed_input
+
+    deep = "[" * 100_000 + "]" * 100_000
+    assert _filed_input(SimpleNamespace(tool_name="Write", display=f"Write {deep}")) is _UNSHOWN
+
+
+def test_answer_refuses_a_root_holding_no_cockpit_before_signing(scratch, capsys, tmp_path):
+    # seen red (fix2, item 11's reachable shape): --path on a directory with no install resolved to a cockpit
+    # root that does not exist; the answer was signed, then refused by the queue
+    queue, laptop, fp, root = scratch
+    request = _file(queue, "/w/a.txt", "e7")
+    bare = tmp_path / "no-install"
+    bare.mkdir()
+    rc = main(["consent", "answer", request.id, "allow", "--signing-key", str(laptop),
+               "--queue-dir", str(queue.directory), "--path", str(bare)])
+    out = capsys.readouterr()
+    assert rc == 1 and "holds no cockpit" in out.err and "answering" not in out.out
+    assert queue.get(request.id)[1] == "pending"

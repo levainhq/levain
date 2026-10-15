@@ -42,12 +42,14 @@ ANSWER_NAMESPACE = "levain-consent-answer"
 # link in the authority log is the signature, re-verified at every delivery
 GRANT_ANSWER_FORMAT = "levain-consent-grant-answer/1"
 DISPLAY_MAX = 2000
-# A key is secret-named when one of its tokens, or two adjacent tokens joined, is one of these words. Tokens: the
-# key split at ``_``, ``-``, any other non-alphanumeric and camelCase (``apiKey``, ``APIKey``, ``x-api-key`` ->
-# api, key), lower-cased. Whole tokens only, so ``author``, ``auth_url`` and a ``private`` flag are shown.
+# A key is secret-named when one of these words occurs inside one of its tokens, or inside two adjacent tokens
+# joined. Tokens: the key split at ``_``, ``-``, any other non-alphanumeric and camelCase (``apiKey``, ``APIKey``,
+# ``x-api-key`` -> api, key), lower-cased. Inside a token, so a run-together ``accesstoken`` or ``secretkey`` is
+# masked; split first, so ``author``, ``auth_url`` and a ``private`` flag are shown. ``max_tokens`` and
+# ``tokenizer`` are masked too: a secret shown costs more than a count hidden.
 _SECRET_WORDS = frozenset({
-    "password", "passwords", "passwd", "secret", "secrets", "token", "tokens", "apikey", "apikeys",
-    "authorization", "credential", "credentials", "cookie", "cookies", "privatekey", "accesskey", "bearer"})
+    "password", "passwd", "secret", "token", "apikey", "authorization", "credential", "cookie", "privatekey",
+    "accesskey", "bearer"})
 _KEY_TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+")
 
 
@@ -67,8 +69,8 @@ def _secret_named(key: Any) -> bool:
     if not isinstance(key, str):
         return False
     tokens = [t.lower() for t in _KEY_TOKEN.findall(key)]
-    return any(t in _SECRET_WORDS for t in tokens) or any(
-        a + b in _SECRET_WORDS for a, b in zip(tokens, tokens[1:]))
+    spans = tokens + [a + b for a, b in zip(tokens, tokens[1:])]
+    return any(word in span for span in spans for word in _SECRET_WORDS)
 
 
 def _masked(value: Any) -> str:
@@ -86,9 +88,9 @@ def _mask(value: Any) -> Any:
 
 
 def redact_display(tool_name: str, tool_input: Any) -> str:
-    """What the operator is shown: the tool and its input with secret-named keys masked (by whole key token,
-    each masked value shown as its type and a string's length, ``[redacted: str, 12 chars]``), bounded to
-    :data:`DISPLAY_MAX` characters. A display, never what is signed: the answer binds the digest of the
+    """What the operator is shown: the tool and its input with secret-named keys masked (a secret word inside a
+    key token, each masked value shown as its type and a string's length, ``[redacted: str, 12 chars]``),
+    bounded to :data:`DISPLAY_MAX` characters. A display, never what is signed: the answer binds the digest of the
     whole input. A secret inside a free-text value (a shell command) is NOT masked: the queue does not parse
     a command (K3)."""
     body = json.dumps(_mask(tool_input), sort_keys=True, ensure_ascii=False, default=str)
