@@ -677,12 +677,14 @@ def _pins_global_codex(ent: Path, adapter: str | None = None) -> bool:
     """Whether this install's pin covers the machine-global Codex ``hooks.json``: only a Codex install's.
     Codex has no per-project hooks file, so ``levain init --adapter codex`` in ANY directory rewrites that
     one file; pinning it from every install turned a Claude Code install's doctor red the moment a Codex
-    install was made elsewhere (diogenes-20261015-021021). The adapter is the one the install attests
-    (``effective_adapter``); ``adapter``, the one an init is about to write, counts only while the install
-    attests none (an init reads the status BEFORE ``AGENTS.md`` exists), so the status an init takes and
-    the re-pin after it read the same adapter."""
+    install was made elsewhere (diogenes-20261015-021021). The adapter is the hook-carrying one the install
+    attests (``effective_adapter``: claude-code or codex); ``adapter``, the one an init is about to write,
+    counts only while the install attests none of those (an init reads the status BEFORE ``AGENTS.md``
+    exists, and a hookless install being switched has none), so the status an init takes and the re-pin
+    after it read the same adapter."""
     from levain.install import effective_adapter
-    return (effective_adapter(ent) or adapter) == "codex"
+    attested = effective_adapter(ent)
+    return (attested if attested in ("claude-code", "codex") else adapter) == "codex"
 
 
 def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None
