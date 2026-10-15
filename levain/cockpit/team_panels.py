@@ -12,7 +12,7 @@ never drawn). ``judged_partial`` also carries the ``why`` as a note on every pan
 """
 from __future__ import annotations
 
-import os
+import dataclasses
 import threading
 import time
 from dataclasses import dataclass
@@ -24,11 +24,12 @@ from levain.cockpit.engine import ProviderSpec, ReadContext
 from levain.cockpit.results import Read, Result, RowIn
 from levain.team import index as _index
 from levain.team.ledger_api import open_ledger
-from levain.team.reader import _NO_TEAM, TeamRead, read_team
+from levain.team.reader import _NO_TEAM, TeamRead, person_text, read_team
 from levain.team.transport import Repo
 
 __all__ = ["TeamSource", "TeamSnapshot", "team_discoverer"]
 
+_PENDING = "The team ledger is still being read on this machine; this page will fill in."
 REGION = "team"
 STATUS_ID = "team-status"
 FACETS = frozenset({"entry_type", "entry_owner", "agent", "age_days", "exposure_count"})
@@ -39,6 +40,7 @@ _ROW_MAX = 400
 class TeamSnapshot:
     read: TeamRead
     sync: dict[str, Any]      # the transport's recorded state: remote, last_fetch_ok, last_fetch_error
+    age_s: float = 0.0        # > 0 only when served past its ttl because the renewal is stuck: it reads as old
 
 
 def _unreadable(why: str) -> TeamSnapshot:
@@ -46,22 +48,25 @@ def _unreadable(why: str) -> TeamSnapshot:
 
 
 class TeamSource:
-    """The cached, single-flight read of one install's team ledger. ``start`` is where ``levain team status``
-    would start looking (its working directory, by default); ``load`` is for tests."""
+    """The cached, single-flight read of one install's team ledger. ``start`` is where the ledger is looked for
+    (never the process's working directory: a caller names it); ``load`` is for tests. A renewal still running
+    after ``stuck_s`` is stuck: the last answer is then served marked old, and a new worker may take over."""
 
     def __init__(self, start: Path | str | None = None, *, ttl_s: float = 15.0, wait_s: float = 8.0,
-                 load: Callable[[], TeamSnapshot] | None = None,
+                 stuck_s: float = 60.0, load: Callable[[], TeamSnapshot] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
-        self._start = Path(start) if start is not None else Path(os.getcwd())
-        self._ttl, self._wait, self._clock = ttl_s, wait_s, clock
+        self._start = Path(start) if start is not None else None
+        self._ttl, self._wait, self._stuck, self._clock = ttl_s, wait_s, stuck_s, clock
         self._load = load or self._load_ledger
         self._lock = threading.Lock()
         self._snap: TeamSnapshot | None = None
         self._at = 0.0
         self._done: threading.Event | None = None     # set while a worker is reading
+        self._began = 0.0                             # when that worker started
+        self._cold_late = False                       # a first read outran its wait: later callers do not wait again
 
     def _load_ledger(self) -> TeamSnapshot:
-        repo = Repo.discover(self._start)
+        repo = Repo.discover(self._start) if self._start is not None else None
         if repo is None:
             return TeamSnapshot(TeamRead("no_team", None, _NO_TEAM), {})
         gl = open_ledger(repo)
@@ -71,30 +76,40 @@ class TeamSource:
         return TeamSnapshot(read_team(gl), sync)
 
     def _work(self, done: threading.Event) -> None:
+        snap = None
         try:
             snap = self._load()
         except Exception as exc:  # noqa: BLE001 - the source never raises into a manifest build
             snap = _unreadable(f"The team ledger could not be read on this machine ({type(exc).__name__}).")
-        with self._lock:
-            self._snap, self._at, self._done = snap, self._clock(), None
-        done.set()
+        finally:
+            with self._lock:
+                if self._done is done:       # a worker a newer one took over from commits nothing
+                    if snap is not None:
+                        self._snap, self._at = snap, self._clock()
+                    self._done, self._cold_late = None, False
+            done.set()
 
     def get(self) -> TeamSnapshot:
         with self._lock:
-            fresh = self._snap is not None and self._clock() - self._at < self._ttl
-            if fresh:
-                return self._snap      # type: ignore[return-value]
-            if self._done is None:
-                self._done = threading.Event()
+            now = self._clock()
+            age = now - self._at
+            if self._snap is not None and age < self._ttl:
+                return self._snap
+            if self._done is None or now - self._began > self._stuck:
+                self._done, self._began = threading.Event(), now
                 threading.Thread(target=self._work, args=(self._done,), daemon=True, name="team-read").start()
             have, done = self._snap, self._done
-        if have is not None:
-            return have
+            if have is not None:
+                # a renewal that has outrun `stuck_s` is not "being renewed": the answer reads as old
+                return dataclasses.replace(have, age_s=age) if age > self._stuck else have
+            if self._cold_late:
+                return _unreadable(_PENDING)
         done.wait(self._wait)
         with self._lock:
             if self._snap is not None:
                 return self._snap
-        return _unreadable("The team ledger is still being read on this machine; this page will fill in.")
+            self._cold_late = True
+        return _unreadable(_PENDING)
 
 
 def _one_line(text: object, limit: int = _ROW_MAX) -> str:
@@ -166,7 +181,7 @@ def _sync_rows(snap: TeamSnapshot) -> tuple[RowIn, ...]:
         ok, err = s.get("last_fetch_ok"), s.get("last_fetch_error")
         lines.append(("remote", f"remote {s['remote']}: last fetch " + (_fmt_ts(ok) if ok else "never")))
         if err:
-            lines.append(("fetch-error", f"last fetch error: {_one_line(err)}"))
+            lines.append(("fetch-error", f"last fetch error: {_one_line(person_text(err))}"))
     else:
         lines.append(("remote", "no remote: the ledger is local only"))
     if m.get("problems"):
@@ -190,27 +205,44 @@ _PANES: tuple[tuple[str, str, str, str, int, int, Callable[[TeamSnapshot], tuple
 )
 
 
+def _snapshot(src: TeamSource, ctx: ReadContext) -> TeamSnapshot:
+    """ONE snapshot per request: the discoverer and every panel of a manifest build or panel read draw the same answer."""
+    return ctx.memo(f"team-snapshot:{id(src)}", src.get)
+
+
+def _age_note(snap: TeamSnapshot) -> str | None:
+    return (f"Showing the ledger as read {int(snap.age_s)}s ago: the newer read has not finished."
+            if snap.age_s > 0 else None)
+
+
+def _notes(*parts: str | None) -> str | None:
+    return " ".join(p for p in parts if p) or None
+
+
 def _pane_read(src: TeamSource, build: Callable[[TeamSnapshot], tuple[RowIn, ...]]) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
-        snap = src.get()
+        snap = _snapshot(src, ctx)
         if snap.read.model is None:       # the zone's shape changed under this read: the page re-reads its manifest
             return Read(rows=(), note=snap.read.why or None)
-        return Read(rows=build(snap), note=snap.read.why if snap.read.state == "judged_partial" else None)
+        return Read(rows=build(snap), note=_notes(snap.read.why if snap.read.state == "judged_partial" else None,
+                                                  _age_note(snap)))
     return read
 
 
 def _status_read(src: TeamSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
-        snap = src.get()
+        snap = _snapshot(src, ctx)
+        if snap.read.model is not None:   # the zone's shape changed under this read: the page re-reads its manifest
+            return Read(rows=(), note=snap.read.why or None)
         why = snap.read.why or "The team ledger could not be read on this machine."
-        return Read(rows=(RowIn(id=snap.read.state, title=_one_line(why), stored={"title": why}),))
+        return Read(rows=(RowIn(id=snap.read.state, title=_one_line(why), stored={"title": why}),), note=_age_note(snap))
     return read
 
 
 def team_discoverer(src: TeamSource) -> Callable[[ReadContext], list[ProviderSpec]]:
     """The Team zone's panels for the state the source reads NOW (register with ``Cockpit.discover(..., retire=True)``)."""
     def discover(ctx: ReadContext) -> list[ProviderSpec]:
-        snap = src.get()
+        snap = _snapshot(src, ctx)
         if snap.read.model is None:
             # one title for both states: a discovered panel's title is its identity, and the row says which state
             return [ProviderSpec(STATUS_ID, "list", "Team", "feed", _status_read(src), region=REGION, rank=0,

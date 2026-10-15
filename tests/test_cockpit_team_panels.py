@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from levain.cockpit.engine import ZONES, Cockpit
 from levain.cockpit.team_panels import TeamSnapshot, TeamSource, team_discoverer
 from levain.team.reader import TeamRead
@@ -73,3 +75,74 @@ def test_one_ledger_read_feeds_the_manifest_and_every_panel():
     for pid in _panels(ck):
         ck.panel(pid)
     assert len(loads) == 1
+
+
+def test_a_panel_retired_between_the_registry_snapshot_and_its_read_answers_error_not_keyerror():
+    reads = [TeamRead("ok", MODEL)]
+    ck = _cockpit(reads, [])
+    assert len(_panels(ck)) == 5
+    spec = ck._specs["team-waiting"]               # request A's registry snapshot
+    reads[0] = TeamRead("no_team", None, "This install has no team ledger.")
+    assert _panels(ck, 1) == ["team-status"]       # request B's discovery retires the four panes
+    from levain.cockpit.engine import ReadContext
+    assert ck._snap_for(spec, ReadContext(ck._clock())).status == "error"
+
+
+def test_the_card_names_a_git_failure_in_words_and_the_cli_text_keeps_the_raw_output():
+    from levain.team.reader import person_text
+    raw = ("cannot judge the team ledger on this clone: git rev-list failed: to convert the grafts into replace refs. "
+           "hint: Turn this message off by running hint: \"git config set advice.graftFileDeprecated false\" fatal: bad object ab12")
+    why = person_text(raw)
+    assert why == "cannot judge the team ledger on this clone: git could not read its history."
+    assert "hint" not in why and "fatal" not in why
+    assert person_text("This clone has not pinned a team ledger: run `levain team join`.") == \
+        "This clone has not pinned a team ledger: run `levain team join`."
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_cold_timeout_is_remembered_and_a_dying_worker_does_not_freeze_the_zone():
+    import threading
+    gate = threading.Event()
+    calls = []
+
+    def load() -> TeamSnapshot:
+        calls.append(1)
+        gate.wait(5)
+        return TeamSnapshot(TeamRead("ok", MODEL), {})
+    src = TeamSource(load=load, ttl_s=0.0, wait_s=0.2)
+    t0 = time.monotonic()
+    assert src.get().read.state == "unreadable"    # the first caller waits its wait_s once
+    t1 = time.monotonic()
+    assert src.get().read.state == "unreadable" and time.monotonic() - t1 < 0.1   # later callers do not wait again
+    assert t1 - t0 >= 0.15 and len(calls) == 1
+    gate.set()
+    for _ in range(100):
+        if src.get().read.state == "ok":
+            break
+        time.sleep(0.02)
+    assert src.get().read.state == "ok"
+
+    class Die(BaseException):
+        pass
+
+    def die() -> TeamSnapshot:
+        raise Die()
+    bad = TeamSource(load=die, ttl_s=0.0, wait_s=0.05)
+    bad.get()
+    time.sleep(0.1)
+    assert bad._done is None                       # reset in finally: the next get() starts a new worker
+
+
+def test_a_source_with_no_install_root_and_no_start_draws_no_team_zone(tmp_path, monkeypatch):
+    from levain.cockpit import team_panels
+    from levain.cockpit.providers import build_default_cockpit
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    seen = []
+    monkeypatch.setattr(team_panels, "TeamSource", lambda *a, **k: seen.append(a) or TeamSource(load=lambda: TeamSnapshot(
+        TeamRead("ok", MODEL), {})))
+    src = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db"))
+    ck = build_default_cockpit(src)
+    assert seen == []                              # the working directory is never scanned for a ledger
+    assert not [z for z in ck.manifest(CRED)["regions"]["zones"] if z["id"] == "team" and z["panels"]]
+    build_default_cockpit(src, team_start=tmp_path)
+    assert seen == [(tmp_path,)]                   # an explicit start is honoured

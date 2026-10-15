@@ -955,8 +955,11 @@ def build_default_cockpit(
         return specs
 
     ck.discover(discover)
-    # the Team zone: read-only, over the team ledger `levain team status` finds from ``team_start`` (the working
-    # directory when None); the panel set follows the ledger's state, so a solo install draws one card
-    from levain.cockpit.team_panels import TeamSource, team_discoverer
-    ck.discover(team_discoverer(TeamSource(team_start)), retire=True)
+    # the Team zone: read-only, over the team ledger found from ``team_start`` or, failing that, from the source's
+    # own install root; NEVER from the process's working directory (an unrelated repo's ledger is not this
+    # source's). A source with neither draws no Team zone. The panel set follows the ledger's state.
+    start = team_start if team_start is not None else source.install_root
+    if start is not None:
+        from levain.cockpit.team_panels import TeamSource, team_discoverer
+        ck.discover(team_discoverer(TeamSource(start)), retire=True)
     return ck

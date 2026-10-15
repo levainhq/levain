@@ -333,6 +333,7 @@ class _State:
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
     fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
+    read: Any = None                              # the registering spec's provider: a state belongs to ONE generation
 
 
 class _Flight:
@@ -706,7 +707,7 @@ class Cockpit:
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
         states = dict(self._state)
-        states[sid] = _State()
+        states[sid] = _State(read=spec.read)
         specs = dict(self._specs)
         specs[sid] = spec
         if spec.rowset is not None:      # claimed last: a failure above leaves nothing half-registered
@@ -964,8 +965,16 @@ class Cockpit:
             st, spec.timeout_s, produce, commit, lambda m: self._plain_error(spec, st, m),
             on_start=start, on_timeout=ctx.abandon, on_end=end)
 
+    def _state_of(self, spec: ProviderSpec) -> _State | None:
+        """The state of the generation ``spec`` belongs to, or None once that panel was retired (or retired and
+        registered anew: the old provider never runs against the new generation's state)."""
+        st = self._state.get(spec.id)
+        return st if st is not None and st.read is spec.read else None
+
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
-        st = self._state[spec.id]
+        st = self._state_of(spec)
+        if st is None:
+            return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
         if spec.refresh_every_s is None:
             return self._read_panel(spec, st, ctx)
         with st.lock:
@@ -1665,8 +1674,12 @@ class Cockpit:
                 snap = self._snap_for(spec, ctx)
                 out[spec.id] = {"as_of": snap.as_of, "status": snap.status}
                 continue
-            with self._state[spec.id].lock:
-                fresh = self._state[spec.id].fresh
+            st = self._state_of(spec)
+            if st is None:
+                out[spec.id] = dict(unread)
+                continue
+            with st.lock:
+                fresh = st.fresh
             if fresh is None:
                 out[spec.id] = dict(unread)
                 continue

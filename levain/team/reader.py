@@ -12,7 +12,7 @@ one of four states and never raises:
 ``no_team``         this clone has never joined or created a team ledger (a solo install). Not an error.
 
 ``why`` is for a person. A ``TeamError`` carries a message written for a person and is passed through (one line,
-bounded); anything else (a git failure, an OS error, a bug) says only that the ledger could not be read, and its text
+bounded, and cut where it starts quoting a git command's own output, which stays in ``detail``); anything else (a git failure, an OS error, a bug) says only that the ledger could not be read, and its text
 stays in ``detail``, which is for a log and never for a screen. Read-only: this module asks the ledger nothing that
 writes, and it fetches nothing (a sync is the transport's own verb).
 
@@ -20,6 +20,7 @@ Synchronous. A cold history read can take a long time: a caller that serves requ
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -54,6 +55,20 @@ def _one_line(text: object) -> str:
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip() + "\u2026"
 
 
+_RAW = re.compile(r"[:;,]?\s*(?:\bgit [a-z-]+ failed\b|\bfatal:|\bhint:|\berror:)", re.I)
+
+
+def person_text(text: object) -> str:
+    """``text`` for a screen: a message that carries a git command's own output is cut where that output starts and
+    says so in words (the full text stays in ``detail`` and on the CLI)."""
+    line = _one_line(text)
+    m = _RAW.search(line)
+    if m is None:
+        return line
+    head = line[:m.start()].rstrip(" :;,")
+    return f"{head}: git could not read its history." if head else _UNREADABLE
+
+
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
               ack_flag: int = DEFAULT_ACK_FLAG) -> TeamRead:
     """The team this clone's ledger describes, as one of the four states. Never raises."""
@@ -75,6 +90,6 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
         return TeamRead("ok", model)
     except TeamError as exc:
         text = _one_line(exc)
-        return TeamRead("unreadable", None, text or _UNREADABLE, f"{type(exc).__name__}: {text}")
+        return TeamRead("unreadable", None, person_text(text) or _UNREADABLE, f"{type(exc).__name__}: {text}")
     except Exception as exc:  # noqa: BLE001 - a surface drawing a team must get a named state, never a traceback
         return TeamRead("unreadable", None, _UNREADABLE, f"{type(exc).__name__}: {_one_line(exc)}")
