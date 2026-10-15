@@ -15,4 +15,4 @@
 
 [mcp_servers.anneal_memory]
 command = "{{PYTHON}}"
-args = ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]
+args = ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve", "--session-id", "levain"]

@@ -123,6 +123,7 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
+    core.extend(_check_baton(install))
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -1057,6 +1058,46 @@ def _check_floor_placeholders() -> list[CheckResult]:
         parts.append("held by a running session (removed when it ends): "
                      + ", ".join(str(p) for p in live))
     return [CheckResult("floor placeholders", True, "; ".join(parts))]
+
+
+def _store_requires_baton(install: Path) -> bool:
+    """Whether this install's store reports `consolidate_requires_baton` (anneal 1.0). False when
+    the store is absent or `status --json` cannot be read: the compat rows report that."""
+    from levain import manifest
+
+    store = install / ".levain" / "memory.db"
+    if not store.is_file():
+        return False
+    status = manifest._run_anneal_json(store, manifest.resolve_anneal_bin(), ["status", "--json"])
+    return isinstance(status, dict) and status.get("consolidate_requires_baton") is True
+
+
+def _check_baton(install: Path) -> list[CheckResult]:
+    """anneal 1.0's consolidate baton (KL-19): on a store that requires it, the MCP launcher's
+    session (``ANNEAL_SESSION_ID``) must hold it, or every wrap over MCP is downgraded to capture
+    and the entity records memory it can never consolidate. No row for a store without the policy
+    (every pre-1.0 store) or when `status --json` cannot be read: the compat rows report that."""
+    from levain import manifest
+
+    store = install / ".levain" / "memory.db"
+    if not store.is_file():
+        return []
+    status = manifest._run_anneal_json(store, manifest.resolve_anneal_bin(), ["status", "--json"])
+    if not isinstance(status, dict) or status.get("consolidate_requires_baton") is not True:
+        return []
+    holder = status.get("baton_holder")
+    if holder == manifest.ANNEAL_SESSION_ID:
+        return [CheckResult("consolidate baton", True, f"held by '{holder}', the session the MCP server runs as")]
+    if status.get("baton_readable") is False:
+        what = "unreadable"
+    else:
+        what = f"held by '{holder}'" if holder else "not claimed"
+    claim = _anneal_invocation("--db", str(store), "baton", "claim", manifest.ANNEAL_SESSION_ID)
+    return [CheckResult(
+        "consolidate baton", False,
+        f"{what}; this store requires it for '{manifest.ANNEAL_SESSION_ID}', so a wrap is downgraded to capture-only",
+        f"Claim it: {claim}" + (" --take" if holder or what == "unreadable" else ""),
+    )]
 
 
 def _check_store(install: Path) -> list[CheckResult]:
@@ -2665,6 +2706,8 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
     written before that change fails it on upgrade — an upgrade step pending, so it carries
     that exit code; an unresolvable command is broken and does not.
     """
+    from levain import manifest
+
     check = f"{name} command"
     if not isinstance(command, str) or not command:
         return CheckResult(check, False, "no command in registration",
@@ -2678,14 +2721,38 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
         return CheckResult(check, False, f"args is not a list: {args!r}",
                            f"Re-run `levain init --force --path {install}`.")
     # The shape `init` writes, element for element:
-    # `<levain python> -P -m anneal_memory --db <store> serve`. A looser test passed
+    # `<levain python> -P -m anneal_memory --db <store> serve --session-id <id>` (anneal 1.0's
+    # consolidate-baton identity; the 6-element form without it is what every pre-1.0 init wrote,
+    # and still starts the server). A looser test passed
     # `-P -c pass -m anneal_memory`, a `status` subcommand (codex HIGH), and a `--version`
     # ahead of `--db` (codex HIGH, reproduced 2026-09-14); none of them starts the server.
     strs = [a for a in args if isinstance(a, str)]
     module_form = (
-        len(strs) == len(args) == 6
+        len(strs) == len(args) in (6, 8)
         and strs[:4] == ["-P", "-m", "anneal_memory", "--db"] and strs[5] == "serve"
+        and (len(strs) == 6 or strs[6:] == ["--session-id", manifest.ANNEAL_SESSION_ID])
     )
+    if (len(strs) == len(args) == 8 and strs[:4] == ["-P", "-m", "anneal_memory", "--db"]
+            and strs[5:7] == ["serve", "--session-id"] and strs[7] != manifest.ANNEAL_SESSION_ID):
+        # The right shape, someone else's session: the baton `init` claims is held for
+        # ANNEAL_SESSION_ID, so this server is always downgraded to capture-only (codex HIGH).
+        return CheckResult(
+            check, False,
+            f"launches the memory server as session '{strs[7]}', but the consolidate baton is "
+            f"claimed for '{manifest.ANNEAL_SESSION_ID}' — every wrap over MCP is downgraded to capture-only",
+            f"Re-run `levain init --force --path {install}` (it RE-RUNS THE INTERVIEW; your store is kept).",
+        )
+    if module_form and len(strs) == 6 and _store_requires_baton(install):
+        # Every install made before the baton: the server starts but with no session id, so on a
+        # store that requires the baton it can never consolidate (codex HIGH). `levain update`
+        # re-renders this registration (the 6-argument form is still recognised as levain's own).
+        return CheckResult(
+            check, False,
+            "launcher predates the consolidate baton (no `--session-id`) — the memory server "
+            "cannot consolidate on this store",
+            f"Run `levain update --path {install}` to rewrite it (the store is kept), then restart your harness.",
+            upgrade_pending=True,
+        )
     if not module_form:
         # Only the registration every pre-spore-751 install carries is a pending upgrade
         # step: a console script named exactly `anneal-memory` with argv exactly

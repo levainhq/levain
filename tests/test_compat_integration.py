@@ -85,7 +85,7 @@ def test_doctor_compat_ahead_is_advisory_not_fail(tmp_path, monkeypatch):
     # works, update won't downgrade -> advisory-green, never a doctor FAIL.
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(anneal="0.10.0"))
+                        lambda *a, **k: _inst(anneal="1.0.1"))
     monkeypatch.setattr(manifest, "read_lock",
                         lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     results = doctor._check_compat_set(tmp_path)
@@ -174,7 +174,9 @@ def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypat
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
-    target = manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL)
+    # The fixture's installed anneal is KNOWN_GOOD_ANNEAL, which may be a pre-release of the cap
+    # (1.0.0rc2 vs 1.0.0): the ack then records the exact runtime, never the bare cap label.
+    target = manifest.template_ack_target(manifest.KNOWN_GOOD_ANNEAL)
     assert ["migrate", "ack", target] in calls
     assert manifest.read_lock(tmp_path) is not None
 
@@ -313,8 +315,8 @@ def test_templates_reconciled_constant_within_known_good():
 def test_template_ack_target_caps_and_skips():
     # Reconciled target when installed is at/above it; capped at installed when
     # older; skipped when unknown. Exercises the 0.9.6 boundary explicitly.
-    assert manifest.template_ack_target("0.10.0") == manifest.TEMPLATES_RECONCILED_ANNEAL
     cap = manifest.TEMPLATES_RECONCILED_ANNEAL
+    assert manifest.template_ack_target(_above(_above(cap))) == cap
     assert manifest.template_ack_target(_above(cap)) == cap  # just above -> cap
     assert manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL) == \
         manifest.TEMPLATES_RECONCILED_ANNEAL                  # exactly at the cap -> the cap
@@ -373,7 +375,15 @@ _COVERAGE_SENTINELS = {
 #   enforces it every run (positive prepare_wrap pointer + negative no-companion-file),
 #   so a future seed edit that froze the wrap steps fails CI instead of silently making
 #   the init-ack dishonest (L1 MED-1).
-_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED"}
+# - KL-19-OPERATOR-CONSOLIDATES (1.0.0) asks for one instruction: when `prepare_wrap` downgrades to
+#   capture-only, tell the human and never claim the baton. anneal's own downgrade message IS that
+#   instruction, delivered at the point of use ("Show your human this; do not run it yourself: to
+#   consolidate, the operator ... claims the baton for it once"), and `levain init` makes the claim
+#   the entry calls the operator's step. The seed's eager surface is at its byte budget
+#   (`test_base_eager_surface_stays_within_budget`: +120 B for the sentence fails it), so the
+#   sentence is not duplicated into memory.md. Reviewed no-edit (1015+9); if the budget moves,
+#   the entry's suggested_edit can land in memory.md and move to _COVERAGE_SENTINELS.
+_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERATOR-CONSOLIDATES"}
 
 
 def test_seed_templates_carry_the_reconciled_guidance():
@@ -550,7 +560,7 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
         if reconciled_t < manifest.version_tuple(e["version"]) <= installed_t
     )
     assert after.pending_count == expected_pending
-    assert after.migrate_acked == manifest.TEMPLATES_RECONCILED_ANNEAL
+    assert after.migrate_acked == manifest.template_ack_target(after.anneal)
 
 
 def test_the_anneal_floor_is_known_good_and_no_manifest_entry_is_above_the_template_cap():

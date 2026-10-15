@@ -448,7 +448,7 @@ def test_a_failing_codex_config_merge_is_review_not_a_traceback(make_install, tm
     receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
     data = json.loads(receipt.read_text())
     text = config.read_text()
-    older = text.replace('"serve"]', '"serve-old"]')
+    older = text.replace('"levain"]', '"levain-old"]')
     assert older != text
     config.write_text(older)
     data["files"][inst_mod.CODEX_CONFIG_KEY] = inst_mod._codex_block_hash(older)

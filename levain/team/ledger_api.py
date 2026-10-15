@@ -118,8 +118,8 @@ class LedgerTransport(Protocol):
         """The team in force at ``rev``: the counted team, never an uncounted file."""
         ...
 
-    def read_canon(self, rev: str | None = None) -> str | None:
-        """The canon text at ``rev``, or None when there is none."""
+    def read_canon(self, rev: str | None = None, *, d=None) -> str | None:
+        """The canon text at ``rev`` (or of the derivation ``d`` the caller holds), or None when there is none."""
         ...
 
     @staticmethod
@@ -150,8 +150,8 @@ class LedgerTransport(Protocol):
         ...
 
     # ---- identity ---------------------------------------------------------------------------------------------
-    def handle(self, team: R.Team | None = None) -> str | None:
-        """The member whose keys in force include this machine's key, or None."""
+    def handle(self, team: R.Team | None = None, *, d=None) -> str | None:
+        """The member whose keys in force include this machine's key, or None (from ``d`` when the caller holds one)."""
         ...
 
     def email(self) -> str:

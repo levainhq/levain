@@ -550,7 +550,7 @@ class TestReadmePinClaim:
         """And the stated pin must name the version levain actually ships against."""
         import re
         readme = (self._repo_root() / "README.md").read_text(encoding="utf-8")
-        claimed = re.search(r"pinned `>=([0-9.]+)", readme)
+        claimed = re.search(r"pinned `>=([0-9][0-9.]*(?:rc[0-9]+)?)", readme)
         assert claimed and claimed.group(1) == manifest.KNOWN_GOOD_ANNEAL
 
 

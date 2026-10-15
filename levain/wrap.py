@@ -683,6 +683,8 @@ def _consolidate(
             validated_save_continuity,
         )
         from anneal_memory.types import AffectiveState
+
+        from levain.manifest import ANNEAL_SESSION_ID
     except ImportError as exc:  # anneal-memory is a BASE dep, so this is a broken install
         print(f"levain wrap: anneal-memory is not importable ({exc}). Reinstall levain.")
         return 2
@@ -849,10 +851,15 @@ def _consolidate(
         crystal = CrystalStore(crystal_path)
         if unattended:
             crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
-        # NO session_id — that engages the embedder's parallel-convo consolidate-efferent gate (spore-194),
-        # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
+        # A store with no baton policy gets NO session_id — that engages the embedder's parallel-convo
+        # consolidate-efferent gate (spore-194), which is meaningless for a single sovereign entity:
+        # one entity, one wrap, no baton. A store anneal 1.0's `init` created IS baton-protected
+        # (KL-19), and there prepare and save refuse a call that names no session; `levain init`
+        # claimed the baton for ANNEAL_SESSION_ID, so the wrap runs as that session (the MCP
+        # launcher's `serve --session-id` does the same).
+        session_id = ANNEAL_SESSION_ID if store.consolidate_requires_baton() else None
         prepare_entered = True
-        result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token)
+        result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token, session_id=session_id)
         status = result.get("status")
         if status == "empty":
             print(
@@ -971,6 +978,7 @@ def _consolidate(
                 crystal_store=crystal,
                 affective_state=affective,
                 allow_shrink=False,
+                session_id=session_id,
             )
         except Exception as exc:  # noqa: BLE001 — anneal raises ValueError (validation) / StoreError
             # WHAT THE STORE ESTABLISHES, and nothing inferred from the absence of a flag. anneal
