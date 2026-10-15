@@ -2899,6 +2899,67 @@
     return p;
   }
 
+  // An agent waiting on the operator (Q6a). Read-only: the page shows what is asked and how to answer it from a
+  // terminal; nothing here answers. Every agent-sourced string is drawn with textContent, never as HTML.
+  function consentLeft(expiresAt) {
+    const ms = Date.parse(expiresAt) - Date.now();
+    if (!Number.isFinite(ms) || ms <= 0) return "expired";
+    const t = Math.floor(ms / 1000);
+    return (t >= 60 ? Math.floor(t / 60) + "m" + String(t % 60).padStart(2, "0") + "s" : t + "s") + " left";
+  }
+  let consentTicker = null;
+  function tickConsent() {
+    for (const n of document.querySelectorAll("[data-consent-expires]")) n.textContent = consentLeft(n.dataset.consentExpires);
+  }
+  function copyText(text, codeEl, btn) {
+    const done = (msg) => { btn.textContent = msg; setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500); };
+    const select = () => {   // the fallback: the command selected in place, ready for the system copy
+      const sel = window.getSelection && window.getSelection();
+      if (sel && document.createRange) { const r = document.createRange(); r.selectNodeContents(codeEl); sel.removeAllRanges(); sel.addRange(r); }
+      done("selected");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done("copied"), select);
+    else select();
+  }
+  function consentRow(o) {
+    const c = o.consent;
+    const pending = c.state === "pending";
+    const row = el("div", "row consent-row" + (pending ? " ext-accent" : " ext-dim"));
+    row.setAttribute("data-consent-row", "");
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", c.agent || "agent"));
+    head.appendChild(el("b", "consent-tool", c.tool));
+    if (c.tier) head.appendChild(el("span", "ext-meta", c.tier));
+    if (pending) {
+      const left = el("span", "consent-left", consentLeft(c.expiresAt));
+      left.dataset.consentExpires = c.expiresAt;
+      head.appendChild(left);
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+    } else head.appendChild(el("span", "consent-audit", c.audit || c.state));
+    row.appendChild(head);
+    row.appendChild(el("pre", "consent-display", c.display));
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "cwd " + c.cwd));
+    facts.appendChild(el("span", "ext-meta", "targets " + c.targets));
+    if (c.age) facts.appendChild(el("span", "ext-meta", "filed " + c.age));
+    row.appendChild(facts);
+    if (pending) {
+      for (const [label, cmd] of [["allow", c.allow], ["deny", c.deny]]) {
+        if (!cmd) continue;
+        const line = el("div", "consent-cmd");
+        const code = el("code", "consent-code", cmd);
+        const b = el("button", "undo-btn consent-copy", "copy " + label);
+        b.type = "button";
+        b.dataset.label = b.textContent;
+        b.title = "copy the " + label + " command; run it in a terminal with your signing key";
+        b.addEventListener("click", () => copyText(cmd, code, b));
+        line.append(code, b);
+        row.appendChild(line);
+      }
+    }
+    return row;
+  }
+
   function appendExternalLines(host, lines) {
     let lastGroup = null;
     for (const ln of lines) {
@@ -2908,6 +2969,7 @@
         lastGroup = o.grp;
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
+      if (o.consent) { host.appendChild(consentRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));

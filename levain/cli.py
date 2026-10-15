@@ -1870,38 +1870,28 @@ def _term_safe(text: object) -> str:
                    if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
 
 
-_UNSHOWN = object()
+def __getattr__(name: str) -> object:
+    # the shared "display too long to read back" sentinel keeps its old name here, imported on first use (lazy)
+    if name == "_UNSHOWN":
+        from levain.consent.listing import UNSHOWN
+
+        return UNSHOWN
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _filed_input(request: object) -> object:
-    """The tool input as filed, parsed back from the request's sealed display (``<tool_name> <json>``, secret-
-    named keys masked); :data:`_UNSHOWN` when the display is not that whole: a display cut at its limit never
-    parses (the cut leaves the JSON unterminated, or trailed by the ellipsis)."""
-    import json
+    """The tool input as filed (``levain.consent.listing.filed_input``, shared with the cockpit page)."""
+    from levain.consent.listing import filed_input
 
-    prefix = f"{request.tool_name} "
-    if not request.display.startswith(prefix):
-        return _UNSHOWN
-    try:
-        return json.loads(request.display[len(prefix):])
-    except (ValueError, RecursionError):            # a display nested too deep to read back is not shown either
-        return _UNSHOWN
+    return filed_input(request)
 
 
 def _consent_targets(request: object) -> str:
-    """The paths a grant's criteria would read from the request, read back from its sealed display. A display
-    only: nothing is decided from it."""
-    import levain.consent.adapters.codex  # noqa: F401 - registers Codex's apply_patch target reader
-    from levain.consent.policy import _request_targets
+    """The paths a grant's criteria would read from the request (``levain.consent.listing.consent_targets``,
+    shared with the cockpit page). A display only: nothing is decided from it."""
+    from levain.consent.listing import consent_targets
 
-    tool_input = _filed_input(request)
-    if tool_input is _UNSHOWN:
-        return "(too long to answer here: the input as filed is cut at its display limit)"
-    got = _request_targets(request.agent, request.tool_name, tool_input)
-    if not got:
-        return "(none named: the working directory)"
-    # a path named by two readers (a file tool's file_path is also a path field) is shown once
-    return ", ".join(dict.fromkeys("(unreadable)" if t is None else str(t) for t in got))
+    return consent_targets(request)
 
 
 def _time_left(expires_at: str, now: datetime) -> str:
@@ -1976,6 +1966,7 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
     from levain.authority import anchor_path
     from levain.cockpit.consent import ConsentError, utc_stamp
     from levain.cockpit.keys import ssh_signer
+    from levain.consent.listing import UNSHOWN
     from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source
     from levain.consent.record import ANSWER_NAMESPACE, answer_message, answer_payload
 
@@ -1987,7 +1978,7 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
         request, state = got
         if state != "pending":
             raise AnswerRefused(f"request {request.id} is already {state}")
-        if _filed_input(request) is _UNSHOWN:
+        if _filed_input(request) is UNSHOWN:
             raise AnswerRefused(f"request {request.id}'s input is too long to show here (the queue keeps a display "
                                 "cut at its limit), so it is not signed from the terminal; the agent's own dialog "
                                 "stands")

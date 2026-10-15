@@ -49,6 +49,7 @@ from levain.cockpit.registry import (
     FACETS,
     ORDERINGS,
     CockpitRegistrationError,
+    CONSENT_ROW_PREFIX,
     OUTCOME_ROW_PREFIX,
     PENDING_ROW_PREFIX,
     FacetValueError,
@@ -116,9 +117,11 @@ _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
 
 DECISIONS_ID = "decisions"
 DECISION_ORDER = "decision.queue"
-KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX)
+KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
-                                    "reason", "unapplied", "cancelled_by"})
+                                    "reason", "unapplied", "cancelled_by",
+                                    "agent", "tool", "consent_state", "via", "cwd", "targets", "consent_tier",
+                                    "answer_allow", "answer_deny", "audit"})
 
 
 def _canon(obj: Any) -> bytes:
@@ -380,6 +383,7 @@ class _Decisions:
 
     source: "ProviderSpec | None" = None
     rows: Callable[[datetime], Any] | None = None
+    consent: Callable[[datetime], Any] | None = None
     spec: "ProviderSpec | None" = None
 
 
@@ -424,6 +428,31 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
             facets={"at": o.terminal_at, "outcome": o.outcome, "verb": o.verb or "", "reason": o.reason,
                     "unapplied": list(o.unapplied), "cancelled_by": o.cancelled_by},
             stored={"record_sha256": o.record_sha256, "state": o.state}))
+    return rows
+
+
+def _consent_rows_in(got: Any) -> list[RowIn]:
+    """The consent queue's listing (``levain.consent.listing.ConsentListing``) as rows: ``consent:<request_id>``
+    per request an agent waits on, and per one decided in the last day. Built only from the sealed request;
+    the row never carries the time left (the page counts down from ``expires_at``), so its version does not
+    change every second."""
+    from levain.consent.listing import audit_line, consent_targets
+
+    rows: list[RowIn] = []
+    for e in (*got.pending, *got.recent):
+        r = e.request
+        pending = e.state == "pending"
+        facets: dict[str, Any] = {
+            "agent": r.agent, "tool": r.tool_name, "consent_state": e.state, "via": e.via,
+            "expires_at": r.expires_at, "due": _due_of(r.expires_at), "at": r.received_at if pending else e.decided_at,
+            "cwd": r.cwd, "targets": consent_targets(r), "consent_tier": r.tier,
+            "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>",
+            "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>",
+            "audit": "" if pending else audit_line(e)}
+        rows.append(RowIn(
+            id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{r.agent} \u00b7 {r.tool_name}", body=r.display, facets=facets,
+            stored={"state": e.state, "expires_at": r.expires_at, "via": e.via, "decided_at": e.decided_at,
+                    "signer_fp": e.signer_fp, "grant_id": e.grant_id, "request": r.id}))
     return rows
 
 
@@ -527,6 +556,15 @@ class Cockpit:
         kernel registers its own panel; a downstream that registered one keeps exactly its panel."""
         with self._lock:
             self._dec.rows = fn
+            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+                self._install_decisions_locked()
+
+    def attach_consent_rows(self, fn: Callable[[datetime], Any]) -> None:
+        """The consent queue's reader (``fn(now)`` returns a ``ConsentListing``, or raises): agents' requests
+        waiting on the operator (Q6a). Read-only, and independent of the broker: a read fault is a note on the
+        panel, never a dark one."""
+        with self._lock:
+            self._dec.consent = fn
             if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
                 self._install_decisions_locked()
 
@@ -1041,7 +1079,7 @@ class Cockpit:
             skipped += out.skipped
             if mine:
                 skipped.append({"count": len(mine), "reason": "open row skipped: its id carries a broker "
-                                                               "prefix (pend:/out:)"})
+                                                               "prefix (pend:/out:/consent:)"})
             filtered += out.filtered
             if out.note:
                 notes.append(out.note)
@@ -1064,6 +1102,17 @@ class Cockpit:
                     skipped += bs.skipped
             except Exception as exc:  # noqa: BLE001 - the gate panel never goes dark over a journal fault
                 notes.append(f"broker decisions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        if dec.consent is not None:
+            try:
+                got = dec.consent(ctx.now)
+                cs = self._read_snap(self._broker_dec_spec, Read(
+                    rows=tuple(_consent_rows_in(got)),
+                    skipped=((got.skipped, "consent request whose seal does not match"),) if got.skipped else ()),
+                    ctx, now_iso)
+                rows += cs.rows or []
+                skipped += cs.skipped
+            except Exception as exc:  # noqa: BLE001 - a consent-queue fault is a note, never a dark panel
+                notes.append(f"agent consent requests unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         rows = self._regroup(rows, ctx.today)
         status = "partial" if skipped else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
@@ -1090,6 +1139,15 @@ class Cockpit:
         if got is None:
             return Fault("decisions waiting on a signature are served by the active broker")
         for r in _decision_rows_in(got):
+            if r.id == row_id:
+                return Read(rows=(r,))
+        return Absent(f"decision {row_id!r} is gone")
+
+    def _consent_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        fn = self._dec.consent
+        if fn is None:
+            return Absent("no consent queue")
+        for r in _consent_rows_in(fn(ctx.now)):
             if r.id == row_id:
                 return Read(rows=(r,))
         return Absent(f"decision {row_id!r} is gone")
@@ -1945,7 +2003,9 @@ class Cockpit:
         if composed:
             # the decisions panel routes by row id to the contributor that owns it (§0.4, §8d row 4)
             if row_id.startswith(KERNEL_DECISION_PREFIXES):
-                spec, reader = self._broker_dec_spec, self._broker_decision_one
+                spec = self._broker_dec_spec
+                reader = self._consent_decision_one if row_id.startswith(CONSENT_ROW_PREFIX) \
+                    else self._broker_decision_one
             else:
                 src = self._dec.source
                 spec, reader = src, (src.read_one if src is not None else None)

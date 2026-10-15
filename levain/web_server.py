@@ -148,6 +148,14 @@ def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
 
 
+def _consent_reader() -> Any:
+    """The consent queue's listing reader for the decisions panel (Q6a): ``fn(now)`` over the default queue
+    directory, read-only; no queue directory means no rows and no note."""
+    from levain.consent.listing import read_listing
+
+    return lambda now: read_listing(now=now)
+
+
 def broker_install_class(httpd: Any) -> str:
     """The install class gestures are decided under, for a render and a dispatch alike: the broker's
     own while it is write-enabled; a broker that is disabled, on standby or stopped (and no broker)
@@ -688,6 +696,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     built.attach_authority(self.broker.capture)    # authority, labels and tiers per request
                     built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
                     built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
+                built.attach_consent_rows(_consent_reader())    # agents waiting on the operator (Q6a)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -1597,6 +1606,8 @@ def make_server(
         cockpit.attach_edits_reader(httpd.broker.edits)
         # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
         cockpit.attach_decision_rows(httpd.broker.decision_rows)
+    if cockpit is not None:
+        cockpit.attach_consent_rows(_consent_reader())      # agents waiting on the operator (Q6a)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address

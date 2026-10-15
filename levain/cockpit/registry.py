@@ -97,6 +97,17 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "reason": ("str|null", _opt(_is_str)),
     "unapplied": ("list[str]", _is_str_list),
     "cancelled_by": ("str|null", _opt(_is_str)),
+    # Q6a: an agent's consent request in the decisions panel (levain.consent.listing); `agent`, `at`, `due`
+    # and `expires_at` are registered above. `via` is how a decided one was answered (signature | grant)
+    "tool": ("str", _is_str),
+    "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn")),
+    "via": ("str|null", _opt(_is_str)),
+    "cwd": ("str", _is_str),
+    "targets": ("str", _is_str),
+    "consent_tier": ("str", _is_str),
+    "answer_allow": ("str", _is_str),
+    "answer_deny": ("str", _is_str),
+    "audit": ("str", _is_str),
 }
 
 
@@ -234,9 +245,12 @@ def _decision_key(row: RowIn, today: date) -> tuple:
 # other id is the downstream's open row
 PENDING_ROW_PREFIX = "pend:"
 OUTCOME_ROW_PREFIX = "out:"
+CONSENT_ROW_PREFIX = "consent:"      # an external agent's consent request (Q6a): the kernel's, like the two above
 
 
 def _queue_group(row: RowIn, today: date) -> str:
+    if row.id.startswith(CONSENT_ROW_PREFIX):
+        return "needs_input" if row.facets.get("consent_state") == "pending" else "resolved"
     if row.id.startswith(PENDING_ROW_PREFIX):
         return "waiting"
     if row.id.startswith(OUTCOME_ROW_PREFIX):
@@ -246,6 +260,8 @@ def _queue_group(row: RowIn, today: date) -> str:
 
 def _queue_key(row: RowIn, today: date) -> tuple:
     # open and waiting: dated first (a pending's due is its expiry date); history: newest first
+    if _queue_group(row, today) == "needs_input":      # an agent is blocked on it: soonest expiry first
+        return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
     if _queue_group(row, today) in ("open", "waiting"):
         return _decision_key(row, today)
     return _time_desc_key(row, today)
@@ -301,7 +317,7 @@ register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
 register_ordering(
     Ordering(
         "decision.queue", _queue_key, _queue_group,
-        (("open", "Waiting on you"), ("waiting", "Waiting on a signature"), ("resolved", "Resolved"),
+        (("needs_input", "Agents waiting on you"), ("open", "Waiting on you"), ("waiting", "Waiting on a signature"), ("resolved", "Resolved"),
          ("outcomes", "Outcomes")),
         uncounted=frozenset({"resolved", "outcomes"}),
     ),

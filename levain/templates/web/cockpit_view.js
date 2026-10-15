@@ -235,6 +235,16 @@
                             route: typeof c.route === "string" ? c.route : "" };
           }
         }
+        // an agent's consent request (levain.consent.listing): everything the row draws comes from its facets and
+        // body, all drawn as text; the countdown is the page's, counted from expires_at
+        if (typeof r.id === "string" && r.id.indexOf("consent:") === 0) {
+          const f = r.facets || {};
+          const sv = (x) => (typeof x === "string" ? x : "");
+          line.consent = { agent: sv(f.agent), tool: sv(f.tool), state: sv(f.consent_state), via: sv(f.via), tier: sv(f.consent_tier),
+                           cwd: sv(f.cwd), targets: sv(f.targets), expiresAt: sv(f.expires_at), audit: sv(f.audit),
+                           display: sv(r.body), allow: sv(f.answer_allow), deny: sv(f.answer_deny),
+                           age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "" };
+        }
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
