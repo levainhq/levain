@@ -95,3 +95,44 @@ def test_launcher_shape_agrees_across_template_doctor_and_reinit(tmp_path):
     for args in (cc_args, cc_args[:6]):                      # re-init reads both as levain's own
         assert inst._is_levain_launcher({"mcp_servers": {"anneal_memory": {
             "command": sys.executable, "args": args}}}, store)
+
+
+def _this_anneal(monkeypatch) -> str:
+    beside = Path(sys.executable).parent / "anneal-memory"
+    anneal = str(beside) if beside.exists() else shutil.which("anneal-memory") or "anneal-memory"
+    monkeypatch.setattr("levain.manifest.resolve_anneal_bin", lambda: anneal)
+    return anneal
+
+
+def test_init_store_claims_the_baton_on_an_existing_store_and_never_takes_a_held_one(tmp_path, monkeypatch):
+    """Reproduced (L3 r1): `levain init --force` after a failed claim, or over a store the MCP server
+    created first, reported success on the "already present" branch with the baton unheld."""
+    anneal = _this_anneal(monkeypatch)
+    _baton_store(tmp_path)
+    baton = tmp_path / ".levain" / "memory.continuity.md"
+    store = tmp_path / ".levain" / "memory.db"
+
+    sessions.release_baton(baton, ANNEAL_SESSION_ID)
+    assert inst._init_store(store, anneal, emit=lambda _l: None) is True
+    assert sessions.baton_holder(baton) == ANNEAL_SESSION_ID
+
+    sessions.release_baton(baton, ANNEAL_SESSION_ID)
+    sessions.claim_baton(baton, "other")
+    lines: list[str] = []
+    assert inst._init_store(store, anneal, emit=lines.append) is False
+    assert sessions.baton_holder(baton) == "other" and any("'other'" in ln for ln in lines)
+
+
+def test_doctor_reads_a_launcher_that_cannot_consolidate_as_unhealthy(tmp_path, monkeypatch):
+    """L3 r1: on a baton store a 6-argument launcher (every install before the baton) or a launcher
+    serving as another session started green and could never consolidate."""
+    _this_anneal(monkeypatch)
+    _baton_store(tmp_path)
+    store = str(tmp_path / ".levain" / "memory.db")
+    base = ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+
+    assert _check_mcp_command("m", sys.executable, base + ["--session-id", ANNEAL_SESSION_ID], tmp_path).ok
+    old = _check_mcp_command("m", sys.executable, base, tmp_path)
+    assert not old.ok and old.upgrade_pending and "levain update" in old.hint
+    other = _check_mcp_command("m", sys.executable, base + ["--session-id", "other"], tmp_path)
+    assert not other.ok and not other.upgrade_pending and "'other'" in other.detail

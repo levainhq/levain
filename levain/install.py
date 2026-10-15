@@ -4464,6 +4464,44 @@ def _store_schema_name(store: Path, anneal_path: str) -> str | None:
     return name if isinstance(name, str) else None
 
 
+def _ensure_baton(
+    store: Path, anneal_path: str, emit: Callable[[str], None] = print
+) -> bool:
+    """anneal 1.0 (KL-19): a store that requires the consolidate baton must have it held by
+    ANNEAL_SESSION_ID, the id the MCP launcher and `levain wrap` run as, or the entity records
+    memory and never consolidates. No MCP tool can claim it, so `init` does. Runs on EVERY path
+    that ends with a usable store, new or existing (a re-run after a failed claim, or a store
+    the rc2 MCP server created first, arrives here with the baton unheld). Claims only an
+    UNHELD baton, never `--take`: a held baton is another session's, and taking it is the
+    operator's call. Loud on failure; True only when the baton is ours or the store has no policy."""
+    from levain.manifest import ANNEAL_SESSION_ID, _run_anneal_json, anneal_invocation
+
+    status = _run_anneal_json(store, anneal_path, ["status", "--json"])
+    if isinstance(status, dict):
+        if status.get("consolidate_requires_baton") is not True:
+            return True  # a store without the policy never needs it
+        holder = status.get("baton_holder")
+        if holder == ANNEAL_SESSION_ID:
+            emit(f"  Consolidate baton already held by session '{ANNEAL_SESSION_ID}'.")
+            return True
+        if holder:
+            emit(f"  ! The consolidate baton is held by session '{holder}', not '{ANNEAL_SESSION_ID}':")
+            emit("    this entity records memory but cannot consolidate it until that session")
+            emit("    releases it, or you take it deliberately (that ends the other session's claim):")
+            emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID, '--take')}")
+            return False
+    ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["baton", "claim", ANNEAL_SESSION_ID])
+    if ok:
+        emit(f"  Consolidate baton claimed for session '{ANNEAL_SESSION_ID}'.")
+        return True
+    emit("  ! The consolidate baton could not be claimed:")
+    for e in errors:
+        emit(f"    - {e}")
+    emit("    Without it this entity records memory but cannot consolidate it.")
+    emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID)}")
+    return False
+
+
 def _init_store(
     store: Path, anneal_path: str, emit: Callable[[str], None] = print
 ) -> bool:
@@ -4471,7 +4509,7 @@ def _init_store(
 
     `emit` (default `print`) sinks the progress + failure-remediation lines so a
     web init can surface them in the browser; the CLI is byte-unchanged."""
-    from levain.manifest import ANNEAL_SESSION_ID, anneal_invocation, pip_invocation
+    from levain.manifest import anneal_invocation, pip_invocation
 
     emit("")
     if store.is_file() and store.stat().st_size > 0:
@@ -4490,11 +4528,11 @@ def _init_store(
         emit(f"anneal-memory store already present at {store} — memory preserved.")
         if _store_schema_name(store, anneal_path) == "partnership":
             emit("  Section schema already partnership — nothing to migrate.")
-            return True
+            return _ensure_baton(store, anneal_path, emit)
         ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["set-schema", "partnership"])
         if ok:
             emit("  Section schema migrated to partnership (memory content preserved).")
-            return True
+            return _ensure_baton(store, anneal_path, emit)
         emit("  ! Could not ensure the partnership schema on the existing store:")
         for e in errors:
             emit(f"    - {e}")
@@ -4514,19 +4552,7 @@ def _init_store(
     ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["init", "--schema", "partnership"])
     if ok:
         emit("  Store initialized (partnership schema).")
-        # anneal 1.0 (KL-19): a store `init` creates requires the consolidate baton, and no MCP
-        # tool can claim it. The MCP launcher runs as ANNEAL_SESSION_ID, so claim it for that id
-        # now, or the entity would record and never consolidate. Loud, not best-effort.
-        ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["baton", "claim", ANNEAL_SESSION_ID])
-        if ok:
-            emit(f"  Consolidate baton claimed for session '{ANNEAL_SESSION_ID}'.")
-            return True
-        emit("  ! The store was initialized but the consolidate baton could not be claimed:")
-        for e in errors:
-            emit(f"    - {e}")
-        emit("    Without it this entity records memory but cannot consolidate it.")
-        emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID)}")
-        return False
+        return _ensure_baton(store, anneal_path, emit)
 
     emit("  ! Could not initialize store:")
     for e in errors:

@@ -1051,6 +1051,18 @@ def _check_floor_placeholders() -> list[CheckResult]:
     return [CheckResult("floor placeholders", True, "; ".join(parts))]
 
 
+def _store_requires_baton(install: Path) -> bool:
+    """Whether this install's store reports `consolidate_requires_baton` (anneal 1.0). False when
+    the store is absent or `status --json` cannot be read: the compat rows report that."""
+    from levain import manifest
+
+    store = install / ".levain" / "memory.db"
+    if not store.is_file():
+        return False
+    status = manifest._run_anneal_json(store, manifest.resolve_anneal_bin(), ["status", "--json"])
+    return isinstance(status, dict) and status.get("consolidate_requires_baton") is True
+
+
 def _check_baton(install: Path) -> list[CheckResult]:
     """anneal 1.0's consolidate baton (KL-19): on a store that requires it, the MCP launcher's
     session (``ANNEAL_SESSION_ID``) must hold it, or every wrap over MCP is downgraded to capture
@@ -2685,6 +2697,8 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
     written before that change fails it on upgrade — an upgrade step pending, so it carries
     that exit code; an unresolvable command is broken and does not.
     """
+    from levain import manifest
+
     check = f"{name} command"
     if not isinstance(command, str) or not command:
         return CheckResult(check, False, "no command in registration",
@@ -2707,8 +2721,29 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
     module_form = (
         len(strs) == len(args) in (6, 8)
         and strs[:4] == ["-P", "-m", "anneal_memory", "--db"] and strs[5] == "serve"
-        and (len(strs) == 6 or (strs[6] == "--session-id" and bool(strs[7])))
+        and (len(strs) == 6 or strs[6:] == ["--session-id", manifest.ANNEAL_SESSION_ID])
     )
+    if (len(strs) == len(args) == 8 and strs[:4] == ["-P", "-m", "anneal_memory", "--db"]
+            and strs[5:7] == ["serve", "--session-id"] and strs[7] != manifest.ANNEAL_SESSION_ID):
+        # The right shape, someone else's session: the baton `init` claims is held for
+        # ANNEAL_SESSION_ID, so this server is always downgraded to capture-only (codex HIGH).
+        return CheckResult(
+            check, False,
+            f"launches the memory server as session '{strs[7]}', but the consolidate baton is "
+            f"claimed for '{manifest.ANNEAL_SESSION_ID}' — every wrap over MCP is downgraded to capture-only",
+            f"Re-run `levain init --force --path {install}` (it RE-RUNS THE INTERVIEW; your store is kept).",
+        )
+    if module_form and len(strs) == 6 and _store_requires_baton(install):
+        # Every install made before the baton: the server starts but with no session id, so on a
+        # store that requires the baton it can never consolidate (codex HIGH). `levain update`
+        # re-renders this registration (the 6-argument form is still recognised as levain's own).
+        return CheckResult(
+            check, False,
+            "launcher predates the consolidate baton (no `--session-id`) — the memory server "
+            "cannot consolidate on this store",
+            f"Run `levain update --path {install}` to rewrite it (the store is kept), then restart your harness.",
+            upgrade_pending=True,
+        )
     if not module_form:
         # Only the registration every pre-spore-751 install carries is a pending upgrade
         # step: a console script named exactly `anneal-memory` with argv exactly
