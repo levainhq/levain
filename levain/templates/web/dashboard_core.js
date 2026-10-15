@@ -2943,11 +2943,20 @@
     while (consentActive < CONSENT_FETCH_MAX && consentWaiting.length) {
       const job = consentWaiting.shift();
       consentActive++;
-      job().then(() => { consentActive--; consentPump(); });
+      const release = () => { consentActive--; consentPump(); };
+      job().then(release, release);
     }
   }
   function consentQueued(job) {
-    return new Promise((resolve) => { consentWaiting.push(() => job().then(resolve)); consentPump(); });
+    const bad = { error: "the request could not be read" };
+    return new Promise((resolve) => {
+      consentWaiting.push(() => {
+        let p;
+        try { p = Promise.resolve(job()); } catch (e) { p = Promise.resolve(bad); }
+        return p.catch(() => bad).then(resolve);      // every job settles; the pump releases its slot on both paths
+      });
+      consentPump();
+    });
   }
   function consentFetch(c, headers, tryNo) {
     return fetch("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
@@ -2958,7 +2967,8 @@
           return new Promise((r) => setTimeout(r, CONSENT_RETRY_MS)).then(() => consentFetch(c, headers, tryNo + 1));
         }
         if (!res.ok) return { error: "the request could not be read (HTTP " + res.status + ")" };
-        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }));
+        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }),
+                               () => ({ error: "the request could not be read" }));
       }, () => ({ error: "the request could not be read (network)" }));
   }
   function consentBody(c) {
@@ -3019,7 +3029,25 @@
     if (c.age) head.appendChild(el("span", "ext-meta", "filed " + c.age));
     if (!pending && c.decidedAge) head.appendChild(el("span", "ext-meta", (c.state === "expired" ? "expired " : "decided ") + c.decidedAge));
     row.appendChild(head);
-    if (!pending) return row;      // a decided request: its state word and times are the panel row's; no body is fetched
+    if (!pending) {
+      // a decided request fetches nothing on draw; "details" fetches its body (the audit line) through the same queue
+      if (!c.id) return row;
+      const btn = el("button", "undo-btn consent-details", "details");
+      btn.type = "button";
+      btn.title = "show how this request was answered";
+      btn.addEventListener("click", () => {
+        btn.disabled = true;
+        const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
+        row.appendChild(slot);
+        consentBody(c).then((b) => {
+          drawConsentBody(row, slot, b, false);
+          if (b.error) btn.disabled = false;
+          else btn.remove();
+        });
+      });
+      head.appendChild(btn);
+      return row;
+    }
     const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
     row.appendChild(slot);
     if (c.id) consentBody(c).then((b) => drawConsentBody(row, slot, b, pending));

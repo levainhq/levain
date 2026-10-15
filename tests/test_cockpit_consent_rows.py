@@ -205,3 +205,44 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
     assert "<img src=x" in display and imgs == 0 and not pwned and grouphead
     assert cmds == [f"levain consent answer {r.id} allow --signing-key <key>",
                     f"levain consent answer {r.id} deny --signing-key <key>"]
+
+
+def test_decided_consent_rows_list_newest_decision_first_and_broker_rows_keep_their_order():
+    from levain.cockpit.registry import _queue_key
+    today = T0.date()
+    def row(i, **f):
+        return RowIn(id=i, title=i, facets=f)
+    old_filed_new_decided = row("consent:a", consent_state="allowed", at="2026-10-15T10:00:00Z", decided_at="2026-10-15T11:50:00Z")
+    new_filed_old_decided = row("consent:b", consent_state="denied", at="2026-10-15T11:00:00Z", decided_at="2026-10-15T11:10:00Z")
+    got = sorted([new_filed_old_decided, old_filed_new_decided], key=lambda r: _queue_key(r, today))
+    assert [r.id for r in got] == ["consent:a", "consent:b"]            # by decision, not by filing
+    b1, b2 = row("x1", at="2026-10-15T09:00:00Z"), row("x2", at="2026-10-15T08:00:00Z")
+    assert [r.id for r in sorted([b2, b1], key=lambda r: _queue_key(r, today))] == ["x1", "x2"]
+
+
+@needs_browser
+def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_slot(tmp_path, monkeypatch):
+    q = _home_queue(tmp_path, monkeypatch)
+    for n in ("p1", "p2"):
+        q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo " + n},
+               cwd="/w", hold=timedelta(minutes=5), event_id=n)
+    gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-decided-marker"},
+                  cwd="/w", hold=timedelta(minutes=5), event_id="p3")
+    q.withdraw(gone.id)
+    _root, src, _ids = _install(tmp_path)
+    # the first two body fetches answer 200 with an unreadable body; a freed slot lets the third (details) through
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && n++ < 2"
+            " ? Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }) : real(u, o); return 1; })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
+            {"eval": stub},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": "document.querySelectorAll('#levain-modal .consent-row .consent-note').length >= 2"},
+            {"eval": "(() => { const r = [...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-details'));"
+                     " const before = !!r.querySelector('.consent-display'); r.querySelector('.consent-details').click(); return before; })()"},
+            {"until": "[...document.querySelectorAll('#levain-modal .consent-row')].some(r => r.querySelector('.consent-display'))"},
+            {"eval": "[...document.querySelectorAll('#levain-modal .consent-row')].filter(r => r.querySelector('.consent-display')).map(r => r.querySelector('.consent-display').textContent)"},
+        ])["values"]
+    assert out[-3] is False, out        # before the click the decided row had no body
+    assert any("zq-decided-marker" in t for t in out[-1])

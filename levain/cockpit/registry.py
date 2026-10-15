@@ -260,6 +260,9 @@ def _queue_key(row: RowIn, today: date) -> tuple:
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
     if _queue_group(row, today) in ("open", "waiting"):
         return _decision_key(row, today)
+    if row.id.startswith(CONSENT_ROW_PREFIX):          # a decided consent row: newest decision first (`at` is the filing)
+        at = str(row.facets.get("decided_at") or row.facets.get("at") or "")
+        return (0 if at else 1, tuple(-ord(c) for c in at), row.id)
     return _time_desc_key(row, today)
 
 
