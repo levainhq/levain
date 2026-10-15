@@ -100,7 +100,7 @@ def test_a_preexisting_codex_hooks_json_is_not_fresh(env):
     codex = env / "codex"
     codex.mkdir()
     (codex / "hooks.json").write_text(json.dumps({"hooks": {"Stop": []}}))
-    assert hg.agent_pin_status(ent, codex) == "none"
+    assert hg.agent_pin_status(ent, codex, adapter="codex") == "none"  # a Codex init, read before AGENTS.md exists
     assert not hg.repin_after_levain_write(ent, "none", codex)
 
 
