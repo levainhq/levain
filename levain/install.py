@@ -4059,11 +4059,14 @@ def _without_levain_keys(parsed: dict | None) -> dict | None:
 
 def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
     """Whether the anneal_memory server table launches `store` exactly as a levain `init`
-    wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, or the current
-    `<python> -P -m anneal_memory --db <store> serve`. Any other launcher was chosen by
-    someone, and replacing it is replacing their customisation."""
+    wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, the pre-KL-19
+    `<python> -P -m anneal_memory --db <store> serve`, or the current
+    `<python> -P -m anneal_memory --db <store> serve --session-id levain`. Any other launcher
+    was chosen by someone, and replacing it is replacing their customisation."""
     if parsed is None or store is None:
         return False
+    from levain.manifest import ANNEAL_SESSION_ID
+
     server = (parsed.get("mcp_servers") or {}).get("anneal_memory") or {}
     command, args = server.get("command"), server.get("args")
     if not isinstance(command, str) or not isinstance(args, list):
@@ -4077,7 +4080,10 @@ def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
     # as levain's own). ⚠ This picks the NOTICE only; `_merge_codex_config` backs the block
     # up whatever this returns, so a misjudged launcher costs a wrong sentence, not the block.
     return (
-        args == ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+        args in (
+            ["-P", "-m", "anneal_memory", "--db", store, "serve"],
+            ["-P", "-m", "anneal_memory", "--db", store, "serve", "--session-id", ANNEAL_SESSION_ID],
+        )
         and _PYTHON_NAME.fullmatch(Path(command).name) is not None
     )
 
@@ -4465,7 +4471,7 @@ def _init_store(
 
     `emit` (default `print`) sinks the progress + failure-remediation lines so a
     web init can surface them in the browser; the CLI is byte-unchanged."""
-    from levain.manifest import anneal_invocation, pip_invocation
+    from levain.manifest import ANNEAL_SESSION_ID, anneal_invocation, pip_invocation
 
     emit("")
     if store.is_file() and store.stat().st_size > 0:
@@ -4508,7 +4514,19 @@ def _init_store(
     ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["init", "--schema", "partnership"])
     if ok:
         emit("  Store initialized (partnership schema).")
-        return True
+        # anneal 1.0 (KL-19): a store `init` creates requires the consolidate baton, and no MCP
+        # tool can claim it. The MCP launcher runs as ANNEAL_SESSION_ID, so claim it for that id
+        # now, or the entity would record and never consolidate. Loud, not best-effort.
+        ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["baton", "claim", ANNEAL_SESSION_ID])
+        if ok:
+            emit(f"  Consolidate baton claimed for session '{ANNEAL_SESSION_ID}'.")
+            return True
+        emit("  ! The store was initialized but the consolidate baton could not be claimed:")
+        for e in errors:
+            emit(f"    - {e}")
+        emit("    Without it this entity records memory but cannot consolidate it.")
+        emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID)}")
+        return False
 
     emit("  ! Could not initialize store:")
     for e in errors:

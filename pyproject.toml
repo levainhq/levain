@@ -128,7 +128,13 @@ dependencies = [
     # `Store.keyword_candidates`) are additive and the seed does not depend on them.
     # `>=0.9.43` (2026-10-10): the cockpit broker (K2b) runs on 0.9.43, the anneal release carrying its slice-P
     # delta and `Store.replace_section`; KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=0.9.43,<0.10",
+    # `>=1.0.0rc2,<2` (2026-10-15): anneal 1.0 is the API freeze and schema generation 2 (any 0.9.x process on a
+    # store refused after the first 1.0 open: levain, hooks and the MCP launcher move together). rc2 is the first
+    # candidate carrying the consolidate-baton default (KL-19): a store `init` creates requires the baton, so
+    # `_init_store` claims it and the MCP launcher passes `serve --session-id` (levain.manifest.ANNEAL_SESSION_ID),
+    # and `levain wrap` passes the same id. A launcher passing `--session-id` stops the server on 0.9.43 (no such
+    # flag), so the pin and the launcher shape land in one commit. KNOWN_GOOD_ANNEAL moves with this floor.
+    "anneal-memory>=1.0.0rc2,<2",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,

@@ -3,7 +3,7 @@
     "anneal_memory": {
       "type": "stdio",
       "command": "{{PYTHON}}",
-      "args": ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]
+      "args": ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve", "--session-id", "levain"]
     }
   }
 }
