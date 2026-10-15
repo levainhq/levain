@@ -39,15 +39,23 @@ def test_the_focus_view_lists_every_metric_behind_a_filter_box(tmp_path: Path) -
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP,
             {"until": f"{HEALTH} && {HEALTH}.querySelector('.xnote')"},
+            # a control inside the tile is its own: a click on it does not open the focus view; a click on the tile does
+            {"eval": f"(async () => {{ const t = {HEALTH}; const b = document.createElement('button'); b.textContent = 'inner'; t.querySelector('.k').appendChild(b); b.click(); "
+                     "const underButton = !!document.getElementById('levain-modal'); b.remove(); return underButton; })()"},
             {"eval": f"(() => {{ {HEALTH}.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', bubbles: true}})); const m = document.getElementById('levain-modal'); "
                      "return [m.querySelectorAll('.op').length, !!m.querySelector('.xfilter-input'), m.querySelector('.xfilter-count').textContent]; })()"},
             {"eval": "(async () => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = 'strength'; i.dispatchEvent(new Event('input', {bubbles: true})); "
                      "await new Promise(r => setTimeout(r, 300)); return [document.querySelectorAll('#levain-modal .op').length, document.querySelector('#levain-modal .xfilter-count').textContent]; })()"},
+            # the cockpit refreshing while he types rebuilds the open view: the query he typed is still there
+            {"eval": "(async () => { document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('focus')); await new Promise(r => setTimeout(r, 600)); "
+                     "const i = document.querySelector('#levain-modal .xfilter-input'); return [i && i.value, document.querySelectorAll('#levain-modal .op').length]; })()"},
             {"eval": f"(async () => {{ {ESC}; await new Promise(r => setTimeout(r, 200)); return !document.getElementById('levain-modal'); }})()"},
         ])["values"]
-    assert out[1] == [12, True, "12 metrics"], out            # the tile drew four of them: the view draws all twelve
-    assert out[2] == [2, "2 of 12"], out                      # avg strength, max strength
-    assert out[3] is True, out
+    assert out[1] is False, out                               # the click landed on a button inside the tile
+    assert out[2] == [12, True, "12 metrics"], out            # the tile drew four of them: the view draws all twelve
+    assert out[3] == [2, "2 of 12"], out                      # avg strength, max strength
+    assert out[4] == ["strength", 2], out
+    assert out[5] is True, out
 
 
 @needs_browser
@@ -63,3 +71,59 @@ def test_no_tile_draws_outside_its_own_box_at_desktop_or_phone_width(tmp_path: P
         ])["values"]
     for tiles in (out[1], out[2]):
         assert tiles and all(t[1] == 0 and t[2] for t in tiles), tiles
+
+
+# A tile built by hand on the live page, through the same `fill` the cockpit uses, in a box of the height we choose.
+TILE = """
+const K = window.LevainCockpitKinds;
+const mk = (h) => { const card = document.createElement('div'); card.className = 'ck-card w'; card.style.cssText = `width:300px;height:${h}px;position:absolute;left:0;top:0`;
+  const p = document.createElement('div'); p.className = 'wbody'; card.appendChild(p); document.body.appendChild(card); p.hid = []; p.addEventListener('levain-hidden', (e) => p.hid.push(e.detail)); return [card, p]; };
+const metrics = (n) => Array.from({length: n}, (_, i) => ({label: 'm' + i, value: i + 1, unit: '', status: 'ok'}));
+const fillTile = (p, data) => K.fill(p, Object.assign({typed: true, search: {}}, data), {widget: true, entry: {title: 'T'}});
+const room = (card, h) => { card.style.height = h + 'px'; K.fitWidgets(document.body); };
+const fits = (p) => p.scrollHeight <= p.clientHeight + 1;
+"""
+
+
+@needs_browser
+def test_a_tile_follows_its_room_and_its_data_and_never_clips_a_reading(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    reading = ("{pid: 'wx', kind: 'reading', reading: {value: 61, unit: '°F', condition: 'Clear and a long way from anything', "
+               "hi: 70, lo: 40, as_of: new Date().toISOString(), sub: ["
+               + ", ".join(f"{{label: 'wind{i}', value: {i}}}" for i in range(6))
+               + ", {label: 'air', value: 41, band: 'good'}]}}")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": f"{HEALTH}"},
+            # 1: squeezed until the text has to be cut, then given room again: the cut goes with the squeeze
+            {"eval": "(async () => { " + TILE + "const [card, p] = mk(4); const s = fillTile(p, {pid: 'sq', kind: 'status-dots', metrics: metrics(4)}); const cut = p.querySelector('.xbody').classList.contains('clamped'); "
+                     "room(card, 400); await new Promise(r => setTimeout(r, 100)); return [cut, p.querySelector('.xbody').classList.contains('clamped'), p.hid.slice(-1)[0], p.querySelector('.xnote') === null]; })()"},
+            # 3: an openable tile that then faults is no longer a button (hidden 0), and is one again after a good repaint
+            {"eval": "(async () => { " + TILE + "const [card, p] = mk(120); const s = fillTile(p, {pid: 'fa', kind: 'status-dots', metrics: metrics(12)}); const before = p.hid.slice(-1)[0]; "
+                     "s.fault = 'down'; s.paint(); const during = p.hid.slice(-1)[0]; s.fault = ''; s.paint(); return [before > 0, during, p.hid.slice(-1)[0] > 0]; })()"},
+            # 4: a reading with many sub-readings that carry no band, and an age, in a short box: it fits, and says what it left out
+            {"eval": "(async () => { " + TILE + f"const [card, p] = mk(150); fillTile(p, {reading}); return [fits(p), p.hid.slice(-1)[0] > 0, /\\+\\d+ more/.test(p.innerText)]; }})()"},
+        ])["values"]
+    assert out[1] == [True, False, 0, True], out
+    assert out[2] == [True, 0, True], out
+    assert out[3] == [True, True, True], out
+
+
+@needs_browser
+def test_a_line_tile_keeps_one_observer_and_fits_a_long_note(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": f"{HEALTH}"},
+            {"eval": """(async () => { const D = window.LevainDashboard; let open = null;
+              const tile = (h, note) => { const b = document.createElement('div'); b.className = 'wbody'; b.style.cssText = `width:240px;height:${h}px;position:absolute;left:0;top:0;display:flex;flex-direction:column;overflow:hidden`;
+                const n = document.createElement('div'); n.className = 'ext-note'; n.textContent = note; const r = document.createElement('div'); r.className = 'row'; r.textContent = 'one row of the list';
+                b.append(n, r); const c = document.createElement('div'); c.className = 'ck-card w'; c.appendChild(b); document.body.appendChild(c); D.fitLineTile(b, (on) => { open = on; }); return b; };
+              // each render replaces the last one's tile: only the current one is still watched
+              for (let i = 0; i < 5; i++) { const t = tile(80, 'x'); if (i < 4) t.parentNode.remove(); }
+              const watched = D.lineTileCount();
+              // a long provider note over one row: the tile still fits, and is a button to the rest
+              const b = tile(60, 'a long provider note '.repeat(12));
+              return [watched, b.scrollHeight <= b.clientHeight + 1, open]; })()"""},
+        ])["values"]
+    assert out[1] == [1, True, True], out

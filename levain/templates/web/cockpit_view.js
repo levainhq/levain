@@ -938,7 +938,8 @@
   // opts (a glance tile only): rows = how many band sub-readings to draw, age = whether the "read ... ago" line is drawn
   function paintReading(host, v, opts) {
     const cap = opts && opts.rows != null ? opts.rows : Infinity;
-    let drawn = 0;
+    const sideCap = opts && opts.side != null ? opts.side : Infinity;
+    let drawn = 0, sideDrawn = 0;
     const top = el("div", "rd wx-main");
     const icon = weatherIcon(v.symbol);
     icon.setAttribute("data-ck-weather", "icon");
@@ -955,6 +956,7 @@
     const subs = Array.isArray(v.sub) ? v.sub : [];
     for (const sub of subs) {
       if (typeof sub.band === "string" && sub.band) continue;
+      if (sideDrawn++ >= sideCap) continue;
       const line = el("div", "rd-sub");
       line.appendChild(document.createTextNode(sub.label + " "));
       line.appendChild(el("b", "num", sub.value == null ? "" : sub.value));
@@ -1056,10 +1058,16 @@
     }
     if (d.kind === "reading") {
       const r = d.reading || {};
-      const bands = (Array.isArray(r.sub) ? r.sub : []).filter((x) => typeof x.band === "string" && x.band).length;
-      s.units = bands;
-      paintReading(host, r, { rows: cap, age: !s.noAge });
-      s.hidden = Math.max(0, bands - cap);
+      // every component the tile draws is budgeted: the side lines (sub-readings with no band) first, then the band rows, and the
+      // "read ... ago" line goes before any of them; whatever is not drawn is counted, so the tile opens
+      const subs = Array.isArray(r.sub) ? r.sub : [];
+      const bands = subs.filter((x) => typeof x.band === "string" && x.band).length;
+      const side = subs.length - bands;
+      const hasAge = typeof r.as_of === "string" && !!ago(r.as_of);
+      s.units = side + bands;
+      const sideShown = Math.min(side, cap), bandShown = Math.min(bands, Math.max(0, cap - side));
+      paintReading(host, r, { rows: bandShown, side: sideShown, age: !s.noAge });
+      s.hidden = side - sideShown + bands - bandShown + (s.noAge && hasAge ? 1 : 0);
       moreNote(host, s.hidden);
       return;
     }
@@ -1080,6 +1088,7 @@
     s.fitting = true;
     try {
       s.budget = null; s.noAge = false; s.clamp = false;
+      s.body.classList.remove("clamped");
       paintBody(s);
       if (!fits()) {
         s.noAge = true; paintBody(s);
@@ -1088,11 +1097,13 @@
         if (!fits()) { s.clamp = true; s.body.classList.add("clamped"); }
       }
     } finally { s.fitting = false; }
-    const n = s.hidden || (s.clamp ? 1 : 0);
-    if ((box.dataset.ckHidden || "0") !== String(n)) {
-      box.dataset.ckHidden = String(n);
-      if (typeof root.CustomEvent === "function" && typeof box.dispatchEvent === "function") box.dispatchEvent(new root.CustomEvent("levain-hidden", { bubbles: true, detail: n }));
-    }
+    publishHidden(s, s.hidden || (s.clamp ? 1 : 0));
+  }
+  function publishHidden(s, n) {
+    const box = s.p;
+    if (!box || (box.dataset.ckHidden || "0") === String(n)) return;
+    box.dataset.ckHidden = String(n);
+    if (typeof root.CustomEvent === "function" && typeof box.dispatchEvent === "function") box.dispatchEvent(new root.CustomEvent("levain-hidden", { bubbles: true, detail: n }));
   }
   // the room a tile has is only known once it is laid out and while it keeps its size: the first fit runs on attach, and a
   // ResizeObserver on the tile's body fits it again whenever its width (a figure row wraps differently) or its room changes
@@ -1338,7 +1349,11 @@
     // the focus view of a long metric list carries the same filter box a long list does (and starts unfiltered: a saved query would hide metrics)
     const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
     s.filterable = !!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN;
-    if (s.filterable) s.query = "";
+    // a fresh open starts unfiltered; the SAME open modal rebuilt by a refresh keeps the query being typed in it
+    if (s.filterable) {
+      const prev = Array.from(states).find((o) => o.modal && o.filterable && o.pid === data.pid && o.body.isConnected);
+      s.query = prev ? prev.query : "";
+    }
     if (s.searchable || s.filterable) p.appendChild(buildFilter(s));
     p.appendChild(s.body);
     s.setQuery = (q, now) => setQuery(s, q, now);
@@ -1377,7 +1392,12 @@
     if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
     dropSky(s);
     s.body.replaceChildren();
-    if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
+    if (s.fault) {
+      s.body.appendChild(el("p", "err", "unavailable — " + s.fault));
+      // a faulted tile has nothing behind it: it is no button until a good repaint says otherwise
+      if (s.ctx.widget) { s.units = 0; s.hidden = 0; s.clamp = false; s.body.classList.remove("clamped"); publishHidden(s, 0); }
+      return;
+    }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
     if (s.ctx.widget) {
       if (!s.fitting && s.p && s.body.isConnected) fitWidget(s); else paintWidget(s, s.body);
