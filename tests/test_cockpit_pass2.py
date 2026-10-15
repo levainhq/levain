@@ -134,3 +134,29 @@ def test_the_page_carries_no_author_repo_or_client_name() -> None:
     hits = sorted({(p.name, w) for p in files for w in re.findall(r"[a-z0-9]+", p.read_text(encoding="utf-8").lower())
                    if hashlib.sha256(w.encode()).hexdigest()[:16] in _AUTHOR_NAMES})
     assert not hits, hits
+
+
+@needs_browser
+def test_a_row_with_a_repo_facet_is_tagged_from_it_and_a_row_without_one_from_its_words(tmp_path: Path) -> None:
+    # a repo named like a common word ("review") must not tag a row that carries another repo's facet and merely uses the word;
+    # a row with no facet keeps the word match, so a provider that does not set the facet regresses nowhere
+    from levain.cockpit.engine import ProviderSpec
+    from levain.cockpit.providers import build_default_cockpit
+    from levain.cockpit.results import Read, RowIn
+
+    _root, src, _ids = _install(tmp_path)
+    now = d.datetime.now(d.timezone.utc).isoformat()
+    rows = [RowIn(id="p:1", title="fix the flaky test", facets={"repo": "review", "at": now}),
+            RowIn(id="p:2", title="Review the cash flow report", facets={"repo": "website", "at": now}),
+            RowIn(id="p:3", title="Review the invoice", facets={"at": now})]
+    ck = build_default_cockpit(src)
+    ck.register(ProviderSpec("projects", "list", "Projects", "feed", lambda ctx: Read(rows=rows), region="operate", rank=30,
+                             order="time.desc", facets=frozenset({"repo", "at"}), version_fields=("*",), empty="none"))
+    with _serve(src, surface_tokens={"browser": "T"}, cockpit=ck) as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": "document.querySelector('.ck-widgets .ck-card.w')"},
+                      {"eval": "new Promise(r => setTimeout(r, 2200))"}, {"eval": """(() => [...document.querySelectorAll('.ck-zgrid .row')]
+        .filter(r => /flaky|cash flow|invoice/.test(r.textContent)).map(r => [r.querySelector('.clause').textContent.replace(/^(review|website)/, ''),
+          (r.querySelector('.rp-tag') || {}).textContent || ''])
+        )()"""}])["values"]
+    got = {k.strip(): t for k, t in vals[2]}
+    assert got == {"fix the flaky test": "review", "Review the cash flow report": "website", "Review the invoice": "review"}, vals[2]
