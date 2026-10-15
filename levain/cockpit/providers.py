@@ -835,6 +835,7 @@ def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadConte
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
     episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
+    team_start: Path | str | None = None,
 ) -> Cockpit:
     """The kernel's own cockpit over one substrate: every panel the dashboard already shows,
     as the five kinds (design §6.2). A downstream registers its own providers on the result.
@@ -954,4 +955,8 @@ def build_default_cockpit(
         return specs
 
     ck.discover(discover)
+    # the Team zone: read-only, over the team ledger `levain team status` finds from ``team_start`` (the working
+    # directory when None); the panel set follows the ledger's state, so a solo install draws one card
+    from levain.cockpit.team_panels import TeamSource, team_discoverer
+    ck.discover(team_discoverer(TeamSource(team_start)), retire=True)
     return ck

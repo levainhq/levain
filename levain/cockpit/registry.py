@@ -82,6 +82,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "last_activated_on": ("date|null", _opt(_is_str)),
     "tags": ("list[str]", _is_str_list),
     "legacy_meta": ("str", _is_str),
+    # the Team zone's entries (levain.cockpit.team_panels): what an entry is and who holds it
+    "entry_type": ("str", _is_str),
+    "entry_owner": ("str", _is_str),
     # K1 job rows (design §6.4 item 3: the consult panel's recent-jobs list). Registered here, in
     # the one closed registry, rather than invented by the provider.
     "job_status": ("enum", _enum("pending", "running", "done", "failed")),

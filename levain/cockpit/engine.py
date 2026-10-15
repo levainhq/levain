@@ -82,7 +82,7 @@ SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current que
 SCOPES = ("rows", "store")
 FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
-ZONES = (("operate", "Work"), ("mind", "Mind"), ("identity", "Identity"))
+ZONES = (("operate", "Work"), ("mind", "Mind"), ("identity", "Identity"), ("team", "Team"))
 HEADER = "header"     # the legacy region: normalised to hero or brief (or operate) when a spec is built
 # the regions above the zones, in drawing order; a panel in one is a single answer, never a list
 HERO, BRIEF, WIDGETS = "hero", "brief", "widgets"
@@ -442,6 +442,7 @@ class Cockpit:
         self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
         self._entity_state = _State()
         self._discovery_states: list[_State] = []
+        self._retiring: frozenset[int] | set[int] = frozenset()   # discoverers whose vanished panels are unregistered
         self._discovered: dict[str, int] = {}   # panel id -> the index of the discoverer that registered it
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
@@ -1473,14 +1474,18 @@ class Cockpit:
             raise TypeError("a discoverer returns a list of ProviderSpec")
         return Read(value=got)
 
-    def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]]) -> None:
-        """Register a discoverer: run when a manifest is built (or a panel nobody registered is
+    def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]], *, retire: bool = False) -> None:
+        """Register a discoverer (``retire=True``: a panel it stops returning is UNREGISTERED, not left reading
+        ``Absent``, for a source whose panel set legitimately changes shape, e.g. a team that appears or goes
+        away): run when a manifest is built (or a panel nobody registered is
         asked for), it returns the panels the substrate holds NOW (prose panels, one per heading).
         Ones not yet registered are added, and one already discovered takes the verbs its source
         offers now (a write re-checks them fresh, ``offer_spec``); one that later vanishes keeps its
         provider, which then reads ``Absent`` and renders ``error``, and offers nothing to a write. A discoverer that raises is a manifest ``errors``
         entry, never silent absence. All discoverers share ONE bounded single-flight read."""
         with self._lock:
+            if retire:
+                self._retiring = self._retiring | {len(self._discoverers)}
             self._discoverers.append(fn)
 
     def _ensure_discovered(self, ctx: ReadContext) -> list[dict[str, Any]]:
@@ -1553,7 +1558,10 @@ class Cockpit:
             with self._lock:
                 # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
                 for pid in [p for p, o in self._discovered.items() if o == i and p not in returned]:
-                    if self._specs[pid].verbs:
+                    if i in self._retiring:
+                        self._unregister_locked(pid)
+                        self._discovered = {k: v for k, v in self._discovered.items() if k != pid}
+                    elif self._specs[pid].verbs:
                         self._set_verbs_locked(pid, ())
         return errors
 
