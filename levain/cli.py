@@ -1369,7 +1369,7 @@ def _add_consent_canary_parser(subparsers: argparse._SubParsersAction) -> None:
             "(it cannot fire PermissionRequest headless). It spends one short model turn."))
     canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     canary_p.add_argument("--workspace", type=Path, default=None,
-                          help="Scratch workspace to use (default: a new temporary directory).")
+                          help="Scratch workspace: a new or empty directory (default: a new temporary one).")
     canary_p.set_defaults(func=_cmd_consent_canary)
 
 

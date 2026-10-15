@@ -69,8 +69,10 @@ HOOK_SCRIPT_NAME = "levain_consent.py"
 # Codex's name for its shell tool in hook events (measured, 0.162.1). A shell request is never parsed (ruling 1).
 SHELL_TOOLS = frozenset({"Bash"})
 PATCH_TOOL = "apply_patch"
-# The file headers of Codex's patch format; their paths are the files a patch touches.
-_PATCH_HEADER = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.MULTILINE)
+# The file headers of Codex's patch format; their paths are the files a patch touches. Indentation is allowed, in
+# case Codex's parser trims it: any other line starting ``***`` that is not a patch marker makes the patch unreadable.
+_PATCH_HEADER = re.compile(r"\s*\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*")
+_PATCH_MARKERS = frozenset({"*** Begin Patch", "*** End Patch", "*** End of File"})
 CODEX_DIR_NAME = ".codex"
 CODEX_CONFIG_NAMES = ("hooks.json", "config.toml")
 # The hooks.json key Codex files a PermissionRequest hook's trust under (``<source>:<event>:<group>:<handler>``).
@@ -104,10 +106,17 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 
 def patch_targets(patch: Any) -> list[str] | None:
     """The file paths a Codex ``apply_patch`` names in its headers (``*** Add File:``, ``Update File:``,
-    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string or names no file."""
+    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, or has a line starting
+    ``***`` (indented or not) that is neither a header nor a patch marker: what it names cannot be told."""
     if not isinstance(patch, str):
         return None
-    found = _PATCH_HEADER.findall(patch)
+    found: list[str] = []
+    for line in patch.splitlines():
+        m = _PATCH_HEADER.fullmatch(line)
+        if m:
+            found.append(m.group(1))
+        elif line.strip().startswith("***") and line.strip() not in _PATCH_MARKERS:
+            return None
     return found or None
 
 
@@ -257,12 +266,26 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
 
 # --- install (one workspace's .codex/) ---------------------------------------------------------------------
 
+# The first lines of every hook script levain writes: Python puts a script's own directory first on sys.path, so a
+# package planted beside the script (``.codex/hooks/levain/``) would be imported instead of levain. Unless already
+# running with -E -P (no PYTHON* variables, no script directory on sys.path), the script re-executes itself so;
+# ``os`` is already loaded by then (site imports it), so nothing is read from the workspace first.
+ISOLATE_PRELUDE = '''import os
+import sys
+
+if not (sys.flags.safe_path and sys.flags.ignore_environment):
+    try:
+        os.execv(sys.executable, [sys.executable, "-EP", os.path.abspath(__file__), *sys.argv[1:]])
+    except BaseException:
+        pass
+    sys.exit(0)
+'''
+
 HOOK_TEMPLATE = '''#!{python}
 # Installed by levain (levain.consent.adapters.codex.install). Codex's PermissionRequest hook: it reports a
 # decision only when levain verified a signed answer; otherwise it prints nothing and Codex's approval dialog
 # appears. Any failure here, including levain missing, is no decision.
-import sys
-
+''' + ISOLATE_PRELUDE.replace("{", "{{").replace("}", "}}") + '''
 try:
     from levain.consent.adapters.codex import main
 except BaseException:
@@ -331,7 +354,8 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
 class TrustStatus:
     """``status``: ``trusted`` (Codex will run it), ``untrusted`` (never trusted: Codex shows "Hooks need review"
     and skips it until the user trusts it), ``changed`` (trusted once, the definition changed since: Codex shows
-    the review screen again and skips it), ``absent`` (no levain hook in the workspace's hooks.json),
+    the review screen again and skips it), ``disabled`` (trusted, but Codex lists it as not enabled, so it does not
+    run it), ``absent`` (no levain hook in the workspace's hooks.json),
     ``unlisted`` (installed, but Codex does not load the workspace's hooks: the project is not trusted in Codex,
     or the hooks.json is invalid) or ``unknown`` (Codex could not be asked; ``detail`` says why). ``key`` is the
     hooks.state key and ``trusted_hash`` what CODEX_HOME's config.toml holds under it; ``current_hash`` is Codex's
@@ -361,8 +385,11 @@ def _our_handler(hooks_path: Path, script: Path) -> tuple[str, int, int] | None:
     return None
 
 
-def script_intact(script: Path) -> bool:
-    """True when ``script`` is exactly a rendering of :data:`HOOK_TEMPLATE` (any interpreter, any argv list)."""
+def script_intact(script: Path, *, queue_dir: Path | str | None = None) -> bool:
+    """True when ``script`` is exactly a rendering of :data:`HOOK_TEMPLATE` by :func:`install`: any interpreter,
+    and an argv of ``--max-hold <finite seconds >= 0>`` alone (the default queue) or followed by ``--queue-dir`` naming
+    exactly ``queue_dir`` (default :func:`levain.consent.queue.default_queue_dir`). A script pointed at any other
+    queue is not intact: the queue's settings name the authority whose answers it trusts."""
     try:
         text = script.read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -377,6 +404,15 @@ def script_intact(script: Path) -> bool:
     except (ValueError, SyntaxError):
         return False
     if not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)):
+        return False
+    expected_queue = str(Path(queue_dir).resolve()) if queue_dir is not None else str(default_queue_dir())
+    if argv[:1] != ["--max-hold"] or argv[2:] not in ([], ["--queue-dir", expected_queue]):
+        return False
+    try:
+        hold = float(argv[1])
+    except (IndexError, ValueError):
+        return False
+    if not (math.isfinite(hold) and hold >= 0 and argv[1] == repr(hold)):
         return False
     return text == HOOK_TEMPLATE.format(python=first[2:], argv=repr(argv))
 
@@ -420,10 +456,11 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
                         raise RuntimeError(f"hooks/list failed: {msg.get('error')}")
                     return msg["result"]
     finally:
-        try:
-            proc.stdin.close()  # type: ignore[union-attr]
-        except OSError:
-            pass
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                pipe.close()  # type: ignore[union-attr]
+            except OSError:
+                pass
         proc.terminate()
         try:
             proc.wait(5)
@@ -434,17 +471,18 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
 
 
 def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: str | None = None,
-                 timeout: float = TRUST_TIMEOUT) -> TrustStatus:
-    """What Codex says about levain's hook in ``workspace``: Codex's own ``hooks/list`` (``trustStatus``) for the
-    handler levain installed, with the ``trusted_hash`` from CODEX_HOME's ``config.toml`` (``home``, default
-    :func:`codex_home`) beside it. Never writes anything."""
+                 timeout: float = TRUST_TIMEOUT, queue_dir: Path | str | None = None) -> TrustStatus:
+    """What Codex says about levain's hook in ``workspace``: Codex's own ``hooks/list`` (``trustStatus`` and
+    ``enabled``) for the handler levain installed, with the ``trusted_hash`` from CODEX_HOME's ``config.toml``
+    (``home``, default :func:`codex_home`) beside it. ``queue_dir`` is the queue the script must name
+    (:func:`script_intact`). Never writes anything."""
     ws, _, script, hooks_path = _paths(workspace)
     ours = _our_handler(hooks_path, script)
     if ours is None:
         return TrustStatus("absent", f"no levain PermissionRequest hook in {hooks_path}")
     command, g, h = ours
     key = f"{os.path.realpath(hooks_path)}:{TRUST_EVENT_KEY}:{g}:{h}"
-    intact = script_intact(script)
+    intact = script_intact(script, queue_dir=queue_dir)
     chome = home if home is not None else codex_home()
     trusted_hash = None
     try:
@@ -464,9 +502,12 @@ def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: 
         for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
             if not isinstance(hook, dict) or hook.get("key") != key or hook.get("command") != command:
                 continue
-            got = hook.get("trustStatus")
+            got, enabled = hook.get("trustStatus"), hook.get("enabled")
             status = {"trusted": "trusted", "untrusted": "untrusted", "modified": "changed"}.get(got, "unknown")
-            return TrustStatus(status, f"codex trustStatus {got!r}", key, trusted_hash, hook.get("currentHash"),
+            if status == "trusted" and enabled is not True:
+                status = "disabled"
+            return TrustStatus(status, f"codex trustStatus {got!r}, enabled {enabled!r}", key, trusted_hash,
+                               hook.get("currentHash"),
                                intact)
     return TrustStatus("unlisted", "codex does not list levain's hook (is the project trusted in Codex?)", key,
                        trusted_hash, None, intact)

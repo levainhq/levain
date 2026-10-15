@@ -43,3 +43,36 @@ def test_claude_canary_passes_on_a_reported_denial(tmp_path, monkeypatch):
     assert (result.status, result.version) == ("PASS", "2.1.300"), result.detail
     assert not (tmp_path / "ws" / canary.SENTINEL_NAME).exists()
 
+
+
+def test_version_pin_compares_the_whole_version_and_needs_exit_0(tmp_path):
+    """r1 HIGH: any output containing a tested X.Y.Z passed the pin."""
+    for name, body in (("alpha", 'echo "codex-cli 0.162.1-alpha.9"'), ("failing", 'echo "codex-cli 0.162.1"; exit 1'),
+                       ("good", 'echo "codex-cli 0.162.1"')):
+        fake = tmp_path / name
+        fake.write_text(f"#!/bin/sh\n{body}\n")
+        fake.chmod(0o755)
+    assert canary.agent_version("codex", binary=str(tmp_path / "alpha")) == "0.162.1-alpha.9"
+    assert canary.agent_version("codex", binary=str(tmp_path / "failing")) is None
+    assert canary.require_tested_version("codex", binary=str(tmp_path / "good")) == "0.162.1"
+    for name in ("alpha", "failing"):
+        try:
+            canary.require_tested_version("codex", binary=str(tmp_path / name))
+        except canary.UntestedAgentVersion:
+            continue
+        raise AssertionError(f"{name} passed the pin")
+
+
+def test_canary_refuses_a_workspace_that_is_not_new_or_empty(tmp_path, monkeypatch):
+    """r1 MED: pointed at a real project, the canary replaced its consent hook with the deny-only canary."""
+    from levain.consent.adapters import codex as cx
+    _fake(tmp_path / "bin", "claude", FAKE_CLAUDE)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    ws = tmp_path / "project"
+    ws.mkdir()
+    script, _ = cx.install(ws, python=sys.executable, queue_dir=tmp_path / "q", max_hold=0,
+                           allow_untested_agent_version=True)
+    before = {p: p.read_bytes() for p in ws.rglob("*") if p.is_file()}
+    result = canary.run_claude_canary(workspace=ws, timeout=60)
+    assert result.status == "FAIL" and "new or empty directory" in result.detail
+    assert {p: p.read_bytes() for p in ws.rglob("*") if p.is_file()} == before

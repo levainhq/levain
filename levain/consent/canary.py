@@ -5,9 +5,10 @@ versions the Q3/Q5 runs used). An agent's hook contract can change in any releas
 an untested version is refused unless the operator passes :data:`ALLOW_FLAG`, and ``levain doctor`` WARNs about an
 installed hook whose agent is no longer a tested version.
 
-**Canary.** ``levain consent canary --agent claude_code|codex`` makes a scratch workspace, installs the agent's
-consent hook entry there with the adapter's own :func:`install` (so the agent loads exactly the entry it loads in
-production), and swaps the hook script for the canary's (:data:`CANARY_TEMPLATE`): it answers ONE sentinel
+**Canary.** ``levain consent canary --agent claude_code|codex`` makes a scratch workspace (``--workspace`` must be a
+new or empty directory, never a real project), installs the agent's consent hook entry there with the adapter's own
+:func:`install` (so the agent loads exactly the entry it loads in production), and swaps the hook script for the
+canary's (:func:`_canary_template`): it answers ONE sentinel
 request (a write of a sentinel file inside the scratch workspace) with deny, never allow, and records every event it
 sees. Then it runs one real agent turn that asks for that write. PASS only when the hook recorded the sentinel
 request AND the agent reported the denial AND the sentinel file does not exist; anything not observed is a FAIL.
@@ -27,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -49,7 +51,9 @@ ALLOW_FLAG = "--allow-untested-agent-version"
 SENTINEL_NAME = "levain_canary_sentinel.txt"
 CANARY_MESSAGE = "levain consent canary: the sentinel write was denied by the hook"
 RECORD_NAME = "canary_record.jsonl"
-_VERSION = re.compile(r"(\d+\.\d+\.\d+)")
+# The whole of `<bin> --version`'s output, per agent (measured: "2.1.300 (Claude Code)", "codex-cli 0.162.1"). The
+# version is the complete token, compared exactly: "0.162.1-alpha.9" is not 0.162.1.
+_VERSION_OUTPUT = {"claude_code": re.compile(r"(\S+) \(Claude Code\)"), "codex": re.compile(r"codex-cli (\S+)")}
 
 
 class UntestedAgentVersion(RuntimeError):
@@ -57,16 +61,17 @@ class UntestedAgentVersion(RuntimeError):
 
 
 def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.0) -> str | None:
-    """The installed agent's version (``<bin> --version``, first ``X.Y.Z``), or ``None`` when it cannot be read."""
+    """The installed agent's version: ``<bin> --version`` exited 0 and its whole output is the agent's version line
+    (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way."""
     binary = binary or shutil.which(AGENT_BINS[agent])
     if not binary:
         return None
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=timeout,
                              stdin=subprocess.DEVNULL, env=child_env())
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    m = _VERSION.search(out.stdout or "")
+    m = _VERSION_OUTPUT[agent].fullmatch((out.stdout or "").strip()) if out.returncode == 0 else None
     return m.group(1) if m else None
 
 
@@ -96,58 +101,98 @@ class Finding:
     warn: bool = False
 
 
-def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Finding]:
-    """What ``levain doctor`` says about consent hooks installed in ``install`` (none installed: nothing). Every
-    finding is at most a WARN: the hooks fail toward the human's own dialog, never toward an allow."""
-    from levain.consent.adapters import claude_code, codex
+# The most ``levain doctor`` waits on the agents altogether (measured: well under a second when they answer).
+DOCTOR_BUDGET = 5.0
+
+
+def _config_references(config: Path, script: Path) -> bool:
+    """True when the agent config ``config`` has a PermissionRequest handler that runs ``script``."""
+    from levain.consent.adapters.claude_code import _is_ours
+    try:
+        data = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    groups = hooks.get("PermissionRequest") if isinstance(hooks, dict) else None
+    script = Path(os.path.realpath(script))
+    return any(_is_ours(h, "", script)
+               for g in (groups if isinstance(groups, list) else []) if isinstance(g, dict)
+               for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else []))
+
+
+def _agent_findings(agent: str, install: Path, script: Path, config: Path, codex_home: Path | None,
+                    deadline: float) -> list[Finding]:
+    from levain.consent.adapters import codex
+    name = f"consent hook ({AGENT_LABELS[agent]})"
+    if not script.is_file():
+        if _config_references(config, script):
+            return [Finding(name, f"{config} runs {script}, which does not exist (no consent hook runs)",
+                            "reinstall the hook, or remove levain's entry from " + str(config), warn=True)]
+        return []
     out: list[Finding] = []
-    for agent, script in (("claude_code", install / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME),
-                          ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME)):
-        if not script.is_file():
-            continue
-        version = agent_version(agent)
-        name = f"consent hook ({AGENT_LABELS[agent]})"
-        if version in TESTED_VERSIONS[agent]:
-            out.append(Finding(name, f"{AGENT_LABELS[agent]} {version} is a tested version"))
-        else:
-            out.append(Finding(name, untested_message(agent, version).split("; pass")[0],
-                               "run `levain consent canary --agent " + agent + "` to check this version", warn=True))
-        if agent != "codex":
-            continue
-        trust = codex.trust_status(install, home=codex_home, timeout=20)
-        tname = "consent hook trust (Codex)"
-        hints = {
-            "untrusted": "start `codex` in this directory and trust levain's hook at Codex's 'Hooks need review' "
-                         "screen; until then Codex does not run it",
-            "changed": "the hook's definition changed since it was trusted, so Codex skips it: review what changed "
-                       "at Codex's 'Hooks need review' screen before trusting it again",
-            "unlisted": "Codex does not load this directory's hooks: trust the project in Codex",
-            "absent": "the hook script is here but .codex/hooks.json has no levain entry: reinstall it",
-        }
-        if trust.status == "trusted":
-            out.append(Finding(tname, "Codex trusts levain's PermissionRequest hook"))
-        else:
-            out.append(Finding(tname, f"{trust.status}: {trust.detail}", hints.get(trust.status), warn=True))
-        if trust.script_intact is False:
-            out.append(Finding("consent hook script (Codex)",
-                               "the hook script differs from what levain installs (Codex does not hash scripts)",
-                               "reinstall the hook", warn=True))
+    version = agent_version(agent, timeout=max(0.5, deadline - time.monotonic()))
+    if version in TESTED_VERSIONS[agent]:
+        out.append(Finding(name, f"{AGENT_LABELS[agent]} {version} is a tested version"))
+    else:
+        out.append(Finding(name, untested_message(agent, version).split("; pass")[0],
+                           "run `levain consent canary --agent " + agent + "` to check this version", warn=True))
+    if agent != "codex":
+        return out
+    trust = codex.trust_status(install, home=codex_home, timeout=max(0.5, deadline - time.monotonic()))
+    tname = "consent hook trust (Codex)"
+    hints = {
+        "untrusted": "start `codex` in this directory and trust levain's hook at Codex's 'Hooks need review' "
+                     "screen; until then Codex does not run it",
+        "changed": "the hook's definition changed since it was trusted, so Codex skips it: review what changed "
+                   "at Codex's 'Hooks need review' screen before trusting it again",
+        "disabled": "Codex has the hook turned off, so it does not run it: enable it in Codex's hooks settings",
+        "unlisted": "Codex does not load this directory's hooks: trust the project in Codex",
+        "absent": "the hook script is here but .codex/hooks.json has no levain entry: reinstall it",
+    }
+    if trust.status == "trusted":
+        out.append(Finding(tname, "Codex trusts levain's PermissionRequest hook"))
+    else:
+        out.append(Finding(tname, f"{trust.status}: {trust.detail}", hints.get(trust.status), warn=True))
+    if trust.script_intact is False:
+        out.append(Finding("consent hook script (Codex)",
+                           "the hook script differs from what levain installs, or names another queue "
+                           "(Codex does not hash scripts)", "reinstall the hook", warn=True))
+    return out
+
+
+def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Finding]:
+    """What ``levain doctor`` says about consent hooks installed in ``install`` (none installed and none
+    referenced: nothing). Every finding is at most a WARN: the hooks fail toward the human's own dialog, never
+    toward an allow. Waits on the agents at most about :data:`DOCTOR_BUDGET` seconds; an error is a WARN."""
+    from levain.consent.adapters import claude_code, codex
+    deadline = time.monotonic() + DOCTOR_BUDGET
+    out: list[Finding] = []
+    for agent, script, config in (
+            ("claude_code", install / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME,
+             install / ".claude" / "settings.json"),
+            ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json")):
+        try:
+            out += _agent_findings(agent, install, script, config, codex_home, deadline)
+        except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
+            out.append(Finding(f"consent hook ({AGENT_LABELS[agent]})", f"could not be checked: {exc}"[:300],
+                               warn=True))
     return out
 
 
 # --- the canary hook -----------------------------------------------------------------------------------------
 
-CANARY_TEMPLATE = '''#!{python}
+def _canary_template() -> str:
+    from levain.consent.adapters.codex import ISOLATE_PRELUDE
+    return ('''#!{python}
 # Installed by `levain consent canary` in its own scratch workspace: it denies ONE sentinel write, never allows,
 # and records every event it sees. Any failure here is no decision.
-import sys
-
+''' + ISOLATE_PRELUDE.replace("{", "{{").replace("}", "}}") + '''
 try:
     from levain.consent.canary import canary_hook_main
 except BaseException:
     sys.exit(0)
 sys.exit(canary_hook_main({agent!r}, {sentinel!r}, {record!r}))
-'''
+''')
 
 
 def _is_sentinel(agent: str, event: Mapping[str, Any], sentinel: str) -> bool:
@@ -193,9 +238,17 @@ class CanaryResult:
 
 
 def _setup(agent: str, workspace: Path | None) -> tuple[Path, Path, Path]:
+    """A scratch workspace with the canary's hook installed. ``workspace`` must be a new or empty directory: the
+    canary installs a deny-only hook there and leaves its records, so it never runs in a real project."""
     from levain.consent.adapters import claude_code, codex
-    ws = Path(workspace).resolve() if workspace else Path(tempfile.mkdtemp(prefix="levain-canary-")).resolve()
-    ws.mkdir(parents=True, exist_ok=True)
+    if workspace:
+        ws = Path(workspace).absolute()
+        if os.path.lexists(ws) and (os.path.islink(ws) or not ws.is_dir() or any(os.scandir(ws))):
+            raise ValueError(f"refusing {ws}: the canary needs a new or empty directory")
+        ws.mkdir(parents=True, exist_ok=True)
+        ws = ws.resolve()
+    else:
+        ws = Path(tempfile.mkdtemp(prefix="levain-canary-")).resolve()
     qdir = ws / ".levain-canary-queue"
     qdir.mkdir(mode=0o700, exist_ok=True)
     if agent == "claude_code":
@@ -205,8 +258,8 @@ def _setup(agent: str, workspace: Path | None) -> tuple[Path, Path, Path]:
                                   allow_untested_agent_version=True)
     sentinel = ws / (SENTINEL_NAME if agent == "claude_code" else f".codex/{SENTINEL_NAME}")
     record = ws / RECORD_NAME
-    claude_code._atomic_write(script, CANARY_TEMPLATE.format(python=sys.executable, agent=agent,
-                                                             sentinel=str(sentinel), record=str(record)), mode=0o755)
+    claude_code._atomic_write(script, _canary_template().format(python=sys.executable, agent=agent,
+                                                                sentinel=str(sentinel), record=str(record)), mode=0o755)
     return ws, sentinel, record
 
 
@@ -234,17 +287,22 @@ def run_claude_canary(*, workspace: Path | None = None, timeout: float = 240.0,
     binary = shutil.which("claude")
     if not binary:
         return CanaryResult("claude_code", None, "FAIL", "claude is not on PATH", str(workspace or ""))
-    ws, sentinel, record = _setup("claude_code", workspace)
+    try:
+        ws, sentinel, record = _setup("claude_code", workspace)
+    except Exception as exc:  # noqa: BLE001 - a canary that cannot set up is a FAIL that says why
+        return CanaryResult("claude_code", version, "FAIL", f"setup failed: {exc}"[:500], str(workspace or ""))
     prompt = (f"Use the Write tool to create the file {sentinel} containing the word canary. "
               "Do nothing else, and do not retry if it is denied.")
     try:
         proc = subprocess.run([binary, "-p", prompt, "--model", model, "--setting-sources", "project,local",
                                "--permission-mode", "default", "--output-format", "stream-json", "--verbose"],
-                              cwd=ws, env=child_env(AGENT_KEY_VARS["claude_code"]), capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
+                              cwd=ws, env=child_env(AGENT_KEY_VARS["claude_code"]), capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
         stream = proc.stdout
     except subprocess.TimeoutExpired as exc:
         stream = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+    except OSError as exc:
+        return _verdict("claude_code", version, ws, sentinel, record, False, f"claude could not be started: {exc}")
     (ws / "canary_agent_output.jsonl").write_text(stream, encoding="utf-8")
     reported = False
     for line in stream.splitlines():
@@ -261,36 +319,68 @@ def run_claude_canary(*, workspace: Path | None = None, timeout: float = 240.0,
     return _verdict("claude_code", version, ws, sentinel, record, reported)
 
 
+def _toml_str(value: str) -> str:
+    """``value`` as a TOML basic string."""
+    out = []
+    for ch in value:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the agent's whole process group (it was started in a session of its own)."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+
 _ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b[=>]")
 
 
 def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -> CanaryResult:
     """Drive one interactive ``codex`` turn under a pty (Codex cannot fire PermissionRequest headless). Never
     answers an update prompt, a folder-trust prompt or a hooks-review screen: any of them is a FAIL that says so."""
+    import fcntl
     import pty
     import select
+    import struct
+    import termios
     version = agent_version("codex")
     binary = shutil.which("codex")
     if not binary:
         return CanaryResult("codex", None, "FAIL", "codex is not on PATH", str(workspace or ""))
-    ws, sentinel, record = _setup("codex", workspace)
+    try:
+        ws, sentinel, record = _setup("codex", workspace)
+    except Exception as exc:  # noqa: BLE001 - a canary that cannot set up is a FAIL that says why
+        return CanaryResult("codex", version, "FAIL", f"setup failed: {exc}"[:500], str(workspace or ""))
     prompt = (f"Use your apply_patch tool (not a shell command) to create the file {sentinel} containing the "
               "single line: canary . If it needs approval, request it. If it is denied, do not retry; stop.")
     argv = [binary, "--dangerously-bypass-hook-trust", "-c", "check_for_update_on_startup=false",
-            "-c", f'projects={{"{ws}"={{trust_level="trusted"}}}}', prompt]
-    import fcntl
-    import struct
-    import termios
-    fd, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
+            "-c", f"projects={{{_toml_str(str(ws))}={{trust_level=\"trusted\"}}}}", prompt]
     try:
+        fd, slave = pty.openpty()
+    except OSError as exc:
+        return _verdict("codex", version, ws, sentinel, record, False, f"no pty: {exc}")
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
         # A new session whose controlling terminal is the pty: Codex's TUI opens /dev/tty.
         proc = subprocess.Popen(argv, cwd=ws, env=child_env(AGENT_KEY_VARS["codex"]), stdin=slave, stdout=slave,
                                 stderr=slave, start_new_session=True,
                                 preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
-    except BaseException:
+    except (OSError, subprocess.SubprocessError) as exc:
         os.close(fd)
-        raise
+        return _verdict("codex", version, ws, sentinel, record, False, f"codex could not be started: {exc}")
     finally:
         os.close(slave)
     buf = b""
@@ -324,20 +414,22 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
                 stop = "Codex showed its approval dialog: the hook's deny did not reach it"
                 break
     finally:
-        # Keep reading while the child exits, and close the pty before reaping it: on macOS a process exiting on a
-        # pty waits for its output to drain, so a reap with nobody reading never returns.
-        proc.terminate()
+        # Keep reading while the agent's process group exits, and close the pty before reaping: on macOS a process
+        # exiting on a pty waits for its output to drain, so a reap with nobody reading never returns.
+        _signal_group(proc, signal.SIGTERM)
         end = time.monotonic() + 1.5
         while time.monotonic() < end:
             ready, _, _ = select.select([fd], [], [], 0.2)
             if ready:
                 try:
-                    if not os.read(fd, 65536):
-                        break
+                    data = os.read(fd, 65536)
                 except OSError:
                     break
+                if not data:
+                    break
+                buf += data
         os.close(fd)
-        proc.kill()
+        _signal_group(proc, signal.SIGKILL)
         proc.wait()
     screen = _ANSI.sub(b"", buf).decode("utf-8", "replace")
     (ws / "canary_agent_screen.txt").write_text(screen, encoding="utf-8")
