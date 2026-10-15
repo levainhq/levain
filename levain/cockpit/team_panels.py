@@ -209,7 +209,7 @@ def _join_rows(joins: list[dict]) -> tuple[RowIn, ...]:
     for j in joins:
         title = _one_line(f"{j['kind']} · {j['handle']}")
         body = _one_line(" · ".join(p for p in (j.get("line"), j.get("fingerprint")) if p))
-        out.append(RowIn(id=f"join:{j['kind']}:{j['handle']}:{j.get('fingerprint') or ''}", title=title, body=body,
+        out.append(RowIn(id=f"join:{j['kind']}:{j['handle']}:{j.get('n', 0)}", title=title, body=body,
                          stored={"title": title, "body": body}))
     return tuple(out)
 

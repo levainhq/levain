@@ -116,7 +116,8 @@ def test_members_lists_the_owner_first_with_roles_keys_and_no_email_anywhere(two
     rows = r.model["members"]
     assert [(m["handle"], m["role"], m["you"], m["key_state"]) for m in rows] == [
         ("ana", "owner", False, "in force"), ("ben", "member", True, "in force")]
-    assert all(m["keys"] >= 1 for m in rows) and rows[0]["since"] is None or rows[0]["since"]
+    assert all(m["keys"] >= 1 for m in rows)
+    assert rows[0]["since"] is None                # genesis: no role change names the spell's start commit
     assert r.model["joins"] == []
     assert not {k for k in _all_keys(r.model["members"] + r.model["joins"]) if "mail" in k.lower()}
     assert "ben@ex.com" not in str(r.model["members"] + r.model["joins"])
@@ -147,3 +148,17 @@ def test_an_ownership_offer_is_a_join_row_until_it_is_withdrawn(two):
     assert team("accept", repo=ben) == 0
     r2 = read_team(_gl(ben))
     assert r2.model["joins"] == [] and r2.model["members"][0]["handle"] == "ben"
+
+
+def test_an_owner_missing_from_the_members_table_still_leads_the_members():
+    # L3 r1 complement MED 1: people() iterated [members] only, so an owner team.toml does not list there vanished
+    from types import SimpleNamespace
+
+    from levain.team.reader import people
+    from levain.team.roles import Team
+    from levain.team.tenure import Tenure
+
+    d = SimpleNamespace(team=Team(project="p", owner="ana", members={"ben": "b@x"}), tenure=Tenure(),
+                        role_changes=[], spells=[])
+    members, joins = people(d, None)
+    assert [(m["handle"], m["role"]) for m in members] == [("ana", "owner"), ("ben", "member")] and joins == []
