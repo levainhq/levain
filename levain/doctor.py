@@ -127,6 +127,7 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
+    core.extend(_check_consent_hooks(install))
     for r in core:
         _emit(r)
 
@@ -259,6 +260,14 @@ _ACTIVATION_FILES = ("posture.md", "recency_directives.md")
 # these two base files carry the identity slots (OPERATOR_NAME/ENTITY_NAME) that
 # matter most, so it is the right minimum.
 _RENDER_TARGET_SEEDS = ("world.md", "origin.md")
+
+
+def _check_consent_hooks(install: Path) -> list[CheckResult]:
+    """Consent hooks installed here (Q5): a WARN when the agent is not a tested version, and for Codex when it
+    does not trust the hook (levain never writes that trust) or the script is not what levain installed."""
+    from levain.consent.canary import doctor_findings
+
+    return [CheckResult(f.name, True, f.detail, f.hint, warn=f.warn) for f in doctor_findings(install)]
 
 
 def _check_seed_content(install: Path) -> list[CheckResult]:
