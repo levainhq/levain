@@ -279,13 +279,17 @@ def _paths(workspace: Path | str) -> tuple[Path, Path, Path, Path]:
 
 
 def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path | str | None = None,
-            max_hold: float = DEFAULT_MAX_HOLD) -> tuple[Path, Path]:
+            max_hold: float = DEFAULT_MAX_HOLD, allow_untested_agent_version: bool = False) -> tuple[Path, Path]:
     """Install the hook into ``workspace``: ``.codex/hooks/levain_consent.py`` and a ``PermissionRequest`` entry
     (matcher ``*``, ``timeout`` = :func:`levain.consent.adapters.claude_code.hook_timeout`) in ``.codex/hooks.json``,
     other hooks kept and any earlier levain entry replaced. Codex will not run it until the user trusts it at
-    Codex's "Hooks need review" screen; levain never writes that trust. Returns (script, hooks.json)."""
+    Codex's "Hooks need review" screen; levain never writes that trust. Refuses (``UntestedAgentVersion``) when the
+    installed ``codex`` is not a tested version (:data:`levain.consent.canary.TESTED_VERSIONS`), unless
+    ``allow_untested_agent_version``. Returns (script, hooks.json)."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
         raise ValueError("max_hold must be a finite number of seconds >= 0")
+    from levain.consent.canary import require_tested_version
+    require_tested_version(AGENT, allow_untested=allow_untested_agent_version)
     ws, codex_dir, script, hooks_path = _paths(workspace)
     hooks_dir = script.parent
     for directory in (codex_dir, hooks_dir):

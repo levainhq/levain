@@ -478,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     _ck_common(ck_init)
     ck_init.set_defaults(func=_cmd_cockpit_ledger_init)
 
+    _add_consent_canary_parser(subparsers)
+
     run_p = subparsers.add_parser(
         "run",
         help="Run a sovereign entity as an interactive partner on an open model.",
@@ -1350,6 +1352,31 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     from levain.doctor import run_doctor
 
     return run_doctor(path=args.path, invoke=args.invoke, repin_hooks=args.repin_hooks)
+
+
+def _add_consent_canary_parser(subparsers: argparse._SubParsersAction) -> None:
+    """`levain consent canary` (Q5). Its own block: `levain consent grant` is added beside it."""
+    consent_p = subparsers.add_parser(
+        "consent", help="The cross-agent consent queue's hooks.",
+        description="Commands for the consent hooks levain installs for Claude Code and Codex.")
+    consent_sub = consent_p.add_subparsers(dest="consent_cmd", required=True)
+    canary_p = consent_sub.add_parser(
+        "canary", help="Check that an agent's consent hook fires and its denial reaches the agent.",
+        description=(
+            "Run one real agent turn in a scratch workspace whose consent hook denies one sentinel write "
+            "(never allows anything). PASS only when the hook fired on it, the agent reported the denial and "
+            "the file was not written. Claude Code runs headless; Codex runs interactively under a pty "
+            "(it cannot fire PermissionRequest headless). It spends one short model turn."))
+    canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
+    canary_p.add_argument("--workspace", type=Path, default=None,
+                          help="Scratch workspace to use (default: a new temporary directory).")
+    canary_p.set_defaults(func=_cmd_consent_canary)
+
+
+def _cmd_consent_canary(args: argparse.Namespace) -> int:
+    from levain.consent.canary import cli_canary
+
+    return cli_canary(args.agent, args.workspace)
 
 
 def _cmd_verify_hooks(args: argparse.Namespace) -> int:

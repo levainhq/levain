@@ -37,7 +37,8 @@ def test_trust_status_asks_codex_and_maps_its_answer(tmp_path):
     home = tmp_path / "codexhome"
     home.mkdir()
     assert cx.trust_status(ws, home=home, codex_bin="/nonexistent").status == "absent"
-    script, hooks = cx.install(ws, python=sys.executable, queue_dir=tmp_path / "q", max_hold=0)
+    script, hooks = cx.install(ws, python=sys.executable, queue_dir=tmp_path / "q", max_hold=0,
+                                 allow_untested_agent_version=True)
     command = json.loads(hooks.read_text())["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
     key = f"{os.path.realpath(hooks)}:permission_request:0:0"
     (home / "config.toml").write_text(f'[hooks.state."{key}"]\ntrusted_hash = "sha256:old"\n')
