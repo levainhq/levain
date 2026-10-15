@@ -827,6 +827,7 @@ def test_agent_pin_names_an_edited_hook_script(tmp_path):
 
 def test_agent_pin_names_settings_hook_codex_and_claude_hooks_dir_changes(tmp_path):
     ent, ch = _pinned_entity(tmp_path)
+    (ent / "AGENTS.md").write_text("x")  # only a Codex install pins the global Codex hooks.json
     hg.check_agent_hook_pins(ent, ch)
     (ent / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [2]}}))
     (ch / "hooks.json").write_text('{"hooks": {"x": 1}}')
@@ -840,6 +841,7 @@ def test_agent_pin_names_settings_hook_codex_and_claude_hooks_dir_changes(tmp_pa
 
 def test_agent_pin_ignores_non_hook_settings_but_repin_clears(tmp_path):
     ent, ch = _pinned_entity(tmp_path)
+    (ent / "AGENTS.md").write_text("x")  # only a Codex install pins the global Codex hooks.json
     hg.check_agent_hook_pins(ent, ch)
     (ent / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [1]}, "model": "x"}))
     assert hg.check_agent_hook_pins(ent, ch)[0] == "match"

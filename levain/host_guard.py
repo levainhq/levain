@@ -673,11 +673,25 @@ def _codex_home(codex_home: str | os.PathLike[str] | None) -> Path:
         os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 
 
+def _pins_global_codex(ent: Path, adapter: str | None = None) -> bool:
+    """Whether this install's pin covers the machine-global Codex ``hooks.json``: only a Codex install's.
+    Codex has no per-project hooks file, so ``levain init --adapter codex`` in ANY directory rewrites that
+    one file; pinning it from every install turned a Claude Code install's doctor red the moment a Codex
+    install was made elsewhere (diogenes-20261015-021021). The adapter is the hook-carrying one the install
+    attests (``effective_adapter``: claude-code or codex); ``adapter``, the one an init is about to write,
+    counts only while the install attests none of those (an init reads the status BEFORE ``AGENTS.md``
+    exists, and a hookless install being switched has none), so the status an init takes and the re-pin
+    after it read the same adapter."""
+    from levain.install import effective_adapter
+    attested = effective_adapter(ent)
+    return (attested if attested in ("claude-code", "codex") else adapter) == "codex"
+
+
 def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None
                                ) -> tuple[dict[str, str], list[str]]:
     ent = Path(os.path.abspath(install))
     cc = ent / ".claude"
-    cj = _codex_home(codex_home) / "hooks.json"
+    cj = _codex_home(codex_home) / "hooks.json" if _pins_global_codex(ent) else None
     pins: dict[str, str] = {}
     errors: list[str] = []
     docs: list[Any] = []
@@ -708,7 +722,8 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
         except OSError as exc:
             raise AgentPinError([f"unreadable ({exc.strerror or exc})"]) from None
     run("activation/hooks/ (scripts)", scripts)
-    run(_CODEX_KEY, lambda: _codex_hooks_digest(cj))
+    if cj is not None:
+        run(_CODEX_KEY, lambda: _codex_hooks_digest(cj))
     wcc = ent / ".codex" / "config.toml"
     run(".codex/config.toml [hooks] (workspace)", lambda: _workspace_codex_digest(wcc))
     try:
@@ -719,7 +734,7 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
         pass
     unresolved: list[str] = []
     try:
-        cdoc = _read_settings_doc(cj)
+        cdoc = _read_settings_doc(cj) if cj is not None else None
         if cdoc is not None:
             docs.append(cdoc)
     except AgentPinError:
@@ -800,12 +815,14 @@ def repin_agent_hooks(install: str | os.PathLike[str], codex_home: str | os.Path
     return pins
 
 
-def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
-                     ) -> Literal["none", "fresh", "match", "changed"]:
+def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None,
+                     adapter: str | None = None) -> Literal["none", "fresh", "match", "changed"]:
     """The pin's state right now, WITHOUT recording anything. ``fresh``: no pin and nothing install-
     local for it to cover yet (a first init), so what levain writes is the only content there.
     ``none``: no pin, but hook files already exist that levain did not write in this run.
-    ``changed``: a pin that differs, or one that is invalid or cannot be compared. Never raises."""
+    ``changed``: a pin that differs, or one that is invalid or cannot be compared. Never raises.
+    ``adapter``: the adapter an init is about to write; read only while there is no pin yet and the install
+    attests no adapter (otherwise the attested one decides, as it does for the re-pin)."""
     ent = Path(os.path.abspath(install))
     try:
         old = _load_agent_pins(ent)
@@ -817,8 +834,9 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         if root is not None and root != ent:
             local += [root / ".claude" / "settings.json", root / ".claude" / "settings.local.json"]
         local.append(ent / ".codex" / "config.toml")
-        # a Codex hooks.json already on disk is global and not levain's: unvetted on first use
-        local.append(_codex_home(codex_home) / "hooks.json")
+        # a Codex hooks.json already on disk is global and not levain's: unvetted on a Codex install's first use
+        if _pins_global_codex(ent, adapter):
+            local.append(_codex_home(codex_home) / "hooks.json")
         return "none" if any(os.path.lexists(p) for p in local) else "fresh"
     try:
         now = agent_hook_pins(ent, codex_home)

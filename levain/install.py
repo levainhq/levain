@@ -714,7 +714,7 @@ def _apply_init(
         roots = [_base_activation_root(chosen, templates_root)]
     from levain import host_guard
 
-    pin_before = host_guard.agent_pin_status(install) if _adapter_has_hooks(chosen) else None
+    pin_before = host_guard.agent_pin_status(install, adapter=chosen) if _adapter_has_hooks(chosen) else None
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit,

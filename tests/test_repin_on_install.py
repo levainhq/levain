@@ -21,13 +21,13 @@ def make_install(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     monkeypatch.setattr(hg, "load_managed_settings", lambda platform=None: [])
 
-    def _make(name: str = "entity") -> Path:
+    def _make(name: str = "entity", adapter: str = "claude-code") -> Path:
         from tests.test_init_answers import _filled
 
         af = tmp_path / f"{name}-answers.json"
         af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
         install = tmp_path / name
-        assert run_init(install, "claude-code", force=False, answers_file=af) == 0
+        assert run_init(install, adapter, force=False, answers_file=af) == 0
         capsys.readouterr()
         return install
 
@@ -101,3 +101,35 @@ def test_reinit_force_after_a_doctor_pin_does_not_fail(make_install, tmp_path, c
     capsys.readouterr()
     res = _pin_check(install)
     assert res.ok and not res.warn and "match the pin" in res.detail, res
+
+
+# diogenes-20261015-021021, reproduced through the real CLI: a Codex init in ANOTHER directory rewrites the one
+# global Codex hooks.json, and that turned a Claude Code install's doctor red.
+def test_a_codex_install_elsewhere_leaves_a_claude_code_install_green(make_install, tmp_path):
+    cc = make_install("cc")
+    make_install("cx", adapter="codex")
+    assert (tmp_path / "codex-home" / "hooks.json").is_file()
+    res = _pin_check(cc)
+    assert res.ok and not res.warn, res
+    assert hg.agent_pin_status(cc) == "match"
+
+
+def test_a_codex_install_still_pins_the_global_codex_hooks(make_install, tmp_path):
+    cx = make_install("cx", adapter="codex")
+    assert _pin_check(cx).ok
+    cj = tmp_path / "codex-home" / "hooks.json"
+    doc = json.loads(cj.read_text(encoding="utf-8"))
+    doc.setdefault("hooks", {}).setdefault("SessionStart", []).append(
+        {"hooks": [{"type": "command", "command": "/tmp/planted.sh"}]})
+    cj.write_text(json.dumps(doc), encoding="utf-8")
+    res = _pin_check(cx)
+    assert not res.ok and "codex hooks.json" in res.detail, res
+    # an init reads the status before AGENTS.md exists: a Codex init must still treat a hooks.json it did not
+    # write as unvetted, while a Claude Code init ignores it
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert hg.agent_pin_status(fresh, adapter="codex") == "none"
+    assert hg.agent_pin_status(fresh, adapter="claude-code") == "fresh"
+    # a hookless (openhands) install switched to codex: its marker must not outrank the init's adapter (L3 r2, run)
+    oh = make_install("oh", adapter="openhands")
+    assert hg.agent_pin_status(oh, adapter="codex") == "none"
