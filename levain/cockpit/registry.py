@@ -103,6 +103,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "tool": ("str", _is_str),
     "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn")),
     "consent_tier": ("str", _is_str),
+    "decided_at": ("timestamp", _is_str),    # a decided request's time (an unswept one: its expiry); `at` stays the filing
 }
 
 

@@ -46,6 +46,10 @@ def test_consent_rows_group_pending_first_counted_and_terminal_resolved(tmp_path
     f = by_id[f"consent:{waiting.id}"]["facets"]
     assert f["agent"] == "claude_code" and f["tool"] == "Bash" and f["consent_state"] == "pending"
     assert by_id[f"consent:{done.id}"]["facets"]["consent_state"] == "withdrawn"
+    # a terminal row's `at` is when it was filed; the decision time is its own facet, and a pending has none
+    df = by_id[f"consent:{done.id}"]["facets"]
+    assert df["at"] == done.received_at and df["decided_at"] >= df["at"]
+    assert f["at"] == waiting.received_at and "decided_at" not in f
     one = ck.read_one("decisions", f"consent:{waiting.id}").value
     assert one["id"] == f"consent:{waiting.id}" and isinstance(ck.read_one("decisions", "consent:nope"), Absent)
 
@@ -177,6 +181,9 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
     r = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash",
                tool_input={"command": "echo '<img src=x onerror=window.__pwned=1>'"}, cwd="/w",
                hold=timedelta(minutes=5), event_id="p1")
+    gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
+                  hold=timedelta(minutes=5), event_id="p2")
+    q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -187,9 +194,13 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
                      " return [row.querySelector('.consent-agent').textContent, row.querySelector('.consent-tool').textContent,"
                      " row.querySelector('.consent-left').textContent, row.querySelector('.consent-display').textContent,"
                      " [...row.querySelectorAll('.consent-code')].map(c => c.textContent), row.querySelectorAll('img').length,"
-                     " !!window.__pwned, /agents waiting on you/i.test(m.innerText)]; })()"},
+                     " !!window.__pwned, /agents waiting on you/i.test(m.innerText),"
+                     " [...m.querySelectorAll('.consent-row')].map(r => [r.querySelector('.consent-tool').textContent,"
+                     " !!r.querySelector('.consent-body')])]; })()"},
         ])["values"]
-    agent, tool, left, display, cmds, imgs, pwned, grouphead = out[-1]
+    agent, tool, left, display, cmds, imgs, pwned, grouphead, rows = out[-1]
+    # only a pending request has a body slot (and so a fetch); a decided one is its state word and times
+    assert sorted(rows) == [["Bash", False], ["Bash", True]]
     assert (agent, tool) == ("claude_code", "Bash") and left.endswith("left")
     assert "<img src=x" in display and imgs == 0 and not pwned and grouphead
     assert cmds == [f"levain consent answer {r.id} allow --signing-key <key>",

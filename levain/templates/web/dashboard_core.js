@@ -2921,24 +2921,47 @@
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done("copied"), select);
     else select();
   }
-  // The request itself (what is asked, where, the answer commands) is not in the token-free panel: it is fetched
-  // from /cockpit/consent/<id>.json with the token this page holds, on every bind. A body never changes while
-  // its request keeps one state, so one fetch per request and state serves every redraw.
+  // The request itself (what is asked, where, the answer commands) is not in the token-free panel: a PENDING
+  // request's body is fetched from /cockpit/consent/<id>.json with the token this page holds, on every bind (a
+  // decided request shows its state word and times from the panel row and fetches nothing). A body never changes
+  // while its request keeps one state, so one fetch per request serves every redraw. The server answers a read
+  // it has no free worker for with 503: at most two fetches run at once, and a 503 is retried (~500 ms apart, three
+  // tries in all) before the row says it could not be read.
   const consentBodies = new Map();
-  const CONSENT_NEEDS_TOKEN = "open this page with its token to see the request";
+  const CONSENT_NO_TOKEN = "this page carries no token, so request details are not shown";
+  const CONSENT_BAD_TOKEN = "this page's token was not accepted, so request details are not shown";
+  const CONSENT_FETCH_MAX = 2, CONSENT_TRIES = 3, CONSENT_RETRY_MS = 500;
+  let consentActive = 0;
+  const consentWaiting = [];
+  function consentPump() {
+    while (consentActive < CONSENT_FETCH_MAX && consentWaiting.length) {
+      const job = consentWaiting.shift();
+      consentActive++;
+      job().then(() => { consentActive--; consentPump(); });
+    }
+  }
+  function consentQueued(job) {
+    return new Promise((resolve) => { consentWaiting.push(() => job().then(resolve)); consentPump(); });
+  }
+  function consentFetch(c, headers, tryNo) {
+    return fetch("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
+      .then((res) => {
+        if (res.status === 403) return { error: CONSENT_BAD_TOKEN };
+        if (res.status === 404) return { error: "this request is no longer listed" };
+        if (res.status === 503 && tryNo < CONSENT_TRIES) {
+          return new Promise((r) => setTimeout(r, CONSENT_RETRY_MS)).then(() => consentFetch(c, headers, tryNo + 1));
+        }
+        if (!res.ok) return { error: "the request could not be read (HTTP " + res.status + ")" };
+        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }));
+      }, () => ({ error: "the request could not be read (network)" }));
+  }
   function consentBody(c) {
     const key = c.id + "|" + c.state;
     if (consentBodies.has(key)) return consentBodies.get(key);
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
-    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NEEDS_TOKEN });
-    const got = fetch("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
-      .then((res) => {
-        if (res.status === 403) return { error: CONSENT_NEEDS_TOKEN };
-        if (res.status === 404) return { error: "this request is no longer listed" };
-        if (!res.ok) return { error: "the request could not be read (HTTP " + res.status + ")" };
-        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }));
-      }, () => ({ error: "the request could not be read (network)" }))
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN });
+    const got = consentQueued(() => consentFetch(c, headers, 1))
       .then((b) => { if (b.error) consentBodies.delete(key); return b; });
     consentBodies.set(key, got);
     return got;
@@ -2988,7 +3011,9 @@
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
     } else head.appendChild(el("span", "consent-audit", c.state));
     if (c.age) head.appendChild(el("span", "ext-meta", "filed " + c.age));
+    if (!pending && c.decidedAge) head.appendChild(el("span", "ext-meta", (c.state === "expired" ? "expired " : "decided ") + c.decidedAge));
     row.appendChild(head);
+    if (!pending) return row;      // a decided request: its state word and times are the panel row's; no body is fetched
     const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
     row.appendChild(slot);
     if (c.id) consentBody(c).then((b) => drawConsentBody(row, slot, b, pending));

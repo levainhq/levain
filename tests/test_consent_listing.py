@@ -112,4 +112,28 @@ def test_pending_past_the_cap_is_counted_not_read(tmp_path, monkeypatch):
     for i in range(3):
         _file(q, f"e{i}")
     got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
-    assert len(got.pending) == 2 and got.overflow == 1 and got.skipped == 0
+    assert len(got.pending) == 2 and got.overflow is True and got.skipped == 0
+
+
+def test_past_the_cap_the_soonest_expiring_are_kept_and_overflow_is_flagged_without_a_count(tmp_path):
+    q = _queue(tmp_path, lambda: T0)
+    made = [_file(q, f"e{i}", hold_min=5 + i) for i in range(201)]        # the last one expires latest
+    got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
+    ids = {e.request.id for e in got.pending}
+    assert len(got.pending) == 200 and got.overflow is True
+    assert made[0].id in ids and made[199].id in ids and made[200].id not in ids
+    exact = read_listing(q.directory, now=T0 + timedelta(minutes=1))      # 200 would be no overflow: drop one
+    q.withdraw(made[200].id)
+    assert read_listing(q.directory, now=T0 + timedelta(minutes=1)).overflow is False and exact.overflow
+
+
+def test_unswept_expired_pending_do_not_crowd_live_ones_out_of_the_cap(tmp_path, monkeypatch):
+    import levain.consent.listing as listing
+
+    monkeypatch.setattr(listing, "PENDING_CAP", 2)
+    q = _queue(tmp_path, lambda: T0)
+    stale = [_file(q, f"x{i}", hold_min=1) for i in range(3)]
+    live = _file(q, "live", hold_min=30)
+    got = read_listing(q.directory, now=T0 + timedelta(minutes=10))
+    assert [e.request.id for e in got.pending] == [live.id] and got.overflow is False
+    assert {e.request.id for e in got.recent} == {r.id for r in stale} and {e.state for e in got.recent} == {"expired"}

@@ -33,7 +33,7 @@ __all__ = ["ConsentEntry", "ConsentListing", "PENDING_CAP", "RECENT", "RECENT_CA
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
 RECENT_CAP = 50
-PENDING_CAP = 200                   # pending rows read per listing; the rest are counted, never drawn
+PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
 UNSHOWN = object()
 TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
 
@@ -86,12 +86,12 @@ class ConsentEntry:
 @dataclass(frozen=True)
 class ConsentListing:
     """``pending`` oldest first; ``recent`` newest first, at most :data:`RECENT_CAP`; ``skipped`` the rows that do
-    not check out (a seal that does not match, a stamp that does not parse); ``overflow`` the pending requests
-    past :data:`PENDING_CAP`, not read."""
+    not check out (a seal that does not match, a stamp that does not parse); ``overflow`` whether more than
+    :data:`PENDING_CAP` requests are pending (the rest are not read, and not counted)."""
     pending: tuple[ConsentEntry, ...] = ()
     recent: tuple[ConsentEntry, ...] = ()
     skipped: int = 0
-    overflow: int = 0
+    overflow: bool = False
 
 
 def audit_line(entry: ConsentEntry) -> str:
@@ -179,14 +179,18 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
         if fmt is None or fmt[0] != STORE_FORMAT:
             raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
-        # both reads are bounded and indexed (requests_pending, requests_decided): the queue's whole history is
-        # never scanned. Past the cap, the latest-expiring pending are kept, so a live request is not crowded out
-        # by a day of unswept expired ones
-        n_pending = conn.execute("SELECT count(*) FROM requests WHERE state = 'pending' AND expires_at >= ?",
-                                 (horizon,)).fetchone()[0]
+        # every read is bounded and indexed (requests_pending, requests_decided): the queue's whole history is
+        # never scanned. The live pending come soonest-expiring first, one past the cap, so overflow is known
+        # without counting every row; the unswept expired ones (which would crowd the live ones out of that
+        # order) are read apart, newest expiry first, within the recent cap
         rows = conn.execute(
-            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at >= ? "
-            "ORDER BY expires_at DESC, rowid DESC LIMIT ?", (horizon, PENDING_CAP)).fetchall()
+            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at > ? "
+            "ORDER BY expires_at ASC, rowid ASC LIMIT ?", (stamp, PENDING_CAP + 1)).fetchall()
+        overflow = len(rows) > PENDING_CAP
+        rows = rows[:PENDING_CAP]
+        rows += conn.execute(
+            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
+            "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, RECENT_CAP)).fetchall()
         rows += conn.execute(
             f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
             "ORDER BY decided_at DESC LIMIT ?", (horizon, RECENT_CAP)).fetchall()
@@ -223,4 +227,4 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
-    return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped, max(0, n_pending - PENDING_CAP))
+    return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped, overflow)

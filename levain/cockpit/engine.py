@@ -120,7 +120,7 @@ DECISION_ORDER = "decision.queue"
 KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
-                                    "agent", "tool", "consent_state", "consent_tier"})
+                                    "agent", "tool", "consent_state", "consent_tier", "decided_at"})
 
 
 def _canon(obj: Any) -> bytes:
@@ -434,8 +434,9 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
     """The consent queue's listing (``levain.consent.listing.ConsentListing``) as rows: ``consent:<request_id>``
     per request an agent waits on, and per one decided in the last day, with the count of entries that did not
     build (each row is built on its own, so one bad entry never blanks the rest). A row carries who asks, for
-    which tool, its tier, state and times, and nothing of the request's body: the display, cwd, targets, answer
-    commands and how it was answered are served only to a token holder (``/cockpit/consent/<id>.json``), since
+    which tool, its tier, state and times (``at`` is when it was filed; a decided one adds
+    ``decided_at``), and nothing of the request's body: the display, cwd, targets, answer commands and how it
+    was answered are served only to a token holder (``/cockpit/consent/<id>.json``), since
     this panel is token-free on loopback. The row never carries the time left (the page counts down from
     ``expires_at``), so its version does not change every second."""
     rows: list[RowIn] = []
@@ -447,7 +448,9 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
             facets: dict[str, Any] = {
                 "agent": r.agent, "tool": r.tool_name, "consent_state": e.state, "consent_tier": r.tier,
                 "expires_at": r.expires_at, "due": _due_of(r.expires_at),
-                "at": r.received_at if pending else e.decided_at}
+                "at": r.received_at}
+            if e.decided_at is not None:
+                facets["decided_at"] = e.decided_at
             rows.append(RowIn(
                 id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{r.agent} \u00b7 {r.tool_name}", facets=facets,
                 stored={"state": e.state, "expires_at": r.expires_at, "decided_at": e.decided_at, "request": r.id}))
@@ -1102,20 +1105,24 @@ class Cockpit:
                     skipped += bs.skipped
             except Exception as exc:  # noqa: BLE001 - the gate panel never goes dark over a journal fault
                 notes.append(f"broker decisions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        overflowed = False
         if dec.consent is not None:
             try:
                 got = dec.consent(ctx.now)
                 built, bad = _consent_rows_in(got)
                 why = tuple((n, reason) for n, reason in (
-                    (got.skipped + bad, "consent request whose seal or stamps do not check out"),
-                    (got.overflow, "consent request past the pending cap, not read")) if n)
+                    (got.skipped + bad, "consent request whose seal or stamps do not check out"),) if n)
+                if got.overflow:
+                    overflowed = True
+                    notes.append("more than 200 consent requests are waiting: the soonest to expire are shown, "
+                                 "the rest are not read")
                 cs = self._read_snap(self._broker_dec_spec, Read(rows=tuple(built), skipped=why), ctx, now_iso)
                 rows += cs.rows or []
                 skipped += cs.skipped
             except Exception as exc:  # noqa: BLE001 - a consent-queue fault is a note, never a dark panel
                 notes.append(f"agent consent requests unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         rows = self._regroup(rows, ctx.today)
-        status = "partial" if skipped else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
+        status = "partial" if skipped or overflowed else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
             status = "stale"
         return _Snap(status, rows, None, filtered, skipped, min(as_ofs) if as_ofs else now_iso, None,
