@@ -3035,10 +3035,11 @@
       const btn = el("button", "undo-btn consent-details", "details");
       btn.type = "button";
       btn.title = "show how this request was answered";
+      let slot = null;  // one slot per row: a retry after a failed read reuses it rather than stacking another
       btn.addEventListener("click", () => {
         btn.disabled = true;
-        const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
-        row.appendChild(slot);
+        if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
+        slot.replaceChildren(document.createTextNode("reading the request\u2026"));
         consentBody(c).then((b) => {
           drawConsentBody(row, slot, b, false);
           if (b.error) btn.disabled = false;
