@@ -2843,6 +2843,7 @@
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
+      if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
         // an addressed row leads with `source -> for` ("everyone" when it names no reader)

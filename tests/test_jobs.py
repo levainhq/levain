@@ -319,7 +319,12 @@ class TestJobRuntime:
         rt = JobRuntime(s, max_concurrent=1)
         rt.submit("a", "consult", lambda: {"text": "a"}, lambda *a: None, _T0)
         _wait(lambda: s.read_status("a", _T0)["status"] == "done")
-        assert rt.submit("b", "consult", lambda: {"text": "b"}, lambda *a: None, _T0) is True
+        # 'done' is written BEFORE the worker's finally releases the semaphore, so wait for the
+        # SLOT, not for 'done': a rejected submit writes no record, so retrying is safe.
+        accepted: list = []
+        _wait(lambda: accepted.append(rt.submit("b", "consult", lambda: {"text": "b"},
+                                                lambda *a: None, _T0)) or accepted[-1])
+        assert accepted[-1] is True
         _wait(lambda: s.read_status("b", _T0)["status"] == "done")
 
     def test_submit_propagates_create_corruption(self, tmp_path: Path) -> None:
