@@ -8,6 +8,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 
+- **Codex's consent hook, as a library; no `levain` command installs it yet.** `levain.consent.adapters.codex` files Codex's `PermissionRequest` on the consent queue and tells Codex `allow` or `deny` only for a signed answer the queue verified; anything else prints nothing and Codex shows its own approval prompt. `install(workspace)` writes the hook into the workspace's `.codex/hooks.json`, keeping your other hooks. Levain never trusts the hook for you: Codex shows "Hooks need review" at its next start and you trust it there. `trust_status(workspace)` asks Codex itself whether the hook is trusted, untrusted, changed or disabled. An `apply_patch` into Codex or Claude Code config or hooks is filed for you alone, like any other agent-config edit; a patch whose file headers cannot be read is treated as one.
+- **`levain consent canary --agent claude_code|codex`** runs one short real agent turn in a new, empty scratch directory and passes only if the installed hook fired and its denial reached the agent (Codex runs under a terminal). It refuses a directory that is not new or empty, so it never touches a real project's hooks.
+- **The consent hooks pin the agent versions they were tested on** (Claude Code 2.1.300, Codex 0.162.1). Installing the Codex hook on another Codex version is refused unless you pass `allow_untested_agent_version`; `levain doctor` warns when an installed consent hook meets an untested version, a Codex trust state other than trusted, a hook script that is not levain's, or a settings entry that names a missing script.
+- Known edge: the Codex hook fires in interactive sessions only. `codex exec` never asks for approval, and `codex -C <dir>` does not load `<dir>/.codex/hooks.json` (Codex loads project hooks from the directory it runs in).
+- Known edge: after Codex runs a command levain allowed, Codex shows no "allowed by hook" text; the record of who allowed it is levain's receipt.
+- Known edge: a hook stopped while it waits (its agent session ended) leaves its request answerable until the hold ends; an answer then reaches no agent, though the receipt records it.
+- Known edge: the hook re-runs its interpreter with `-E -P` so nothing in the workspace or `PYTHONPATH` can stand in for levain; a levain importable only through `PYTHONPATH` therefore never answers (the agent's own prompt stands). Two `install` calls racing on one workspace can interleave.
+
+### Changed
+
+- **A cockpit row's project tag comes from its `repo` facet when it has one.** A provider that sets `repo` on a row tags that row with that repo, in the spelling your data first used, and its words are no longer read for a repo name; so a repo named like an ordinary word (`review`) no longer tags a row that only uses the word but belongs to another repo. A row with no `repo` facet is still tagged from its words, as before.
+- Known edge: levain's own list panels set no `repo` facet yet, so their rows are still tagged from their words. A facet the page has not registered as a repo (longer than 100 characters, or past the registry's limit) is ignored and the row falls back to its words.
+
+## [0.10.4] — 2026-10-15
+
+The consent queue's core and Claude Code adapter as a library, signed standing policy for the cockpit, doctor's hook pins, and the cockpit's phone layout, project hues and Decisions tile. No `levain` command installs the consent queue yet.
+
+### Added
+
 - **The consent queue's core and its Claude Code adapter, as a library; no `levain` command installs or shows them yet.** `levain.consent` files a request for a Claude Code `PermissionRequest` gate, keeps it in a store under `<levain home>/consent`, expires it, and delivers a decision only when it verifies as a signed answer against the cockpit's authority log (the row is never the authority; a signed answer uses the reserved SSHSIG namespace `levain-consent-answer`). With no verified answer the hook decides nothing and Claude Code shows its own dialog. `levain.consent.adapters.claude_code.install(workspace, ...)` writes the hook into a workspace's `.claude/settings.json`. Any request that would edit agent configuration or hooks (Claude Code and Codex settings and hook files, `.mcp.json`, `~/.claude.json`, `.claude/agents|skills|commands|plugins`, plugin hook files, levain's own installed code) is never answered by a policy; it waits for you. Policy answers, the Codex adapter and the cockpit's queue view are not built.
 
 ### Known edges

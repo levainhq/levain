@@ -480,15 +480,17 @@ def main(argv: list[str] | None = None) -> int:
 
     cs_p = subparsers.add_parser(
         "consent",
-        help="The consent queue's standing grants: answer an agent's permission prompt without asking.",
+        help="The cross-agent consent queue: its standing grants and its hook canary.",
         description=(
-            "A consent grant lets the consent queue answer a Claude Code or Codex permission prompt for you: "
-            "this agent, these exact tools, inside this workspace, under these permission modes, until it "
-            "expires (at most 30 days). It is a link in the cockpit's signed authority log. Shell commands "
-            "(Bash) are never granted: they always reach you. Edits of agent config or hooks always reach you."
+            "Commands for the consent queue levain runs for Claude Code and Codex. A consent grant lets the "
+            "queue answer an agent's permission prompt for you: this agent, these exact tools, inside this "
+            "workspace, under these permission modes, until it expires (at most 30 days). It is a link in the "
+            "cockpit's signed authority log. Shell commands (Bash) are never granted: they always reach you. "
+            "Edits of agent config or hooks always reach you. `canary` checks that an agent's hook fires."
         ),
     )
     cs_sub = cs_p.add_subparsers(dest="consent_cmd", required=True)
+    _add_consent_canary_parser(cs_sub)
     _add_consent_grant_parser(cs_sub, _ck_common)
 
     run_p = subparsers.add_parser(
@@ -1363,6 +1365,27 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     from levain.doctor import run_doctor
 
     return run_doctor(path=args.path, invoke=args.invoke, repin_hooks=args.repin_hooks)
+
+
+def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:
+    """`levain consent canary` (Q5), under the one `consent` parser; `levain consent grant` sits beside it."""
+    canary_p = consent_sub.add_parser(
+        "canary", help="Check that an agent's consent hook fires and its denial reaches the agent.",
+        description=(
+            "Run one real agent turn in a scratch workspace whose consent hook denies one sentinel write "
+            "(never allows anything). PASS only when the hook fired on it, the agent reported the denial and "
+            "the file was not written. Claude Code runs headless; Codex runs interactively under a pty "
+            "(it cannot fire PermissionRequest headless). It spends one short model turn."))
+    canary_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
+    canary_p.add_argument("--workspace", type=Path, default=None,
+                          help="Scratch workspace: a new or empty directory (default: a new temporary one).")
+    canary_p.set_defaults(func=_cmd_consent_canary)
+
+
+def _cmd_consent_canary(args: argparse.Namespace) -> int:
+    from levain.consent.canary import cli_canary
+
+    return cli_canary(args.agent, args.workspace)
 
 
 def _cmd_verify_hooks(args: argparse.Namespace) -> int:

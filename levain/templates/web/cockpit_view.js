@@ -211,6 +211,8 @@
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
         if (grouped) line.grp = grp;
+        const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
+        if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
         if (addressed) {
           const f = r.facets || {};
           // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no
@@ -1506,10 +1508,18 @@
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
       // the row means, or move a hue slot
       const had = clause.querySelector(":scope > .rp-tag");
-      let text = row.textContent;
-      if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
-      const hit = matchers.find(([, re]) => re.test(text));
-      const key = hit && sky.hueKey ? sky.hueKey(hit[0]) : "";
+      // a row with a structured `repo` facet the sky's registry knows is tagged from it alone, in the registry's
+      // spelling (so its length and count are the registry's bounds); any other row is read by its words
+      const facet = (row.dataset.repoFacet || "").toLowerCase();
+      const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
+      let hit;
+      if (known) hit = [known[0]];
+      else {
+        let text = row.textContent;
+        if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
+        hit = matchers.find(([, re]) => re.test(text));
+      }
+      const key = hit && sky && typeof sky.hueKey === "function" ? sky.hueKey(hit[0]) : "";
       if (had && key && had.textContent === hit[0]) { if (had.dataset.repo !== key) had.dataset.repo = key; continue; }
       if (!had && !key) continue;
       if (had) had.remove();
