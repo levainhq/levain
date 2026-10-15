@@ -1274,8 +1274,10 @@ class GitLedger:
                             + (msg[-1] if msg else f"exit {cp.returncode}")
                             + ". The signing key must be in ssh-agent or have no passphrase")
 
-    def confirm_own_key(self, d) -> bool:
-        """If this machine's key is PENDING for a member, move it into force with a commit signed by that key."""
+    def confirm_own_key(self, d, *, push: bool | None = None) -> bool:
+        """If this machine's key is PENDING for a member, move it into force with a commit signed by that key.
+        ``push`` None pushes when the clone has a remote; False commits here only (a caller that pushes on its own
+        bounded wait)."""
         from . import tenure as T
         fp = self.own_fingerprint()
         holder = next((h for h, lines in d.tenure.pending_keys.items()
@@ -1287,8 +1289,25 @@ class GitLedger:
             line = next(x for x in ten.pending_keys[holder] if T._fp_or_none(x) == fp)
             ten.pending_keys[holder] = [x for x in ten.pending_keys[holder] if x != line]
             ten.keys.setdefault(holder, []).append(line)
-        self.update_counted(confirm, f"levain team: {holder} confirms a key", push=bool(self.remote))
+        self.update_counted(confirm, f"levain team: {holder} confirms a key",
+                            push=bool(self.remote) if push is None else push)
         return True
+
+    def accept_offer(self, d, *, push: bool = True) -> str:
+        """Accept the live ownership offer in ``d``, made to the member whose key IN FORCE is this machine's: the
+        offeree becomes the owner and the offer is gone, in one counted change signed by that key. The one
+        implementation of the act (``levain team accept`` and the cockpit's accept both call it)."""
+        from . import tenure as T
+        off = d.tenure.offer
+        fp = self.own_fingerprint()
+        if not off or fp not in T.key_fps(d.tenure, off["handle"]):
+            raise TeamError("there is no live ownership offer to a member whose key in force is this machine's")
+
+        def accept(team: R.Team, ten) -> None:
+            team.owner = off["handle"]
+            team.members[off["handle"]] = off.get("email") or team.members[off["handle"]]
+            ten.offer = None
+        return self.update_counted(accept, f"levain team: {off['handle']} accepts ownership", push=push)
 
     def _require_own_key_in_force(self, author: str) -> None:
         from . import tenure as T
@@ -1967,6 +1986,22 @@ class GitLedger:
             return str(exc)
         except Exception as exc:  # noqa: BLE001 - a hook path: report, never raise
             return f"{type(exc).__name__}: {exc}"
+
+    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0) -> str:
+        """One sync now (a fetch and rebase; a push only when ``push``), for a caller that holds a person's request
+        open: the op is waited for ``op_wait`` seconds and each git network call gets ``timeout``, never the CLI's
+        minutes. A busy op raises TeamBusy and records nothing (it is not an attempt, as for ``fetch_if_due``); a
+        fetch that fails is recorded as ``last_fetch_error``, as the hook records one, and raised; a success is
+        stamped by the fetch itself."""
+        with self.op(timeout=op_wait):
+            try:
+                return self._sync_in_op(push=push, timeout=timeout, net_timeout=op_wait, lock_timeout=op_wait)
+            except TeamBusy:
+                raise
+            except TeamError as exc:
+                if not push:
+                    self.save_state(last_fetch_attempt=time.time(), last_fetch_error=str(exc))
+                raise
 
     # ---- canon ---------------------------------------------------------------------------------------------
 
