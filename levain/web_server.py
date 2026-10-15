@@ -1588,6 +1588,18 @@ def make_server(
     # A downstream T2/T3 verb's broker effect (K2b §13): an EffectStore and its canonical_effect, per
     # verb in extra_verbs. Refused here, pre-bind; a T2/T3 downstream verb without one is not_built.
     extra_effects = dict(extra_effects or {})
+    # The Team zone's verbs (TEAM_VIEW_PLAN T3): a fetch and a join accept over the ledger found from the install
+    # root, as the Team zone's panels are. Their names are the kernel's: a caller's verb or effect under one is
+    # refused, never overwritten by the merge (nor overwriting it).
+    from levain.team.cockpit_verbs import TEAM_VERB_NAMES, team_verbs
+
+    taken = sorted(n for n in TEAM_VERB_NAMES if n in extra_verbs or n in extra_effects)
+    if taken:
+        raise ValueError(f"refusing extra_verbs/extra_effects {taken}: those names are the Team zone's verbs")
+    if source.write_scope is not None and source.install_root is not None:
+        team_v, team_e = team_verbs(source.install_root)
+        extra_verbs.update(team_v)
+        extra_effects.update(team_e)
     stray = sorted(v for v in extra_effects if v not in extra_verbs)
     if stray:
         raise ValueError(f"refusing extra_effects {stray}: each must name a verb in extra_verbs")

@@ -149,6 +149,10 @@ class LedgerTransport(Protocol):
         """Fetch when the last fetch is older than ``interval``; returns a note when it could not, else None."""
         ...
 
+    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0) -> str:
+        """Sync now on bounded waits (a push only when ``push``); TeamBusy while another team operation holds it."""
+        ...
+
     # ---- identity ---------------------------------------------------------------------------------------------
     def handle(self, team: R.Team | None = None, *, d=None) -> str | None:
         """The member whose keys in force include this machine's key, or None (from ``d`` when the caller holds one)."""
@@ -167,8 +171,12 @@ class LedgerTransport(Protocol):
         ...
 
 
-    def confirm_own_key(self, d) -> bool:
+    def confirm_own_key(self, d, *, push: bool | None = None) -> bool:
         """If this machine's key is PENDING for a member, move it into force with a commit signed by that key."""
+        ...
+
+    def accept_offer(self, d, *, push: bool = True) -> str:
+        """Accept the live ownership offer to the member whose key in force is this machine's."""
         ...
 
     @staticmethod
