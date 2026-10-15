@@ -1470,53 +1470,58 @@
   }
   // ---- project colour: repo tags on rows that name a repo, and the Decisions signal ----
   // The repos are the install's own: every `repo` its data carries (a row's `repo` facet, an ambient event's `repo`),
-  // collected as panels are read. The package names none, so an install whose data names no repo shows no tags.
-  const userRepos = new Map();   // lower-cased name -> the name as the data spells it
-  const MAX_REPOS = 64;
-  let repoMatchers = null;   // built from userRepos on first use, dropped when a repo is added
-  function noteRepo(name) {
-    if (typeof name !== "string") return;
-    const n = visible(name).trim();
-    if (!n || n.length > 100 || userRepos.has(n.toLowerCase()) || userRepos.size >= MAX_REPOS) return;
-    userRepos.set(n.toLowerCase(), n);
-    repoMatchers = null;
-    if (root.LevainSky && root.LevainSky.noteRepo) root.LevainSky.noteRepo(n);   // the sky assigns the hue slots over the names it is given
-  }
+  // collected as panels are read into the sky's one registry (sky.js `noteRepo`), which also assigns their hues. The package
+  // names none, so an install whose data names no repo shows no tags.
   function noteRepos(panels) {
+    const sky = root.LevainSky;
+    if (!sky || !sky.noteRepo) return;
+    const note = (n) => { if (typeof n === "string") sky.noteRepo(visible(n)); };
     for (const p of Object.values(panels || {})) {
       if (!isObj(p)) continue;
-      for (const r of Array.isArray(p.rows) ? p.rows : []) if (isObj(r) && isObj(r.facets)) noteRepo(r.facets.repo);
+      for (const r of Array.isArray(p.rows) ? p.rows : []) if (isObj(r) && isObj(r.facets)) note(r.facets.repo);
       const ev = isObj(p.value) && Array.isArray(p.value.events) ? p.value.events : [];
-      for (const e of ev) if (isObj(e)) noteRepo(e.repo);
+      for (const e of ev) if (isObj(e)) note(e.repo);
     }
   }
-  // A row names a repo when its own words do: the whole name, not inside a longer word or path segment. The longest
-  // name is tried first, so `anneal-memory` wins over `anneal`.
-  function matchersOf() {
-    if (!repoMatchers) {
+  // A row names a repo when its own words do: the whole name, bounded by anything but a letter, digit, `_` or `-` (so
+  // `my-app` is not inside `my-apps`, while a path such as `x/my-app/y` still names it). The longest name is tried first,
+  // so `anneal-memory` wins over `anneal`. The registry only grows, so its size says when the list must be rebuilt.
+  let repoMatchers = [], matchersFor = -1;
+  function matchersOf(sky) {
+    const names = sky && sky.repos ? sky.repos() : [];
+    if (names.length !== matchersFor) {
       const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      repoMatchers = Array.from(userRepos.values()).sort((a, b) => b.length - a.length)
+      repoMatchers = names.slice().sort((a, b) => b.length - a.length)
         .map((n) => [n, new RegExp("(?:^|[^\\w-])" + esc(n) + "(?![\\w-])", "i")]);   // no lookbehind: Safari before 16.4 throws on one
+      matchersFor = names.length;
     }
     return repoMatchers;
   }
   function tintRepos() {
     const sky = root.LevainSky;
+    const matchers = matchersOf(sky);
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
       if (!clause) continue;
+      // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
+      // the row means, or move a hue slot
       const had = clause.querySelector(":scope > .rp-tag");
-      if (had) { const k = sky && sky.hueKey ? sky.hueKey(had.textContent) : ""; if (k && had.dataset.repo !== k) had.dataset.repo = k; continue; }   // a repo noted later can move a slot
-      const hit = matchersOf().find(([, re]) => re.test(row.textContent));
-      const key = hit && sky && sky.hueKey ? sky.hueKey(hit[0]) : "";
-      if (!key) continue;
-      const tag = el("span", "rp-tag", hit[0]);
-      tag.dataset.repo = key;
-      clause.insertBefore(tag, clause.firstChild);
-      // the tag can push a clause past its clamp after the clause toggles were measured: measure this row again
+      let text = row.textContent;
+      if (had && text.startsWith(had.textContent)) text = text.slice(had.textContent.length);
+      const hit = matchers.find(([, re]) => re.test(text));
+      const key = hit && sky.hueKey ? sky.hueKey(hit[0]) : "";
+      if (had && key && had.textContent === hit[0]) { if (had.dataset.repo !== key) had.dataset.repo = key; continue; }
+      if (!had && !key) continue;
+      if (had) had.remove();
+      if (key) {
+        const tag = el("span", "rp-tag", hit[0]);
+        tag.dataset.repo = key;
+        clause.insertBefore(tag, clause.firstChild);
+      }
+      // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
-    // the Decisions tile glows only while something waits on him
+    // the Decisions tile glows only while something waits on the operator
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
       const big = w.querySelector(".big");
       const n = big ? parseInt(big.textContent, 10) : 0;

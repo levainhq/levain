@@ -34,9 +34,11 @@
   function norm(repo) { return String(repo == null ? '' : repo).trim().toLowerCase(); }
   function noteRepo(repo) {
     var r = norm(repo);
-    if (!r || r.length > 100 || known[r] || nKnown >= MAX_KNOWN) return;
-    known[r] = true; nKnown++; slotOf = null;
+    if (!r || r.length > 100 || r in known || nKnown >= MAX_KNOWN) return;
+    known[r] = String(repo).trim(); nKnown++; slotOf = null;
   }
+  // the repos noted so far, as the data first spelled them (the row tags match these)
+  function repos() { return Object.keys(known).map(function (k) { return known[k]; }); }
   function hueKey(repo) {
     var r = norm(repo);
     if (!r) return '';
@@ -421,7 +423,7 @@
     };
   }
 
-  var api = { mount: mount, hueKey: hueKey, noteRepo: noteRepo, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
+  var api = { mount: mount, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();
