@@ -91,3 +91,24 @@ def test_a_text_editor_keeps_its_own_size_when_typed_in(tmp_path: Path) -> None:
       return { before, after: ta.offsetHeight, inline: ta.style.height }; })()"""}])
     got = vals[2]
     assert got["before"] > 0 and got["after"] == got["before"] and got["inline"] == "", got
+
+
+@needs_browser
+def test_the_clock_is_one_text_node_and_an_am_pm_at_every_hour_with_no_time_of_day_tint(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"until": "document.querySelector('.hero .clock')"}, {"eval": """(() => {
+      const c = document.querySelector('.hero .clock'); const small = c.querySelector('small');
+      return { kids: [...c.childNodes].map(n => n.nodeType + ':' + (n.nodeName)), colon: !!c.querySelector('.clock-colon'), tod: c.dataset.tod || '',
+        colonText: /^\\d{1,2}:\\d{2}$/.test(c.firstChild.textContent), ampm: small ? small.textContent : '' }; })()"""}])
+    got = vals[2]
+    assert got["kids"] == ["3:#text", "1:SMALL"] and got["colonText"] and not got["colon"] and got["tod"] == "" and got["ampm"] in ("am", "pm"), got
+
+
+@needs_browser
+def test_project_colour_is_the_product_with_no_variant_switch(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": """(() => {
+      const root = getComputedStyle(document.documentElement);
+      const stripe = document.querySelector('.ck-card.w[data-ck-panel="decisions"], .ck-card.w[data-ck-panel="memory"]');
+      return { variantAttr: document.documentElement.dataset.variant || '', levain: root.getPropertyValue('--hue-levain').trim(), anneal: root.getPropertyValue('--hue-anneal').trim(),
+        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', hues: window.LevainSky ? ['levain', 'anneal', 'wisp', 'income', 'zzz'].map(window.LevainSky.hueKey) : [] }; })()"""}])
+    got = vals[1]
+    assert got["variantAttr"] == "" and got["levain"] and got["anneal"] and got["stripeH"] == "2px" and got["hues"] == ["levain", "anneal", "games", "money", ""], got

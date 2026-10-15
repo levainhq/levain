@@ -19,7 +19,7 @@
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
-  // PREVIEW variants (the cockpit pass-2 colour trial): a repo's hue key, shared with the row tags in cockpit_view.js
+  // a repo's hue key, shared with the row tags in cockpit_view.js
   var HUE_KEYS = [['levain', /^levain/], ['anneal', /^anneal/], ['flow', /^flow/],
     ['games', /^(wisp|nowhere|squish|shatterbeat|solitaire|blackjack|video[-_ ]?poker|flowpoker)/], ['money', /^(income|arlington|clapham|invoice)/]];
   function hueKey(repo) {
@@ -27,7 +27,6 @@
     for (var i = 0; i < HUE_KEYS.length; i++) if (HUE_KEYS[i][1].test(r)) return HUE_KEYS[i][0];
     return '';
   }
-  function variant() { return typeof document !== 'undefined' ? (document.documentElement.dataset.variant || '') : ''; }
   var SHORT_LABELS = { memory: 'mem', decisions: 'dec' };   // by row id
   var FONT_MONO = '11px ui-monospace, "SF Mono", Menlo, monospace';
   var FONT_SEAT = '600 11.5px ui-rounded, -apple-system, sans-serif';
@@ -174,7 +173,7 @@
       return { base: css('--base', '#060912'), accent: css('--accent', '#ff8a3d'), contrast: css('--contrast', css('--text', '#f3f5f9')),
         label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a'),
         bad: css('--bad', '#e5484d'),
-        hues: variant() ? { levain: css('--hue-levain', ''), anneal: css('--hue-anneal', ''), flow: css('--hue-flow', ''), games: css('--hue-games', ''), money: css('--hue-money', '') } : null };
+        hues: { levain: css('--hue-levain', ''), anneal: css('--hue-anneal', ''), flow: css('--hue-flow', ''), games: css('--hue-games', ''), money: css('--hue-money', '') } };
     }
 
     function setToggle() {
@@ -277,7 +276,7 @@
         if (e.kind === 'commit') { g.globalAlpha = hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath(); g.arc(x, y, (hue ? 2 : 1.3) + hash01(e.t) * 0.9, 0, 7); g.fill(); }
         else if (e.kind === 'review') {
           g.globalAlpha = e.ok ? a * 0.8 : 1; g.lineWidth = e.ok ? 1.2 : 1.5;
-          var glow = !e.ok && variant() !== 'C';   // a failed review glows red in A and B; C keeps the orange ring
+          var glow = !e.ok;   // a failed review glows red
           g.strokeStyle = e.ok ? (hue || P.label) : (glow ? P.bad : P.accent);
           if (glow) { g.shadowColor = P.bad; g.shadowBlur = 12; g.lineWidth = 2; }
           g.beginPath(); g.arc(x, y, e.ok ? 2.8 : 3.6, 0, 7); g.stroke(); g.shadowBlur = 0;

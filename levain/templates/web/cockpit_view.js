@@ -1083,9 +1083,7 @@
   function setClock(c) {
     const d = new Date();
     const h = d.getHours();
-    // the clock's colon is its own node and the node carries the time of day, for the variant that tints them (B)
-    c.node.replaceChildren(document.createTextNode(String(h % 12 || 12)), el("span", "clock-colon", ":"), document.createTextNode(String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
-    c.node.dataset.tod = h >= 5 && h < 8 ? "dawn" : h >= 21 ? "night" : "day";
+    c.node.replaceChildren(document.createTextNode((h % 12 || 12) + ":" + String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
     c.date.textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
   }
   // the page's own clock (the hero's column), ticking whether or not a sky is mounted
@@ -1469,15 +1467,13 @@
       p.classList.toggle("ck-fold", none && !p.querySelector(".tray-dump, .ck-tabs, .edit-trigger-row"));
     }
   }
-  // ---- PREVIEW variants (cockpit pass-2 colour trial): repo tags on rows that name a repo, and the Decisions signal ----
+  // ---- project colour: repo tags on rows that name a repo, and the Decisions signal ----
   // A row names a repo when its own words do (a tag, the text); the tag is the first thing on the line. A production version would
   // read a structured repo facet from the provider instead of the row's words.
   const REPO_WORDS = [["levain", /\blevain\b/i], ["anneal", /\banneal(?:-memory)?\b/i], ["flow", /\bflow(?:connect)?\b/i],
     ["wisp", /\bwisp\b/i], ["squish", /\bsquish\b/i], ["nowhere", /\bnowhere\b/i], ["shatterbeat", /\bshatterbeat\b/i],
     ["income", /\b(?:income|invoice|rent|arlington)\b/i]];
   function tintRepos() {
-    const variant = document.documentElement.dataset.variant;
-    if (!variant) return;
     const sky = root.LevainSky;
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
@@ -1497,7 +1493,7 @@
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
-  if (typeof document !== "undefined" && document.documentElement && document.documentElement.dataset.variant) root.setInterval(tintRepos, 1500);
+  if (typeof document !== "undefined" && document.documentElement) root.setInterval(tintRepos, 1500);
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();

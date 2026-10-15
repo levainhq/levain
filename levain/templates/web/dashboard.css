@@ -1356,12 +1356,11 @@ body.ke .ck-zgrid > .panel.k-brief.ck-h-tall { height: auto; max-height: var(--c
 body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-height: 220px; }
 @media (pointer: coarse) { body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: var(--hit-min); } }
 
-/* ═══════════════════════════ PREVIEW VARIANTS A / B / C (the cockpit pass-2 colour trial; html[data-variant] is set by the preview proxy) ═══════════════════════════
+/* ═══════════════════════════ PROJECT COLOUR (one hue per project, carried everywhere a project shows) ═══════════════════════════
    One hue per project, carried everywhere a project shows. The hues are checked by a script, not eyeballed (text contrast on the card and
    pair distance under simulated protanopia, deuteranopia and tritanopia): run project_memory/1014-cockpit-pass2/hues.py; it exits 1 on a failure.
-   A = hues in the graph + repo tags on rows + a 2px stripe on panels tied to a project + two signals (a Decisions halo, a failed review glowing red).
-   B = A + a time-of-day tint on the clock's colon and am/pm. C = hues in the graph and the repo tags only: no stripes, no glow. */
-html[data-variant] {
+   The hues show in the graph and the repo tags on rows, a 2px stripe tops each panel tied to a project, and two signals stand out: a Decisions halo and a failed review glowing red. */
+html {
   --hue-levain: oklch(0.82 0.15 75); --hue-anneal: oklch(0.68 0.14 255); --hue-flow: oklch(0.66 0.21 350);
   --hue-games: oklch(0.94 0.17 105); --hue-money: oklch(0.76 0.13 165);
 }
@@ -1370,21 +1369,15 @@ html[data-variant] {
 .rp-tag[data-repo="levain"] { --tag: var(--hue-levain); } .rp-tag[data-repo="anneal"] { --tag: var(--hue-anneal); } .rp-tag[data-repo="flow"] { --tag: var(--hue-flow); }
 .rp-tag[data-repo="games"] { --tag: var(--hue-games); } .rp-tag[data-repo="money"] { --tag: var(--hue-money); }
 
-/* A and B: a 2px stripe across the top of a panel that belongs to one project */
-html:is([data-variant="A"], [data-variant="B"]) :is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="wraps"], [data-ck-panel^="section:"])::before { background: var(--hue-anneal); }
-html:is([data-variant="A"], [data-variant="B"]) :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--hue-levain); }
-html:is([data-variant="A"], [data-variant="B"]) :is([data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"])::before { background: var(--hue-flow); }
-html:is([data-variant="A"], [data-variant="B"]) :is(.ck-card.w, .ck-zgrid > .panel):is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="decisions"], [data-ck-panel="edits"],
+/* a 2px stripe across the top of a panel that belongs to one project */
+html :is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="wraps"], [data-ck-panel^="section:"])::before { background: var(--hue-anneal); }
+html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--hue-levain); }
+html :is([data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"])::before { background: var(--hue-flow); }
+html :is(.ck-card.w, .ck-zgrid > .panel):is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="decisions"], [data-ck-panel="edits"],
   [data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"])::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; }
 
-/* A and B: the Decisions tile carries a soft halo only while something waits on him; calm otherwise */
-html:is([data-variant="A"], [data-variant="B"]) .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
+/* the Decisions tile carries a soft halo only while something waits on him; calm otherwise */
+html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
   border-color: color-mix(in oklch, var(--accent) 55%, var(--hair));
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); }
-
-/* B: the clock's colon and am/pm take the time of day: cool before eight in the morning, neutral by day, warm from nine at night */
-html[data-variant="B"] .clock[data-tod="dawn"] { --tod: oklch(0.78 0.12 235); }
-html[data-variant="B"] .clock[data-tod="night"] { --tod: oklch(0.72 0.19 350); }
-html[data-variant="B"] body.ke .hero .clock small { color: var(--tod, var(--label)); }
-html[data-variant="B"] .clock .clock-colon { color: var(--tod, inherit); }
