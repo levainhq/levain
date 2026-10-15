@@ -145,13 +145,12 @@ _GRANT_VERBS = frozenset({"push", "fetch"})
 CONSENT_GRANT_KIND = "consent"
 _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "expires_at"})
 CONSENT_AGENTS = ("claude_code", "codex")
-# Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Claude
-# Code's shell tool is Bash, and Codex's PermissionRequest names its shell escalation Bash too (Q0 item 6, the one
-# name measured); the rest are unmeasured shell-tool names refused defensively until Q3 measures Codex's. Compared
-# case-insensitively.
-CONSENT_SHELL_TOOLS = frozenset({"bash", "shell", "local_shell", "exec_command", "unified_exec", "container.exec"})
+# Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Both agents
+# name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1, measured in Q0 item 6 and Q3).
+# Compared case-insensitively.
+CONSENT_SHELL_TOOLS = frozenset({"bash"})
 # The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
-# permission modes (Q0 measured ``default``); Codex: the one value measured (Q0 item 6); Q3 extends it.
+# permission modes (Q0 measured ``default``); Codex: the value its event carries (Q0 item 6, Q3: ``default``).
 CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({
     "claude_code": frozenset({"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}),
     "codex": frozenset({"default"}),

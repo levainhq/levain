@@ -11,7 +11,9 @@ grant names the request's agent, its exact tool, and the posture the agent's own
 posture matches nothing); the request's working directory resolves inside the grant's workspace; for a file tool
 (:data:`FILE_TOOLS`) every target path resolves inside it, and a file tool whose target cannot be read matches
 nothing; an MCP tool's path fields (:data:`MCP_PATH_FIELDS`), when it has any, likewise; and the grant has not
-expired. A tool with no target paths (WebFetch, an MCP tool without path fields) is matched on the working directory
+expired. Which tools are file tools, and how their targets are read, is per agent (:data:`AGENT_FILE_TOOLS`,
+:func:`register_targets`): Claude Code's are built in; Codex's ``apply_patch`` has its targets read by the Codex
+adapter's extractor, registered when that adapter is imported, and with no extractor registered it matches nothing. A tool with no target paths (WebFetch, an MCP tool without path fields) is matched on the working directory
 alone. The tool input the criteria read is the one the request's digest was computed from: the adapter passes it in,
 and a digest mismatch decides nothing.
 
@@ -33,8 +35,8 @@ if TYPE_CHECKING:
     from levain.consent.queue import ConsentQueue, Decision
     from levain.consent.record import ExternalGateRequest
 
-__all__ = ["AGENT_CONFIG_TIER", "FILE_TOOLS", "MCP_PATH_FIELDS", "Policy", "PolicyNotEligible", "decide",
-           "grant_refusal", "guarded_policy", "targets"]
+__all__ = ["AGENT_CONFIG_TIER", "AGENT_FILE_TOOLS", "FILE_TOOLS", "MCP_PATH_FIELDS", "Policy", "PolicyNotEligible",
+           "Targets", "decide", "grant_refusal", "guarded_policy", "register_targets", "targets"]
 
 # The tier an agent_config request is filed at: an allow then needs a key class covering T3.
 AGENT_CONFIG_TIER = "T3"
@@ -45,6 +47,10 @@ FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 MCP_PATH_FIELDS = ("file_path", "path", "paths", "notebook_path", "source", "destination")
 
 Policy = Callable[..., "Decision | None"]
+# (tool_name, tool_input) -> the target paths, or None when the tool names none
+Targets = Callable[[str, Any], "list[Any] | None"]
+# per agent, the tools whose targets are file paths: one whose targets cannot be read matches no grant
+AGENT_FILE_TOOLS: Mapping[str, frozenset[str]] = {"claude_code": FILE_TOOLS, "codex": frozenset({"apply_patch"})}
 
 
 class PolicyNotEligible(AssertionError):
@@ -66,6 +72,34 @@ def targets(tool_name: str, tool_input: Any) -> list[Any] | None:
             value = tool_input[field]
             out += value if isinstance(value, list) else [value]
     return out
+
+
+_TARGETS: dict[str, Targets] = {}
+
+
+def register_targets(agent: str, extract: Targets) -> None:
+    """Set how ``agent``'s request targets are read (the Codex adapter registers its ``apply_patch`` reader when it
+    is imported). Claude Code's is :func:`targets`. An agent with none registered: its file tools match nothing, and
+    an MCP tool's targets are read by :func:`targets`."""
+    _TARGETS[agent] = extract
+
+
+register_targets("claude_code", targets)
+
+
+def _request_targets(agent: str, tool_name: str, tool_input: Any) -> list[Any] | None:
+    """The target paths of a request, ``[None]`` (matches nothing) for a file tool whose targets cannot be read."""
+    file_tool = tool_name in AGENT_FILE_TOOLS.get(agent, frozenset())
+    extract = _TARGETS.get(agent)
+    if extract is None:
+        return [None] if file_tool else targets(tool_name, tool_input)
+    try:
+        got = extract(tool_name, tool_input)
+    except Exception:  # noqa: BLE001 - an extractor that fails reads no target: nothing matches
+        return [None]
+    if file_tool and (not isinstance(got, list) or not got):
+        return [None]
+    return got if isinstance(got, list) or got is None else [None]
 
 
 def _within(path: str, root: str) -> bool:
@@ -120,10 +154,8 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
         return "the workspace cannot be resolved"
     if not _within(cwd, root):
         return "the working directory is outside the grant's workspace"
-    paths = targets(request.tool_name, tool_input)
+    paths = _request_targets(request.agent, request.tool_name, tool_input)
     if paths is not None:
-        if request.tool_name in FILE_TOOLS and not paths:
-            return "a file tool with no target"
         for target in paths:
             where = _resolved(target, request.cwd)
             if where is None or not _within(where, root):

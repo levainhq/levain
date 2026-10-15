@@ -489,49 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     cs_sub = cs_p.add_subparsers(dest="consent_cmd", required=True)
-    cs_grant = cs_sub.add_parser("grant", help="Create, revoke and list consent grants.")
-    cs_grant_sub = cs_grant.add_subparsers(dest="grant_cmd", required=True)
-    cs_create = cs_grant_sub.add_parser(
-        "create",
-        help="Sign a consent grant (a laptop-presence key).",
-        description=(
-            "Append a signed create_grant link: from the next prompt on, a permission prompt from AGENT for one "
-            "of the named tools, under one of the named permission modes, whose working directory and every "
-            "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
-            "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
-            "directory alone. The log refuses a shell tool, a workspace of / or your home directory, and a life "
-            "over 30 days, before anything is signed."
-        ),
-    )
-    cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
-    cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
-                           help="An exact tool name (Edit, Write, WebFetch, mcp__server__tool); repeatable. "
-                                "No globs.")
-    cs_create.add_argument("--workspace", type=Path, required=True,
-                           help="The project directory the grant covers (resolved through symlinks).")
-    cs_create.add_argument("--posture", dest="postures", action="append", required=True, metavar="MODE",
-                           help="A permission mode the agent reports (Claude Code: default, acceptEdits, plan, "
-                                "auto, dontAsk, bypassPermissions); repeatable.")
-    cs_create.add_argument("--expires", required=True,
-                           help="A duration (30m, 12h, 7d; at most 30d) or a UTC time (2026-10-20T12:00:00Z).")
-    cs_create.add_argument("--id", dest="grant_id", default=None, help="The grant's id (default: cg-<random>).")
-    cs_create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
-                           help="An enrolled laptop-presence key that signs the grant (its private key file, or "
-                                "the .pub of a key an agent holds).")
-    _ck_common(cs_create)
-    cs_create.set_defaults(func=_cmd_consent_grant_create)
-    cs_revoke = cs_grant_sub.add_parser(
-        "revoke", help="Revoke a consent grant (any enrolled key).",
-        description="Append a signed revoke_grant link. From the next prompt on the grant answers nothing, and "
-                    "an answer it already gave is no longer delivered.")
-    cs_revoke.add_argument("grant_id", help="The grant's id, as `levain consent grant list` shows it.")
-    cs_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
-                           help="An enrolled key that signs the revoke.")
-    _ck_common(cs_revoke)
-    cs_revoke.set_defaults(func=_cmd_consent_grant_revoke)
-    cs_list = cs_grant_sub.add_parser("list", help="List the consent grants the authority log holds.")
-    _ck_common(cs_list)
-    cs_list.set_defaults(func=_cmd_consent_grant_list)
+    _add_consent_grant_parser(cs_sub, _ck_common)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1773,6 +1731,54 @@ def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
+
+
+def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object) -> None:
+    """``levain consent grant create|revoke|list`` under the ``consent`` subparsers ``cs_sub``; ``common`` adds
+    the cockpit commands' ``--path`` / ``--data-root``."""
+    cs_grant = cs_sub.add_parser("grant", help="Create, revoke and list consent grants.")
+    cs_grant_sub = cs_grant.add_subparsers(dest="grant_cmd", required=True)
+    cs_create = cs_grant_sub.add_parser(
+        "create",
+        help="Sign a consent grant (a laptop-presence key).",
+        description=(
+            "Append a signed create_grant link: from the next prompt on, a permission prompt from AGENT for one "
+            "of the named tools, under one of the named permission modes, whose working directory and every "
+            "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
+            "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
+            "directory alone. The log refuses a shell tool, a workspace of / or your home directory, and a life "
+            "over 30 days, before anything is signed."
+        ),
+    )
+    cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
+    cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
+                           help="An exact tool name (Edit, Write, WebFetch, mcp__server__tool; Codex: "
+                                "apply_patch); repeatable. No globs; never Bash.")
+    cs_create.add_argument("--workspace", type=Path, required=True,
+                           help="The project directory the grant covers (resolved through symlinks).")
+    cs_create.add_argument("--posture", dest="postures", action="append", required=True, metavar="MODE",
+                           help="A permission mode the agent reports (Claude Code: default, acceptEdits, plan, "
+                                "auto, dontAsk, bypassPermissions; Codex: default); repeatable.")
+    cs_create.add_argument("--expires", required=True,
+                           help="A duration (30m, 12h, 7d; at most 30d) or a UTC time (2026-10-20T12:00:00Z).")
+    cs_create.add_argument("--id", dest="grant_id", default=None, help="The grant's id (default: cg-<random>).")
+    cs_create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled laptop-presence key that signs the grant (its private key file, or "
+                                "the .pub of a key an agent holds).")
+    common(cs_create)
+    cs_create.set_defaults(func=_cmd_consent_grant_create)
+    cs_revoke = cs_grant_sub.add_parser(
+        "revoke", help="Revoke a consent grant (any enrolled key).",
+        description="Append a signed revoke_grant link. From the next prompt on the grant answers nothing, and "
+                    "an answer it already gave is no longer delivered.")
+    cs_revoke.add_argument("grant_id", help="The grant's id, as `levain consent grant list` shows it.")
+    cs_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled key that signs the revoke.")
+    common(cs_revoke)
+    cs_revoke.set_defaults(func=_cmd_consent_grant_revoke)
+    cs_list = cs_grant_sub.add_parser("list", help="List the consent grants the authority log holds.")
+    common(cs_list)
+    cs_list.set_defaults(func=_cmd_consent_grant_list)
 
 
 def _grant_expiry(text: str) -> object:
