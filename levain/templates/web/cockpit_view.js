@@ -935,7 +935,10 @@
     return svg;
   }
 
-  function paintReading(host, v) {
+  // opts (a glance tile only): rows = how many band sub-readings to draw, age = whether the "read ... ago" line is drawn
+  function paintReading(host, v, opts) {
+    const cap = opts && opts.rows != null ? opts.rows : Infinity;
+    let drawn = 0;
     const top = el("div", "rd wx-main");
     const icon = weatherIcon(v.symbol);
     icon.setAttribute("data-ck-weather", "icon");
@@ -967,6 +970,7 @@
     host.appendChild(top);
     for (const sub of subs) {
       if (!(typeof sub.band === "string" && sub.band)) continue;
+      if (drawn++ >= cap) continue;
       const token = bandOf(sub.band);
       const row = el("div", "aqi band-" + (token || "other"));
       row.appendChild(bars());
@@ -979,14 +983,20 @@
       if (typeof sub.detail === "string" && sub.detail) host.appendChild(el("div", "wx-src", sub.detail));
     }
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
-    if (age) host.appendChild(el("div", "wx-src", "read " + age));
+    if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src", "read " + age));
   }
 
   // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
   const WIDGET_DOTS = 4, WIDGET_FIGURES = 4;
   const figure = (n) => Number.isInteger(n) ? n.toLocaleString("en-US") : isNum(n) ? String(Number(n.toPrecision(3))) : String(n);
+  // A glance tile draws what fits and says how much more is behind it. `s.budget` is how many items the tile may draw (null = all
+  // the static caps allow); `s.units` is how many it could draw, `s.hidden` how many it does not (a "+N more" line), `s.clamp` whether
+  // a run of text had to be cut to two lines. fitWidget() finds the budget that fits the tile's real height.
+  const moreNote = (host, n) => { if (n > 0) host.appendChild(el("div", "xnote", "+" + n + " more")); };
   function paintWidget(s, host) {
     const d = s.data;
+    const cap = s.budget == null ? Infinity : s.budget;
+    s.units = 0; s.hidden = 0;
     if (d.face === "count") {
       const n = isNum(d.count) ? d.count : (d.lines || []).length;
       host.appendChild(el("div", "big num", n));
@@ -1008,37 +1018,106 @@
       // whole numbers first (they read as the headline figures), then the fractional and the written ones, each in the provider's order
       const rest = ms.filter((m) => !isDot(m) && m.value != null);
       const figs = rest.filter((m) => Number.isInteger(m.value)).concat(rest.filter((m) => !Number.isInteger(m.value)));
-      if (dots.length) {
+      const dotsAll = dots.slice(0, WIDGET_DOTS), figsAll = figs.slice(0, WIDGET_FIGURES);
+      s.units = dotsAll.length + figsAll.length;
+      // the dots keep the room first; the figures give way first
+      const nd = Math.min(dotsAll.length, cap), nf = Math.min(figsAll.length, Math.max(0, cap - nd));
+      if (nd) {
         const box = el("div", "dots");
-        paintStatusDots(box, dots.slice(0, WIDGET_DOTS));
+        paintStatusDots(box, dotsAll.slice(0, nd));
         host.appendChild(box);
       }
-      if (figs.length) {
+      if (nf) {
         const row = el("div", "row");
-        for (const m of figs.slice(0, WIDGET_FIGURES)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
+        for (const m of figsAll.slice(0, nf)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
         host.appendChild(row);
       }
-      const hidden = Math.max(0, dots.length - WIDGET_DOTS) + Math.max(0, figs.length - WIDGET_FIGURES);
-      if (hidden) host.appendChild(el("div", "xnote", "+" + hidden + " more"));
+      s.hidden = ms.length - nd - nf;
+      moreNote(host, s.hidden);
       if (!ms.length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
       return;
     }
     if (d.kind === "metric-grid") {
       const ns = d.numbers || [];
+      s.units = ns.length;
+      const shown = ns.slice(0, cap);
       // the first number is the headline, its label beside it; the others follow as a row of figure and label
-      if (ns[0]) {
+      if (shown[0]) {
         const head = el("div", "bigrow");
-        head.append(el("div", "big num", figure(ns[0].value)), el("span", "bl", ns[0].label + (ns[0].unit ? " (" + ns[0].unit + ")" : "")));
+        head.append(el("div", "big num", figure(shown[0].value)), el("span", "bl", shown[0].label + (shown[0].unit ? " (" + shown[0].unit + ")" : "")));
         host.appendChild(head);
       }
       const row = el("div", "row");
-      ns.slice(1).forEach((n) => { const c = el("span"); c.append(el("b", "num", figure(n.value)), document.createTextNode(n.label + (n.unit ? " (" + n.unit + ")" : ""))); row.appendChild(c); });
-      if (ns.length > 1) host.appendChild(row);
+      shown.slice(1).forEach((n) => { const c = el("span"); c.append(el("b", "num", figure(n.value)), document.createTextNode(n.label + (n.unit ? " (" + n.unit + ")" : ""))); row.appendChild(c); });
+      if (shown.length > 1) host.appendChild(row);
+      s.hidden = ns.length - shown.length;
+      moreNote(host, s.hidden);
       return;
     }
-    if (d.kind === "reading") { paintReading(host, d.reading); return; }
-    for (const l of d.lines || []) host.appendChild(el("div", "sub", l.text));
-    if (!(d.lines || []).length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+    if (d.kind === "reading") {
+      const r = d.reading || {};
+      const bands = (Array.isArray(r.sub) ? r.sub : []).filter((x) => typeof x.band === "string" && x.band).length;
+      s.units = bands;
+      paintReading(host, r, { rows: cap, age: !s.noAge });
+      s.hidden = Math.max(0, bands - cap);
+      moreNote(host, s.hidden);
+      return;
+    }
+    const ls = d.lines || [];
+    s.units = ls.length;
+    for (const l of ls.slice(0, cap)) host.appendChild(el("div", "sub", l.text));
+    s.hidden = Math.max(0, ls.length - cap);
+    moreNote(host, s.hidden);
+    if (!ls.length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+  }
+
+  // Draw a glance tile at the largest budget that fits the room it really has (its height is fixed on a wide page and grows with
+  // its content on a phone), so nothing is cut by the tile's bottom edge. What does not fit is counted, and the tile says so to
+  // whoever opens it: a "levain-hidden" event on the tile's body, with the number hidden (0 = nothing behind it).
+  function fitWidget(s) {
+    const box = s.p;
+    const fits = () => box.scrollHeight <= box.clientHeight + 1;
+    s.fitting = true;
+    try {
+      s.budget = null; s.noAge = false; s.clamp = false;
+      paintBody(s);
+      if (!fits()) {
+        s.noAge = true; paintBody(s);
+        let b = s.units;
+        while (!fits() && b > 0) { b--; s.budget = b; paintBody(s); }
+        if (!fits()) { s.clamp = true; s.body.classList.add("clamped"); }
+      }
+    } finally { s.fitting = false; }
+    const n = s.hidden || (s.clamp ? 1 : 0);
+    if ((box.dataset.ckHidden || "0") !== String(n)) {
+      box.dataset.ckHidden = String(n);
+      if (typeof root.CustomEvent === "function" && typeof box.dispatchEvent === "function") box.dispatchEvent(new root.CustomEvent("levain-hidden", { bubbles: true, detail: n }));
+    }
+  }
+  // the room a tile has is only known once it is laid out and while it keeps its size: the first fit runs on attach, and a
+  // ResizeObserver on the tile's body fits it again whenever its width (a figure row wraps differently) or its room changes
+  function fitWidgets(region) {
+    for (const s of Array.from(states)) {
+      if (!(s.ctx.widget && s.p && s.body.isConnected && region.contains(s.p))) continue;
+      fitWidget(s);
+      if (!s.ro && typeof root.ResizeObserver === "function") {
+        s.ro = new root.ResizeObserver(() => { if (s.body.isConnected && !s.fitting) fitWidget(s); });
+        s.ro.observe(s.p);
+      }
+    }
+  }
+
+  // The focus view of a metric list (status-dots, metric-grid): every metric, and a filter box once the list is long enough to want one.
+  const FILTER_MIN = 8;
+  function paintFiltered(s) {
+    const d = s.data, dots = d.kind === "status-dots";
+    const all = (dots ? d.metrics : d.numbers) || [];
+    const terms = termsOf(s.query);
+    const hay = (m) => fold([m.label, m.value, m.unit, m.read, m.status].filter((x) => x != null).join(" "));
+    const ms = terms.length ? all.filter((m) => hits(hay(m), terms)) : all;
+    if (s.countEl) s.countEl.textContent = terms.length ? ms.length + " of " + all.length : all.length + " metrics";
+    if (!ms.length) { s.body.appendChild(el("p", "empty", terms.length ? "no match" : d.empty)); return; }
+    if (dots) paintStatusDots(s.body, ms); else paintGrid(s.body, ms);
   }
 
   function paintGrid(host, numbers) {
@@ -1123,6 +1202,7 @@
     root.clearTimeout(s.timer);
     s.seq++;
     dropSky(s);
+    if (s.ro) { s.ro.disconnect(); s.ro = null; }
     states.delete(s);
   }
   function skyCounts(sky) {
@@ -1255,7 +1335,11 @@
       big.appendChild(el("span", "cq-l", "waiting"));
       p.appendChild(big);
     }
-    if (s.searchable) p.appendChild(buildFilter(s));
+    // the focus view of a long metric list carries the same filter box a long list does (and starts unfiltered: a saved query would hide metrics)
+    const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
+    s.filterable = !!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN;
+    if (s.filterable) s.query = "";
+    if (s.searchable || s.filterable) p.appendChild(buildFilter(s));
     p.appendChild(s.body);
     s.setQuery = (q, now) => setQuery(s, q, now);
     s.paint = () => paint(s);
@@ -1295,7 +1379,11 @@
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
-    if (s.ctx.widget) { paintWidget(s, s.body); return; }
+    if (s.ctx.widget) {
+      if (!s.fitting && s.p && s.body.isConnected) fitWidget(s); else paintWidget(s, s.body);
+      return;
+    }
+    if (s.filterable) { paintFiltered(s); return; }
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length && !s.ctx.alerted) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
@@ -1667,7 +1755,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
+  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

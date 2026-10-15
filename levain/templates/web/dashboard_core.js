@@ -125,6 +125,7 @@
   // modal's episode search across refresh-rebuilds (the supersede — see renderEpisodes).
   let currentView = null;
   let modalKey = null;
+  let modalGlance = false;   // the open view came from a glance tile: it shows that tile's own typed panel, whatever the entry's kind
   let modalReturnFocus = null;
   let modalEpisodeQuery = "";
   // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
@@ -599,6 +600,7 @@
     const region = document.getElementById("ck-widgets");
     const entries = view.ke.widgets.map((id) => byId.get(id)).filter(Boolean);
     const cards = [];
+    const fitLines = [];
     for (const e of entries) {
       const data = (view.extra_panels || {})[e.id] || {};
       const node = el("div", "ck-card w");
@@ -608,28 +610,61 @@
       // the card is the node the page grades; the typed mount inside it carries the kind class
       body.removeAttribute("data-ck-panel"); body.removeAttribute("data-ck-kind");
       node.appendChild(body);
-      // a count tile is one answer with a list behind it: it opens that list in the focus modal (a button, so the keyboard reaches it)
-      if (data.face === "count" && data.typed && !data.error) {
-        node.classList.add("w-open");
-        node.tabIndex = 0;
-        node.setAttribute("role", "button");
-        node.setAttribute("aria-haspopup", "dialog");
-        node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
-        // the entry as the page holds it now: a refetch since this tile was drawn may have changed its rows and its title
-        const open = () => openModal(findEntry(currentView, entryKey(e)) || e, node);
-        node.addEventListener("click", open);
-        node.addEventListener("keydown", (ev) => {
-          if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
-          ev.preventDefault();
-          open();
-        });
-      }
+      // a count tile is one answer with a list behind it: it opens that list in the focus modal (a button, so the keyboard reaches it).
+      // Any other tile that does not draw everything it has (a "+N more", a clipped run of text) is the same kind of button: the
+      // fit pass in cockpit_view.js says so with a "levain-hidden" event on the tile's body, and the focus view shows all of it.
+      const open = () => openModal(findEntry(currentView, entryKey(e)) || e, node, true);
+      const onKey = (ev) => {
+        if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
+        ev.preventDefault();
+        open();
+      };
+      const setOpenable = (on) => {
+        node.classList.toggle("w-open", on);
+        if (on) {
+          node.tabIndex = 0;
+          node.setAttribute("role", "button");
+          node.setAttribute("aria-haspopup", "dialog");
+          // the entry as the page holds it now: a refetch since this tile was drawn may have changed its rows and its title
+          node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
+        } else { node.removeAttribute("tabindex"); node.removeAttribute("role"); node.removeAttribute("aria-haspopup"); node.removeAttribute("aria-label"); }
+      };
+      node.addEventListener("click", () => { if (node.classList.contains("w-open")) open(); });
+      node.addEventListener("keydown", (ev) => { if (node.classList.contains("w-open")) onKey(ev); });
+      if (data.face === "count" && data.typed && !data.error) setOpenable(true);
+      else if (data.typed && !data.error) node.addEventListener("levain-hidden", (ev) => { if (ev.target === body) setOpenable(ev.detail > 0); });
+      else if (!data.typed && !data.error && Array.isArray(data.lines) && data.lines.length) fitLines.push(() => fitLineTile(body, setOpenable));
       cards.push(node);
     }
     region.replaceChildren(...cards);
     region.hidden = !entries.length;
+    for (const f of fitLines) f();
+    if (window.LevainCockpitKinds && window.LevainCockpitKinds.fitWidgets) window.LevainCockpitKinds.fitWidgets(region);   // after attach: the room a tile has is only known on the page
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
     region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
+  }
+
+  // An untyped lines tile (rows the page draws itself) draws the rows that fit the tile and counts the rest in a "+N more" line, then
+  // is a button to the whole list; a single row too tall for the tile is cut to two lines. It is fitted again when its room changes.
+  function fitLineTile(body, setOpenable) {
+    const rows = Array.from(body.children);
+    const fit = () => {
+      if (!body.isConnected) return;
+      body.classList.remove("clamped");
+      body.replaceChildren(...rows);
+      const fits = () => body.scrollHeight <= body.clientHeight + 1;
+      let shown = rows.length, note = null;
+      while (!fits() && shown > 1) {
+        shown--;
+        body.replaceChildren(...rows.slice(0, shown));
+        note = el("div", "xnote", "+" + (rows.length - shown) + " more");
+        body.appendChild(note);
+      }
+      if (!fits()) body.classList.add("clamped");
+      setOpenable(shown < rows.length || body.classList.contains("clamped"));
+    };
+    fit();
+    if (typeof ResizeObserver === "function") new ResizeObserver(fit).observe(body);
   }
 
   function ckPlaceholder(entry) {
@@ -772,6 +807,8 @@
   }
 
   function renderPanel(entry, view, opts) {
+    // a glance tile opens its own typed panel in full, not the zone card of the same name
+    if (opts && opts.glance && ((view.extra_panels || {})[entry.id] || {}).typed) return renderExternal(entry, view, opts);
     switch (entry.kind) {
       case "health": return renderHealth(entry, view);
       case "graph": return renderGraph(entry, view);
@@ -3067,7 +3104,8 @@
     return b;
   }
 
-  function openModal(entry, triggerEl) {
+  function openModal(entry, triggerEl, glance) {
+    modalGlance = !!glance;
     modalKey = entryKey(entry);
     modalReturnFocus = triggerEl || null;
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
@@ -3080,7 +3118,7 @@
   // body, so editing works in-place exactly as the grid does. NOT clamped — the
   // .modal-body is the scroll container, so the content reads at full height.
   function modalContent(entry, view) {
-    const p = renderPanelSafe(entry, view, { modal: true });
+    const p = renderPanelSafe(entry, view, { modal: true, glance: modalGlance });
     if (!p) return null;
     const host = el("div", "modal-panel");
     const phead = p.querySelector(".phead");
@@ -3191,6 +3229,7 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
+    modalGlance = false;
     let rf = modalReturnFocus;
     modalReturnFocus = null;
     // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
