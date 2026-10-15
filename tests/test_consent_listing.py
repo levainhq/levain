@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.consent.listing import UNSHOWN, audit_line, consent_targets, filed_input, read_listing
+from levain.consent.listing import (TOO_LONG, UNSHOWN, audit_line, consent_targets, entry_body, filed_input, find_entry,
+                                    read_listing)
 from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
 
 T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -87,3 +88,28 @@ def test_the_shared_readers_show_the_targets_and_an_unreadable_display(tmp_path)
                  tool_input={"file_path": "/w/b", "content": "x" * 50000}, cwd="/w", hold=timedelta(minutes=5),
                  event_id="e9")
     assert filed_input(big) is UNSHOWN
+
+
+def test_a_request_whose_display_is_cut_offers_no_commands(tmp_path):
+    q = _queue(tmp_path, lambda: T0)
+    short = _file(q, "e1")
+    big = q.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                 tool_input={"file_path": "/w/b", "content": "x" * 50000}, cwd="/w", hold=timedelta(minutes=5),
+                 event_id="e9")
+    got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
+    cut = entry_body(find_entry(got, big.id))
+    assert cut["answer_allow"] is None and cut["answer_deny"] is None and cut["note"] == TOO_LONG
+    whole = entry_body(find_entry(got, short.id))
+    assert whole["answer_deny"] == f"levain consent answer {short.id} deny --signing-key <key>" and whole["note"] == ""
+    assert find_entry(got, "pend-unknown") is None
+
+
+def test_pending_past_the_cap_is_counted_not_read(tmp_path, monkeypatch):
+    import levain.consent.listing as listing
+
+    monkeypatch.setattr(listing, "PENDING_CAP", 2)
+    q = _queue(tmp_path, lambda: T0)
+    for i in range(3):
+        _file(q, f"e{i}")
+    got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
+    assert len(got.pending) == 2 and got.overflow == 1 and got.skipped == 0

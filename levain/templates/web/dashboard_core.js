@@ -2921,6 +2921,57 @@
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done("copied"), select);
     else select();
   }
+  // The request itself (what is asked, where, the answer commands) is not in the token-free panel: it is fetched
+  // from /cockpit/consent/<id>.json with the token this page holds, on every bind. A body never changes while
+  // its request keeps one state, so one fetch per request and state serves every redraw.
+  const consentBodies = new Map();
+  const CONSENT_NEEDS_TOKEN = "open this page with its token to see the request";
+  function consentBody(c) {
+    const key = c.id + "|" + c.state;
+    if (consentBodies.has(key)) return consentBodies.get(key);
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NEEDS_TOKEN });
+    const got = fetch("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
+      .then((res) => {
+        if (res.status === 403) return { error: CONSENT_NEEDS_TOKEN };
+        if (res.status === 404) return { error: "this request is no longer listed" };
+        if (!res.ok) return { error: "the request could not be read (HTTP " + res.status + ")" };
+        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }));
+      }, () => ({ error: "the request could not be read (network)" }))
+      .then((b) => { if (b.error) consentBodies.delete(key); return b; });
+    consentBodies.set(key, got);
+    return got;
+  }
+  function drawConsentBody(row, slot, b, pending) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const parts = [el("pre", "consent-display", sv(b.display))];
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
+    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
+    parts.push(facts);
+    if (sv(b.note)) parts.push(el("div", "consent-note ext-meta", sv(b.note)));
+    if (!pending && sv(b.audit)) {
+      const audit = row.querySelector(".consent-audit");
+      if (audit) audit.textContent = sv(b.audit);
+    }
+    if (pending) {
+      for (const [label, cmd] of [["allow", sv(b.answer_allow)], ["deny", sv(b.answer_deny)]]) {
+        if (!cmd) continue;
+        const line = el("div", "consent-cmd");
+        const code = el("code", "consent-code", cmd);
+        const btn = el("button", "undo-btn consent-copy", "copy " + label);
+        btn.type = "button";
+        btn.dataset.label = btn.textContent;
+        btn.title = "copy the " + label + " command; run it in a terminal with your signing key";
+        btn.addEventListener("click", () => copyText(cmd, code, btn));
+        line.append(code, btn);
+        parts.push(line);
+      }
+    }
+    slot.replaceChildren(...parts);
+  }
   function consentRow(o) {
     const c = o.consent;
     const pending = c.state === "pending";
@@ -2935,28 +2986,13 @@
       left.dataset.consentExpires = c.expiresAt;
       head.appendChild(left);
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
-    } else head.appendChild(el("span", "consent-audit", c.audit || c.state));
+    } else head.appendChild(el("span", "consent-audit", c.state));
+    if (c.age) head.appendChild(el("span", "ext-meta", "filed " + c.age));
     row.appendChild(head);
-    row.appendChild(el("pre", "consent-display", c.display));
-    const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "cwd " + c.cwd));
-    facts.appendChild(el("span", "ext-meta", "targets " + c.targets));
-    if (c.age) facts.appendChild(el("span", "ext-meta", "filed " + c.age));
-    row.appendChild(facts);
-    if (pending) {
-      for (const [label, cmd] of [["allow", c.allow], ["deny", c.deny]]) {
-        if (!cmd) continue;
-        const line = el("div", "consent-cmd");
-        const code = el("code", "consent-code", cmd);
-        const b = el("button", "undo-btn consent-copy", "copy " + label);
-        b.type = "button";
-        b.dataset.label = b.textContent;
-        b.title = "copy the " + label + " command; run it in a terminal with your signing key";
-        b.addEventListener("click", () => copyText(cmd, code, b));
-        line.append(code, b);
-        row.appendChild(line);
-      }
-    }
+    const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
+    row.appendChild(slot);
+    if (c.id) consentBody(c).then((b) => drawConsentBody(row, slot, b, pending));
+    else slot.textContent = "this request has no id";
     return row;
   }
 

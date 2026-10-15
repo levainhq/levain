@@ -98,16 +98,11 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "unapplied": ("list[str]", _is_str_list),
     "cancelled_by": ("str|null", _opt(_is_str)),
     # Q6a: an agent's consent request in the decisions panel (levain.consent.listing); `agent`, `at`, `due`
-    # and `expires_at` are registered above. `via` is how a decided one was answered (signature | grant)
+    # and `expires_at` are registered above. The request's body is never a facet: the panel is token-free on
+    # loopback, so the body is served only to a token holder (web_server's /cockpit/consent/<id>.json)
     "tool": ("str", _is_str),
     "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn")),
-    "via": ("str|null", _opt(_is_str)),
-    "cwd": ("str", _is_str),
-    "targets": ("str", _is_str),
     "consent_tier": ("str", _is_str),
-    "answer_allow": ("str", _is_str),
-    "answer_deny": ("str", _is_str),
-    "audit": ("str", _is_str),
 }
 
 

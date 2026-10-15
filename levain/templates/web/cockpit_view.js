@@ -235,14 +235,14 @@
                             route: typeof c.route === "string" ? c.route : "" };
           }
         }
-        // an agent's consent request (levain.consent.listing): everything the row draws comes from its facets and
-        // body, all drawn as text; the countdown is the page's, counted from expires_at
-        if (typeof r.id === "string" && r.id.indexOf("consent:") === 0) {
+        // an agent's consent request (levain.consent.listing), in the kernel's decisions panel only: the row carries
+        // who asks, for what tool, its state and times; the request itself is fetched with the page's token
+        // (dashboard_core.js consentRow). Everything is drawn as text; the countdown is the page's, from expires_at
+        if (head.id === "decisions" && typeof r.id === "string" && r.id.indexOf("consent:") === 0) {
           const f = r.facets || {};
           const sv = (x) => (typeof x === "string" ? x : "");
-          line.consent = { agent: sv(f.agent), tool: sv(f.tool), state: sv(f.consent_state), via: sv(f.via), tier: sv(f.consent_tier),
-                           cwd: sv(f.cwd), targets: sv(f.targets), expiresAt: sv(f.expires_at), audit: sv(f.audit),
-                           display: sv(r.body), allow: sv(f.answer_allow), deny: sv(f.answer_deny),
+          line.consent = { id: r.id.slice("consent:".length), agent: sv(f.agent), tool: sv(f.tool), state: sv(f.consent_state),
+                           tier: sv(f.consent_tier), expiresAt: sv(f.expires_at),
                            age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "" };
         }
         return line;

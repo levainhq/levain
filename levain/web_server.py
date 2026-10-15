@@ -127,6 +127,13 @@ from levain.writes import (
 # The one write route of the shared cockpit (design §4.1). ``/edit`` and ``/action`` are its aliases:
 # all three end in ``levain.cockpit.verbs.dispatch``.
 _COCKPIT_VERB_PATH = "/cockpit/verb"
+# One agent consent request's body (Q6a): GET /cockpit/consent/<request_id>.json. The decisions panel is
+# token-free on loopback, so it carries no request body; this route serves it, and requires a surface token on
+# EVERY bind, loopback included, for the reason /chat does (the CHAT factor below): another OS user, a sandboxed
+# app or a container can reach loopback, and a Bash command's text is not something redaction masks.
+_CONSENT_BODY_PREFIX = "/cockpit/consent/"
+_CONSENT_BODY_SUFFIX = ".json"
+_CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 _WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
 # The broker's pending routes (K2b design §1, §3.2, §3.5): POST /cockpit/pending/<id>/signature and
 # POST /cockpit/pending/<id>/cancel. They ride the same write gate as _WRITE_ROUTES.
@@ -343,6 +350,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
+# Prefixes no downstream extra route may live under (the consent body route is one path per request id).
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX,)
 
 
 _TEAM_VIEWS_GATE = threading.BoundedSemaphore(2)
@@ -630,6 +639,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
     # EVERY bind for every write, since 127.0.0.1 is reachable by every local uid. Name -> token.
     surface_tokens: dict[str, str]
+    # Q6a: ``fn(now)`` -> the consent queue's read-only listing, shared by the decisions panel and the body route
+    consent_reader: Callable[[datetime], Any]
     verb_registry: VerbRegistry
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
@@ -696,7 +707,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     built.attach_authority(self.broker.capture)    # authority, labels and tiers per request
                     built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
                     built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
-                built.attach_consent_rows(_consent_reader())    # agents waiting on the operator (Q6a)
+                built.attach_consent_rows(self.consent_reader)    # agents waiting on the operator (Q6a)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -810,6 +821,39 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _serve_consent_body(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/consent/<request_id>.json``: one listed consent request's body (``entry_body``). Reached
+        only through ``_route`` (Host allowlist, cross-site refusal, off-box gate), then a surface token is
+        required on every bind, judged by the one compare every token check here uses (``_credential``).
+        Read-only: the id is looked up in the read-only listing over the queue the decisions panel reads;
+        an unknown id is 404 and nothing is written."""
+        from urllib.parse import unquote
+
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"a consent request's details need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        request_id = unquote(path[len(_CONSENT_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
+        status, payload = 404, {"error": "not_found", "message": "no such consent request listed"}
+        if _CONSENT_ID.fullmatch(request_id):
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                from levain.consent.listing import entry_body, find_entry
+
+                entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
+                if entry is not None:
+                    status, payload = 200, entry_body(entry)
+            except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
+                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+            finally:
+                self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _peer_open(self) -> bool:
         """False once the client has closed its end. A stream never reads the request body, so any readable
         byte-less state is the peer hanging up."""
@@ -907,6 +951,10 @@ class _Handler(GuardedHandler):
                 status=403,
                 head=head,
             )
+            return
+
+        if path.startswith(_CONSENT_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
+            self._serve_consent_body(path, head=head)
             return
 
         if is_cockpit_path(path):
@@ -1465,7 +1513,7 @@ def make_server(
         # Case-INSENSITIVE reserved check: /EDIT must be refused as a near-collision even
         # though exact-string routing would treat it as a distinct path — defense against a
         # future case-folding normalization.
-        if path.lower() in _reserved_lower:
+        if path.lower() in _reserved_lower or path.lower().startswith(_RESERVED_PREFIXES):
             raise ValueError(
                 f"refusing extra route {path!r}: it collides with a built-in route "
                 "(a dashboard asset, the JSON reads, or /edit) and may not be overridden."
@@ -1606,8 +1654,10 @@ def make_server(
         cockpit.attach_edits_reader(httpd.broker.edits)
         # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
         cockpit.attach_decision_rows(httpd.broker.decision_rows)
+    # one reader over one queue directory for the decisions panel's rows and the consent body route alike
+    httpd.consent_reader = _consent_reader()
     if cockpit is not None:
-        cockpit.attach_consent_rows(_consent_reader())      # agents waiting on the operator (Q6a)
+        cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address

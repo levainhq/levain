@@ -6,8 +6,8 @@ purpose: the queue's constructor path creates the directory and the schema, and 
 missing directory or file is "no consent queue here" (an empty listing), nothing is created, nothing is
 swept, nothing is written.
 
-The rows are an index, never authority (``queue.py``'s own docstring): a request whose seal does not match
-is skipped and counted, and a pending request past its expiry that nobody has swept reads as ``expired``
+The rows are an index, never authority (``queue.py``'s own docstring): a request whose seal does not match,
+or whose timestamps do not parse, is skipped and counted, and a pending request past its expiry that nobody has swept reads as ``expired``
 here, for display only. What a request means (``display``) is already ``redact_display``'s output.
 
 This module also holds the two readers the terminal and the page share, so both show the same thing:
@@ -28,12 +28,14 @@ from typing import Any
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.record import ExternalGateRequest
 
-__all__ = ["ConsentEntry", "ConsentListing", "RECENT", "RECENT_CAP", "UNSHOWN", "audit_line", "consent_targets",
-           "filed_input", "read_listing"]
+__all__ = ["ConsentEntry", "ConsentListing", "PENDING_CAP", "RECENT", "RECENT_CAP", "UNSHOWN", "audit_line",
+           "consent_targets", "entry_body", "filed_input", "find_entry", "read_listing"]
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
 RECENT_CAP = 50
+PENDING_CAP = 200                   # pending rows read per listing; the rest are counted, never drawn
 UNSHOWN = object()
+TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
 
 _REQUEST_FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display",
                    "cwd", "tier", "received_at", "expires_at")
@@ -83,11 +85,13 @@ class ConsentEntry:
 
 @dataclass(frozen=True)
 class ConsentListing:
-    """``pending`` oldest first; ``recent`` newest first, at most :data:`RECENT_CAP`; ``skipped`` the rows whose
-    seal did not match."""
+    """``pending`` oldest first; ``recent`` newest first, at most :data:`RECENT_CAP`; ``skipped`` the rows that do
+    not check out (a seal that does not match, a stamp that does not parse); ``overflow`` the pending requests
+    past :data:`PENDING_CAP`, not read."""
     pending: tuple[ConsentEntry, ...] = ()
     recent: tuple[ConsentEntry, ...] = ()
     skipped: int = 0
+    overflow: int = 0
 
 
 def audit_line(entry: ConsentEntry) -> str:
@@ -103,6 +107,30 @@ def audit_line(entry: ConsentEntry) -> str:
     if entry.state == "withdrawn":
         return "withdrawn"
     return entry.state
+
+
+def find_entry(listing: ConsentListing, request_id: str) -> ConsentEntry | None:
+    """The listed request with this id, or None (unknown, past the listing's day, or skipped)."""
+    for e in (*listing.pending, *listing.recent):
+        if e.request.id == request_id:
+            return e
+    return None
+
+
+def entry_body(entry: ConsentEntry) -> dict[str, Any]:
+    """What the page shows of one request beyond its panel row: the request as filed, where, what it names, how
+    to answer it from a terminal, and, once decided, how it was. Served only to a caller holding a surface token
+    (``web_server``'s consent route), never in the token-free panel. A request whose display is cut at its limit
+    offers no commands: ``levain consent answer`` refuses to sign what it cannot show."""
+    r = entry.request
+    pending = entry.state == "pending"
+    answerable = pending and filed_input(r) is not UNSHOWN
+    return {"id": r.id, "agent": r.agent, "tool": r.tool_name, "tier": r.tier, "state": entry.state,
+            "display": r.display, "cwd": r.cwd, "targets": consent_targets(r),
+            "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
+            "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>" if answerable else None,
+            "note": TOO_LONG if pending and not answerable else "",
+            "audit": "" if pending else audit_line(entry)}
 
 
 def _check_directory(directory: Path) -> None:
@@ -143,16 +171,25 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         return ConsentListing()
     stamp = utc_stamp(now)
     horizon = utc_stamp(now - RECENT)
-    cols = ", ".join(_REQUEST_FIELDS)
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=5.0)
+    cols = ", ".join(_REQUEST_FIELDS) + ", state, decided_at, answer, signer_fp, via"
+    # a short busy wait: the page's read worker never stalls on a writer holding the database
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
     try:
         conn.execute("BEGIN")
         fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
         if fmt is None or fmt[0] != STORE_FORMAT:
             raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
+        # both reads are bounded and indexed (requests_pending, requests_decided): the queue's whole history is
+        # never scanned. Past the cap, the latest-expiring pending are kept, so a live request is not crowded out
+        # by a day of unswept expired ones
+        n_pending = conn.execute("SELECT count(*) FROM requests WHERE state = 'pending' AND expires_at >= ?",
+                                 (horizon,)).fetchone()[0]
         rows = conn.execute(
-            f"SELECT {cols}, state, decided_at, answer, signer_fp, via FROM requests "
-            "WHERE state = 'pending' OR decided_at >= ? ORDER BY received_at, rowid", (horizon,)).fetchall()
+            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at >= ? "
+            "ORDER BY expires_at DESC, rowid DESC LIMIT ?", (horizon, PENDING_CAP)).fetchall()
+        rows += conn.execute(
+            f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
+            "ORDER BY decided_at DESC LIMIT ?", (horizon, RECENT_CAP)).fetchall()
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -165,7 +202,13 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         try:
             request = ExternalGateRequest(**fields)
             sealed = request.seal_matches()
-        except Exception:  # noqa: BLE001 - a row that does not even build is a row that does not match
+            # the seal says the fields are as filed, not that they were filed through create(): a self-sealed
+            # row with a stamp that does not parse is skipped here, never compared or dated downstream
+            parse_stamp(request.received_at)
+            parse_stamp(request.expires_at)
+            if decided_at is not None:
+                parse_stamp(decided_at)
+        except Exception:  # noqa: BLE001 - a row that does not even build, or does not date, is skipped
             sealed = False
         if not sealed:
             skipped += 1
@@ -178,5 +221,6 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         elif decided_at is not None and decided_at >= horizon:
             gid = _grant_id_of(answer) if via == "grant" else None
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at))
+    pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
-    return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped)
+    return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped, max(0, n_pending - PENDING_CAP))

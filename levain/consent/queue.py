@@ -93,6 +93,8 @@ _SCHEMA = (
     "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT, "
     "via TEXT CHECK (via IS NULL OR via IN ('signature','grant')))",
     "CREATE INDEX IF NOT EXISTS requests_pending ON requests (state, expires_at)",
+    # the cockpit's read-only listing reads the last day's decided requests by this (levain.consent.listing)
+    "CREATE INDEX IF NOT EXISTS requests_decided ON requests (decided_at)",
     # a hook's own event id names one permission event: a retry of it, at any time, is refused
     "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
     "WHERE event_id LIKE 'hook:%'",

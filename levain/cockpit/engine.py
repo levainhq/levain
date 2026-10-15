@@ -120,8 +120,7 @@ DECISION_ORDER = "decision.queue"
 KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
-                                    "agent", "tool", "consent_state", "via", "cwd", "targets", "consent_tier",
-                                    "answer_allow", "answer_deny", "audit"})
+                                    "agent", "tool", "consent_state", "consent_tier"})
 
 
 def _canon(obj: Any) -> bytes:
@@ -431,29 +430,30 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
     return rows
 
 
-def _consent_rows_in(got: Any) -> list[RowIn]:
+def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
     """The consent queue's listing (``levain.consent.listing.ConsentListing``) as rows: ``consent:<request_id>``
-    per request an agent waits on, and per one decided in the last day. Built only from the sealed request;
-    the row never carries the time left (the page counts down from ``expires_at``), so its version does not
-    change every second."""
-    from levain.consent.listing import audit_line, consent_targets
-
+    per request an agent waits on, and per one decided in the last day, with the count of entries that did not
+    build (each row is built on its own, so one bad entry never blanks the rest). A row carries who asks, for
+    which tool, its tier, state and times, and nothing of the request's body: the display, cwd, targets, answer
+    commands and how it was answered are served only to a token holder (``/cockpit/consent/<id>.json``), since
+    this panel is token-free on loopback. The row never carries the time left (the page counts down from
+    ``expires_at``), so its version does not change every second."""
     rows: list[RowIn] = []
+    bad = 0
     for e in (*got.pending, *got.recent):
-        r = e.request
-        pending = e.state == "pending"
-        facets: dict[str, Any] = {
-            "agent": r.agent, "tool": r.tool_name, "consent_state": e.state, "via": e.via,
-            "expires_at": r.expires_at, "due": _due_of(r.expires_at), "at": r.received_at if pending else e.decided_at,
-            "cwd": r.cwd, "targets": consent_targets(r), "consent_tier": r.tier,
-            "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>",
-            "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>",
-            "audit": "" if pending else audit_line(e)}
-        rows.append(RowIn(
-            id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{r.agent} \u00b7 {r.tool_name}", body=r.display, facets=facets,
-            stored={"state": e.state, "expires_at": r.expires_at, "via": e.via, "decided_at": e.decided_at,
-                    "signer_fp": e.signer_fp, "grant_id": e.grant_id, "request": r.id}))
-    return rows
+        try:
+            r = e.request
+            pending = e.state == "pending"
+            facets: dict[str, Any] = {
+                "agent": r.agent, "tool": r.tool_name, "consent_state": e.state, "consent_tier": r.tier,
+                "expires_at": r.expires_at, "due": _due_of(r.expires_at),
+                "at": r.received_at if pending else e.decided_at}
+            rows.append(RowIn(
+                id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{r.agent} \u00b7 {r.tool_name}", facets=facets,
+                stored={"state": e.state, "expires_at": r.expires_at, "decided_at": e.decided_at, "request": r.id}))
+        except Exception:  # noqa: BLE001 - one entry that does not build is skipped and counted
+            bad += 1
+    return rows, bad
 
 
 class Cockpit:
@@ -1105,10 +1105,11 @@ class Cockpit:
         if dec.consent is not None:
             try:
                 got = dec.consent(ctx.now)
-                cs = self._read_snap(self._broker_dec_spec, Read(
-                    rows=tuple(_consent_rows_in(got)),
-                    skipped=((got.skipped, "consent request whose seal does not match"),) if got.skipped else ()),
-                    ctx, now_iso)
+                built, bad = _consent_rows_in(got)
+                why = tuple((n, reason) for n, reason in (
+                    (got.skipped + bad, "consent request whose seal or stamps do not check out"),
+                    (got.overflow, "consent request past the pending cap, not read")) if n)
+                cs = self._read_snap(self._broker_dec_spec, Read(rows=tuple(built), skipped=why), ctx, now_iso)
                 rows += cs.rows or []
                 skipped += cs.skipped
             except Exception as exc:  # noqa: BLE001 - a consent-queue fault is a note, never a dark panel
@@ -1147,7 +1148,7 @@ class Cockpit:
         fn = self._dec.consent
         if fn is None:
             return Absent("no consent queue")
-        for r in _consent_rows_in(fn(ctx.now)):
+        for r in _consent_rows_in(fn(ctx.now))[0]:
             if r.id == row_id:
                 return Read(rows=(r,))
         return Absent(f"decision {row_id!r} is gone")

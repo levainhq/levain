@@ -1,6 +1,10 @@
 """Agents' consent requests in the decisions panel (Q6a): composed by the kernel, grouped, never a dark panel."""
 from __future__ import annotations
 
+import json
+import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,9 +45,7 @@ def test_consent_rows_group_pending_first_counted_and_terminal_resolved(tmp_path
     assert p["count"] == 1
     f = by_id[f"consent:{waiting.id}"]["facets"]
     assert f["agent"] == "claude_code" and f["tool"] == "Bash" and f["consent_state"] == "pending"
-    assert f["answer_allow"] == f"levain consent answer {waiting.id} allow --signing-key <key>"
-    assert by_id[f"consent:{waiting.id}"]["body"] == waiting.display
-    assert by_id[f"consent:{done.id}"]["facets"]["audit"] == "withdrawn"
+    assert by_id[f"consent:{done.id}"]["facets"]["consent_state"] == "withdrawn"
     one = ck.read_one("decisions", f"consent:{waiting.id}").value
     assert one["id"] == f"consent:{waiting.id}" and isinstance(ck.read_one("decisions", "consent:nope"), Absent)
 
@@ -72,6 +74,27 @@ def test_a_reader_fault_is_a_note_not_a_dark_panel_and_no_queue_adds_no_note(tmp
     assert p2["rows"] == [] and "consent" not in p2.get("note", "")
 
 
+def test_a_self_sealed_row_with_a_malformed_stamp_is_skipped_and_the_others_still_list(tmp_path):
+    from levain.consent.record import ExternalGateRequest
+
+    qdir, waiting, done = _filed(tmp_path)
+    # the right shape, an impossible date: create() refuses it, but a raw writer can seal it itself
+    fields = dict(agent="codex", agent_session_id="s9", event_id="raw", tool_name="Bash", tool_input_digest="d",
+                  display="Bash {}", cwd="/w", tier="t", received_at=waiting.received_at,
+                  expires_at="2026-99-99T99:99:99.999999Z")
+    rid = ExternalGateRequest._seal(**fields)
+    conn = sqlite3.connect(qdir / "queue.db", isolation_level=None)
+    conn.execute(f"INSERT INTO requests (id, {', '.join(fields)}) VALUES (?{', ?' * len(fields)})",
+                 (rid, *fields.values()))
+    conn.close()
+    ck = _ck()
+    ck.attach_consent_rows(lambda now: read_listing(qdir, now=now))
+    p = ck.panel("decisions", credential_class="token")
+    assert {r["id"] for r in p["rows"]} == {f"consent:{waiting.id}", f"consent:{done.id}"}
+    assert "unavailable" not in p.get("note", "")
+    assert any("consent" in str(s.get("reason")) and s.get("count") == 1 for s in p["skipped"])
+
+
 def test_a_downstream_row_with_a_consent_id_is_skipped(tmp_path):
     ck = _ck()
     ck.attach_decision_source(ProviderSpec(
@@ -92,6 +115,56 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser          # noqa
 from tests.test_cockpit_k2a import _install, _serve                        # noqa: E402
 
 TILE = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Decisions waiting/i.test(c.innerText))"
+MARK_CMD, MARK_CWD = "zq-cmd-marker-7731", "/w/zq-cwd-marker-4419"
+
+
+def _get(url: str, token: str | None = None) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, headers={"X-Levain-Write-Token": token} if token is not None else {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 - loopback
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _home_queue(tmp_path, monkeypatch) -> ConsentQueue:
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    return ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None))
+
+
+def test_the_token_free_panel_and_manifest_carry_no_request_body_on_loopback(tmp_path, monkeypatch):
+    q = _home_queue(tmp_path, monkeypatch)
+    r = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": f"echo {MARK_CMD}"},
+               cwd=MARK_CWD, hold=timedelta(minutes=5), event_id="m1")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
+        st, panel = _get(f"{url}/cockpit/panel/decisions.json")
+        st2, manifest = _get(f"{url}/cockpit/manifest.json")
+    assert st == 200 and st2 == 200
+    assert f"consent:{r.id}".encode() in panel                     # the row is there ...
+    for blob in (panel, manifest):                                 # ... and nothing of what it asks
+        assert MARK_CMD.encode() not in blob and b"zq-cwd-marker" not in blob
+        assert b"levain consent answer" not in blob and b"signing-key" not in blob
+
+
+def test_the_consent_body_route_needs_the_token_on_loopback_and_answers_with_it(tmp_path, monkeypatch):
+    q = _home_queue(tmp_path, monkeypatch)
+    r = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": f"echo {MARK_CMD}"},
+               cwd=MARK_CWD, hold=timedelta(minutes=5), event_id="m2")
+    _root, src, _ids = _install(tmp_path)
+    route = f"/cockpit/consent/{urllib.request.quote(r.id, safe='')}.json"
+    with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
+        none, no_body = _get(url + route)
+        wrong, _ = _get(url + route, token="not-T")
+        ok, body = _get(url + route, token="T")
+        gone, _ = _get(url + "/cockpit/consent/pend-nope.json", token="T")
+    assert (none, wrong, ok, gone) == (403, 403, 200, 404)
+    assert MARK_CMD.encode() not in no_body
+    b = json.loads(body)
+    assert MARK_CMD in b["display"] and b["cwd"] == MARK_CWD and b["state"] == "pending"
+    assert b["answer_allow"] == f"levain consent answer {r.id} allow --signing-key <key>"
 
 
 @needs_browser
@@ -109,7 +182,7 @@ def test_the_page_draws_a_consent_request_as_text_with_a_countdown_and_copy_butt
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
             {"eval": f"{TILE}.click(); 1"},
-            {"until": "document.querySelector('#levain-modal .consent-row')"},
+            {"until": "document.querySelector('#levain-modal .consent-row .consent-code')"},
             {"eval": "(() => { const m = document.getElementById('levain-modal'); const row = m.querySelector('.consent-row');"
                      " return [row.querySelector('.consent-agent').textContent, row.querySelector('.consent-tool').textContent,"
                      " row.querySelector('.consent-left').textContent, row.querySelector('.consent-display').textContent,"
