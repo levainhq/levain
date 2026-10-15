@@ -191,8 +191,33 @@ def _sync_rows(snap: TeamSnapshot) -> tuple[RowIn, ...]:
     return tuple(RowIn(id=i, title=t, stored={"title": t}) for i, t in lines)
 
 
+def _member_rows(members: list[dict]) -> tuple[RowIn, ...]:
+    out = []
+    for m in members:
+        who = _one_line(m["handle"]) + (" (you)" if m.get("you") else "")
+        keys = f"{m['keys']} key{'s' if m['keys'] != 1 else ''}" if m["keys"] else ""
+        body = _one_line(" · ".join(p for p in (m["role"], m["key_state"] + (f" ({keys})" if keys else ""),
+                                                f"since {m['since']}" if m.get("since") else "") if p))
+        if m["key_state"] == "no key":
+            body = _one_line(body + " · cannot sign")
+        out.append(RowIn(id=f"member:{m['handle']}", title=who, body=body, stored={"title": who, "body": body}))
+    return tuple(out)
+
+
+def _join_rows(joins: list[dict]) -> tuple[RowIn, ...]:
+    out = []
+    for j in joins:
+        title = _one_line(f"{j['kind']} · {j['handle']}")
+        body = _one_line(" · ".join(p for p in (j.get("line"), j.get("fingerprint")) if p))
+        out.append(RowIn(id=f"join:{j['kind']}:{j['handle']}:{j.get('fingerprint') or ''}", title=title, body=body,
+                         stored={"title": title, "body": body}))
+    return tuple(out)
+
+
 _PANES: tuple[tuple[str, str, str, str, int, int, Callable[[TeamSnapshot], tuple[RowIn, ...]]], ...] = (
     # id, title, empty line, size, span, rank, rows from the snapshot
+    ("team-members", "Members", "No members on team.toml.", "medium", 1, 5,
+     lambda sn: _member_rows(sn.read.model["members"])),
     ("team-waiting", "Waiting on you", "Nothing is waiting on you.", "medium", 1, 10,
      lambda sn: _entry_rows(sn.read.model["waiting"])),
     ("team-stopped", "Where agents were stopped", "No acknowledged rulings yet.", "medium", 1, 20,
@@ -201,6 +226,8 @@ _PANES: tuple[tuple[str, str, str, str, int, int, Callable[[TeamSnapshot], tuple
      lambda sn: _entry_rows(sn.read.model["held"])),
     ("team-canon", "In force", "Nothing is in force yet.", "tall", 2, 40,
      lambda sn: _canon_rows(sn.read.model["in_force"])),
+    ("team-joins", "Joins pending", "No joins are waiting.", "short", 1, 45,
+     lambda sn: _join_rows(sn.read.model["joins"])),
     ("team-sync", "Sync", "", "short", 1, 50, _sync_rows),
 )
 

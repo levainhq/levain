@@ -6,7 +6,7 @@ from pathlib import Path
 
 from levain.team.reader import read_team
 from levain.team.transport import LEGACY_BRANCH, GitLedger, Repo
-from tests.test_team_git import BRANCH, _keys, git, record_ruling, sign_as, signed_commit, team, two  # noqa: F401,F811  (fixtures: pytest finds them by name in this module)
+from tests.test_team_git import BRANCH, KEYS, _keys, clone as _clone_of, join, git, record_ruling, sign_as, signed_commit, team, two  # noqa: F401,F811  (fixtures: pytest finds them by name in this module)
 
 
 def _gl(repo: Path) -> GitLedger:
@@ -92,3 +92,58 @@ def test_one_read_uses_one_derivation_for_the_team_the_judgement_and_the_handle(
     # one derivation for the whole read: the team, the judgement, the handle and the canon text all come from it. The
     # canon read re-derived at the current trust state before, so an accept-merge between the two reads mixed judgements
     assert r.state == "ok" and calls == [None], calls
+
+
+# ---- members and joins pending (1015+18): who is on the team and what waits on whom, from the same derivation -----
+
+
+def _all_keys(obj) -> set[str]:
+    out: set[str] = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.add(str(k))
+            out |= _all_keys(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            out |= _all_keys(v)
+    return out
+
+
+def test_members_lists_the_owner_first_with_roles_keys_and_no_email_anywhere(two):
+    tmp, ana, ben = two
+    r = read_team(_gl(ben))
+    assert r.state == "ok" and r.model is not None
+    rows = r.model["members"]
+    assert [(m["handle"], m["role"], m["you"], m["key_state"]) for m in rows] == [
+        ("ana", "owner", False, "in force"), ("ben", "member", True, "in force")]
+    assert all(m["keys"] >= 1 for m in rows) and rows[0]["since"] is None or rows[0]["since"]
+    assert r.model["joins"] == []
+    assert not {k for k in _all_keys(r.model["members"] + r.model["joins"]) if "mail" in k.lower()}
+    assert "ben@ex.com" not in str(r.model["members"] + r.model["joins"])
+
+
+def test_a_proposed_key_is_a_join_waiting_on_its_owner_until_they_confirm_it(two):
+    tmp, ana, ben = two
+    assert team("member", "add", "cat", "cat@ex.com", "--key", str(KEYS["cat"]), repo=ana) == 0
+    r = read_team(_gl(ana))
+    cat = [m for m in r.model["members"] if m["handle"] == "cat"][0]
+    assert cat["key_state"] == "waiting for confirm" and cat["keys"] == 0
+    (j,) = r.model["joins"]
+    assert (j["kind"], j["handle"]) == ("key", "cat") and j["fingerprint"].startswith("SHA256:")
+    assert "levain team key confirm" in j["line"] and "cat@ex.com" not in str(r.model)
+    cc = _clone_of(tmp, "cat", "cat@ex.com")
+    assert join(cc, "cat") == 0 and team("sync", repo=ana) == 0
+    r2 = read_team(_gl(ana))
+    cat2 = [m for m in r2.model["members"] if m["handle"] == "cat"][0]
+    assert r2.model["joins"] == [] and cat2["key_state"] == "in force"
+
+
+def test_an_ownership_offer_is_a_join_row_until_it_is_withdrawn(two):
+    tmp, ana, ben = two
+    assert team("owner", "ben", repo=ana) == 0 and team("sync", repo=ben) == 0
+    r = read_team(_gl(ben))
+    (j,) = r.model["joins"]
+    assert (j["kind"], j["handle"]) == ("owner-offer", "ben") and "levain team accept" in j["line"] and "you" in j["line"].lower()
+    assert team("accept", repo=ben) == 0
+    r2 = read_team(_gl(ben))
+    assert r2.model["joins"] == [] and r2.model["members"][0]["handle"] == "ben"
