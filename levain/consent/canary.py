@@ -36,9 +36,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from levain.launch import child_env
+
 AGENTS = ("claude_code", "codex")
 AGENT_BINS = {"claude_code": "claude", "codex": "codex"}
 AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
+# The one credential variable each agent may need beyond levain's allowlist (an operator on an API key).
+AGENT_KEY_VARS = {"claude_code": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY"}
 # The agent versions the consent adapters were run against (`claude --version`, `codex --version`).
 TESTED_VERSIONS: dict[str, tuple[str, ...]] = {"claude_code": ("2.1.300",), "codex": ("0.162.1",)}
 ALLOW_FLAG = "--allow-untested-agent-version"
@@ -59,7 +63,7 @@ def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.
         return None
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=timeout,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL, env=child_env())
     except (OSError, subprocess.SubprocessError):
         return None
     m = _VERSION.search(out.stdout or "")
@@ -223,9 +227,6 @@ def _verdict(agent: str, version: str | None, ws: Path, sentinel: Path, record: 
     return CanaryResult(agent, version, "PASS" if ok else "FAIL", detail + (f"; {extra}" if extra else ""), str(ws))
 
 
-def _agent_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
-
 
 def run_claude_canary(*, workspace: Path | None = None, timeout: float = 240.0,
                       model: str = "haiku") -> CanaryResult:
@@ -239,7 +240,7 @@ def run_claude_canary(*, workspace: Path | None = None, timeout: float = 240.0,
     try:
         proc = subprocess.run([binary, "-p", prompt, "--model", model, "--setting-sources", "project,local",
                                "--permission-mode", "default", "--output-format", "stream-json", "--verbose"],
-                              cwd=ws, env=_agent_env(), capture_output=True, text=True, timeout=timeout,
+                              cwd=ws, env=child_env(AGENT_KEY_VARS["claude_code"]), capture_output=True, text=True, timeout=timeout,
                               stdin=subprocess.DEVNULL)
         stream = proc.stdout
     except subprocess.TimeoutExpired as exc:
@@ -268,7 +269,6 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
     answers an update prompt, a folder-trust prompt or a hooks-review screen: any of them is a FAIL that says so."""
     import pty
     import select
-    import signal
     version = agent_version("codex")
     binary = shutil.which("codex")
     if not binary:
@@ -278,17 +278,21 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
               "single line: canary . If it needs approval, request it. If it is denied, do not retry; stop.")
     argv = [binary, "--dangerously-bypass-hook-trust", "-c", "check_for_update_on_startup=false",
             "-c", f'projects={{"{ws}"={{trust_level="trusted"}}}}', prompt]
-    pid, fd = pty.fork()
-    if pid == 0:  # pragma: no cover - the child
-        try:
-            os.chdir(ws)
-            import fcntl
-            import struct
-            import termios
-            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
-            os.execve(binary, argv, {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")})
-        finally:
-            os._exit(127)
+    import fcntl
+    import struct
+    import termios
+    fd, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
+    try:
+        # A new session whose controlling terminal is the pty: Codex's TUI opens /dev/tty.
+        proc = subprocess.Popen(argv, cwd=ws, env=child_env(AGENT_KEY_VARS["codex"]), stdin=slave, stdout=slave,
+                                stderr=slave, start_new_session=True,
+                                preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        os.close(slave)
     buf = b""
     stop = ""
     deadline = time.monotonic() + timeout
@@ -322,10 +326,7 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
     finally:
         # Keep reading while the child exits, and close the pty before reaping it: on macOS a process exiting on a
         # pty waits for its output to drain, so a reap with nobody reading never returns.
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        proc.terminate()
         end = time.monotonic() + 1.5
         while time.monotonic() < end:
             ready, _, _ = select.select([fd], [], [], 0.2)
@@ -336,14 +337,8 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
                 except OSError:
                     break
         os.close(fd)
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+        proc.kill()
+        proc.wait()
     screen = _ANSI.sub(b"", buf).decode("utf-8", "replace")
     (ws / "canary_agent_screen.txt").write_text(screen, encoding="utf-8")
     flat = screen.replace(" ", "").lower()

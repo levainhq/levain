@@ -383,7 +383,8 @@ def script_intact(script: Path) -> bool:
 
 def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) -> dict[str, Any]:
     """Codex's own ``hooks/list`` for ``ws``, asked of a ``codex app-server`` started in it (stdio JSON-RPC)."""
-    env = {k: v for k, v in os.environ.items()}
+    from levain.launch import child_env
+    env = child_env()
     if home is not None:
         env["CODEX_HOME"] = str(home)
     msgs = [{"id": 1, "method": "initialize",
