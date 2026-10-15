@@ -1485,7 +1485,7 @@
       tag.dataset.repo = key;
       clause.insertBefore(tag, clause.firstChild);
       // the tag can push a clause past its clamp after the clause toggles were measured: measure this row again
-      if (clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
+      if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
     // the Decisions tile glows only while something waits on him
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
