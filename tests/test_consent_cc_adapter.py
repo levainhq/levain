@@ -19,8 +19,10 @@ import pytest
 
 import levain.authority as auth
 from levain.authority import ReplayCache
+from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import CockpitDB
 from levain.consent import ConsentQueue, Decision, answer_message, authority_source
+from levain.consent import policy as policy_mod
 from levain.consent.adapters import claude_code as cc
 from levain.consent.record import ANSWER_NAMESPACE, ExternalGateRequest
 
@@ -76,8 +78,11 @@ class FakeQueue:
         self.withdrawn.append(request_id)
         return self.at != "race"
 
-    def decision(self, request_id):
+    def decision(self, request_id, **kw):
         return self._decision(request_id) if self.at == "race" else None
+
+    def answer_by_grant(self, request_id, **kw):
+        return None  # no standing grant: the default policy decides nothing
 
 
 AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
@@ -87,7 +92,7 @@ def run_main(monkeypatch, queue, stdin_text, settings=AWAY, policy=None):
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: queue)
     monkeypatch.setattr(cc, "load_settings", lambda d: settings)
     if policy is not None:
-        monkeypatch.setattr(cc, "decide_by_policy", policy)
+        monkeypatch.setattr(policy_mod, "decide", policy)
     out = io.StringIO()
     rc = cc.main(["--queue-dir", "/nonexistent"], stdin=io.StringIO(stdin_text), stdout=out)
     return rc, out.getvalue()
@@ -193,7 +198,7 @@ def test_settings_default_to_away_off(tmp_path):
 
 
 def test_policy_answer_is_delivered_without_a_wait(monkeypatch):
-    def policy(request):
+    def policy(request, queue=None, **kw):
         return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
                         request_digest=request.digest)
     q = FakeQueue(None)
@@ -256,7 +261,7 @@ def test_an_unreadable_file_target_is_tagged():
 def test_agent_config_never_reaches_the_policy_seam(monkeypatch):
     calls = []
 
-    def policy(request):
+    def policy(request, queue=None, **kw):
         calls.append(request)
         return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
                         request_digest=request.digest)
@@ -268,7 +273,7 @@ def test_agent_config_never_reaches_the_policy_seam(monkeypatch):
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER
     # the seam itself refuses one, should a future caller route it there
     with pytest.raises(cc.PolicyNotEligible):
-        cc.guarded_policy(q.requests[0], policy)
+        cc.guarded_policy(q.requests[0], q, policy=policy)
     assert calls == []
 
 
@@ -353,6 +358,42 @@ def test_real_core_signed_allow_through_main(tmp_path):
     assert json.loads(out.getvalue())["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
 
 
+def test_real_core_grant_allow_through_main_carries_the_posture_and_says_so(tmp_path):
+    """Q4: main passes the event's permission_mode as the posture; a grant's allow names the grant to the operator.
+    Reproduced by a probe that dropped the posture at the seam: the grant then answered nothing."""
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    ws.mkdir()
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    for op in ({"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key, "class": "laptop-presence",
+                "custody": "passphrase"},
+               {"op": "create_grant", "grant": {"id": "g1", "kind": "consent", "agent": "claude_code",
+                                                "tools": ["Write"], "workspace": str(ws), "postures": ["default"],
+                                                "expires_at": utc_stamp(datetime.now(timezone.utc)
+                                                                        + timedelta(days=1))}}):
+        auth.sign_and_append(conn, op, signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    qdir = tmp_path / "home" / "consent"
+    qdir.mkdir(parents=True, mode=0o700)
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    write = event("Write", {"file_path": str(ws / "a.txt"), "content": "hi"}, cwd=str(ws))
+
+    def run(e):
+        out = io.StringIO()
+        assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
+        return out.getvalue()
+    got = json.loads(run(write))
+    assert got["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert "standing consent grant g1" in got["systemMessage"] and "posture default" in got["systemMessage"]
+    assert run({k: v for k, v in write.items() if k != "permission_mode"}) == ""
+    assert run({**write, "permission_mode": "acceptEdits"}) == ""
+
+
 def test_real_core_without_authority_is_no_decision(tmp_path):
     qdir = tmp_path / "consent"
     out = io.StringIO()
@@ -382,7 +423,7 @@ def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeyp
     q.directory = tmp_path / "consent"  # _queue_for builds the queue over main's --queue-dir
     target = str(tmp_path / "consent" / cc.SETTINGS_NAME)
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: q)
-    monkeypatch.setattr(cc, "decide_by_policy", lambda r: calls.append(r))
+    monkeypatch.setattr(policy_mod, "decide", lambda r, *a, **kw: calls.append(r))
     cc.main(["--queue-dir", str(tmp_path / "consent")],
             stdin=io.StringIO(json.dumps(event("Write", {"file_path": target, "content": "{}"}))), stdout=io.StringIO())
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
@@ -462,10 +503,10 @@ def test_an_exception_after_filing_withdraws(where):
     """P5 (codex 6): no ghost request stays pending (and answerable) after the hook has gone."""
     q = FakeQueue(RuntimeError("boom") if where == "await" else None)
 
-    def policy(request):
+    def policy(request, queue=None, **kw):
         raise RuntimeError("policy boom")
     with pytest.raises(RuntimeError):
-        cc.decide(event(), q, AWAY, policy=policy if where == "policy" else (lambda r: None))
+        cc.decide(event(), q, AWAY, policy=policy if where == "policy" else (lambda r, *a, **kw: None))
     assert q.withdrawn == [q.requests[0].id]
 
 
@@ -483,7 +524,7 @@ def test_a_withdraw_that_raises_is_retried_by_the_cleanup():
         return True
     q.withdraw = withdraw
     with pytest.raises(RuntimeError):
-        cc.decide(event(), q, AWAY, policy=lambda r: None)
+        cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: None)
     assert len(calls) == 2 and q.withdrawn == [q.requests[0].id]
 
 
@@ -520,7 +561,7 @@ def test_the_deadline_counts_time_already_spent():
     t = [1000.0]
     q = FakeQueue(None)
 
-    def slow_policy(request):
+    def slow_policy(request, queue=None, **kw):
         t[0] += 50
         return None
     cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=200,
@@ -580,7 +621,7 @@ def test_an_mcp_tool_is_tagged_by_its_named_path_fields(inp, tagged):
 def test_a_policy_that_would_allow_an_mcp_json_edit_is_never_consulted(monkeypatch):
     calls = []
 
-    def allow_all(request):
+    def allow_all(request, queue=None, **kw):
         calls.append(request)
         return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
                         request_digest=request.digest)
@@ -597,7 +638,7 @@ def test_an_edit_of_the_imported_levain_package_is_never_policy_answered(monkeyp
     import levain
     calls = []
 
-    def allow_all(request):
+    def allow_all(request, queue=None, **kw):
         calls.append(request)
         return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
                         request_digest=request.digest)
@@ -631,8 +672,8 @@ def test_decide_always_goes_through_the_guard(monkeypatch):
     through guarded_policy (fail closed)."""
     seen = []
     real = cc.guarded_policy
-    monkeypatch.setattr(cc, "guarded_policy", lambda r, p=None: (seen.append(r.id), real(r, p))[1])
-    for kw in ({}, {"policy": lambda r: None}):
+    monkeypatch.setattr(cc, "guarded_policy", lambda r, q, **k: (seen.append(r.id), real(r, q, **k))[1])
+    for kw in ({}, {"policy": lambda r, *a, **k: None}):
         q = FakeQueue(None)
         cc.decide(event(), q, cc.AdapterSettings(), **kw)
         assert seen[-1] == q.requests[0].id
@@ -647,15 +688,15 @@ def test_a_request_filed_at_the_config_tier_never_reaches_a_direct_callers_polic
             return super().file(**{**kw, "tier": cc.AGENT_CONFIG_TIER})
     calls = []
     q = RaisedQueue("allow")
-    out = cc.decide(event(), q, AWAY, policy=lambda r: calls.append(r))
+    out = cc.decide(event(), q, AWAY, policy=lambda r, *a, **kw: calls.append(r))
     assert calls == [] and out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
     with pytest.raises(cc.PolicyNotEligible):
-        cc.guarded_policy(q.requests[0], lambda r: None)
+        cc.guarded_policy(q.requests[0], q, policy=lambda r, *a, **kw: None)
     mcp = FakeQueue(None)
     mcp.file(agent="claude_code", agent_session_id="s", event_id=None, tool_name="mcp__fs__write_file",
              cwd="/w", tier=cc.AGENT_CONFIG_TIER)
     with pytest.raises(cc.PolicyNotEligible):
-        cc.guarded_policy(mcp.requests[0], lambda r: None)
+        cc.guarded_policy(mcp.requests[0], mcp, policy=lambda r, *a, **kw: None)
 
 
 # --- fix round 4 (L3 Q2 r4 complement MED, codex LOW) -------------------------------------------------------------
@@ -670,7 +711,7 @@ def test_a_direct_decide_caller_cannot_skip_the_adapters_own_protection(tmp_path
     q.directory = tmp_path / "consent"
     settings = cc.AdapterSettings(away_mode=True, away_hold_seconds=20, cockpit_data_root=str(tmp_path / "cockpit"))
     cc.decide(event("Write", {"file_path": str(tmp_path / rel), "content": "{}"}), q, settings,
-              policy=lambda r: calls.append(r))
+              policy=lambda r, *a, **kw: calls.append(r))
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
 
 

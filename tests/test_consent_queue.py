@@ -23,7 +23,6 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import UNINITIALISED, CockpitDB
 from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
-    decide_by_policy,
 )
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 
@@ -699,5 +698,80 @@ def test_digest_and_display():
     assert len(redact_display("Bash", {"command": "x" * 5000})) == 2000
 
 
-def test_policy_seam_decides_nothing(queue):
-    assert decide_by_policy(FakeAgent(queue).ask()) is None
+def test_policy_seam_decides_nothing_without_a_grant(queue):
+    """No standing grant in the log: the seam answers nothing and leaves the request pending."""
+    from levain.consent.policy import decide
+    request = FakeAgent(queue).ask()
+    assert decide(request, queue, posture="default", tool_input={"command": "touch /tmp/x"}) is None
+    assert queue.get(request.id)[1] == "pending"
+
+
+# --- Q4: standing consent grants --------------------------------------------------------------------------------
+
+def _granted_queue(tmp_path, keys):
+    """A real signed log holding one consent grant g1 (Edit, Write; posture default) over ``tmp_path/proj``, a
+    queue over it, and a directory outside it with a symlink to it from inside the workspace."""
+    from levain.consent import policy
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    (ws / "sub").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    os.symlink(outside, ws / "escape")
+    log.link({"op": "create_grant", "grant": {
+        "id": "g1", "kind": "consent", "agent": "claude_code", "tools": ["Edit", "Write"], "workspace": str(ws),
+        "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}})
+    q = ConsentQueue(tmp_path / "consent", authority=log.source)
+
+    def ask(tool_input, *, tool="Edit", cwd=str(ws), posture="default"):
+        r = q.file(agent="claude_code", agent_session_id="s1", tool_name=tool, tool_input=tool_input, cwd=cwd,
+                   hold=timedelta(minutes=5))
+        return r, policy.guarded_policy(r, q, posture=posture, tool_input=tool_input)
+    return log, q, ws, outside, ask
+
+
+def test_a_standing_grant_answers_only_inside_its_workspace(tmp_path, keys):
+    """Q4 criteria: the cwd and every file target must resolve inside the grant's workspace, under a posture it
+    names. Reproduced by a probe with the containment test forced true: all four outside cases were allowed."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys)
+    inside = {"file_path": str(ws / "sub" / "a.txt"), "old_string": "a", "new_string": "b"}
+    r, d = ask(inside)
+    assert (d.decision, d.via, d.grant_id, d.signer_fp, d.posture) == ("allow", "grant", "g1", None, "default")
+    assert q.get(r.id)[1] == "allowed"
+    face = q.receipt(r.id)["face"]
+    assert face["gate"] == {"verdict": "approved", "by": "binding", "binding_id": "g1"}
+    assert face["authority_scope"]["grant"].startswith(f"standing-grant:g1@{d.grant_seq}:{d.grant_hash}")
+    for tool_input, kw in (({"file_path": str(outside / "x")}, {}),             # a target outside
+                           ({"file_path": str(ws / "escape" / "x")}, {}),       # a symlink out of the workspace
+                           ({"file_path": "../elsewhere/x"}, {}),               # a relative escape
+                           (inside, {"cwd": str(outside)}),                     # the session runs outside
+                           (inside, {"posture": "acceptEdits"}),                # a posture the grant does not name
+                           (inside, {"posture": None})):                        # no posture reported
+        r2, d2 = ask(tool_input, **kw)
+        assert d2 is None and q.get(r2.id)[1] == "pending", (tool_input, kw)
+
+
+def test_a_grant_answer_is_delivered_only_while_the_grant_still_answers_it(tmp_path, keys):
+    """Delivery re-verifies a grant answer in a fresh replay with the input it was filed for: a raw write can only
+    take it away (a copied answer verifies on no other row), and a revoked grant delivers nothing it gave."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys)
+    inside = {"file_path": str(ws / "a.txt"), "content": "x"}
+    r, d = ask(inside, tool="Write")
+    assert d is not None and q.decision(r.id, tool_input=inside, posture="default") == d
+    assert q.decision(r.id) is None                                             # no input: no delivery
+    assert q.decision(r.id, tool_input={**inside, "content": "y"}, posture="default") is None
+    assert q.decision(r.id, tool_input=inside, posture="acceptEdits") is None
+    other = q.file(agent="claude_code", agent_session_id="s1", tool_name="Write", tool_input=inside, cwd=str(ws),
+                   hold=timedelta(minutes=5))
+    raw = sqlite3.connect(q.path)
+    stored = raw.execute("SELECT answer FROM requests WHERE id = ?", (r.id,)).fetchone()[0]
+    raw.execute("UPDATE requests SET state = 'allowed', via = 'grant', answer = ?, decided_at = ? WHERE id = ?",
+                (stored, utc_stamp(datetime.now(timezone.utc)), other.id))
+    raw.commit()
+    raw.close()
+    assert q.decision(other.id, tool_input=inside, posture="default") is None
+    log.link({"op": "revoke_grant", "grant_id": "g1"}, signer="laptop")
+    assert q.decision(r.id, tool_input=inside, posture="default") is None
+    assert ask(inside, tool="Write")[1] is None

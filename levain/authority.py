@@ -44,10 +44,12 @@ from typing import Any
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
 __all__ = [
-    "ANCHOR_DIR", "ANCHOR_NAME", "CUSTODIES", "FIDO_ATTESTED", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
+    "CUSTODIES", "FIDO_ATTESTED", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
-    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema", "custody_problem",
+    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
+    "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -138,6 +140,26 @@ _OP_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 }
 _GRANT_FIELDS = frozenset({"id", "entity", "remote_url", "deploy_key_sha256", "refspecs", "verbs", "expires_at"})
 _GRANT_VERBS = frozenset({"push", "fetch"})
+# A consent grant (Q4) answers an external agent's permission gate on the consent queue. A grant with no
+# ``kind`` is an egress grant (the fields above, unchanged); a consent grant carries exactly these.
+CONSENT_GRANT_KIND = "consent"
+_CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "expires_at"})
+CONSENT_AGENTS = ("claude_code", "codex")
+# Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Claude
+# Code's shell tool is Bash, and Codex's PermissionRequest names its shell escalation Bash too (Q0 item 6, the one
+# name measured); the rest are unmeasured shell-tool names refused defensively until Q3 measures Codex's. Compared
+# case-insensitively.
+CONSENT_SHELL_TOOLS = frozenset({"bash", "shell", "local_shell", "exec_command", "unified_exec", "container.exec"})
+# The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
+# permission modes (Q0 measured ``default``); Codex: the one value measured (Q0 item 6); Q3 extends it.
+CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({
+    "claude_code": frozenset({"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}),
+    "codex": frozenset({"default"}),
+})
+# an exact tool name: no glob, no prefix; an MCP tool is mcp__<server>__<tool>
+_CONSENT_TOOL = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}")
+_CONSENT_MCP_TOOL = re.compile(r"mcp__[^_].*?__\S+")
+_CONSENT_GRANT_MAX = timedelta(days=30)
 # a branch glob only: no force (+), no src:dst, no deletion (empty source)
 _REFSPEC = re.compile(r"refs/heads/[A-Za-z0-9._/*-]+")
 _STORE_ID = re.compile(r"[A-Za-z0-9-]{8,64}")
@@ -336,9 +358,18 @@ class AuthoritySnapshot:
     head_at: datetime | None = None
     # set only on what append returns: the link committed but the anchor could not be advanced
     anchor_warning: str | None = field(default=None, compare=False)
+    # per standing grant, the seq of the link that last created or changed it (a create, a renew, a loosen)
+    grant_seqs: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
+
+    def grant_link(self, grant_id: str) -> tuple[int, str] | None:
+        """``(seq, hash)`` of the link that created or last changed the standing grant ``grant_id``; None when
+        the policy holds no such grant."""
+        seq = self.grant_seqs.get(grant_id)
+        link = None if seq is None else self.hash_at(seq)
+        return None if seq is None or link is None or grant_id not in self.policy.grants else (seq, link)
 
     def active_keys(self) -> list[AuthorityKey]:
         return [k for k in self.keys.values() if k.active]
@@ -546,7 +577,60 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
 # policy ops and the recompute classifier
 
 
-def _validate_grant(grant: Any, what: str) -> dict[str, Any]:
+def consent_workspace_problem(workspace: Any) -> str | None:
+    """Why ``workspace`` cannot be a consent grant's workspace (None when it can): an absolute path in its
+    normal form (no ``..``, no ``.``, no doubled or trailing slash), never ``/``. Pure, so the replay holds it;
+    the home directory (and its ancestors) is refused at append (:func:`_append_only_checks`), which knows it."""
+    if not isinstance(workspace, str) or not workspace or "\x00" in workspace:
+        return "the workspace must be a non-empty path"
+    if not workspace.startswith("/") or workspace.startswith("//"):
+        return f"the workspace {workspace[:80]!r} must be an absolute path"
+    if os.path.normpath(workspace) != workspace:
+        return f"the workspace {workspace[:80]!r} is not in its normal form (no .., no trailing slash)"
+    if workspace == "/":
+        return "the workspace may not be / (that grants the whole disk)"
+    return None
+
+
+def _validate_consent_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A consent grant's shape (Q4). ``at``: the link's own time, when the grant arrives in a link; its life
+    ends at most 30 days after it (the bound a renew has), so no link can carry a longer one."""
+    if set(grant) != _CONSENT_GRANT_FIELDS:
+        raise AuthorityError(f"{what} (a consent grant) must carry exactly {', '.join(sorted(_CONSENT_GRANT_FIELDS))}")
+    if grant["kind"] != CONSENT_GRANT_KIND:
+        raise AuthorityError(f"{what}.kind must be {CONSENT_GRANT_KIND!r}")
+    if not isinstance(grant["id"], str) or not grant["id"]:
+        raise AuthorityError(f"{what}.id must be a non-empty string")
+    agent = grant["agent"]
+    if not isinstance(agent, str) or agent not in CONSENT_AGENTS:
+        raise AuthorityError(f"{what}.agent must be one of {', '.join(CONSENT_AGENTS)}")
+    for name, ok in (("tools", lambda t: bool(_CONSENT_TOOL.fullmatch(t)) and (
+                        not t.startswith("mcp__") or bool(_CONSENT_MCP_TOOL.fullmatch(t)))),
+                     ("postures", CONSENT_POSTURES[agent].__contains__)):
+        items = grant[name]
+        if not isinstance(items, (list, tuple)) or not items or not all(isinstance(i, str) and ok(i) for i in items):
+            raise AuthorityError(f"{what}.{name} is not a non-empty list of allowed values" + (
+                " (exact tool names, an MCP tool as mcp__<server>__<tool>)" if name == "tools" else
+                f" (for {agent}: {', '.join(sorted(CONSENT_POSTURES[agent]))})"))
+        if list(items) != sorted(set(items)):
+            raise AuthorityError(f"{what}.{name} must be sorted and unique")
+    shell = [t for t in grant["tools"] if t.lower() in CONSENT_SHELL_TOOLS]
+    if shell:
+        raise AuthorityError(f"{what} names the shell tool {shell[0]!r}: a shell command is never parsed, so a "
+                             "grant for it would allow every command; shell requests go to you")
+    problem = consent_workspace_problem(grant["workspace"])
+    if problem is not None:
+        raise AuthorityError(f"{what}: {problem}")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    # a difference, never `at + 30 days`, which overflows near year 9999
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    return _thaw(grant)
+
+
+def _validate_grant(grant: Any, what: str, *, at: datetime | None = None) -> dict[str, Any]:
+    if isinstance(grant, Mapping) and "kind" in grant:
+        return _validate_consent_grant(grant, what, at)
     if not isinstance(grant, Mapping) or set(grant) != _GRANT_FIELDS:
         raise AuthorityError(f"{what} must carry exactly {', '.join(sorted(_GRANT_FIELDS))}")
     for name in ("id", "entity", "remote_url", "deploy_key_sha256"):
@@ -563,7 +647,7 @@ def _validate_grant(grant: Any, what: str) -> dict[str, Any]:
     return _thaw(grant)
 
 
-def _validate_policy(data: Any) -> StandingPolicy:
+def _validate_policy(data: Any, *, at: datetime | None = None) -> StandingPolicy:
     if not isinstance(data, Mapping) or set(data) != {"raise_to", "timeouts", "grants"}:
         raise AuthorityError("a policy must carry exactly raise_to, timeouts and grants")
     raise_to, timeouts, grants = data["raise_to"], data["timeouts"], data["grants"]
@@ -575,7 +659,7 @@ def _validate_policy(data: Any) -> StandingPolicy:
     if not isinstance(grants, Mapping):
         raise AuthorityError("policy.grants must be a mapping")
     for gid, grant in grants.items():
-        g = _validate_grant(grant, f"policy.grants[{gid!r}]")
+        g = _validate_grant(grant, f"policy.grants[{gid!r}]", at=at)
         if g["id"] != gid:
             raise AuthorityError(f"policy.grants[{gid!r}] carries id {g['id']!r}")
     return StandingPolicy.from_dict(data)
@@ -612,14 +696,17 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
             raise AuthorityError("raise needs a verb and a tier")
         data["raise_to"][verb] = tier
     elif op == "loosen":
-        return _validate_policy(rec["policy"])
+        return _validate_policy(rec["policy"], at=_parse_stamp(rec["at"], "at"))
     elif op == "timeouts":
         _validate_timeouts(rec["timeouts"])
         data["timeouts"] = _thaw(rec["timeouts"])
     elif op == "create_grant":
-        grant = _validate_grant(rec["grant"], "grant")
+        at = _parse_stamp(rec["at"], "at")
+        grant = _validate_grant(rec["grant"], "grant", at=at)
         if grant["id"] in data["grants"]:
             raise AuthorityError(f"grant {grant['id']!r} already exists")
+        if grant.get("kind") == CONSENT_GRANT_KIND and _parse_stamp(grant["expires_at"], "expires_at") <= at:
+            raise AuthorityError("a consent grant must expire after the link that creates it")
         data["grants"][grant["id"]] = grant
     elif op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
@@ -654,7 +741,11 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     o, n = _thaw(old), _thaw(new)
     if _canonical(o) == _canonical(n):
         return "same"
+    if o.get("kind") != n.get("kind"):
+        return "loose"
     o_exp, n_exp = _parse_stamp(o["expires_at"], "expires_at"), _parse_stamp(n["expires_at"], "expires_at")
+    if n.get("kind") == CONSENT_GRANT_KIND:
+        return _consent_grant_change(o, n, o_exp, n_exp)
     rest = [k for k in _GRANT_FIELDS if k not in ("refspecs", "verbs", "expires_at")]
     if any(o[k] != n[k] for k in rest):
         return "loose"
@@ -665,6 +756,26 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     if narrower_sets and n_exp <= o_exp:
         return "tight"
     return "loose"
+
+
+def _path_within(path: str, root: str) -> bool:
+    """``path`` is ``root`` or under it (both absolute normal forms; a string test, so ``/a/bc`` is not in ``/a/b``)."""
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _consent_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A consent grant's change: ``renew`` when only the expiry moved later; ``tight`` when the id and agent
+    are the same, tools and postures a subset, the workspace the same or under the old one, and the expiry no
+    later; anything else ``loose``."""
+    if o["id"] != n["id"] or o["agent"] != n["agent"]:
+        return "loose"
+    if n["tools"] == o["tools"] and n["postures"] == o["postures"] and n["workspace"] == o["workspace"] \
+            and n_exp > o_exp:
+        return "renew"
+    narrower = set(n["tools"]) <= set(o["tools"]) and set(n["postures"]) <= set(o["postures"]) \
+        and isinstance(n["workspace"], str) and isinstance(o["workspace"], str) \
+        and _path_within(n["workspace"], o["workspace"])
+    return "tight" if narrower and n_exp <= o_exp else "loose"
 
 
 def classify(old: StandingPolicy, new: StandingPolicy) -> str:
@@ -808,6 +919,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     ranks = _ranks()
     keys = {} if state is None else dict(state.keys)
     policy = genesis_policy() if state is None else state.policy
+    grant_seqs = {} if state is None else dict(state.grant_seqs)
     try:
         if state is None:
             # TOFU genesis (§3.2): the first link enrols a laptop-presence key, signed by that key
@@ -832,6 +944,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 if delta not in _OP_DELTAS[op]:
                     raise AuthorityError(f"a {op} link computes to a {delta} change")
                 rank = _DELTA_RANK[delta]
+                grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
+                    _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
                 policy = need
             else:
                 rank = need
@@ -851,7 +965,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
     hashes = (() if state is None else state._hashes) + (row.hash,)
-    return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at)
+    return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
+                             grant_seqs=MappingProxyType(grant_seqs))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
@@ -1026,8 +1141,29 @@ def _require_aware(now: Any) -> None:
         raise AuthorityError("`now` must be an aware datetime; a naive one has no zone")
 
 
+def _consent_home_check(grants: list[Any]) -> None:
+    home = os.path.expanduser("~")
+    homes = {os.path.normpath(home), os.path.realpath(home)}
+    for grant in grants:
+        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+            continue
+        ws = grant.get("workspace")
+        if isinstance(ws, str) and any(_path_within(h, ws) for h in homes):
+            raise AuthorityError(f"the workspace {ws} is the home directory or above it; name a project directory")
+
+
 def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
-    """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6)."""
+    """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6), or its home
+    directory: a consent grant's workspace is never the home directory or above it (that grants every
+    workspace under it), judged for every consent grant a create or a loosen brings in or changes."""
+    if rec["op"] == "create_grant":
+        _consent_home_check([rec["grant"]])
+    elif rec["op"] == "loosen":
+        policy = rec["policy"]
+        grants = policy.get("grants", {}) if isinstance(policy, Mapping) else {}
+        old = state.policy.grants
+        _consent_home_check([g for gid, g in grants.items()
+                             if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))])
     if rec["op"] != "renew":
         return
     grant = state.policy.grants.get(rec["grant_id"])

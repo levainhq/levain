@@ -478,6 +478,61 @@ def main(argv: list[str] | None = None) -> int:
     _ck_common(ck_init)
     ck_init.set_defaults(func=_cmd_cockpit_ledger_init)
 
+    cs_p = subparsers.add_parser(
+        "consent",
+        help="The consent queue's standing grants: answer an agent's permission prompt without asking.",
+        description=(
+            "A consent grant lets the consent queue answer a Claude Code or Codex permission prompt for you: "
+            "this agent, these exact tools, inside this workspace, under these permission modes, until it "
+            "expires (at most 30 days). It is a link in the cockpit's signed authority log. Shell commands "
+            "(Bash) are never granted: they always reach you. Edits of agent config or hooks always reach you."
+        ),
+    )
+    cs_sub = cs_p.add_subparsers(dest="consent_cmd", required=True)
+    cs_grant = cs_sub.add_parser("grant", help="Create, revoke and list consent grants.")
+    cs_grant_sub = cs_grant.add_subparsers(dest="grant_cmd", required=True)
+    cs_create = cs_grant_sub.add_parser(
+        "create",
+        help="Sign a consent grant (a laptop-presence key).",
+        description=(
+            "Append a signed create_grant link: from the next prompt on, a permission prompt from AGENT for one "
+            "of the named tools, under one of the named permission modes, whose working directory and every "
+            "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
+            "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
+            "directory alone. The log refuses a shell tool, a workspace of / or your home directory, and a life "
+            "over 30 days, before anything is signed."
+        ),
+    )
+    cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
+    cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
+                           help="An exact tool name (Edit, Write, WebFetch, mcp__server__tool); repeatable. "
+                                "No globs.")
+    cs_create.add_argument("--workspace", type=Path, required=True,
+                           help="The project directory the grant covers (resolved through symlinks).")
+    cs_create.add_argument("--posture", dest="postures", action="append", required=True, metavar="MODE",
+                           help="A permission mode the agent reports (Claude Code: default, acceptEdits, plan, "
+                                "auto, dontAsk, bypassPermissions); repeatable.")
+    cs_create.add_argument("--expires", required=True,
+                           help="A duration (30m, 12h, 7d; at most 30d) or a UTC time (2026-10-20T12:00:00Z).")
+    cs_create.add_argument("--id", dest="grant_id", default=None, help="The grant's id (default: cg-<random>).")
+    cs_create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled laptop-presence key that signs the grant (its private key file, or "
+                                "the .pub of a key an agent holds).")
+    _ck_common(cs_create)
+    cs_create.set_defaults(func=_cmd_consent_grant_create)
+    cs_revoke = cs_grant_sub.add_parser(
+        "revoke", help="Revoke a consent grant (any enrolled key).",
+        description="Append a signed revoke_grant link. From the next prompt on the grant answers nothing, and "
+                    "an answer it already gave is no longer delivered.")
+    cs_revoke.add_argument("grant_id", help="The grant's id, as `levain consent grant list` shows it.")
+    cs_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled key that signs the revoke.")
+    _ck_common(cs_revoke)
+    cs_revoke.set_defaults(func=_cmd_consent_grant_revoke)
+    cs_list = cs_grant_sub.add_parser("list", help="List the consent grants the authority log holds.")
+    _ck_common(cs_list)
+    cs_list.set_defaults(func=_cmd_consent_grant_list)
+
     run_p = subparsers.add_parser(
         "run",
         help="Run a sovereign entity as an interactive partner on an open model.",
@@ -1717,6 +1772,82 @@ def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
     print(f"raised: {args.verb} at {tier} or above, at seq {seq}")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _grant_expiry(text: str) -> object:
+    """``--expires``: a duration (``30m``, ``12h``, ``7d``) as a timedelta, or a UTC time as an aware datetime."""
+    import re
+    from datetime import timedelta
+
+    m = re.fullmatch(r"(\d{1,6})([mhd])", text.strip())
+    if m:
+        unit = {"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]
+        return timedelta(**{unit: int(m.group(1))})
+    try:
+        when = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        when = None
+    if when is None or when.tzinfo is None:
+        raise ValueError(f"--expires {text!r} is neither a duration (30m, 12h, 7d) nor a UTC time "
+                         "(2026-10-20T12:00:00Z)")
+    return when
+
+
+def _cmd_consent_grant_create(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import ssh_signer
+    from levain.consent.grants import create_grant
+
+    try:
+        expires = _grant_expiry(args.expires)
+        signer_fp, sign = ssh_signer(args.signing_key)
+        grant, warning = create_grant(_cockpit_root(args), agent=args.agent, tools=args.tools,
+                                      workspace=args.workspace, postures=args.postures, expires=expires,
+                                      signer_fp=signer_fp, sign=sign, clock=_utc_now, grant_id=args.grant_id)
+    except (ValueError, *_cockpit_refusals()) as exc:
+        print(f"grant refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"granted: {grant.id} at seq {grant.seq}: {grant.agent} {', '.join(grant.tools)} in {grant.workspace} "
+          f"under {', '.join(grant.postures)}, until {grant.expires_at}")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import ssh_signer
+    from levain.consent.grants import revoke_grant
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        seq, warning = revoke_grant(_cockpit_root(args), args.grant_id, signer_fp=signer_fp, sign=sign,
+                                    clock=_utc_now)
+    except _cockpit_refusals() as exc:
+        print(f"revoke refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"revoked: {args.grant_id} at seq {seq}")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
+    from levain.cockpit.consent import utc_stamp
+    from levain.consent.grants import list_grants
+
+    try:
+        now = _utc_now()
+        grants = list_grants(_cockpit_root(args), now=now)
+    except _cockpit_refusals() as exc:
+        print(f"grants: {exc}", file=sys.stderr)
+        return 1
+    if not grants:
+        print("no consent grants")
+    stamp = utc_stamp(now)
+    for g in grants:
+        state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
+        print(f"{g.id}  {g.agent}  {','.join(g.tools)}  {g.workspace}  postures {','.join(g.postures)}  {state}  "
+              f"(seq {g.seq})")
     return 0
 
 

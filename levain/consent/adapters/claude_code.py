@@ -6,12 +6,15 @@ hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it an
 1. reads the event (``tool_name``, ``tool_input``, ``session_id``, ``agent_id`` for a subagent, ``cwd``) and files
    one request on the queue, with Claude Code's ``tool_use_id`` as its event id when the event carries one (a
    ``PermissionRequest`` measured in Q0 does not; the core then mints a random one);
-2. asks the core's policy seam (:func:`levain.consent.decide_by_policy`, which decides nothing today), except for
-   a request that targets agent config or hooks (:func:`targets_agent_config`), which is never eligible for one;
+2. asks the core's policy seam (:func:`levain.consent.policy.guarded_policy`) with the session's own posture (the
+   event's ``permission_mode``) and the tool input the request was filed for; it answers only with a standing
+   consent grant the queue verified. A request that targets agent config or hooks (:func:`targets_agent_config`)
+   is never eligible for one;
 3. when away mode is on (an adapter setting, default off, default hold 0 s) waits up to the hold for a signed
    answer the core verifies, and withdraws the request if none came (one whose hold ran out is expired);
-4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
-   exception, prints nothing and exits 0: the native dialog stands and the human answers it.
+4. prints ``allow`` only for a verified allow (with a line naming the grant when a grant answered) and ``deny``
+   only for a verified deny. Anything else, including any exception, prints nothing and exits 0: the native
+   dialog stands and the human answers it.
 
 Nothing read from stdin is ever a decision: the event only says what is being asked. Bash commands are never
 parsed (ruling 1): a Bash request is just a Bash request.
@@ -43,7 +46,14 @@ from pathlib import Path
 from typing import IO, Any
 
 from levain.authority import anchor_path
-from levain.consent.queue import ConsentQueue, Decision, authority_source, decide_by_policy, default_queue_dir
+# FILE_TOOLS, MCP_PATH_FIELDS, PolicyNotEligible and guarded_policy are re-exported: this module's names since Q2
+from levain.consent.policy import AGENT_CONFIG_TIER, Policy
+from levain.consent.policy import FILE_TOOLS as FILE_TOOLS
+from levain.consent.policy import MCP_PATH_FIELDS as MCP_PATH_FIELDS
+from levain.consent.policy import PolicyNotEligible as PolicyNotEligible
+from levain.consent.policy import guarded_policy as guarded_policy
+from levain.consent.policy import targets as _targets
+from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
 
 AGENT = "claude_code"
@@ -65,17 +75,10 @@ CLEANUP_RESERVE = 60.0
 # Code never cancels the hook while a verified answer is on its way out (a cancelled hook's output is discarded).
 TIMEOUT_MARGIN = 30
 DEFAULT_MAX_HOLD = 900.0
-# A request on one of these tools (or an MCP tool, by its MCP_PATH_FIELDS) whose target path is agent config or a
-# hook is tagged agent_config.
-FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
-# tier an agent_config request is filed at: an allow then needs a key class covering T3 (fail toward the human).
-AGENT_CONFIG_TIER = "T3"
+# A request on one of FILE_TOOLS (or an MCP tool, by its MCP_PATH_FIELDS) whose target path is agent config or a
+# hook is tagged agent_config and filed at AGENT_CONFIG_TIER (all three from levain.consent.policy): an allow then
+# needs a key class covering T3, and no policy is ever asked (fail toward the human).
 DEFAULT_TIER = "T2"
-
-
-class PolicyNotEligible(AssertionError):
-    """The policy seam was reached for a request that may never have a policy answer (ruling 3b item 1)."""
-
 
 @dataclass(frozen=True)
 class AdapterSettings:
@@ -137,9 +140,6 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 # its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
 USER_CONFIG_NAME = ".claude.json"
-# The tool_input fields an MCP tool's target paths are read from (the reference filesystem server's names, plus
-# Claude Code's own): only these, never a value parsed out of another field.
-MCP_PATH_FIELDS = ("file_path", "path", "paths", "notebook_path", "source", "destination")
 
 
 def _is_config_path(path: Path) -> bool:
@@ -200,23 +200,6 @@ def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
     return False
 
 
-def _targets(tool_name: str, tool_input: Any) -> list[Any] | None:
-    """The paths a request names, or ``None`` when it is not a tool this tags. A file tool names one
-    (``file_path``, else ``notebook_path``); an MCP tool names whatever its :data:`MCP_PATH_FIELDS` hold (a
-    ``paths`` list item by item), possibly nothing."""
-    if tool_name in FILE_TOOLS:
-        return [tool_input.get("file_path", tool_input.get("notebook_path")) if isinstance(tool_input, Mapping)
-                else None]
-    if not tool_name.startswith("mcp__") or not isinstance(tool_input, Mapping):
-        return None
-    out: list[Any] = []
-    for field in MCP_PATH_FIELDS:
-        if field in tool_input:
-            value = tool_input[field]
-            out += value if isinstance(value, list) else [value]
-    return out
-
-
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
                          protected: Iterable[Path] = ()) -> bool:
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
@@ -275,21 +258,30 @@ def _verified(decision: Any, request: ExternalGateRequest) -> Decision | None:
 
 
 def hook_output(decision: Decision) -> dict[str, Any]:
-    """What Claude Code reads from a ``PermissionRequest`` hook for a verified decision."""
+    """What Claude Code reads from a ``PermissionRequest`` hook for a verified decision. A grant's allow also
+    carries a ``systemMessage`` (shown to the operator) naming the grant, so an answer the operator did not
+    give in the moment says where it came from."""
     verdict: dict[str, Any] = {"behavior": decision.decision}
     if decision.decision == "deny":
         verdict["message"] = f"Denied by a signed levain answer (key {decision.signer_fp})."
-    return {"hookSpecificOutput": {"hookEventName": EVENT, "decision": verdict}}
+    out: dict[str, Any] = {"hookSpecificOutput": {"hookEventName": EVENT, "decision": verdict}}
+    if decision.via == "grant":
+        out["systemMessage"] = (f"levain: allowed by your standing consent grant {decision.grant_id} "
+                                f"(posture {decision.posture}); `levain consent grant revoke {decision.grant_id}` "
+                                "ends it.")
+    return out
 
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
-           policy: Callable[[ExternalGateRequest], Decision | None] | None = None,
+           policy: Policy | None = None,
            home: Path | None = None, clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
     decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. ``policy``
-    (default :func:`levain.consent.decide_by_policy`) is only ever reached through :func:`guarded_policy`, and
-    never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot bypass ruling 3b item 1. What
+    (default :func:`levain.consent.policy.decide`) is only ever reached through :func:`guarded_policy`, called with
+    the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
+    request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
+    bypass ruling 3b item 1. What
     the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory`` and ``settings`` here, never
     from the caller, so no call can leave it out; a queue without a directory raises before anything is filed."""
     if getattr(queue, "directory", None) is None:
@@ -309,6 +301,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if isinstance(agent_id, str) and agent_id:
         session = f"{session}#agent:{agent_id}"
     tool_use_id = event.get("tool_use_id")
+    mode = event.get("permission_mode")
+    posture = mode if isinstance(mode, str) and mode else None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
     hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
@@ -319,15 +313,17 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     try:
         got: Decision | None = None
         if not agent_config and request.tier != AGENT_CONFIG_TIER:
-            got = _verified(guarded_policy(request, policy), request)
+            got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy),
+                            request)
         wait = min(hold, max(0.0, deadline - clock()))
         if got is None and wait > 0:
-            got = _verified(queue.await_decision(request.id, wait), request)
+            got = _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture),
+                            request)
         if got is None:
             # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
             if not queue.withdraw(request.id, note="the hook stopped waiting; the native dialog stands"):
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
-                got = _verified(queue.decision(request.id), request)
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
         settled = True
         return hook_output(got) if got is not None else None
     finally:
@@ -338,15 +334,6 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                 queue.withdraw(request.id, note="the hook failed; the native dialog stands")
             except Exception:
                 pass
-
-
-def guarded_policy(request: ExternalGateRequest,
-                   policy: Callable[[ExternalGateRequest], Decision | None] | None = None) -> Decision | None:
-    """The policy seam (default :func:`levain.consent.decide_by_policy`) with ruling 3b item 1 asserted at it:
-    a request filed as agent_config (any tool at :data:`AGENT_CONFIG_TIER`) never reaches a policy."""
-    if request.tier == AGENT_CONFIG_TIER:
-        raise PolicyNotEligible(f"request {request.id} targets agent config: never eligible for a policy answer")
-    return (policy or decide_by_policy)(request)
 
 
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
@@ -389,8 +376,9 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
 
 HOOK_TEMPLATE = '''#!{python}
 # Installed by levain (levain.consent.adapters.claude_code.install). Claude Code's PermissionRequest hook:
-# it reports a decision only when levain verified a signed answer; otherwise it prints nothing and the native
-# permission dialog stands. Any failure here, including levain missing, is no decision.
+# it reports a decision only when levain verified a signed answer or a standing consent grant; otherwise it
+# prints nothing and the native permission dialog stands. Any failure here, including levain missing, is no
+# decision.
 import sys
 
 try:

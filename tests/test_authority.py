@@ -1209,3 +1209,28 @@ def test_a_cockpit_act_signed_without_user_presence_is_refused_like_a_link(monke
     assert e.value.code == "bad_signature"
     touched = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x01)
     assert broker_mod.Broker._verify(me, authority, b"m", touched) == FAKE_FP   # the control
+
+
+# --- Q4: consent grants -----------------------------------------------------------------------------------------
+
+def _consent(gid="c1", *, tools=("Edit",), workspace="/w/p", postures=("default",), expires=NOW + timedelta(days=5)):
+    return {"id": gid, "kind": "consent", "agent": "claude_code", "tools": sorted(tools), "workspace": workspace,
+            "postures": sorted(postures), "expires_at": _stamp(expires)}
+
+
+@pytest.mark.parametrize("shell", ["Bash", "BASH"])
+def test_a_consent_grant_never_names_the_shell_and_a_sibling_workspace_is_a_loosen(base, keys, shell):
+    """Ruling 1 in the replay (a shell grant would allow every command), and the classifier's workspace test is a
+    path test, not a string prefix: /w/pp is not under /w/p. Both reproduced by a probe with the shell set emptied
+    and the containment test made a bare startswith."""
+    insert(base, {"op": "create_grant", "grant": _consent(tools=(shell, "Edit"))}, keys["laptop"])
+    refused(base, "shell tool")
+    old = auth.StandingPolicy.from_dict({"raise_to": {}, "timeouts": {}, "grants": {"c1": _consent()}})
+
+    def to(**kw):
+        return auth.classify(old, auth.StandingPolicy.from_dict(
+            {"raise_to": {}, "timeouts": {}, "grants": {"c1": _consent(**kw)}}))
+    assert to(workspace="/w/pp") == auth.LOOSEN
+    assert to(workspace="/w/p/sub") == auth.TIGHTEN
+    assert to(expires=NOW + timedelta(days=9)) == auth.RENEW
+    assert to(tools=("Edit", "Write")) == auth.LOOSEN

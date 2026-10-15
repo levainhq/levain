@@ -27,8 +27,9 @@ from typing import Any
 from levain.autonomic.pending import seal_pending_id
 from levain.cockpit.consent import ConsentError, encode, parse_stamp, record_sha256, value_sha256
 
-__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "POSTURE",
-           "ExternalGateRequest", "answer_message", "answer_payload", "redact_display", "tool_input_digest"]
+__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE",
+           "ExternalGateRequest", "answer_message", "answer_payload", "grant_answer_payload", "redact_display",
+           "tool_input_digest"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
@@ -37,6 +38,9 @@ POSTURE = "external-gate"
 ANSWER_FORMAT = "levain-consent-answer/1"
 # its own SSHSIG namespace: an answer verifies as nothing else, and nothing else verifies as an answer
 ANSWER_NAMESPACE = "levain-consent-answer"
+# what the queue stores when a standing consent grant answered (Q4): never signed per request; the grant's own
+# link in the authority log is the signature, re-verified at every delivery
+GRANT_ANSWER_FORMAT = "levain-consent-grant-answer/1"
 DISPLAY_MAX = 2000
 _SECRET_KEY = re.compile(r"(?i)(token|secret|passw(or)?d|api[_-]?key|auth|credential|private|cookie)")
 _MASK = "[redacted]"
@@ -156,3 +160,16 @@ def answer_payload(*, queue_id: str, request: ExternalGateRequest, decision: str
 def answer_message(payload: dict[str, str]) -> bytes:
     """The exact bytes signed, in :data:`ANSWER_NAMESPACE`: the payload's JCS encoding."""
     return encode(payload)
+
+
+def grant_answer_payload(*, queue_id: str, request: ExternalGateRequest, grant_id: str, grant_seq: int,
+                         grant_hash: str, posture: str) -> dict[str, Any]:
+    """The record the queue stores when a standing consent grant answered ``request``: this queue, the request
+    and its digest, the grant, the authority link (seq and hash) that created or last renewed it, and the posture
+    the agent reported. Always an allow: a grant never denies. Its JCS bytes are what the row's ``answer`` holds."""
+    if type(grant_seq) is not int or grant_seq < 1:
+        raise ConsentError("grant_seq must be an authority seq (an integer >= 1)")
+    return {"format": GRANT_ANSWER_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
+            "request_digest": request.digest, "decision": "allow", "expires_at": request.expires_at,
+            "grant_id": _need("grant_id", grant_id), "grant_seq": grant_seq,
+            "grant_hash": _need("grant_hash", grant_hash), "posture": _need("posture", posture)}

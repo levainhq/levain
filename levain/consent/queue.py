@@ -3,6 +3,10 @@
 A hook files an :class:`~levain.consent.record.ExternalGateRequest`; the request is ``pending`` until exactly
 one of four things ends it:
 
+  - ``allowed`` by a standing consent grant (:meth:`ConsentQueue.answer_by_grant`, Q4): a grant a fresh replay of
+    the authority log holds, whose criteria (:func:`levain.consent.policy.grant_refusal`) hold for the request, the
+    tool input it was filed for and the posture the agent reported. The row says it was answered by a grant
+    (``via``) and stores which grant and the authority link that created or last renewed it;
   - ``allowed`` / ``denied``: an answer that VERIFIES (:meth:`ConsentQueue.answer`): a record binding this
     queue, the request's id, its digest, its expiry, the decision and when it was signed (before the expiry),
     signed in :data:`~levain.consent.record.ANSWER_NAMESPACE` by a key the replayed authority log holds unrevoked, of a
@@ -16,7 +20,9 @@ The row is an INDEX, never authority. A process that can write ``queue.db`` raw 
 delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`) re-reads the
 stored answer and signature, checks the answer binds this queue, this request and the row's decision, and
 re-verifies it against a FRESH replay of the authority log taken at delivery (the queue's ``authority``
-source): a key revoked after it answered delivers nothing. Anything that fails is ``None``, never an allow;
+source): a key revoked after it answered delivers nothing. A grant answer is re-verified the same way: the grant
+must still be in a fresh replay, unexpired, its criteria still true for the tool input and posture the deliverer
+holds. Anything that fails is ``None``, never an allow;
 a raw write can only take a decision away (the native dialog then stands), never make one.
 
 A terminal request never changes again: SQL triggers refuse any update of a terminal row, any change of a
@@ -28,8 +34,6 @@ its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before conside
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
 operator's alone (0700, refused otherwise).
-
-Policy answers (standing grants, criteria) are Q4: :func:`decide_by_policy` is their seam and decides nothing.
 
 Stdlib only.
 """
@@ -56,20 +60,25 @@ from levain.autonomic.receipt import build_action_face, build_gate_face, build_g
 from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
+from levain.consent.policy import grant_refusal
 from levain.consent.record import (
-    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message, answer_payload, redact_display,
-    tool_input_digest,
+    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, ExternalGateRequest, answer_message,
+    answer_payload, grant_answer_payload, redact_display, tool_input_digest,
 )
 
 __all__ = ["DB_NAME", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue",
-           "Decision", "QueueStoreError", "authority_source", "decide_by_policy", "default_queue_dir"]
+           "Decision", "QueueStoreError", "authority_source", "default_queue_dir"]
 
 DB_NAME = "queue.db"
-STORE_FORMAT = "levain-consent-queue/2"
+STORE_FORMAT = "levain-consent-queue/3"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn")
 TERMINAL: frozenset[str] = frozenset(STATES[1:])
 _ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                           "signer_fp", "signed_at"})
+_GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
+                                "grant_id", "grant_seq", "grant_hash", "posture"})
+# how a decided request was answered: a signed answer, or a standing consent grant
+VIA: tuple[str, ...] = ("signature", "grant")
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _STATE_OF = {"allow": "allowed", "deny": "denied"}
@@ -81,7 +90,8 @@ _SCHEMA = (
     "event_id TEXT NOT NULL, tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, display TEXT NOT NULL, "
     "cwd TEXT NOT NULL, tier TEXT NOT NULL, received_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
     "state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','allowed','denied','expired','withdrawn')), "
-    "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT)",
+    "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT, "
+    "via TEXT CHECK (via IS NULL OR via IN ('signature','grant')))",
     "CREATE INDEX IF NOT EXISTS requests_pending ON requests (state, expires_at)",
     # a hook's own event id names one permission event: a retry of it, at any time, is refused
     "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
@@ -118,12 +128,20 @@ class AnswerRefused(Exception):
 class Decision:
     """A verified answer: what the hook delivers. ``decision`` is ``allow`` or ``deny``. ``request_digest`` is
     the digest of the request the answer signed: an adapter delivers only when it is the digest of the request
-    it filed for the input it is holding (``ExternalGateRequest.digest``)."""
+    it filed for the input it is holding (``ExternalGateRequest.digest``). ``via`` says how it was answered:
+    ``signature`` (``signer_fp`` is the key) or ``grant`` (``signer_fp`` is None; ``grant_id`` names the standing
+    grant, ``grant_seq``/``grant_hash`` the authority link that created or last renewed it, ``posture`` the
+    agent's reported posture it matched)."""
     request_id: str
     decision: str
-    signer_fp: str
+    signer_fp: str | None
     decided_at: str
     request_digest: str
+    via: str = "signature"
+    grant_id: str | None = None
+    grant_seq: int | None = None
+    grant_hash: str | None = None
+    posture: str | None = None
 
 
 def default_queue_dir() -> Path:
@@ -174,12 +192,6 @@ def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: Repl
                      ssh_keygen: Path | str | None = None) -> AuthoritySource:
     """The trusted authority source for a queue (see :class:`AuthoritySource`)."""
     return AuthoritySource(cockpit_db, anchor=anchor, cache=cache, ssh_keygen=ssh_keygen)
-
-
-def decide_by_policy(request: ExternalGateRequest) -> Decision | None:
-    """The seam for Q4's policy and criteria (signed standing grants, tool identity, workspace). Decides
-    nothing yet: every request goes to a signed answer or to the human."""
-    return None
 
 
 def _now_utc(clock: Callable[[], datetime]) -> datetime:
@@ -326,7 +338,7 @@ class ConsentQueue:
             return None
 
     def _row(self, conn: sqlite3.Connection, request_id: str) -> dict[str, Any] | None:
-        cur = conn.execute(f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signature, signer_fp "
+        cur = conn.execute(f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signature, signer_fp, via "
                            "FROM requests WHERE id = ?", (request_id,))
         row = cur.fetchone()
         if row is None:
@@ -368,9 +380,18 @@ class ConsentQueue:
 
     # --- transitions ---------------------------------------------------------------------------------
     @staticmethod
-    def _face(request: ExternalGateRequest, state: str, signer_fp: str | None) -> dict[str, Any]:
+    def _face(request: ExternalGateRequest, state: str, signer_fp: str | None,
+              grant: Mapping[str, Any] | None = None) -> dict[str, Any]:
         common: dict[str, Any] = dict(context_id=request.id, query_text=request.display, query_date=request.received_at[:10],
                       producers=[request.agent])
+        if grant is not None:
+            gid = grant["grant_id"]
+            return build_gate_face(
+                **common, gate=build_gate_verdict(verdict="approved", by="binding", binding_id=gid),
+                authority=AuthorityScope(grantor="binding", binding_id=gid,
+                                         grant=f"standing-grant:{gid}@{grant['grant_seq']}:{grant['grant_hash']} "
+                                               f"posture={grant['posture']}"),
+                terminal_state="fired", downstream_id=request.id)
         if state in ("allowed", "denied"):
             return build_gate_face(
                 **common,
@@ -384,15 +405,17 @@ class ConsentQueue:
 
     def _transition(self, conn: sqlite3.Connection, request: ExternalGateRequest, state: str, *, stamp: str,
                     answer: str | None = None, signature: str | None = None, signer_fp: str | None = None,
-                    note: str | None = None) -> bool:
+                    note: str | None = None, via: str | None = None,
+                    grant: Mapping[str, Any] | None = None) -> bool:
         """One ``pending -> state`` move plus its receipt, inside the caller's write transaction. False when
-        the request is no longer pending: nothing is written."""
+        the request is no longer pending: nothing is written. ``grant`` is the grant answer record when a
+        standing grant answered (its receipt names the grant and its link)."""
         if conn.execute("UPDATE requests SET state = ?, decided_at = ?, answer = ?, signature = ?, signer_fp = ?, "
-                        "note = ? WHERE id = ? AND state = 'pending'",
-                        (state, stamp, answer, signature, signer_fp, note, request.id)).rowcount != 1:
+                        "note = ?, via = ? WHERE id = ? AND state = 'pending'",
+                        (state, stamp, answer, signature, signer_fp, note, via, request.id)).rowcount != 1:
             return False
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
-                     (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp),
+                     (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp, grant),
                                                            ensure_ascii=False, sort_keys=True)))
         return True
 
@@ -515,7 +538,7 @@ class ConsentQueue:
             current, now_state, stamp = self._settle(conn, request_id)
             moved = current is not None and now_state == "pending" and self._transition(
                 conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
-                signature=signature, signer_fp=payload["signer_fp"])
+                signature=signature, signer_fp=payload["signer_fp"], via="signature")
         if not moved:
             raise AnswerRefused(f"request {request_id} is already {now_state or 'gone'}")
         return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
@@ -533,11 +556,74 @@ class ConsentQueue:
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
                               signed_at=utc_stamp(_now_utc(self._clock)))
 
-    def decision(self, request_id: str) -> Decision | None:
-        """The decision of a terminal request, re-verified now: the stored answer must be the canonical
-        record of this row's decision for this queue and request, decided before its expiry, and its
-        signature must verify under a key a fresh replay holds active (and of a class covering the tier,
-        for an allow). ``None`` while pending, for expired/withdrawn, and for anything that fails."""
+    # --- standing grants (Q4) --------------------------------------------------------------------------
+    def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,
+                        posture: Any, now: datetime) -> tuple[str, int, str] | None:
+        """``(grant_id, link seq, link hash)`` of the first consent grant (by id) in ``authority`` that answers
+        ``request``, or ``None``."""
+        for gid in sorted(authority.policy.grants):
+            link = authority.grant_link(gid)
+            if link is not None and grant_refusal(authority.policy.grants[gid], request, tool_input=tool_input,
+                                                  posture=posture, now=now) is None:
+                return gid, link[0], link[1]
+        return None
+
+    def answer_by_grant(self, request_id: str, *, tool_input: Any, posture: str) -> Decision | None:
+        """Answer ``request_id`` with a standing consent grant when one covers it: a grant a FRESH replay of
+        the authority log holds whose criteria (:func:`levain.consent.policy.grant_refusal`) hold for the
+        request, ``tool_input`` (the input it was filed for) and ``posture`` at the queue's clock read under
+        the write lock. Records ``pending -> allowed`` with the grant, its link and the posture, and its
+        receipt, in one transaction, then returns the decision as :meth:`decision` delivers it (re-verified
+        in another fresh replay). ``None`` when no grant covers it, the request is not pending, or the log
+        cannot be replayed: the request is left as it was."""
+        authority = self._fresh_authority()
+        if authority is None or not authority.policy.grants:
+            return None
+        moved = False
+        with self._write() as conn:
+            request, state, stamp = self._settle(conn, request_id)
+            if request is not None and state == "pending":
+                found = self._matching_grant(authority, request, tool_input=tool_input, posture=posture,
+                                             now=parse_stamp(stamp))
+                if found is not None:
+                    queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+                    record = grant_answer_payload(queue_id=queue_id, request=request, grant_id=found[0],
+                                                  grant_seq=found[1], grant_hash=found[2], posture=posture)
+                    moved = self._transition(conn, request, "allowed", stamp=stamp,
+                                             answer=answer_message(record).decode("utf-8"), via="grant",
+                                             grant=record)
+        return self.decision(request_id, tool_input=tool_input, posture=posture) if moved else None
+
+    def _grant_decision(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
+                        payload: Mapping[str, Any], *, tool_input: Any, posture: Any) -> Decision | None:
+        """A grant-answered row's decision, re-verified now: the stored record binds this queue, this request
+        and its digest; the deliverer holds the tool input the request was filed for and the posture recorded;
+        and the named grant is still in a fresh replay, unexpired, its criteria true at the queue's clock."""
+        if set(payload) != _GRANT_ANSWER_KEYS or payload["format"] != GRANT_ANSWER_FORMAT \
+                or payload["queue_id"] != queue_id or payload["request_id"] != request.id \
+                or payload["request_digest"] != request.digest or payload["expires_at"] != request.expires_at \
+                or payload["decision"] != "allow" or row["state"] != "allowed" or row["signer_fp"] is not None:
+            return None
+        if tool_input is None or not isinstance(posture, str) or payload["posture"] != posture:
+            return None
+        gid = payload["grant_id"]
+        authority = self._fresh_authority()
+        grant = None if authority is None or not isinstance(gid, str) else authority.policy.grants.get(gid)
+        if grant is None or grant_refusal(grant, request, tool_input=tool_input, posture=posture,
+                                          now=_now_utc(self._clock)) is not None:
+            return None
+        return Decision(request_id=request.id, decision="allow", signer_fp=None, decided_at=row["decided_at"],
+                        request_digest=request.digest, via="grant", grant_id=gid, grant_seq=payload["grant_seq"],
+                        grant_hash=payload["grant_hash"], posture=posture)
+
+    def decision(self, request_id: str, *, tool_input: Any = None, posture: str | None = None) -> Decision | None:
+        """The decision of a terminal request, re-verified now. A signed answer: the stored answer must be the
+        canonical record of this row's decision for this queue and request, decided before its expiry, and its
+        signature must verify under a key a fresh replay holds active (and of a class covering the tier, for an
+        allow). A grant answer (``via`` ``grant``): delivered only to a caller holding the request's tool input
+        and the posture recorded, while the grant still answers it in a fresh replay (:meth:`_grant_decision`);
+        without ``tool_input`` it is ``None``. ``None`` while pending, for expired/withdrawn, and for anything
+        that fails."""
         with self._read() as conn:
             row = self._row(conn, request_id)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
@@ -554,6 +640,10 @@ class ConsentQueue:
                 return None
         except (ValueError, ConsentError, RecursionError):
             return None
+        if row["via"] == "grant":
+            return self._grant_decision(row, request, queue_id[0], payload, tool_input=tool_input, posture=posture)
+        if row["via"] != "signature":
+            return None
         named = payload.get("decision")
         if not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
                 or payload.get("signer_fp") != row["signer_fp"]:
@@ -565,11 +655,13 @@ class ConsentQueue:
                         decided_at=decided_at, request_digest=request.digest)
 
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
-                       sleep: Callable[[float], None] = time.sleep) -> Decision | None:
+                       sleep: Callable[[float], None] = time.sleep, tool_input: Any = None,
+                       posture: str | None = None) -> Decision | None:
         """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request
         expired, was withdrawn, is unknown, its stored answer no longer verifies, or it is still pending
         when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
-        lets it expire). ``poll`` below 1ms (or not a number) is 1ms."""
+        lets it expire). ``poll`` below 1ms (or not a number) is 1ms. ``tool_input`` / ``posture`` are passed to
+        :meth:`decision` (a grant answer is delivered only with them)."""
         poll = poll if poll >= 0.001 else 0.001             # NaN compares false: it becomes 1ms too
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
@@ -577,7 +669,7 @@ class ConsentQueue:
             if got is None:
                 return None
             if got[1] != "pending":
-                return self.decision(request_id)
+                return self.decision(request_id, tool_input=tool_input, posture=posture)
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
