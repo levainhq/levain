@@ -289,8 +289,8 @@ def test_install_writes_the_hook_and_keeps_other_settings(tmp_path):
     ws = tmp_path / "ws"
     (ws / ".claude").mkdir(parents=True)
     (ws / ".claude" / "settings.json").write_text(json.dumps({"model": "haiku", "hooks": {"Stop": [{"hooks": []}]}}))
-    script, settings = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
-    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)  # idempotent
+    script, settings = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)  # idempotent
     data = json.loads(settings.read_text())
     assert data["model"] == "haiku" and "Stop" in data["hooks"]
     [entry] = data["hooks"]["PermissionRequest"]
@@ -457,7 +457,7 @@ def test_install_refuses_a_symlink_on_the_path(tmp_path, link):
     parent.mkdir(parents=True, exist_ok=True)
     (ws / link).symlink_to(elsewhere if not link.endswith((".json", ".py")) else elsewhere / "victim")
     with pytest.raises(ValueError):
-        cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+        cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     assert (elsewhere / "victim").read_text() == "{}" and sorted(p.name for p in elsewhere.iterdir()) == ["victim"]
 
 
@@ -465,7 +465,7 @@ def test_reinstall_removes_only_the_exact_levain_handler(tmp_path):
     """P4 (codex 8): other handlers in a shared group and group fields stay; a lookalike command stays."""
     ws = tmp_path / "ws"
     (ws / ".claude").mkdir(parents=True)
-    script, settings = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    script, settings = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     data = json.loads(settings.read_text())
     [group] = data["hooks"]["PermissionRequest"]
     audit = {"type": "command", "command": "/usr/bin/audit backup-levain_consent.py"}
@@ -474,7 +474,7 @@ def test_reinstall_removes_only_the_exact_levain_handler(tmp_path):
     lone = {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/levain_consent.py.bak"}]}
     data["hooks"]["PermissionRequest"].append(lone)
     settings.write_text(json.dumps(data))
-    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     groups = json.loads(settings.read_text())["hooks"]["PermissionRequest"]
     assert groups[0] == {"matcher": "*", "hooks": [audit], "note": "kept"}
     assert groups[1] == lone
@@ -491,7 +491,7 @@ def test_settings_update_is_an_atomic_replace(tmp_path, monkeypatch):
     real_fsync, real_replace = os.fsync, os.replace
     monkeypatch.setattr(cc.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
     monkeypatch.setattr(cc.os, "replace", lambda a, b: (replaced.append(Path(b).name), real_replace(a, b))[1])
-    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     assert "settings.json" in replaced and cc.HOOK_SCRIPT_NAME in replaced and len(synced) >= 2
     assert os.stat(ws / ".claude" / "settings.json").st_ino != before
     assert json.loads((ws / ".claude" / "settings.json").read_text())["model"] == "haiku"
@@ -533,12 +533,12 @@ def test_reinstall_under_another_python_replaces_the_old_levain_handler(tmp_path
     beside the new one. A lookalike script path is still never ours."""
     ws = tmp_path / "ws"
     (ws / ".claude").mkdir(parents=True)
-    script, settings = cc.install(ws, python="/old/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    script, settings = cc.install(ws, python="/old/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     data = json.loads(settings.read_text())
     lookalike = {"type": "command", "command": f"/old/bin/python3 {script}.bak"}
     data["hooks"]["PermissionRequest"].append({"matcher": "*", "hooks": [lookalike]})
     settings.write_text(json.dumps(data))
-    cc.install(ws, python="/new/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    cc.install(ws, python="/new/bin/python3", queue_dir=tmp_path / "q", max_hold=60, allow_untested_agent_version=True)
     commands = [h["command"] for g in json.loads(settings.read_text())["hooks"]["PermissionRequest"] for h in g["hooks"]]
     assert commands.count(f"/new/bin/python3 {script}") == 1
     assert not any(c == f"/old/bin/python3 {script}" for c in commands)
@@ -737,3 +737,32 @@ def test_dot_claude_json_is_config_only_as_the_users_own(tmp_path):
     for path in ("tests/fixtures/.claude.json", ".claude.json", str(home / "sub" / ".claude.json")):
         assert not cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home), path
     assert cc.targets_agent_config("Write", {"file_path": "sub/.mcp.json"}, str(ws), home=home)
+
+
+def test_install_refuses_an_untested_claude_version_unless_allowed(tmp_path, monkeypatch):
+    """The Claude Code install takes the same version pin as Codex's (canary.TESTED_VERSIONS)."""
+    from levain.consent.canary import UntestedAgentVersion
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "claude"
+    fake.write_text("#!/bin/sh\necho '9.9.9 (Claude Code)'\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    with pytest.raises(UntestedAgentVersion, match="9.9.9"):
+        cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    assert not (ws / ".claude").exists()
+    script, _ = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60,
+                           allow_untested_agent_version=True)
+    assert script.is_file()
+    fake.write_text("#!/bin/sh\necho '2.1.300 (Claude Code)'\n")
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+
+
+def test_hook_script_reexecs_isolated_with_EP(tmp_path):
+    """Q3 r1 item 1 on the Claude side: the script re-executes with -EP (keeps the user site, unlike -I), so a
+    levain planted beside it is never imported."""
+    text = cc.HOOK_TEMPLATE.format(python="/py/bin/python3", argv=repr(["--max-hold", "0.0"]))
+    assert '"-EP"' in text and '"-I"' not in text
+    assert text.index("os.execv") < text.index("from levain.consent.adapters.claude_code import main")

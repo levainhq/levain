@@ -374,13 +374,28 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
 
 # --- install (one workspace's project settings) ------------------------------------------------------------
 
+# The first lines of every hook script levain writes (this adapter's, Codex's and the canary's): Python puts a
+# script's own directory first on sys.path, so a package planted beside the script (``.claude/hooks/levain/``) would
+# be imported instead of levain. Unless already running with -E -P (no PYTHON* variables, no script directory on
+# sys.path), the script re-executes itself so; ``os`` is already loaded by then (site imports it), so nothing is read
+# from the workspace first. ``-EP``, not ``-I``: ``-I`` also drops the user site, where levain may be installed.
+ISOLATE_PRELUDE = '''import os
+import sys
+
+if not (sys.flags.safe_path and sys.flags.ignore_environment):
+    try:
+        os.execv(sys.executable, [sys.executable, "-EP", os.path.abspath(__file__), *sys.argv[1:]])
+    except BaseException:
+        pass
+    sys.exit(0)
+'''
+
 HOOK_TEMPLATE = '''#!{python}
 # Installed by levain (levain.consent.adapters.claude_code.install). Claude Code's PermissionRequest hook:
 # it reports a decision only when levain verified a signed answer or a standing consent grant; otherwise it
 # prints nothing and the native permission dialog stands. Any failure here, including levain missing, is no
 # decision.
-import sys
-
+''' + ISOLATE_PRELUDE.replace("{", "{{").replace("}", "}}") + '''
 try:
     from levain.consent.adapters.claude_code import main
 except BaseException:
@@ -390,12 +405,17 @@ sys.exit(main({argv}))
 
 
 def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path | str | None = None,
-            max_hold: float = DEFAULT_MAX_HOLD) -> tuple[Path, Path]:
+            max_hold: float = DEFAULT_MAX_HOLD, allow_untested_agent_version: bool = False) -> tuple[Path, Path]:
     """Install the hook into ``workspace``: ``.claude/hooks/levain_consent.py`` and a ``PermissionRequest``
     entry (matcher ``*``, ``timeout`` = :func:`hook_timeout`) in ``.claude/settings.json``, other
-    settings kept and any earlier levain entry replaced. Returns (script, settings)."""
+    settings kept and any earlier levain entry replaced. Raises
+    :class:`levain.consent.canary.UntestedAgentVersion` when the installed ``claude`` is not a tested version
+    (:data:`levain.consent.canary.TESTED_VERSIONS`), unless ``allow_untested_agent_version``. Returns
+    (script, settings)."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
         raise ValueError("max_hold must be a finite number of seconds >= 0")
+    from levain.consent.canary import require_tested_version
+    require_tested_version(AGENT, allow_untested=allow_untested_agent_version)
     ws = Path(workspace).resolve()
     claude_dir = ws / ".claude"
     hooks_dir = claude_dir / "hooks"

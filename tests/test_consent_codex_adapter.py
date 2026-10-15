@@ -80,3 +80,57 @@ def test_installed_hook_never_imports_a_levain_planted_beside_it(tmp_path):
     assert (out.returncode, out.stdout) == (0, "")
     assert (tmp_path / "q" / "queue.db").exists()  # the real adapter ran: it filed the request
     assert cx.script_intact(script, queue_dir=tmp_path / "q")
+
+
+def test_real_core_grant_answers_an_apply_patch_inside_its_workspace_only(tmp_path):
+    """Q3+Q4 merge: the Codex adapter passes the input it filed and the posture to the policy, and registers its
+    apply_patch reader; without either, a grant answers nothing. A patch naming a file outside the workspace, and
+    one whose headers cannot be read, fall to the human."""
+    import io
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.firejournal import CockpitDB
+    from levain.consent import policy as policy_mod
+    from tests.test_consent_cc_adapter import Key
+
+    assert policy_mod._TARGETS["codex"] is cx.policy_targets
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    ws.mkdir()
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    for op in ({"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key, "class": "laptop-presence",
+                "custody": "passphrase"},
+               {"op": "create_grant", "grant": {"id": "gx", "kind": "consent", "agent": "codex",
+                                                "tools": ["apply_patch"], "workspace": str(ws),
+                                                "postures": ["default"],
+                                                "expires_at": utc_stamp(datetime.now(timezone.utc)
+                                                                        + timedelta(days=1))}}):
+        auth.sign_and_append(conn, op, signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    qdir = tmp_path / "home" / "consent"
+    qdir.mkdir(parents=True, mode=0o700)
+    (qdir / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+
+    def patch(path):
+        return {"command": f"*** Begin Patch\n*** Add File: {path}\n+hi\n*** End Patch\n"}
+
+    def run(tool_input, **extra):
+        e = {"session_id": "s-1", "cwd": str(ws), "permission_mode": "default", "hook_event_name": "PermissionRequest",
+             "tool_name": "apply_patch", "tool_input": tool_input, **extra}
+        out = io.StringIO()
+        assert cx.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
+        return out.getvalue()
+    got = json.loads(run(patch("a.txt")))
+    assert got["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert run(patch(str(tmp_path / "outside.txt"))) == ""
+    assert run({"command": "*** Begin Patch\n*** Bogus: a.txt\n*** End Patch\n"}) == ""
+    assert run(patch("a.txt"), permission_mode="never") == ""

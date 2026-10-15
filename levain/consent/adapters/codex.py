@@ -7,8 +7,10 @@ delays the dialog, and away mode stays opt-in with a default hold of 0 s. The ho
 1. reads the event (``tool_name``, ``tool_input``, ``session_id``, ``cwd``, ``permission_mode``) and files one
    request on the queue. A Codex ``PermissionRequest`` carries no per-event id (only ``turn_id``, which one turn
    shares across its requests), so the core mints a random one;
-2. asks the policy seam (:func:`levain.consent.policy.guarded_policy`, posture = the event's ``permission_mode``),
-   except for a request that targets agent config or hooks (:func:`targets_agent_config`), which is never eligible;
+2. asks the policy seam (:func:`levain.consent.policy.guarded_policy`, with the tool input it filed and posture =
+   the event's ``permission_mode``), except for a request that targets agent config or hooks
+   (:func:`targets_agent_config`), which is never eligible. A standing consent grant can answer there; its targets
+   are read by :func:`policy_targets`, registered with the policy when this module is imported;
 3. when away mode is on waits up to the hold for a signed answer the core verifies, and withdraws the request if
    none came;
 4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
@@ -18,7 +20,8 @@ Measured on codex-cli 0.162.1: the approvals that reach this event are a shell e
 the command in ``tool_input.command``, Codex's model-written reason in ``tool_input.description``) and an
 ``apply_patch`` outside what the sandbox may write, the workspace's ``.codex/`` included (``tool_name``
 ``apply_patch``, the patch text in ``tool_input.command``). A shell command is never parsed (ruling 1). A patch's
-own file headers are read, only to tag agent config: a patch naming no file is tagged.
+own file headers are read to tag agent config (a patch naming no file is tagged) and to match a grant's workspace
+(an unreadable patch matches no grant).
 
 Codex fires project hooks only in an INTERACTIVE session whose process cwd is the project: ``codex exec`` never asks
 (its approval policy is ``never``) and ``codex -C <dir>`` does not load ``<dir>/.codex/hooks.json`` (Q0 item 6).
@@ -54,8 +57,9 @@ from typing import IO, Any
 from levain.authority import anchor_path
 from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (
-    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings, _absolute_root,
-    _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_timeout, protected_paths,
+    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings,
+    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_timeout,
+    protected_paths,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
@@ -118,6 +122,20 @@ def patch_targets(patch: Any) -> list[str] | None:
         elif line.strip().startswith("***") and line.strip() not in _PATCH_MARKERS:
             return None
     return found or None
+
+
+def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
+    """The paths a Codex request names, for the consent policy's grant criteria: an ``apply_patch``'s headers
+    (:func:`patch_targets` of ``tool_input.command``; ``None``, which matches nothing, when unreadable), an MCP
+    tool's path fields (:func:`levain.consent.policy.targets`), else ``None`` (matched on cwd only)."""
+    if tool_name == PATCH_TOOL:
+        return patch_targets(tool_input.get("command") if isinstance(tool_input, Mapping) else None)
+    if tool_name.startswith("mcp__"):
+        return consent_policy.targets(tool_name, tool_input)
+    return None
+
+
+consent_policy.register_targets(AGENT, policy_targets)
 
 
 def _in_codex_config(path: str, cwd: str, home: Path, codex_dir: Path) -> bool:
@@ -213,13 +231,14 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     try:
         got: Decision | None = None
         if not agent_config and request.tier != AGENT_CONFIG_TIER:
-            got = _verified(consent_policy.guarded_policy(request, queue, posture=posture, policy=policy), request)
+            got = _verified(consent_policy.guarded_policy(request, queue, posture=posture, tool_input=tool_input,
+                                                          policy=policy), request)
         wait = min(hold, max(0.0, deadline - clock()))
         if got is None and wait > 0:
-            got = _verified(queue.await_decision(request.id, wait), request)
+            got = _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture), request)
         if got is None:
             if not queue.withdraw(request.id, note="the hook stopped waiting; Codex's approval dialog stands"):
-                got = _verified(queue.decision(request.id), request)
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
         settled = True
         return hook_output(got) if got is not None else None
     finally:
@@ -266,25 +285,10 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
 
 # --- install (one workspace's .codex/) ---------------------------------------------------------------------
 
-# The first lines of every hook script levain writes: Python puts a script's own directory first on sys.path, so a
-# package planted beside the script (``.codex/hooks/levain/``) would be imported instead of levain. Unless already
-# running with -E -P (no PYTHON* variables, no script directory on sys.path), the script re-executes itself so;
-# ``os`` is already loaded by then (site imports it), so nothing is read from the workspace first.
-ISOLATE_PRELUDE = '''import os
-import sys
-
-if not (sys.flags.safe_path and sys.flags.ignore_environment):
-    try:
-        os.execv(sys.executable, [sys.executable, "-EP", os.path.abspath(__file__), *sys.argv[1:]])
-    except BaseException:
-        pass
-    sys.exit(0)
-'''
-
 HOOK_TEMPLATE = '''#!{python}
 # Installed by levain (levain.consent.adapters.codex.install). Codex's PermissionRequest hook: it reports a
-# decision only when levain verified a signed answer; otherwise it prints nothing and Codex's approval dialog
-# appears. Any failure here, including levain missing, is no decision.
+# decision only when levain verified a signed answer or a standing consent grant; otherwise it prints nothing and
+# Codex's approval dialog appears. Any failure here, including levain missing, is no decision.
 ''' + ISOLATE_PRELUDE.replace("{", "{{").replace("}", "}}") + '''
 try:
     from levain.consent.adapters.codex import main

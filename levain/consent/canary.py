@@ -182,7 +182,7 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
 # --- the canary hook -----------------------------------------------------------------------------------------
 
 def _canary_template() -> str:
-    from levain.consent.adapters.codex import ISOLATE_PRELUDE
+    from levain.consent.adapters.claude_code import ISOLATE_PRELUDE
     return ('''#!{python}
 # Installed by `levain consent canary` in its own scratch workspace: it denies ONE sentinel write, never allows,
 # and records every event it sees. Any failure here is no decision.
@@ -251,9 +251,11 @@ def _setup(agent: str, workspace: Path | None) -> tuple[Path, Path, Path]:
         ws = Path(tempfile.mkdtemp(prefix="levain-canary-")).resolve()
     qdir = ws / ".levain-canary-queue"
     qdir.mkdir(mode=0o700, exist_ok=True)
+    # the canary checks whatever version is installed, so it installs past the pin
     if agent == "claude_code":
-        script, _ = claude_code.install(ws, python=sys.executable, queue_dir=qdir, max_hold=0)
-    else:  # the canary checks whatever version is installed, so it installs past the pin
+        script, _ = claude_code.install(ws, python=sys.executable, queue_dir=qdir, max_hold=0,
+                                        allow_untested_agent_version=True)
+    else:
         script, _ = codex.install(ws, python=sys.executable, queue_dir=qdir, max_hold=0,
                                   allow_untested_agent_version=True)
     sentinel = ws / (SENTINEL_NAME if agent == "claude_code" else f".codex/{SENTINEL_NAME}")
