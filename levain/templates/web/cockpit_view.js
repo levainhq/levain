@@ -1484,6 +1484,8 @@
       const tag = el("span", "rp-tag", hit[0]);
       tag.dataset.repo = key;
       clause.insertBefore(tag, clause.firstChild);
+      // the tag can push a clause past its clamp after the clause toggles were measured: measure this row again
+      if (clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
     // the Decisions tile glows only while something waits on him
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
@@ -1493,7 +1495,7 @@
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
-  if (typeof document !== "undefined" && document.documentElement) root.setInterval(tintRepos, 1500);
+  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) tintRepos(); }, 1500);
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();

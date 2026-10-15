@@ -20,8 +20,8 @@
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
   // a repo's hue key, shared with the row tags in cockpit_view.js
-  var HUE_KEYS = [['levain', /^levain/], ['anneal', /^anneal/], ['flow', /^flow/],
-    ['games', /^(wisp|nowhere|squish|shatterbeat|solitaire|blackjack|video[-_ ]?poker|flowpoker)/], ['money', /^(income|arlington|clapham|invoice)/]];
+  var HUE_KEYS = [['levain', /^levain/], ['anneal', /^anneal/],
+    ['games', /^(wisp|nowhere|squish|shatterbeat|solitaire|blackjack|video[-_ ]?poker|flow[-_ ]?poker)/], ['flow', /^flow/], ['money', /^(income|arlington|clapham|invoice)/]];   // games before flow: flowpoker is a game
   function hueKey(repo) {
     var r = String(repo || '').toLowerCase();
     for (var i = 0; i < HUE_KEYS.length; i++) if (HUE_KEYS[i][1].test(r)) return HUE_KEYS[i][0];

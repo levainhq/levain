@@ -109,6 +109,6 @@ def test_project_colour_is_the_product_with_no_variant_switch(tmp_path: Path) ->
       const root = getComputedStyle(document.documentElement);
       const stripe = document.querySelector('.ck-card.w[data-ck-panel="decisions"], .ck-card.w[data-ck-panel="memory"]');
       return { variantAttr: document.documentElement.dataset.variant || '', levain: root.getPropertyValue('--hue-levain').trim(), anneal: root.getPropertyValue('--hue-anneal').trim(),
-        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', hues: window.LevainSky ? ['levain', 'anneal', 'wisp', 'income', 'zzz'].map(window.LevainSky.hueKey) : [] }; })()"""}])
+        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', hues: window.LevainSky ? ['levain', 'anneal', 'wisp', 'flowpoker', 'flow-poker', 'flowconnect', 'income', 'zzz'].map(window.LevainSky.hueKey) : [] }; })()"""}])
     got = vals[1]
-    assert got["variantAttr"] == "" and got["levain"] and got["anneal"] and got["stripeH"] == "2px" and got["hues"] == ["levain", "anneal", "games", "money", ""], got
+    assert got["variantAttr"] == "" and got["levain"] and got["anneal"] and got["stripeH"] == "2px" and got["hues"] == ["levain", "anneal", "games", "games", "games", "flow", "money", ""], got
