@@ -24,7 +24,7 @@ existing ``human_present: bool`` signature untouched. **K3's security boundary d
 **Why the floor no longer follows the gate's line.** Until 2026-10-07 the floor kept ``headless`` open
 and denied only ``unattended``; that default was ruled flipped (cockpit chat is ``headless``, and its
 every turn is captured), which left the interactive REPL as the one drive with the standard credential
-stores open by default. On 2026-10-12 (N7) he ruled that one closed too: the crown-jewels floor is
+stores open by default. On 2026-10-12 (N7) that one was ruled closed too: the crown-jewels floor is
 presence-INDEPENDENT, as ``~/.anneal-memory`` already was, because it is *irreversibility containment*
 and not fan-in. The reasons the credential stores belong in it:
 
