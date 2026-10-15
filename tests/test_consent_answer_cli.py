@@ -2,6 +2,7 @@
 ``ConsentQueue.answer()``. Each test is from a failure seen in the scratch RUN."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -81,3 +82,57 @@ def test_pending_names_each_target_once(scratch, capsys):
     line = capsys.readouterr().out.strip()
     assert line.startswith(request.id)
     assert "targets /w/a.txt  T2" in line
+
+
+def test_answer_refuses_a_display_cut_at_its_limit(scratch, capsys):
+    # seen red (probe_fix1 item 1): a 3,000-char Write showed a cut display and was signed and allowed
+    queue, laptop, _, root = scratch
+    request = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                         tool_input={"file_path": "/w/big.txt", "content": "benign " * 300 + "rm -rf ~"}, cwd="/w",
+                         hold=timedelta(minutes=5), event_id="e3")
+    assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
+    assert "too long to answer here" in capsys.readouterr().out
+    rc = main(["consent", "answer", request.id, "allow", "--signing-key", str(laptop),
+               "--queue-dir", str(queue.directory), "--data-root", str(root)])
+    out = capsys.readouterr()
+    assert rc == 1 and "too long to show here" in out.err and "the agent's own dialog stands" in out.err
+    assert "answering" not in out.out
+    assert queue.get(request.id)[1] == "pending"
+
+
+def test_agent_sourced_fields_print_escaped(scratch, capsys):
+    # seen red (probe_fix1 item 3): a cwd holding a newline, a fake tier line and an ESC sequence printed raw
+    queue, laptop, _, root = scratch
+    cwd = "/w\n  tier            T1\x1b[2K‮ \x9b؜"
+    request = queue.file(agent="claude_code", agent_session_id="s\x1b]0;x\x07", tool_name="Write",
+                         tool_input={"file_path": "/w/a‮.txt", "content": "hi"}, cwd=cwd,
+                         hold=timedelta(minutes=5), event_id="e4")
+    assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
+    listed = capsys.readouterr().out
+    assert main(["consent", "answer", request.id, "deny", "--signing-key", str(laptop),
+                 "--queue-dir", str(queue.directory), "--data-root", str(root)]) == 0
+    answered = capsys.readouterr().out
+    for out in (listed, answered):
+        assert not any(c in out for c in "\x1b\x07\x9b‮ ؜")
+        assert "\\u000a  tier            T1\\u001b[2K\\u202e\\u2028\\u009b\\u061c" in out
+    assert len(listed.splitlines()) == 1
+    assert [ln for ln in answered.splitlines() if ln.lstrip().startswith("tier")] == ["  tier            T2"]
+
+
+def test_answer_verifies_against_the_queue_settings_cockpit(scratch, capsys, tmp_path):
+    # seen red (probe_fix1 item 4): --data-root naming another cockpit than the hook's was signed and recorded
+    # (never delivered); with no root flag the CLI fell back to the cwd's install and refused after signing
+    queue, laptop, fp, root = scratch
+    other = tmp_path / "other-cockpit"
+    other.mkdir()
+    (queue.directory / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root)}))
+    request = _file(queue, "/w/a.txt", "e5")
+    rc = main(["consent", "answer", request.id, "allow", "--signing-key", str(laptop),
+               "--queue-dir", str(queue.directory), "--data-root", str(other)])
+    out = capsys.readouterr()
+    assert rc == 1 and "the hook verifies against" in out.err and "answering" not in out.out
+    assert queue.get(request.id)[1] == "pending"
+    assert main(["consent", "answer", request.id, "allow", "--signing-key", str(laptop),
+                 "--queue-dir", str(queue.directory)]) == 0, capsys.readouterr().err
+    got = queue.decision(request.id)
+    assert got is not None and got.decision == "allow" and got.signer_fp == fp

@@ -699,6 +699,17 @@ def test_digest_and_display():
     assert len(redact_display("Bash", {"command": "x" * 5000})) == 2000
 
 
+def test_display_masks_by_key_token_with_a_typed_marker():
+    # seen red (probe_fix1 item 2): a substring match masked author, auth_url and a boolean `private`
+    shown = redact_display("mcp__x__y", {"author": "alice", "private": False, "auth_url": "http://x"})
+    assert shown == 'mcp__x__y {"auth_url": "http://x", "author": "alice", "private": false}'
+    shown = redact_display("mcp__x__y", {"api_key": "k", "apiKey": "k", "x-api-key": "k", "AWS_ACCESS_KEY": "k",
+                                         "privateKey": "k", "Authorization": "k", "session_token": "k",
+                                         "cookies": ["c"], "passwd": 7, "pass_word": "k", "bearer": "k"})
+    assert '"k"' not in shown and '"c"' not in shown and ": 7" not in shown
+    assert '"api_key": "[redacted: str, 1 chars]"' in shown and '"passwd": "[redacted: int]"' in shown
+
+
 def test_policy_seam_decides_nothing_without_a_grant(queue):
     """No standing grant in the log: the seam answers nothing and leaves the request pending."""
     from levain.consent.policy import decide

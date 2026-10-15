@@ -493,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     cs_sub = cs_p.add_subparsers(dest="consent_cmd", required=True)
     _add_consent_canary_parser(cs_sub)
     _add_consent_grant_parser(cs_sub, _ck_common)
-    _add_consent_answer_parser(cs_sub, _ck_common)
+    _add_consent_answer_parser(cs_sub)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1806,10 +1806,8 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
     cs_list.set_defaults(func=_cmd_consent_grant_list)
 
 
-def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction, common: object) -> None:
-    """``levain consent pending`` and ``levain consent answer`` under the ``consent`` subparsers ``cs_sub``;
-    ``common`` adds the cockpit commands' ``--path`` / ``--data-root`` (the authority log an answer is verified
-    against)."""
+def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
+    """``levain consent pending`` and ``levain consent answer`` under the ``consent`` subparsers ``cs_sub``."""
     queue_help = "The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent)."
     cs_pending = cs_sub.add_parser(
         "pending", help="List the consent requests waiting on an answer.",
@@ -1824,7 +1822,8 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction, common: objec
                     "hand it to the queue, which verifies it against a fresh replay of the authority log (an "
                     "enrolled, unrevoked key; for an allow, a key class that covers the request's tier) and "
                     "records it. The hook waiting on the request then delivers it to the agent. One request, "
-                    "one signature; a deny is signed too.")
+                    "one signature; a deny is signed too. A request whose input is too long to show here in "
+                    "full is not signed: the agent's own dialog stands.")
     cs_answer.add_argument("request_id", help="The request's id, as `levain consent pending` shows it.")
     cs_answer.add_argument("decision", choices=("allow", "deny"))
     cs_answer.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
@@ -1832,7 +1831,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction, common: objec
                                 "key an agent holds). An allow of an agent-config edit needs a laptop-presence "
                                 "key.")
     cs_answer.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
-    common(cs_answer)
+    cs_answer.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                           help="The cockpit data root whose authority log verifies the answer. Default: the one "
+                                "the queue's hook settings name for the request's agent (its cockpit_data_root); "
+                                "a root other than that one is refused before anything is signed.")
+    cs_answer.add_argument("--path", type=Path, default=None,
+                           help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     cs_answer.set_defaults(func=_cmd_consent_answer)
 
 
@@ -1845,21 +1849,54 @@ def _consent_queue_dir(args: argparse.Namespace) -> Path:
     return qdir
 
 
-def _consent_targets(request: object) -> str:
-    """The paths a grant's criteria would read from the request, read back from its sealed display (the tool
-    input as filed, secret-named keys masked). A display only: nothing is decided from it."""
+def _reading_queue(qdir: Path) -> object:
+    """The queue in ``qdir`` for reading: its authority source is the adapters' no-authority one (the queue
+    directory, which sqlite cannot open as a log), so nothing read through it can ever verify."""
+    from levain.consent.queue import ConsentQueue, authority_source
+
+    return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+
+
+# What the terminal must never receive raw from an agent-sourced string: every C0/C1 control and DEL (Cc), every
+# format control, the bidi controls among them (Cf), a lone surrogate (Cs), and the line and paragraph separators
+# (Zl, Zp). Each is printed as its escape, \uXXXX (\UXXXXXXXX past the BMP).
+_TERM_UNSAFE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def _term_safe(text: object) -> str:
+    import unicodedata
+
+    return "".join((f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
+                   if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
+
+
+_UNSHOWN = object()
+
+
+def _filed_input(request: object) -> object:
+    """The tool input as filed, parsed back from the request's sealed display (``<tool_name> <json>``, secret-
+    named keys masked); :data:`_UNSHOWN` when the display is not that whole: a display cut at its limit never
+    parses (the cut leaves the JSON unterminated, or trailed by the ellipsis)."""
     import json
 
+    prefix = f"{request.tool_name} "
+    if not request.display.startswith(prefix):
+        return _UNSHOWN
+    try:
+        return json.loads(request.display[len(prefix):])
+    except ValueError:
+        return _UNSHOWN
+
+
+def _consent_targets(request: object) -> str:
+    """The paths a grant's criteria would read from the request, read back from its sealed display. A display
+    only: nothing is decided from it."""
     import levain.consent.adapters.codex  # noqa: F401 - registers Codex's apply_patch target reader
     from levain.consent.policy import _request_targets
 
-    prefix = f"{request.tool_name} "
-    try:
-        if not request.display.startswith(prefix):
-            raise ValueError
-        tool_input = json.loads(request.display[len(prefix):])
-    except ValueError:
-        return "(not shown: the input as filed is cut at its display limit)"
+    tool_input = _filed_input(request)
+    if tool_input is _UNSHOWN:
+        return "(too long to answer here: the input as filed is cut at its display limit)"
     got = _request_targets(request.agent, request.tool_name, tool_input)
     if not got:
         return "(none named: the working directory)"
@@ -1878,64 +1915,97 @@ def _time_left(expires_at: str, now: datetime) -> str:
 
 def _cmd_consent_pending(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import ConsentError
-    from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
+    from levain.consent.queue import QueueStoreError
 
     try:
-        qdir = _consent_queue_dir(args)
-        # listing verifies nothing: a source over the queue directory, which never replays (as the hook's
-        # no-authority fallback)
-        queue = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
-        pending = queue.pending()
+        pending = _reading_queue(_consent_queue_dir(args)).pending()
+        if not pending:
+            print("no pending consent requests")
+        now = _utc_now()
+        for r in pending:
+            print(_term_safe(f"{r.id}  {r.agent}  {r.tool_name}  cwd {r.cwd}  targets {_consent_targets(r)}  "
+                             f"{r.tier}  filed {r.received_at}  {_time_left(r.expires_at, now)}"))
     except (OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
-        print(f"pending: {exc}", file=sys.stderr)
+        print(f"pending: {_term_safe(exc)}", file=sys.stderr)
         return 1
-    if not pending:
-        print("no pending consent requests")
-    now = _utc_now()
-    for r in pending:
-        print(f"{r.id}  {r.agent}  {r.tool_name}  cwd {r.cwd}  targets {_consent_targets(r)}  {r.tier}  "
-              f"filed {r.received_at}  {_time_left(r.expires_at, now)}")
     return 0
+
+
+def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
+    """The cockpit data root an answer to ``request`` is verified against: the one the hook for its agent
+    replays (``cockpit_data_root`` in the queue directory's adapter settings), so a recorded answer is one the
+    hook can deliver. ``--data-root`` / ``--path`` naming another directory is refused; with no setting (the
+    hook then verifies nothing) one of them is required."""
+    import os
+
+    from levain.consent.adapters import claude_code, codex
+    from levain.consent.queue import AnswerRefused
+
+    adapter = {"claude_code": claude_code, "codex": codex}.get(request.agent)
+    if adapter is None:
+        raise AnswerRefused(f"no consent hook files for agent {request.agent!r}")
+    hook = adapter.load_settings(qdir).cockpit_data_root
+    named = None if args.data_root is None and args.path is None else Path(_cockpit_root(args)).expanduser()
+    if hook is None:
+        if named is None:
+            raise AnswerRefused(f"the queue's {adapter.SETTINGS_NAME} names no cockpit_data_root for "
+                                f"{request.agent}; pass --data-root")
+        return named
+    if named is not None:
+        try:
+            same = os.path.samefile(named, hook)
+        except OSError:
+            same = False
+        if not same:
+            raise AnswerRefused(f"{named} is not the cockpit the hook verifies against ({hook}, the queue's "
+                                f"{adapter.SETTINGS_NAME}): an answer verified there would never be delivered")
+    return Path(hook)
 
 
 def _cmd_consent_answer(args: argparse.Namespace) -> int:
     from levain.authority import anchor_path
-    from levain.cockpit.consent import ConsentError
+    from levain.cockpit.consent import ConsentError, utc_stamp
     from levain.cockpit.keys import ssh_signer
     from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source
-    from levain.consent.record import ANSWER_NAMESPACE, answer_message
+    from levain.consent.record import ANSWER_NAMESPACE, answer_message, answer_payload
 
     try:
         qdir = _consent_queue_dir(args)
-        root = _cockpit_root(args)
-        queue = ConsentQueue(qdir, authority=authority_source(Path(root) / "cockpit.db",
-                                                              anchor=anchor_path(Path(root))))
-        signer_fp, sign = ssh_signer(args.signing_key, namespace=ANSWER_NAMESPACE)
-        payload = queue.answer_payload(args.request_id, args.decision, signer_fp)   # refuses a non-pending id
-        got = queue.get(args.request_id)
+        got = _reading_queue(qdir).get(args.request_id)      # the one read: expires it first if its time is up
         if got is None:
             raise AnswerRefused(f"no sealed request {args.request_id!r}")
-        request = got[0]
-        print(f"answering {request.id}: {args.decision.upper()}\n"
-              f"  agent           {request.agent} (session {request.agent_session_id})\n"
-              f"  tool            {request.tool_name}\n"
-              f"  input as filed  {request.display[len(request.tool_name) + 1:]}\n"
-              f"  cwd             {request.cwd}\n"
-              f"  tier            {request.tier}\n"
-              f"  filed           {request.received_at}, hold ends {request.expires_at}\n"
-              f"  input digest    {request.tool_input_digest}\n"
-              f"  request digest  {payload['request_digest']}\n"
-              f"  signer          {signer_fp}", flush=True)
+        request, state = got
+        if state != "pending":
+            raise AnswerRefused(f"request {request.id} is already {state}")
+        if _filed_input(request) is _UNSHOWN:
+            raise AnswerRefused(f"request {request.id}'s input is too long to show here (the queue keeps a display "
+                                "cut at its limit), so it is not signed from the terminal; the agent's own dialog "
+                                "stands")
+        root = _answer_root(args, qdir, request)
+        queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+        signer_fp, sign = ssh_signer(args.signing_key, namespace=ANSWER_NAMESPACE)
+        payload = answer_payload(queue_id=queue.queue_id, request=request, decision=args.decision,
+                                 signer_fp=signer_fp, signed_at=utc_stamp(_utc_now()))
+        print(_term_safe(f"answering {request.id}: {args.decision.upper()}"))
+        for label, value in (("agent", f"{request.agent} (session {request.agent_session_id})"),
+                             ("tool", request.tool_name),
+                             ("input as filed", request.display[len(request.tool_name) + 1:]),
+                             ("cwd", request.cwd), ("tier", request.tier),
+                             ("filed", f"{request.received_at}, hold ends {request.expires_at}"),
+                             ("input digest", request.tool_input_digest),
+                             ("request digest", payload["request_digest"]), ("signer", signer_fp)):
+            print(f"  {label:<15} {_term_safe(value)}")
+        sys.stdout.flush()
         signature = sign(answer_message(payload))
-        decision = queue.answer(args.request_id, payload, signature)
-    except AnswerRefused as exc:
-        print(f"answer refused: {exc}", file=sys.stderr)
+        decision = queue.answer(request.id, payload, signature)
+    except KeyboardInterrupt:
+        print("answer cancelled", file=sys.stderr)
         return 1
-    except (OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
-        print(f"answer refused: {exc}", file=sys.stderr)
+    except (AnswerRefused, OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
+        print(f"answer refused: {_term_safe(exc)}", file=sys.stderr)
         return 1
-    print(f"{'allowed' if decision.decision == 'allow' else 'denied'}: {decision.request_id} by "
-          f"{decision.signer_fp} at {decision.decided_at}")
+    print(_term_safe(f"{'allowed' if decision.decision == 'allow' else 'denied'}: {decision.request_id} by "
+                     f"{decision.signer_fp} at {decision.decided_at}"))
     return 0
 
 
