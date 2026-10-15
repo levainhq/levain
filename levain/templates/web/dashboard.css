@@ -1113,6 +1113,14 @@ body.ke .dot.ok { background: var(--ok); }
 .w .row b { color: var(--text); font: var(--fw-bold) var(--fs-lead) var(--round); margin-right: var(--sp-2); }
 .w .dots { display: flex; flex-direction: column; gap: var(--sp-1); }
 .w .op { padding: var(--sp-1) 0; font-size: var(--fs-meta); }
+/* a tile whose text had to be cut says so with an ellipsis (and is a button to the whole of it), never with its bottom edge */
+.w .xbody.clamped .sub { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.w .xnote, .w .sub { margin-top: 0; }
+/* a row in a tile: two lines at most (the ellipsis is the cue), and no per-row expand: the tile opens the whole list */
+.w .wbody.clamped .row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 2; line-clamp: 2; }
+.w .wbody.clamped .row .clause-toggle { display: none; }
+/* the focus view's filter box over a long metric list stays in reach while the list scrolls */
+.modal-body .xfilter { position: sticky; top: 0; z-index: 2; }
 /* a count tile with a list behind it: it is a button, and the glyph is the same one every panel's focus control wears */
 body.ke .ck-card.w.w-open { cursor: pointer; }
 body.ke .ck-card.w.w-open::after { content: "\2922"; position: absolute; top: var(--sp-4); right: var(--sp-5); color: var(--meta); font-size: var(--fs-lead); line-height: 1; }
