@@ -181,7 +181,7 @@ def _sync_rows(snap: TeamSnapshot) -> tuple[RowIn, ...]:
         ok, err = s.get("last_fetch_ok"), s.get("last_fetch_error")
         lines.append(("remote", f"remote {s['remote']}: last fetch " + (_fmt_ts(ok) if ok else "never")))
         if err:
-            lines.append(("fetch-error", f"last fetch error: {_one_line(person_text(err))}"))
+            lines.append(("fetch-error", f"last fetch error: {_one_line(person_text(err, said='git could not fetch it.', fallback='the remote could not be fetched.'))}"))
     else:
         lines.append(("remote", "no remote: the ledger is local only"))
     if m.get("problems"):

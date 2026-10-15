@@ -1491,7 +1491,9 @@ class Cockpit:
         Ones not yet registered are added, and one already discovered takes the verbs its source
         offers now (a write re-checks them fresh, ``offer_spec``); one that later vanishes keeps its
         provider, which then reads ``Absent`` and renders ``error``, and offers nothing to a write. A discoverer that raises is a manifest ``errors``
-        entry, never silent absence. All discoverers share ONE bounded single-flight read."""
+        entry, never silent absence. All discoverers share ONE bounded single-flight read. A ``retire=True``
+        discoverer must return a NEW ``read`` callable for a panel it re-registers after retiring it: a retired
+        panel's state is matched to its spec by that callable's identity."""
         with self._lock:
             if retire:
                 self._retiring = self._retiring | {len(self._discoverers)}

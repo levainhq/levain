@@ -58,15 +58,16 @@ def _one_line(text: object) -> str:
 _RAW = re.compile(r"[:;,]?\s*(?:\bgit [a-z-]+ failed\b|\bfatal:|\bhint:|\berror:)", re.I)
 
 
-def person_text(text: object) -> str:
+def person_text(text: object, *, said: str = "git could not read its history.", fallback: str = _UNREADABLE) -> str:
     """``text`` for a screen: a message that carries a git command's own output is cut where that output starts and
-    says so in words (the full text stays in ``detail`` and on the CLI)."""
+    ends with ``said`` instead; one that is only git output reads ``fallback`` (the full text stays in ``detail``
+    and on the CLI)."""
     line = _one_line(text)
     m = _RAW.search(line)
     if m is None:
         return line
     head = line[:m.start()].rstrip(" :;,")
-    return f"{head}: git could not read its history." if head else _UNREADABLE
+    return f"{head}: {said}" if head else fallback
 
 
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
@@ -89,7 +90,7 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
             return TeamRead("judged_partial", model, why, _one_line(d.frozen_why or ""))
         return TeamRead("ok", model)
     except TeamError as exc:
-        text = _one_line(exc)
-        return TeamRead("unreadable", None, person_text(text) or _UNREADABLE, f"{type(exc).__name__}: {text}")
+        raw = " ".join(str(exc).split())
+        return TeamRead("unreadable", None, person_text(raw) or _UNREADABLE, f"{type(exc).__name__}: {raw}")
     except Exception as exc:  # noqa: BLE001 - a surface drawing a team must get a named state, never a traceback
         return TeamRead("unreadable", None, _UNREADABLE, f"{type(exc).__name__}: {_one_line(exc)}")
