@@ -83,24 +83,26 @@ def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
     dates = {sha: date for sha, date, _ in d.role_changes}
     began = {s.handle: s.start_sha for s in d.spells if s.end is None}
     members: list[dict] = []
-    for h in sorted(team.members, key=lambda h: (h != team.owner, h)):
+    # the owner leads; team.toml may name an owner its [members] table does not list (its spell is seeded apart)
+    for h in [team.owner, *sorted(set(team.members) - {team.owner})]:
         keys, pending = len(ten.keys.get(h, [])), len(ten.pending_keys.get(h, []))
         since = dates.get(began.get(h, ""))
         members.append({"handle": h, "role": "owner" if h == team.owner else "member", "you": h == you,
                         "keys": keys, "since": str(since)[:10] if since else None,
                         "key_state": "in force" if keys else ("waiting for confirm" if pending else "no key")})
     joins: list[dict] = []
+    # third person always: ``you`` is matched by a key IN FORCE, so the person whose key is only proposed is never
+    # ``you`` here, and a "your key" line would reach almost nobody it names
     for h in sorted(ten.pending_keys):
-        for line in ten.pending_keys[h]:
-            who = "your" if h == you else f"{_tick(h)}'s"
-            run = "you run" if h == you else f"{_tick(h)} runs"
-            joins.append({"kind": "key", "handle": h, "fingerprint": _fp_or_none(line),
-                          "line": f"{who} key is proposed; it comes into force when {run} `levain team key confirm` on "
-                                  f"{'your' if h == you else 'their'} own machine"})
+        for n, line in enumerate(ten.pending_keys[h]):
+            joins.append({"kind": "key", "handle": h, "n": n, "fingerprint": _fp_or_none(line),
+                          "line": f"{_tick(h)}'s key is proposed; it comes into force when {_tick(h)} runs "
+                                  "`levain team key confirm` on their own machine"})
     if ten.offer:
+        # the offeree accepts with a key already in force, so ``you`` does reach them here
         h = str(ten.offer["handle"])
         who, run = ("you", "you run") if h == you else (_tick(h), f"{_tick(h)} runs")
-        joins.append({"kind": "owner-offer", "handle": h,
+        joins.append({"kind": "owner-offer", "handle": h, "n": 0,
                       "line": f"ownership is offered to {who}; it moves when {run} `levain team accept`"})
     return members, joins
 

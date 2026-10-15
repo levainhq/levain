@@ -18,7 +18,7 @@ MODEL = {"project": "p", "owner": "ana", "mode": "ask", "you": "ben", "canon_sta
          "members": [{"handle": "ana", "role": "owner", "you": False, "keys": 1, "key_state": "in force", "since": "2026-10-01"},
                      {"handle": "ben", "role": "member", "you": True, "keys": 0, "key_state": "waiting for confirm", "since": None}],
          "joins": [{"kind": "key", "handle": "ben", "fingerprint": "SHA256:abc",
-                    "line": "your key is proposed; it comes into force when you run `levain team key confirm` on your own machine"}]}
+                    "line": "`ben`'s key is proposed; it comes into force when `ben` runs `levain team key confirm` on their own machine"}]}
 
 
 def _cockpit(reads: list, loads: list[int]) -> Cockpit:
@@ -161,7 +161,7 @@ def test_members_and_joins_panes_draw_rows_without_an_address_and_retire_with_th
     assert "levain team key confirm" in joins["rows"][0]["body"] and "SHA256:abc" in joins["rows"][0]["body"]
     assert "@" not in str(members) + str(joins)
     empty = _cockpit([TeamRead("ok", {**MODEL, "members": [], "joins": []})], [])
-    assert ck.panel("team-joins")["empty"] if "empty" in ck.panel("team-joins") else True
+    assert empty.panel("team-joins")["empty"] == "No joins are waiting."
     assert empty.panel("team-joins")["rows"] == []
     gone = _cockpit([TeamRead("unreadable", None, "The team ledger could not be read.")], [])
     assert _panels(gone) == ["team-status"]
