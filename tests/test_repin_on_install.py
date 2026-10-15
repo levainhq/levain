@@ -130,3 +130,6 @@ def test_a_codex_install_still_pins_the_global_codex_hooks(make_install, tmp_pat
     fresh.mkdir()
     assert hg.agent_pin_status(fresh, adapter="codex") == "none"
     assert hg.agent_pin_status(fresh, adapter="claude-code") == "fresh"
+    # a hookless (openhands) install switched to codex: its marker must not outrank the init's adapter (L3 r2, run)
+    oh = make_install("oh", adapter="openhands")
+    assert hg.agent_pin_status(oh, adapter="codex") == "none"
