@@ -1189,6 +1189,16 @@ body.ke .ck-zgrid > .panel.ck-h-short { height: var(--card-short); }
 body.ke .ck-zgrid > .panel.ck-tab-off { display: none; }
 body.ke .ck-zgrid > .panel.ck-is-empty { height: auto; align-self: start; }
 body.ke .ck-zgrid > .panel.k-brief.ck-h-medium { height: auto; max-height: var(--card-medium); }   /* a prose card sizes to its text; only a long one reaches the medium height and scrolls */
+/* the Team zone: panes hold a few short rows, so each card sizes to its rows (its size class is the cap, then it scrolls),
+   and rows align to their top (no dense packing: the visual order stays the DOM and focus order) */
+/* (desktop widths only: one column already sizes every card to its content, under the phone's own cap below) */
+@media (min-width: 721px) {
+  body.ke .ck-zgrid[data-ck-zone="team"] { align-items: start; }
+  body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-tall { height: auto; max-height: var(--card-tall); }
+  body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-medium { height: auto; max-height: var(--card-medium); }
+  body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-short { height: auto; max-height: var(--card-short); }
+}
+.clause .nowrap { white-space: nowrap; }
 body.ke .ck-zgrid .panel .phead { padding: var(--sp-5) var(--sp-6) var(--sp-4); flex: none; }
 body.ke .ck-zgrid .panel h2 { font: var(--fw-bold) var(--fs-title)/1 var(--round); }
 body.ke .ck-zgrid .panel .pbody { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; padding: 0 var(--sp-6) var(--sp-5); }

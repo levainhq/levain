@@ -1040,7 +1040,13 @@
   function appendClause(row, text) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
     // wrap/edit labels) stays full so it never clamps without this expand affordance.
-    const clause = el("span", "clause clampable", text);
+    const clause = el("span", "clause clampable");
+    // a date (2026-10-15) never breaks at its hyphens: each one is a nowrap span, the text around it plain text
+    const parts = String(text != null ? text : "").split(/(\b\d{4}-\d{2}-\d{2}\b)/);   // nullish text draws an empty clause, as el() does
+    parts.forEach((part, i) => {
+      if (i % 2) clause.appendChild(el("span", "nowrap", part));
+      else if (part) clause.appendChild(document.createTextNode(part));
+    });
     row.appendChild(clause);
     const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
     toggle.type = "button";
