@@ -196,7 +196,8 @@ def _member_rows(members: list[dict]) -> tuple[RowIn, ...]:
     for m in members:
         who = _one_line(m["handle"]) + (" (you)" if m.get("you") else "")
         keys = f"{m['keys']} key{'s' if m['keys'] != 1 else ''}" if m["keys"] else ""
-        body = _one_line(" · ".join(p for p in (m["role"], m["key_state"] + (f" ({keys})" if keys else ""),
+        # a list row draws its BODY as the line (seen in WebKit: a title-only handle was never drawn), so it leads
+        body = _one_line(" · ".join(p for p in (who, m["role"], m["key_state"] + (f" ({keys})" if keys else ""),
                                                 f"since {m['since']}" if m.get("since") else "") if p))
         if m["key_state"] == "no key":
             body = _one_line(body + " · cannot sign")

@@ -18,7 +18,7 @@ MODEL = {"project": "p", "owner": "ana", "mode": "ask", "you": "ben", "canon_sta
          "members": [{"handle": "ana", "role": "owner", "you": False, "keys": 1, "key_state": "in force", "since": "2026-10-01"},
                      {"handle": "ben", "role": "member", "you": True, "keys": 0, "key_state": "waiting for confirm", "since": None}],
          "joins": [{"kind": "key", "handle": "ben", "fingerprint": "SHA256:abc",
-                    "line": "`ben`'s key is proposed; it comes into force when `ben` runs `levain team key confirm` on their own machine"}]}
+                    "line": "ben's key is proposed; it comes into force when ben runs `levain team key confirm` on their own machine"}]}
 
 
 def _cockpit(reads: list, loads: list[int]) -> Cockpit:
@@ -157,6 +157,8 @@ def test_members_and_joins_panes_draw_rows_without_an_address_and_retire_with_th
     assert {"team-members", "team-joins"} <= set(_panels(ck))
     members, joins = ck.panel("team-members"), ck.panel("team-joins")
     assert [r["title"] for r in members["rows"]] == ["ana", "ben (you)"]
+    # seen in WebKit (1015-team/shots): the list draws the body, so the handle must lead it
+    assert [r["body"].split(" · ")[0] for r in members["rows"]] == ["ana", "ben (you)"]
     assert "waiting for confirm" in members["rows"][1]["body"] and "since 2026-10-01" in members["rows"][0]["body"]
     assert "levain team key confirm" in joins["rows"][0]["body"] and "SHA256:abc" in joins["rows"][0]["body"]
     assert "@" not in str(members) + str(joins)

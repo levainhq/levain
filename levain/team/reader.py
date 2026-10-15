@@ -71,10 +71,6 @@ def person_text(text: object, *, said: str = "git could not read its history.", 
     return f"{head}: {said}" if head else fallback
 
 
-def _tick(handle: str) -> str:
-    return f"`{handle}`"
-
-
 def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
     """Who is on the team and what waits on whom, from the one derivation ``d``. Pure: no I/O. No email field exists in
     either list (team.toml holds addresses; the zone needs handles). ``since`` is the date of the commit that began the
@@ -96,12 +92,12 @@ def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
     for h in sorted(ten.pending_keys):
         for n, line in enumerate(ten.pending_keys[h]):
             joins.append({"kind": "key", "handle": h, "n": n, "fingerprint": _fp_or_none(line),
-                          "line": f"{_tick(h)}'s key is proposed; it comes into force when {_tick(h)} runs "
+                          "line": f"{h}'s key is proposed; it comes into force when {h} runs "
                                   "`levain team key confirm` on their own machine"})
     if ten.offer:
         # the offeree accepts with a key already in force, so ``you`` does reach them here
         h = str(ten.offer["handle"])
-        who, run = ("you", "you run") if h == you else (_tick(h), f"{_tick(h)} runs")
+        who, run = ("you", "you run") if h == you else (h, f"{h} runs")
         joins.append({"kind": "owner-offer", "handle": h, "n": 0,
                       "line": f"ownership is offered to {who}; it moves when {run} `levain team accept`"})
     return members, joins
