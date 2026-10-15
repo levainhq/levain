@@ -677,13 +677,12 @@ def _pins_global_codex(ent: Path, adapter: str | None = None) -> bool:
     """Whether this install's pin covers the machine-global Codex ``hooks.json``: only a Codex install's.
     Codex has no per-project hooks file, so ``levain init --adapter codex`` in ANY directory rewrites that
     one file; pinning it from every install turned a Claude Code install's doctor red the moment a Codex
-    install was made elsewhere (diogenes-20261015-021021). ``adapter`` is the adapter about to be written
-    when the caller knows it (an init reads the status BEFORE ``AGENTS.md`` exists); otherwise the one
-    the install attests."""
-    if adapter is None:
-        from levain.install import effective_adapter
-        adapter = effective_adapter(ent)
-    return adapter == "codex"
+    install was made elsewhere (diogenes-20261015-021021). The adapter is the one the install attests
+    (``effective_adapter``); ``adapter``, the one an init is about to write, counts only while the install
+    attests none (an init reads the status BEFORE ``AGENTS.md`` exists), so the status an init takes and
+    the re-pin after it read the same adapter."""
+    from levain.install import effective_adapter
+    return (effective_adapter(ent) or adapter) == "codex"
 
 
 def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None
@@ -820,8 +819,8 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
     local for it to cover yet (a first init), so what levain writes is the only content there.
     ``none``: no pin, but hook files already exist that levain did not write in this run.
     ``changed``: a pin that differs, or one that is invalid or cannot be compared. Never raises.
-    ``adapter``: the adapter an init is about to write; read only while there is no pin yet (an existing pin
-    is compared under the adapter the install attests)."""
+    ``adapter``: the adapter an init is about to write; read only while there is no pin yet and the install
+    attests no adapter (otherwise the attested one decides, as it does for the re-pin)."""
     ent = Path(os.path.abspath(install))
     try:
         old = _load_agent_pins(ent)
