@@ -42,7 +42,6 @@ import math
 import os
 import re
 import select
-import shlex
 import shutil
 import subprocess
 import sys
@@ -58,7 +57,8 @@ from levain.authority import anchor_path
 from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings,
-    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_timeout,
+    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
+    hook_timeout,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
@@ -126,13 +126,11 @@ def patch_targets(patch: Any) -> list[str] | None:
 
 def policy_targets(tool_name: str, tool_input: Any) -> list[Any] | None:
     """The paths a Codex request names, for the consent policy's grant criteria: an ``apply_patch``'s headers
-    (:func:`patch_targets` of ``tool_input.command``; ``None``, which matches nothing, when unreadable), an MCP
-    tool's path fields (:func:`levain.consent.policy.targets`), else ``None`` (matched on cwd only)."""
+    (:func:`patch_targets` of ``tool_input.command``; ``None``, which matches nothing, when unreadable), else any
+    tool's path fields (:func:`levain.consent.policy.grant_targets`)."""
     if tool_name == PATCH_TOOL:
         return patch_targets(tool_input.get("command") if isinstance(tool_input, Mapping) else None)
-    if tool_name.startswith("mcp__"):
-        return consent_policy.targets(tool_name, tool_input)
-    return None
+    return consent_policy.grant_targets(tool_name, tool_input)
 
 
 consent_policy.register_targets(AGENT, policy_targets)
@@ -334,7 +332,7 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
     if queue_dir is not None:
         argv += ["--queue-dir", str(Path(queue_dir).resolve())]
     _atomic_write(script, HOOK_TEMPLATE.format(python=python, argv=repr(argv)), mode=0o755)
-    command = f"{shlex.quote(python)} {shlex.quote(str(script))}"
+    command = hook_command(python, script)
     handler = {"type": "command", "command": command, "timeout": hook_timeout(max_hold)}
     for _ in range(5):
         before = _stat_key(hooks_path)

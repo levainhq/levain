@@ -6,6 +6,7 @@ Keys are real ssh-keygen keys; the authority is a verified replay of a real sign
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sqlite3
 import stat
@@ -19,7 +20,7 @@ import pytest
 
 import levain.authority as auth
 from levain.authority import ReplayCache
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.cockpit.firejournal import UNINITIALISED, CockpitDB
 from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
@@ -61,12 +62,12 @@ class Log:
             pass
         self.source = authority_source(self.path, anchor=None, cache=ReplayCache())
 
-    def link(self, op, signer="laptop"):
+    def link(self, op, signer="laptop", at=None):
         signer = self.keys[signer]
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             auth.sign_and_append(conn, op, signer_fp=signer.fp, sign=lambda m: signer.sign(m, auth.NAMESPACE),
-                                 clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+                                 clock=lambda: at or datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
         finally:
             conn.close()
 
@@ -708,9 +709,9 @@ def test_policy_seam_decides_nothing_without_a_grant(queue):
 
 # --- Q4: standing consent grants --------------------------------------------------------------------------------
 
-def _granted_queue(tmp_path, keys):
-    """A real signed log holding one consent grant g1 (Edit, Write; posture default) over ``tmp_path/proj``, a
-    queue over it, and a directory outside it with a symlink to it from inside the workspace."""
+def _granted_queue(tmp_path, keys, tools=("Edit", "Write")):
+    """A real signed log holding one consent grant g1 (``tools``, default Edit and Write; posture default) over
+    ``tmp_path/proj``, a queue over it, and a directory outside it with a symlink to it from inside the workspace."""
     from levain.consent import policy
     (tmp_path / "auth").mkdir()
     log = Log(tmp_path / "auth", keys)
@@ -721,7 +722,7 @@ def _granted_queue(tmp_path, keys):
     outside.mkdir()
     os.symlink(outside, ws / "escape")
     log.link({"op": "create_grant", "grant": {
-        "id": "g1", "kind": "consent", "agent": "claude_code", "tools": ["Edit", "Write"], "workspace": str(ws),
+        "id": "g1", "kind": "consent", "agent": "claude_code", "tools": sorted(tools), "workspace": str(ws),
         "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}})
     q = ConsentQueue(tmp_path / "consent", authority=log.source)
 
@@ -775,3 +776,133 @@ def test_a_grant_answer_is_delivered_only_while_the_grant_still_answers_it(tmp_p
     log.link({"op": "revoke_grant", "grant_id": "g1"}, signer="laptop")
     assert q.decision(r.id, tool_input=inside, posture="default") is None
     assert ask(inside, tool="Write")[1] is None
+
+
+# --- Q4 L3 r1 -----------------------------------------------------------------------------------------------------
+
+READ_TOOLS = ("Glob", "Grep", "LS", "NotebookRead", "Read", "mcp__fs__read_file")
+
+
+def test_every_path_field_of_a_non_shell_tool_is_checked(tmp_path, keys):
+    """r1 item 1 (complement HIGH 1): a Read grant on the workspace answered a Read of a file outside it, because only
+    Edit/Write/MultiEdit/NotebookEdit and MCP tools had their paths read. Reproduced red on 8135c4b."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys, tools=READ_TOOLS)
+    secret = str(outside / "id_rsa")
+    for tool, tool_input in (("Read", {"file_path": str(ws / "a.txt")}),
+                             ("Glob", {"pattern": "src/**/*.py"}),
+                             ("Glob", {"pattern": "*.{ts,tsx}", "path": str(ws / "sub")}),
+                             ("Grep", {"pattern": "x", "path": str(ws)}),
+                             ("LS", {"path": str(ws / "sub")})):
+        assert ask(tool_input, tool=tool)[1] is not None, (tool, tool_input)               # the controls
+    for tool, tool_input in (("Read", {"file_path": secret}),
+                             ("Read", {"file_path": "~/.ssh/id_rsa"}),
+                             ("Read", {"file_path": 3}),                                   # not a string
+                             ("Read", {"file_path": [secret]}),
+                             ("Grep", {"pattern": "x", "path": str(outside)}),
+                             ("LS", {"path": str(outside)}),
+                             ("NotebookRead", {"notebook_path": str(outside / "n.ipynb")}),
+                             ("Glob", {"pattern": str(outside / "*")}),                    # absolute
+                             ("Glob", {"pattern": "~/.ssh/*"}),
+                             ("Glob", {"pattern": "../elsewhere/*"}),
+                             ("Glob", {"pattern": "sub/../../elsewhere/*"}),
+                             ("Glob", {"pattern": "{" + str(outside) + ",x}/*"}),          # an absolute alternative
+                             ("Glob", {"pattern": 7}),
+                             ("Glob", {"pattern": "*", "path": str(outside)}),
+                             ("mcp__fs__read_file", {"path": [str(ws / "a")]})):          # a list where one path goes
+        r, d = ask(tool_input, tool=tool)
+        assert d is None and q.get(r.id)[1] == "pending", (tool, tool_input)
+
+
+def test_a_workspace_swapped_for_a_symlink_answers_and_delivers_nothing(tmp_path, keys):
+    """r1 item 2 (codex HIGH 2): the signed workspace string was re-resolved per decision, so renaming the directory
+    and putting a symlink to / in its place widened the grant to the whole disk, and an answer given before the swap
+    was still delivered. Reproduced red on 8135c4b."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys, tools=("Read",))
+    inside = {"file_path": str(ws / "a.txt")}
+    r, d = ask(inside, tool="Read")
+    assert d is not None
+    os.rename(ws, tmp_path / "proj.old")
+    os.symlink("/", ws)
+    r2, d2 = ask({"file_path": "/etc/hosts"}, tool="Read", cwd=str(tmp_path))
+    assert d2 is None and q.get(r2.id)[1] == "pending"
+    assert q.decision(r.id, tool_input=inside, posture="default") is None
+
+
+def test_a_grant_answers_nothing_once_its_workspace_is_home(tmp_path, keys, monkeypatch):
+    """r1 item 2: the home / above-home refusal is re-applied at decision, so a log written on a machine whose home
+    differs grants no home. Reproduced red on 8135c4b (HOME set to the workspace after the grant was signed)."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys, tools=("Read",))
+    inside = {"file_path": str(ws / "a.txt")}
+    r, d = ask(inside, tool="Read")
+    assert d is not None
+    for home in (ws, ws / "sub"):
+        monkeypatch.setenv("HOME", str(home))
+        assert q.decision(r.id, tool_input=inside, posture="default") is None, home
+        assert ask(inside, tool="Read")[1] is None, home
+
+
+@pytest.mark.parametrize("where", ["a symlink", "missing", "not normal"])
+def test_a_grant_workspace_must_be_a_real_directory_when_it_is_signed(tmp_path, keys, where):
+    """r1 item 2 at append: the signed string is the directory's realpath, exactly. Reproduced red on 8135c4b for a
+    symlink and a missing directory (a non-normal path was already refused by the replay)."""
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    real = Path(os.path.realpath(tmp_path)) / "real"
+    real.mkdir()
+    os.symlink(real, real.parent / "link")
+    workspace = {"a symlink": str(real.parent / "link"), "missing": str(real.parent / "missing"),
+                 "not normal": str(real) + "/"}[where]
+    with pytest.raises(auth.AuthorityError):
+        log.link({"op": "create_grant", "grant": {
+            "id": "g1", "kind": "consent", "agent": "claude_code", "tools": ["Read"], "workspace": workspace,
+            "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}})
+
+
+def test_a_target_through_a_symlink_inside_the_workspace_matches_nothing(tmp_path, keys):
+    """r1 item 3 (codex HIGH 3, static case): a link inside the workspace that points inside it today can point at
+    agent config tomorrow; a target whose path crosses any existing symlink matches nothing. Reproduced red on
+    8135c4b (both link targets were allowed)."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys)
+    os.symlink(ws / "sub", ws / "link")
+    os.symlink(ws / "sub" / "real.txt", ws / "leaf")
+    assert ask({"file_path": str(ws / "sub" / "a.txt"), "content": "x"}, tool="Write")[1] is not None
+    assert ask({"file_path": str(ws / "sub" / ".." / "a.txt"), "content": "x"}, tool="Write")[1] is not None
+    for target in (str(ws / "link" / "a.txt"), "link/a.txt", str(ws / "leaf"), str(ws / "escape" / ".." / "a.txt")):
+        r, d = ask({"file_path": target, "content": "x"}, tool="Write")
+        assert d is None and q.get(r.id)[1] == "pending", target
+
+
+def _forge_grant_answer(q, request, **link):
+    from levain.consent.record import grant_answer_payload
+    record = grant_answer_payload(queue_id=q.queue_id, request=request, grant_id="g1", posture="default", **link)
+    raw = sqlite3.connect(q.path)
+    raw.execute("UPDATE requests SET state = 'allowed', via = 'grant', answer = ?, decided_at = ? WHERE id = ?",
+                (answer_message(record).decode("utf-8"), utc_stamp(datetime.now(timezone.utc)), request.id))
+    raw.commit()
+    raw.close()
+
+
+def test_a_grant_answer_is_delivered_only_for_the_link_it_names(tmp_path, keys):
+    """r1 item 5 (codex MED 4): delivery never compared the recorded grant_seq / grant_hash with the fresh replay, so
+    a raw write naming a link that never created the grant was delivered with that provenance; and an answer given
+    before a renew is still delivered after it. Reproduced red on 8135c4b."""
+    log, q, ws, outside, ask = _granted_queue(tmp_path, keys)
+    inside = {"file_path": str(ws / "a.txt"), "content": "x"}
+    r, d = ask(inside, tool="Write")
+    assert d is not None
+    other = q.file(agent="claude_code", agent_session_id="s1", tool_name="Write", tool_input=inside, cwd=str(ws),
+                   hold=timedelta(minutes=5))
+    _forge_grant_answer(q, other, grant_seq=1, grant_hash="0" * 64)
+    assert q.decision(other.id, tool_input=inside, posture="default") is None
+    third = q.file(agent="claude_code", agent_session_id="s1", tool_name="Write", tool_input=inside, cwd=str(ws),
+                   hold=timedelta(minutes=5))
+    _forge_grant_answer(q, third, grant_seq=d.grant_seq, grant_hash=d.grant_hash)
+    assert q.decision(third.id, tool_input=inside, posture="default") == dataclasses.replace(
+        d, request_id=third.id, decided_at=q.decision(third.id, tool_input=inside, posture="default").decided_at,
+        request_digest=third.digest)                                                  # the control: the real link
+    now = datetime.now(timezone.utc)
+    log.link({"op": "renew", "grant_id": "g1", "expires_at": utc_stamp(now + timedelta(days=2)),
+              "signed_at": utc_stamp(now)}, at=parse_stamp(utc_stamp(now)))
+    assert q.decision(r.id, tool_input=inside, posture="default") is None
+    assert ask(inside, tool="Write")[1] is not None                                    # the renewed grant answers anew

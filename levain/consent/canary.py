@@ -2,8 +2,8 @@
 
 **Version pin.** Each agent adapter was measured against particular agent versions (:data:`TESTED_VERSIONS`, the
 versions the Q3/Q5 runs used). An agent's hook contract can change in any release, so installing a consent hook for
-an untested version is refused unless the operator passes :data:`ALLOW_FLAG`, and ``levain doctor`` WARNs about an
-installed hook whose agent is no longer a tested version.
+an untested version is refused unless the caller passes :data:`ALLOW_PARAMETER` to the adapter's ``install``, and
+``levain doctor`` WARNs about an installed hook whose agent is no longer a tested version.
 
 **Canary.** ``levain consent canary --agent claude_code|codex`` makes a scratch workspace (``--workspace`` must be a
 new or empty directory, never a real project), installs the agent's consent hook entry there with the adapter's own
@@ -47,7 +47,9 @@ AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
 AGENT_KEY_VARS = {"claude_code": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY"}
 # The agent versions the consent adapters were run against (`claude --version`, `codex --version`).
 TESTED_VERSIONS: dict[str, tuple[str, ...]] = {"claude_code": ("2.1.300",), "codex": ("0.162.1",)}
-ALLOW_FLAG = "--allow-untested-agent-version"
+# What a caller passes to an adapter's install() to install for an untested version (no levain command installs a
+# consent hook, so there is no CLI flag for it).
+ALLOW_PARAMETER = "allow_untested_agent_version=True"
 SENTINEL_NAME = "levain_canary_sentinel.txt"
 CANARY_MESSAGE = "levain consent canary: the sentinel write was denied by the hook"
 RECORD_NAME = "canary_record.jsonl"
@@ -78,7 +80,8 @@ def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.
 def untested_message(agent: str, version: str | None) -> str:
     seen = f"{AGENT_LABELS[agent]} {version}" if version else f"{AGENT_LABELS[agent]} (version not readable)"
     return (f"{seen} is not a version levain's consent hook was tested with "
-            f"(tested: {', '.join(TESTED_VERSIONS[agent])}); pass {ALLOW_FLAG} to install it anyway")
+            f"(tested: {', '.join(TESTED_VERSIONS[agent])}); pass {ALLOW_PARAMETER} to install() to install it "
+            "anyway")
 
 
 def require_tested_version(agent: str, *, allow_untested: bool = False, version: str | None = None,

@@ -76,3 +76,12 @@ def test_canary_refuses_a_workspace_that_is_not_new_or_empty(tmp_path, monkeypat
     result = canary.run_claude_canary(workspace=ws, timeout=60)
     assert result.status == "FAIL" and "new or empty directory" in result.detail
     assert {p: p.read_bytes() for p in ws.rglob("*") if p.is_file()} == before
+
+
+def test_the_untested_version_message_names_what_the_caller_can_pass():
+    """Q4 r1 item 7: the refusal told the user to pass --allow-untested-agent-version, a flag no command has (no
+    levain command installs a consent hook); it names the install functions' parameter. Reproduced red on 8135c4b."""
+    for agent in canary.AGENTS:
+        text = canary.untested_message(agent, "9.9.9")
+        assert "allow_untested_agent_version=True" in text and "--allow" not in text, text
+    assert "--allow" not in (canary.__doc__ or "")

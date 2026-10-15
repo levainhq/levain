@@ -436,7 +436,7 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
     if queue_dir is not None:
         argv += ["--queue-dir", str(Path(queue_dir).resolve())]
     _atomic_write(script, HOOK_TEMPLATE.format(python=python, argv=repr(argv)), mode=0o755)
-    command = f"{shlex.quote(python)} {shlex.quote(str(script))}"
+    command = hook_command(python, script)
     handler = {"type": "command", "command": command, "timeout": hook_timeout(max_hold)}
     for _ in range(5):
         before = _stat_key(settings_path)
@@ -461,10 +461,22 @@ def hook_timeout(max_hold: float) -> int:
     return int(math.ceil(max(max_hold, CLEANUP_RESERVE))) + TIMEOUT_MARGIN
 
 
+# The flags the installed command starts the interpreter with: -E -P from the FIRST process, so no PYTHON* variable
+# (a sitecustomize on PYTHONPATH) and no script directory runs before the hook; the script's ISOLATE_PRELUDE stays for
+# a direct invocation. Releases before this one installed the command without them (:func:`_is_ours` still knows it).
+HOOK_FLAGS = "-EP"
+
+
+def hook_command(python: str, script: Path | str) -> str:
+    """The command levain installs for a consent hook (Claude Code's and Codex's): ``<python> -EP <script>``."""
+    return f"{shlex.quote(python)} {HOOK_FLAGS} {shlex.quote(str(script))}"
+
+
 def _is_ours(h: Any, command: str, script: Path | None) -> bool:
     """A handler this installation owns: its command is exactly ``command``, or it is exactly
-    ``<one interpreter> <this installation's absolute script path>`` (a reinstall under another Python must replace
-    the old handler, not run beside it). Lookalike paths and any other command shape are never ours."""
+    ``<one interpreter> -EP <this installation's absolute script path>`` or the earlier releases'
+    ``<one interpreter> <that path>`` (a reinstall under another Python, or after an upgrade, must replace the old
+    handler, not run beside it). Lookalike paths and flags, and any other command shape, are never ours."""
     if not isinstance(h, dict) or not isinstance(h.get("command"), str):
         return False
     if h["command"] == command:
@@ -475,7 +487,7 @@ def _is_ours(h: Any, command: str, script: Path | None) -> bool:
         tokens = shlex.split(h["command"])
     except ValueError:
         return False
-    return len(tokens) == 2 and tokens[1] == str(script)
+    return len(tokens) in (2, 3) and tokens[-1] == str(script) and tokens[1:-1] in ([], [HOOK_FLAGS])
 
 
 def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any],

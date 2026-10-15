@@ -598,7 +598,8 @@ class ConsentQueue:
                         payload: Mapping[str, Any], *, tool_input: Any, posture: Any) -> Decision | None:
         """A grant-answered row's decision, re-verified now: the stored record binds this queue, this request
         and its digest; the deliverer holds the tool input the request was filed for and the posture recorded;
-        and the named grant is still in a fresh replay, unexpired, its criteria true at the queue's clock."""
+        and the named grant is still in a fresh replay, at the link recorded, unexpired, its criteria true at the
+        queue's clock."""
         if set(payload) != _GRANT_ANSWER_KEYS or payload["format"] != GRANT_ANSWER_FORMAT \
                 or payload["queue_id"] != queue_id or payload["request_id"] != request.id \
                 or payload["request_digest"] != request.digest or payload["expires_at"] != request.expires_at \
@@ -609,7 +610,10 @@ class ConsentQueue:
         gid = payload["grant_id"]
         authority = self._fresh_authority()
         grant = None if authority is None or not isinstance(gid, str) else authority.policy.grants.get(gid)
-        if grant is None or grant_refusal(grant, request, tool_input=tool_input, posture=posture,
+        # the link recorded is the one that created or last changed the grant in this replay: a raw writer cannot
+        # name another, and a renew, tighten or loosen after the answer takes back an undelivered answer
+        if grant is None or authority.grant_link(gid) != (payload["grant_seq"], payload["grant_hash"]) \
+                or grant_refusal(grant, request, tool_input=tool_input, posture=posture,
                                           now=_now_utc(self._clock)) is not None:
             return None
         return Decision(request_id=request.id, decision="allow", signer_fp=None, decided_at=row["decided_at"],

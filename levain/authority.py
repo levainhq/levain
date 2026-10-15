@@ -49,7 +49,7 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -1140,15 +1140,35 @@ def _require_aware(now: Any) -> None:
         raise AuthorityError("`now` must be an aware datetime; a naive one has no zone")
 
 
-def _consent_home_check(grants: list[Any]) -> None:
+def consent_root_problem(workspace: str) -> str | None:
+    """Why the directory ``workspace`` names, on THIS machine, cannot be a consent grant's root (None when it can):
+    it is ``/``, or this machine's home directory or above it. Read at append and again at every decision, since
+    a log written elsewhere names another home."""
     home = os.path.expanduser("~")
-    homes = {os.path.normpath(home), os.path.realpath(home)}
+    if workspace == "/" or any(_path_within(h, workspace) for h in {os.path.normpath(home), os.path.realpath(home)}):
+        return f"the workspace {workspace[:200]} is / or the home directory or above it; name a project directory"
+    return None
+
+
+def _consent_home_check(grants: list[Any]) -> None:
+    """At append, every consent grant's workspace is an existing directory whose realpath is exactly the signed
+    string (no symlink anywhere on it, so what was signed is what the criteria resolve), and not a refused root."""
     for grant in grants:
         if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
             continue
         ws = grant.get("workspace")
-        if isinstance(ws, str) and any(_path_within(h, ws) for h in homes):
-            raise AuthorityError(f"the workspace {ws} is the home directory or above it; name a project directory")
+        if not isinstance(ws, str):
+            continue                                    # the replay's own shape check refuses it
+        try:
+            canonical = os.path.isdir(ws) and os.path.realpath(ws) == ws
+        except (OSError, ValueError):
+            canonical = False
+        if not canonical:
+            raise AuthorityError(f"the workspace {ws[:200]} must be an existing directory named by its real path "
+                                 "(no symlink on it)")
+        problem = consent_root_problem(ws)
+        if problem is not None:
+            raise AuthorityError(problem)
 
 
 def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
