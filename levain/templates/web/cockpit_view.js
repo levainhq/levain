@@ -1097,7 +1097,14 @@
         if (!fits()) { s.clamp = true; s.body.classList.add("clamped"); }
       }
     } finally { s.fitting = false; }
-    publishHidden(s, s.hidden || (s.clamp ? 1 : 0));
+    publishOpenable(s);
+  }
+  // THE rule for whether a glance tile is a button, in one place: it is openable iff it is not faulted AND (it is a count face, whose
+  // list is always behind it, OR it holds items back: a "+N more" or a run of text cut to two lines). Every path that paints a widget
+  // ends here (a good fit, a fault), and dashboard_core.js listens to the "levain-hidden" event this publishes for every typed tile.
+  function publishOpenable(s) {
+    const open = !s.fault && (s.data.face === "count" || s.hidden > 0 || s.clamp);
+    publishHidden(s, open ? Math.max(1, s.hidden || 0) : 0);
   }
   function publishHidden(s, n) {
     const box = s.p;
@@ -1395,7 +1402,7 @@
     if (s.fault) {
       s.body.appendChild(el("p", "err", "unavailable — " + s.fault));
       // a faulted tile has nothing behind it: it is no button until a good repaint says otherwise
-      if (s.ctx.widget) { s.units = 0; s.hidden = 0; s.clamp = false; s.body.classList.remove("clamped"); publishHidden(s, 0); }
+      if (s.ctx.widget) { s.units = 0; s.hidden = 0; s.clamp = false; s.body.classList.remove("clamped"); publishOpenable(s); }
       return;
     }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
