@@ -19,13 +19,38 @@
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
-  // a repo's hue key, shared with the row tags in cockpit_view.js
-  var HUE_KEYS = [['levain', /^levain/], ['anneal', /^anneal/],
-    ['games', /^(wisp|nowhere|squish|shatterbeat|solitaire|blackjack|video[-_ ]?poker|flow[-_ ]?poker)/], ['flow', /^flow/], ['money', /^(income|arlington|clapham|invoice)/]];   // games before flow: flowpoker is a game
+  // A repo's hue slot, shared with the row tags in cockpit_view.js. The repos are the install's own: the names its data
+  // carries (an event's or a row's `repo`), noted as they are read; the package knows none. Slots go to the known repos in
+  // name order, each to its name's hash slot or the next free one, so up to HUE_SLOTS repos never share a hue; past that a
+  // repo takes its hash slot. A repo not noted yet gets its hash slot.
+  var HUE_SLOTS = 5;   // --hue-1 .. --hue-5 in dashboard.css
+  var MAX_KNOWN = 64;
+  var known = Object.create(null), nKnown = 0, slotOf = null;
+  function slotHash(r) {
+    var h = 2166136261;   // FNV-1a, 32 bit
+    for (var i = 0; i < r.length; i++) { h ^= r.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return h % HUE_SLOTS;
+  }
+  function norm(repo) { return String(repo == null ? '' : repo).trim().toLowerCase(); }
+  function noteRepo(repo) {
+    var r = norm(repo);
+    if (!r || r.length > 100 || known[r] || nKnown >= MAX_KNOWN) return;
+    known[r] = true; nKnown++; slotOf = null;
+  }
   function hueKey(repo) {
-    var r = String(repo || '').toLowerCase();
-    for (var i = 0; i < HUE_KEYS.length; i++) if (HUE_KEYS[i][1].test(r)) return HUE_KEYS[i][0];
-    return '';
+    var r = norm(repo);
+    if (!r) return '';
+    if (!slotOf) {
+      slotOf = Object.create(null);
+      var used = {}, names = Object.keys(known).sort();
+      for (var i = 0; i < names.length; i++) {
+        var h = slotHash(names[i]), s = h;
+        for (var k = 0; k < HUE_SLOTS && used[s]; k++) s = (h + k + 1) % HUE_SLOTS;
+        if (used[s]) s = h;
+        used[s] = true; slotOf[names[i]] = s;
+      }
+    }
+    return String((r in slotOf ? slotOf[r] : slotHash(r)) + 1);
   }
   var SHORT_LABELS = { memory: 'mem', decisions: 'dec' };   // by row id
   var FONT_MONO = '11px ui-monospace, "SF Mono", Menlo, monospace';
@@ -57,6 +82,7 @@
     for (var i = 0; i < src.length; i++) {
       var e = src[i], t = parseAt(e.at);
       if (!e || isNaN(t) || !e.kind) continue;
+      if (e.repo != null) noteRepo(e.repo);
       out.push({ t: t, kind: String(e.kind), repo: e.repo == null ? null : String(e.repo),
         agent: e.agent == null ? null : String(e.agent), ok: e.outcome !== 'failed',
         key: e.at + '|' + e.kind + '|' + e.repo + '|' + e.agent + '|' + e.outcome });
@@ -173,7 +199,7 @@
       return { base: css('--base', '#060912'), accent: css('--accent', '#ff8a3d'), contrast: css('--contrast', css('--text', '#f3f5f9')),
         label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a'),
         bad: css('--bad', '#e5484d'),
-        hues: { levain: css('--hue-levain', ''), anneal: css('--hue-anneal', ''), flow: css('--hue-flow', ''), games: css('--hue-games', ''), money: css('--hue-money', '') } };
+        hues: (function () { var o = {}; for (var i = 1; i <= HUE_SLOTS; i++) o[String(i)] = css('--hue-' + i, ''); return o; })() };
     }
 
     function setToggle() {
@@ -395,7 +421,7 @@
     };
   }
 
-  var api = { mount: mount, hueKey: hueKey, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
+  var api = { mount: mount, hueKey: hueKey, noteRepo: noteRepo, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

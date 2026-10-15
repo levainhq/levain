@@ -35,7 +35,7 @@
   // The server signals it via `view.write_token_required` (set in load()); we hold the token in
   // localStorage and attach it. The server prints the token at start, with a link carrying it
   // in the fragment, which the page takes on load. (This localStorage entry is the
-  // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
+  // desktop-browser STOPGAP; a native app shell later holds the token in the keychain
   // and injects the same header — the server gate underneath is identical.)
   //
   // ⚠ SECURITY (TCB, L2 review): storing the token here puts it in the page's localStorage, so
@@ -70,7 +70,7 @@
     try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; }
   }
   // Prompt for + persist the write token; returns the entered token ("" if cancelled). The
-  // desktop-browser STOPGAP entry point (flowConnect's native shell injects the same header from
+  // desktop-browser STOPGAP entry point (a native app shell injects the same header from
   // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
   let tokenDeclined = false;   // this page load: the operator declined the prompt; passive refreshes stay quiet
   function promptForToken() {

@@ -459,6 +459,7 @@
       try { v = clean(raw.panels[key]); } catch (e) { v = { error: "payload rejected: " + (e && e.message ? e.message : e) }; }
       Object.defineProperty(snap.panels, k, { value: v, enumerable: true, writable: true, configurable: true });
     }
+    noteRepos(snap.panels);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
@@ -1468,17 +1469,45 @@
     }
   }
   // ---- project colour: repo tags on rows that name a repo, and the Decisions signal ----
-  // A row names a repo when its own words do (a tag, the text); the tag is the first thing on the line. A production version would
-  // read a structured repo facet from the provider instead of the row's words.
-  const REPO_WORDS = [["levain", /\blevain\b/i], ["anneal", /\banneal(?:-memory)?\b/i], ["flow", /\bflow(?:connect)?\b/i],
-    ["wisp", /\bwisp\b/i], ["squish", /\bsquish\b/i], ["nowhere", /\bnowhere\b/i], ["shatterbeat", /\bshatterbeat\b/i],
-    ["income", /\b(?:income|invoice|rent|arlington)\b/i]];
+  // The repos are the install's own: every `repo` its data carries (a row's `repo` facet, an ambient event's `repo`),
+  // collected as panels are read. The package names none, so an install whose data names no repo shows no tags.
+  const userRepos = new Map();   // lower-cased name -> the name as the data spells it
+  const MAX_REPOS = 64;
+  let repoMatchers = null;   // built from userRepos on first use, dropped when a repo is added
+  function noteRepo(name) {
+    if (typeof name !== "string") return;
+    const n = visible(name).trim();
+    if (!n || n.length > 100 || userRepos.has(n.toLowerCase()) || userRepos.size >= MAX_REPOS) return;
+    userRepos.set(n.toLowerCase(), n);
+    repoMatchers = null;
+    if (root.LevainSky && root.LevainSky.noteRepo) root.LevainSky.noteRepo(n);   // the sky assigns the hue slots over the names it is given
+  }
+  function noteRepos(panels) {
+    for (const p of Object.values(panels || {})) {
+      if (!isObj(p)) continue;
+      for (const r of Array.isArray(p.rows) ? p.rows : []) if (isObj(r) && isObj(r.facets)) noteRepo(r.facets.repo);
+      const ev = isObj(p.value) && Array.isArray(p.value.events) ? p.value.events : [];
+      for (const e of ev) if (isObj(e)) noteRepo(e.repo);
+    }
+  }
+  // A row names a repo when its own words do: the whole name, not inside a longer word or path segment. The longest
+  // name is tried first, so `anneal-memory` wins over `anneal`.
+  function matchersOf() {
+    if (!repoMatchers) {
+      const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      repoMatchers = Array.from(userRepos.values()).sort((a, b) => b.length - a.length)
+        .map((n) => [n, new RegExp("(?:^|[^\\w-])" + esc(n) + "(?![\\w-])", "i")]);   // no lookbehind: Safari before 16.4 throws on one
+    }
+    return repoMatchers;
+  }
   function tintRepos() {
     const sky = root.LevainSky;
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
-      if (!clause || clause.querySelector(":scope > .rp-tag")) continue;
-      const hit = REPO_WORDS.find(([, re]) => re.test(row.textContent));
+      if (!clause) continue;
+      const had = clause.querySelector(":scope > .rp-tag");
+      if (had) { const k = sky && sky.hueKey ? sky.hueKey(had.textContent) : ""; if (k && had.dataset.repo !== k) had.dataset.repo = k; continue; }   // a repo noted later can move a slot
+      const hit = matchersOf().find(([, re]) => re.test(row.textContent));
       const key = hit && sky && sky.hueKey ? sky.hueKey(hit[0]) : "";
       if (!key) continue;
       const tag = el("span", "rp-tag", hit[0]);

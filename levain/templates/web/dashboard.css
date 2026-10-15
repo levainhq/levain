@@ -1356,28 +1356,32 @@ body.ke .ck-zgrid > .panel.k-brief.ck-h-tall { height: auto; max-height: var(--c
 body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-height: 220px; }
 @media (pointer: coarse) { body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: var(--hit-min); } }
 
-/* ═══════════════════════════ PROJECT COLOUR (one hue per project, carried everywhere a project shows) ═══════════════════════════
-   One hue per project, carried everywhere a project shows. The hues are checked by a script, not eyeballed (text contrast on the card and
-   pair distance under simulated protanopia, deuteranopia and tritanopia): run project_memory/1014-cockpit-pass2/hues.py; it exits 1 on a failure.
-   The hues show in the graph and the repo tags on rows, a 2px stripe tops each panel tied to a project, and two signals stand out: a Decisions halo and a failed review glowing red. */
+/* ═══════════════════════════ PROJECT COLOUR (one hue per repo, carried everywhere a repo shows) ═══════════════════════════
+   The repos are the install's own (the `repo` its rows and ambient events carry); a repo's hue is a slot picked from its name
+   (sky.js `hueKey`), so the package names no repo. The five slots are checked by a script, not eyeballed (text contrast on the
+   card and pair distance under simulated protanopia, deuteranopia and tritanopia). The hues show in the graph and the repo
+   tags on rows; a 2px stripe tops each panel of one levain subsystem (memory, decisions, the work lists); and two signals stand
+   out: a Decisions halo and a failed review glowing red. */
 html {
-  --hue-levain: oklch(0.82 0.15 75); --hue-anneal: oklch(0.68 0.14 255); --hue-flow: oklch(0.66 0.21 350);
-  --hue-games: oklch(0.94 0.17 105); --hue-money: oklch(0.76 0.13 165);
+  --hue-1: oklch(0.82 0.15 75); --hue-2: oklch(0.68 0.14 255); --hue-3: oklch(0.66 0.21 350);
+  --hue-4: oklch(0.94 0.17 105); --hue-5: oklch(0.76 0.13 165);
+  /* the subsystem stripes: a panel's place in levain, not a repo */
+  --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3);
 }
 .rp-tag { display: inline-block; margin-right: var(--sp-3); padding: 0 var(--sp-3); border-radius: var(--r-pill); vertical-align: 1px; letter-spacing: 0; text-transform: none;
   font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
-.rp-tag[data-repo="levain"] { --tag: var(--hue-levain); } .rp-tag[data-repo="anneal"] { --tag: var(--hue-anneal); } .rp-tag[data-repo="flow"] { --tag: var(--hue-flow); }
-.rp-tag[data-repo="games"] { --tag: var(--hue-games); } .rp-tag[data-repo="money"] { --tag: var(--hue-money); }
+.rp-tag[data-repo="1"] { --tag: var(--hue-1); } .rp-tag[data-repo="2"] { --tag: var(--hue-2); } .rp-tag[data-repo="3"] { --tag: var(--hue-3); }
+.rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); }
 
-/* a 2px stripe across the top of a panel that belongs to one project */
-html :is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="wraps"], [data-ck-panel^="section:"])::before { background: var(--hue-anneal); }
-html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--hue-levain); }
-html :is([data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"])::before { background: var(--hue-flow); }
+/* a 2px stripe across the top of a panel of one levain subsystem */
+html :is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="wraps"], [data-ck-panel^="section:"])::before { background: var(--stripe-memory); }
+html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
+html :is([data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
 html :is(.ck-card.w, .ck-zgrid > .panel):is([data-ck-panel="memory"], [data-ck-panel="health"], [data-ck-panel="crystals"], [data-ck-panel="decisions"], [data-ck-panel="edits"],
   [data-ck-panel="ops"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"])::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; }
 
-/* the Decisions tile carries a soft halo only while something waits on him; calm otherwise */
+/* the Decisions tile carries a soft halo only while something waits on the operator; calm otherwise */
 html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
   border-color: color-mix(in oklch, var(--accent) 55%, var(--hair));
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); }

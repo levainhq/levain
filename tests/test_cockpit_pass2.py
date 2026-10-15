@@ -104,11 +104,33 @@ def test_the_clock_is_one_text_node_and_an_am_pm_at_every_hour_with_no_time_of_d
 
 
 @needs_browser
-def test_project_colour_is_the_product_with_no_variant_switch(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": """(() => {
+def test_project_colour_is_the_product_with_no_variant_switch_and_no_repo_of_its_own(tmp_path: Path) -> None:
+    # this install's data names no repo, so the page tags nothing; a hue is a slot picked from the name alone
+    vals = _page(tmp_path, [{"eval": "new Promise(r => setTimeout(r, 1800))"}, {"eval": """(() => {
       const root = getComputedStyle(document.documentElement);
       const stripe = document.querySelector('.ck-card.w[data-ck-panel="decisions"], .ck-card.w[data-ck-panel="memory"]');
-      return { variantAttr: document.documentElement.dataset.variant || '', levain: root.getPropertyValue('--hue-levain').trim(), anneal: root.getPropertyValue('--hue-anneal').trim(),
-        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', hues: window.LevainSky ? ['levain', 'anneal', 'wisp', 'flowpoker', 'flow-poker', 'flowconnect', 'income', 'zzz'].map(window.LevainSky.hueKey) : [] }; })()"""}])
-    got = vals[1]
-    assert got["variantAttr"] == "" and got["levain"] and got["anneal"] and got["stripeH"] == "2px" and got["hues"] == ["levain", "anneal", "games", "games", "games", "flow", "money", ""], got
+      const k = window.LevainSky ? window.LevainSky.hueKey : null;
+      return { variantAttr: document.documentElement.dataset.variant || '', slots: [1, 2, 3, 4, 5].map(i => !!root.getPropertyValue('--hue-' + i).trim()),
+        stripeH: stripe ? getComputedStyle(stripe, '::before').height : '', tags: document.querySelectorAll('.rp-tag').length,
+        hues: k ? ['alpha', 'Alpha', 'my-app', 'x'.repeat(300), '', null].map(k) : [] }; })()"""}])
+    got = vals[2]
+    assert got["variantAttr"] == "" and all(got["slots"]) and got["stripeH"] == "2px" and got["tags"] == 0, got
+    assert got["hues"][0] == got["hues"][1] and all(h in "12345" and h for h in got["hues"][:4]) and got["hues"][4:] == ["", ""], got
+
+
+# Phill 10-15: "there is no reason a public package should have my personal dealings in it". The names are held as hash
+# prefixes so this file does not publish them either; any word of the page's own files that hashes into the set fails.
+_AUTHOR_NAMES = {"13bf0c28c373b20e", "209fe9ce83ce987a", "30ac85182428479d", "5990f302c4e48d0c", "601ded6e7a9d9993",
+                 "60f80eae09b53d12", "687f2181e010409a", "7b8d92a4afb4265a", "a5967a750d416704", "ac5135dc0e52a42c",
+                 "f275dcde8d5ee4bb", "f8cf3c92d1f8041c"}
+
+
+def test_the_page_carries_no_author_repo_or_client_name() -> None:
+    import hashlib
+    import re
+    web = ROOT / "levain" / "templates" / "web"
+    files = sorted(p for p in web.rglob("*") if p.is_file() and p.suffix in (".js", ".css", ".html"))
+    assert files
+    hits = sorted({(p.name, w) for p in files for w in re.findall(r"[a-z0-9]+", p.read_text(encoding="utf-8").lower())
+                   if hashlib.sha256(w.encode()).hexdigest()[:16] in _AUTHOR_NAMES})
+    assert not hits, hits
