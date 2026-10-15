@@ -9,7 +9,7 @@ from typing import Any, Iterator
 import sqlite3
 
 import pytest
-from anneal_memory import Store
+from anneal_memory import Store, register_writer_schema
 
 from levain.cockpit.anneal_effects import EPISODES, EpisodeEffectStore, tomb_resource_key, tombstone_effects
 from levain.cockpit.broker import Broker
@@ -178,6 +178,7 @@ def test_a_row_whose_rendered_fields_moved_is_stale_while_the_episode_stays(brok
 def test_deeply_nested_metadata_is_a_transient_read_fault_not_a_recursion_error(db):
     """L1 r1 #1: anneal parses metadata with json.loads; a nested value must not escape the read."""
     conn = sqlite3.connect(db)
+    register_writer_schema(conn)   # anneal 1.0: a plain-sqlite3 write to its store needs this
     conn.execute("UPDATE episodes SET metadata = ? WHERE origin_key = 'ok.target'",
                  ("[" * 100_000 + "]" * 100_000,))
     conn.commit()
@@ -294,6 +295,7 @@ def test_the_episodes_read_one_needs_no_newest_list(home):
         st.record("an older episode", "observation", origin_key="ok.old")
     eid = _episode(db, "ok.old").id
     conn = sqlite3.connect(db)
+    register_writer_schema(conn)   # anneal 1.0: a plain-sqlite3 write to its store needs this
     conn.execute("INSERT INTO episodes (id, timestamp, type, content, source, metadata) "
                   "VALUES ('bad00001', '2999-01-01T00:00:00+00:00', 'not-a-type', 'x', 'probe', NULL)")
     conn.commit()
