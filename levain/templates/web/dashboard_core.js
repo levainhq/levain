@@ -629,7 +629,12 @@
           node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
         } else { node.removeAttribute("tabindex"); node.removeAttribute("role"); node.removeAttribute("aria-haspopup"); node.removeAttribute("aria-label"); }
       };
-      node.addEventListener("click", () => { if (node.classList.contains("w-open")) open(); });
+      node.addEventListener("click", (ev) => {
+        // a link, button or field inside the tile is its own control: the tile does not open under it
+        const inner = ev.target && ev.target.closest ? ev.target.closest("a, button, input, select, textarea") : null;
+        if (inner && inner !== node && node.contains(inner)) return;
+        if (node.classList.contains("w-open")) open();
+      });
       node.addEventListener("keydown", (ev) => { if (node.classList.contains("w-open")) onKey(ev); });
       if (data.face === "count" && data.typed && !data.error) setOpenable(true);
       else if (data.typed && !data.error) node.addEventListener("levain-hidden", (ev) => { if (ev.target === body) setOpenable(ev.detail > 0); });
@@ -638,6 +643,7 @@
     }
     region.replaceChildren(...cards);
     region.hidden = !entries.length;
+    pruneLineTiles();     // the last render's tiles went with their cards: nothing may keep watching them
     for (const f of fitLines) f();
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.fitWidgets) window.LevainCockpitKinds.fitWidgets(region);   // after attach: the room a tile has is only known on the page
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
@@ -646,25 +652,42 @@
 
   // An untyped lines tile (rows the page draws itself) draws the rows that fit the tile and counts the rest in a "+N more" line, then
   // is a button to the whole list; a single row too tall for the tile is cut to two lines. It is fitted again when its room changes.
+  // ONE observer watches every untyped line tile on the page, and lets go of a tile once its body has left the page, so a cockpit
+  // that refreshes for days holds the current render's tiles and nothing older.
+  const lineFits = new Map();
+  let lineRO = null;
+  function pruneLineTiles() {
+    for (const b of Array.from(lineFits.keys())) if (!b.isConnected) { if (lineRO) lineRO.unobserve(b); lineFits.delete(b); }
+  }
   function fitLineTile(body, setOpenable) {
-    const rows = Array.from(body.children);
+    // the provider's notes are chrome (kept, and cut to two lines when the room is short); the rows are the items
+    const all = Array.from(body.children);
+    const notes = all.filter((c) => c.classList.contains("ext-note"));
+    const rows = all.filter((c) => !c.classList.contains("ext-note"));
     const fit = () => {
       if (!body.isConnected) return;
       body.classList.remove("clamped");
-      body.replaceChildren(...rows);
       const fits = () => body.scrollHeight <= body.clientHeight + 1;
-      let shown = rows.length, note = null;
-      while (!fits() && shown > 1) {
-        shown--;
-        body.replaceChildren(...rows.slice(0, shown));
-        note = el("div", "xnote", "+" + (rows.length - shown) + " more");
-        body.appendChild(note);
+      let shown = rows.length;
+      const draw = () => {
+        body.replaceChildren(...notes, ...rows.slice(0, shown));
+        if (shown < rows.length) body.appendChild(el("div", "xnote", "+" + (rows.length - shown) + " more"));
+      };
+      draw();
+      while (!fits() && shown > 1) { shown--; draw(); }
+      if (!fits()) {
+        body.classList.add("clamped");     // the notes and the row's text cut to two lines; then, if it is still too tall, the rows give way
+        while (!fits() && shown > 0) { shown--; draw(); }
       }
-      if (!fits()) body.classList.add("clamped");
       setOpenable(shown < rows.length || body.classList.contains("clamped"));
     };
     fit();
-    if (typeof ResizeObserver === "function") new ResizeObserver(fit).observe(body);
+    if (typeof ResizeObserver === "function") {
+      pruneLineTiles();
+      if (!lineRO) lineRO = new ResizeObserver((recs) => { for (const r of recs) { const f = lineFits.get(r.target); if (f) f(); } });
+      lineFits.set(body, fit);
+      lineRO.observe(body);
+    }
   }
 
   function ckPlaceholder(entry) {
@@ -3371,5 +3394,5 @@
     for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
     if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
   }
-  window.LevainDashboard = { render, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
+  window.LevainDashboard = { render, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
