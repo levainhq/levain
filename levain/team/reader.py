@@ -71,10 +71,12 @@ def person_text(text: object, *, said: str = "git could not read its history.", 
     return f"{head}: {said}" if head else fallback
 
 
-def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
+def people(d, you: str | None, own_fp: str | None = None) -> tuple[list[dict], list[dict]]:
     """Who is on the team and what waits on whom, from the one derivation ``d``. Pure: no I/O. No email field exists in
     either list (team.toml holds addresses; the zone needs handles). ``since`` is the date of the commit that began the
-    handle's CURRENT spell, set only when ``role_changes`` names that commit, else None."""
+    handle's CURRENT spell, set only when ``role_changes`` names that commit, else None. ``own_fp`` is this machine's
+    signing-key fingerprint: a join is ``mine`` when it waits on THIS machine (its proposed key is that key, or the
+    offer is to ``you``), so only this machine can do the act it waits on."""
     team, ten = d.team, d.tenure
     dates = {sha: date for sha, date, _ in d.role_changes}
     began = {s.handle: s.start_sha for s in d.spells if s.end is None}
@@ -91,16 +93,26 @@ def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
     # ``you`` here, and a "your key" line would reach almost nobody it names
     for h in sorted(ten.pending_keys):
         for n, line in enumerate(ten.pending_keys[h]):
-            joins.append({"kind": "key", "handle": h, "n": n, "fingerprint": _fp_or_none(line),
+            fp = _fp_or_none(line)
+            joins.append({"kind": "key", "handle": h, "n": n, "fingerprint": fp,
+                          "mine": own_fp is not None and fp == own_fp,
                           "line": f"{h}'s key is proposed; it comes into force when {h} runs "
                                   "`levain team key confirm` on their own machine"})
     if ten.offer:
         # the offeree accepts with a key already in force, so ``you`` does reach them here
         h = str(ten.offer["handle"])
         who, run = ("you", "you run") if h == you else (h, f"{h} runs")
-        joins.append({"kind": "owner-offer", "handle": h, "n": 0,
+        joins.append({"kind": "owner-offer", "handle": h, "n": 0, "mine": you is not None and h == you,
                       "line": f"ownership is offered to {who}; it moves when {run} `levain team accept`"})
     return members, joins
+
+
+def _own_fp(gl: LedgerTransport) -> str | None:
+    """This machine's signing-key fingerprint, or None when it has no usable key (then no join is this machine's)."""
+    try:
+        return gl.own_fingerprint()
+    except Exception:  # noqa: BLE001 - a missing key marks no join mine; it never fails the read
+        return None
 
 
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
@@ -116,7 +128,7 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
         ledger = gl.ledger_of(d)
         model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(d=d), gl.state_hash(ledger, team),
                             recheck_days=recheck_days, ack_flag=ack_flag, path_filter=path_filter)
-        model["members"], model["joins"] = people(d, model.get("you"))
+        model["members"], model["joins"] = people(d, model.get("you"), _own_fp(gl))
         if d.judged != "full":
             waiting = int(d.waiting or 0)
             why = ("Part of the team ledger could not be fully judged on this machine, so what follows may be out of date"
