@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .ledger_api import LedgerTransport
+from .tenure import _fp_or_none
 from .transport import TeamError
 from .view import DEFAULT_ACK_FLAG, DEFAULT_RECHECK_DAYS, build_model
 
@@ -70,6 +71,40 @@ def person_text(text: object, *, said: str = "git could not read its history.", 
     return f"{head}: {said}" if head else fallback
 
 
+def _tick(handle: str) -> str:
+    return f"`{handle}`"
+
+
+def people(d, you: str | None) -> tuple[list[dict], list[dict]]:
+    """Who is on the team and what waits on whom, from the one derivation ``d``. Pure: no I/O. No email field exists in
+    either list (team.toml holds addresses; the zone needs handles). ``since`` is the date of the commit that began the
+    handle's CURRENT spell, set only when ``role_changes`` names that commit, else None."""
+    team, ten = d.team, d.tenure
+    dates = {sha: date for sha, date, _ in d.role_changes}
+    began = {s.handle: s.start_sha for s in d.spells if s.end is None}
+    members: list[dict] = []
+    for h in sorted(team.members, key=lambda h: (h != team.owner, h)):
+        keys, pending = len(ten.keys.get(h, [])), len(ten.pending_keys.get(h, []))
+        since = dates.get(began.get(h, ""))
+        members.append({"handle": h, "role": "owner" if h == team.owner else "member", "you": h == you,
+                        "keys": keys, "since": str(since)[:10] if since else None,
+                        "key_state": "in force" if keys else ("waiting for confirm" if pending else "no key")})
+    joins: list[dict] = []
+    for h in sorted(ten.pending_keys):
+        for line in ten.pending_keys[h]:
+            who = "your" if h == you else f"{_tick(h)}'s"
+            run = "you run" if h == you else f"{_tick(h)} runs"
+            joins.append({"kind": "key", "handle": h, "fingerprint": _fp_or_none(line),
+                          "line": f"{who} key is proposed; it comes into force when {run} `levain team key confirm` on "
+                                  f"{'your' if h == you else 'their'} own machine"})
+    if ten.offer:
+        h = str(ten.offer["handle"])
+        who, run = ("you", "you run") if h == you else (_tick(h), f"{_tick(h)} runs")
+        joins.append({"kind": "owner-offer", "handle": h,
+                      "line": f"ownership is offered to {who}; it moves when {run} `levain team accept`"})
+    return members, joins
+
+
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
               ack_flag: int = DEFAULT_ACK_FLAG) -> TeamRead:
     """The team this clone's ledger describes, as one of the four states. Never raises."""
@@ -83,6 +118,7 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
         ledger = gl.ledger_of(d)
         model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(d=d), gl.state_hash(ledger, team),
                             recheck_days=recheck_days, ack_flag=ack_flag, path_filter=path_filter)
+        model["members"], model["joins"] = people(d, model.get("you"))
         if d.judged != "full":
             waiting = int(d.waiting or 0)
             why = ("Part of the team ledger could not be fully judged on this machine, so what follows may be out of date"

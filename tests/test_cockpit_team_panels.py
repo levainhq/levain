@@ -14,7 +14,11 @@ MODEL = {"project": "p", "owner": "ana", "mode": "ask", "you": "ben", "canon_sta
          "waiting": [{"id": "q1", "type": "question", "kind": None, "owner": "ben", "words": "", "summary": "Discounts first?",
                       "reason": "", "recheck": "", "paths": ["src/a.py"], "recorded_by": "ana", "age": "1d ago",
                       "age_days": 1, "pack": ""}],
-         "stopped": [], "held": [], "in_force": []}
+         "stopped": [], "held": [], "in_force": [],
+         "members": [{"handle": "ana", "role": "owner", "you": False, "keys": 1, "key_state": "in force", "since": "2026-10-01"},
+                     {"handle": "ben", "role": "member", "you": True, "keys": 0, "key_state": "waiting for confirm", "since": None}],
+         "joins": [{"kind": "key", "handle": "ben", "fingerprint": "SHA256:abc",
+                    "line": "your key is proposed; it comes into force when you run `levain team key confirm` on your own machine"}]}
 
 
 def _cockpit(reads: list, loads: list[int]) -> Cockpit:
@@ -41,11 +45,11 @@ def test_team_is_a_peer_zone_and_the_panel_set_follows_the_state():
     assert ("team", "Team") in ZONES
     reads = [TeamRead("ok", MODEL)]
     ck = _cockpit(reads, [])
-    assert _panels(ck) == ["team-waiting", "team-stopped", "team-held", "team-canon", "team-sync"]
+    assert _panels(ck) == ["team-members", "team-waiting", "team-stopped", "team-held", "team-canon", "team-joins", "team-sync"]
     reads[0] = TeamRead("no_team", None, "This install has no team ledger.")
     assert _panels(ck, 1) == ["team-status"]                   # the four panes are RETIRED, not left reading Absent
     reads[0] = TeamRead("ok", MODEL)
-    assert len(_panels(ck, 5)) == 5
+    assert len(_panels(ck, 7)) == 7
 
 
 def test_unreadable_draws_one_card_with_the_why_and_never_the_detail():
@@ -58,7 +62,7 @@ def test_unreadable_draws_one_card_with_the_why_and_never_the_detail():
 
 def test_judged_partial_draws_every_pane_with_the_why_beside_the_rows():
     ck = _cockpit([TeamRead("judged_partial", MODEL, "Part of the ledger could not be judged.")], [])
-    assert len(_panels(ck)) == 5
+    assert len(_panels(ck)) == 7
     waiting = ck.panel("team-waiting")
     assert waiting["note"] == "Part of the ledger could not be judged." and [r["id"] for r in waiting["rows"]] == ["q1"]
     assert "Discounts first?" in waiting["rows"][0]["body"]    # the line a list row draws is its body
@@ -80,7 +84,7 @@ def test_one_ledger_read_feeds_the_manifest_and_every_panel():
 def test_a_panel_retired_between_the_registry_snapshot_and_its_read_answers_error_not_keyerror():
     reads = [TeamRead("ok", MODEL)]
     ck = _cockpit(reads, [])
-    assert len(_panels(ck)) == 5
+    assert len(_panels(ck)) == 7
     spec = ck._specs["team-waiting"]               # request A's registry snapshot
     reads[0] = TeamRead("no_team", None, "This install has no team ledger.")
     assert _panels(ck, 1) == ["team-status"]       # request B's discovery retires the four panes
@@ -146,3 +150,18 @@ def test_a_source_with_no_install_root_and_no_start_draws_no_team_zone(tmp_path,
     assert not [z for z in ck.manifest(CRED)["regions"]["zones"] if z["id"] == "team" and z["panels"]]
     build_default_cockpit(src, team_start=tmp_path)
     assert seen == [(tmp_path,)]                   # an explicit start is honoured
+
+
+def test_members_and_joins_panes_draw_rows_without_an_address_and_retire_with_the_zone():
+    ck = _cockpit([TeamRead("ok", MODEL)], [])
+    assert {"team-members", "team-joins"} <= set(_panels(ck))
+    members, joins = ck.panel("team-members"), ck.panel("team-joins")
+    assert [r["title"] for r in members["rows"]] == ["ana", "ben (you)"]
+    assert "waiting for confirm" in members["rows"][1]["body"] and "since 2026-10-01" in members["rows"][0]["body"]
+    assert "levain team key confirm" in joins["rows"][0]["body"] and "SHA256:abc" in joins["rows"][0]["body"]
+    assert "@" not in str(members) + str(joins)
+    empty = _cockpit([TeamRead("ok", {**MODEL, "members": [], "joins": []})], [])
+    assert ck.panel("team-joins")["empty"] if "empty" in ck.panel("team-joins") else True
+    assert empty.panel("team-joins")["rows"] == []
+    gone = _cockpit([TeamRead("unreadable", None, "The team ledger could not be read.")], [])
+    assert _panels(gone) == ["team-status"]
