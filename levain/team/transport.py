@@ -529,11 +529,12 @@ class GitLedger:
         """The team IN FORCE at ``rev``: the counted team, never the tip's team.toml."""
         return self.derivation(rev).team
 
-    def handle(self, team: R.Team | None = None) -> str | None:
+    def handle(self, team: R.Team | None = None, *, d=None) -> str | None:
         """This clone's member handle: the member whose keys include this clone's signing key (email as fallback
-        only for display, before a key is confirmed)."""
+        only for display, before a key is confirmed). ``d``: a derivation the caller already holds, so a reader that
+        draws one snapshot resolves the handle from that same derivation, never from a newer tip."""
         try:
-            d = self.derivation()
+            d = d if d is not None else self.derivation()
             fp = self.own_fingerprint()
             from . import tenure as T
             for h in d.team.members:
@@ -1973,10 +1974,11 @@ class GitLedger:
         cp = git(["rev-parse", "-q", "--verify", f"{self.ref}:ledger"], self.repo.toplevel, check=False)
         return cp.stdout.strip() or "empty"
 
-    def read_canon(self, rev: str | None = None) -> str | None:
-        """The OWNER's canon: PROJECT.md as of the last commit the owner in force signed, never the tip's file."""
+    def read_canon(self, rev: str | None = None, *, d=None) -> str | None:
+        """The OWNER's canon: PROJECT.md as of the last commit the owner in force signed, never the tip's file.
+        ``d``: a derivation the caller already holds (its canon_sha is used; ``rev`` is then ignored)."""
         try:
-            sha = self.derivation(rev).canon_sha
+            sha = (d if d is not None else self.derivation(rev)).canon_sha
         except TeamError:
             return None
         return self._show(CANON_FILE, sha) if sha else None
