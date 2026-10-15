@@ -1508,16 +1508,18 @@
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
       // the row means, or move a hue slot
       const had = clause.querySelector(":scope > .rp-tag");
-      // a row with a structured `repo` facet is tagged from it alone; only a row without one is read by its words
-      const facet = row.dataset.repoFacet;
+      // a row with a structured `repo` facet the sky's registry knows is tagged from it alone, in the registry's
+      // spelling (so its length and count are the registry's bounds); any other row is read by its words
+      const facet = (row.dataset.repoFacet || "").toLowerCase();
+      const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
       let hit;
-      if (facet) hit = [facet];
+      if (known) hit = [known[0]];
       else {
         let text = row.textContent;
         if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
         hit = matchers.find(([, re]) => re.test(text));
       }
-      const key = hit && sky.hueKey ? sky.hueKey(hit[0]) : "";
+      const key = hit && sky && typeof sky.hueKey === "function" ? sky.hueKey(hit[0]) : "";
       if (had && key && had.textContent === hit[0]) { if (had.dataset.repo !== key) had.dataset.repo = key; continue; }
       if (!had && !key) continue;
       if (had) had.remove();

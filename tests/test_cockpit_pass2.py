@@ -154,7 +154,7 @@ def test_a_row_with_a_repo_facet_is_tagged_from_it_and_a_row_without_one_from_it
                              order="time.desc", facets=frozenset({"repo", "at"}), version_fields=("*",), empty="none"))
     with _serve(src, surface_tokens={"browser": "T"}, cockpit=ck) as (url, _httpd):
         vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": "document.querySelector('.ck-widgets .ck-card.w')"},
-                      {"eval": "new Promise(r => setTimeout(r, 2200))"}, {"eval": """(() => [...document.querySelectorAll('.ck-zgrid .row')]
+                      {"until": "[...document.querySelectorAll('.ck-zgrid .row')].filter(r => /flaky|cash flow|invoice/.test(r.textContent) && r.querySelector('.rp-tag')).length === 3"}, {"eval": """(() => [...document.querySelectorAll('.ck-zgrid .row')]
         .filter(r => /flaky|cash flow|invoice/.test(r.textContent)).map(r => [r.querySelector('.clause').textContent.replace(/^(review|website)/, ''),
           (r.querySelector('.rp-tag') || {}).textContent || ''])
         )()"""}])["values"]
