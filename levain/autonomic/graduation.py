@@ -33,7 +33,7 @@ it would have been re-floored back up to the static ``earned_posture`` → silen
       is still >= the floor (graduation earns DOWN toward the floor, never below — §1.4).
 
 Stdlib-only; corpus-agnostic; PURE (the per-binding + per-link risk are INJECTED resolvers, structurally
-bound to the sealed tools — the core never imports flow's manifest). The decision is deterministic.
+bound to the sealed tools — the core never imports the embedder's manifest). The decision is deterministic.
 """
 from __future__ import annotations
 

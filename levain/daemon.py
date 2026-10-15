@@ -475,7 +475,7 @@ def _private_logs(spec: "DaemonSpec") -> None:
 class LaunchdProvider(DaemonProvider):
     """macOS launchd *user* agent (``~/Library/LaunchAgents`` + ``launchctl bootstrap
     gui/$UID``). RunAtLoad=login-start, KeepAlive=crash-survive — the proven choices from
-    flow's ``com.claphamdigital.flowbridge`` reference. User-scope only: never a LaunchDaemon,
+    the embedder's ``com.claphamdigital.flowbridge`` reference. User-scope only: never a LaunchDaemon,
     never sudo."""
 
     UNIT_DIR = Path.home() / "Library" / "LaunchAgents"

@@ -49,7 +49,7 @@ The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (n
      completed-wrap watermark), losing nothing.
 
 **Isolation (the #1 requirement).** The consolidate reads/writes ONLY the entity's own stores under
-``<entity>/.levain/`` and NEVER flow's ``~/.anneal-memory/``. The LLM never touches the store —
+``<entity>/.levain/`` and NEVER the operator's ``~/.anneal-memory/``. The LLM never touches the store —
 anneal does all store I/O in-process — so isolation here is simply the pure fail-closed guard
 (:func:`~levain.firing.isolation.assert_entity_isolated`) over the explicitly-derived store paths,
 BEFORE either store is opened. No ``$LEVAIN_ENTITY_DIR``, no firing kind: the wrap holds the
@@ -651,7 +651,7 @@ def _consolidate(
         return 2
 
     # ISOLATION, fail-closed, BEFORE opening anything: derive the entity's OWN store paths and refuse
-    # any that would reach flow's store or escape `<entity>/.levain/`. The wrap holds these handles
+    # any that would reach the operator's store or escape `<entity>/.levain/`. The wrap holds these handles
     # directly — the LLM never sees them.
     try:
         crystal_path, episodic_path = entity_store_paths(entity_dir)
@@ -849,7 +849,7 @@ def _consolidate(
         crystal = CrystalStore(crystal_path)
         if unattended:
             crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
-        # NO session_id — that engages flow's parallel-convo consolidate-efferent gate (spore-194),
+        # NO session_id — that engages the embedder's parallel-convo consolidate-efferent gate (spore-194),
         # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
         prepare_entered = True
         result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token)

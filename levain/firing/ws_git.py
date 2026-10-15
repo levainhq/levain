@@ -1,6 +1,6 @@
 """levain.firing.ws_git — the operator's ways into a hands workspace (M2, H then A).
 
-THE RULE (Phill, 2026-10-07: "go with H", then (A): "technically the best way for an augmentation
+THE RULE (2026-10-07: "go with H", then (A): "technically the best way for an augmentation
 operator to be editing these files is through their entity anyways"). The workspace and everything
 in it belong to the hands user; the operator can read it and nothing more. Git refuses to read the
 config of, or run the hooks of, a repository its user does not own ("By default, Git will refuse to
@@ -158,7 +158,7 @@ def _config_lines(config: Path, *args: str) -> list[str]:
 
 
 #: The git verbs that reach a remote. On Linux ws-git runs them with the hands user's net group,
-#: the one gid its egress boundary lets out (D, Phill 2026-10-09), only when the verb is the FIRST
+#: the one gid its egress boundary lets out (D, 2026-10-09), only when the verb is the FIRST
 #: argument: anything before it (a global option) and the command keeps the hands user's own group,
 #: with no network at all. A network verb not listed here is refused by the boundary, not let out.
 NET_VERBS = frozenset({"push", "fetch", "pull", "ls-remote"})

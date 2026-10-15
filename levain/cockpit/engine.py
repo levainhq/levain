@@ -1426,7 +1426,7 @@ class Cockpit:
             # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
             "note": _label_note(snap.note, labels if labelled else None),
             "empty": "Nothing needs you now.", "order": None, "groups": None,
-            # the gate view is row-shaped, so it carries the same filter box as every other long panel (Phill 10-11),
+            # the gate view is row-shaped, so it carries the same filter box as every other long panel (10-11),
             # over the rows' own title/body/id. It is never cut to a first screenful: a row waiting on him is not
             # hidden behind "show all", so default_visible is the row count itself.
             "search": {"fields": list(ROW_SEARCH_DEFAULT["list"]), "scope": "rows", "default_visible": max(len(rows), 1),
@@ -2193,7 +2193,7 @@ def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         if not isinstance(v.get("text"), list):
             raise _bad(spec, "value.text", "a visual always ships a text projection")
         return v
-    # the typed event stream; extra keys on an event (flow's `_ts`) are allowed and ignored
+    # the typed event stream; extra keys on an event (the embedder's `_ts`) are allowed and ignored
     for i, e in enumerate(_need_list(spec, v, "events")):
         for k in ("kind", "at", "repo", "agent", "outcome"):
             if k not in e:

@@ -69,7 +69,7 @@ PENDING_CAP = 8                        # WAITING pendings per principal generati
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
 FIRST_RETRY_DELAY = timedelta(seconds=5)   # decided_at + this is a never-faulted unit's due time (§4.2)
 _MAX_BACKOFF = 120
-# the `outcome` facet's enum is flow's (cockpit_manifest_DESIGN_1009 §3.2.1 "COMMITTED-INCOMPLETE/STALE/REFUSED/
+# the `outcome` facet's enum is the embedder's (cockpit_manifest_DESIGN_1009 §3.2.1 "COMMITTED-INCOMPLETE/STALE/REFUSED/
 # EXPIRED/cancelled/deleted"), not the journal's state names
 _OUTCOME_NAMES = {"COMMITTED_INCOMPLETE": "COMMITTED-INCOMPLETE", "CANCELLED": "cancelled"}
 OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach back this far (K2b-3b §3)

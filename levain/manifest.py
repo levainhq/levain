@@ -303,7 +303,7 @@ def pip_invocation() -> str:
 def resolve_anneal_bin() -> str:
     """The ``anneal-memory`` console script of the anneal THIS interpreter imports.
 
-    ``spore-751``, ruled by Phill 2026-09-13: exactly one anneal is authoritative, and it
+    ``spore-751``, ruled 2026-09-13: exactly one anneal is authoritative, and it
     is the one levain's own interpreter (``sys.executable``) resolves. It used to be
     ``shutil.which("anneal-memory")``, which returns whatever PATH finds first. On a
     machine with a second anneal earlier on PATH, init wired THAT one into the hooks
@@ -533,7 +533,7 @@ def compute_drift(
         and _cmp(installed.anneal, lock.anneal) != 0
     ):
         if lock.levain and _cmp(lock.levain, _FIRST_SINGLE_ANNEAL_LEVAIN) < 0:
-            # ⚖ Phill 2026-09-14, option 3: the exit code stays, the TEXT names the likely
+            # ⚖ 2026-09-14, option 3: the exit code stays, the TEXT names the likely
             # cause. A pre-spore-751 levain recorded whichever `anneal-memory` came first on
             # PATH, so a mismatch here is most likely a second anneal on PATH at lock-write
             # time, not an upgrade (measured on a scratch-HOME upgrade from published 0.4.6).

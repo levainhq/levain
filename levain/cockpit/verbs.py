@@ -285,7 +285,7 @@ _SURFACE_SOURCE = {"browser": "web", "flowconnect": "app"}
 def _operator_state_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
                          confirm: bool) -> dict[str, Any]:
     """The version compare and the write in one step under the state file's lock (§4.4,
-    ``dashboard.write_state``). A writer outside levain (flow's own state CLI) does not take that
+    ``dashboard.write_state``). A writer outside levain (the embedder's own state CLI) does not take that
     lock: routed to M1."""
     return _apply_operator_state_edit(scope, {"kind": "operator_state", "text": params.get("text"),
                                               "source": target.get("source", "web")}, None,

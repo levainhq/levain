@@ -176,7 +176,7 @@ def humanize_finish_json(text: str) -> str:
     return text  # no finish message found → don't fabricate a reply from the scratchpad
 
 
-# What the panel and the REPL show instead of a reply that is a model's unreadable tool call (Phill, 2026-10-05).
+# What the panel and the REPL show instead of a reply that is a model's unreadable tool call (2026-10-05).
 UNREADABLE_CALL_NOTICE = (
     "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models."
 )
@@ -213,7 +213,7 @@ _TOOL_CALL_OPEN = re.compile(r"<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s
 # Qwen3-Coder's call without its wrapper: an upstream parser can consume "<tool_call>" and leave the rest as text
 # (glm-5.2:cloud via Ollama, 2026-10-07). The function tag must be followed by a parameter tag or its own close.
 _FUNCTION_CALL_OPEN = re.compile(r"<function=[A-Za-z_][\w.-]*>\s*(?:<parameter=|</function>)")
-# A reply this large is not parsed as Markdown (Phill 2026-10-05, A'): a bound, so no input can make the parser slow.
+# A reply this large is not parsed as Markdown (2026-10-05, A'): a bound, so no input can make the parser slow.
 # It is still searched for markup and call JSON, with no region counted as code, so a large leak is flagged rather
 # than shown as an answer.
 MAX_CLASSIFIED_BYTES = 200_000
@@ -236,7 +236,7 @@ _LEXICAL_NAME = re.compile(r"\"name\"\s*:\s*\"([A-Za-z_][\w.-]*)\"")
 _LEXICAL_ARGS = re.compile(r"\"(?:arguments|parameters)\"\s*:")
 _SPACE = re.compile(r"\s*")
 
-# The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
+# The rule (2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
 # heading, a list or a quote included. A model has no reason to write that markup in prose; a false flag still shows
 # the text, under the notice, and nothing runs either way, but a headless run then exits 7 with no stdout payload. Code regions are the CommonMark parser's to decide
 # (markdown-it-py, "commonmark" preset): fenced and indented code blocks and code spans. Everything else is kept, in

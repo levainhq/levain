@@ -17,7 +17,7 @@ is the one presence job that needs the condenser to be *compaction-aware*, and t
 This module — the harness-neutral **``PresenceSource`` seam** — is a **dependency-isolated
 leaf**, exactly like ``vagus.firing``: importing ``levain.firing`` pulls NO OpenHands and NO
 flow. The OpenHands ``LevainCondenser`` lives in the sibling ``levain.firing.openhands`` behind
-the ``openhands`` extra; the real presence CONTENT (flow's behavioral re-anchor / a Levain
+the ``openhands`` extra; the real presence CONTENT (the embedder's behavioral re-anchor / a Levain
 operator's seed) registers as a new kind behind the same ``reanchor`` signature later. Slice 1
 ships a STUB (``StubPresence``) with a real re-anchor SHAPE and stubbed CONTENT — proving the
 seam, not the content (the same discipline ``vagus.firing.StubFiring`` used for Slice 1 there).
@@ -68,7 +68,7 @@ class PresenceSource(Protocol):
     is then injected). It MUST be READ-ONLY — it never acts outward and never consolidates — and it
     MUST NOT raise into the agent's turn (the condenser wraps it fail-soft, but a source that
     fail-softs at its OWN boundary keeps the "no re-anchor beats a crash" guarantee local and
-    testable). The concrete re-anchor content (flow's ``compaction_reinject.md`` + State + Top of
+    testable). The concrete re-anchor content (the embedder's ``compaction_reinject.md`` + State + Top of
     Mind; a Levain operator's seed) registers as a new kind behind this signature in a later slice.
     """
 
@@ -152,7 +152,7 @@ class StubPresence:
     """A static ``PresenceSource`` for Slice 1 — proves the SEAM, not the content.
 
     The re-anchor SHAPE is real (a compressed behavioral re-assertion at recency on the recovery
-    turn); only the CONTENT is a placeholder. The real kinds render flow's ``compaction_reinject.md``
+    turn); only the CONTENT is a placeholder. The real kinds render the embedder's ``compaction_reinject.md``
     + live State + Top of Mind, or a Levain operator's seed, behind this same ``reanchor`` signature.
     """
 

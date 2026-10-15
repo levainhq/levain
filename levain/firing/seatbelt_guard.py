@@ -5,7 +5,7 @@ malformed mask kernel-panicked a Mac on 2026-10-07 ("mask size exceeds maximum",
 levain's own profile never contains one (a test pins that); this module is the run-time refusal at
 levain's only exec point, so a profile that was altered after rendering still never reaches the
 kernel. The token set and the computed-operation forms follow the host guard written the same day
-(flow's sandbox_guard.py), restated here so levain carries no dependency on flow.
+(the embedder's sandbox_guard.py), restated here so levain carries no dependency on flow.
 
 Pure stdlib, no levain imports.
 """

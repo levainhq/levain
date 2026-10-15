@@ -3,7 +3,7 @@
 The cockpit adds an HTTP route that answers approvals. An entity that can reach it can approve
 its own held actions, which removes the human gate a terminal prompt keeps. So a hosted session
 must hold one property: no code the entity can influence runs outside the OS sandbox while the
-session is hosted. Phill ruled the shape on 10-06 (Claude Code: CC's own sandbox with loopback
+session is hosted. The shape was ruled on 10-06 (Claude Code: CC's own sandbox with loopback
 and Unix sockets denied, or refuse; Codex: network-denied sandbox, broker socket in a private
 dir). The design, its decisions D1-D10 and the review that shaped it live flow-side in
 projects/levain/reference/chat_s2_plan_1007.md (branch seat/1007-22-s2-plan).
@@ -60,7 +60,7 @@ CC_VERSION_FLOOR = (2, 1, 285)
 
 # D4 + D12: the exact hosted tool set, compared by string equality, and the ONE place it is set.
 # Bash runs inside the kernel sandbox; Read is confined to the working directories by
-# --restricted. Edit and Write are OUT (D12, proposed to Phill, 10-07): the host approving a
+# --restricted. Edit and Write are OUT (D12, proposed 10-07): the host approving a
 # file-tool PATH that Claude Code resolves and writes LATER is a race that sandboxed Bash can
 # win by swapping a workspace symlink to activation/hooks (L3 r1, codex 1), so every write the
 # entity makes goes through Bash, where denyWrite holds at the syscall. Restoring them is a

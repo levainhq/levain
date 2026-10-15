@@ -605,7 +605,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             handle = next((k[1] for k in state if k[0] == "member" and E.safe_handle(k[1]) == top_dir), None)
             if i == 0:
                 # nothing levain writes puts ledger lines in a genesis (a re-genesis carries the old history under
-                # prior/, a read-only record, Phill's Option 2): a line here was signed by no member, so it is not
+                # prior/, a read-only record, the operator's Option 2): a line here was signed by no member, so it is not
                 # enforced
                 good = False
             elif top_dir.startswith("pack-"):

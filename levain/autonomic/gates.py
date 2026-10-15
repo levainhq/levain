@@ -8,12 +8,12 @@ all" ⊥ "how dangerous is the ask" (§1.5 ⊥ §1.4). A low-confidence / ungrou
 trigger is refused BEFORE posture resolution, and no trust tier or reversibility buys it back —
 §1.5 is constitutional, not a policy knob. ALL THREE gates must pass.
 
-Generalized from flow's live ``email_classifier.gate_directive`` (the two-context-proven instance —
+Generalized from the embedder's live ``email_classifier.gate_directive`` (the two-context-proven instance —
 shipped on flow AND the argushub email pipeline; it survived a real Diogenes BLOCK on a
 confidence-bypass). The yeast: ``min(overall, directive)`` confidence with sane coercion, the
 substring groundedness check (grounding constrains EXISTENCE not correspondence → a separate
 injection gate covers smuggled-but-real quotes), the injection-pattern scan. The fossil (the email
-schema, the specific directive shape) stays in flow's adapter.
+schema, the specific directive shape) stays in the embedder's adapter.
 """
 from __future__ import annotations
 

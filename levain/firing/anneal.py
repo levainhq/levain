@@ -55,7 +55,7 @@ def _refuse_in_entity_process() -> None:
     opened an entity (:func:`~levain.firing.binding.entity_process_latched`) a default-kind op REFUSES
     (:class:`~levain.firing.isolation.IsolationError`) rather than resolve it — so a stray bare
     ``vagus_run`` / ``wrap_nudge`` there can never read or write ``~/.anneal-memory``, and it is never
-    redirected to an entity either (the latch names none; ruled by Phill 2026-10-02, "approve levain
+    redirected to an entity either (the latch names none; ruled 2026-10-02, "approve levain
     design"). Callers (``_recall`` / ``capture`` / ``wrap_nudge``) wrap resolution in their fail-soft
     boundary, so it degrades to no-recall / a loud lost capture. An entity's own ops go through
     :class:`AnnealEntityFiring` with an explicit entity and never reach here."""
@@ -68,7 +68,7 @@ def _refuse_in_entity_process() -> None:
 
 
 def _env_crystal_path() -> Path:
-    """The default crystal path for the ``"anneal"`` kind: ``$VAGUS_CRYSTAL_PATH``, else flow's laptop
+    """The default crystal path for the ``"anneal"`` kind: ``$VAGUS_CRYSTAL_PATH``, else the operator's laptop
     store — refused outright in an entity process (:func:`_refuse_in_entity_process`).
     (``AnnealEntityFiring`` never falls through here — it resolves via its own ``_entity_paths``.)"""
     _refuse_in_entity_process()
@@ -304,7 +304,7 @@ class AnnealFiring:
             # ``Store.record`` raises ValueError on a bad type, which the fail-soft boundary would
             # swallow as "episode LOST" — fail-soft-loud applied to the TYPE means we keep the
             # content (the valuable part) and only lose the mislabel, loudly. (anneal's enum is
-            # observation/decision/tension/question/outcome/context — NOT flow's "finding".)
+            # observation/decision/tension/question/outcome/context — NOT the embedder's "finding".)
             etype = req.episode_type
             if etype not in {e.value for e in EpisodeType}:
                 _log.warning(
@@ -368,7 +368,7 @@ class AnnealEntityFiring(AnnealFiring):
         # → every op refuses (no store). It is NOT frozen
         # into crystal_path/episodic_path — those RE-resolve and re-guard per op, so a post-bind
         # ``.levain`` swap is caught. Passing a crystal_path/episodic_path override to an entity firing is refused
-        # (an explicit path could point at flow's store — the exact leak); the entity dir is the
+        # (an explicit path could point at the operator's store — the exact leak); the entity dir is the
         # single source of truth.
         if kwargs.get("crystal_path") is not None or kwargs.get("episodic_path") is not None:
             raise ValueError(

@@ -200,7 +200,7 @@ _log = logging.getLogger(__name__)
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 _HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
-# The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). Slice 2a's token-free loopback write
+# The CHAT factor (spore-1310, rec B, ruled 2026-10-03). Slice 2a's token-free loopback write
 # rested on "anything that can reach loopback can already edit the files" (K2a later dropped it for
 # writes too). It always failed for /chat, which makes an entity execute and spend the model endpoint: a container reaching host
 # loopback through host.docker.internal, a sandboxed app with a network entitlement, or another OS
@@ -887,7 +887,7 @@ class _Handler(GuardedHandler):
             # JSON body carrying a token message so the frontend distinguishes a token-403 from a
             # Host/cross-site-403 (plain text) and prompts for the token — mirroring the write path's
             # 403-retry (dashboard_boot.js). Served via _send (GET has no unread body to drain).
-            # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + flow's fleetview_web.py) match
+            # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + an embedder's own frontend) match
             # ``/token/i`` on this "token" wording to trigger the prompt — keep the word "token" here
             # AND in do_POST's identical message if ever reworded (spore-129/220, two repos).
             self._send(
@@ -1367,7 +1367,7 @@ def make_server(
 
     Non-loopback binding (a LAN / Tailscale IP) is governed by the source's nature:
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
-      e.g. flow's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
+      e.g. the embedder's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
       route 422s and there is no seed/config to expose, so the private mesh (Tailscale's
       WireGuard) is the access boundary;
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
@@ -1610,7 +1610,7 @@ def make_server(
     # *requested* host, but the ACTUAL bound address can still be wildcard/public via a resolver
     # surprise (a hosts-file/DNS mapping of a loopback-CLASSIFIED name to such an address) — for
     # ANY source class, including a read-only or token'd one the specific checks below don't cover.
-    # Serving flow's substrate on 0.0.0.0 / a public IP is the catastrophic case the whole bind
+    # Serving the embedder's substrate on 0.0.0.0 / a public IP is the catastrophic case the whole bind
     # refusal exists to prevent, so verify the BOUND address and refuse it universally. (Private /
     # CGNAT-mesh addresses — Tailscale 100.64/10 — are is_global False, so a legit mesh bind passes.)
     try:
@@ -1716,7 +1716,7 @@ def run_web_server(
     (with a link that carries it), loopback included, behind the Host/CSRF guards. An install-bearing
     substrate is loopback-only either way (its seed/config is operator-private), so
     ``serve`` never binds off-box — a posture that fits a network surface: read-only
-    is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).
+    is the safe default, writes are an explicit opt-in (mirrors the embedder's bridge cockpit).
 
     ``chat`` (``--chat``, repeatable) also serves the chat routes over those entities
     (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only

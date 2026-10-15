@@ -1,6 +1,6 @@
 """levain.autonomic.binding — the compiled binding + the delegated-authority registry (Slice 3a).
 
-A binding is a delegated-authority grant made concrete: *"I, Phill, authorize flow to do G when P,
+A binding is a delegated-authority grant made concrete: *"I, the operator, authorize the agent to do G when P,
 at posture R."* (`agent_authority_model.md` / `awareness_bus_binding_language.md`). It is the
 structure that makes the efferent gate AUTONOMOUS — Slices 1-2 fire the gate on a MANUAL,
 human-present invocation (``manual_invocation()``); a binding fires the SAME gate on a trigger, with
@@ -23,7 +23,7 @@ The load-bearing cuts (each one an apparatus finding made structural):
    structurally (the seal now catches a cardinality flip).
 
 2. **The predicate ``P`` is OPAQUE here (corpus-agnostic core).** ``TriggerSpec.pattern`` is stored as
-   an opaque JSON object — the vagus core NEVER imports flow's ``events.py`` (the dependency arrow
+   an opaque JSON object — the vagus core NEVER imports the embedder's ``events.py`` (the dependency arrow
    stays down; the anti-cycle rule). The deterministic-predicate INVARIANT ("``P`` must reduce to a
    deterministic predicate, never a fire-time LLM judgment") is enforced where the corpus is KNOWN:
    the compiler/cockpit (3b/3c) and the fire-path (Slice 4) validate ``pattern`` via the injected

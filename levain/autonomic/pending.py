@@ -13,7 +13,7 @@ gate via ``EfferentGate.resolve(pending_id, ...)``, which loads the pending, fir
 the gate-receipt, and REMOVES it. So this store is the durable record that survives the propose→reply
 gap (the operator may reply minutes/hours later, or never).
 
-This is the inversion of the proven 2b directive-undo map, mirroring flow's ``pending_responses.json``
+This is the inversion of the proven 2b directive-undo map, mirroring the embedder's ``pending_responses.json``
 (the established deferred-action queue): a small, MUTABLE queue (items are removed on resolution), so
 a JSON-LIST store with atomic tmp+replace writes + an ``flock`` is the right shape — NOT the
 append-only JSONL the receipt/proposal stores use (those never remove). The flock serializes the

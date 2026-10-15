@@ -13,13 +13,13 @@ per-link chain executor (the gate travelling WITH the chain, pausing at the risk
 
 The membrane (the anti-cycle rule, held by construction): this module imports anneal-free vagus
 internals + the INJECTED seams ONLY. The deterministic predicate evaluator is INJECTED
-(``predicate_match`` — flow wires ``events.predicate_match``); the core NEVER imports flow's
+(``predicate_match`` — flow wires ``events.predicate_match``); the core NEVER imports the embedder's
 ``events.py`` (the dependency arrow stays down). The request's action-specific shape (the action name,
 the payload rendered from the event, the trust fossil) is the adapter's ``request_builder`` seam — but
 the GOVERNANCE-critical fields (the authority, the kill predicates, the predicted trajectory, the
 ratified-posture floor, the trigger event, AND the risk) are OVERLAID here from the SEALED binding, so
 the adapter's request_builder cannot forge them. The ONE field still adapter-sourced is ``trust`` (the
-fire-time fossil — the core is corpus-agnostic, it cannot derive flow's signal-auth mapping); it sits
+fire-time fossil — the core is corpus-agnostic, it cannot derive the embedder's signal-auth mapping); it sits
 in the adapter's TCB, and the unforgeable safety backstop for any too-trusting value is the
 ``ratified_posture`` floor (overlaid from the SEALED binding) — no adapter value can fire BELOW the
 rung the human ratified.

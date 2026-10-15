@@ -27,7 +27,7 @@ For an entity whose bash runs as its own user (``levain setup-isolation``) the e
 file in-process: it reads, stats, lists and writes through a fixed helper run as that user under
 the same profile, inside its workspace only (:data:`_EDITOR_HANDS`).
 
-**The crown-jewels floor (structural, never).** ``~/.anneal-memory/`` (flow's memory — the identity
+**The crown-jewels floor (structural, never).** ``~/.anneal-memory/`` (the operator's memory — the identity
 moat in file terms), sibling entities' ``.levain/`` stores, ``~/.ssh`` key material (``ssh_mode=
 "agent"`` — the entity authenticates via the agent socket but can't read/exfil raw keys),
 ``~/.ssh/authorized_keys`` WRITE (both ssh_modes — no key can be planted as a persistence backdoor),
@@ -38,11 +38,11 @@ and its non-store files are writable — EXCEPT its own memory STORE files (``me
 crystal.json,db}`` + the SQLite sidecars), which are WRITE-denied to the hands (``own_memory_files``,
 spore-359): spore-359 folds the neocortex into the always-loaded frame, so only the host-process wrap
 may compose it, never the hands. The firing's ``assert_entity_isolated`` moat, not these tools, keeps
-recall/capture off flow's store.
+recall/capture off the operator's store.
 
 **Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** The
 floor protects the crown jewels and NOTHING else. With default-allow and no permission prompts
-(Phill: people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
+(people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
 ``git push --force``, or ``curl | bash`` — **none of which THE FLOOR stops**, which is a true
 statement about the floor and never was one about the whole system.
 
@@ -1385,7 +1385,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # working, and then silently stops guarding.
                 # ⛔⛔ THE REFRESH HAPPENS HERE, UPSTREAM OF THE PROVIDER — AND THAT IS WHAT
                 # REPLACED A METACLASS GUARD THAT WAS DEFEATED SEVEN TIMES ACROSS FIVE VERSIONS
-                # (Phill ruled 2026-09-04). The provider is handed an ALREADY-REFRESHED policy, so
+                # (ruled 2026-09-04). The provider is handed an ALREADY-REFRESHED policy, so
                 # a provider cannot skip the re-resolution: there is no step for it to omit.
                 # ⚡ The guard tried to make it impossible to SKIP a call. This makes the call not
                 # exist at that layer -- for a provider that implements the `_spawn_shell_impl`

@@ -30,7 +30,7 @@ user cannot enter. Setup creates ``/Users/Shared/levain/<hands>/workspace`` (mac
 ``/var/lib/levain/<hands>/workspace`` (Linux) and records the path in ``confinement.json`` (a
 recorded path, never a symlink). The workspace and everything in it belong to the hands user. The
 operator gets an inherited ACL that allows reading and listing only, never writing, creating or
-deleting (Phill, 2026-10-07, ruling A: the operator edits the entity's workspace through the
+deleting (2026-10-07, ruling A: the operator edits the entity's workspace through the
 entity). The reason: git's ownership check for a BARE repository looks only at that directory, so
 any operator-owned directory the hands user could write would be one the operator's git trusts and
 the entity could fill with a repository whose config runs code as the operator. With nothing in the
@@ -80,7 +80,7 @@ OPERATOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 HANDS_MARKER = "Levain hands user"
 
 #: What undo leaves: the account, disabled in place, so its id stays reserved in the directory
-#: service the OS allocates from (Phill's head, 2026-10-07, ruling (a): a tombstone, never a
+#: service the OS allocates from (2026-10-07, ruling (a): a tombstone, never a
 #: deletion). Starts with :data:`HANDS_MARKER`, so it is still recognisably Levain's.
 RETIRED_MARKER = {"darwin": "Levain hands user (retired)", "linux": "Levain hands user,retired"}
 
@@ -110,7 +110,7 @@ _CRON_DENY = {"darwin": (Path("/usr/lib/cron/cron.deny"), Path("/usr/lib/cron/at
 #: and read, and nothing that writes, creates or deletes.
 _DARWIN_OPERATOR_READ = "list,search,readattr,readextattr,readsecurity,read,file_inherit,directory_inherit"
 
-#: Linux egress boundary (P-1 (a), Phill 2026-10-08): where the per-user nftables ruleset and the
+#: Linux egress boundary (P-1 (a), 2026-10-08): where the per-user nftables ruleset and the
 #: systemd unit that loads it at boot live. Root-owned; only setup writes them, only undo removes them.
 _EGRESS_DIR = Path("/etc/levain/egress")
 _SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
@@ -141,7 +141,7 @@ def egress_table(hands_user: str) -> str:
 
 
 def hands_net_group(hands_user: str) -> str:
-    """The group whose gid the boundary lets out (Linux, D: Phill 2026-10-09). Only network git that
+    """The group whose gid the boundary lets out (Linux, D: 2026-10-09). Only network git that
     ``levain ws-git`` starts runs with it: the hands user is never a member and the group has no
     password, so no process of the hands user can take this gid by itself."""
     egress_table(hands_user)   # validates the name
@@ -361,7 +361,7 @@ def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...])
     or two that raced, can leave MORE allowed than recorded or the unit not enabled while the table is
     still loaded, and the probe tests only the live kernel and one refused port (L3 r2, r5). It does not
     try to prove the boot path against root: units, drop-ins and the firewall are root's, and a root
-    rewrite lifts the boundary until it is re-asserted (Phill 2026-10-09, ruling (A)).
+    rewrite lifts the boundary until it is re-asserted (2026-10-09, ruling (A)).
 
     The live check before a launch is the CALLER's: a caller starting a hands process on Linux calls
     :func:`egress_boundary_problem` and :func:`net_group_problem` first and refuses on a problem."""
@@ -717,7 +717,7 @@ def plan_setup(
     as_hands = ("/usr/bin/sudo", "-u", hands, "/usr/bin/env", "-i", f"HOME={home}", f"PATH={SECURE_PATH}")
     git, keygen = _abs("git"), _abs("ssh-keygen")
     key = deploy_key_path(home)
-    # No safe.directory on either side (Phill, 2026-10-07: "go with H"): every repository in the
+    # No safe.directory on either side (2026-10-07: "go with H"): every repository in the
     # workspace belongs to the hands user, so the hands user's git needs no exception and the
     # operator's git refuses them by its own ownership check.
     steps += [

@@ -162,7 +162,7 @@ def _seen_ordinal(row: RowIn) -> int:
 
 
 def _tray_key(row: RowIn, today: date) -> tuple:
-    # Ported from flow's Tray order (RULED Q2, 2026-10-09). Six keys, in order: expired-handoff
+    # Ported from the embedder's Tray order (RULED Q2, 2026-10-09). Six keys, in order: expired-handoff
     # demotion, dated before undated, disposition (handoff first), tier, salience, seen-recency.
     f = row.facets
     return (
@@ -176,7 +176,7 @@ def _tray_key(row: RowIn, today: date) -> tuple:
 
 
 def _tray_group(row: RowIn, today: date) -> str:
-    # Ported from flow's session-open banding (RULED Q2): an explicit past date is OVERDUE whatever
+    # Ported from the embedder's session-open banding (RULED Q2): an explicit past date is OVERDUE whatever
     # the disposition; today's date is TODAY; an undated handoff still inside its claim is TODAY;
     # the rest are ALSO.
     f = row.facets

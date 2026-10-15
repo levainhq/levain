@@ -1,7 +1,7 @@
 """levain.autonomic — the governed EFFERENT edge (the gate).
 
 Folded into Levain on 2026-10-06 from the vagus repo's ``vagus/efferent/`` at vagus commit
-7fdfddd (Phill: vagus "will no longer be Vagus and just be part of Levain itself"), the second
+7fdfddd (vagus "will no longer be Vagus and just be part of Levain itself"), the second
 installment after ``levain.firing`` (2026-07-07). The modules were copied as they were, with
 ``vagus.efferent`` renamed to ``levain.autonomic``; the one afferent import (the receipt's
 ``build_action_face``) now lives in ``levain.autonomic.receipt``. Docstrings that say "the vagus"
@@ -14,11 +14,11 @@ where the unbuyable risk floor allows it. ``govern-not-trust`` compiled into a r
 the augmentation thesis stops being positioning and becomes the binary's behavior. The gate's trace
 is the action-face of the FROZEN DecisionInfluenceReceipt (the vagus is its PRODUCER).
 
-Clean-layer, dogfood-discriminator-sorted out of flow's two-context-proven gate
+Clean-layer, dogfood-discriminator-sorted out of the embedder's two-context-proven gate
 (``email_classifier.gate_directive`` + ``approved_actions.json`` + C1b): the YEAST is here (the risk
 manifest SCHEMA, the ``policy()`` resolver, the §1.5 refuse stack, the posture ladder, the
-``Executor``/``ConfirmTransport`` protocols, later the binding compiler); flow's FOSSIL (the
-concrete actions, the flowConnect wire, the specific manifest content) stays in flow's adapter.
+``Executor``/``ConfirmTransport`` protocols, later the binding compiler); the embedder's FOSSIL (the
+concrete actions, the flowConnect wire, the specific manifest content) stays in the embedder's adapter.
 
 The membrane (load-bearing — the anti-grab-bag guard):
   - It NEVER renders (the surface layer's job).
@@ -68,7 +68,7 @@ Architecture:
     An effect is also stopped (STALE, decided again) when its risk FENCE, a digest of the risk inputs
     its rung was decided from, differs from the same inputs read again at its admission (any change to
     them, made any way), and held (UNCLASSIFIED) when they cannot be read there.
-  Who answered a confirm (Phill's ruling B, 2026-10-08; "a delivered 'yes' is never authority"):
+  Who answered a confirm (the operator's ruling B, 2026-10-08; "a delivered 'yes' is never authority"):
   - ``confirm`` (``challenge`` / ``verify_signature``) + ``EfferentGate.confirm_challenge`` — a person's
     approval is an SSH signature by an enrolled key over the store's identity, the pending and hold ids,
     the pending's content, the risk fence and the rung, never a delivered "yes"; without one the

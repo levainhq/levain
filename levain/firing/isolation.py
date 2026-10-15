@@ -3,14 +3,14 @@
 An OpenHands Levain entity runs on an open model with its OWN memory — its anneal store lives
 in the entity's own ``.levain/`` dir (``<entity>/.levain/memory.db`` + ``memory.crystal.json``,
 the convention ``doctor._check_store`` / ``dashboard.SubstrateSource.local`` enforce). The #1
-sovereignty requirement (Phill, 2026-07-07): an entity's firing must NEVER touch the operator-
+sovereignty requirement (2026-07-07): an entity's firing must NEVER touch the operator-
 laptop's flow store (``~/.anneal-memory/``).
 
 The leak this closes (grounded): the default firing (``AnnealFiring``, kind ``"anneal"``) hard-
 DEFAULTS its crystal + episodic paths to ``~/.anneal-memory/`` and the serialization-safe registry
 rebuilds it ZERO-ARG on ``fork()`` / reload — so "point it at the entity via ``VAGUS_*`` env" is
 DISCIPLINE, not structure. Forget to set the env (or reach a firing built off the chokepoint) and
-an Ollama entity silently recalls flow's identity. That is the exact ``claim > enforcement`` gap.
+an Ollama entity silently recalls the operator's identity. That is the exact ``claim > enforcement`` gap.
 
 The fix is STRUCTURAL (``structural_invariants_beat_discipline``):
 
@@ -56,7 +56,7 @@ class IsolationError(RuntimeError):
     """Raised when an isolated entity's resolved store path would reach the operator-laptop flow
     store OR escape its own sovereign ``.levain/`` dir. FAIL-CLOSED: refuse rather than silently
     read/write the wrong store. Inside the firing's inject/capture this is caught by the fail-soft
-    boundary → degrades to no-recall / a loud lost-capture, NEVER a silent read of flow's memory."""
+    boundary → degrades to no-recall / a loud lost-capture, NEVER a silent read of the operator's memory."""
 
 
 def flow_store_dir() -> Path:
@@ -64,7 +64,7 @@ def flow_store_dir() -> Path:
 
     Computed FRESH from ``Path.home()`` on each call (never a frozen module constant) so a test
     that repoints ``$HOME`` — and the real thing, an operator whose home differs — is honored. An
-    entity firing that resolved anywhere under here has leaked flow's identity into the sovereign
+    entity firing that resolved anywhere under here has leaked the operator's identity into the sovereign
     entity (the exact failure this module guards)."""
     return Path.home() / ".anneal-memory"
 
@@ -145,7 +145,7 @@ def assert_entity_isolated(*paths: Path, entity_dir: Path | str) -> None:
         if _is_within_ci(rp, forbidden):
             raise IsolationError(
                 f"isolation violation: {rp} is under the operator-laptop flow store {forbidden} — "
-                "an entity firing must never touch flow's memory."
+                "an entity firing must never touch the operator's memory."
             )
         if not _is_within(rp, sovereign):
             raise IsolationError(
@@ -193,9 +193,9 @@ def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str
     This is the STRUCTURAL confinement the OpenHands file tools LACK. The shipped ``FileEditorTool``
     does not confine at all: its ``workspace_root`` is cosmetic (path-SUGGESTION text only) and
     ``FileEditor.validate_path`` has no containment check, so a stock editor would happily
-    ``view ~/.anneal-memory/`` (reading flow's identity) or ``create /etc/...``. The confined
+    ``view ~/.anneal-memory/`` (reading the operator's identity) or ``create /etc/...``. The confined
     executor (``levain.firing.openhands.tools``) calls this on EVERY command — reads (``view``)
-    INCLUDED, because a view of the flow store is an isolation LEAK (it pulls flow's memory into the
+    INCLUDED, because a view of the flow store is an isolation LEAK (it pulls the operator's memory into the
     entity's context), not merely an unsafe write. String-inspecting the path for ``..`` / absolute
     prefixes would be discipline (bypassable via symlink); resolve-then-check is structural — a
     symlink planted inside the workspace that points out is caught by its RESOLVED target, exactly as
@@ -229,7 +229,7 @@ def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str
     if _is_within_ci(resolved, flow_store_dir().resolve()):
         raise IsolationError(
             f"file path {resolved} is under the operator-laptop flow store {flow_store_dir()} — "
-            "an entity's file authority must never touch flow's memory."
+            "an entity's file authority must never touch the operator's memory."
         )
     if not _is_within(resolved, root):
         raise IsolationError(

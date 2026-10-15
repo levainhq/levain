@@ -22,7 +22,7 @@ a scheduled seat has a human to fan an action in to at the moment it would fire.
 existing ``human_present: bool`` signature untouched. **K3's security boundary does not change here.**
 
 **Why the floor no longer follows the gate's line.** Until 2026-10-07 the floor kept ``headless`` open
-and denied only ``unattended``; Phill ruled that default flipped (cockpit chat is ``headless``, and its
+and denied only ``unattended``; that default was ruled flipped (cockpit chat is ``headless``, and its
 every turn is captured), which left the interactive REPL as the one drive with the standard credential
 stores open by default. On 2026-10-12 (N7) he ruled that one closed too: the crown-jewels floor is
 presence-INDEPENDENT, as ``~/.anneal-memory`` already was, because it is *irreversibility containment*
@@ -73,7 +73,7 @@ __all__ = [
 ]
 
 # There is no process-level drive-mode channel. ``$LEVAIN_DRIVE_MODE`` and its widen-refusal guard were
-# retired on 2026-10-02 (Phill: "b on levain") once spore-438 moved the mode onto each conversation
+# retired on 2026-10-02 ("b on levain") once spore-438 moved the mode onto each conversation
 # (:class:`levain.firing.binding.ConversationBinding`) and no reader of the env was left anywhere —
 # in levain, flow, anneal-memory, the hub, or any child process (the confined shell and the daemon
 # start from env dicts built from scratch). A process-global mode is the race spore-438 reproduced.

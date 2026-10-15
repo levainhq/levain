@@ -59,7 +59,7 @@
   // Find the next `_`/`__` that closes at a word boundary (the char after it is not
   // alphanumeric). With the intra-word OPENING guard below, this keeps snake_case
   // identifiers (cross_substrate_review_codex_nonreplaceable, master_plan.md) fully
-  // literal — flow's content is dense with them, so a naive `_` italic shreds it.
+  // literal — the embedder's content is dense with them, so a naive `_` italic shreds it.
   function mdCloseUnderscore(s, from, delim) {
     let k = s.indexOf(delim, from);
     while (k >= 0) {

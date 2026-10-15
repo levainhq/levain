@@ -30,8 +30,8 @@ class SignalAuth(IntEnum):
 
     UNAUTHENTICATED = 0   # unknown / unsigned → refuse at the entry (§1.3), don't even classify
     WEAK = 1              # handle-based (iMessage); no DMARC-equivalent alignment check
-    AUTHENTICATED = 2     # DMARC-pass email, genuinely-Phill's-phone GPS — strong but not sufficient
-    STRONG = 3            # Phill's own authenticated device+app (flowConnect NL); self-clock (cron)
+    AUTHENTICATED = 2     # DMARC-pass email, the operator's own phone GPS — strong but not sufficient
+    STRONG = 3            # the operator's own authenticated device+app (flowConnect NL); self-clock (cron)
 
 
 class IntentProvenance(IntEnum):

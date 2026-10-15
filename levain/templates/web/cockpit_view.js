@@ -1452,7 +1452,7 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     fillGrids();
   }
-  // The grids keep their designed widths whatever a mode hides (Phill 10-14: a lone widget or a lone Work card stretched
+  // The grids keep their designed widths whatever a mode hides (10-14: a lone widget or a lone Work card stretched
   // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
   // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }

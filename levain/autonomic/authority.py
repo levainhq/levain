@@ -1,6 +1,6 @@
 """levain.autonomic.authority — the authorization in force at the gate (the receipt's authority_scope).
 
-A binding is a delegated-authority grant ("I, Phill, authorize flow to do G when P, at posture R" —
+A binding is a delegated-authority grant ("I, the operator, authorize the agent to do G when P, at posture R" —
 agent_authority_model.md / the binding-language doc). ``AuthorityScope`` is the concrete record of
 WHICH grant gated a given fire — the receipt's ``authority_scope`` field (the FROZEN
 DecisionInfluenceReceipt). For Slice 1 (binding-LESS, manual) the grant is the human's own

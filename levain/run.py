@@ -2,7 +2,7 @@
 
 ``levain run <entity_dir>`` is the "use it like Claude Code, but sovereign" surface: a
 partner-entity that runs on an open model (Ollama by default), carries its OWN memory, and —
-the #1 requirement (Phill, 2026-07-07) — MUST NOT touch the operator-laptop flow store.
+the #1 requirement (2026-07-07) — MUST NOT touch the operator-laptop flow store.
 
 **This module holds DRIVERS, not the entity.** The session itself — construction, the
 sovereignty guards, and the one ``run_turn`` operation — lives in :mod:`levain.session`

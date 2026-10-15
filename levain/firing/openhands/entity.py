@@ -94,9 +94,9 @@ class EntityBinding:
         )
 
     def wrap_nudge(self, *, threshold: int | None = None) -> str | None:
-        """The SessionEnd wrap-nudge against THIS entity's episodic store (never flow's, apparatus
+        """The SessionEnd wrap-nudge against THIS entity's episodic store (never the operator's, apparatus
         F2). RE-DERIVES + RE-GUARDS the episodic path from ``entity_dir`` at USE time (not the cached
-        ``episodic_path``), so a post-bind ``.levain`` symlink-swap can't relocate the read to flow's
+        ``episodic_path``), so a post-bind ``.levain`` symlink-swap can't relocate the read to the operator's
         store (codex round-2 TOCTOU) — a runtime guard, not a one-shot validator. Fail-soft: a guard
         trip degrades to ``None`` (no nudge), never a read of the wrong store."""
         from levain.firing.anneal import wrap_nudge as _wrap_nudge
@@ -264,7 +264,7 @@ def build_entity_agent(
     constructing anything, and refuses ``tools`` whose hands are bound to a DIFFERENT entity (one
     conversation's floor and memory must serve the same entity).
     Every firing/condenser is wired with ``firing_kind="anneal_entity"`` — the isolated kind — so
-    the agent recalls + captures ONLY under ``<entity>/.levain/`` and never touches flow's store,
+    the agent recalls + captures ONLY under ``<entity>/.levain/`` and never touches the operator's store,
     across fork/reload.
 
     ``inner`` defaults to an ``LLMSummarizingCondenser`` (compression-first, so the afferent inject
@@ -284,7 +284,7 @@ def build_entity_agent(
 
     The constitution rides a STRING baked into the AgentContext (fork-safe as data, so the per-turn
     firing kind need not carry it); the re-anchor rides the serializable ``presence_kind`` (rebuilt on
-    fork). Both read only the ENTITY's own seed — never flow's fossil (isolation applies to the seed)."""
+    fork). Both read only the ENTITY's own seed — never the embedder's fossil (isolation applies to the seed)."""
     ed, crystal, episodic = guard_entity(entity_dir)
     mark_entity_process()
     _require_tools_serve(tools, ed)

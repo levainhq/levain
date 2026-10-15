@@ -7,7 +7,7 @@ bash cannot be confined that way (a persistent host shell's ``cd ~`` / absolute 
 Python check), so the shell needs an OS sandbox. This module is that sandbox — SLICE 1: the
 confinement CORE (the policy + the profile + the stateful sandboxed shell), behind a provider seam.
 
-**The polarity FLIPS (Phill-ratified 2026-07-10).** The step-6 file jail was ``(deny default) →
+**The polarity FLIPS (ratified 2026-07-10).** The step-6 file jail was ``(deny default) →
 allow the workspace`` — a JAIL. A CC replacement inverts it: ``(allow default) → DENY the crown
 jewels``. The OS sandbox stops being a jail and becomes a **structural FLOOR** that keeps the
 (less-trusted, open-model) entity out of the sovereignty crown jewels no matter what it is told to
@@ -18,8 +18,8 @@ of the old design — a default-DENY profile blocked ``cat``/``python`` from loa
 it needed an empirically-hunted "system allow-set"; a default-ALLOW profile needs NO allow-set at all
 (every tool loads its libs freely), so the profile is JUST the denylist.
 
-**The crown-jewels denylist (structural, never — the Phill-ratified starting set):**
-  - flow's store ``~/.anneal-memory/`` (the identity moat, in file terms);
+**The crown-jewels denylist (structural, never — the ratified starting set):**
+  - the operator's store ``~/.anneal-memory/`` (the identity moat, in file terms);
   - credential files (declared by the caller — this module does NOT guess where secrets live);
   - sibling entities' ``<other>/.levain/`` stores (one entity can't read another's memory);
   - the ``~/.ssh`` key material (``ssh_mode="agent"``): the entity may USE keys via the agent socket
@@ -143,7 +143,7 @@ is tabulated above :func:`_bwrap_argv`.
     its own addresses (loopback AND the LAN IP — seatbelt's ``localhost`` keyword covers every
     local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in BOTH
     ssh_modes by ``deny_localhost_outbound`` (renders ``(deny network-outbound (remote ip
-    "localhost:*"))``), DEFAULT-ON at ``ConversationBinding.create`` (Phill 2026-09-13, 0.4.6 = A+B),
+    "localhost:*"))``), DEFAULT-ON at ``ConversationBinding.create`` (2026-09-13, 0.4.6 = A+B),
     operator opt-out ``allow_localhost_outbound``. Both modes because raw mode has the same
     fresh-connection exposure (codex L3 HIGH#1, REPRODUCED): the entity reads its OWN key but the
     OTHER jewels stay floor-denied and a local sshd reads THEM as root just the same. This deny also
@@ -179,7 +179,7 @@ is tabulated above :func:`_bwrap_argv`.
   - CROWN-JEWEL DIRECTORY NAMES leak: ``ls ~`` lists ``.anneal-memory`` as a NAME (the parent's
     metadata is allowed; the subtree's CONTENTS + the jewel dir's own stat are denied). Names are
     already public; informational.
-  - FLOOR-EXPANSION (spore-322, Phill-ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
+  - FLOOR-EXPANSION (spore-322, ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
     the UNIVERSAL floor (:data:`_SSH_AUTHORIZED_KEYS`, both ssh_modes — a persistence backdoor with zero
     legit use, so it is folded unconditionally). The other default-allow-readable standard cred stores
     — :data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES` (a GitHub token = repo push/admin) — are ≥
@@ -191,7 +191,7 @@ is tabulated above :func:`_bwrap_argv`.
 
 **Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** This
 floor protects the crown jewels and NOTHING else. With default-allow and no permission prompts
-(Phill: people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
+(people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
 ``git push --force``, or ``curl | bash`` — **none of which THE FLOOR stops.** That sentence is about
 the floor, and about the floor it is still exactly true.
 
@@ -301,8 +301,8 @@ SshMode = Literal["agent", "raw"]
 # PARENT process's memory without limit (apparatus L3 complement #4). Normal commands never hit these.
 _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then truncate + mark)
 
-# The ssh files WRITE-denied in EVERY ssh_mode — the persistence/exec-vector floor (slice 3, Phill-
-# ratified 2026-07-12; expanded from authorized_keys-only after apparatus L1 caught the config/rc gap +
+# The ssh files WRITE-denied in EVERY ssh_mode — the persistence/exec-vector floor (slice 3, ratified
+# 2026-07-12; expanded from authorized_keys-only after apparatus L1 caught the config/rc gap +
 # the banner overclaim). Writing ANY of these grants code the operator or sshd runs LATER, with ZERO
 # legit entity use — a strictly worse vector than reading a key (a read exfils; a write grants standing
 # execution):
@@ -842,8 +842,8 @@ class CrownJewelsPolicy:
     # file the floor denies. REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD. In ``ssh_mode="agent"``
     # the carrier is the forwarded ``SSH_AUTH_SOCK`` (proven sole carrier: disable it and the attack
     # fails "Permission denied (publickey)"). This flag is mode-AGNOSTIC — it renders the deny
-    # whenever True — and its CALL SITE (`ConversationBinding.create`) sets it in BOTH ssh_modes (Phill
-    # 2026-09-13, 0.4.6 = A+B). codex L3 HIGH#1 REPRODUCED a raw-mode variant (the entity reads its own
+    # whenever True — and its CALL SITE (`ConversationBinding.create`) sets it in BOTH ssh_modes
+    # (2026-09-13, 0.4.6 = A+B). codex L3 HIGH#1 REPRODUCED a raw-mode variant (the entity reads its own
     # key, but the OTHER jewels — ~/.anneal-memory, sibling stores, deny_files — stay floor-denied and
     # a local sshd reads THEM as root just the same), so both modes get the deny.
     # Same class as the container-daemon socket (spore-725): a floor
@@ -949,9 +949,9 @@ DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Path]]:
     """The operator's PROJECT memory: ``(subtrees, trust_spellings, store_links)`` (spore-1308, ruled
-    by Phill 2026-10-03, option A).
+    2026-10-03, option A).
 
-    ``~/.anneal-projects`` holds per-project anneal stores and, by flow's convention, the derive-trust
+    ``~/.anneal-projects`` holds per-project anneal stores and, by the embedder's convention, the derive-trust
     file that binds re-derive labels to repo roots. It is operator memory exactly as ``~/.anneal-memory``
     is, and a project store's continuity may be loaded into an operator session's prompt (flow did so
     for every levain seat when this was ruled), so a confined write there is an injection path. A run
@@ -1046,12 +1046,12 @@ def _anneal_trusted_dbs(path: Path) -> list[str]:
 
 def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[Path]:
     """Directories of the project stores the operator's anneal trust files name, to deny read+write
-    (spore-1308 follow-on, ruled by Phill 2026-10-03: "yes for trust file thing").
+    (spore-1308 follow-on, ruled 2026-10-03: "yes for trust file thing").
 
     A store lives wherever its trust file's ``stores[].db`` points, so naming one directory does not
     cover a moved project home. Read at each policy build and each spawn (:func:`refresh_socket_denies`):
     ``$ANNEAL_MEMORY_DERIVE_TRUST`` if set in this process, anneal's default
-    ``~/.anneal-memory/derive-trust.json`` and flow's ``~/.anneal-projects/derive-trust.json``, each
+    ``~/.anneal-memory/derive-trust.json`` and the embedder's ``~/.anneal-projects/derive-trust.json``, each
     through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
     ``~/.anneal-projects`` subtree still applies.
 
@@ -1260,7 +1260,7 @@ def build_policy(
 
     **Operator-declared crown jewels (the caller MUST pass — this generic, operator-neutral module
     deliberately does NOT guess where an operator's app-specific secrets live):**
-      - ``deny_files`` — credential FILES (e.g. flow's ``~/Documents/flow/.env.flow``). Denied by
+      - ``deny_files`` — credential FILES (e.g. the embedder's ``~/Documents/flow/.env.flow``). Denied by
         ``literal`` so a same-named file elsewhere is unaffected. NOTE: guessing a filename like
         ``~/.env.flow`` is worse than useless — it is FALSE SECURITY (it "protects" a path the secret
         isn't at while missing the real one; L4-live 2026-07-11 caught exactly this), so the module
@@ -2000,7 +2000,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
     write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
-    moat, not this predicate, is what keeps recall/capture off flow's store."""
+    moat, not this predicate, is what keeps recall/capture off the operator's store."""
     try:
         p = Path(path).expanduser().resolve()
     # ⛔ RuntimeError IS IN THIS CLAUSE FOR THE SAME REASON IT IS IN `doctor.py`'s, AND THIS
@@ -2169,7 +2169,7 @@ class ConfinementConfig:
     # spore-755. The OPT-OUT of the connect-to-self deny, and the exact sibling of
     # ``allow_container_sockets`` above (allow_* = opt out of a default deny; absent means False =
     # the deny stays on). Default FALSE means the floor denies outbound connect() to THIS host in
-    # BOTH ssh_modes (Phill 2026-09-13, 0.4.6 = A+B), closing the FRESH-CONNECTION local-sshd bypass
+    # BOTH ssh_modes (2026-09-13, 0.4.6 = A+B), closing the FRESH-CONNECTION local-sshd bypass
     # (REPRODUCED 2026-09-13; loopback-loss ACCEPTED). Set true ONLY if this entity genuinely needs a LOCAL
     # service (a dev server it started, argushub on :8420) and the operator accepts that a local sshd
     # can then be asked to read a floor-denied file. NOT a tri-state like ``deny_standard_creds`` —
@@ -2583,7 +2583,7 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
 #: by the operator floor's bwrap, as the operator, inside the command's cgroup leaf (role ``operator``).
 #: The role is passed, never inferred (L3 r2: a guess from ``/proc/<levain>``'s owner is a guess about
 #: procfs). Before it execs the command:
-#: 1. It joins a NEW, empty session keyring (:data:`_START_KEYRING`; on the operator floor too, Phill
+#: 1. It joins a NEW, empty session keyring (:data:`_START_KEYRING`; on the operator floor too,
 #:    2026-10-09: "yes to both").
 #: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd).
 #:    ``operator``: when either ends, the watcher writes ``cgroup.kill`` of its own leaf, which holds
@@ -3015,7 +3015,7 @@ class SandboxedShell:
 
     :meth:`run` spawns ``<driver argv> -c <runner> bash`` in a new session, writes its input to its
     stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the status is its
-    waitpid status** (spore-1385, Phill's ruling): nothing the shell prints is parsed for either, so
+    waitpid status** (spore-1385, the operator's ruling): nothing the shell prints is parsed for either, so
     code the entity runs cannot end a command early or forge its status. The model this replaced ran
     one bash reading commands from a pipe and took completion and ``$?`` from a line bash printed; bash
     read that pipe one byte at a time on fd 255, so a builtin in a command could read the status line
@@ -3640,7 +3640,7 @@ class ConfinementProvider(ABC):
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
-        (Phill ruled 2026-09-04, on codex L3 round 7). The history is the argument, so it is kept:
+        (ruled 2026-09-04, on codex L3 round 7). The history is the argument, so it is kept:
 
         | v | mechanism | defeated by |
         |---|-----------|-------------|
@@ -3703,7 +3703,7 @@ class ConfinementProvider(ABC):
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
         # Against the WHOLE policy, a hands launch's too: a jewel outside the view may have its other name
-        # inside it, and no check can tell where that name is (codex + complement L3 r5; Phill 10-03:
+        # inside it, and no check can tell where that name is (codex + complement L3 r5; ruled 10-03:
         # refuse bash when ANY jewel inode has st_nlink > 1). The view's narrowing starts after this.
         _refuse_multiply_linked_jewels(refreshed)
         # `hands` is passed only when set, so a provider written before it existed still works for
@@ -3834,7 +3834,7 @@ class SeatbeltProvider(ConfinementProvider):
 
     Renders a ``(version 1)(allow default)`` profile that DENIES the crown jewels — the polarity flip:
     the sandbox is a FLOOR, not a jail. Deny both read AND write on the subtrees (the entity can
-    neither exfil nor corrupt flow's memory / a sibling's memory); deny the credential FILES; and for
+    neither exfil nor corrupt the operator's memory / a sibling's memory); deny the credential FILES; and for
     ``ssh_mode="agent"`` deny read+write on ALL of ``~/.ssh`` (see the module docstring — location-
     based, not ``id_*``) while re-allowing ``known_hosts`` (r+w) and ``config`` (r) so agent-auth
     still works. ⚠ ``config`` is read-re-allowed and its WRITE stays denied in BOTH modes, which
@@ -4663,7 +4663,7 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     have ``st_nlink == 1``. An earlier version counted the names it could see and graded them by
     access; four review rounds each found a way that count misjudged, so the rule is now strict: a
     second name anywhere refuses, including one inside a hidden subtree.
-    Checked at spawn only: a link a host process makes while a shell is live is not watched (Phill's
+    Checked at spawn only: a link a host process makes while a shell is live is not watched (a
     ruling, 2026-10-03). The file editor checks every path it touches instead
     (:func:`linked_jewel_reason`)."""
     for links, path in _jewel_inodes(policy).values():
@@ -4726,7 +4726,7 @@ def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
     An unreadable regular file in a directory this user can write is refused too: it may be a
     database a more privileged process uses, and the shell could plant beside it (codex, L3).
     ⚖ Before 0e09df5 bwrap aborted on a file-shaped root, so such a host had no bash; that commit
-    made bash start and opened this path. Refusing restores fail-closed. Ruled by Phill 2026-10-02
+    made bash start and opened this path. Refusing restores fail-closed. Ruled 2026-10-02
     for the writable-directory case, with no opt-out; the late-sidecar run widened it. A store that
     is a DIRECTORY is hidden by a read-only tmpfs and is unaffected."""
     candidates = [p for p in policy.deny_read_write if not p.is_dir()] + list(policy.deny_files)
@@ -6069,7 +6069,7 @@ def _probe_env() -> dict[str, str]:
     return child_env()
 
 
-# --- one cgroup v2 leaf per command (S2, Phill 2026-10-09: "yes sorry, that is correct: A'") --------
+# --- one cgroup v2 leaf per command (S2, ruled 2026-10-09, option A') --------
 # Every process of a Linux command lives in ONE cgroup v2 leaf levain names before the command runs: a
 # transient scope of the operator's own systemd user manager (``systemd-run --user --scope``), which
 # systemd delegates to the operator. kill = write ``1`` to its ``cgroup.kill``; gone = its
@@ -6383,7 +6383,7 @@ def bwrap_netns_available() -> bool:
     return proc.returncode == 0
 
 
-# ⚖ THE LINUX POSTURE, DECIDED 2026-10-01 (option B, under Phill's go): bwrap has no
+# ⚖ THE LINUX POSTURE, DECIDED 2026-10-01 (option B, under the operator's go): bwrap has no
 # per-destination connect deny, so the deny renders as ``--unshare-net`` and bash runs with no IP
 # network (pathname unix sockets remain: ``OFFLINE_RESIDUAL``). Measured on argushub the same day: under ``--unshare-net`` a 127.0.0.1 listener is refused
 # (curl rc 7), an abstract-socket D-Bus is refused (busctl rc 1), the internet is gone (rc 6) and bash
@@ -7182,7 +7182,7 @@ class _Leader:
 
 
 # --- the Linux hands launch (S2-linux) ------------------------------------------------------------
-# bwrap runs AS the hands user, in an ALLOWLISTED view (Phill's ruling (A), 2026-10-09): the sandbox
+# bwrap runs AS the hands user, in an ALLOWLISTED view (the operator's ruling (A), 2026-10-09): the sandbox
 # root is bwrap's own empty tmpfs, and only the trees bash needs are mounted into it. Read-only: /usr
 # (and the merged-/usr links /bin, /sbin, /lib*), /etc and /opt. Writable: the hands workspace and the
 # hands home. Fresh and empty: /tmp, /var/tmp, /run, and bwrap's own /dev and /proc. The host's root is
@@ -7707,7 +7707,7 @@ def _hands_walk(hands: HandsIdentity,
 
 
 def _hands_launch_problem(hands: HandsIdentity) -> str | None:
-    """What stops a Linux hands launch, checked before any of its processes starts (Phill's ruling (A):
+    """What stops a Linux hands launch, checked before any of its processes starts (the operator's ruling (A):
     probe at every hands launch). None when nothing does."""
     from levain.firing.hands import HandsSetupError, egress_boundary_problem, hands_net_group, net_group_problem
 
@@ -7726,7 +7726,7 @@ def _hands_launch_problem(hands: HandsIdentity) -> str | None:
 
 class _BwrapShell(SandboxedShell):
     """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
-    mounts it was started with (spore-1312, rec C, ruled by Phill 2026-10-03, widened by its L3).
+    mounts it was started with (spore-1312, rec C, ruled 2026-10-03, widened by its L3).
 
     Two checks, one rule each:
       - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
@@ -8090,7 +8090,7 @@ class _BwrapShell(SandboxedShell):
             self._preflight_thread = threading.get_ident()
         hands = self._hands
         if hands is not None:
-            # The walk again before every command (Phill 2026-10-09, "yes to both"): a socket or FIFO
+            # The walk again before every command (2026-10-09, "yes to both"): a socket or FIFO
             # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
             # this command. What is made DURING a command is not seen; that is the README's residue.
             # A walk that could not be done says nothing about the host: that command is refused and the
@@ -8148,7 +8148,7 @@ class BwrapProvider(ConfinementProvider):
     this paragraph once weighed it for: without it the sandbox's procfs showed every process of this
     user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. pid_namespaces(7): the
     new procfs shows only the namespace's processes (asserted live by
-    ``test_linux_live_bash_sees_no_host_process``, which the CI workflow's live job runs), and "If
+    ``test_linux_live_bash_sees_no_host_process``, which the live job of the CI workflow runs), and "If
     the "init" process of a PID namespace terminates, the kernel terminates all of the processes in
     the namespace via a SIGKILL signal". Each command now runs as its own bwrap with bash as that
     pid 1 (``--as-pid-1``), so a ``setsid`` child ends with its command

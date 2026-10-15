@@ -1,11 +1,11 @@
 """levain.cockpit.external: a server's ``extra_panels`` callable as manifest panels (design §6.2).
 
-A downstream (flow's Bridge) hands ``make_server`` a zero-arg callable returning legacy external-panel
+A downstream (the embedder's Bridge) hands ``make_server`` a zero-arg callable returning legacy external-panel
 dicts. Here each one becomes a manifest panel: ``lines`` -> a triage-list whose rows carry the legacy
 ``meta`` as the ``legacy_meta`` facet, ``markdown`` -> a prose panel, ``note``/``empty``/``error`` -> the
 panel head. A panel's ``action`` verb is the one verb it offers (``ProviderSpec.verbs``, K2a).
 
-The callable may do network reads (flow's inbox is HTTP to argushub), so it is called ONCE per refresh,
+The callable may do network reads (the embedder's inbox is HTTP to argushub), so it is called ONCE per refresh,
 not once per panel: concurrent callers join the running call, and a finished call is reused for
 ``reuse_s`` so the panel reads that follow a manifest read share it. A reused read carries its call's own
 ``as_of``. The callable is operator-registered, in-process code and trusted not to be adversarial (the

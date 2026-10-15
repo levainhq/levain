@@ -67,7 +67,7 @@ SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
     "handoff_expired", "last_seen", "age_days",
 })
-# the Tray's second view (Phill 2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
+# the Tray's second view (2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
 # a second box): the same rows, oldest first
 TRAY_VIEWS = (("age", "By age", "spore.age"),)
 EPISODE_FACETS = frozenset({"episode_type", "source", "at", "tags", "agent"})
@@ -807,7 +807,7 @@ def _anneal_section(source: SubstrateSource, heading: str) -> Callable[[ReadCont
 
 
 def _section_writer_shipped() -> bool:
-    """anneal's section writer (``Store.replace_section``, 0.9.43): Phill ruled (i) on 2026-10-10, so
+    """anneal's section writer (``Store.replace_section``, 0.9.43): ruling (i) on 2026-10-10, so
     no section_edit is offered on an anneal without it."""
     from anneal_memory import Store
 

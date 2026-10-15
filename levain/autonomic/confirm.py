@@ -1,6 +1,6 @@
 """levain.autonomic.confirm — who answered a confirm: a signature, never a delivered "yes".
 
-The rule (Phill, 2026-10-08): "a delivered 'yes' is never authority; authority = a signature by an
+The rule (2026-10-08): "a delivered 'yes' is never authority; authority = a signature by an
 authenticator the operator's uid cannot hold, over content shown on a display the requester cannot write."
 
 A person's approval of a pending action is authority only when it carries an SSH signature (SSHSIG, in

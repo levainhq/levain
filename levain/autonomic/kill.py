@@ -8,11 +8,11 @@ is in the room at fire-time):
   - **kill-purity** (``assert_kill_pure``): the kill reduces to a pure, read-only, deterministic
     predicate over event fields — no effector node, no fire-time judgment, no op this substrate can't
     evaluate. Corpus-AGNOSTIC + vagus-core-OWNED: the diverse substrate validates its OWN input rather
-    than trusting that flow's ``events.validate_predicate`` did (substrate independence at the
+    than trusting that the embedder's ``events.validate_predicate`` did (substrate independence at the
     validation layer too).
 
   - **a DIVERSE substrate** (``kill_outcome`` / ``kill_trips``): the kill is evaluated by an
-    INDEPENDENT evaluator — re-implemented here, NOT flow's ``events.py`` (the anti-cycle rule
+    INDEPENDENT evaluator — re-implemented here, NOT the embedder's ``events.py`` (the anti-cycle rule
     forbids the import anyway). The diversity is LOAD-BEARING, not incidental. Today (3c) a kill and
     its trigger were COMMON-MODE: same ``events.py`` implementation, same ``_eval_leaf`` absent-field
     semantics. A blind spot shared by both (the H2 footgun: ``events._eval_leaf`` returns FALSE on an
@@ -88,7 +88,7 @@ class KillImpurityError(ValueError):
     ``except Exception`` around predicate validation catches it uniformly with the validator's raises."""
 
 
-# The op vocabulary this substrate evaluates — the SAME deterministic grammar as flow's events.py
+# The op vocabulary this substrate evaluates — the SAME deterministic grammar as the embedder's events.py
 # (so a kill authored there is evaluable here), re-declared so the diverse substrate owns its own
 # contract rather than importing the corpus's (the anti-cycle rule + substrate independence).
 KILL_LEAF_OPS = frozenset({"==", "!=", "contains", "in", ">", ">=", "<", "<=", "exists"})

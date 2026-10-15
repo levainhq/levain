@@ -19,15 +19,15 @@ This module is the dashboard's render half: it CLASSIFIES a spore dict into the 
 operator-facing projections — Open Loops / Tray / Keep — via :func:`bucket_of`.
 
 ⚠ **Scope of the "keep operator-I/O OUT of cognition" invariant.** ``is_loop`` is the
-PREDICATE; who ENFORCES it depends on the surface. flow's own store enforces it at its
-cognition reads (``scripts/spores.py`` + flow_state/constellation — flow's layer 2). A bare
+PREDICATE; who ENFORCES it depends on the surface. The embedder's own store enforces it at its
+cognition reads (``scripts/spores.py`` + flow_state/constellation — the embedder's layer 2). A bare
 LEVAIN install's cognition surfaces are its activation hooks
 (``templates/activation/hooks/*`` — session-start dormant-surface + per-prompt collision):
 3b ports ``is_loop`` there (the standalone hook copies filter on
 ``_NON_COGNITION_DISPOSITIONS``), so the boundary holds for a stranger too.
 
 ⚠ **Drift contract (load-bearing).** The taxonomy is duplicated in FOUR places BY DESIGN —
-this module, flow's ``scripts/spores.py``, and the TWO standalone hook copies (Claude +
+this module, the embedder's ``scripts/spores.py``, and the TWO standalone hook copies (Claude +
 Codex adapters, which can't import a package). anneal — the shared dependency — deliberately
 does NOT carry the taxonomy (the de-risk keeps the canonical object's storage
 disposition-blind), so every consumer that must INTERPRET disposition carries the vocab. A
@@ -35,7 +35,7 @@ NEW operator-I/O disposition added upstream must be added to ALL FOUR (and to th
 seam's ``choices``). Guards: the flow↔levain cross-repo equality test
 (``flow/scripts/test_tray_disposition.py``); the hook↔hook parity + hook↔levain.spores tests
 (``levain/tests/test_hooks.py``). The ``is_loop`` definition below is the byte-for-byte twin
-of flow's; keep them identical.
+of the reference implementation's; keep them identical.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def is_loop(item: Mapping[str, Any]) -> bool:
     item leaking into a render is visible text, but a real loop wrongly bucketed out
     vanishes from the Open-Loops panel with no signal. An unknown value is almost always
     a typo / corruption / version-skew on a real loop — fail it toward the visible loop.
-    (Byte-for-byte twin of flow's ``scripts/spores.py:is_loop``; keeping them identical
+    (Byte-for-byte twin of the embedder's ``scripts/spores.py:is_loop``; keeping them identical
     is the drift contract above.)"""
     return disposition_of(item) not in NON_COGNITION_DISPOSITIONS
 

@@ -498,8 +498,8 @@ def entity_name_notice() -> str | None:
 # live-context contract .levain/context.json {state, state_set_at, state_source}; this
 # reader puts it in the partner's session. It mirrors the kernel's dashboard._read_state
 # and its bounds, so the entity sees the same line the cockpit renders (and agrees with
-# flow's session_init, which mirrors the same bound). A control plane that REDIRECTS
-# context_json (flow's Bridge -> state/context_state.json) owns its own reader; this reads
+# the embedder's session_init, which mirrors the same bound). A control plane that REDIRECTS
+# context_json (the embedder's Bridge -> state/context_state.json) owns its own reader; this reads
 # the bare-install default. Stdlib only.
 _STATE_EXPIRES_AFTER_HOURS = 12  # mirror dashboard.STATE_EXPIRES_AFTER_HOURS
 _STATE_MAX_TEXT_LEN = 500  # mirror dashboard.STATE_MAX_TEXT_LEN
@@ -580,7 +580,7 @@ def state_notice() -> str | None:
 
 
 # Per-session "seen" markers for the change-only per-prompt state line (the behaviour
-# reference is flow's scripts/state_line_hook.py). One file per session, so concurrent
+# reference is the embedder's scripts/state_line_hook.py). One file per session, so concurrent
 # sessions never share a write; the content is a signature, never state text.
 _STATE_SEEN_KEEP = 200
 _STATE_CLEARED_LINE = "[state] line cleared or expired"
@@ -813,10 +813,10 @@ def pack_drift() -> str | None:
 # + Keep durable reference (note). A spore carrying one is operator I/O, NOT one of the
 # entity's own prospective loops — so it stays OUT of the activation surfaces that feed the
 # entity's cognition (the session-start dormant-surface + the per-prompt collision), exactly
-# as flow's own layer-2 keeps operator I/O out of salience / digest / Top of Mind.
+# as the embedder's own layer-2 keeps operator I/O out of salience / digest / Top of Mind.
 #
 # DRIFT CONTRACT (load-bearing): this tuple MUST equal levain.spores.NON_COGNITION_DISPOSITIONS
-# (and flow's scripts/spores.py) — anneal stays disposition-blind, so every interpreter of the
+# (and the embedder's scripts/spores.py) — anneal stays disposition-blind, so every interpreter of the
 # taxonomy carries the vocab. This hook is a STANDALONE template (stdlib only, no levain import
 # on a stranger install), so it carries its own copy; keep it byte-identical. (levain's test
 # suite asserts this copy == levain.spores.)
@@ -828,7 +828,7 @@ def _is_loop(spore: dict) -> bool:
     I/O — the Tray inbox + Keep notes). Fail-OPEN on the unknown: only an EXPLICITLY-known
     operator-I/O disposition is excluded — a typo'd/unknown value reads as a visible loop,
     never silently dropped (the silent-loss direction the whole slice guards). Mirrors
-    levain.spores.is_loop / flow's scripts/spores.is_loop."""
+    levain.spores.is_loop / the embedder's scripts/spores.is_loop."""
     return (spore.get("disposition") or "loop") not in _NON_COGNITION_DISPOSITIONS
 
 
@@ -836,7 +836,7 @@ def open_spores(timeout: float = 2.0) -> list[dict]:
     """The entity's own open prospective loops, via anneal-memory's `spore list --json`.
     Tray dispositions (the operator inbox) are filtered OUT here — the SINGLE chokepoint
     both germination surfaces (dormant-surface + collision) read, so the Tray can't leak
-    into a Levain install's cognition (the stranger-side twin of flow's layer-2).
+    into a Levain install's cognition (the stranger-side twin of the embedder's layer-2).
     Returns [] on any failure (an anneal too old to have spores, no store yet, an error)
     — the prospective surfaces then show nothing. Tight default timeout: the collision
     surface runs before every prompt."""

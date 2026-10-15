@@ -55,7 +55,7 @@ EXIT_BROKEN = 1
 
 EXIT_UPGRADE_PENDING = 6
 """Every failing check is a routine post-upgrade step that has not been applied yet
-(``spore-840``, ruled by Phill 2026-09-13).
+(``spore-840``, ruled 2026-09-13).
 
 Its own code because the two states want opposite responses: ``1`` means something is
 wrong, ``6`` means run the remedy the output names. ⛔ It is NOT a success. Until the step
@@ -2182,7 +2182,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # made before the receipt existed — the hook stays pending and the text says doctor
     # cannot tell which it is.
     #
-    # ⚖ C6 AMENDED (Phill, 2026-09-15): a CORRUPT or EMPTY receipt is not a pre-receipt
+    # ⚖ C6 AMENDED (2026-09-15): a CORRUPT or EMPTY receipt is not a pre-receipt
     # install and must not read as one. `_write_activation_receipt` (install.py) is the
     # sole writer and runs after the tree is in place; a failed write reads as absent, and
     # rollback restores the prior text — so a legitimate install cannot produce a corrupt

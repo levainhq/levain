@@ -1298,7 +1298,7 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     because a BSD ``flock`` belongs to the open file, not the process. Where no lock can be
     taken (no ``flock`` on the platform, or the filesystem answers "not supported") this raises
     :class:`InstallUnlockable` unless ``LEVAIN_UNLOCKED=1`` is set: one lock protocol for both
-    of levain's single-writer locks (Phill 10-11, frame A). Run unguarded, two such inits were
+    of levain's single-writer locks (10-11, frame A). Run unguarded, two such inits were
     reproduced interleaving their activation swaps (1011+40, argushub, flock answering ENOTSUP)."""
     path = install.joinpath(*INSTALL_LOCK_REL)
 
@@ -1343,7 +1343,7 @@ class CodexHomeUnlockable(InstallLockError):
 
 
 CODEX_HOME_LOCK_NAME = "levain.lock"
-# The named override where a lock cannot be taken (Phill 2026-10-10, option B, then 10-11 frame A:
+# The named override where a lock cannot be taken (2026-10-10, option B, then 10-11 frame A:
 # one protocol for both locks). Exactly "1" opts in; any other value refuses. The 0.7.1 name
 # CODEX_HOME_UNLOCKED_ENV stays as an alias for the CODEX_HOME lock only.
 UNLOCKED_ENV = "LEVAIN_UNLOCKED"
@@ -2259,7 +2259,7 @@ def _refresh_adapter(
                 # its bytes are what levain last wrote for THIS install; anything else,
                 # another install's file, an edit, or a file from before the receipt, is
                 # staged under .levain/pending/ and never overwritten. Ownership is not
-                # inferred from the file's text (spore-866 L3 r1-r7; Phill 2026-10-10 "go
+                # inferred from the file's text (spore-866 L3 r1-r7; ruled 2026-10-10 "go
                 # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
@@ -3362,7 +3362,7 @@ def hook_body(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The activation install receipt — `spore-900`, ruled by Phill 2026-09-13.
+# The activation install receipt — `spore-900`, ruled 2026-09-13.
 #
 # What install WROTE into `activation/`, per file: the sha256 of the installed bytes
 # (after placeholder substitution) and of the composed layer source they came from.
@@ -3637,7 +3637,7 @@ def _tree_proves_pristine(tree: Path) -> bool:
 def _prune_activation_backups(backups_root: Path, keep: int) -> list[str]:
     """Remove whole-tree backups that PROVE pristine, beyond the newest ``keep`` of them.
 
-    ⚖ spore-861, ruling B (Phill 2026-09-13). A tree may be deleted only if it matches the
+    ⚖ spore-861, ruling B (2026-09-13). A tree may be deleted only if it matches the
     receipt of the install that wrote it, with no extra files. Every other tree, including
     every one without a readable receipt, is kept and named. Only ``tree-<digits>``
     directories are candidates; the bare-timestamp directories older releases wrote can
@@ -3968,7 +3968,7 @@ def _report_and_rotate(
                 f"covers it, so levain cannot tell whether you edited anything in it)"
             )
         else:
-            # ⚖ C6 AMENDED (Phill, 2026-09-15): a corrupt/empty receipt read the same as
+            # ⚖ C6 AMENDED (2026-09-15): a corrupt/empty receipt read the same as
             # "no receipt yet" here, contradicting doctor's own C6 text ("a damaged receipt
             # is not a pre-receipt install") a few lines away in doctor.py. Reproduced via
             # the real CLI 2026-09-16: absent, corrupt and empty all printed the byte-

@@ -42,7 +42,7 @@ it must stay under the entity root AND must never resolve into the operator-lapt
 (``~/.anneal-memory/``, case-insensitive). Reusing :mod:`levain.firing.isolation`'s own
 ``_is_within`` / ``_is_within_ci`` / ``flow_store_dir`` predicates (not a re-implementation) keeps
 this fail-closed exactly like ``assert_entity_isolated`` / ``assert_workspace_isolated`` — a
-per-file symlink escaping to another entity, the operator's home, or flow's memory is refused, so
+per-file symlink escaping to another entity, the operator's home, or the operator's memory is refused, so
 a foreign identity can never be injected as this entity's constitution or re-anchor.
 """
 from __future__ import annotations

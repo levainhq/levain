@@ -70,7 +70,7 @@ class CaptureRequest:
     the same epistemic status as perception (a raw log, NOT metabolized truth). It must NOT be
     an LLM-summarized synthesis — summarizing is a light consolidate, which would breach the
     afferent line. ``episode_type`` must be one of anneal's real ``EpisodeType`` values —
-    ``observation / decision / tension / question / outcome / context`` (NOT flow's looser
+    ``observation / decision / tension / question / outcome / context`` (NOT the embedder's looser
     ``finding`` vocabulary, which anneal's enum rejects); the raw turn defaults to
     ``observation``. A bad type degrades to ``observation`` at write (the firing won't lose an
     episode over a type typo). ``source`` is the attribution; ``session_id`` groups a run's
@@ -248,7 +248,7 @@ def build_firing(kind: str, *, entity_dir: str | None = None) -> FiringContract:
 # the HOOKED adapters (Claude Code / Codex) inject via their ``UserPromptSubmit`` hook. The
 # OpenHands entity is HOOKLESS (``init --adapter openhands`` lays down NO activation tree — the
 # ``LevainCondenser`` IS its activation, per step 3), so it cannot read that file; this package
-# constant is the ONE per-turn drift-defense surface it has. Spore-296 (package locus, Phill
+# constant is the ONE per-turn drift-defense surface it has. Spore-296 (package locus,
 # 2026-07-10) folds the rich directives in HERE, not into the entity seed: the drift-defense is
 # UNIVERSAL machinery (NOT the identity moat — the seed owns identity), so one canonical set lives
 # in the package and a package upgrade improves every entity at once. The base-lane

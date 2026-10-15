@@ -105,7 +105,7 @@
   // True iff a 403 is the off-box token gate (JSON body w/ a token message) vs a Host / cross-site
   // refusal (plain text). Consumes the body — the caller re-fetches on retry, so that's fine.
   // NB (complement L3 FIND-4): this ``/token/i`` matcher is coupled to the kernel's literal token-403
-  // message ("missing or invalid write token") and is DUPLICATED in flow's fleetview_web.py — tighten
+  // message ("missing or invalid write token") and is DUPLICATED in an embedder's own frontend — tighten
   // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
   async function isTokenReject(res) {
     try { const d = await res.json(); return /token/i.test((d && d.message) || ""); }

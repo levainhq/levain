@@ -17,7 +17,7 @@ harness's own consent surfaces are the driver's. A driver returns each outcome a
 OPERATOR registered at startup, and it sends message text. Everything that shapes the agent comes
 from the operator's command line and from :meth:`EntitySession.open`, which builds the agent itself
 through ``build_entity_agent``. This is the K1-part-2 requirement of the approved binding design
-(``spore-438``, Phill 2026-10-02): the crown-jewels floor lives in the hands' tool-spec params, so a
+(``spore-438``, 2026-10-02): the crown-jewels floor lives in the hands' tool-spec params, so a
 client-supplied spec would be a client writing its own floor. There is no code path here that
 accepts one, which is a stronger claim than a validator that refuses one.
 
@@ -930,7 +930,7 @@ class ChatHost:
 
     def approve(self, session_id: Any, expect: Any = None) -> dict[str, Any]:
         """Run the held actions. ``expect`` (the current decision id) is REQUIRED: an approval is bound to
-        the set the operator was shown, for every caller, API included (Phill 2026-10-05)."""
+        the set the operator was shown, for every caller, API included (2026-10-05)."""
         return self._start(session_id, "approve", ("gated",), ("approve",), expect=expect,
                            require_expect=True)
 

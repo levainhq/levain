@@ -1648,7 +1648,7 @@ class EfferentGate:
         trips (or this is a manual fire with no kill_predicates / no trigger_event ⇒ inert).
 
         The diversity is load-bearing (3a.5): the kill is re-implemented in ``levain.autonomic.kill``, NOT
-        flow's ``events.py`` that drove the trigger match — so a common-mode absent-field event that the
+        the embedder's ``events.py`` that drove the trigger match — so a common-mode absent-field event that the
         trigger fired on still TRIPS the kill. Pure read over the event; ``kill_trips`` never raises (the
         outer gate net is the backstop regardless)."""
         if not request.kill_predicates or request.trigger_event is None:

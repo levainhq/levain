@@ -13,7 +13,7 @@ binding has no one in the room, so the prediction-error monitor takes that seat.
 
 Two design commitments:
   - **DIVERSE substrate.** The monitor reuses the diverse, fail-safe Kleene evaluator from
-    ``levain.autonomic.kill`` — NOT the executor, NOT flow's ``events.py``. The same common-mode argument
+    ``levain.autonomic.kill`` — NOT the executor, NOT the embedder's ``events.py``. The same common-mode argument
     as the kill: the thing that judges "did the world match the prediction" must fail differently from
     the thing that produced the action.
   - **FAIL-SAFE.** Divergence is declared unless the actual is PROVABLY within the predicted envelope.

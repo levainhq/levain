@@ -369,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--path", type=Path, default=Path.cwd(),
                         help="Install directory (default: cwd); the journal is its ledger's cockpit/.")
         sp.add_argument("--data-root", type=Path, default=None, dest="data_root",
-                        help="The cockpit data root itself (an embedder's, e.g. flow's state/bridge/cockpit).")
+                        help="The cockpit data root itself (an embedder's, e.g. its state/bridge/cockpit).")
 
     ck_enroll = ck_sub.add_parser("enroll", help="Enroll an OpenSSH public key.")
     ck_enroll.add_argument("key", type=Path, help="The public key file (e.g. ~/.ssh/id_ed25519.pub).")

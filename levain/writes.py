@@ -137,7 +137,7 @@ _CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 # Ledger artifacts live UNDER a WriteScope.ledger_root (a Levain install's `.levain/`,
-# or any explicit dir — e.g. flow's `state/bridge/`). These names are ledger-RELATIVE;
+# or any explicit dir — e.g. the embedder's `state/bridge/`). These names are ledger-RELATIVE;
 # the `.levain/` location is just `WriteScope.from_install_root`'s choice of ledger_root.
 _AUDIT_LOG_NAME = "edits.jsonl"
 _BACKUPS_NAME = "backups"
@@ -162,7 +162,7 @@ class WriteScope:
     """WHERE + WHETHER a substrate is writable — the write-path peer of the read
     path's :class:`~levain.dashboard.SubstrateSource`. Decouples the governed write
     surface from the ``.levain/`` install convention so a non-install substrate (e.g.
-    flow's own store — anneal at ``~/.anneal-memory``, spores in its repo, NO
+    the embedder's own store — anneal at ``~/.anneal-memory``, spores in its repo, NO
     ``.levain/``) is governed through the SAME seam a Levain install uses.
 
     Four explicit fields, each the trusted source for one class of write:
@@ -184,7 +184,7 @@ class WriteScope:
       (operator live-state, last-writer-wins — no backup/undo, distinct from the
       consolidated-cognition State edit). ``None`` (a substrate with no live-context
       file, or a read-only source) → the ``operator_state`` kind is refused. TRUSTED (never
-      request-supplied). NB in flow's N-of-1 case this points at the sensor-written
+      request-supplied). NB in the embedder's N-of-1 case this points at the sensor-written
       SUPERSET (``state/context_state.json``), a foreign-multi-writer file — so the state
       write is a lost-update race with the sensor drains (``os.replace`` prevents a torn
       read, but a concurrent whole-object writer can revert a just-set line, which —
@@ -242,7 +242,7 @@ class ActionVerb:
     control plane (the flow Bridge) registers a ``name → ActionVerb`` so the kernel can
     GOVERN dispatch (auth → confirm → audit) while the handler does the domain work. The
     write-peer of the read-only ``extra_panels`` seam: the kernel stays domain-agnostic;
-    the verb operates flow's N-of-1 channels (inbox / relay / consult), which never live
+    the verb operates the embedder's N-of-1 channels (inbox / relay / consult), which never live
     in the kernel (``dogfood_discriminator``). Action verbs require a WRITABLE source —
     they are mutations, so the off-box write-token governance already covers ``/action``
     with no second auth path (``structural_invariants_beat_discipline``).
@@ -629,7 +629,7 @@ def recent_edits(ledger_root: Path, limit: int = 20) -> list[dict[str, Any]]:
 def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
     """A ``config`` / ``entity_name`` edit targets the install's seed/config surface —
     which only exists when the scope has an ``install_root``. A non-install substrate
-    (``install_root is None`` — e.g. flow's own store) refuses these cleanly; State +
+    (``install_root is None`` — e.g. the embedder's own store) refuses these cleanly; State +
     the Class-B verbs never reach here (they run off ``scope.anneal`` + the ledger)."""
     if scope.install_root is None:
         raise EditError(
@@ -1133,7 +1133,7 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
 def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     """Apply a Class-A edit to the neocortex **State** section — the ONE operator-
     editable section of the consolidated-cognition file. State is live-state
-    (last-writer-wins; flow's own "quick update" treats it as a direct targeted edit,
+    (last-writer-wins; the embedder's own "quick update" treats it as a direct targeted edit,
     no consolidate needed) — an INPUT to cognition, never a conclusion the consolidate
     produced (scope §1). Confined two ways, by construction:
 
@@ -1145,7 +1145,7 @@ def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -
        one *incidental* defense the pre-WriteScope install-relative ``_resolve_inside`` had
        (it would have refused a ``.levain/memory.continuity.md`` symlinked OUTSIDE the
        install): the target is now an operator/installer-trusted store path — and for a
-       non-install substrate the continuity legitimately lives outside any tree (flow's
+       non-install substrate the continuity legitimately lives outside any tree (the operator's
        ``~/.anneal-memory/``) — so a store-owned symlink is the operator's choice, not a
        request-injection vector. For a Levain install this is
        ``<root>/.levain/memory.continuity.md``; for a non-install substrate (flow) it is
@@ -1746,7 +1746,7 @@ def _apply_spore_set_disposition(
         update_kwargs["next"] = next_value  # None ⇒ clear (incl. the →note force-clear); a date ⇒ set — SAME atomic write
     try:
         # CAS on the disposition we just read closes the read→write window against a
-        # concurrent (cross-process) writer — flow's CLI on the same store [codex L3 HIGH].
+        # concurrent (cross-process) writer — the embedder's CLI on the same store [codex L3 HIGH].
         # If it changed since `get`, anneal raises and nothing is written; the operator
         # re-reads and the confirm decision is re-made on fresh state. The disposition + the
         # optional surface_at land in ONE store.update (one transaction, one CAS) — the promote

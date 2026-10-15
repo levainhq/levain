@@ -229,7 +229,7 @@
     sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "button";
     form.appendChild(area); form.appendChild(sendBtn);
     // A turn is sent only by a trusted activation of Send (a click, or Enter/Space on the focused button, which the
-    // browser delivers as a trusted click: keyboard access is kept on purpose, Phill 2026-10-05) or by Enter in the
+    // browser delivers as a trusted click: keyboard access is kept on purpose, 2026-10-05) or by Enter in the
     // compose box (below). Never by the form's submit event: a script's form.requestSubmit() fires a submit the browser
     // marks trusted, so submit only prevents default. Nothing else sends, and no key decides a held action.
     form.addEventListener("submit", (ev) => { ev.preventDefault(); });
@@ -580,7 +580,7 @@
       poll(jid, myRun, (j) => { live.textContent = ""; decided(j, jid); });
     }
 
-    // APPROVE OPENS A CONFIRM ROW (Phill 2026-10-05, the W3C alertdialog pattern): "Run the N held actions?
+    // APPROVE OPENS A CONFIRM ROW (2026-10-05, the W3C alertdialog pattern): "Run the N held actions?
     // [Cancel] [Run them]". Cancel takes Approve's place in the row and the focus; reaching Run them takes a deliberate
     // move (Tab or an arrow key), then Enter, Space or a click. Tab and the arrows stay inside the row while it is open;
     // Esc and Cancel close it and return focus to Approve. The two presses are separated by STRUCTURE, not by time, so

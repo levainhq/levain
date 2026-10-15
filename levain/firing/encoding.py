@@ -48,7 +48,7 @@ because the fault has only been observed end-to-end and has not been isolated to
 layer of the chain) — is ``docs/upstream-defects.md``, UD-1.
 
 CALIBRATION, and a warning about how it was nearly misread (2026-07-20). A corpus sweep over
-223,192 lines of this repo plus flow's project notes — 38,226 of them carrying non-ASCII
+223,192 lines of this repo plus the embedder's project notes — 38,226 of them carrying non-ASCII
 characters — modified only 5 lines, every one of them a line that literally DISCUSSES
 mojibake. Zero false positives. **That number was reassuring and insufficient**, and it is
 recorded here as a caution rather than a credential: the corpus is written in a house style

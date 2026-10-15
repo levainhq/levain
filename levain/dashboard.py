@@ -106,7 +106,7 @@ CLASS_B = "B"
 CLASS_C = "C"
 
 # The ONE neocortex section the operator directly edits (Class A). It is live-state
-# (last-writer-wins; flow's own "quick update" discipline treats it as a direct
+# (last-writer-wins; the embedder's own "quick update" discipline treats it as a direct
 # targeted edit, no consolidate needed) — an INPUT to cognition, not a conclusion the
 # consolidate produced. Every other section (Patterns / Decisions / Context /
 # Understanding / Active Threads) is the felt layer the consolidate single-writer owns
@@ -180,7 +180,7 @@ class SubstrateSource:
     install_root: Path | None = None
     scope: str = "personal"
     # The governed WRITE surface (the write-path peer, `writes.WriteScope`). Decoupled
-    # from `install_root` so a NON-install substrate (flow's own store — no `.levain/`)
+    # from `install_root` so a NON-install substrate (the embedder's own store — no `.levain/`)
     # can still be writable. ``None`` → a read-only source (no write affordances, the
     # `POST /edit` route 422s). ``.local()`` auto-derives it from the install; a bare /
     # read-only inspection source leaves it ``None``.
@@ -402,7 +402,7 @@ def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
         next=(str(nx) if (nx := s.get("next")) is not None else None),
         pointer=s.get("pointer"),
         # str-coerce for parity (a corrupted store could carry a non-str
-        # disposition); disposition_of itself stays the pure twin of flow's.
+        # disposition); disposition_of itself stays the pure twin of the embedder's.
         disposition=str(disposition_of(s)),
         descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
         ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
@@ -832,7 +832,7 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     version wrote) keeps them. Atomic (temp + ``os.replace``, so a reader never sees a torn
     file) and serialised with every other levain state writer by ``_state_lock``;
     ``check`` (the cockpit's version compare) runs under that lock, so the compare and the
-    write are one step. A writer outside levain (a sensor app, flow's own state CLI) does
+    write are one step. A writer outside levain (a sensor app, the embedder's own state CLI) does
     not take the lock: a concurrent whole-object writer holding an older snapshot can
     revert a just-set line (re-set is one keystroke). A blank text
     CLEARS by popping all three keys. The parent dir is created if absent; a
@@ -1717,7 +1717,7 @@ def build_substrate_view(
         except (OSError, ValueError) as exc:
             view.errors["config"] = f"{type(exc).__name__}: {exc}"
     elif ledger_root is not None:
-        # A non-install substrate (flow's own store) has no seed/config surface but DOES
+        # A non-install substrate (the embedder's own store) has no seed/config surface but DOES
         # carry an explicit ledger (its WriteScope.ledger_root) — surface its edit log so
         # the cockpit shows the audit trail + undo affordances. recent_edits is fail-soft.
         from levain.writes import recent_edits  # lazy: writes↔dashboard cycle

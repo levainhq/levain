@@ -20,7 +20,7 @@ entity is opened in a process, :func:`mark_entity_process` sets ``$LEVAIN_ENTITY
 DEFAULT (``"anneal"``-kind) store refuses to resolve the operator's ``~/.anneal-memory`` there. It
 names no entity, is written with one constant value, and is never cleared — so it needs no lock and
 a failed start that set it can only make a stray default-kind op refuse (the fail-closed side).
-Ruled by Phill 2026-10-02 ("approve levain design").
+Ruled 2026-10-02 ("approve levain design").
 
 Dependency-isolated: stdlib + :mod:`levain.firing.confinement` / ``drive`` / ``isolation`` only — no
 anneal, no OpenHands.

@@ -1231,7 +1231,7 @@
     // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
     // unlike the episode keyword search). Matches the spore TEXT (case-insensitive substring)
     // OR the spore-id ("spore-103" / "103"), so you can jump straight to a loop by handle or
-    // content [Phill 2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
+    // content [2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
@@ -1538,7 +1538,7 @@
   // Find the next `_`/`__` that closes at a word boundary (the char after it is not
   // alphanumeric). With the intra-word OPENING guard below, this keeps snake_case
   // identifiers (cross_substrate_review_codex_nonreplaceable, master_plan.md) fully
-  // literal — flow's content is dense with them, so a naive `_` italic shreds it.
+  // literal — the embedder's content is dense with them, so a naive `_` italic shreds it.
   function mdCloseUnderscore(s, from, delim) {
     let k = s.indexOf(delim, from);
     while (k >= 0) {

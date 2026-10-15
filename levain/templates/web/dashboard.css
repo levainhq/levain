@@ -322,7 +322,7 @@
     position: sticky; top: 0; z-index: 2; background: var(--panel);
     margin: calc(var(--sp-4) * -1) calc(var(--sp-4) * -1) 0; padding: 0 var(--sp-4) var(--sp-3);
     /* a hard bottom edge so the pinned bar reads as a distinct layer: a row scrolled up to its bottom
-       must not look tucked UNDER the search box (Phill's visual gate, twice). No shadow (D7). */
+       must not look tucked UNDER the search box (the operator's visual gate, twice). No shadow (D7). */
     border-bottom: 1px solid var(--line-hot); }
   /* ONE filter look (spec D4): 28px, 8px radius, 12px sans. .xfilter (KE panels) wraps its input,
      .ep-search-input (episodes / spore filters) is the bare input; both draw this box. */
@@ -336,7 +336,7 @@
   /* The grid search bar full-bleeds to the panel-body top via a negative top margin, which
      also pulls the results list UP → the first episode overlapped the bar (measured gap -11
      at rest). Push the grid results down to clear it. Grid-scoped (.clamped): the modal bar has no negative top margin, so its
-     results must NOT get this offset. [Phill's visual gate — measured, not guessed.] */
+     results must NOT get this offset. [the operator's visual gate — measured, not guessed.] */
   .pbody.clamped .ep-results, .pbody.clamped .sp-results { margin-top: var(--sp-4); }
 
   .note { color: var(--dim); font-size: var(--fs-micro); margin-top: var(--sp-3); letter-spacing: 0; }
@@ -369,7 +369,7 @@
     stroke-dasharray: 1; stroke-dashoffset: 1;
     animation: traceDraw 1.2s ease-out forwards, traceBreathe 10s ease-in-out 1.2s infinite;
   }
-  /* the three Cognition series each carry their own hue (Phill 10-13: "one more accent color on the chart"); hues kept
+  /* the three Cognition series each carry their own hue (10-13: "one more accent color on the chart"); hues kept
      clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
   .scope-wrap, svg.scope { --series-1: oklch(0.78 0.12 200); --series-2: oklch(0.74 0.15 300); }
   svg.scope .ch1 { stroke: var(--series-1); }
@@ -679,8 +679,8 @@
      ─────────────────────────────────────────────────────────────────────────── */
 
   /* the masthead Unit name is sized for a wide faceplate (21px); scale it down as
-     the viewport narrows so it doesn't dominate the brand on tablet/phone (Phill's
-     visual gate). Width-gated — a tablet with a mouse wants it too; desktop ≥1180px
+     the viewport narrows so it doesn't dominate the brand on tablet/phone (the
+     operator's visual gate). Width-gated — a tablet with a mouse wants it too; desktop ≥1180px
      keeps the approved 21px. max-width cascade: 1180 first, 760 overrides under it. */
   @media (max-width: 1180px) { .entity { font-size: var(--fs-lead); } }
 
@@ -810,7 +810,7 @@
      action. The sticky pin tracks the .modal-body scroll. */
   /* OPAQUE to its own bottom edge (matches the .modal card-top var(--card-2)) so scrolled
      rows pass cleanly UNDER the pinned bar — a translucent tail let the first episode
-     bleed through (Phill's visual gate + L2 MED-2). Matches the grid bar's opaque rule. */
+     bleed through (the operator's visual gate + L2 MED-2). Matches the grid bar's opaque rule. */
   .modal-body .ep-search { position: sticky; top: 0; z-index: 2; margin: 0 0 var(--sp-3);
     padding: var(--sp-2) 0 var(--sp-4); background: var(--card-2); }
   .modal-body .ep-search-input { flex-basis: 280px; font-size: var(--fs-lead); padding: var(--sp-3) var(--sp-4); }
@@ -1312,7 +1312,7 @@ body.ke .ck-card-title { font: var(--fw-bold) var(--fs-title)/1 var(--round); co
 .tray-dump[hidden], .edit-trigger-row[hidden] { display: none; }
 body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertical; }
 
-/* ═══════════════════════════ PASS 2 (Phill 10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
+/* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
 /* PHONE HEADER (<=720px). The nav comes FIRST: the mode segment spans the width, the three buttons are one centred row under it, the
    status line under that; then the clock and the weather; then the sky, full-bleed. The strip's own container query already

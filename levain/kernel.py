@@ -30,7 +30,7 @@ Contract surface:
   - governed verb-dispatch   : WriteScope, apply_edit, EditError
   - governed ACTION-dispatch : ActionVerb, apply_action — the write-peer of extra_panels;
                                a downstream registers ``make_server(extra_verbs=...)`` to
-                               steer flow's N-of-1 channels (inbox/relay/...) through the
+                               steer the embedder's N-of-1 channels (inbox/relay/...) through the
                                same auth + confirm + audit envelope as ``POST /edit``.
 
 This module is a pure re-export façade: it adds NO logic (the moat stays

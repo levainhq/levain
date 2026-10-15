@@ -7,7 +7,7 @@ piped — and the entity received ELEVEN turns. It then did the only coherent th
 to it: it read its own specification as a DIALOGUE. It treated later lines of the spec as the
 operator pushing back on its answers to earlier lines, and apologized for mistakes in
 response to corrections that were never sent. ``levain wrap`` then consolidated that
-misreading into PERMANENT identity memory ("Phill catches what I miss, and what I miss is
+misreading into PERMANENT identity memory ("The operator catches what I miss, and what I miss is
 where I soften") — and the wrap's grounding checks PASSED, because the episodes genuinely
 supported the conclusion.
 
