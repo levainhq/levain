@@ -68,7 +68,16 @@ def run_update(
     install = Path(str(path)).expanduser().resolve()
     try:
         with install_lock(install, create=False):
-            return _run_update(path, **kwargs)  # type: ignore[arg-type]
+            rc = _run_update(path, **kwargs)  # type: ignore[arg-type]
+            # anneal 1.0 (KL-19): an update that leaves a usable store also leaves its consolidate
+            # baton held by the entity's session, the same rule `init` applies (a store whose claim
+            # failed at init, or one an older install never claimed, is reconciled here too).
+            store = install / ".levain" / "memory.db"
+            if rc == 0 and store.is_file():
+                from levain.install import _ensure_baton
+                if not _ensure_baton(store, manifest.resolve_anneal_bin(), emit):
+                    return 1
+            return rc
     except InstallLockError as e:
         emit(f"FAIL: {e.message}")
         return 1
