@@ -1177,10 +1177,10 @@ body.ke .ck-zgrid > .panel.ck-tab-off { display: none; }
 body.ke .ck-zgrid > .panel.ck-is-empty { height: auto; align-self: start; }
 body.ke .ck-zgrid > .panel.k-brief.ck-h-medium { height: auto; max-height: var(--card-medium); }   /* a prose card sizes to its text; only a long one reaches the medium height and scrolls */
 /* the Team zone: panes hold a few short rows, so each card sizes to its rows (its size class is the cap, then it scrolls),
-   rows align to their top, and a one-column card fills a gap a wider card left in an earlier row */
+   and rows align to their top (no dense packing: the visual order stays the DOM and focus order) */
 /* (desktop widths only: one column already sizes every card to its content, under the phone's own cap below) */
 @media (min-width: 721px) {
-  body.ke .ck-zgrid[data-ck-zone="team"] { align-items: start; grid-auto-flow: row dense; }
+  body.ke .ck-zgrid[data-ck-zone="team"] { align-items: start; }
   body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-tall { height: auto; max-height: var(--card-tall); }
   body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-medium { height: auto; max-height: var(--card-medium); }
   body.ke .ck-zgrid[data-ck-zone="team"] > .panel.ck-h-short { height: auto; max-height: var(--card-short); }
