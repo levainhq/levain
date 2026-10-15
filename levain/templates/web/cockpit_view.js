@@ -1507,7 +1507,7 @@
       // the row means, or move a hue slot
       const had = clause.querySelector(":scope > .rp-tag");
       let text = row.textContent;
-      if (had && text.startsWith(had.textContent)) text = text.slice(had.textContent.length);
+      if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
       const hit = matchers.find(([, re]) => re.test(text));
       const key = hit && sky.hueKey ? sky.hueKey(hit[0]) : "";
       if (had && key && had.textContent === hit[0]) { if (had.dataset.repo !== key) had.dataset.repo = key; continue; }
