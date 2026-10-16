@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Answer an agent's consent request from your phone, with a passkey.** `levain consent phone` serves a small consent page on its own loopback port (default 7428) for an https proxy you run to put on a name your phone reaches (`--tailscale` finds this machine's tailnet name and prints the `tailscale serve` line; `--name` names any other proxy's). From the page you read each waiting request (the agent, the tool, the request as filed, where) and answer it with "allow with passkey" or "deny with passkey". The phone signs the exact answer record; the phone port turns the WebAuthn signature into an OpenSSH one and the queue verifies it with `ssh-keygen` against the cockpit's authority log, as for `levain consent answer`. The page also makes the phone's passkey and shows the laptop commands that enrol it; a passkey never enrols itself. A new custody word, `passkey`, is for a `display-phone` key only: it allows up to T2 and denies any request, so a T3 row offers deny only and a T3 allow is refused by the server. The phone port serves nothing else (not the cockpit, not the install), and its link carries its own token, which opens nothing on the cockpit.
+- Known edges, phone answers: (1) the passkey prompt shows no request text; the page shows it and the signature covers exactly that request. (2) A passkey is made for one https name; a renamed machine or tailnet needs a new one. (3) Anyone holding the phone link who reaches the name can read the waiting requests until the phone port stops. (4) The page is served by your own user account, and levain does not confine a Claude Code or Codex session, so answer only on a phone port you started. (5) When more than one passkey is enrolled on a name and this browser made none of them, the page asks which one, and the phone's own prompt may then offer another; that answer is refused at verify, never recorded. (6) An iCloud or Google passkey syncs with its account and reports no signature counter, so a cloned one cannot be detected.
+
 ## [0.11.0] — 2026-10-16
 
 ### Added

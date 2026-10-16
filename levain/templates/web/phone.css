@@ -1,0 +1,44 @@
+:root {
+  --bg: #f6f5f2; --card: #ffffff; --ink: #1c1b19; --muted: #6b6862; --line: #dedbd4;
+  --allow: #1f6f43; --allow-ink: #ffffff; --deny: #9b2c2c; --deny-ink: #ffffff; --warn: #8a5a00;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --card: #1f1e1c; --ink: #ecebe7; --muted: #a29e96; --line: #34322e;
+          --allow: #2f9a5f; --deny: #c24a4a; --warn: #e0a83a; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); }
+body { font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+       padding: max(12px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); max-width: 40rem;
+       margin: 0 auto; overflow-x: hidden; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1 { font-size: 1.25rem; margin: 0; }
+h1 .sub { color: var(--muted); font-weight: 400; }
+h2 { font-size: 1rem; margin: 0 0 6px; }
+.status, .meta { color: var(--muted); font-size: 0.875rem; }
+.status { margin: 8px 0 12px; min-height: 1.3em; }
+.req, .enrol { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+               margin: 0 0 12px; min-width: 0; }
+.req-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+.tool { font-weight: 600; overflow-wrap: anywhere; }
+.tier { font: 600 0.75rem var(--mono); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+.tier.t3 { color: var(--warn); border-color: var(--warn); }
+.display { font: 0.8125rem/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0;
+           padding: 10px; border-radius: 8px; background: var(--bg); max-height: 40vh; overflow-y: auto; }
+.where { font: 0.75rem/1.4 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+button { font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--line); background: var(--card);
+         color: var(--ink); padding: 12px 16px; min-height: 44px; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+button.allow { background: var(--allow); color: var(--allow-ink); border-color: var(--allow); flex: 1 1 8rem; }
+button.deny { background: var(--deny); color: var(--deny-ink); border-color: var(--deny); flex: 1 1 8rem; }
+button.quiet { font-weight: 400; padding: 6px 12px; min-height: 36px; }
+.note { margin-top: 10px; font-size: 0.875rem; overflow-wrap: anywhere; }
+.note.ok { color: var(--allow); }
+.note.bad { color: var(--deny); }
+.cmd { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; min-width: 0; }
+.cmd code { flex: 1 1 auto; min-width: 0; font: 0.75rem/1.4 var(--mono); overflow-wrap: anywhere; user-select: all;
+            background: var(--bg); padding: 8px; border-radius: 8px; }
+.cmd button { flex: 0 0 auto; padding: 6px 10px; min-height: 36px; font-weight: 400; }

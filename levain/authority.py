@@ -115,7 +115,7 @@ def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool
             return None
         if not legacy:
             return (f"a {LAPTOP} key must state its custody "
-                    f"({', '.join(c for c in CUSTODIES if c not in (UNSTATED, FIDO_ATTESTED))}); "
+                    f"({', '.join(c for c in CUSTODIES if c not in (UNSTATED, FIDO_ATTESTED, PASSKEY))}); "
                     f"{UNSTATED} is for display-phone and presence keys and a carried legacy key")
         if key_type not in _LAPTOP_KEY_TYPES:
             return f"key type {key_type} is not eligible for {LAPTOP} (one of {', '.join(sorted(_LAPTOP_KEY_TYPES))})"
