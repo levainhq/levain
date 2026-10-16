@@ -2698,6 +2698,8 @@
       box.appendChild(node);
       controls.push({ f: f, nodes: [node], read: () => node.value });
     }
+    // an action with no field to fill is a bare button: no field bar, no box
+    if (!controls.length) box.classList.add("action-bare");
     const row = el("div", "tray-dump-controls");
     const go = el("button", "tray-dump-btn", spec.label || action.verb);
     go.type = "button";

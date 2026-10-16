@@ -1320,6 +1320,10 @@ body.ke .ext-note.stale { color: var(--label); }
 body.ke .row.ext-accent { border-left-color: var(--hair-2); }
 /* the inbox compose card (KE3): one card on the list itself, recipient chips, an address line in words, one primary send */
 body.ke .tray-dump { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); gap: var(--sp-3); background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+body.ke .tray-dump.action-bare { margin: 0 0 var(--sp-3); padding: 0; background: none; border: 0; border-radius: 0; }
+body.ke .tray-dump.action-bare .tray-dump-btn { margin-left: 0; }
+/* the same outside the KE layout (a substrate source or a pre-KE manifest has no body.ke) */
+.tray-dump.action-bare { padding: 0; background: none; border: 0; }
 body.ke .tray-dump-ta { background: none; border: 0; border-radius: 0; padding: 0; resize: none; font: var(--fw-regular) var(--fs-body)/var(--lh-list) var(--sans); color: var(--text); min-height: 40px; }
 body.ke .tray-dump-ta:focus { border: 0; outline: 1px solid var(--hair-2); outline-offset: 4px; border-radius: var(--r-sm); }
 body.ke .tray-dump-ta::placeholder { color: var(--meta); }
