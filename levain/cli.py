@@ -2010,7 +2010,7 @@ def _cmd_consent_pending(args: argparse.Namespace) -> int:
 
 def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
     """The cockpit data root an answer to ``request`` is verified against (``levain.consent.answering.answer_root``,
-    shared with the cockpit's passkey route); ``--data-root`` / ``--path`` must name that same directory."""
+    shared with the phone port's passkey route); ``--data-root`` / ``--path`` must name that same directory."""
     from levain.consent.answering import answer_root
 
     named = None if args.data_root is None and args.path is None else Path(_cockpit_root(args)).expanduser()

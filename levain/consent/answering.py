@@ -1,6 +1,6 @@
 """levain.consent.answering — what every way of answering a consent request shares, wherever the answer is signed.
 
-``levain consent answer`` signs in the terminal; the cockpit's passkey route (Q6b) has a browser sign. Both read the
+``levain consent answer`` signs in the terminal; the phone port's passkey route (``levain.phone_server``, Q6b) has a phone sign. Both read the
 rules here, so neither re-spells them:
 
   - :func:`answer_root`: the cockpit data root an answer is verified against is the one the agent's consent hook

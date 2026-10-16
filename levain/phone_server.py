@@ -24,7 +24,9 @@ is the proxy's). A listener that serves nothing else needs no such test.
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -148,7 +150,10 @@ class _PhoneHandler(GuardedHandler):
         except (UnicodeDecodeError, ValueError):
             self._json({"error": "bad_request", "message": "the body is not JSON"}, 400)
             return
-        if not self.server.request_gate.acquire(blocking=False):
+        # an answer carries a signature the person just made with Face ID: it waits a moment for a slot rather than
+        # throw that ceremony away; everything else answers busy at once
+        waits = consent is not None and consent[1] == "answer"
+        if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
         try:
@@ -189,48 +194,61 @@ class _PhoneServer(ThreadingHTTPServer):
 
         return authority_source(root / "cockpit.db", anchor=anchor_path(root), cache=self.replay_cache)
 
-    def _signers(self, request: Any) -> "tuple[list[str], str]":
-        """The fingerprints of the active passkey keys enrolled on this server's name in the cockpit that verifies
-        ``request``'s answer, and a note when there are none."""
+    def _keys_at(self, root: Path, memo: "dict[Path, list[str] | str]") -> "list[str] | str":
+        """The fingerprints of the active passkey keys enrolled on this name in the cockpit at ``root``, or why they
+        cannot be read. ``memo`` holds one listing's answers, so a listing replays each cockpit once however many
+        requests it shows."""
         from levain.authority import AuthorityError
-        from levain.consent.answering import answer_root, passkey_keys
+        from levain.consent.answering import passkey_keys
+
+        if root not in memo:
+            try:
+                memo[root] = [k.fingerprint for k in passkey_keys(self._source(root)(), self.rp_id)]
+            except (AuthorityError, OSError, sqlite3.Error) as exc:
+                memo[root] = str(exc)
+        return memo[root]
+
+    def _signers(self, request: Any, memo: "dict[Path, list[str] | str]") -> "tuple[list[str], str]":
+        """The passkeys enrolled on this name in the cockpit that verifies ``request``'s answer, and a note when
+        there are none."""
+        from levain.consent.answering import answer_root
         from levain.consent.queue import AnswerRefused
 
         try:
             root = answer_root(self.queue_dir, request)
-            keys = passkey_keys(self._source(root)(), self.rp_id)
-        except (AnswerRefused, AuthorityError, OSError, sqlite3.Error) as exc:
+        except (AnswerRefused, OSError) as exc:
             return [], str(exc)
+        keys = self._keys_at(root, memo)
+        if isinstance(keys, str):
+            return [], keys
         if not keys:
             return [], f"no passkey is enrolled for {self.rp_id} in {root}"
-        return [k.fingerprint for k in keys], ""
+        return keys, ""
 
     def listing(self) -> dict[str, Any]:
         """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``."""
         from levain.consent.listing import entry_body, read_listing
 
         listing = read_listing(self.queue_dir, now=datetime.now(timezone.utc))
+        memo: dict[Path, list[str] | str] = {}
         rows = []
         for entry in listing.pending:
             body = entry_body(entry)
             body.pop("answer_allow", None)
             body.pop("answer_deny", None)
-            body["signers"], body["signer_note"] = self._signers(entry.request)
+            body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             rows.append(body)
-        return {"rp_id": self.rp_id, "pending": rows, "overflow": listing.overflow, "enrolled": self._enrolled()}
+        return {"rp_id": self.rp_id, "pending": rows, "overflow": listing.overflow, "enrolled": self._enrolled(memo)}
 
-    def _enrolled(self) -> list[str]:
+    def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
         """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol
         section reports with nothing pending)."""
-        from levain.authority import AuthorityError
-        from levain.consent.answering import hook_roots, passkey_keys
+        from levain.consent.answering import hook_roots
 
         found: list[str] = []
         for root in hook_roots(self.queue_dir):
-            try:
-                found += [k.fingerprint for k in passkey_keys(self._source(root)(), self.rp_id) if k.fingerprint not in found]
-            except (AuthorityError, OSError, sqlite3.Error):
-                continue
+            keys = self._keys_at(root, memo)
+            found += [] if isinstance(keys, str) else [fp for fp in keys if fp not in found]
         return found
 
     def answer_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
@@ -300,7 +318,8 @@ class _PhoneServer(ThreadingHTTPServer):
             line = public_key_line(b64url_decode(req["spki"], "spki"), self.rp_id)
         except PasskeyError as exc:
             raise PhoneError(422, "bad_passkey", str(exc)) from None
-        name = f"passkey-{self.rp_id.split('.')[0]}.pub"
+        # one file per passkey: two devices enrolled on one name must not overwrite each other's file
+        name = f"passkey-{self.rp_id.split('.')[0]}-{hashlib.sha256(line.encode('ascii')).hexdigest()[:8]}.pub"
         roots = hook_roots(self.queue_dir)
         enrol = [f"levain cockpit enroll {name} --class display-phone --custody passkey --data-root {shlex.quote(str(r))} "
                  "--signing-key YOUR_LAPTOP_PRESENCE_KEY" for r in roots]
@@ -316,13 +335,20 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
     ``rp_id``. Loopback only: the proxy in front of it is what reaches the phone."""
     from levain.consent.passkey import is_host_name
 
-    if host not in _LOOPBACK_HOSTS and not host.startswith("127."):
+    if host != "localhost" and not _is_loopback_address(host):
         raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
     if not is_host_name(rp_id):
         raise ValueError(f"refusing {str(rp_id)[:80]!r}: the https name must be a lowercase DNS name a proxy serves "
                          "this port on (no scheme, port or path, not an address); `localhost` answers from this "
                          "machine's own browser")
     return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32))
+
+
+def _is_loopback_address(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 _TAILSCALE_SOCKETS = (None, "/var/run/tailscale/tailscaled.sock")   # the CLI's default, then the open-source daemon's

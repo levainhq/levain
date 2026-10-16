@@ -128,12 +128,16 @@
           say(done + " · signed by " + a.body.signer_fp, "ok");
         },
               (e) => say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered", "bad"));
-    }).catch((e) => say("the passkey step failed (" + ((e && e.name) || "error") + "); nothing was answered", "bad"))
+    }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
   // enrolment: the created credential is kept, so a failed key-line call retries only that call, never makes another
+  // kept for this tab (across a reload too) until the key line is sent, so a retry never makes a second passkey
+  const MADE = "levain-phone-made";
   let made = null;
+  try { made = JSON.parse(store.get("sessionStorage", MADE) || "null"); } catch (e) { made = null; }
+  const setMade = (v) => { made = v; try { if (v) window.sessionStorage.setItem(MADE, JSON.stringify(v)); else window.sessionStorage.removeItem(MADE); } catch (e) { /* memory only */ } };
   function enrol() {
     const btn = $("enrol-btn"), out = $("enrol-out"), note = $("enrol-note");
     btn.disabled = true;
@@ -143,11 +147,18 @@
       rp: { id: rpId, name: "levain" }, user: { id: rand(16), name: "levain operator", displayName: "levain operator" },
       challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
       authenticatorSelection: { residentKey: "required", userVerification: "required" } } })
-      .then((cred) => (made = { rawId: b64u(cred.rawId), spki: b64u(cred.response.getPublicKey()) }));
+      .then((cred) => { setMade({ rawId: b64u(cred.rawId), spki: b64u(cred.response.getPublicKey()) }); return made; });
     create.then((c) => call("POST", "/passkey/key-line", { spki: c.spki }).then((r) => {
-      if (!r.ok) { btn.disabled = false; btn.textContent = "try sending the key again"; note.textContent = why(r); return; }
+      if (!r.ok) {
+        btn.disabled = false;
+        // a refused key (422) will never be accepted: drop it so the next tap makes a fresh passkey; anything else
+        // (the laptop unreachable, busy) keeps it and retries only the send
+        if (r.status === 422) { setMade(null); btn.textContent = "make a passkey here"; } else btn.textContent = "try sending the key again";
+        note.textContent = why(r);
+        return;
+      }
       remember(r.body.fingerprint, c.rawId);
-      made = null;
+      setMade(null);
       note.textContent = "passkey made (" + r.body.fingerprint + "). On the laptop, run these to enrol it"
         + " (a passkey cannot enrol itself), then refresh:" + (r.body.note ? " " + r.body.note : "");
       out.replaceChildren(...(r.body.commands || []).map((cmd) => {

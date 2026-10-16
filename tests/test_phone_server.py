@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -195,7 +196,7 @@ def test_key_line_gives_the_key_its_fingerprint_and_the_laptop_enrol_command(wor
         status, body = _call(base + "/passkey/key-line", {"spki": _b64u(_SPKI)})
     assert status == 200
     assert body["public_key"] == world["passkey"] and body["fingerprint"] == world["passkey_fp"]
-    assert any("cockpit enroll passkey-localhost.pub --class display-phone --custody passkey" in c
+    assert any(re.search(r"cockpit enroll passkey-localhost-[0-9a-f]{8}\.pub --class display-phone --custody passkey", c)
                and str(world["root"]) in c for c in body["commands"])
 
 

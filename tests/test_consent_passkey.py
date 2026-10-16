@@ -71,3 +71,10 @@ def test_the_presence_rule_reads_a_webauthn_signature():
     text = base64.b64encode(bytes(blob)).decode()
     no_touch = "-----BEGIN SSH SIGNATURE-----\n" + text + "\n-----END SSH SIGNATURE-----\n"
     assert presence_missing(no_touch, key) is True
+
+
+def test_an_assertion_made_inside_another_sites_frame_is_refused():
+    key, auth, cdj, der = _parts()
+    framed = json.dumps({**json.loads(cdj), "crossOrigin": True}).encode()
+    with pytest.raises(PasskeyError, match="another site"):
+        to_sshsig(key, auth, framed, der)

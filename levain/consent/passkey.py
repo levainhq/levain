@@ -18,9 +18,11 @@ whose origin is not the key's own host or that lacks user verification. So:
   - :func:`to_sshsig` wraps one assertion as an armored SSHSIG over that key.
 
 This module decides nothing on its own. A wrong conversion makes ``ssh-keygen`` refuse a good answer; it cannot make
-a bad one verify, because the message, rpId, flags and signature are checked by the verifier the consent queue already
-uses (:func:`levain.authority.verify_link_sig`). The checks here refuse the wrong shape early, with a reason, and add
-the two (origin host, user verification) that ``ssh-keygen`` does not make.
+a bad one verify on the message, the rpId, user presence or the signature, which the verifier the consent queue
+already uses checks on every delivery (:func:`levain.authority.verify_link_sig`, :func:`levain.authority.presence_missing`).
+The checks here refuse the wrong shape early, with a reason, and add three that ``ssh-keygen`` does not make (the
+origin host, user verification, and not cross-origin); those three run at conversion only, on the phone port, not
+again at delivery.
 
 Stdlib only. The conversion was first run by a test page against a real iPhone (Safari, iCloud passkey, 2026-10-16:
 ``/usr/bin/ssh-keygen`` verified it and a one-bit change to the message did not); this module's output for a recorded
@@ -201,6 +203,8 @@ def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: byte
         raise PasskeyError("clientDataJSON is not JSON") from exc
     if not isinstance(client, dict) or client.get("type") != "webauthn.get":
         raise PasskeyError("clientDataJSON is not a webauthn.get assertion")
+    if client.get("crossOrigin") is True:
+        raise PasskeyError("the passkey signed inside a page from another site")
     origin = client.get("origin")
     parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
     if (parts is None or parts.hostname != application or parts.path or parts.query or parts.fragment
