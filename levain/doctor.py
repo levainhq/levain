@@ -2043,9 +2043,10 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
     if p.inbound in ("hold", "refuse") and p.outbound in ("ask", "deny"):
         return [CheckResult("Claude Code messaging", True, detail)]
     return [CheckResult("Claude Code messaging", True, detail,
-                        'Set `crossSessionInbound: "hold"` and `permissions.ask: ["SendMessage"]` in the '
-                        "workspace's .claude/settings.json (levain's template writes both; doctor never edits your "
-                        "settings), or accept this as your own trust decision.", warn=True)]
+                        f"Run `levain init --path {install} --force --messaging governed` to have levain write "
+                        '`crossSessionInbound: "hold"` and `permissions.ask: ["SendMessage"]` into the workspace\'s '
+                        ".claude/settings.json (doctor never edits your settings), set them there yourself, or "
+                        "accept this as your own trust decision.", warn=True)]
 
 
 def _check_hook_freshness(install: Path) -> list[CheckResult]:
