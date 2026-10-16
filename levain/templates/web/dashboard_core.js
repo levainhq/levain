@@ -3112,8 +3112,9 @@
     };
     const choose = (decision, signers) => {
       say("more than one passkey is enrolled for this name; pick the one this device holds:");
+      for (const old of buttons.querySelectorAll(".consent-pick")) old.remove();
       for (const fp of signers) {
-        const pick = el("button", "undo-btn consent-copy", fp.slice(0, 18) + "\u2026");
+        const pick = el("button", "undo-btn consent-copy consent-pick", fp.slice(0, 18) + "\u2026");
         pick.type = "button";
         pick.addEventListener("click", () => answer(decision, fp));
         buttons.appendChild(pick);
