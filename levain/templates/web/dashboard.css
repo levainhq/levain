@@ -1384,6 +1384,8 @@ body.ke .ck-zgrid > .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var
 body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
 body.ke .ck-zgrid > .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
 body.ke .ck-zgrid > .panel.ck-fold .pbody .empty, body.ke .ck-zgrid > .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
+/* on a phone the body wraps below the head, so it takes the head's left inset instead of sitting at the card edge */
+@media (max-width: 720px) { body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: 0 var(--sp-6) var(--sp-4) var(--sp-6); } }
 
 /* the Edit link of an identity card sits on the first line of the text, to its right, instead of on a row of its own above it */
 body.ke .ck-zgrid .pbody > .edit-trigger-row { float: right; padding: 0; margin: 0 0 var(--sp-2) var(--sp-4); }
