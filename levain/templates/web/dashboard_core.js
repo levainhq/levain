@@ -564,6 +564,19 @@
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
+      const V = window.LevainCockpitView;
+      if (V && typeof V.refetchPanel === "function") {
+        // re-reads this panel's source now; the source decides how fresh that is (the read age under the figure says)
+        const again = el("button", "wx-refresh", "↻");
+        again.type = "button";
+        again.title = "Read the weather again";
+        again.setAttribute("aria-label", "Read the weather again");
+        again.addEventListener("click", () => {
+          again.disabled = true;
+          Promise.resolve().then(() => V.refetchPanel(wx.id)).catch(() => "fault").finally(() => { again.disabled = false; });
+        });
+        node.appendChild(again);
+      }
       whenKids.push(node);
     } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
@@ -3715,5 +3728,13 @@
     for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
     if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
   }
-  window.LevainDashboard = { render, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
+  // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
+  function renderKeepingPlace(view, opts) {
+    const y = window.scrollY || 0;
+    try { return render(view, opts); }
+    finally { if (y > 0 && window.scrollY !== y) window.scrollTo(0, y); }
+  }
+
+  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();

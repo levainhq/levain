@@ -1403,7 +1403,7 @@
       // the panel is attached by the caller after this returns; a node that is not in the page cannot take focus
       root.setTimeout(() => {
         if (!s.filterInput.isConnected || (document.activeElement && document.activeElement !== document.body)) return;
-        s.filterInput.focus();
+        s.filterInput.focus({ preventScroll: true });   // the box was where the reader left it; focusing must not move the page
         try { s.filterInput.setSelectionRange(keep.start, keep.end); } catch (_) { /* a search box that cannot place a caret */ }
       }, 0);
     }
@@ -1815,9 +1815,11 @@
       if (ev.key === "/") {
         const all = visibleFilters();
         if (!all.length) return;
-        const near = (hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i))) || all[0];
+        const hovered = hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i));
+        const near = hovered || all[0];
         ev.preventDefault();
-        near.focus();
+        // the hovered panel's box is under the pointer, so the page stays put; the first box on the page may be off-screen
+        near.focus(hovered ? { preventScroll: true } : undefined);
         near.select();
       } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
     });
