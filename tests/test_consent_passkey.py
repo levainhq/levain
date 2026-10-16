@@ -78,3 +78,13 @@ def test_an_assertion_made_inside_another_sites_frame_is_refused():
     framed = json.dumps({**json.loads(cdj), "crossOrigin": True}).encode()
     with pytest.raises(PasskeyError, match="another site"):
         to_sshsig(key, auth, framed, der)
+
+
+@needs_ssh_keygen
+def test_an_unparseable_origin_is_a_refusal_not_a_crash():
+    """An origin urlsplit cannot parse (an unclosed IPv6 bracket) refused with a reason; before, it raised ValueError
+    out of the consent queue's delivery check (L3 r3, codex)."""
+    key, auth, cdj, der = _parts()
+    broken = json.dumps({**json.loads(cdj), "origin": "https://["}).encode()
+    with pytest.raises(PasskeyError, match="not https://"):
+        to_sshsig(key, auth, broken, der)
