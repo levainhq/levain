@@ -729,6 +729,14 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[n:]
 
 
+def _sessions_dir(directory: Path) -> None:
+    """The sessions directory, this user's only (0700): its files name sessions, their working directories and
+    what was said in them."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.stat().st_mode & 0o077:
+        os.chmod(directory, 0o700)
+
+
 def session_touch(session_id, cwd, event, context_delivered=None) -> None:
     """Record that this session just fired `event` ("SessionStart" | "UserPromptSubmit").
     first_seen and (when `context_delivered` is None) context_delivered are kept from the
@@ -742,7 +750,7 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
         directory = install_root() / ".levain" / "sessions"
         path = directory / f"{key}.json"
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        directory.mkdir(parents=True, exist_ok=True)
+        _sessions_dir(directory)
         with _sessions_lock(directory) as held:
             if not held:
                 return
@@ -769,7 +777,9 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
             }
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             try:
-                tmp.write_text(json.dumps(record), encoding="utf-8")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record))
                 os.replace(tmp, path)
             finally:
                 tmp.unlink(missing_ok=True)
@@ -852,7 +862,7 @@ def session_log(session_id, kind, text) -> None:
         key = hashlib.sha1(f"{_SESSION_AGENT}:{session_id}".encode("utf-8", "replace")).hexdigest()[:24]
         directory = install_root() / ".levain" / "sessions"
         path = directory / f"{key}.log.jsonl"
-        directory.mkdir(parents=True, exist_ok=True)
+        _sessions_dir(directory)
         event = {
             "v": 1,
             "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

@@ -2917,7 +2917,9 @@
   }
   let consentTicker = null;
   function tickConsent() {
-    for (const n of document.querySelectorAll("[data-consent-expires]")) n.textContent = consentLeft(n.dataset.consentExpires);
+    const nodes = document.querySelectorAll("[data-consent-expires]");
+    if (!nodes.length && consentTicker) { window.clearInterval(consentTicker); consentTicker = null; return; }
+    for (const n of nodes) n.textContent = consentLeft(n.dataset.consentExpires);
   }
   function copyText(text, codeEl, btn) {
     const done = (msg) => { btn.textContent = msg; setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500); };
@@ -2938,9 +2940,17 @@
   const consentBodies = new Map();
   const CONSENT_NO_TOKEN = "this page carries no token, so request details are not shown";
   const CONSENT_BAD_TOKEN = "this page's token was not accepted, so request details are not shown";
-  const CONSENT_FETCH_MAX = 2, CONSENT_TRIES = 3, CONSENT_RETRY_MS = 500;
+  const CONSENT_FETCH_MAX = 2, CONSENT_TRIES = 3, CONSENT_RETRY_MS = 500, CONSENT_FETCH_TIMEOUT_MS = 15000;
   let consentActive = 0;
+  let consentGen = 0;   // closeModal bumps it: a job queued before a close whose row has left the page is not fetched
   const consentWaiting = [];
+  // one read with a deadline: a server that never answers frees its slot instead of holding the queue
+  function fetchBounded(url, opts) {
+    if (typeof AbortController !== "function") return fetch(url, opts);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), CONSENT_FETCH_TIMEOUT_MS);
+    return fetch(url, Object.assign({}, opts, { signal: ac.signal })).finally(() => clearTimeout(timer));
+  }
   function consentPump() {
     while (consentActive < CONSENT_FETCH_MAX && consentWaiting.length) {
       const job = consentWaiting.shift();
@@ -2949,10 +2959,15 @@
       job().then(release, release);
     }
   }
-  function consentQueued(job, badError) {
+  function consentQueued(job, badError, row) {
     const bad = { error: badError || "the request could not be read" };
+    const gen = consentGen;
     return new Promise((resolve) => {
       consentWaiting.push(() => {
+        if (row && gen !== consentGen && !row.isConnected) {   // its view closed; a board row stays and is read
+          resolve({ error: "the view closed before this was read" });
+          return Promise.resolve();
+        }
         let p;
         try { p = Promise.resolve(job()); } catch (e) { p = Promise.resolve(bad); }
         return p.catch(() => bad).then(resolve);      // every job settles; the pump releases its slot on both paths
@@ -2961,7 +2976,7 @@
     });
   }
   function consentFetch(c, headers, tryNo) {
-    return fetch("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
+    return fetchBounded("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
       .then((res) => {
         if (res.status === 403) return { error: CONSENT_BAD_TOKEN };
         if (res.status === 404) return { error: "this request is no longer listed" };
@@ -2973,13 +2988,13 @@
                                () => ({ error: "the request could not be read" }));
       }, () => ({ error: "the request could not be read (network)" }));
   }
-  function consentBody(c) {
+  function consentBody(c, row) {
     const key = c.id + "|" + c.state;
     if (consentBodies.has(key)) return consentBodies.get(key);
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN });
-    const got = consentQueued(() => consentFetch(c, headers, 1))
+    const got = consentQueued(() => consentFetch(c, headers, 1), undefined, row)
       .then((b) => { if (b.error) consentBodies.delete(key); return b; });
     consentBodies.set(key, got);
     return got;
@@ -3042,7 +3057,7 @@
         btn.disabled = true;
         if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
         slot.replaceChildren(document.createTextNode("reading the request\u2026"));
-        consentBody(c).then((b) => {
+        consentBody(c, row).then((b) => {
           drawConsentBody(row, slot, b, false);
           if (b.error) btn.disabled = false;
           else btn.remove();
@@ -3053,7 +3068,7 @@
     }
     const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
     row.appendChild(slot);
-    if (c.id) consentBody(c).then((b) => drawConsentBody(row, slot, b, pending));
+    if (c.id) consentBody(c, row).then((b) => drawConsentBody(row, slot, b, pending));
     else slot.textContent = "this request has no id";
     return row;
   }
@@ -3067,7 +3082,7 @@
   const sessionBodies = new Map();   // stem -> the last good body, so a redraw of the modal (a fresh view arrived) keeps an open transcript; closeModal clears it
   const SESS_BAD_TOKEN = "this page's token was not accepted, so the transcript is not shown";
   function sessionFetch(stem, headers, tryNo) {
-    return fetch("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers })
+    return fetchBounded("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers })
       .then((res) => {
         if (res.status === 403) return { error: SESS_BAD_TOKEN };
         if (res.status === 404) return { error: "this session record is gone" };
@@ -3528,6 +3543,8 @@
     const overlay = document.getElementById("levain-modal");
     if (overlay) overlay.remove();
     sessionBodies.clear();
+    consentBodies.clear();   // request bodies (commands, working directories) are not kept past the view
+    consentGen++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;

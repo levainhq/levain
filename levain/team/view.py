@@ -265,7 +265,8 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             f"<p class=\"sub teamline\">{who} · canon owner {_e(m['owner'])} · mode {_e(m['mode'])} · "
             f"{_e(m['canon_status'])}"
             + (f" · <span class=\"warn\">{m['problems']} integrity problem(s): run levain team verify</span>"
-               if m["problems"] else "") + "</p>"
+               if m["problems"] else "")
+            + (f" · <span class=\"warn\">{_e(m['partial'])}</span>" if m.get("partial") else "") + "</p>"
             f"<nav class=\"tabs\"><a class=\"tab\" href=\"{_e(cockpit_url)}\">◍ Cockpit</a>"
             "<a class=\"tab active\" href=\"/\">▣ Team view</a></nav>"
             + pathfilter + pathbar
@@ -397,9 +398,19 @@ class _ViewHandler(GuardedHandler):
             raise _Busy()
         try:
             sha, team, ledger = gl.snapshot()
-            return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
-                               recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
-                               path_filter=path_filter)
+            model = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
+                                path_filter=path_filter)
+            # a ledger judged only in part says so here as the Team zone does, never drawn as if current; the
+            # derivation is the one the snapshot just used (cached per tip), not a second judgement
+            derive = getattr(gl, "derivation", None)
+            if callable(derive):
+                from .reader import partial_why
+
+                why = partial_why(derive(sha))
+                if why is not None:
+                    model["partial"] = why
+            return model
         finally:
             self.server.model_lock.release()
 

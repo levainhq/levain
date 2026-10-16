@@ -724,15 +724,19 @@ def test_display_masks_auth_as_its_own_word_and_a_passphrase():
     # seen red (run at 3eb69f3): word-token masking showed auth, basic_auth, x-auth and auth_header in clear
     shown = redact_display("mcp__http__request", {"auth": "Basic dXNlcjpodW50ZXIy", "basic_auth": "k", "proxy_auth": "k",
                                                    "auth_header": "k", "headers": {"X-Auth": "s3cr3t"},
-                                                   "passphrase": "k", "pass_phrase": "k"})
+                                                   "passphrase": "k", "pass_phrase": "k", "basicauth": "k",
+                                                   "authheader": "k", "pwd": "k", "jwt": "k", "pass": "k",
+                                                   "private": "-----BEGIN OPENSSH PRIVATE KEY-----"})
     assert "dXNlcjpodW50ZXIy" not in shown and "s3cr3t" not in shown and '"k"' not in shown
+    assert "BEGIN OPENSSH" not in shown
 
 
 def test_display_still_shows_keys_about_auth_rather_than_holding_it():
     shown = redact_display("mcp__x__y", {"auth_url": "http://x", "authType": "oauth", "author": "alice",
-                                         "auth_method": "basic"})
+                                         "auth_method": "basic", "authenticated": True, "private": False,
+                                         "passenger": "p"})
     assert shown == ('mcp__x__y {"authType": "oauth", "auth_method": "basic", "auth_url": "http://x", '
-                     '"author": "alice"}')
+                     '"authenticated": true, "author": "alice", "passenger": "p", "private": false}')
 
 
 def test_policy_seam_decides_nothing_without_a_grant(queue):

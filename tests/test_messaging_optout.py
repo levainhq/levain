@@ -102,11 +102,15 @@ def test_init_default_is_isolate_only_and_doctor_names_the_gaps(env, capsys):
     assert "does not queue or record sends" in r.detail and "never counts a message" in r.detail
     cfg.write_text("{not json")
     assert persisted_messaging(ent) == "governed"  # a record that cannot be read is never the looser default
-    # seen red (review round 1): a governed file whose record is gone re-rendered as isolate, dropping the hold
+    # seen red (review rounds 1-2): a re-render with no explicit choice dropped controls the file carried (a governed
+    # file whose record was gone came back isolate; a refuse came back hold). It now keeps every one of them.
     cfg.unlink()
-    s["crossSessionInbound"] = "hold"
+    s["crossSessionInbound"] = "refuse"
+    s.setdefault("permissions", {})["ask"] = ["SendMessage"]
     (ent / ".claude" / "settings.json").write_text(json.dumps(s))
-    assert persisted_messaging(ent) == "governed"
+    assert run_init(ent, "claude-code", force=True, answers_file=env / "a.json") == 0
+    after = _settings(ent)
+    assert after["crossSessionInbound"] == "refuse" and "SendMessage" in after["permissions"]["ask"]
 
 
 @pytest.mark.parametrize("choice,inbound", [("off", "refuse"), ("unmanaged", None), ("governed", "hold")])

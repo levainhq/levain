@@ -1509,13 +1509,27 @@
 
   // The store scope: ask the kernel, over the page's own read transport (the same token handling as every
   // panel read; q rides the query string of a read and is never kept by the kernel).
+  // every live copy of a panel (the board and its focus modal) asking the same query shares one read, so two copies
+  // never spend both of the kernel's search slots on one question
+  const searchShared = new Map();
+  function sharedSearch(pid, q) {
+    const k = pid + "\u0000" + q;
+    let p = searchShared.get(k);
+    if (!p) {
+      p = readPanel(pid, "&q=" + encodeURIComponent(q) + "&limit=" + STORE_LIMIT);
+      searchShared.set(k, p);
+      const drop = () => { if (searchShared.get(k) === p) searchShared.delete(k); };
+      p.then(drop, drop);
+    }
+    return p;
+  }
   async function runStoreSearch(s) {
     const q = sendable(s.query);
     const seq = ++s.seq;
     if (!q) { s.results = null; paint(s); return; }
     let out;
     try {
-      const raw = await readPanel(s.pid, "&q=" + encodeURIComponent(q) + "&limit=" + STORE_LIMIT);
+      const raw = await sharedSearch(s.pid, q);
       out = mapSearch(s, clean(raw));
     } catch (e) { out = { items: [], hays: [], label: "", error: e && e.message ? e.message : String(e) }; }
     if (seq !== s.seq || !onPage(s)) return;     // a newer query, or the panel is gone

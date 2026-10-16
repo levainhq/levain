@@ -167,7 +167,7 @@ class TeamJoinStore:
     store_assigned_fields = ("id", "origin_key")
 
     def __init__(self, start: Path | str) -> None:
-        self.start = Path(start)
+        self.start = Path(start).expanduser().resolve(strict=False)   # one absolute meaning, whatever the cwd later is
 
     @staticmethod
     def _key(resource_key: str) -> str:
@@ -182,8 +182,10 @@ class TeamJoinStore:
 
     @staticmethod
     def _final(rec: Any) -> bool:
-        """A record of an applied accept (an ``acting`` marker is not one: it says only that the act was begun)."""
-        return isinstance(rec, dict) and rec.get("state") != _ACTING
+        """A record of an applied accept: the shape :meth:`_apply_in_op` writes last (an ``acting`` marker, or a
+        malformed entry, is not one, so it never stands in for the act)."""
+        return isinstance(rec, dict) and "state" not in rec and isinstance(rec.get("id"), str) \
+            and isinstance(rec.get("origin_key"), str)
 
     @staticmethod
     def _save(gl: LedgerTransport, key: str, rec: dict[str, Any]) -> None:
@@ -259,7 +261,10 @@ class TeamJoinStore:
             if join_digest(d, kind, handle, fp) != about:
                 raise PermanentApplyRefusal(f"what was signed changed: the {kind} for {handle} is not the one the "
                                             "signature was given for; nothing was changed")
-            self._save(gl, key, marker)       # durable before the act: a re-drive after it knows the act is its own
+            try:
+                self._save(gl, key, marker)   # durable before the act: a re-drive after it knows the act is its own
+            except OSError as exc:
+                raise TransientApplyFault("OSError", f"the accept could not be marked as begun: {exc}") from exc
             try:
                 # committed here only; published below on a bounded wait
                 if kind == "key":
@@ -268,6 +273,9 @@ class TeamJoinStore:
                                                     "was changed")
                 else:
                     gl.accept_offer(d, push=False)
+            except KeyError as exc:
+                raise PermanentApplyRefusal(f"the {kind} for {handle} does not name a member this ledger knows "
+                                            f"({exc}); nothing was changed") from exc
             except TeamBusy:
                 raise                 # a lock held by another team operation: the pending re-drives
             except TeamError as exc:
@@ -284,7 +292,8 @@ class TeamJoinStore:
             # only a published act is APPLIED: a push that fails is a transient fault, the pending re-drives, and the
             # re-drive finds the marker and the act done above and pushes it here (the hook's own sync never pushes)
             try:
-                gl.sync_now(push=True, op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)
+                # one push round: a person's request waits for one fetch, rebase and push, not the CLI's retries
+                gl.sync_now(push=True, op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S, retries=1)
             except TeamBusy:
                 raise
             except TeamError as exc:
@@ -295,10 +304,15 @@ class TeamJoinStore:
                 # the sync re-landed this clone's change on a newer remote, and a change there undid it
                 raise PermanentApplyRefusal(f"a newer team change landed first; the {kind} for {handle} is not "
                                             "in force")
-        head = gl.head()
-        rec = {"id": head, "origin_key": key, "kind": kind, "handle": handle, "about": about, "sha": head,
-               "at": time.time()}
-        self._save(gl, key, rec)              # replaces the marker
+        try:
+            head = gl.head()
+            rec = {"id": head, "origin_key": key, "kind": kind, "handle": handle, "about": about, "sha": head,
+                   "at": time.time()}
+            self._save(gl, key, rec)          # replaces the marker
+        except (TeamError, OSError) as exc:
+            # the act is in force and published; the re-drive finds the marker and records it
+            raise TransientApplyFault(type(exc).__name__, f"the {kind} for {handle} is done but not yet recorded: "
+                                      f"{exc}") from exc
         return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(rec["id"], rec),))
 
 
@@ -309,7 +323,7 @@ def _accept_fire(*_a: Any) -> dict[str, Any]:
 
 def team_verbs(start: Path | str) -> tuple[dict[str, VerbSpec], dict[str, DownstreamEffect]]:
     """The two downstream specs, and the accept's broker effect, over the team ledger found from ``start``."""
-    start = Path(start)
+    start = Path(start).expanduser().resolve(strict=False)
     fetch = VerbSpec(FETCH_VERB, "fetch now", "fetch the team ledger from its remote now and rebase onto it "
                      "(never a push)", "panel", fields=(), floor="C1", tier_fn=_const("C1"), idempotent=True,
                      fire=_fetch_fire(start))

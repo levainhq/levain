@@ -735,7 +735,7 @@ def _apply_init(
     _check_messaging(install, chosen, messaging)
     if messaging is None and chosen == "claude-code":
         kept = persisted_messaging(install)
-        if kept != DEFAULT_MESSAGING:
+        if recorded_messaging(install) is not None:
             emit(f"  messaging:  {kept} (kept from .levain/config.json)")
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
@@ -1932,7 +1932,9 @@ def _claude_code_files(
 
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
     settings_text = _fill(settings_text, {"PYTHON": _hook_arg_body(python_path)})
-    settings_text = _apply_messaging(settings_text, messaging or persisted_messaging(install))
+    settings_text = (_apply_messaging(settings_text, messaging) if messaging is not None else
+                     _apply_messaging(settings_text, persisted_messaging(install),
+                                      keep_from=install / ".claude" / "settings.json"))
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
@@ -1981,54 +1983,43 @@ def _check_messaging(install: Path, chosen: str, messaging: str | None) -> None:
                             "recorded; fix it, then re-run.")
 
 
-def persisted_messaging(install: Path) -> str:
-    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). A file that cannot be read
-    as a JSON object, or a value that is not a choice (a hand edit), = ``governed``. With no record (no file,
-    no key: an install from before init recorded every choice, or a record a dashboard write dropped), the
-    choice is read off the workspace's own `.claude/settings.json` (:func:`_messaging_in_settings`), so a
-    re-render never drops a hold or an ask the file carries; a file with none of them = ``isolate``, the
-    default. What may hold the operator's choice is never read as the looser default."""
+def recorded_messaging(install: Path) -> str | None:
+    """The messaging choice recorded in ``.levain/config.json`` (``messaging``), or ``None`` when there is no
+    record (no file, no key). A file that cannot be read as a JSON object, or a value that is not a choice (a hand
+    edit), = ``governed``: what may hold the operator's choice is never read as a looser one."""
     from levain.dashboard import LEVAIN_CONFIG_REL
 
     path = install.joinpath(*LEVAIN_CONFIG_REL)
-    config: object = {}
-    if os.path.lexists(path):
-        try:
-            config = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return "governed"
-        if not isinstance(config, dict):
-            return "governed"
-    if isinstance(config, dict) and "messaging" in config:
-        value = config["messaging"]
-        return value if value in MESSAGING_CHOICES else "governed"
-    return _messaging_in_settings(install)
-
-
-def _messaging_in_settings(install: Path) -> str:
-    """The choice the workspace's `.claude/settings.json` already carries: ``off`` when it denies `SendMessage`,
-    ``governed`` when it holds or refuses inbound or asks for `SendMessage` (an unrecognised inbound value holds,
-    Claude Code's rule), else ``isolate``. A file that exists and cannot be read = ``governed``."""
-    from levain.host_guard import messaging_facts
-
-    path = install / ".claude" / "settings.json"
     if not os.path.lexists(path):
-        return DEFAULT_MESSAGING
+        return None
     try:
-        facts = messaging_facts(json.loads(path.read_text(encoding="utf-8"))) or {}
-    except (OSError, ValueError, RecursionError):
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return "governed"
-    if "SendMessage" in facts.get("deny", ()):
-        return "off"
-    if "crossSessionInbound" in facts and facts["crossSessionInbound"] != "accept" or "SendMessage" in facts.get(
-            "ask", ()):
+    if not isinstance(config, dict):
         return "governed"
-    return DEFAULT_MESSAGING
+    if "messaging" not in config:
+        return None
+    value = config["messaging"]
+    return value if value in MESSAGING_CHOICES else "governed"
 
 
-def _apply_messaging(settings_text: str, choice: str) -> str:
-    """``settings_text`` (the rendered claude-code settings JSON) with the messaging keys ``choice`` names."""
+def persisted_messaging(install: Path) -> str:
+    """The recorded choice (:func:`recorded_messaging`), else the default, ``isolate``. A render with no explicit
+    choice also keeps every messaging control the workspace file already carries (:func:`_apply_messaging`), so a
+    default read here never drops a hold or an ask."""
+    recorded = recorded_messaging(install)
+    return DEFAULT_MESSAGING if recorded is None else recorded
+
+
+def _apply_messaging(settings_text: str, choice: str, keep_from: Path | None = None) -> str:
+    """``settings_text`` (the rendered claude-code settings JSON) with the messaging keys ``choice`` names. With
+    ``keep_from`` (a re-render with no explicit choice: `update`, `init --force` without `--messaging`), every
+    messaging control that file already carries is merged back through `merge_messaging`, which never loosens: a
+    hold or refuse, an ask or deny on a messaging tool, `isolatePeerMachines`. A file that exists and cannot be read
+    keeps the governed pair. Only an explicit `--messaging` loosens what a workspace carries."""
     from levain.consent.adapters.claude_code import merge_messaging
+    from levain.host_guard import messaging_facts
 
     inbound, outbound = _MESSAGING_KNOBS[choice]
     try:
@@ -2036,6 +2027,21 @@ def _apply_messaging(settings_text: str, choice: str) -> str:
         if not isinstance(doc, dict):
             raise ValueError("the settings template is not a JSON object")
         merge_messaging(doc, inbound=inbound, outbound=outbound)
+        if keep_from is not None and os.path.lexists(keep_from):
+            try:
+                facts = messaging_facts(json.loads(keep_from.read_text(encoding="utf-8"))) or {}
+            except (OSError, ValueError, RecursionError):
+                facts = {"crossSessionInbound": "hold", "ask": ["SendMessage"]}
+            kept_in = facts.get("crossSessionInbound")
+            if kept_in is not None and kept_in != "accept":
+                merge_messaging(doc, inbound=kept_in if kept_in in ("hold", "refuse") else "hold",
+                                outbound="unmanaged")
+            if "SendMessage" in facts.get("deny", ()) or "ListAgents" in facts.get("deny", ()):
+                merge_messaging(doc, inbound="unmanaged", outbound="deny")
+            if "SendMessage" in facts.get("ask", ()):
+                merge_messaging(doc, inbound="unmanaged", outbound="ask")
+            if facts.get("isolatePeerMachines") is True:
+                merge_messaging(doc, inbound="unmanaged", outbound="isolate")
     except ValueError as e:
         raise InitError(f"the claude-code settings template could not take the messaging keys: {e}") from e
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
@@ -4633,7 +4639,7 @@ def _store_schema_name(store: Path, anneal_path: str) -> str | None:
 
 
 def _ensure_baton(
-    store: Path, anneal_path: str, emit: Callable[[str], None] = print
+    store: Path, anneal_path: str, emit: Callable[[str], None] = print, *, held_is_ok: bool = False
 ) -> bool:
     """anneal 1.0 (KL-19): a store that requires the consolidate baton must have it held by
     ANNEAL_SESSION_ID, the id the MCP launcher and `levain wrap` run as, or the entity records
@@ -4641,7 +4647,9 @@ def _ensure_baton(
     that ends with a usable store, new or existing (a re-run after a failed claim, or a store
     the rc2 MCP server created first, arrives here with the baton unheld). Claims only an
     UNHELD baton, never `--take`: a held baton is another session's, and taking it is the
-    operator's call. Loud on failure; True only when the baton is ours or the store has no policy."""
+    operator's call. Loud on failure; True only when the baton is ours or the store has no policy, and, with
+    ``held_is_ok`` (`levain update`), also when another session holds it or the store's status could not be read
+    and no claim succeeded: the warning is printed, but an update that did its own work is not failed for it."""
     from levain.manifest import ANNEAL_SESSION_ID, _run_anneal_json, anneal_invocation
 
     status = _run_anneal_json(store, anneal_path, ["status", "--json"])
@@ -4657,7 +4665,7 @@ def _ensure_baton(
             emit("    this entity records memory but cannot consolidate it until that session")
             emit("    releases it, or you take it deliberately (that ends the other session's claim):")
             emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID, '--take')}")
-            return False
+            return held_is_ok
     ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["baton", "claim", ANNEAL_SESSION_ID])
     if ok:
         emit(f"  Consolidate baton claimed for session '{ANNEAL_SESSION_ID}'.")
@@ -4667,6 +4675,10 @@ def _ensure_baton(
         emit(f"    - {e}")
     emit("    Without it this entity records memory but cannot consolidate it.")
     emit(f"    Then: {anneal_invocation('--db', str(store), 'baton', 'claim', ANNEAL_SESSION_ID)}")
+    if held_is_ok and not isinstance(status, dict):
+        emit("    (the store's status could not be read, so whether it needs the baton is not known; "
+             "`levain doctor` says what it can)")
+        return True
     return False
 
 

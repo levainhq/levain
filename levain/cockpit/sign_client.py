@@ -11,7 +11,11 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
+import shutil
 import socket
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -85,13 +89,64 @@ def _no_server(base_url: str, why: object) -> SignRefused:
 
 def server_listening(base_url: str, *, timeout: float = 3.0) -> None:
     """Refuse before anything is signed (a touch is not spent on a POST nobody receives) when nothing
-    listens at ``base_url``. Only a connect: it proves nothing about who listens; the POST's answer and the
-    journal read again after it decide the exit code."""
+    listens at ``base_url``, or when what listens there is not this OS user's (:func:`own_listener`): the token
+    and the signature go only to a listener this user owns. A process of this same user can still stand there;
+    the POST's answer and the journal read again after it decide the exit code."""
     parts = urllib.parse.urlsplit(base_url)
+    port = 80 if parts.port is None else parts.port
     try:
-        socket.create_connection((parts.hostname, 80 if parts.port is None else parts.port), timeout=timeout).close()
+        socket.create_connection((parts.hostname, port), timeout=timeout).close()
     except (OSError, ValueError) as exc:
         raise _no_server(base_url, getattr(exc, "strerror", None) or exc) from None
+    if not own_listener(parts.hostname or "", port):
+        raise SignRefused(f"something listens at {base_url}, but no listener this OS user owns is bound there "
+                          "(another user's process, or one this check cannot see): the write token and the signature "
+                          "are not sent, and nothing was decided")
+
+
+def _proc_listeners(port: int) -> list[tuple[str, int]]:
+    """Linux: (hex local address, uid) of each TCP socket in LISTEN on ``port``, from /proc/net/tcp and tcp6."""
+    out: list[tuple[str, int]] = []
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(name, encoding="ascii") as fh:
+                next(fh, None)
+                for line in fh:
+                    f = line.split()
+                    if len(f) > 7 and f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == port:
+                        out.append((f[1].rsplit(":", 1)[0], int(f[7])))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+_PROC_HOSTS = {"127.0.0.1": "0100007F", "::1": "00000000000000000000000001000000"}
+_PROC_WILDCARD = {"00000000", "00000000000000000000000000000000"}
+
+
+def own_listener(host: str, port: int) -> bool:
+    """Is the TCP listener at ``host:port`` this OS user's? Linux: /proc/net/tcp names each listener's uid, and a
+    wildcard listener of this user also counts (Linux refuses another bind of that port while it listens). macOS:
+    lsof run as this user lists only this user's sockets, and only a listener bound to exactly ``host`` counts.
+    Any other platform, or a reader that fails: False (refuse rather than hand the token to a stranger)."""
+    hosts = ("127.0.0.1", "::1") if host == "localhost" else (host,)
+    uid = os.getuid()
+    if sys.platform.startswith("linux"):
+        found = _proc_listeners(port)
+        wanted = {_PROC_HOSTS[h] for h in hosts if h in _PROC_HOSTS}
+        if any(addr in wanted and owner != uid for addr, owner in found):
+            return False
+        return any(owner == uid and (addr in wanted or addr in _PROC_WILDCARD) for addr, owner in found)
+    if sys.platform == "darwin":
+        lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+        try:
+            cp = subprocess.run([lsof, "-nP", "-a", "-u", str(uid), f"-iTCP:{port}", "-sTCP:LISTEN", "-Fn"],
+                                capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        names = {ln[1:] for ln in cp.stdout.splitlines() if ln.startswith("n")}
+        return any((f"[{h}]:{port}" if ":" in h else f"{h}:{port}") in names for h in hosts)
+    return False
 
 
 def waiting(db: CockpitDB, pending_id: str, now: datetime) -> OpView:
@@ -188,7 +243,12 @@ def post_signature(base_url: str, pending_id: str, signature: str, token: str,
         with exc:
             status, raw = exc.code, exc.read(_BODY_MAX)
     except (urllib.error.URLError, OSError) as exc:
-        raise _no_server(base_url, getattr(exc, "reason", exc)) from None
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+            raise _no_server(base_url, reason) from None
+        # a timeout or a reset can come after the request was sent: the server may have decided it
+        raise SignRefused(f"the request to {base_url} got no answer ({reason}): the server may have applied it; "
+                          "`levain cockpit pending` shows what the journal says now") from None
     except ValueError as exc:      # (UnicodeEncodeError too) a header or URL http.client will not send
         raise SignRefused(f"the request to {base_url} could not be sent ({exc}): nothing was decided") from None
     text = raw.decode("utf-8", "replace")

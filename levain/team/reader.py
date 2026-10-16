@@ -144,6 +144,16 @@ def _own_fp(gl: LedgerTransport) -> str | None:
         return None
 
 
+def partial_why(d) -> str | None:
+    """The sentence a surface shows when the derivation ``d`` was judged only in part here, or None when it was
+    judged in full. The Team zone and the standalone team view both say it."""
+    if d.judged == "full":
+        return None
+    waiting = int(d.waiting or 0)
+    return ("Part of the team ledger could not be fully judged on this machine, so what follows may be out of date"
+            + (f"; {waiting} newer line{'s are' if waiting != 1 else ' is'} waiting." if waiting else "."))
+
+
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
               ack_flag: int = DEFAULT_ACK_FLAG) -> TeamRead:
     """The team this clone's ledger describes, as one of the four states. Never raises."""
@@ -158,10 +168,8 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
         model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(d=d), gl.state_hash(ledger, team),
                             recheck_days=recheck_days, ack_flag=ack_flag, path_filter=path_filter)
         model["members"], model["joins"] = people(d, model.get("you"), _own_fp(gl))
-        if d.judged != "full":
-            waiting = int(d.waiting or 0)
-            why = ("Part of the team ledger could not be fully judged on this machine, so what follows may be out of date"
-                   + (f"; {waiting} newer line{'s are' if waiting != 1 else ' is'} waiting." if waiting else "."))
+        why = partial_why(d)
+        if why is not None:
             return TeamRead("judged_partial", model, why, _one_line(d.frozen_why or ""))
         return TeamRead("ok", model)
     except TeamError as exc:

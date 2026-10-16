@@ -73,10 +73,12 @@ def run_update(
             # anneal 1.0 (KL-19): an update that leaves a usable store also leaves its consolidate
             # baton held by the entity's session, the same rule `init` applies (a store whose claim
             # failed at init, or one an older install never claimed, is reconciled here too).
+            # Reconciled whatever the update itself returned: a review condition elsewhere must not leave the
+            # store capture-only. A baton another session holds warns and does not fail the update.
             store = install / ".levain" / "memory.db"
-            if rc == 0 and store.is_file():
+            if store.is_file():
                 from levain.install import _ensure_baton
-                if not _ensure_baton(store, manifest.resolve_anneal_bin(), emit):
+                if not _ensure_baton(store, manifest.resolve_anneal_bin(), emit, held_is_ok=True):
                     return 1
             return rc
     except InstallLockError as e:

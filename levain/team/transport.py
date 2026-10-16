@@ -244,8 +244,18 @@ class GitLedger:
             if _mutate is not None:
                 _mutate(data)
             tmp = self.state_path.with_suffix(f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())   # durable before it replaces: the cockpit's accept marker is read after a crash
             os.replace(tmp, self.state_path)
+            dfd = os.open(self.state_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            except OSError:
+                pass        # a filesystem that cannot sync a directory still has the file synced
+            finally:
+                os.close(dfd)
         finally:
             os.close(fd)
 
@@ -1874,7 +1884,8 @@ class GitLedger:
         with self.op(timeout=net_timeout):
             return self._sync_in_op(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout)
 
-    def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float) -> str:
+    def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
+                    retries: int = _PUSH_RETRIES) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
@@ -1891,7 +1902,7 @@ class GitLedger:
                 return "local only (no remote)"
             rref = f"refs/remotes/{remote}/{self.branch}"
             local = self.ref
-            for attempt in range(_PUSH_RETRIES):
+            for attempt in range(retries):
                 if not self._fetch(remote, rref, timeout):
                     published = bool(self.state().get("anchor")) or bool(git(
                         ["for-each-ref", "--count=1", f"refs/levain/seen/{self.branch}/", f"refs/levain/gone/{self.branch}/"],
@@ -1936,7 +1947,7 @@ class GitLedger:
                     lines = [l for l in (cp.stderr or "").splitlines() if "rejected" in l or "error" in l.lower()]
                     raise TeamError(f"push failed: {lines[0].strip() if lines else _tail(cp)}")
                 time.sleep(random.uniform(0.05, 0.4) * (attempt + 1))
-        raise TeamError(f"push still rejected after {_PUSH_RETRIES} fetch+rebase rounds")
+        raise TeamError(f"push still rejected after {retries} fetch+rebase rounds")
 
     def _advance_anchor(self, rref: str) -> None:
         """The anchor is the last PUBLISHED tip this clone derived in full (never a local tip)."""
@@ -1994,7 +2005,8 @@ class GitLedger:
         except Exception as exc:  # noqa: BLE001 - a hook path: report, never raise
             return f"{type(exc).__name__}: {exc}"
 
-    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0) -> str:
+    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0,
+                 retries: int = _PUSH_RETRIES) -> str:
         """One sync now (a fetch and rebase; a push only when ``push``), for a caller that holds a person's request
         open: the op is waited for ``op_wait`` seconds and each git network call gets ``timeout``, never the CLI's
         minutes. ``timeout`` bounds EACH git call, not the sync: one sync may run several (fetch, the strict-ledger
@@ -2006,7 +2018,8 @@ class GitLedger:
         with self.op(timeout=op_wait):
             try:
                 self._sync_preamble(lock_timeout=op_wait)
-                return self._sync_in_op(push=push, timeout=timeout, net_timeout=op_wait, lock_timeout=op_wait)
+                return self._sync_in_op(push=push, timeout=timeout, net_timeout=op_wait, lock_timeout=op_wait,
+                                        retries=retries)
             except TeamBusy:
                 raise
             except TeamError as exc:

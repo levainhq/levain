@@ -2035,16 +2035,22 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
                     + ("" if p.list_denied else "; ListAgents not denied, so listing your sessions stays on"))
     elif p.outbound == "ask":
         outbound = (f"outbound asks: every SendMessage goes to the permission flow (levain's consent hook, any "
-                    f"PermissionRequest hook you installed, or your dialog) ({p.outbound_source})"
-                    + ("; cross-machine sends ask (isolatePeerMachines)" if p.isolate else ""))
+                    f"PermissionRequest hook you installed, or your dialog) ({p.outbound_source}), resuming a "
+                    "subagent and messaging a teammate included; a standing grant on SendMessage for this workspace "
+                    "is the quiet path" + ("; cross-machine sends ask (isolatePeerMachines)" if p.isolate else ""))
     else:
         outbound = "outbound NOT governed: no rule asks for or denies SendMessage"
     detail = f"{inbound}; {outbound} {seen}"
+    from levain.install import recorded_messaging
+
+    chosen = recorded_messaging(install)
+    if chosen == "off" and not (p.inbound == "refuse" and p.outbound == "deny" and p.list_denied):
+        return [CheckResult("Claude Code messaging", True, f"this install's recorded choice is `off`, and the files "
+                            f"say less: {detail}",
+                            "Re-run `levain init --path <install> --force --messaging off`, or record the posture "
+                            "you want; doctor never edits your settings.", warn=True)]
     if p.inbound in ("hold", "refuse") and p.outbound in ("ask", "deny"):
         return [CheckResult("Claude Code messaging", True, detail)]
-    from levain.install import persisted_messaging
-
-    chosen = persisted_messaging(install)
     if chosen == "unmanaged" or (chosen == "isolate" and p.isolate):
         # the install's own recorded choice (the default is `isolate`): not a warning, but the gaps said plainly
         gaps = "levain does not queue or record sends to your other sessions"

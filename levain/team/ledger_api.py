@@ -16,7 +16,7 @@ from typing import Protocol
 
 from . import index as I
 from . import roles as R
-from .transport import GitLedger, Repo, TeamError
+from .transport import _PUSH_RETRIES, GitLedger, Repo, TeamError
 
 
 class LedgerTransport(Protocol):
@@ -154,7 +154,8 @@ class LedgerTransport(Protocol):
         """Fetch when the last fetch is older than ``interval``; returns a note when it could not, else None."""
         ...
 
-    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0) -> str:
+    def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0,
+                 retries: int = _PUSH_RETRIES) -> str:
         """Sync now on bounded waits (a push only when ``push``); TeamBusy while another team operation holds it."""
         ...
 

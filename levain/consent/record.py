@@ -49,7 +49,9 @@ DISPLAY_MAX = 2000
 # ``tokenizer`` are masked too: a secret shown costs more than a count hidden.
 _SECRET_WORDS = frozenset({
     "password", "passwd", "secret", "token", "apikey", "authorization", "credential", "cookie", "privatekey",
-    "accesskey", "bearer", "passphrase"})
+    "accesskey", "bearer", "passphrase", "pwd", "jwt"})
+# exact words that are secrets only on their own (`pass`, not `passenger` or `compass`)
+_SECRET_EXACT = frozenset({"pass"})
 # a word that is or ends in `auth` is a credential (auth, basic_auth, x-auth, basicauth, auth_header) unless the next
 # word says what kind of thing it is about rather than the thing itself (auth_url, auth_type); `author` is not one
 _AUTH_ABOUT = frozenset({"url", "uri", "type", "method", "mode", "scheme", "provider", "endpoint", "server", "host",
@@ -74,8 +76,10 @@ def _secret_named(key: Any) -> bool:
         return False
     tokens = [t.lower() for t in _KEY_TOKEN.findall(key)]
     spans = tokens + [a + b for a, b in zip(tokens, tokens[1:])]
-    if any(t.endswith("auth") and (i + 1 == len(tokens) or tokens[i + 1] not in _AUTH_ABOUT)
-           for i, t in enumerate(tokens)):
+    if any((t.endswith("auth") or (t.startswith("auth") and not t.startswith(("author", "authent"))))
+           and (i + 1 == len(tokens) or tokens[i + 1] not in _AUTH_ABOUT) for i, t in enumerate(tokens)):
+        return True
+    if any(t in _SECRET_EXACT for t in tokens):
         return True
     return any(word in span for span in spans for word in _SECRET_WORDS)
 
@@ -86,9 +90,16 @@ def _masked(value: Any) -> str:
     return f"[redacted: str, {len(value)} chars]" if isinstance(value, str) else f"[redacted: {kind}]"
 
 
+def _private_flagless(key: Any, value: Any) -> bool:
+    """A key whose word is `private` is a flag only while its value is a bool; holding anything else, it may be
+    the key itself (``{"private": "-----BEGIN ... PRIVATE KEY-----"}``)."""
+    return isinstance(key, str) and "private" in (t.lower() for t in _KEY_TOKEN.findall(key)) \
+        and not isinstance(value, bool)
+
+
 def _mask(value: Any) -> Any:
     if isinstance(value, dict):
-        return {k: (_masked(v) if _secret_named(k) else _mask(v)) for k, v in value.items()}
+        return {k: (_masked(v) if _secret_named(k) or _private_flagless(k, v) else _mask(v)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_mask(v) for v in value]
     return value

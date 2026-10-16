@@ -706,12 +706,12 @@ def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLi
     file an older Claude Code left in the starting directory is still read after the root's (the root's value wins).
     Local files come highest precedence first."""
     d = Path(os.path.abspath(cwd))
-    hm = Path(os.path.abspath(home if home is not None else os.path.expanduser("~")))
+    hm = Path(os.path.realpath(home if home is not None else os.path.expanduser("~")))
     shared = d / ".claude" / "settings.json"
     beside = d / ".claude" / "settings.local.json"
     root = _git_root(d)
     main = _main_checkout(root) if root is not None else None
-    if main is None or root == hm or main == hm or sys.platform == "win32" or not all(
+    if main is None or hm in (Path(os.path.realpath(root)), Path(os.path.realpath(main))) or sys.platform == "win32" or not all(
             _owned(p) for r in {root, main} for p in (r, r / ".git", r / ".claude") if p is r or os.path.lexists(p)):
         return [beside], shared
     at_root = main / ".claude" / "settings.local.json"
@@ -1093,6 +1093,15 @@ def repin_agent_hooks_with_owner(install: str | os.PathLike[str], codex_home: st
     return pins, owner
 
 
+def _hooks_entry_digest_or_none(path: Path) -> bool:
+    """True when ``path`` sets any key the hook pin covers (or cannot be read: then it is not vouched for either)."""
+    try:
+        doc = _read_settings_doc(path)
+    except AgentPinError:
+        return True
+    return isinstance(doc, dict) and any(doc.get(k) not in (None, {}, []) for k in _SETTINGS_PINNED_KEYS)
+
+
 def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None,
                      adapter: str | None = None) -> Literal["none", "fresh", "match", "changed"]:
     """The pin's state right now, WITHOUT recording anything. ``fresh``: no pin and nothing install-
@@ -1111,6 +1120,9 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         root = _git_root(ent)
         if root is not None and root != ent:
             local += [root / ".claude" / "settings.json", root / ".claude" / "settings.local.json"]
+        # the local file Claude Code reads at a worktree's main checkout counts only while it carries hooks: it is
+        # commonly Claude Code's own "don't ask again" file, which must not make a first init read as unpinned
+        local += [p for p in cc_project_settings_files(ent)[0] if p not in local and _hooks_entry_digest_or_none(p)]
         local.append(ent / ".codex" / "config.toml")
         # a Codex hooks.json already on disk is global and unvetted on a Codex install's first use, unless it
         # is levain's own recorded write for another install (a second Codex install's init then pins its own)
