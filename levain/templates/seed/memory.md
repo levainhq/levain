@@ -36,7 +36,7 @@ Record the reasoning, not just the fact. "Chose X because Y" beats "using X." Do
 
 **Before decisions (NON-NEGOTIABLE):** Before any architectural decision, design choice, or rule change, call `recall` on the surface area being decided. Integrate findings into the decision context. If recall returns nothing relevant, proceed and note that recall fired clean. The store is not a write-only sink — recall before deciding is what produces closed-loop learning. Skipping this step produces the **dead-store failure mode**: wraps land, episodes write, the store grows, but architectural decisions get made blind to accumulated patterns. Memory storage without recall is functionally dead, regardless of how many episodes it contains.
 
-**End of session:** the wrap procedure (`prepare_wrap -> compress -> save_continuity`) is in `memory_workflow.md`, next in this seed.
+**End of session:** always wrap before ending. The procedure (`prepare_wrap -> compress -> save_continuity`) is in `memory_workflow.md`.
 
 ## Hebbian associations (automatic)
 
