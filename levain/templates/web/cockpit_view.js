@@ -1561,14 +1561,18 @@
   // date, "superseded" when a newer refetch of the same panel took over (this one changed nothing and says nothing), "fault" when the read or the mapping failed (the panel
   // says so, and the caller may retry), and false when the caller must reload.
   const refetchGen = new Map();
+  // bumped by every board render (K.reset): a panel read begun before one cannot repaint what that render drew
+  let boardEpoch = 0;
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
     if (!liveOf(pid).length) return false;
     const gen = (refetchGen.get(pid) || 0) + 1;
     refetchGen.set(pid, gen);
+    const epoch = boardEpoch;
     let raw, fault = "";
     try { raw = await readPanel(pid); } catch (e) { fault = e && e.message ? e.message : String(e); }
     if (refetchGen.get(pid) !== gen) return "superseded";   // a newer refetch of this panel owns the answer and the record
+    if (boardEpoch !== epoch) return "superseded";          // a full render since drew this panel from a newer read
     const live = liveOf(pid);
     if (!live.length) return false;
     if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }
@@ -1832,7 +1836,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
+  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
