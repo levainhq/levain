@@ -40,6 +40,24 @@
             "command": "\"{{PYTHON}}\" \"${CLAUDE_PROJECT_DIR}/activation/hooks/automemory_mirror.py\" hook"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{PYTHON}}\" \"${CLAUDE_PROJECT_DIR}/activation/hooks/post_tool_use.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{PYTHON}}\" \"${CLAUDE_PROJECT_DIR}/activation/hooks/stop.py\""
+          }
+        ]
       }
     ]
   }
