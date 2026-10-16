@@ -14,11 +14,13 @@ What the operator signs is ``(kind, handle, about)``: ``about`` is the Joins row
 (``levain.team.reader.join_digest``: the pending key LINE, or the current owner and the offer with its email). The
 fingerprint is never a param: the store reads this machine's own, so a caller cannot name another machine's key. At
 apply the store decides again, under the team op lock, after a fetch, from ONE derivation: the act is done
-(``GitLedger.confirm_own_key`` / ``GitLedger.accept_offer``, the same acts the laptop commands run), found already
-done, or refused naming what moved since the signature (a digest that no longer matches: "what was signed changed").
-Only a PUBLISHED act (or one on a clone with no remote) is recorded APPLIED: a push that fails, or a busy lock, is a
-transient fault and the broker re-drives the pending, which then finds the act done here and pushes it. Its records
-live in the clone's own state file, so an ``ALREADY`` survives a restart.
+(``GitLedger.confirm_own_key`` / ``GitLedger.accept_offer``, the same acts the laptop commands run), or refused naming
+what moved since the signature (a digest that no longer matches: "what was signed changed"; an act already in force
+that this signature did not make: "changed nothing"). An ``acting`` marker saved under the op before the act is what
+proves an act found in force is this pending's own (a crash, a failed push or a failed final record re-drives into it).
+Only a PUBLISHED act (or one on a clone with no remote) is recorded APPLIED: a push that fails, a busy lock or any
+other fault of the environment during the act is transient and the broker re-drives the pending. Its records live
+in the clone's own state file, so an ``ALREADY`` survives a restart.
 
 ``team_verbs(start)`` returns the two specs and the accept's broker effect for ``make_server`` to merge. Nothing here
 reads the ledger at construction: ``start`` is resolved on each fire and each apply.
@@ -61,6 +63,7 @@ FIELDS = ("kind", "handle", "about")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _PREFIX = "team-join:"
 _RECORDS = "cockpit_joins"      # the clone state file's key for this store's records: origin_key -> record
+_ACTING = "acting"              # a record's ``state`` while its act is begun and not yet recorded (a marker, not a record)
 _BUSY = "another levain team operation on this clone is running"
 _NO_REMOTE = "this team ledger has no remote to fetch from; nothing was fetched"
 # a person's request is open: the op is waited for briefly and each git network call is bounded (the CLI waits minutes)
@@ -125,10 +128,13 @@ def join_effect(params: Mapping[str, Any], *, origin_key: str) -> Effect:
 
 
 def _done(d, kind: str, handle: str, fp: str) -> bool:
-    """The act this join names is already in force (a crash between the ledger commit and the record lands here)."""
+    """The act this join names is in force: this machine's key for ``handle`` (key), or ``handle`` the owner with this
+    machine's key in force (owner-offer). The ONE done-definition per kind. It never proves that THIS pending acted:
+    only an ``acting`` marker does (``TeamJoinStore._apply_in_op``). No offer clause: once ``handle`` owns the team,
+    an offer the new owner then makes to someone else does not undo the accept (T3 L3 r1 glm HIGH)."""
     if kind == "key":
         return fp in T.key_fps(d.tenure, handle)
-    return d.team.owner == handle and not d.tenure.offer and fp in T.key_fps(d.tenure, handle)
+    return d.team.owner == handle and fp in T.key_fps(d.tenure, handle)
 
 
 def _moved(d, kind: str, handle: str, fp: str) -> str | None:
@@ -174,11 +180,20 @@ class TeamJoinStore:
         recs = gl.state().get(_RECORDS)
         return dict(recs) if isinstance(recs, dict) else {}
 
+    @staticmethod
+    def _final(rec: Any) -> bool:
+        """A record of an applied accept (an ``acting`` marker is not one: it says only that the act was begun)."""
+        return isinstance(rec, dict) and rec.get("state") != _ACTING
+
+    @staticmethod
+    def _save(gl: LedgerTransport, key: str, rec: dict[str, Any]) -> None:
+        gl.save_state(_mutate=lambda st: st.__setitem__(_RECORDS, {**dict(st.get(_RECORDS) or {}), key: rec}))
+
     def snapshot(self, resource_key: str) -> Snapshot:
         key = self._key(resource_key)
         gl = _ledger(self.start)
         rec = None if gl is None else self._records(gl).get(key)
-        return Snapshot(None, None) if not isinstance(rec, dict) else Snapshot(dict(rec), str(rec.get("sha") or ""))
+        return Snapshot(dict(rec), str(rec.get("sha") or "")) if self._final(rec) else Snapshot(None, None)
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
         return [ApplyUnit(STORE, (i,), (e,)) for i, e in effects]
@@ -208,9 +223,19 @@ class TeamJoinStore:
             invalidate()
 
     def _apply_in_op(self, gl: LedgerTransport, key: str, kind: str, handle: str, about: str) -> UnitApplyResult:
+        """Under the op: ALREADY for a final record; else the team as it is now (fetched), then RECOVERY or FRESH.
+
+        Before the act a durable ``acting`` marker for this pending is saved under the op, and after the act (and its
+        publication) the final record replaces it (T3 L3 r1 head ruling). So an act found in force proves this pending
+        did it only when the marker is there: RECOVERY (a crash, a failed push, a failed final save) publishes and
+        records it with no other check. With no marker, or a marker whose act did not land, the apply is FRESH: an act
+        already in force was not done by this signature and is refused, then what moved, then the digest, then the
+        act. A fault of the environment (a fetch, a lock, a missing agent key) waits for repair: transient."""
         rec = self._records(gl).get(key)
-        if isinstance(rec, dict):
+        if self._final(rec):
             return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(str(rec.get("id")), dict(rec)),))
+        marker = {"state": _ACTING, "origin_key": key, "kind": kind, "handle": handle, "about": about}
+        acting = isinstance(rec, dict) and all(rec.get(f) == marker[f] for f in ("state", "kind", "handle", "about"))
         try:
             if gl.remote:
                 # the act is decided on the team as it is now, as the laptop commands fetch first: a key removed or
@@ -223,15 +248,18 @@ class TeamJoinStore:
             raise
         except TeamError as exc:      # an unreachable remote, an unreadable ledger or key: the consented act waits
             raise TransientApplyFault("TeamError", person_text(exc)) from exc
-        if not _done(d, kind, handle, fp):
-            # not done yet (a done act is a re-drive after a failed push, or a crash before the record: it is
-            # published below and recorded, nothing is committed again)
+        if not (acting and _done(d, kind, handle, fp)):
+            # FRESH: no marker, or a marker whose act did not land (it is made now, every check included)
+            if _done(d, kind, handle, fp):
+                raise PermanentApplyRefusal(f"the {kind} for {handle} is already in force; this signature changed "
+                                            "nothing")
             why = _moved(d, kind, handle, fp)
             if why is not None:
                 raise PermanentApplyRefusal(why)
             if join_digest(d, kind, handle, fp) != about:
                 raise PermanentApplyRefusal(f"what was signed changed: the {kind} for {handle} is not the one the "
                                             "signature was given for; nothing was changed")
+            self._save(gl, key, marker)       # durable before the act: a re-drive after it knows the act is its own
             try:
                 # committed here only; published below on a bounded wait
                 if kind == "key":
@@ -243,9 +271,10 @@ class TeamJoinStore:
             except TeamBusy:
                 raise                 # a lock held by another team operation: the pending re-drives
             except TeamError as exc:
-                gl.forget_derivation()
-                if not _done(gl.derivation(), kind, handle, fp):
-                    raise PermanentApplyRefusal(person_text(exc)) from exc
+                # an environment fault (no key in the agent, a lock timeout): what moved was decided above, so the
+                # consented act waits for repair; the re-drive finds the marker and whether the act landed
+                raise TransientApplyFault("TeamError", f"the {kind} for {handle} did not complete: "
+                                          f"{person_text(exc)}") from exc
             # on every clone, remote or not: the act counts only if the ledger now says it is in force
             gl.forget_derivation()
             if not _done(gl.derivation(), kind, handle, fp):
@@ -253,7 +282,7 @@ class TeamJoinStore:
                                             "recorded")
         if gl.remote:
             # only a published act is APPLIED: a push that fails is a transient fault, the pending re-drives, and the
-            # re-drive finds the act done above and pushes it here (the hook's own sync never pushes)
+            # re-drive finds the marker and the act done above and pushes it here (the hook's own sync never pushes)
             try:
                 gl.sync_now(push=True, op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)
             except TeamBusy:
@@ -266,9 +295,10 @@ class TeamJoinStore:
                 # the sync re-landed this clone's change on a newer remote, and a change there undid it
                 raise PermanentApplyRefusal(f"a newer team change landed first; the {kind} for {handle} is not "
                                             "in force")
-        rec = {"id": gl.head(), "origin_key": key, "kind": kind, "handle": handle, "about": about, "sha": gl.head(),
+        head = gl.head()
+        rec = {"id": head, "origin_key": key, "kind": kind, "handle": handle, "about": about, "sha": head,
                "at": time.time()}
-        gl.save_state(_mutate=lambda st: st.__setitem__(_RECORDS, {**dict(st.get(_RECORDS) or {}), key: rec}))
+        self._save(gl, key, rec)              # replaces the marker
         return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(rec["id"], rec),))
 
 
