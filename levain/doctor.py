@@ -1923,7 +1923,8 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
                             "If anything here is not yours, fix it before relying on this pin.",
                             warn=True)] + extra
     if status == "match":
-        return [CheckResult(name, True, "hook entries and scripts match the pin")] + extra
+        return [CheckResult(name, True, "hook entries and scripts match the pin"
+                            + "".join(f"; {d}" for d in diffs))] + extra
     return [CheckResult(name, False, "changed since pinned: " + "; ".join(diffs),
                         "If you made the change, run `levain doctor --path "
                         f"{shlex.quote(str(install))} --repin-hooks`. If you did not, "
@@ -2655,6 +2656,11 @@ def _check_codex(install: Path) -> list[CheckResult]:
                 ("SessionStart", ss, "session_start.py"),
                 ("UserPromptSubmit", ups, "user_prompt_submit.py"),
             )
+            from levain import host_guard as hg
+
+            owner = hg.codex_hooks_owner(install, codex_home)
+            takeover = (f"To wire this install again: `levain init --path {shlex.quote(str(install))} "
+                        "--adapter codex --force` (plain `levain init` refuses a directory that is not empty).")
             for ev_name, entries, script_name in ev_scripts:
                 # Exact-path match — substring-only match would false-positive
                 # against ~/levain vs ~/levain-test (prefix overlap).
@@ -2663,8 +2669,9 @@ def _check_codex(install: Path) -> list[CheckResult]:
                         CheckResult(
                             f"~/.codex/hooks.json {ev_name} → {script_name}",
                             False,
-                            "not wired to this install (Codex is one-install-per-machine at v1)",
-                            "Another install may own ~/.codex/hooks.json. Re-run `levain init` here to take over.",
+                            "not wired to this install (Codex is one-install-per-machine at v1)"
+                            + (f": levain wired it to the install at {owner}" if owner else ""),
+                            ("" if owner else "Another install may own ~/.codex/hooks.json. ") + takeover,
                         )
                     )
                     continue
