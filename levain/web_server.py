@@ -206,6 +206,14 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # 503. Static assets (cached bytes) bypass the gate.
 _MAX_INFLIGHT = 8
 
+# The cockpit's GET reads (the manifest and one request per panel; a page load bursts ~28 of them, two
+# open pages double it) wait this long for a slot before the 503, and at most ``_MAX_READ_WAITERS`` of them
+# wait at once, so a flood still cannot pile up threads without bound. Every other gated route (the POSTs,
+# the substrate read, a consent body) keeps the instant 503: a write must not queue behind reads, and a
+# caller that retries those has the answer at once.
+_READ_WAIT_SECONDS = 5.0
+_MAX_READ_WAITERS = 64
+
 _log = logging.getLogger(__name__)
 
 # The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
@@ -630,6 +638,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
+    read_waiters: int
+    read_waiters_lock: threading.Lock
     # ``is_loopback_bind`` is computed from the ACTUAL bound address (un-foolable) and gates
     # whether the substrate READS need a token (spore-220). ``write_token`` is the ``browser``
     # surface's token: minted on a writable server given no tokens at all, None when the caller's
@@ -854,6 +864,23 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _acquire_read_slot(self) -> bool:
+        """Take a ``request_gate`` slot for a cockpit read, waiting up to ``_READ_WAIT_SECONDS`` behind at
+        most ``_MAX_READ_WAITERS`` other waiting reads. False (the caller answers 503) when the wait times
+        out or the waiting room is full."""
+        srv = self.server
+        if srv.request_gate.acquire(blocking=False):
+            return True
+        with srv.read_waiters_lock:
+            if srv.read_waiters >= _MAX_READ_WAITERS:
+                return False
+            srv.read_waiters += 1
+        try:
+            return srv.request_gate.acquire(timeout=_READ_WAIT_SECONDS)
+        finally:
+            with srv.read_waiters_lock:
+                srv.read_waiters -= 1
+
     def _peer_open(self) -> bool:
         """False once the client has closed its end. A stream never reads the request body, so any readable
         byte-less state is the peer hanging up."""
@@ -965,7 +992,7 @@ class _Handler(GuardedHandler):
             if path == EVENTS_PATH:
                 self._serve_stream(head=head)
                 return
-            if not self.server.request_gate.acquire(blocking=False):
+            if not self._acquire_read_slot():
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             try:
@@ -1727,6 +1754,8 @@ def make_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
     # Bound the expensive routes (store read + writes); past the cap → 503.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    httpd.read_waiters = 0
+    httpd.read_waiters_lock = threading.Lock()
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

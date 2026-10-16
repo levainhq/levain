@@ -47,6 +47,8 @@
   // for daily-driver convenience on the operator's personal device; the native keychain is the
   // real fix at Lane 1.
   const WRITE_TOKEN_KEY = "levain_write_token";
+  // The page's own cap on concurrent panel reads (see the batch in the board read below).
+  const PANEL_READ_CONCURRENCY = 4;
   let writeTokenRequired = false;
 
   // K2a: `levain serve` opens the page with the write token in the URL FRAGMENT (never sent to the server).
@@ -595,7 +597,11 @@
     // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
     let reauth = null;
     const fetchPanel = (url) => fetch(url, { cache: "no-store", headers: readHeaders() });
-    await Promise.all(ids.map(async (id) => {
+    // At most PANEL_READ_CONCURRENCY panel reads are in flight, the rest queue in manifest order: one page
+    // bursting ~28 reads at once, or two open pages, would otherwise meet the server's concurrency cap.
+    // Every read settles (the worker catches its own failure) and so frees its slot.
+    const queue = ids.slice();
+    const readOne = async (id) => {
       const url = "/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full";
       try {
         let res = await fetchPanel(url);
@@ -622,7 +628,9 @@
         // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
         panels[id] = { error: e && e.message ? e.message : String(e) };
       }
-    }));
+    };
+    const worker = async () => { while (queue.length) await readOne(queue.shift()); };
+    await Promise.all(Array.from({ length: Math.min(PANEL_READ_CONCURRENCY, ids.length) }, worker));
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
     heldNext = Object.fromEntries(ids.map((id) => [id, { etag: (manifest.panels[id] || {}).etag || null }]));

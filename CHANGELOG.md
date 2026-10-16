@@ -47,6 +47,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **`levain.consent.decide_by_policy`**, 0.10.4's placeholder that decided nothing. A policy answer now comes only from a standing grant, through `levain.consent.policy.guarded_policy`, which the adapters call with the request, the tool input it was filed with and the session's posture.
 
+### Fixed
+
+- **Two cockpit pages open at once no longer leave each other half drawn.** The server made a cockpit read wait up to 5 seconds for a free slot (past 64 waiting reads it still answers 503) instead of refusing it at once when 8 were in flight, and the page now reads at most 4 panels at a time, in order. Known edge: other routes (writes, the substrate read) still refuse at once when the server is full.
+
+
 ## [0.10.4] — 2026-10-15
 
 The consent queue's core and Claude Code adapter as a library, signed standing policy for the cockpit, doctor's hook pins, and the cockpit's phone layout, project hues and Decisions tile. No `levain` command installs the consent queue yet.
