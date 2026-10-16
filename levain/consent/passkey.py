@@ -21,8 +21,8 @@ This module decides nothing on its own. A wrong conversion makes ``ssh-keygen`` 
 a bad one verify on the message, the rpId, user presence or the signature, which the verifier the consent queue
 already uses checks on every delivery (:func:`levain.authority.verify_link_sig`, :func:`levain.authority.presence_missing`).
 The checks here refuse the wrong shape early, with a reason, and add three that ``ssh-keygen`` does not make (the
-origin host, user verification, and not cross-origin); those three run at conversion only, on the phone port, not
-again at delivery.
+origin host, user verification, and not cross-origin); the consent queue runs those three again on every
+verification of a passkey key's answer (:func:`answer_signature_problem`).
 
 Stdlib only. The conversion was first run by a test page against a real iPhone (Safari, iCloud passkey, 2026-10-16:
 ``/usr/bin/ssh-keygen`` verified it and a one-bit change to the message did not); this module's output for a recorded
@@ -183,7 +183,10 @@ def _client_origin(client_data_json: bytes, application: str) -> str:
     if client.get("crossOrigin") is True:
         raise PasskeyError("the passkey signed inside a page from another site")
     origin = client.get("origin")
-    parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
+    try:
+        parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
+    except ValueError:  # an unparseable origin (an unclosed IPv6 bracket) is a refusal, never a crash at delivery
+        parts = None
     if (parts is None or parts.hostname != application or parts.path or parts.query or parts.fragment
             or not (parts.scheme == "https" or (parts.scheme == "http" and application == "localhost"))):
         raise PasskeyError(f"the passkey signed on a page that is not https://{application}")
