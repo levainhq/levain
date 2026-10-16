@@ -294,7 +294,7 @@
     color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.4 var(--sans); }
   p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: var(--r-pill); background: var(--meta); }
   p.err::before { background: var(--warn); }
-  p.empty.loading::before { animation: statusPulse 1.2s ease-in-out infinite; }
+  p.empty.loading::before { animation: statusPulse 1.2s ease-in-out 8;  /* finite, then a still dot: a panel stuck loading must not animate forever */ }
   @keyframes statusPulse { 50% { opacity: .3; } }
   @media (prefers-reduced-motion: reduce) { p.empty.loading::before { animation: none; } }
 
@@ -380,7 +380,7 @@
   svg.scope .trace-glow {
     stroke-width: 5.5; stroke-linejoin: round; stroke-linecap: round; opacity: .22;
     stroke-dasharray: 1; stroke-dashoffset: 1;
-    animation: traceDraw 1.2s ease-out forwards, traceBreathe 10s ease-in-out 1.2s infinite;
+    animation: traceDraw 1.2s ease-out forwards, traceBreathe 10s ease-in-out 1.2s 3 forwards;  /* finite: an infinite animation keeps the page compositing every frame (10-15: a full core on his tab) */
   }
   /* the three Cognition series each carry their own hue (10-13: "one more accent color on the chart"); hues kept
      clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
@@ -427,7 +427,6 @@
     letter-spacing: var(--track-caps); text-transform: uppercase; font-family: var(--sans); position: relative; z-index: 1; }
 
   /* ── motion ────────────────────────────────────────────────────────────── */
-  @keyframes blink { 0%,55% { opacity: 1; } 56%,100% { opacity: 0; } }
   /* the settled trace is solid in every engine: with non-scaling-stroke an engine may skip the pathLength
      normalisation and draw the 1-unit dash as a dotted line, so the end state drops the dash entirely */
   @keyframes traceDraw { 99% { stroke-dashoffset: 0; } to { stroke-dashoffset: 0; stroke-dasharray: none; } }
@@ -1318,6 +1317,10 @@ body.ke .ext-note.stale { color: var(--label); }
 body.ke .row.ext-accent { border-left-color: var(--hair-2); }
 /* the inbox compose card (KE3): one card on the list itself, recipient chips, an address line in words, one primary send */
 body.ke .tray-dump { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); gap: var(--sp-3); background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+body.ke .tray-dump.action-bare { margin: 0 0 var(--sp-3); padding: 0; background: none; border: 0; border-radius: 0; }
+body.ke .tray-dump.action-bare .tray-dump-btn { margin-left: 0; }
+/* the same outside the KE layout (a substrate source or a pre-KE manifest has no body.ke) */
+.tray-dump.action-bare { padding: 0; background: none; border: 0; }
 body.ke .tray-dump-ta { background: none; border: 0; border-radius: 0; padding: 0; resize: none; font: var(--fw-regular) var(--fs-body)/var(--lh-list) var(--sans); color: var(--text); min-height: 40px; }
 body.ke .tray-dump-ta:focus { border: 0; outline: 1px solid var(--hair-2); outline-offset: 4px; border-radius: var(--r-sm); }
 body.ke .tray-dump-ta::placeholder { color: var(--meta); }
