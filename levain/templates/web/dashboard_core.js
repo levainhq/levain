@@ -2949,8 +2949,8 @@
       job().then(release, release);
     }
   }
-  function consentQueued(job) {
-    const bad = { error: "the request could not be read" };
+  function consentQueued(job, badError) {
+    const bad = { error: badError || "the request could not be read" };
     return new Promise((resolve) => {
       consentWaiting.push(() => {
         let p;
@@ -3063,6 +3063,8 @@
   // whatever an agent said). The record shows the events the hooks kept (cut ones marked) with the session's consent
   // requests merged in by time; a page without its token says so, and a record that is gone says that.
   const SESS_NO_TOKEN = "this page carries no token, so the transcript is not shown";
+  const SESS_BAD_READ = "the transcript could not be read";
+  const sessionBodies = new Map();   // stem -> the last good body, so a redraw of the modal (a fresh view arrived) keeps an open transcript; closeModal clears it
   const SESS_BAD_TOKEN = "this page's token was not accepted, so the transcript is not shown";
   function sessionFetch(stem, headers, tryNo) {
     return fetch("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers })
@@ -3079,9 +3081,10 @@
   }
   function sessionTranscript(stem) {
     const t = window.LevainCockpitTransport;
-    const headers = t && typeof t.headers === "function" ? t.headers() : {};
-    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SESS_NO_TOKEN });
-    return sessionFetch(stem, headers, 1);
+    let headers;
+    try { headers = t && typeof t.headers === "function" ? t.headers() : {}; } catch (e) { return Promise.resolve({ error: SESS_BAD_READ }); }
+    if (!headers || !headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SESS_NO_TOKEN });
+    return consentQueued(() => sessionFetch(stem, headers, 1), SESS_BAD_READ);   // the consent fetches' two-at-a-time queue: a long Sessions list cannot stampede the server
   }
   const SESS_KIND = { prompt: "you", reply: "agent", tool: "tool", consent: "consent" };
   function sessionWhen(iso) {
@@ -3101,7 +3104,7 @@
     const sv = (x) => (typeof x === "string" ? x : "");
     const parts = [];
     parts.push(el("div", "ext-meta sess-head", [sv(b.agent), sv(b.workspace),
-      "started " + sessionWhen(b.first_seen), "last active " + sessionWhen(b.last_seen)].filter(Boolean).join(" \u00b7 ")));
+      sessionWhen(b.first_seen) && "started " + sessionWhen(b.first_seen), sessionWhen(b.last_seen) && "last active " + sessionWhen(b.last_seen)].filter(Boolean).join(" \u00b7 ")));
     if (sv(b.resume)) {
       const line = el("div", "consent-cmd");
       const code = el("code", "consent-code", sv(b.resume));
@@ -3115,10 +3118,12 @@
     }
     // one timeline, oldest first: the kept events and the consent requests by when each happened (equal times keep events first)
     const items = [];
-    for (const e of b.events) if (e && typeof e === "object") items.push({ at: sv(e.at), kind: SESS_KIND[e.kind] ? e.kind : "tool", text: sv(e.text), cut: Number.isInteger(e.cut) ? e.cut : 0 });
+    for (const e of b.events) if (e && typeof e === "object") items.push({ at: sv(e.at), kind: Object.prototype.hasOwnProperty.call(SESS_KIND, e.kind) ? e.kind : "tool", text: sv(e.text), cut: Number.isInteger(e.cut) ? e.cut : 0 });
     if (Array.isArray(b.consent)) for (const c of b.consent) if (c && typeof c === "object") items.push({ at: sv(c.at), kind: "consent", text: sessionConsentLine(c), cut: 0 });
     const keyed = items.map((it, i) => ({ it, i, ms: Date.parse(it.at) }));
-    keyed.sort((x, y) => (Number.isFinite(x.ms) && Number.isFinite(y.ms) && x.ms !== y.ms ? x.ms - y.ms : x.i - y.i));
+    // a total order: the dated items by time, the undated after them, equal keys in kept order (a comparator that falls back to the index when only one side is dated is not transitive)
+    const rank = (k) => [Number.isFinite(k.ms) ? 0 : 1, Number.isFinite(k.ms) ? k.ms : 0, k.i];
+    keyed.sort((x, y) => { const a = rank(x), c = rank(y); return a[0] - c[0] || a[1] - c[1] || a[2] - c[2]; });
     const tl = el("div", "sess-tl");
     for (const { it } of keyed) {
       const ev = el("div", "sess-ev sess-" + it.kind);
@@ -3148,11 +3153,18 @@
       slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
       sessionTranscript(stem).then((b) => {
         drawSessionTranscript(slot, b);
-        btn.disabled = false;
-        if (!b.error) btn.textContent = "refresh";
-      });
+        if (!b.error) { btn.textContent = "refresh"; sessionBodies.set(stem, b); }
+      }).catch(() => {
+        slot.replaceChildren(el("div", "consent-note ext-meta", SESS_BAD_READ));
+      }).finally(() => { btn.disabled = false; });
     });
     wrap.appendChild(btn);
+    const kept = sessionBodies.get(stem);
+    if (kept) {   // the row was rebuilt under an open transcript: draw the last body again, open
+      slot = el("div", "sess-tx ext-meta");
+      wrap.appendChild(slot);
+      try { drawSessionTranscript(slot, kept); btn.textContent = "refresh"; } catch (e) { slot.remove(); slot = null; sessionBodies.delete(stem); }
+    }
     return wrap;
   }
 
@@ -3515,6 +3527,7 @@
   function closeModal() {
     const overlay = document.getElementById("levain-modal");
     if (overlay) overlay.remove();
+    sessionBodies.clear();
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;

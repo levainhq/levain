@@ -61,3 +61,52 @@ def test_a_page_without_its_token_says_so_and_fetches_nothing(tmp_path, monkeypa
             {"eval": f"{ROW_CC}.querySelector('.sess-tx').innerText"},
         ])
     assert "carries no token" in out[-1] and "claude --resume" not in out[-1]
+
+
+STUB_KIND = ("window.fetch = (f => (u, o) => String(u).includes('/cockpit/session/') ? f(u, o).then(r => r.json().then(b => "
+             "{ b.events.push({at: '2026-10-15T10:01:00Z', kind: 'constructor', text: 'proto', cut: 0}); "
+             "return new Response(JSON.stringify(b), {status: 200}); })) : f(u, o))(window.fetch); 1")
+
+
+@needs_browser
+def test_an_event_kind_that_names_an_object_prototype_key_draws_as_a_tool_line(tmp_path, monkeypatch):
+    root, src = _fixture(tmp_path, monkeypatch)
+    _log(root, [{"at": "2026-10-15T10:00:00Z", "kind": "prompt", "text": "hi"}])
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _open_modal(f"{url}/#write_token=T", tmp_path, [
+            {"eval": STUB_KIND},
+            {"eval": f"{ROW_CC}.querySelector('.sess-tx-btn').click(); 1"},
+            {"until": f"{ROW_CC}.querySelector('.sess-ev')"},
+            {"eval": f"JSON.stringify([...{ROW_CC}.querySelectorAll('.sess-kind')].map(k => k.textContent))"},
+        ])
+    assert json.loads(out[-1]) == ["you", "tool", "consent"], out[-1]      # "constructor" is not a kind: it reads as a tool line, not "function Object()"
+
+
+@needs_browser
+def test_a_throwing_transport_ends_in_words_and_leaves_the_button_usable(tmp_path, monkeypatch):
+    _root, src = _fixture(tmp_path, monkeypatch)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _open_modal(f"{url}/#write_token=T", tmp_path, [
+            {"eval": "window.LevainCockpitTransport.headers = () => { throw new Error('boom'); }; 1"},
+            {"eval": f"{ROW_CC}.querySelector('.sess-tx-btn').click(); 1"},
+            {"until": f"/could not be read/.test({ROW_CC}.innerText)"},
+            {"eval": f"JSON.stringify({{text: {ROW_CC}.querySelector('.sess-tx').innerText, off: {ROW_CC}.querySelector('.sess-tx-btn').disabled}})"},
+        ])
+    got = json.loads(out[-1])
+    assert "could not be read" in got["text"] and "reading" not in got["text"] and got["off"] is False, got
+
+
+@needs_browser
+def test_an_open_transcript_survives_a_redraw_of_the_modal(tmp_path, monkeypatch):
+    root, src = _fixture(tmp_path, monkeypatch)
+    _log(root, [{"at": "2026-10-15T10:00:00Z", "kind": "prompt", "text": "still here"}])
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _open_modal(f"{url}/#write_token=T", tmp_path, [
+            {"eval": f"{ROW_CC}.querySelector('.sess-tx-btn').click(); 1"},
+            {"until": f"{ROW_CC}.querySelector('.sess-ev')"},
+            {"eval": "window.__box = document.querySelector('#levain-modal .modal'); window.LevainCockpitTransport.reload(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal') && document.querySelector('#levain-modal .modal') !== window.__box"},   # the modal was rebuilt
+            {"eval": f"JSON.stringify({{text: {ROW_CC}.querySelector('.sess-tx') ? {ROW_CC}.querySelector('.sess-tx').innerText : '', btn: {ROW_CC}.querySelector('.sess-tx-btn').textContent}})"},
+        ])
+    got = json.loads(out[-1])
+    assert "still here" in got["text"] and got["btn"] == "refresh", got
