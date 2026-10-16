@@ -364,7 +364,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _CUSTODY_HELP = ("How the key is held, declared in its enrol record and shown on every listing: touch-id "
                      "(a Secure Enclave key `levain cockpit key create` made), passphrase (an encrypted key file, "
-                     "checked), tpm, fido, windows-hello, or unstated. A declaration, never a proof. "
+                     "checked), tpm, fido, windows-hello, passkey (a WebAuthn passkey, display-phone keys only), or unstated. "
+                     "A declaration, never a proof. "
                      "fido-attested is refused until attestation at enrol is built.")
     ck_p = subparsers.add_parser(
         "cockpit",

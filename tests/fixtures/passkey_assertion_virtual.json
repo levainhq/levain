@@ -1,0 +1,10 @@
+{
+ "source": "Chrome 155 CDP virtual authenticator (ctap2, internal, UV), rpId localhost, origin http://localhost:8765, 2026-10-15 (levain Q6b phone test); namespace levain-consent",
+ "message": "{\"request_id\":\"req-0001\",\"decision\":\"allow\",\"request_digest\":\"sha256:abababababababababababababababababababababababababababababababab\"}",
+ "namespace": "levain-consent",
+ "rp_id": "localhost",
+ "pub_point_hex": "0474e39b7eb32a92b288e39ef8f54c7c2a8fb5ba8768233097aba0e5bd5b635d02554786b4f3fd52308cef678d93ed61ac289f2be440bd2f89c44f591fbe9807b6",
+ "authData_hex": "49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000002",
+ "clientDataJSON": "{\"type\":\"webauthn.get\",\"challenge\":\"U1NIU0lHAAAADmxldmFpbi1jb25zZW50AAAAAAAAAAZzaGE1MTIAAABAeTTIx7e3y4RJ-ezyBVQxBiVEwvzjCHZncOh0oxTMExwN2VG7VGZkMCjL1VrnAyrplxx_VHNnVQo1XUfy8U-2WQ\",\"origin\":\"http://localhost:8765\",\"crossOrigin\":false}",
+ "sig_der_hex": "3044022012ee869cb098aed9ddcab27b8156e9113d20adb736b9d4a8b623ead8c5ebb92202201fc1089fe827128a2bb15792391e9ec0525dfe636e0851dc65b75572f61c9621"
+}

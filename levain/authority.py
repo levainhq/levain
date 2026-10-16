@@ -45,7 +45,7 @@ from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anch
 
 __all__ = [
     "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "FIDO_ATTESTED", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
@@ -79,16 +79,21 @@ LAPTOP = "laptop-presence"
 # how the key was made. The replay holds the declaration to the key types it can be true of.
 UNSTATED = "unstated"
 FIDO_ATTESTED = "fido-attested"
-CUSTODIES = ("touch-id", "passphrase", "tpm", "fido", "windows-hello", FIDO_ATTESTED, UNSTATED)
+# A WebAuthn passkey (Q6b): an iCloud or Google passkey syncs to every device the account holds, so it is weaker
+# custody than a key that never leaves one machine, and it is declared as itself. It answers for display-phone only.
+PASSKEY = "passkey"
+DISPLAY_PHONE = "display-phone"
+CUSTODIES = ("touch-id", "passphrase", "tpm", "fido", "windows-hello", PASSKEY, FIDO_ATTESTED, UNSTATED)
 _SK_KEY_TYPES = frozenset({"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
 # the custody table: the key types each stated custody admits (``unstated`` is not in it)
 _CUSTODY_KEY_TYPES: Mapping[str, frozenset[str]] = MappingProxyType({
     "touch-id": _SK_KEY_TYPES, "fido": _SK_KEY_TYPES, "windows-hello": _SK_KEY_TYPES, FIDO_ATTESTED: _SK_KEY_TYPES,
     "tpm": frozenset({"ecdsa-sha2-nistp256"}),
+    PASSKEY: frozenset({"sk-ecdsa-sha2-nistp256@openssh.com"}),     # WebAuthn ES256 is the one passkey curve
     "passphrase": frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256"}),
 })
-# The laptop-presence floor IS the custody table: every stated custody is accepted for the class, so the
-# types it admits are the table's union (a carried legacy key with no stated custody stays inside it). The
+# The laptop-presence floor IS the custody table: every stated custody but ``passkey`` is accepted for the class, so
+# the types it admits are the table's union (a carried legacy key with no stated custody stays inside it). The
 # signers line never carries ``no-touch-required``, so an sk key's presence flag is still required.
 _LAPTOP_KEY_TYPES = frozenset().union(*_CUSTODY_KEY_TYPES.values())
 
@@ -103,6 +108,8 @@ def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool
     if custody == FIDO_ATTESTED:
         return (f"custody {FIDO_ATTESTED} is refused until attestation at enrol is built (it comes with the "
                 "governed install); an unattested FIDO key is custody fido")
+    if custody == PASSKEY and key_class != DISPLAY_PHONE:
+        return f"custody {PASSKEY} is for a {DISPLAY_PHONE} key only (a synced passkey never signs T3 or an enrolment)"
     if custody == UNSTATED:
         if key_class != LAPTOP:
             return None
@@ -432,6 +439,7 @@ def _signers_line(principal: str, namespace: str, public_key: str) -> str:
 _SSHSIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
 _SSHSIG_END = "-----END SSH SIGNATURE-----"
 _SK_USER_PRESENT = 0x01
+_WEBAUTHN_SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
 
 
 class _Wire:
@@ -466,7 +474,9 @@ def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     string publickey, string namespace, string reserved, string hash_algorithm, string signature.
     For an sk-* algorithm the ``signature`` string is (OpenSSH PROTOCOL.u2f §"SSH U2F signatures"):
     string sig-type, string inner signature, byte flags, uint32 counter; flags bit 0x01 is user
-    presence. Every other algorithm is string sig-type, string signature."""
+    presence. A WebAuthn signature (``webauthn-sk-ecdsa-sha2-nistp256@openssh.com``, the same section: a
+    passkey's assertion, Q6b) carries string origin, string clientData, string extensions after the
+    counter. Every other algorithm is string sig-type, string signature."""
     text = armored.strip()
     if not text.startswith(_SSHSIG_BEGIN) or not text.endswith(_SSHSIG_END):
         raise ValueError("not an armored SSH signature")
@@ -480,11 +490,15 @@ def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     outer.end()
     sig_type = inner.string().decode("ascii")
     inner.string()
-    if not sig_type.startswith("sk-"):
+    webauthn = sig_type == _WEBAUTHN_SIG_TYPE
+    if not (sig_type.startswith("sk-") or webauthn):
         inner.end()
         return sig_type, None
     flags = inner.take(1)[0]
     inner.u32()
+    if webauthn:
+        for _ in range(3):          # origin, clientData, extensions: ssh-keygen checks them against the message
+            inner.string()
     inner.end()
     return sig_type, flags
 
@@ -498,7 +512,7 @@ def presence_missing(signature: str, public_key: str) -> bool:
     except (ValueError, UnicodeError):
         return True
     key_type = public_key.split()[0] if isinstance(public_key, str) and public_key.split() else ""
-    return (key_type.startswith("sk-") or sig_type.startswith("sk-")) \
+    return (key_type.startswith("sk-") or sig_type.startswith("sk-") or sig_type == _WEBAUTHN_SIG_TYPE) \
         and (flags is None or not flags & _SK_USER_PRESENT)
 
 
