@@ -320,6 +320,9 @@ class _Snap:
     # applied from these at render, from the request's snapshot
     label_keys: dict[str, LabelKey] | None = None
     value_label_key: LabelKey | None = None
+    # rows the provider marked ``held`` (a Tray spore whose surface date has not come): listed apart so
+    # ``rows``, its counts, groups and orders stay what they were for every reader that does not know them
+    held: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1211,14 +1214,20 @@ class Cockpit:
             rows, refused = self._rows(spec, list(res.rows), ctx)
             if refused:
                 skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
+            label_ids = {r["id"] for r in rows}
+            held = sorted((r for r in rows if r["facets"].get("held") is True),
+                          key=lambda r: (r["facets"].get("due") or "", r["id"]))
+            if held:
+                rows = [r for r in rows if r["facets"].get("held") is not True]
             status = "partial" if skipped else ("empty" if not counted_rows(spec.order, rows) else "ok")
             value = None
             # the views' orders are computed here, in the read worker, like every other ordering: an
             # ordering key runs on provider data, so its failure is this read's Fault, never a crash
             view_order = self._view_order(spec, rows, ctx.today) if spec.views else None
-            label_keys = self._label_keys(spec, list(res.rows), {r["id"] for r in rows})
+            label_keys = self._label_keys(spec, list(res.rows), label_ids)
             value_key = None
         else:
+            held = []
             view_order = None
             if res.value is None:
                 raise ValueError(f"a {spec.kind} Read carries a value")
@@ -1233,7 +1242,7 @@ class Cockpit:
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
                      value["value_version"] if spec.kind in VERSIONED_VALUE_KINDS else None, view_order,
-                     label_keys, value_key)
+                     label_keys, value_key, held)
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
@@ -1373,6 +1382,8 @@ class Cockpit:
         return _sha({"schema": SCHEMA, "status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
+                     # a panel with no held rows hashes exactly as it did before they existed
+                     **({"held": snap.held} if snap.held else {}),
                      "verbs": self._verb_rev(auth),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
                      **({"views": [list(v) for v in views]} if views else {}),
@@ -1797,6 +1808,7 @@ class Cockpit:
             head, rows = self._now_head_and_rows(ctx, credential_class, specs_map)
             spec = None
             snap_rows: list[dict[str, Any]] | None = rows
+            held_rows: list[dict[str, Any]] = []
             value = None
             view_order = None
         else:
@@ -1808,6 +1820,7 @@ class Cockpit:
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
             if snap_rows is not None:
                 snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
+            held_rows = self._with_provenance(snap.held, snap.label_keys, auth.labels) if snap.held else []
             if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
                 value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
         out: dict[str, Any] = dict(head)
@@ -1817,7 +1830,7 @@ class Cockpit:
         if head["kind"] in ROW_ENGINE_KINDS:
             rows_all = snap_rows or []
             if row is not None:
-                hit = [r for r in rows_all if r["id"] == row]
+                hit = [r for r in rows_all + held_rows if r["id"] == row]
                 out["rows"] = self._with_actions(hit, panel_id, credential_class, ctx.today, auth)
                 if not hit:
                     raise RowNotFound(row)
@@ -1849,6 +1862,7 @@ class Cockpit:
                         rows_all, matched = [], None
                 else:
                     keep = [r for r in rows_all if _terms_match([_field_text(r, f) for f in fields], q)]
+                    held_rows = [r for r in held_rows if _terms_match([_field_text(r, f) for f in fields], q)]
                     matched = len(keep)
                     rows_all = keep
                     out["match_label"] = (f"searches the newest {spec.window} only: {matched} of {held}"
@@ -1870,11 +1884,15 @@ class Cockpit:
                 out["rows"] = rows_all
             if matched is not None:
                 out["matched"] = matched
+            if held_rows and (profile != "compact" or q or head["priority"] == "gate"):
+                out["held"] = [{**r, "body": None} for r in held_rows] if profile == "compact" else held_rows
             if spec is not None and spec.views and out["rows"] is not None and view_order is not None:
                 sent = {r["id"] for r in rows_all}
                 out["view_rows"] = {v: [i for i in ids if i in sent] for v, ids in view_order.items()}
             if out["rows"] is not None and not out.get("rows_by_ref"):
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today, auth)
+            if out.get("held"):
+                out["held"] = self._with_actions(out["held"], panel_id, credential_class, ctx.today, auth)
         else:
             if head["kind"] in VALUE_ROW_KINDS and isinstance(value, dict):
                 if q and spec is not None:
@@ -1901,11 +1919,13 @@ class Cockpit:
         that is empty today can still have store matches), and its validator covers what it returned,
         so a revalidation never 304s on results that changed or a search that recovered."""
         shown = out["rows"] if out["rows"] is not None else (out["value"] or {}).get("rows")
+        shown = shown or out.get("held")
         if out["status"] in ("ok", "empty") and "search_error" not in out:
             out["status"] = "ok" if shown else "empty"
         out["etag"] = _sha({"base": out["etag"], "status": out["status"], "rows": out["rows"], "value": out["value"],
                             "matched": out.get("matched"), "label": out.get("match_label"),
-                            "error": out.get("search_error")})
+                            "error": out.get("search_error"),
+                            **({"held": out["held"]} if out.get("held") else {})})
 
     def _store_search(self, spec: ProviderSpec, q: str, limit: int) -> tuple[list[Any], int | None, str | None]:
         """Run the provider's ``search(q, limit)`` hook, bounded by the panel's own timeout. Returns

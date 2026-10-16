@@ -136,6 +136,18 @@
   // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
   // ("" = all). Both are display choices that survive a refresh re-render in the same page.
   let trayView = "";
+  // Whether the Tray lists the rows held until their surface date. Per viewer and per browser: it is a display
+  // choice, so it lives in localStorage (which may be absent or throw) and never on the server. Default hidden.
+  const HELD_KEY = "levain.tray.showHeld";
+  let trayHeldShown = false;
+  try { trayHeldShown = window.localStorage.getItem(HELD_KEY) === "1"; } catch (e) { trayHeldShown = false; }
+  const saveHeldShown = () => { try { window.localStorage.setItem(HELD_KEY, trayHeldShown ? "1" : "0"); } catch (e) { /* the choice then lasts this page only */ } };
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  // "2026-10-22" -> "Oct 22", from the digits alone (a Date would shift the day by the zone)
+  const surfaceLabel = (due) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(due || ""));
+    return m && MONTHS[+m[2] - 1] ? MONTHS[+m[2] - 1] + " " + (+m[3]) : String(due || "");
+  };
   let episodeAgent = "";
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
@@ -1218,7 +1230,12 @@
     else badge = s.tier;
     if (badge) row.appendChild(tagEl("tier", badge));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
-    if (s.next) {
+    if (s.held) {
+      row.dataset.held = "1";
+      const sf = tagEl("muted", "surfaces " + surfaceLabel(s.next));
+      sf.setAttribute("data-ck-tag-state", "held");
+      row.appendChild(sf);
+    } else if (s.next) {
       const due = tagEl("muted", "→ " + s.next);
       if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
       row.appendChild(due);
@@ -1247,13 +1264,14 @@
     p.appendChild(results);
     const render = (raw) => {
       const q = raw.trim().toLowerCase();
-      const base = opts && opts.pick ? opts.pick(all) : all;
+      const picked = opts && opts.pick ? opts.pick(all) : all;
+      const base = opts && opts.extra ? picked.concat(opts.extra()) : picked;   // rows listed apart, filtered with the rest
       const rows = q
         ? base.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                             String(s.id || "").toLowerCase().includes(q))
         : base;
       results.replaceChildren();
-      if (rows.length === 0) results.appendChild(el("p", "empty", "no " + noun + " match “" + raw.trim() + "”"));
+      if (rows.length === 0) results.appendChild(el("p", "empty", q || !(opts && opts.empty) ? "no " + noun + " match “" + raw.trim() + "”" : opts.empty));
       else drawRows(rows, results);
       status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
       const b = results.closest(".pbody"); if (b) measureOverflow(b);
@@ -1278,13 +1296,31 @@
     // Tray/Keep their own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
+    // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
+    const held = entry.kind === "tray" && Array.isArray(view.tray_held) ? view.tray_held : [];
+    if ((!list || list.length === 0) && held.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
     const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
     const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
-    const opts = views.length ? {
+    const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
+    const opts = views.length || heldLine ? {
+      empty: emptyMsg,
+      extra: () => (heldLine && trayHeldShown ? held : []),
       controls: (bar, redraw) => {
+        if (heldLine) {
+          const line = el("div", "ext-note held-line");
+          line.appendChild(el("span", null, heldLine.count + " held back — " + heldLine.reason + " "));
+          const tog = el("button", "held-toggle");
+          tog.type = "button";
+          tog.dataset.heldToggle = "1";
+          const label = () => { tog.textContent = trayHeldShown ? "hide" : "show"; tog.setAttribute("aria-expanded", trayHeldShown ? "true" : "false"); };
+          label();
+          tog.addEventListener("click", () => { trayHeldShown = !trayHeldShown; saveHeldShown(); label(); redraw(); });
+          line.appendChild(tog);
+          bar.after(line);
+        }
+        if (!views.length) return;
         const sel = el("select", "tray-dump-type");
         sel.setAttribute("aria-label", "Tray order");
         sel.appendChild(Object.assign(el("option", null, "Tray order"), { value: "" }));
@@ -1294,7 +1330,7 @@
         bar.appendChild(sel);
       },
       pick: (all) => {
-        const ids = viewOf() ? view.tray_view_rows[viewOf()] : null;
+        const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
@@ -1303,13 +1339,15 @@
           .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
       },
     } : undefined;
-    mountSporeFilter(p, list, "items", entry.kind, (rows, results) => {
+    mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
+      let heldHead = false;
       for (const s of rows) {
+        if (s.held && !heldHead) { heldHead = true; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup && !viewOf()) results.appendChild(el("div", "grp-head", s.group_title));
+        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) results.appendChild(el("div", "grp-head", s.group_title));
         lastGroup = g;
         results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
       }

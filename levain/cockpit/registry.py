@@ -64,6 +64,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "overdue_days": ("int", _is_int),
     "held_until": ("date|null", _opt(_is_date)),
     "handoff_expired": ("bool", _is_bool),
+    "held": ("bool", _is_bool),          # a Tray row whose surface date has not come: listed apart from the due rows
     "last_seen": ("timestamp|null", _opt(_is_str)),
     "source": ("str", _is_str),
     "for": ("str", _is_str),            # who an inbox message is addressed to (readers, comma-joined); absent = everyone

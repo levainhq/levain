@@ -113,18 +113,26 @@
     const t = targetOf(pid, row);
     return Object.assign({
       id: bare(row.id), age: ageOf(row), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
-      disposition: f.disposition, text: row.body || row.title, next: f.due || null,
+      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
+
+  // the reason the Tray gives for a spore it holds until its surface date
+  const HELD_REASON = "surface date not reached";
 
   // a stale or partial panel keeps rendering its rows, under a banner saying so
   function bannerOf(head, panel, now) {
     const out = [];
     if (head.status === "stale") out.push({ tone: "stale", text: "STALE: last read " + (ageLabel(head.as_of, now, "") || "unknown") });
     if (head.status === "partial") for (const s of head.skipped || []) out.push({ tone: "stale", text: "PARTIAL: " + s.count + " unreadable — " + s.reason });
-    for (const f of head.filtered || []) out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
+    // a panel that lists its held rows draws that line itself, as the control that shows them
+    const held = Array.isArray(panel.held) && panel.held.length > 0;
+    for (const f of head.filtered || []) {
+      if (held && f.reason === HELD_REASON) continue;
+      out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
+    }
     if (head.note) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
     for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", alert: true, text: "! " + a.message });
@@ -468,7 +476,7 @@
     const hiddenRows = new Set();
     for (const key of Object.keys(raw.panels || {})) {
       const rp = raw.panels[key];
-      for (const r of (isObj(rp) && Array.isArray(rp.rows) ? rp.rows : [])) {
+      for (const r of (isObj(rp) ? (Array.isArray(rp.rows) ? rp.rows : []).concat(Array.isArray(rp.held) ? rp.held : []) : [])) {
         if (!isObj(r) || typeof r.id !== "string") continue;
         if ([r.body, r.title].some((t) => typeof t === "string" && visible(t) !== t)) hiddenRows.add(visible(r.id));
       }
@@ -588,12 +596,13 @@
       // what this panel lets the operator do: its own actions (a create, a value write, a downstream verb)
       // and the actions its rows carry. The page offers a verb only where the kernel offered one.
       const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
-      const rowsAct = rows.some((r) => r && Array.isArray(r.actions) && r.actions.length);
+      const heldRows = nat === "tray" && Array.isArray(panel.held) ? panel.held : [];
+      const rowsAct = rows.concat(heldRows).some((r) => r && Array.isArray(r.actions) && r.actions.length);
       if (pActions.length) {
         const pv = isObj(panel.value) && typeof panel.value.value_version === "string" ? panel.value.value_version : null;
         view.targets.panels[pid] = { actions: pActions, panel_version: pv };
       }
-      for (const r of rows) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
+      for (const r of rows.concat(heldRows)) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
         view.targets.rows[r.id] = targetOf(pid, r);
       }
       // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
@@ -603,6 +612,11 @@
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+        if (heldRows.length) {
+          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+          const hf = (head.filtered || []).find((f) => f && f.reason === HELD_REASON);
+          view.tray_held_line = { count: hf && isNum(hf.count) ? hf.count : heldRows.length, reason: HELD_REASON };
+        }
         if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));

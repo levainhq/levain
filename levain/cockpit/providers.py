@@ -65,7 +65,7 @@ SPORE_VERSION_EXCLUDED = ("seen", "origin_key")
 SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
-    "handoff_expired", "last_seen", "age_days",
+    "handoff_expired", "last_seen", "age_days", "held",
 })
 # the Tray's second view (2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
 # a second box): the same rows, oldest first
@@ -104,7 +104,7 @@ def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
     return None
 
 
-def _spore_row(s: Any, today: date) -> RowIn:
+def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
     due = parse_date(s.next)
     seen = parse_date(s.seen)
     expired = bool(
@@ -115,6 +115,9 @@ def _spore_row(s: Any, today: date) -> RowIn:
         "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
         "due": due.isoformat() if due else None,
     }
+    if held:
+        # a Tray row whose surface date has not come: the kernel lists it apart from the due rows
+        facets["held"] = True
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
     created = parse_date(s.created)
@@ -174,17 +177,23 @@ def _spore_provider(
         items = {"tray": view.tray, "loops": view.open_spores, "keep": view.keep}[bucket]
         filtered = 0
         rows = []
+        held_rows = []
         for s in items:
             if apply_hold and bucket == "tray" and (d := parse_date(s.next)) and d > ctx.today:
                 filtered += 1           # surface date not reached: held on purpose, not unreadable
+                held_rows.append(_spore_row(s, ctx.today, held=True))
                 continue
             rows.append(_spore_row(s, ctx.today))
         view_full = len(items) >= VIEW_SPORE_LIMIT
         over = max(0, len(rows) - SPORE_CAP) if apply_hold else 0
+        over_held = max(0, len(held_rows) - SPORE_CAP)
         rows = rows[:SPORE_CAP] if apply_hold else rows
+        rows += held_rows[:SPORE_CAP]
         skipped = ()
         if over:
             skipped += ((over, f"over the display cap of {SPORE_CAP}"),)
+        if over_held:
+            skipped += ((over_held, f"held rows over the display cap of {SPORE_CAP}"),)
         if view_full:
             skipped += ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),

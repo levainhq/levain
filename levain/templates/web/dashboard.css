@@ -304,6 +304,12 @@
      .clause/.row machinery, so per-item expand + line-clamp are inherited, not re-invented. */
   .ext-note { color: var(--dim); font-size: var(--fs-micro); margin: var(--sp-1) 0 var(--sp-3); }
   .ext-note.stale { color: var(--operate); }
+  .held-line { display: flex; align-items: baseline; gap: var(--sp-2); }
+  .held-toggle { cursor: pointer; background: none; border: 0; padding: 0; font: inherit; color: var(--label);
+    text-decoration: underline; text-decoration-color: var(--hair-2); text-underline-offset: 3px; }
+  .held-toggle:hover { color: var(--text); }
+  /* the date a held row surfaces is the reason it is listed here: the meta line's ellipsis never cuts it */
+  body.ke .row[data-held] > [data-ck-tag-state="held"] { overflow: visible !important; text-overflow: clip !important; }
   .grp-head { color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase;
     margin: var(--sp-3) 0 var(--sp-1); padding-top: var(--sp-2); border-top: 1px solid var(--line); }
   .grp-head:first-child { border-top: 0; margin-top: 0; }
