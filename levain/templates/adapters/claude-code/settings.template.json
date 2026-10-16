@@ -50,6 +50,16 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{PYTHON}}\" \"${CLAUDE_PROJECT_DIR}/activation/hooks/post_tool_use.py\""
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

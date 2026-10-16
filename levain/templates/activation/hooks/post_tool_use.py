@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Levain activation — PostToolUse hook (Claude Code): the transcript's `tool` line (Q8).
 
+Claude Code also runs it for PostToolUseFailure (a tool that ran and failed fires only that event; measured on
+2.1.301 in Q8_RUN), with the same tool_name / tool_input, so a failed tool has its line too.
+
 Records each tool the agent ran as `<tool_name>` or `<tool_name>: <summary>`, the summary being a
 shell tool's `command` (first line only), an apply_patch patch's first file header, or a file
-tool's `file_path`. `tool_response` is NEVER read: its
+tool's `file_path` (a notebook tool's `notebook_path`). `tool_response` is NEVER read: its
 shape differs per agent and it can carry anything. A DISPLAY for the cockpit, never an authority.
 
 Prints NOTHING and exits 0 always. FAIL-OPEN — the hook import is guarded and main() swallows
@@ -39,9 +42,10 @@ def _summary(tool_name, tool_input) -> str | None:
         m = _PATCH_HEADER.search(command)
         if m and m.group(1):
             return m.group(1)
-    path = tool_input.get("file_path")
-    if isinstance(path, str) and path:
-        return path
+    for key in ("file_path", "notebook_path"):
+        path = tool_input.get(key)
+        if isinstance(path, str) and path:
+            return path
     return None
 
 

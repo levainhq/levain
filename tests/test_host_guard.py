@@ -93,7 +93,7 @@ def test_deny_write_covers_hooks_and_store(ent):
 def test_hook_commands_are_rewritten_from_the_package_template(ent, tmp_path):
     py = sys.executable
     hooks = hg.cc_hook_settings(ent, py, tmp_path / "pyc")
-    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
+    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop"}
     real = os.path.realpath(ent)
     for groups in hooks.values():
         for g in groups:

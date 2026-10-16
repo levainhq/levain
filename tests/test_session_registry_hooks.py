@@ -438,3 +438,11 @@ def test_what_the_hooks_write_is_what_the_cockpit_reader_reads(agent_root):
     assert body is not None and body["agent"] == agent and body["skipped"] == 0
     assert [(e["kind"], e["cut"]) for e in body["events"]] == [("prompt", 1000), ("tool", 0), ("reply", 0)]
     assert body["events"][-1]["text"] == "all done" and body["resume"].startswith("cd -- /w && ")
+
+
+def test_a_notebook_tool_logs_its_path(agent_root):
+    agent, root = agent_root
+    proc = _run(root, "post_tool_use.py", {"session_id": "s9", "cwd": "/w", "tool_name": "NotebookEdit",
+                                           "tool_input": {"notebook_path": "/w/n.ipynb", "new_source": "x"}})
+    assert proc.returncode == 0 and proc.stdout == ""
+    assert [e["text"] for e in _events(root, agent, "s9")] == ["NotebookEdit: /w/n.ipynb"]
