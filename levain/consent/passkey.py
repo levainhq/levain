@@ -33,7 +33,7 @@ import urllib.parse
 
 from levain.consent.record import ANSWER_NAMESPACE
 
-__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "b64url_decode", "challenge", "key_application",
+__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "b64url_decode", "challenge", "is_host_name", "key_application",
            "public_key_line", "to_sshsig"]
 
 KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
@@ -80,6 +80,11 @@ def challenge(message: bytes, namespace: str = ANSWER_NAMESPACE) -> bytes:
     """The bytes a passkey signs (as its WebAuthn challenge) to sign ``message`` in ``namespace``."""
     return (b"SSHSIG" + _string(namespace) + _string(b"") + _string(_HASH_ALG)
             + _string(hashlib.sha512(message).digest()))
+
+
+def is_host_name(text: object) -> bool:
+    """True for a lowercase DNS host name with no scheme, port or path: what an rpId (and a proxied https name) is."""
+    return isinstance(text, str) and _RP_ID.fullmatch(text) is not None
 
 
 def _rp_id(rp_id: object) -> str:
