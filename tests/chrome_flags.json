@@ -1,0 +1,1 @@
+{"flags": ["--headless=new", "--use-mock-keychain", "--password-store=basic"]}

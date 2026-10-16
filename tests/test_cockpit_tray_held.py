@@ -259,3 +259,20 @@ def test_a_tray_with_only_held_rows_still_offers_them(tmp_path: Path) -> None:
             {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
         ])
     assert out["values"][1][0] == 1 and out["values"][2] == 2, out
+
+
+@needs_browser
+def test_a_filter_matching_only_hidden_held_rows_says_so_and_offers_to_show_them(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path)
+    type_q = (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = 'sooner'; "
+              "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": WAIT},
+            {"eval": type_q},
+            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, {ALL_ROWS}.length]"},
+            {"eval": f"{TRAY}.querySelector('[data-held-show-matches]').click(); [{HELD_ROWS}.length, {TOGGLE}.textContent]"},
+        ])
+    v = out["values"]
+    assert "no items match" in v[2][0] and "1 held row matches" in v[2][0] and v[2][1] == 0, v
+    assert v[3] == [1, "hide"], v

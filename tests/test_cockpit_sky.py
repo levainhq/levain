@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._page_drive_run import run as run_driver
+
 ROOT = Path(__file__).resolve().parents[1]
 SKY = ROOT / "levain" / "templates" / "web" / "sky.js"
 REPLAY = ROOT / "tests" / "sky_replay"
@@ -55,7 +57,7 @@ def test_pinned_rows_replace_the_busiest_and_a_single_repo_rows_are_event_types(
 
 @pytest.mark.skipif(NODE is None or CHROME is None, reason="node or headless Chrome not installed")
 def test_frame_loop_stops_after_the_last_meteor_settles():
-    run = subprocess.run([NODE, str(REPLAY / "run_cdp.mjs"), CHROME], capture_output=True, text=True, timeout=120)
+    run = run_driver([NODE, str(REPLAY / "run_cdp.mjs"), CHROME], timeout=120)
     assert run.returncode == 0, "run_cdp.mjs failed:\n" + run.stdout[-2000:] + "\n" + run.stderr[-2000:]
     out = run.stdout
     lines = [ln for ln in out.splitlines() if "RESULT" in ln]

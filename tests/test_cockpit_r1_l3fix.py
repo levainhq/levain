@@ -9,6 +9,7 @@ from pathlib import Path
 from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
+from tests._chrome_flags import CHROME_SAFE_FLAGS
 from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
@@ -76,7 +77,7 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
 def _dump(url: str) -> str:
-    return run_driver([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000",
+    return run_driver([CHROME, *CHROME_SAFE_FLAGS, "--dump-dom", "--virtual-time-budget=8000",
                        "--window-size=1440,1000", url], timeout=90).stdout
 
 

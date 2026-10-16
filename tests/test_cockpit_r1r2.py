@@ -22,6 +22,7 @@ import pytest
 from levain.cockpit import Cockpit, Fault, ProviderSpec, Read, RowIn, register_ordering
 from levain.cockpit.registry import Ordering
 from levain.cockpit.text import render_lines, snapshot, visible
+from tests._chrome_flags import CHROME_SAFE_FLAGS
 from tests._page_drive_run import run as run_driver
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
@@ -582,7 +583,7 @@ class TestManifestMapperParses:
 
 
 def _dump_dom(url: str) -> str:
-    return run_driver([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
+    return run_driver([CHROME, *CHROME_SAFE_FLAGS, "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
                       timeout=60).stdout
 
 

@@ -1250,7 +1250,10 @@
   // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
   // FILTER-EXTRACT-START (a node test lifts this block)
   // opts (optional): controls(bar, redraw) adds in-panel controls to the bar; pick(list) returns the
-  // rows to filter (a view's own order), re-read on every redraw.
+  // rows to filter (a view's own order), re-read on every redraw; extra() returns rows listed apart that are
+  // filtered with the rest; empty is the message shown when nothing is listed and there is no query;
+  // unlisted() returns rows that are not listed now (held back) but would be searched, so an empty result
+  // can say how many of them match the query and offer to show them (hintShow(n, show) builds that offer).
   function mountSporeFilter(p, all, noun, kind, drawRows, opts) {
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
@@ -1266,13 +1269,16 @@
       const q = raw.trim().toLowerCase();
       const picked = opts && opts.pick ? opts.pick(all) : all;
       const base = opts && opts.extra ? picked.concat(opts.extra()) : picked;   // rows listed apart, filtered with the rest
-      const rows = q
-        ? base.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
-                            String(s.id || "").toLowerCase().includes(q))
-        : base;
+      const hit = (s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+                         String(s.id || "").toLowerCase().includes(q);
+      const rows = q ? base.filter(hit) : base;
       results.replaceChildren();
-      if (rows.length === 0) results.appendChild(el("p", "empty", q || !(opts && opts.empty) ? "no " + noun + " match “" + raw.trim() + "”" : opts.empty));
-      else drawRows(rows, results);
+      if (rows.length === 0) {
+        const note = el("p", "empty", q || !(opts && opts.empty) ? "no " + noun + " match “" + raw.trim() + "”" : opts.empty);
+        const unlisted = q && opts && opts.unlisted ? opts.unlisted().filter(hit).length : 0;
+        if (unlisted && opts.hintShow) opts.hintShow(note, unlisted);
+        results.appendChild(note);
+      } else drawRows(rows, results);
       status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
       const b = results.closest(".pbody"); if (b) measureOverflow(b);
       measureClauses(results);
@@ -1298,6 +1304,8 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
     const held = entry.kind === "tray" && Array.isArray(view.tray_held) ? view.tray_held : [];
+    // no held row left: forget a stored "show", so the next held item does not appear already open
+    if (entry.kind === "tray" && held.length === 0 && trayHeldShown) { trayHeldShown = false; saveHeldShown(); }
     if ((!list || list.length === 0) && held.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
@@ -1307,6 +1315,16 @@
     const opts = views.length || heldLine ? {
       empty: emptyMsg,
       extra: () => (heldLine && trayHeldShown ? held : []),
+      unlisted: () => (heldLine && !trayHeldShown ? held : []),
+      hintShow: (note, n) => {
+        note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
+        const go = el("button", "held-toggle");
+        go.type = "button";
+        go.dataset.heldShowMatches = "1";
+        go.textContent = "show";
+        go.addEventListener("click", () => { const t = p.querySelector("[data-held-toggle]"); if (t) t.click(); });
+        note.appendChild(go);
+      },
       controls: (bar, redraw) => {
         if (heldLine) {
           const line = el("div", "ext-note held-line");

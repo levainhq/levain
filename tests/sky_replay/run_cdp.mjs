@@ -9,9 +9,23 @@ import { fileURLToPath } from 'node:url';
 const [chrome, outdir = '-'] = process.argv.slice(2);
 const here = dirname(fileURLToPath(import.meta.url));
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
-const proc = spawn(chrome, ['--headless=new', '--use-mock-keychain', '--password-store=basic', '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
+const chromeFlags = JSON.parse(readFileSync(join(here, '..', 'chrome_flags.json'), 'utf8')).flags;
+const proc = spawn(chrome, [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Chrome must not outlive this process on any exit node can see (a signal, a thrown error, the parent dying);
+// a SIGKILL is invisible to node, and the Python runner (tests/_page_drive_run.py) kills the whole process group.
+const scratch = /\/levain-run-[^/]+\/?$/.test(tmpdir()) ? tmpdir() : null;   // the runner's own TMPDIR; see _page_drive.mjs
+const cleanup = () => { try { proc.kill(); } catch {} try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); if (scratch) rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} };
+const bail = (code) => {
+  const fin = () => { cleanup(); process.exit(code); };
+  if (exited || proc.exitCode !== null || proc.signalCode !== null) return fin();
+  proc.once('exit', fin); setTimeout(fin, 3000); proc.kill('SIGKILL');
+};
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => bail(130));
+process.on('exit', cleanup);
+const parent = process.ppid;
+setInterval(() => { if (process.ppid !== parent) bail(130); }, 1000).unref();
 // Chrome picks a free port itself (port 0) and writes it to <profile>/DevToolsActivePort, the way Puppeteer finds
 // it: a guessed port could collide with another Chrome on the runner, which CI hit as "no chrome target".
 let exited = null;
