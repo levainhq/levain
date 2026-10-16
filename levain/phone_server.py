@@ -361,6 +361,7 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     import subprocess
 
     from levain.consent.passkey import is_host_name
+    from levain.launch import child_env
 
     exe = shutil.which("tailscale")
     if exe is None:
@@ -369,7 +370,7 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     for sock in _TAILSCALE_SOCKETS:
         argv = [exe, *([] if sock is None else [f"--socket={sock}"]), "status", "--json"]
         try:
-            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=child_env())
             data = json.loads(cp.stdout) if cp.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired, ValueError):
             data = None
