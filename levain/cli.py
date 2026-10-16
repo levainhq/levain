@@ -204,6 +204,18 @@ def main(argv: list[str] | None = None) -> int:
             "to change it."
         ),
     )
+    init_p.add_argument(
+        "--consent-hook",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "The consent hook (claude-code and codex adapters). `on` (the default) wires levain's "
+            "PermissionRequest hook, which answers only with a signed answer or a standing grant and otherwise "
+            "lets the agent's own dialog ask you. `off` wires no consent hook, for a session that should run "
+            "without one. The choice is kept in .levain/config.json, so `levain update` and `init --force` keep "
+            "it; give --consent-hook again to change it."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -1358,9 +1370,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print("levain init: --answers-template cannot be combined with --messaging (it installs "
                   "nothing, so there is no posture to set).")
             return 1
+        if args.consent_hook is not None:
+            print("levain init: --answers-template cannot be combined with --consent-hook (it installs "
+                  "nothing).")
+            return 1
         from levain.install import run_answers_template
 
         return run_answers_template(packs=args.pack)
+
+    if args.consent_hook is not None and args.web:
+        print("levain init: --consent-hook cannot be combined with --web; drop --web, or run "
+              "`levain init --consent-hook ...` in the terminal.")
+        return 1
 
     if args.messaging is not None and args.web:
         print("levain init: --messaging cannot be combined with --web; drop --web, or run "
@@ -1409,6 +1430,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         packs=args.pack,
         answers_file=args.answers,
         messaging=args.messaging,
+        consent_hook=args.consent_hook,
     )
 
 

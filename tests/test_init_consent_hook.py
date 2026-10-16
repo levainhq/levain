@@ -57,7 +57,8 @@ def test_codex_init_wires_the_consent_hook_in_the_global_file(make_install, tmp_
     (group,) = _consent_groups(_cj(tmp_path))
     script = cx / "activation" / "hooks" / "consent_codex.py"
     (handler,) = group["hooks"]
-    assert handler["command"] == claude_code.hook_command(sys.executable, script)
+    # machine-wide: through levain.hookrun, so a gone install never blocks Codex (exit 2)
+    assert handler["command"] == claude_code.machine_wide_hook_command(sys.executable, script)
     assert handler["timeout"] == claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)
     assert script.is_file() and not (cx / "activation" / "hooks" / "consent_claude_code.py").exists()
     assert set(json.loads(_cj(tmp_path).read_text())["hooks"]) == {
@@ -302,3 +303,88 @@ def test_the_static_scripts_carry_the_isolate_prelude(rel, module):
     assert claude_code.ISOLATE_PRELUDE in text
     assert f"    from {module} import main\n" in text and text.endswith("sys.exit(main([]))\n")
     assert "{{" not in text  # nothing for the activation copy to substitute
+
+
+# --- update creates the settings file; --consent-hook off ----------------------------------------------------
+
+def test_update_creates_a_missing_settings_file_create_only(make_install, capsys):
+    cc = make_install("cc")
+    path = _settings_file(claude_code.SETTINGS_NAME)
+    path.unlink()
+    refresh_adapter(cc, apply=True, emit=print)
+    assert json.loads(path.read_text())["cockpit_data_root"] == os.path.realpath(cc / ".levain" / "cockpit")
+    assert "consent settings:" in capsys.readouterr().out
+    path.write_text(json.dumps({"cockpit_data_root": "/elsewhere", "away_mode": True, "away_hold_seconds": 5}))
+    refresh_adapter(cc, apply=True, emit=lambda _l: None)
+    assert json.loads(path.read_text())["cockpit_data_root"] == "/elsewhere"
+
+
+def test_update_of_an_install_whose_codex_file_another_holds_writes_no_settings(make_install):
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    path = _settings_file(codex.SETTINGS_NAME)
+    path.unlink()
+    refresh_adapter(a, apply=True, emit=lambda _l: None)
+    assert not path.exists()
+
+
+def _init(tmp_path, capsys, name, adapter, **kw):
+    from tests.test_init_answers import _filled
+
+    af = tmp_path / f"{name}-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    rc = inst.run_init(tmp_path / name, adapter, answers_file=af, **kw)
+    out = capsys.readouterr().out
+    return rc, tmp_path / name, out
+
+
+@pytest.mark.parametrize("adapter", ["claude-code", "codex"])
+def test_consent_hook_off_wires_nothing_and_update_keeps_it_off(make_install, tmp_path, capsys, adapter):
+    rc, install, out = _init(tmp_path, capsys, "x", adapter, force=False, consent_hook="off")
+    assert rc == 0, out
+    target = install / ".claude" / "settings.json" if adapter == "claude-code" else _cj(tmp_path)
+    assert _consent_groups(target) == []
+    assert json.loads((install / ".levain" / "config.json").read_text())["consent_hook"] == "off"
+    assert "consent hook: off" in out
+    for name in (claude_code.SETTINGS_NAME, codex.SETTINGS_NAME):
+        assert not _settings_file(name).exists()
+    before = target.read_bytes()
+    r = refresh_adapter(install, apply=True, emit=lambda _l: None)
+    assert r.review == [], r
+    assert target.read_bytes() == before
+    label = "Claude Code" if adapter == "claude-code" else "Codex"
+    checks = doctor._check_claude_code(install) if adapter == "claude-code" else doctor._check_codex(install)
+    row = _row(checks, f"{label} consent hook")
+    assert row.ok and not row.warn and "off" in row.detail, row
+    (pin,) = doctor._check_agent_hook_pins(install)
+    assert pin.ok and not pin.warn, pin
+    # and back on, explicitly
+    rc, _, out = _init(tmp_path, capsys, "x", adapter, force=True, consent_hook="on")
+    assert rc == 0, out
+    assert len(_consent_groups(target)) == 1
+    assert json.loads((install / ".levain" / "config.json").read_text())["consent_hook"] == "on"
+
+
+def test_init_force_without_the_flag_keeps_off(make_install, tmp_path, capsys):
+    rc, install, _ = _init(tmp_path, capsys, "x", "claude-code", force=False, consent_hook="off")
+    assert rc == 0
+    rc, _, out = _init(tmp_path, capsys, "x", "claude-code", force=True)
+    assert rc == 0, out
+    assert _consent_groups(install / ".claude" / "settings.json") == []
+
+
+def test_a_bad_consent_hook_value_is_refused_before_anything_is_written(make_install, tmp_path, capsys):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code", force=False, consent_hook="maybe")
+    assert rc == 1 and "--consent-hook must be one of" in out
+    assert not install.exists()
+
+
+@pytest.mark.parametrize("shape", ["plain", "flags", "hookrun"])
+def test_every_levain_consent_shape_is_ours_and_lookalikes_are_not(tmp_path, shape):
+    script = tmp_path / "activation" / "hooks" / "consent_codex.py"
+    cmd = {"plain": f"/usr/bin/python3 {script}", "flags": claude_code.hook_command("/usr/bin/python3", script),
+           "hookrun": claude_code.machine_wide_hook_command("/usr/bin/python3", script)}[shape]
+    assert claude_code._is_ours({"command": cmd}, "other", script)
+    for bad in (f"/usr/bin/python3 -m levain.hookrun {script}", f"/usr/bin/python3 -EP -m evil {script}",
+                f"/usr/bin/python3 -EP -m levain.hookrun {script}x"):
+        assert not claude_code._is_ours({"command": bad}, "other", script), bad
