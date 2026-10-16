@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>levain · consent</title>
+<link rel="stylesheet" href="/phone.css">
+</head>
+<body>
+<header class="top">
+  <h1>levain <span class="sub">consent</span></h1>
+  <button type="button" id="refresh" class="quiet">refresh</button>
+</header>
+<p id="status" class="status" role="status">reading the queue…</p>
+<main id="requests"></main>
+<section id="enrol" class="enrol" hidden>
+  <h2>this phone's passkey</h2>
+  <p id="enrol-note" class="meta"></p>
+  <button type="button" id="enrol-btn">make a passkey here</button>
+  <div id="enrol-out"></div>
+</section>
+<script src="/phone.js"></script>
+</body>
+</html>

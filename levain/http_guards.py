@@ -26,7 +26,6 @@ from urllib.parse import unquote_plus
 __all__ = [
     "GuardedHandler",
     "host_header_allowed",
-    "host_header_name",
 ]
 
 # A write only ever legitimately originates from our own dashboard page (which sends
@@ -64,13 +63,7 @@ _CSP = (
 def host_header_allowed(
     raw_host: str | None, allowed_hosts: "frozenset[str] | set[str]"
 ) -> bool:
-    """True iff ``raw_host`` parses (:func:`host_header_name`) to one of ``allowed_hosts``."""
-    hostname = host_header_name(raw_host)
-    return hostname is not None and hostname in allowed_hosts
-
-
-def host_header_name(raw_host: str | None) -> str | None:
-    """The hostname a request's raw ``Host`` header names, or None.
+    """True iff a request's raw ``Host`` header names one of ``allowed_hosts``.
 
     The SECURITY-CRITICAL DNS-rebinding parse, in one place so every server
     (through :meth:`GuardedHandler._host_ok`) uses ONE implementation and none can
@@ -79,28 +72,28 @@ def host_header_name(raw_host: str | None) -> str | None:
     well-formed (``[host]`` optionally ``:port``); a non-bracket Host with a ``:``
     must carry a clean numeric port; the hostname is normalized (trailing FQDN dot
     dropped, case-folded) before the allowlist compare. So neither ``LOCALHOST``
-    false-rejects nor ``[::1]evil`` / a junk ``:`` port sneaks through. Returns the
-    normalized hostname, or None for a Host that does not parse."""
+    false-rejects nor ``[::1]evil`` / a junk ``:`` port sneaks through."""
     if raw_host is None:
-        return None  # HTTP/1.1 requires a Host; absent = refuse (fail-closed)
+        return False  # HTTP/1.1 requires a Host; absent = refuse (fail-closed)
     host = raw_host.strip()
     if host.startswith("["):  # bracketed IPv6 literal: [::1] or [::1]:port
         end = host.find("]")
         if end == -1:
-            return None  # unterminated bracket
+            return False  # unterminated bracket
         hostname = host[1:end]
         rest = host[end + 1 :]
         if rest and not (rest.startswith(":") and rest[1:].isdigit()):
-            return None  # junk after the bracket (e.g. "[::1]evil")
+            return False  # junk after the bracket (e.g. "[::1]evil")
     else:
         head_part, sep, port = host.rpartition(":")
         if sep:
             if not port.isdigit():
-                return None  # a ":" that isn't a clean numeric port → malformed
+                return False  # a ":" that isn't a clean numeric port → malformed
             hostname = head_part
         else:
             hostname = host  # bare host, no port
-    return hostname.rstrip(".").lower()
+    hostname = hostname.rstrip(".").lower()
+    return hostname in allowed_hosts
 
 
 class GuardedHandler(BaseHTTPRequestHandler):

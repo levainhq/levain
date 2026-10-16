@@ -863,25 +863,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     web_p.add_argument(
-        "--remote-host",
-        default=None,
-        dest="remote_host",
-        metavar="NAME",
-        help=(
-            "The https name a proxy you run serves this cockpit on (for example `tailscale serve` in front of the "
-            "loopback port), so a phone can answer consent requests with a passkey. The server stays bound to "
-            "loopback; a proxied request needs the write token for every read, as an off-box one does. Needs --write."
-        ),
-    )
-    web_p.add_argument(
-        "--tailscale",
-        action="store_true",
-        help=(
-            "Take --remote-host from this machine's Tailscale name (`tailscale status`) and print the "
-            "`tailscale serve` line that puts the cockpit on it. Changes nothing in Tailscale itself."
-        ),
-    )
-    web_p.add_argument(
         "--install-class",
         choices=["reported"],
         default=None,
@@ -1906,6 +1887,44 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_answer.add_argument("--path", type=Path, default=None,
                            help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     cs_answer.set_defaults(func=_cmd_consent_answer)
+    cs_phone = cs_sub.add_parser(
+        "phone", help="Answer consent requests from a phone with a passkey (serves the phone port).",
+        description="Serve a small consent page on its own loopback port, for an https proxy you run (for example "
+                    "`tailscale serve`) to put on your tailnet. From the phone you see what each agent asked and "
+                    "answer it with a passkey, which the queue verifies like a terminal answer. A passkey is a "
+                    "display-phone key: it can allow a T2 request and deny any; a T3 allow stays on the laptop. "
+                    "The page also makes the phone's passkey and shows the laptop command that enrols it (a "
+                    "passkey never enrols itself). Nothing else is served there: not the cockpit, not your "
+                    "install. The printed link carries this server's token; anyone holding it can read the "
+                    "waiting requests until it stops, and none can answer without an enrolled passkey.")
+    cs_phone.add_argument("--name", default=None,
+                          help="The https name your proxy serves the phone port on (it becomes the passkey's "
+                               "name, so keep it: a passkey made on one name never answers on another).")
+    cs_phone.add_argument("--tailscale", action="store_true",
+                          help="Take --name from this machine's Tailscale name (`tailscale status`) and print the "
+                               "`tailscale serve` line. Changes nothing in Tailscale itself.")
+    cs_phone.add_argument("--port", type=int, default=None,
+                          help=f"The loopback port (default {_phone_port_default()}).")
+    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
+    cs_phone.set_defaults(func=_cmd_consent_phone)
+
+
+def _phone_port_default() -> int:
+    from levain.phone_server import DEFAULT_PHONE_PORT
+
+    return DEFAULT_PHONE_PORT
+
+
+def _cmd_consent_phone(args: argparse.Namespace) -> int:
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
+
+    try:
+        qdir = _consent_queue_dir(args)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
+                            port=DEFAULT_PHONE_PORT if args.port is None else args.port)
 
 
 def _consent_queue_dir(args: argparse.Namespace) -> Path:
@@ -2405,8 +2424,6 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         max_iterations=args.max_iterations,
         turn_seconds=args.turn_seconds,
         install_class=args.install_class,
-        remote_host=args.remote_host,
-        tailscale=args.tailscale,
     )
 
 

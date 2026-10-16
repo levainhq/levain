@@ -1,0 +1,389 @@
+"""levain.phone_server — the phone port: answer consent requests with a passkey from a phone (Q6b).
+
+``levain consent phone`` runs this. It is its OWN loopback listener, separate from the cockpit (``levain serve``), and
+it serves exactly four things:
+
+  - a static page (``/``, ``/phone.js``, ``/phone.css``) that carries no data;
+  - ``GET /consent.json``: the pending consent requests and, for each, the passkey keys enrolled to answer it on
+    this server's https name;
+  - ``POST /consent/<request_id>/challenge`` and ``.../answer``: the answer record to sign and its WebAuthn
+    challenge, then the passkey's assertion, which the consent queue verifies with the same ssh-keygen check as
+    ``levain consent answer``;
+  - ``POST /passkey/key-line``: a new passkey's OpenSSH public key and the laptop commands that enrol it (a passkey
+    never enrols itself: enrolment is signed by a laptop-presence key).
+
+A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
+token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
+opens nothing on the cockpit. The https name is configured, never read from a request: it is the WebAuthn rpId, and a
+passkey enrolled on it signs that name's hash, which ssh-keygen checks against the key's application.
+
+Why a separate listener: a proxy's clients and the laptop's own processes share 127.0.0.1, so no header the cockpit
+reads can tell them apart (measured through ``tailscale serve`` 2026-10-16: the Host is the client's, X-Forwarded-For
+is the proxy's). A listener that serves nothing else needs no such test.
+"""
+from __future__ import annotations
+
+import base64
+import hmac
+import json
+import re
+import secrets
+import shlex
+import sqlite3
+import sys
+import threading
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+from levain.http_guards import GuardedHandler
+
+__all__ = ["DEFAULT_PHONE_PORT", "PHONE_TOKEN_HEADER", "PhoneError", "make_phone_server", "run_phone_server",
+           "tailscale_name"]
+
+DEFAULT_PHONE_PORT = 7428
+PHONE_TOKEN_HEADER = "X-Levain-Phone-Token"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
+           "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
+           "/phone.css": ("phone.css", "text/css; charset=utf-8")}
+_CONSENT_PREFIX = "/consent/"
+_CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
+_ACTIONS = ("challenge", "answer")
+_KEY_LINE = "/passkey/key-line"
+_MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
+_MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
+
+
+class PhoneError(Exception):
+    """A refusal a route answers with: an HTTP status, an error word and the words the page shows."""
+
+    def __init__(self, status: int, error: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status, self.error, self.message, self.extra = status, error, message, extra or {}
+
+
+def _consent_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for ``/consent/<id>/<action>``, else None."""
+    if not route.startswith(_CONSENT_PREFIX):
+        return None
+    from urllib.parse import unquote
+
+    quoted, sep, action = route[len(_CONSENT_PREFIX):].partition("/")
+    rid = unquote(quoted)          # the page sends encodeURIComponent(id); an id carries ':'
+    if not sep or _CONSENT_ID.fullmatch(rid) is None or action not in _ACTIONS:
+        return None
+    return rid, action
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+class _PhoneHandler(GuardedHandler):
+    server_version = "levain-phone"
+
+    # -- the gates ---------------------------------------------------------------------------------------
+
+    def _token_ok(self) -> bool:
+        supplied = self.headers.get(PHONE_TOKEN_HEADER)
+        return supplied is not None and hmac.compare_digest(supplied.encode("utf-8", "replace"),
+                                                            self.server.phone_token.encode("utf-8"))
+
+    def _json(self, payload: dict[str, Any], status: int = 200, *, head: bool = False) -> None:
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", PHONE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    # -- reads -------------------------------------------------------------------------------------------
+
+    def _route(self, *, head: bool) -> None:
+        if self._refuse_read(head=head):
+            return
+        route = self.path.split("?", 1)[0]
+        static = _STATIC.get(route)
+        if static is not None:
+            from levain.web_server import load_web_asset
+
+            self._send(load_web_asset(static[0]).encode("utf-8"), static[1], head=head)
+            return
+        if route != "/consent.json":
+            self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
+            return
+        if not self._token_ok():
+            self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
+                       403, head=head)
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503, head=head)
+            return
+        try:
+            self._json(self.server.listing(), head=head)
+        except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
+            self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
+        finally:
+            self.server.request_gate.release()
+
+    # -- writes ------------------------------------------------------------------------------------------
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
+        if self._refuse_write_origin():
+            return
+        route = self.path.split("?", 1)[0]
+        consent = _consent_route(route)
+        if consent is None and route != _KEY_LINE:
+            self._reject(404, "not_found", "no such route")
+            return
+        if not self._token_ok():
+            # refused before a byte of the body is read
+            self._reject(403, "credential_required", f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}")
+            return
+        if self._refuse_non_json():
+            return
+        clen = self._declared_length()
+        if clen is None or self._refuse_oversize(clen, _MAX_BODY, _MAX_BODY * 4):
+            return
+        try:
+            req = json.loads(self.rfile.read(clen).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._json({"error": "bad_request", "message": "the body is not JSON"}, 400)
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
+            return
+        try:
+            if consent is not None:
+                result = self.server.answer_step(consent[0], consent[1], req)
+            else:
+                result = self.server.key_line(req)
+            self._json(result)
+        except PhoneError as exc:
+            self._json({"error": exc.error, "message": exc.message, **exc.extra}, exc.status)
+        except Exception as exc:  # noqa: BLE001 - every failure is an answer the page can show
+            self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500)
+        finally:
+            self.server.request_gate.release()
+
+
+class _PhoneServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], *, queue_dir: Path, rp_id: str, token: str) -> None:
+        from levain.authority import ReplayCache
+
+        super().__init__(address, _PhoneHandler)
+        self.queue_dir = queue_dir
+        self.rp_id = rp_id
+        self.phone_token = token
+        self.allowed_hosts = _LOOPBACK_HOSTS | {str(self.server_address[0]).lower(), rp_id}
+        self.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+        # one replay cache for every request this server answers: a replay re-verifies only the links past what it
+        # already holds, so a page that asks again costs one ssh-keygen run per new link, not one per link
+        self.replay_cache = ReplayCache()
+
+    # -- what the routes do (here, not on the handler, so tests can drive them without a socket) --------------
+
+    def _source(self, root: Path) -> Any:
+        from levain.authority import anchor_path
+        from levain.consent.queue import authority_source
+
+        return authority_source(root / "cockpit.db", anchor=anchor_path(root), cache=self.replay_cache)
+
+    def _signers(self, request: Any) -> "tuple[list[str], str]":
+        """The fingerprints of the active passkey keys enrolled on this server's name in the cockpit that verifies
+        ``request``'s answer, and a note when there are none."""
+        from levain.authority import AuthorityError
+        from levain.consent.answering import answer_root, passkey_keys
+        from levain.consent.queue import AnswerRefused
+
+        try:
+            root = answer_root(self.queue_dir, request)
+            keys = passkey_keys(self._source(root)(), self.rp_id)
+        except (AnswerRefused, AuthorityError, OSError, sqlite3.Error) as exc:
+            return [], str(exc)
+        if not keys:
+            return [], f"no passkey is enrolled for {self.rp_id} in {root}"
+        return [k.fingerprint for k in keys], ""
+
+    def listing(self) -> dict[str, Any]:
+        """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``."""
+        from levain.consent.listing import entry_body, read_listing
+
+        listing = read_listing(self.queue_dir, now=datetime.now(timezone.utc))
+        rows = []
+        for entry in listing.pending:
+            body = entry_body(entry)
+            body.pop("answer_allow", None)
+            body.pop("answer_deny", None)
+            body["signers"], body["signer_note"] = self._signers(entry.request)
+            rows.append(body)
+        return {"rp_id": self.rp_id, "pending": rows, "overflow": listing.overflow, "enrolled": self._enrolled()}
+
+    def _enrolled(self) -> list[str]:
+        """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol
+        section reports with nothing pending)."""
+        from levain.authority import AuthorityError
+        from levain.consent.answering import hook_roots, passkey_keys
+
+        found: list[str] = []
+        for root in hook_roots(self.queue_dir):
+            try:
+                found += [k.fingerprint for k in passkey_keys(self._source(root)(), self.rp_id) if k.fingerprint not in found]
+            except (AuthorityError, OSError, sqlite3.Error):
+                continue
+        return found
+
+    def answer_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``challenge`` ({decision, signer_fp}) -> the answer record and its WebAuthn challenge; ``answer``
+        ({payload, authenticator_data, client_data_json, signature}, base64url) -> the queue's verdict."""
+        from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
+        from levain.consent.passkey import PasskeyError, b64url_decode, challenge, to_sshsig
+        from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source, class_covers
+        from levain.consent.record import DECISIONS, answer_message
+
+        need = {"challenge": {"decision", "signer_fp"},
+                "answer": {"payload", "authenticator_data", "client_data_json", "signature"}}[action]
+        if not isinstance(req, dict) or set(req) != need:
+            raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
+        try:
+            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+            if got is None:
+                raise PhoneError(404, "not_found", "no such consent request")
+            request, state = got
+            if state != "pending":
+                raise PhoneError(409, "conflict", f"request {request_id} is already {state}")
+            refuse_cut_display(request, "from a phone")
+            source = self._source(answer_root(self.queue_dir, request))
+            keys = {k.fingerprint: k for k in passkey_keys(source(), self.rp_id)}
+            if action == "challenge":
+                decision, fp = req["decision"], req["signer_fp"]
+                if decision not in DECISIONS:
+                    raise PhoneError(400, "bad_request", f"decision must be one of {list(DECISIONS)}")
+                if not isinstance(fp, str) or fp not in keys:
+                    raise PhoneError(422, "no_passkey", f"{str(fp)[:80]} is not an active passkey enrolled for "
+                                                        f"{self.rp_id}")
+                if decision == "allow" and not class_covers(keys[fp].key_class, request.tier):
+                    raise PhoneError(422, "answer_refused", f"a {keys[fp].key_class} passkey cannot allow a "
+                                                            f"{request.tier} request: allow it from the laptop")
+                payload = ConsentQueue(self.queue_dir, authority=source).answer_payload(request_id, decision, fp)
+                return {"payload": payload, "rp_id": self.rp_id, "challenge": _b64u(challenge(answer_message(payload)))}
+            payload = req["payload"]
+            fp = payload.get("signer_fp") if isinstance(payload, dict) else None
+            key = keys.get(fp) if isinstance(fp, str) else None
+            if key is None:
+                raise PhoneError(422, "no_passkey", f"the answer's signer is not an active passkey enrolled for "
+                                                    f"{self.rp_id}")
+            signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
+                                  b64url_decode(req["client_data_json"], "client_data_json"),
+                                  b64url_decode(req["signature"], "signature"))
+            decided = ConsentQueue(self.queue_dir, authority=source).answer(request_id, payload, signature)
+        except (AnswerRefused, PasskeyError, ConsentError) as exc:
+            raise PhoneError(422, "answer_refused", str(exc)) from None
+        except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
+        return {"request_id": decided.request_id, "decision": decided.decision, "signer_fp": decided.signer_fp,
+                "decided_at": decided.decided_at}
+
+    def key_line(self, req: Any) -> dict[str, Any]:
+        """``POST /passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url) -> its OpenSSH
+        public key on this server's name, its fingerprint, and the laptop commands that enrol it. Nothing is
+        enrolled here."""
+        from levain.cockpit.keys import fingerprint_of
+        from levain.consent.answering import hook_roots
+        from levain.consent.passkey import PasskeyError, b64url_decode, public_key_line
+
+        if not isinstance(req, dict) or set(req) != {"spki"}:
+            raise PhoneError(400, "bad_request", "request keys must be ['spki']")
+        try:
+            line = public_key_line(b64url_decode(req["spki"], "spki"), self.rp_id)
+        except PasskeyError as exc:
+            raise PhoneError(422, "bad_passkey", str(exc)) from None
+        name = f"passkey-{self.rp_id.split('.')[0]}.pub"
+        roots = hook_roots(self.queue_dir)
+        enrol = [f"levain cockpit enroll {name} --class display-phone --custody passkey --data-root {shlex.quote(str(r))} "
+                 "--signing-key YOUR_LAPTOP_PRESENCE_KEY" for r in roots]
+        return {"public_key": line, "fingerprint": fingerprint_of(line), "file": name,
+                "commands": [f"printf '%s\\n' '{line}' > {name}", *enrol],
+                "note": None if roots else ("no consent hook names a cockpit yet (run `levain init` with the consent "
+                                            "hook first); then enrol into the cockpit it names")}
+
+
+def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", port: int = DEFAULT_PHONE_PORT,
+                      token: str | None = None) -> _PhoneServer:
+    """A bound (not yet serving) phone port over the consent queue at ``queue_dir``, answering for the https name
+    ``rp_id``. Loopback only: the proxy in front of it is what reaches the phone."""
+    from levain.consent.passkey import is_host_name
+
+    if host not in _LOOPBACK_HOSTS and not host.startswith("127."):
+        raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
+    if not is_host_name(rp_id):
+        raise ValueError(f"refusing {str(rp_id)[:80]!r}: the https name must be a lowercase DNS name a proxy serves "
+                         "this port on (no scheme, port or path, not an address); `localhost` answers from this "
+                         "machine's own browser")
+    return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32))
+
+
+_TAILSCALE_SOCKETS = (None, "/var/run/tailscale/tailscaled.sock")   # the CLI's default, then the open-source daemon's
+
+
+def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
+    """``(this machine's Tailscale DNS name, "")``, or ``(None, why not)``: read from ``tailscale status --json``
+    (the default socket, then ``/var/run/tailscale/tailscaled.sock``). Nothing is changed in Tailscale."""
+    import shutil
+    import subprocess
+
+    from levain.consent.passkey import is_host_name
+
+    exe = shutil.which("tailscale")
+    if exe is None:
+        return None, "no `tailscale` command on PATH; pass --name for any https proxy instead"
+    why = "tailscale is not running"
+    for sock in _TAILSCALE_SOCKETS:
+        argv = [exe, *([] if sock is None else [f"--socket={sock}"]), "status", "--json"]
+        try:
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            data = json.loads(cp.stdout) if cp.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            continue
+        if data.get("BackendState") != "Running":
+            why = f"tailscale is {data.get('BackendState')!r}, not Running"
+            continue
+        name = str((data.get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+        if is_host_name(name):
+            return name, ""
+        why = "tailscale reports no DNS name for this machine (MagicDNS off?)"
+    return None, why
+
+
+def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int) -> int:
+    """``levain consent phone``: serve the phone port until interrupted."""
+    if name is None:
+        if not tailscale:
+            print("name the https name the phone reaches this on: --name NAME, or --tailscale", file=sys.stderr)
+            return 2
+        name, why = tailscale_name()
+        if name is None:
+            print(f"--tailscale: {why}", file=sys.stderr)
+            return 2
+    try:
+        httpd = make_phone_server(queue_dir, name, port=port)
+    except (ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    bound = httpd.server_address[1]
+    print(f"levain phone port on http://127.0.0.1:{bound}/ for https://{name}/ (consent queue {queue_dir})", flush=True)
+    print(f"  put it on https: tailscale serve --bg --https=443 http://127.0.0.1:{bound}   (stop: tailscale serve reset)"
+          if tailscale else f"  point your https proxy for {name} at http://127.0.0.1:{bound}", flush=True)
+    page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
+    print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
