@@ -1918,11 +1918,10 @@ def _phone_port_default() -> int:
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
     from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
 
-    try:
-        qdir = _consent_queue_dir(args)
-    except FileNotFoundError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    from levain.consent.queue import default_queue_dir
+
+    # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
+    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
     return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
                             port=DEFAULT_PHONE_PORT if args.port is None else args.port)
 

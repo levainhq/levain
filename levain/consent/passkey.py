@@ -40,7 +40,7 @@ import urllib.parse
 
 from levain.consent.record import ANSWER_NAMESPACE
 
-__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "b64url_decode", "challenge", "is_host_name", "key_application",
+__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "answer_signature_problem", "b64url_decode", "challenge", "is_host_name", "key_application",
            "public_key_line", "to_sshsig"]
 
 KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
@@ -170,6 +170,83 @@ def _ecdsa_signature(der: bytes) -> bytes:
     return _mpint(r) + _mpint(s)
 
 
+def _client_origin(client_data_json: bytes, application: str) -> str:
+    """The origin a passkey's clientDataJSON names, once it is a same-origin ``webauthn.get`` from a page on
+    ``application`` over https (http only on ``localhost``, which browsers treat as secure); else
+    :class:`PasskeyError`. The one rule, used at conversion and at every delivery."""
+    try:
+        client = json.loads(client_data_json.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PasskeyError("clientDataJSON is not JSON") from exc
+    if not isinstance(client, dict) or client.get("type") != "webauthn.get":
+        raise PasskeyError("clientDataJSON is not a webauthn.get assertion")
+    if client.get("crossOrigin") is True:
+        raise PasskeyError("the passkey signed inside a page from another site")
+    origin = client.get("origin")
+    parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
+    if (parts is None or parts.hostname != application or parts.path or parts.query or parts.fragment
+            or not (parts.scheme == "https" or (parts.scheme == "http" and application == "localhost"))):
+        raise PasskeyError(f"the passkey signed on a page that is not https://{application}")
+    return origin
+
+
+def answer_signature_problem(signature: str, public_key: str) -> str | None:
+    """Why ``signature`` is not a consent answer a passkey ``public_key`` may give, or None. Run by the consent
+    queue on every verification of a passkey key's answer (on answer and at each delivery), beside ssh-keygen:
+    the signature must be a WebAuthn assertion (never a plain sk signature), carry user verification, and come
+    from a same-origin page on the key's own host. A passkey signs consent answers only; the authority replay
+    and the broker refuse its signature for anything else."""
+    try:
+        _key_blob, application = _key_parts(public_key)
+        text = signature.strip()
+        head, tail = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
+        if not (text.startswith(head) and text.endswith(tail)):
+            return "the answer is not an armored SSH signature"
+        blob = base64.b64decode("".join(text[len(head):-len(tail)].split()), validate=True)
+        at = [0]
+
+        def take(n: int) -> bytes:
+            if at[0] + n > len(blob):
+                raise ValueError("short")
+            out = blob[at[0]:at[0] + n]
+            at[0] += n
+            return out
+
+        def string() -> bytes:
+            (n,) = struct.unpack(">I", take(4))
+            return take(n)
+
+        if take(6) != b"SSHSIG":
+            return "the answer is not an SSHSIG"
+        take(4)
+        for _ in range(4):             # publickey, namespace, reserved, hash algorithm
+            string()
+        inner = string()
+        if at[0] != len(blob):
+            return "the answer's signature has trailing bytes"
+        blob, at[0] = inner, 0
+        if string() != SIG_TYPE.encode("ascii"):
+            return "a passkey answer must be a WebAuthn signature"
+        string()                       # the ECDSA signature: ssh-keygen checks it
+        flags = take(1)[0]
+        take(4)
+        origin = string().decode("utf-8")
+        client_data_json = string()
+        string()                       # extensions
+        if at[0] != len(blob):
+            return "the WebAuthn signature has trailing bytes"
+    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+        return "the answer's passkey signature cannot be read"
+    if not flags & _FLAG_UV:
+        return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
+    try:
+        if _client_origin(client_data_json, application) != origin:
+            return "the signature's origin disagrees with its client data"
+    except PasskeyError as exc:
+        return str(exc)
+    return None
+
+
 def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: bytes, der_signature: bytes,
               namespace: str = ANSWER_NAMESPACE) -> str:
     """One WebAuthn assertion by the passkey ``public_key`` as an armored SSHSIG in ``namespace``.
@@ -197,19 +274,7 @@ def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: byte
     extensions = authenticator_data[_AUTH_DATA_MIN:]
     if bool(flags & _FLAG_ED) != bool(extensions):
         raise PasskeyError("authenticatorData's extension flag disagrees with its length")
-    try:
-        client = json.loads(client_data_json.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise PasskeyError("clientDataJSON is not JSON") from exc
-    if not isinstance(client, dict) or client.get("type") != "webauthn.get":
-        raise PasskeyError("clientDataJSON is not a webauthn.get assertion")
-    if client.get("crossOrigin") is True:
-        raise PasskeyError("the passkey signed inside a page from another site")
-    origin = client.get("origin")
-    parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
-    if (parts is None or parts.hostname != application or parts.path or parts.query or parts.fragment
-            or not (parts.scheme == "https" or (parts.scheme == "http" and application == "localhost"))):
-        raise PasskeyError(f"the passkey signed on a page that is not https://{application}")
+    origin = _client_origin(client_data_json, application)
     (counter,) = struct.unpack(">I", authenticator_data[33:37])
     signature = (_string(SIG_TYPE) + _string(_ecdsa_signature(der_signature)) + bytes([flags])
                  + struct.pack(">I", counter) + _string(origin) + _string(client_data_json) + _string(extensions))

@@ -28,6 +28,7 @@
   // which enrolled passkey THIS browser made: fingerprint -> credential id, so the OS prompt is asked for that one
   const mapKey = () => "levain-passkeys:" + rpId;
   const mine = () => { try { return JSON.parse(store.get("localStorage", mapKey()) || "{}") || {}; } catch (e) { return {}; } };
+  const forget = (fp) => { const all = mine(); delete all[fp]; store.set("localStorage", mapKey(), JSON.stringify(all)); };
   const remember = (fp, rawId) => { const all = mine(); all[fp] = rawId; store.set("localStorage", mapKey(), JSON.stringify(all)); };
 
   function call(method, route, body) {
@@ -95,15 +96,19 @@
   function start(r, decision, signers, say, actions) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length || signers.length === 1) return answer(r, decision, known[0] || signers[0], known.length ? local[known[0]] : null, say);
-    // more than one passkey is enrolled and this browser made none of them: the person picks (the OS prompt then
-    // offers every passkey for this name, so a pick of another device's key is refused at verify)
+    // exactly one passkey this browser made is enrolled: use it, and ask the OS for that credential
+    if (known.length === 1) return answer(r, decision, known[0], local[known[0]], say);
+    if (!known.length && signers.length === 1) return answer(r, decision, signers[0], null, say);
+    // otherwise the person picks: among this browser's own when it made several (a deleted one is forgotten when
+    // the OS refuses it), else among every enrolled one (the OS then offers every passkey for this name, and a
+    // pick of another device's key is refused at verify)
+    const choices = known.length ? known : signers;
     say("more than one passkey is enrolled for this name; pick the one this phone holds:");
     for (const old of actions.querySelectorAll(".pick")) old.remove();
-    for (const fp of signers) {
+    for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => answer(r, decision, fp, null, say));
+      p.addEventListener("click", () => answer(r, decision, fp, known.length ? local[fp] : null, say));
       actions.appendChild(p);
     }
   }
@@ -127,7 +132,12 @@
           last = done + " " + (r.tool || "");
           say(done + " · signed by " + a.body.signer_fp, "ok");
         },
-              (e) => say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered", "bad"));
+              (e) => {
+                // asked for one credential and the OS had none it would use: forget it here, so the next tap is not
+                // pinned to a passkey this phone no longer holds
+                if (rawId && e && e.name === "NotAllowedError") forget(fp);
+                say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered", "bad");
+              });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
