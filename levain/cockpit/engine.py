@@ -588,7 +588,9 @@ class Cockpit:
             refresh_every_s=src.refresh_every_s if src else None,
             stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
-            version_fields=("*",), search_fields=src.search_fields if src else ("title", "body"),
+            version_fields=("*",),
+            # what a decisions row shows: who asks and for which tool (the title) and its state word and tier
+            search_fields=tuple(dict.fromkeys((*((src.search_fields if src else ()) or ROW_SEARCH_DEFAULT["list"]), "consent_state", "consent_tier"))),
             search_default_visible=src.search_default_visible if src else 10,
             read_one=lambda ctx, row_id: Fault("the decisions panel routes read_one by row id"),
             note=src.note if src else "", empty=src.empty if src else "Nothing is waiting on you.",
@@ -1363,7 +1365,8 @@ class Cockpit:
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
                  views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
-                 face: str = "", compose: dict[str, Any] | None = None, *, auth: RequestAuthority) -> str:
+                 face: str = "", compose: dict[str, Any] | None = None, search: dict[str, Any] | None = None,
+                 *, auth: RequestAuthority) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
@@ -1377,6 +1380,9 @@ class Cockpit:
                      **({"face": face} if face else {}),
                      # the compose card is drawn from the head, so a changed declaration is not a 304
                      **({"compose": compose} if compose else {}),
+                     # the search head is drawn from the head too: a kernel that starts marking a panel searchable
+                     # (or changes its fields) over unchanged rows is not a 304
+                     **({"search": search} if search else {}),
                      # K2b-3b §0.3: provenance is applied at render, so the journal's revision (and a
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
@@ -1411,7 +1417,8 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
-        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, auth=auth)
+        search_head = self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count)
+        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head, auth=auth)
         if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
             # a roster's health is read against the clock, so a tone that turns with time is content
             etag = _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
@@ -1428,7 +1435,7 @@ class Cockpit:
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
-            **self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count),
+            **search_head,
             "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version,
                                                       labels.label(snap.value_label_key), auth=auth)
                         if self._verb_view is not None else []),
@@ -1444,11 +1451,15 @@ class Cockpit:
     def _search_head(spec: ProviderSpec, count: int | None) -> dict[str, Any]:
         """The searchable property (contract v2): the kernel marks a row-shaped panel ``searchable`` when
         it holds more rows than SEARCH_THRESHOLD (every row it delivers, not only the counted ones: a decisions panel
-        with two waiting and fifty outcomes is a long list) or is windowed. A contributor declares WHAT is searched
+        with two waiting and fifty outcomes is a long list), is windowed, or is drawn as a count (``face == "count"``)
+        with at least one row: its modal is the whole list, so the box is there from the first row. A contributor declares WHAT is searched
         (``search.fields``, ``scope``), never WHETHER."""
         if spec.kind not in ROW_KINDS:
             return {"search": None, "searchable": False, "window": None}
-        searchable = spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+        # a panel drawn as a count opens into a focus modal that is its whole list (Decisions waiting, Sessions): it
+        # carries the box from the first row, since the tile is where it is short and the modal is where it is read
+        searchable = (spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+                      or (spec.face == "count" and (count or 0) > 0))
         return {
             "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
                        "default_visible": roster_visible(spec), "hook": spec.search is not None},
