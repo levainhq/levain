@@ -1478,7 +1478,9 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         staged = install.joinpath(*PENDING_REL, *((".claude", "settings.json") if adapter == "claude-code"
                                                   else ("codex-home", "hooks.json")))
         hint = (f"`levain update` staged levain's version at {staged}: merge its PermissionRequest entry."
-                if staged.is_file() else "Run `levain update` to wire it.")
+                if staged.is_file() else
+                "`levain update` wires it unless the file holds your own edit, which it keeps: then add the entry back, "
+                f"or record the choice with `levain init --path {install} --force --consent-hook off`.")
         out.append(CheckResult(f"{label} consent hook", True,
                                "not wired: the agent's own dialog answers every permission; no grant or away "
                                "answer can reach it", hint, warn=True))
@@ -1506,10 +1508,15 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
                                            "answer can answer the hook",
                                f"Add \"cockpit_data_root\": \"{ours}\" to it to verify against this install's.",
                                warn=True))
+    elif root != ours and not (Path(root) / "cockpit.db").is_file() and not (Path(ours) / "cockpit.db").is_file():
+        out.append(CheckResult(name, True, f"{qdir / mod.SETTINGS_NAME} names another install's cockpit ({root}); "
+                                           "neither it nor this install's holds a cockpit database, so nothing is "
+                                           "answered by a grant and the agent's own dialog answers"))
     elif root != ours:
         out.append(CheckResult(name, True, f"grants verify against {root} (queue {qdir}), not this install's "
                                            f"{ours}",
-                               "One cockpit per agent per machine: that file is kept as it is.", warn=True))
+                               "One cockpit per agent per machine: that file is kept as it is. To use this "
+                               f"install's, set \"cockpit_data_root\" in it to \"{ours}\".", warn=True))
     elif not (Path(root) / "cockpit.db").is_file():
         out.append(CheckResult(name, True, f"this install's cockpit {root} (queue {qdir}); no cockpit.db there yet, "
                                            "so no grant can answer until a cockpit holds enrolled keys"))
@@ -1653,7 +1660,7 @@ def _user_level_wiring(install: Path) -> list[str]:
     report, never a hard failure on someone else's config).
 
     ⛔ `~/.codex/hooks.json` IS DELIBERATELY NOT CHECKED, AND THIS IS THE WHOLE
-    SUBTLETY OF THE CHECK. Codex has no per-project hooks file, so
+    SUBTLETY OF THE CHECK. levain wires Codex through the machine-wide file only, so
     `levain init --adapter codex` writes the GLOBAL `~/.codex/hooks.json`
     itself (`install.py`, `hooks_target`). For a Codex install, user-level
     wiring is not a signal of anything — it is the only deployment there is,

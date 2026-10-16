@@ -91,6 +91,7 @@ AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
 def run_main(monkeypatch, queue, stdin_text, settings=AWAY, policy=None):
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: queue)
     monkeypatch.setattr(cc, "load_settings", lambda d: settings)
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)  # these tests drive the policy seam itself
     if policy is not None:
         monkeypatch.setattr(policy_mod, "decide", policy)
     out = io.StringIO()
@@ -424,6 +425,7 @@ def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeyp
     target = str(tmp_path / "consent" / cc.SETTINGS_NAME)
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: q)
     monkeypatch.setattr(policy_mod, "decide", lambda r, *a, **kw: calls.append(r))
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
     cc.main(["--queue-dir", str(tmp_path / "consent")],
             stdin=io.StringIO(json.dumps(event("Write", {"file_path": target, "content": "{}"}))), stdout=io.StringIO())
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
@@ -673,6 +675,7 @@ def test_decide_always_goes_through_the_guard(monkeypatch):
     seen = []
     real = cc.guarded_policy
     monkeypatch.setattr(cc, "guarded_policy", lambda r, q, **k: (seen.append(r.id), real(r, q, **k))[1])
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
     for kw in ({}, {"policy": lambda r, *a, **k: None}):
         q = FakeQueue(None)
         cc.decide(event(), q, cc.AdapterSettings(), **kw)

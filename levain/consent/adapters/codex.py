@@ -58,7 +58,7 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
-    hook_timeout,
+    hook_timeout, nothing_can_decide,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
@@ -222,6 +222,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         tool_input = {}
     posture = event.get("permission_mode")
     posture = posture if isinstance(posture, str) and posture else None
+    if policy is None and nothing_can_decide(settings):
+        return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
                                         protected=protected)
     hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0

@@ -1043,7 +1043,7 @@ class TestUserLevelWiring:
         by pointing a check at the wrong tree — in the release built to carry
         this same reporter's previous fixes. The first draft of this check did
         it again: `levain init --adapter codex` WRITES ~/.codex/hooks.json
-        itself (Codex has no per-project hooks file), so treating that as
+        itself (levain wires Codex through the machine-wide file only), so treating that as
         operator intent fails every Codex install on earth.
 
         A green suite did not catch it either time. Running `levain doctor`

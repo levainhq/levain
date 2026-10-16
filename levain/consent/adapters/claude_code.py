@@ -154,11 +154,20 @@ def _is_config_path(path: Path) -> bool:
                 return True
         if part == ".codex" and len(rest) == 1 and rest[0] in ("hooks.json", "config.toml"):
             return True
+        if part == "activation" and rest[0] == "hooks" and len(rest) > 1:
+            return True  # a levain install's hook scripts (the consent hook among them) run in every agent session
         if part == ".claude-plugin":
             return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
         if part == "hooks" and i > 0 and os.path.isdir(Path(*path.parts[:i]) / ".claude-plugin"):
             return True  # a plugin outside ~/.claude/plugins (a local marketplace, --plugin-dir): its hooks/
     return False
+
+
+def nothing_can_decide(settings: AdapterSettings) -> bool:
+    """Away mode off and no cockpit database where the settings point: no grant or signed answer can verify and no
+    hold is asked, so the hook files nothing (a queue row is kept for good) and the agent's own dialog answers."""
+    root = settings.cockpit_data_root
+    return not settings.away_mode and not (root and (Path(root) / "cockpit.db").is_file())
 
 
 def _under(path: Path, roots: tuple[str, ...]) -> bool:
@@ -205,7 +214,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
-    ``.claude/hooks/``); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
+    ``.claude/hooks/``, the one `levain init` wires under the install's ``activation/hooks/``, below); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
     ``.codex/config.toml``; anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a
     plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
@@ -304,6 +313,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
+    if policy is None and nothing_can_decide(settings):
+        return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
     hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
@@ -487,12 +498,12 @@ def hook_command(python: str, script: Path | str) -> str:
     return f"{shlex.quote(python)} {HOOK_FLAGS} {shlex.quote(str(script))}"
 
 
-# A hook in a MACHINE-WIDE file (Codex's CODEX_HOME/hooks.json) runs its script through `levain.hookrun`, so a gone
-# install exits 0 and a failing hook exits 1, never the 2 that blocks Codex (levain/hookrun.py).
+# The consent hook `levain init` wires runs its script through `levain.hookrun`, so a gone or moved install exits 0
+# and a failing hook exits 1, never the 2 that blocks Codex or that Claude Code may read as a deny (levain/hookrun.py).
 HOOKRUN = ("-m", "levain.hookrun")
 
 
-def machine_wide_hook_command(python: str, script: Path | str) -> str:
+def hookrun_command(python: str, script: Path | str) -> str:
     """``<python> -EP -m levain.hookrun <script>``: the script stays the last token."""
     return f"{shlex.quote(python)} {HOOK_FLAGS} {' '.join(HOOKRUN)} {shlex.quote(str(script))}"
 
