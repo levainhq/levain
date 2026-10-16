@@ -5,10 +5,12 @@ format and wires the two things a Levain entity needs to run: the
 **activation hooks** (the posture mechanism, via SessionStart +
 UserPromptSubmit) and the **anneal-memory MCP server** (the entity's
 memory). Codex exposes both hook events the activation mechanism needs with
-`hookSpecificOutput.additionalContext` injection — Stop is *not* wired
+`hookSpecificOutput.additionalContext` injection. Stop carries no posture,
 because Codex 0.133's `stop.command.output` schema does not accept
-`hookSpecificOutput` (Layer D folds into the two wired hooks instead, same
-shape as the Claude Code adapter; see *Known characteristics* below).
+`hookSpecificOutput` (Layer D folds into the two posture hooks instead, same
+shape as the Claude Code adapter; see *Known characteristics* below). Stop and
+PostToolUse are wired only to record the cockpit's session transcript, and print
+nothing.
 
 The adapter is **project-scoped on the install side and global on the
 harness-config side**: the install lives inside one directory (the operator's
@@ -101,7 +103,8 @@ described below.
   prompt injects nothing). Once episodes-since-last-wrap pass a threshold
   (default 12) it also appends the **Layer D ambient nudge**.
 
-No Stop hook is wired. Codex 0.133's `stop.command.output` schema accepts
+No posture rides the Stop hook (it is wired only to record the turn's final
+reply for the cockpit's session transcript, and prints nothing). Codex 0.133's `stop.command.output` schema accepts
 `continue` / `decision` / `reason` / `stopReason` / `suppressOutput` /
 `systemMessage` — it does *not* accept `hookSpecificOutput.additionalContext`,
 the shape the activation mechanism produces. The Claude Code adapter folds
@@ -127,7 +130,7 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 
 ### 3. Hooks-config global wiring
 
-`~/.codex/hooks.json` (the **sidecar** JSON file) registers the two hooks.
+`~/.codex/hooks.json` (the **sidecar** JSON file) registers the hooks.
 Codex's inline `[[hooks.X]]` TOML form in `~/.codex/config.toml` was
 empirically observed to fail to parse in codex-cli 0.132.0 ("invalid type:
 map, expected a sequence in `hooks`"). The JSON sidecar at

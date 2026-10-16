@@ -1,10 +1,13 @@
 """Shared helpers for the Levain activation hooks.
 
-Levain's Claude Code adapter wires two hooks:
+Levain's Claude Code adapter wires two posture hooks:
   - session_start.py      -> SessionStart    (Layer A: primacy posture; Layer D: start-catch)
   - user_prompt_submit.py -> UserPromptSubmit (Layer B: recency directive; Layer D: nudge)
+and two record-only hooks for the cockpit's session transcript (Q8), which print nothing:
+  - stop.py               -> Stop            (the turn's final reply)
+  - post_tool_use.py      -> PostToolUse     (the tool that ran)
 
-Both share install detection, scoping, activation-file parsing, the
+The posture hooks share install detection, scoping, activation-file parsing, the
 unwrapped-episode query, temporal formatting, and the harness output format.
 That common surface lives here.
 

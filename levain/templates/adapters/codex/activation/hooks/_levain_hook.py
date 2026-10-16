@@ -1,14 +1,17 @@
 """Shared helpers for the Levain activation hooks (Codex adapter).
 
-Levain's Codex adapter wires two hooks:
+Levain's Codex adapter wires two posture hooks:
   - session_start.py      -> SessionStart    (Layer A: primacy posture; Layer D: start-catch)
   - user_prompt_submit.py -> UserPromptSubmit (Layer B: recency directive; Layer D: ambient nudge)
+and two record-only hooks for the cockpit's session transcript (Q8), which print nothing:
+  - stop.py               -> Stop            (the turn's final reply)
+  - post_tool_use.py      -> PostToolUse     (the tool that ran)
 
-Both hooks share install detection, scoping, activation-file parsing, the
+The posture hooks share install detection, scoping, activation-file parsing, the
 unwrapped-episode query, temporal formatting, and the harness output format.
 That common surface lives here.
 
-The Stop event is NOT used on Codex: per Codex 0.133 schema, `stop.command.output`
+Stop carries no posture on Codex: per Codex 0.133 schema, `stop.command.output`
 accepts only `continue` / `decision` / `reason` / `stopReason` / `suppressOutput`
 / `systemMessage` — it does NOT accept `hookSpecificOutput.additionalContext`,
 the shape this helper's emit() produces. The Claude Code adapter folds Layer D
