@@ -1,10 +1,13 @@
 """Shared helpers for the Levain activation hooks.
 
-Levain's Claude Code adapter wires two hooks:
+Levain's Claude Code adapter wires two posture hooks:
   - session_start.py      -> SessionStart    (Layer A: primacy posture; Layer D: start-catch)
   - user_prompt_submit.py -> UserPromptSubmit (Layer B: recency directive; Layer D: nudge)
+and two record-only hooks for the cockpit's session transcript (Q8), which print nothing:
+  - stop.py               -> Stop            (the turn's final reply)
+  - post_tool_use.py      -> PostToolUse     (the tool that ran)
 
-Both share install detection, scoping, activation-file parsing, the
+The posture hooks share install detection, scoping, activation-file parsing, the
 unwrapped-episode query, temporal formatting, and the harness output format.
 That common surface lives here.
 
@@ -31,10 +34,12 @@ that raises is caught there.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -661,12 +666,75 @@ def state_seen_record(session_id: str, signature: str) -> None:
 _SESSION_AGENT = "claude_code"
 _SESSIONS_KEEP = 200
 
+# ONE lock for the whole sessions directory (Q8 L3 r1): flock on `<sessions>/.lock`, held across the
+# registry write, the transcript append + size check + rewrite, and the prune. Without it a rotation
+# (read, halve, replace) loses an event another hook appended in between, an appender holding the old
+# inode writes into an unlinked file, and a prune acts on a stale mtime snapshot. A hook that cannot
+# get the lock inside _SESSIONS_LOCK_WAIT drops its event (fail-soft: the display misses a line, the
+# session is never held up). No fcntl (Windows): proceed unlocked, the races above stay possible.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+_SESSIONS_LOCK_NAME = ".lock"
+_SESSIONS_LOCK_WAIT = 0.25
+# Only what this module produces is ever pruned: `<24 hex>.json`, `<24 hex>.log.jsonl` and the tmp
+# names of those two (`<file>.<pid>.tmp`). A foreign file in the directory is never ours to delete.
+_STEM_FILE = re.compile(r"([0-9a-f]{24})\.(?:json|log\.jsonl)")
+_STEM_TMP = re.compile(r"[0-9a-f]{24}\.(?:json|log\.jsonl)\.\d+\.tmp")
+
+
+@contextlib.contextmanager
+def _sessions_lock(directory: Path):
+    """Yield True when the directory lock is held (or this platform has no flock), False when it
+    could not be taken inside _SESSIONS_LOCK_WAIT: the caller then drops its write."""
+    if fcntl is None:
+        yield True
+        return
+    fd = None
+    held = False
+    try:
+        fd = os.open(directory / _SESSIONS_LOCK_NAME,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + _SESSIONS_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.005)
+    except OSError:
+        pass
+    try:
+        yield held
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)    # closing the descriptor releases the flock
+            except OSError:
+                pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write until every byte is out; a zero-byte write raises rather than spinning."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
 
 def session_touch(session_id, cwd, event, context_delivered=None) -> None:
     """Record that this session just fired `event` ("SessionStart" | "UserPromptSubmit").
     first_seen and (when `context_delivered` is None) context_delivered are kept from the
-    existing file. Atomic (tmp + replace), pruned to the newest _SESSIONS_KEEP by mtime.
-    Fail-soft: ANY exception is swallowed; a hook never fails a session over this."""
+    existing file. Atomic (tmp + replace) under the sessions-directory lock, pruned to the newest
+    _SESSIONS_KEEP by mtime. Fail-soft: ANY exception is swallowed; a hook never fails a session
+    over this."""
     try:
         if not isinstance(session_id, str) or not session_id:
             return
@@ -674,35 +742,149 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
         directory = install_root() / ".levain" / "sessions"
         path = directory / f"{key}.json"
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        first_seen, kept = now, None
-        try:
-            old = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(old, dict):
-                if isinstance(old.get("first_seen"), str):
-                    first_seen = old["first_seen"]
-                if isinstance(old.get("context_delivered"), bool):
-                    kept = old["context_delivered"]
-        except Exception:
-            pass  # absent or corrupt: start the record fresh
-        delivered = context_delivered if isinstance(context_delivered, bool) else kept
-        record = {
-            "v": 1,
-            "agent": _SESSION_AGENT,
-            "session_id": session_id,
-            "cwd": cwd if isinstance(cwd, str) else "",
-            "first_seen": first_seen,
-            "last_seen": now,
-            "last_event": event,
-            "context_delivered": delivered,
-        }
         directory.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        with _sessions_lock(directory) as held:
+            if not held:
+                return
+            first_seen, kept = now, None
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(old, dict):
+                    if isinstance(old.get("first_seen"), str):
+                        first_seen = old["first_seen"]
+                    if isinstance(old.get("context_delivered"), bool):
+                        kept = old["context_delivered"]
+            except Exception:
+                pass  # absent or corrupt: start the record fresh
+            delivered = context_delivered if isinstance(context_delivered, bool) else kept
+            record = {
+                "v": 1,
+                "agent": _SESSION_AGENT,
+                "session_id": session_id,
+                "cwd": cwd if isinstance(cwd, str) else "",
+                "first_seen": first_seen,
+                "last_seen": now,
+                "last_event": event,
+                "context_delivered": delivered,
+            }
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            try:
+                tmp.write_text(json.dumps(record), encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            _sessions_prune(directory)
+    except Exception:
+        pass
+
+
+def _sessions_prune(directory: Path, keep: int = _SESSIONS_KEEP) -> None:
+    """Bound the sessions directory by SESSIONS, not files: a stem is `<stem>.json` (the registry
+    record) plus `<stem>.log.jsonl` (the transcript). Past `keep` stems the least recently touched
+    (the newer mtime of the pair) go, both files together; stale tmp leaks of those two go too.
+    Only names this module produces are touched (see _STEM_FILE / _STEM_TMP). Callers hold the
+    sessions lock. The state-line store keeps its own file-count prune (_state_seen_prune)."""
+    now = time.time()
+    stems: dict[str, float] = {}
+    for p in directory.iterdir():
         try:
-            tmp.write_text(json.dumps(record), encoding="utf-8")
-            os.replace(tmp, path)
+            if _STEM_TMP.fullmatch(p.name):
+                if now - p.stat().st_mtime > 3600:
+                    p.unlink(missing_ok=True)
+                continue
+            m = _STEM_FILE.fullmatch(p.name)
+            if m:
+                stems[m.group(1)] = max(stems.get(m.group(1), 0.0), p.stat().st_mtime)
+        except OSError:
+            pass
+    for stem in sorted(stems, key=stems.__getitem__)[: max(0, len(stems) - keep)]:
+        for suffix in (".json", ".log.jsonl"):
+            try:
+                (directory / f"{stem}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+# The per-session transcript the cockpit reads back (Q8): `<stem>.log.jsonl` beside the registry
+# file, one line per event {"v","at","kind","text","cut"}. A DISPLAY, never an authority.
+_LOG_TEXT_MAX = 4000
+_LOG_ROTATE_AT = 256 * 1024
+
+
+def _log_rewrite_newest_half(path: Path) -> None:
+    """Rewrite `path` to its newest half of WHOLE lines via tmp + os.replace, never in place: the
+    reader holds the file open and must not see it cut under a read. The source is opened
+    O_NOFOLLOW and must be a regular file; the replace happens only after the whole tmp is written.
+    The caller holds the sessions lock."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read()
+    finally:
+        os.close(fd)
+    start = len(data) // 2
+    if start > 0 and data[start - 1:start] != b"\n":
+        nl = data.find(b"\n", start)
+        start = len(data) if nl < 0 else nl + 1
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            _write_all(fd, data[start:])
         finally:
-            tmp.unlink(missing_ok=True)
-        _state_seen_prune(directory, _SESSIONS_KEEP)
+            os.close(fd)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def session_log(session_id, kind, text) -> None:
+    """Append one transcript event for this session: `kind` is "prompt" | "reply" | "tool". Text is
+    capped at _LOG_TEXT_MAX chars (`cut` = chars dropped). Under the sessions lock: one O_APPEND write
+    (mode 0600, no symlink followed; a log whose last byte is not "\\n" gets a fresh line first); past
+    _LOG_ROTATE_AT the file is rewritten to its newest half. Fail-soft: ANY exception is swallowed; a
+    hook never fails a session over this."""
+    try:
+        if not isinstance(session_id, str) or not session_id or not isinstance(text, str):
+            return
+        key = hashlib.sha1(f"{_SESSION_AGENT}:{session_id}".encode("utf-8", "replace")).hexdigest()[:24]
+        directory = install_root() / ".levain" / "sessions"
+        path = directory / f"{key}.log.jsonl"
+        directory.mkdir(parents=True, exist_ok=True)
+        event = {
+            "v": 1,
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "kind": kind,
+            "text": text[:_LOG_TEXT_MAX],
+            "cut": max(0, len(text) - _LOG_TEXT_MAX),
+        }
+        line = (json.dumps(event) + "\n").encode("ascii")
+        with _sessions_lock(directory) as held:
+            if not held:
+                return
+            try:
+                os.stat(path, follow_symlinks=False)
+                created = False
+            except FileNotFoundError:   # a new stem: the only moment the count of sessions grows
+                created = True
+            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                size = os.fstat(fd).st_size
+                if size and hasattr(os, "pread") and os.pread(fd, 1, size - 1) != b"\n":
+                    line = b"\n" + line     # an earlier write was cut short: never glue onto its tail
+                _write_all(fd, line)
+                size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            if size > _LOG_ROTATE_AT:
+                try:
+                    _log_rewrite_newest_half(path)
+                except Exception:
+                    pass
+            if created:
+                _sessions_prune(directory)
     except Exception:
         pass
 
