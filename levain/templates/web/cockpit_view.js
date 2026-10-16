@@ -650,10 +650,15 @@
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
         const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
-        const own = pActions.find((a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb));
+        const ownOf = (a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb);
+        // an action a browser cannot perform (laptop-only, refused) draws nothing: the panel's rows already name the laptop command.
+        // A text panel keeps its read-first editor whatever the gesture (its own design, held by the editor tests)
+        const textPanel = view.extra_panels[pid].markdown != null;
+        const own = pActions.find((a) => ownOf(a) && (isPostable(a) || textPanel));
+        const ownLaptop = !own && pActions.some((a) => ownOf(a) && !isPostable(a));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
         const cmpDecl = view.extra_panels[pid].compose;
-        if (cmpDecl && view.writable && !NATIVE.has(pid)) {
+        if (cmpDecl && view.writable && !NATIVE.has(pid) && !ownLaptop) {
           // a writable surface draws the card or says why not, never a silently missing card (a read-only one
           // draws no verbs at all, so it stays silent)
           if (!vh) throw new Error("its compose verb " + cmpDecl.verb + " is not offered by this panel");

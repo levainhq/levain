@@ -49,6 +49,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 - **The cockpit no longer keeps a CPU core busy while it is open.** The Cognition chart's glow breathed forever, so the browser drew a frame every refresh (measured 10-15: 53 frames a second and 7-11% of a core in headless Chrome, against about 2% without it). It now breathes three times and settles; a loading dot pulses for about ten seconds, then holds still.
+- **A panel's action the page cannot perform draws nothing, and an action with no field is a bare button.** An external panel (such as the Team Joins pane) whose own action is laptop-only or refused no longer draws an empty compose box that clipped the row naming the laptop command (the compose card of such a verb draws nothing rather than an unavailable panel), and an action with no fields (such as a fetch) draws its button alone, not an empty field bar. A text panel keeps its edit button.
 
 ## [0.10.4] — 2026-10-15
 
