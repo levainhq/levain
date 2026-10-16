@@ -146,6 +146,12 @@ class Decision:
     posture: str | None = None
 
 
+def class_covers(key_class: str, tier: str) -> bool:
+    """True when a key of ``key_class`` may ALLOW a request of ``tier`` (a deny needs only an enrolled key)."""
+    have = _CLASS_RANK.get(key_class)
+    return have is not None and tier in _TIER_NEEDS and have >= _TIER_NEEDS[tier]
+
+
 def default_queue_dir() -> Path:
     """``<levain home>/consent``: ``$LEVAIN_HOME/consent`` if set, else ``~/.levain/consent``, made absolute
     (as ``levain.autonomic.db.default_store_dir`` does for the autonomic store)."""
@@ -500,10 +506,8 @@ class ConsentQueue:
             return "the signer is not an enrolled key"
         if not key.active:
             return "the signer's key is revoked"
-        if decision == "allow":
-            need, have = _TIER_NEEDS[request.tier], _CLASS_RANK.get(key.key_class)
-            if have is None or have < need:
-                return f"key class {key.key_class} does not cover {request.tier}"
+        if decision == "allow" and not class_covers(key.key_class, request.tier):
+            return f"key class {key.key_class} does not cover {request.tier}"
         if not isinstance(signature, str) or not signature:
             return "the answer carries no signature"
         try:
