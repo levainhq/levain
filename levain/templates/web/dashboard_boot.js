@@ -260,8 +260,10 @@
   // An editor closing lifts the block: the render core announces a retired stale form, and any other editor
   // closes by a click (cancel, save) or Escape; check after that handler has run.
   document.addEventListener("levain:editor-closed", function () { setTimeout(flushIfIdle, 0); });
-  document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); });
-  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); });
+  // capture phase: an inline editor's own handlers may stop propagation, and its close must still flush (the
+  // timeout runs the check after that handler)
+  document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); }, true);
+  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); }, true);
   function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and

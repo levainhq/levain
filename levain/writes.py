@@ -1380,13 +1380,15 @@ def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, spore_
         return _NO_CAS
     expect = _normalize_expect_disposition(req["expect_disposition"])
     if current is not None:
-        found = current.get("disposition")
+        raw = current.get("disposition")
+        found = raw or None   # a stored "" is a loop, as the render reads it
         if found != expect:
             raise EditError(
                 "stale", 409,
                 f"disposition changed since read (expected {expect!r}, found {found!r}); "
                 "re-read the spore and retry.",
             )
+        return raw   # anneal's CAS compares the stored value itself
     return expect
 
 
@@ -1461,7 +1463,7 @@ def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = N
         # an id the store does not hold is not a race this write lost: its own refusal stands
         if cur is not None and cur.get("status") == "resolved":
             return EditError("stale", 409, "the item was resolved or removed since it was read")
-        if cur is not None and cur.get("disposition") != expect_disposition:
+        if cur is not None and (cur.get("disposition") or None) != (expect_disposition or None):
             return EditError("stale", 409, str(exc))   # anneal names what it expected and what it found
     return EditError("verb_failed", 422, str(exc))
 

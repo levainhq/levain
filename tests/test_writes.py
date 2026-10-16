@@ -1499,6 +1499,22 @@ class TestSporeUpdate:
         assert ei.value.code == "stale"
         assert any(r["id"] == sid for r in _spore_store(install).list_open())
 
+    def test_a_loop_stored_as_an_empty_disposition_takes_a_loop_snapshot(self, install: Path) -> None:
+        # L3 r2 LOW: a stored "" renders as a loop; its snapshot must match and the write must land, not
+        # answer stale on every re-read
+        sid = _add_spore(install)
+        # anneal clears "" itself, so only a hand-edited store holds one: write it as a hand would
+        path = _scope(install).anneal.spores_json
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data["spores"] if isinstance(data, dict) else data
+        next(r for r in rows if r["id"] == sid)["disposition"] = ""
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert _spore_store(install).get(sid).get("disposition") == ""
+        res = apply_edit(_scope(install), {
+            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "ref": "p", "confirm": True, "expect_disposition": "loop"})
+        assert res["ok"]
+
     def test_ascend_with_a_matching_snapshot_and_without_one_both_land(self, install: Path) -> None:
         a, b = _add_spore(install), _add_spore(install)
         for sid, extra in ((a, {"expect_disposition": "loop"}), (b, {})):
