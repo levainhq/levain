@@ -150,8 +150,11 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
 
 ## Install (manual — `levain init` automates this at build step 4)
 
-1. **Install anneal-memory** into the interpreter you will use and confirm
-   it runs: `<python> -m anneal_memory --help`. Note that interpreter's
+1. **Install levain and anneal-memory** into the interpreter you will use
+   and confirm both run: `<python> -m anneal_memory --help` and
+   `<python> -EP -m levain.hookrun` (exits 1 with no output). The hook
+   commands run `-m levain.hookrun`, so a deleted or moved install never
+   blocks Codex. Note that interpreter's
    absolute path (for example `command -v python3`).
 2. **Place `seed/`, `activation/`, and `AGENTS.md`** (from
    `AGENTS.md.template`) in the partnership directory.

@@ -233,7 +233,7 @@ def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
     stays as a regression pin."""
     data = json.loads(current)
     cmd = data["hooks"]["SessionStart"][0]["hooks"][0]
-    script = shlex.split(cmd["command"])[1]
+    script = shlex.split(cmd["command"])[-1]
     if shape == "nan_constant":        # a JSON constant json.loads accepts
         cmd["timeout"] = float("nan")
     elif shape == "echo_exact_script":  # the exact generated command, run by something else
