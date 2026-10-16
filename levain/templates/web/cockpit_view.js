@@ -1572,7 +1572,9 @@
     let raw, fault = "";
     try { raw = await readPanel(pid); } catch (e) { fault = e && e.message ? e.message : String(e); }
     if (refetchGen.get(pid) !== gen) return "superseded";   // a newer refetch of this panel owns the answer and the record
-    if (boardEpoch !== epoch) return "superseded";          // a full render since drew this panel from a newer read
+    // a full render since drew this panel from a read that may be older or newer than this one: the panel is not
+    // painted from this read, and `false` asks the caller to draw the board again (the stream reloads)
+    if (boardEpoch !== epoch) return false;
     const live = liveOf(pid);
     if (!live.length) return false;
     if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }

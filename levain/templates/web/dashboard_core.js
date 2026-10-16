@@ -578,8 +578,8 @@
           busy = true;
           again.setAttribute("aria-busy", "true");
           Promise.resolve().then(() => V.refetchPanel(wx.id)).catch(() => "fault").then((r) => {
-            // `false`: the panel cannot be re-read on its own (no longer external, or its shape moved): the board reloads,
-            // as the stream does with the same answer
+            // `false`: the panel cannot be re-read on its own (no longer external, its shape moved, or a board render
+            // landed meanwhile): the board reloads, as the stream does with the same answer
             const T = window.LevainCockpitTransport;
             if (r === false && T && typeof T.reload === "function") return T.reload();
             return r;
