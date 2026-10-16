@@ -18,8 +18,9 @@ This module decides nothing. A wrong conversion makes ``ssh-keygen`` refuse a go
 verify, because every byte that carries trust is checked by the verifier the consent queue already uses
 (:func:`levain.authority.verify_link_sig`). The checks here only refuse input of the wrong SHAPE early, with a reason.
 
-Stdlib only. Measured against a real iPhone (Safari, iCloud passkey) on 2026-10-16: the converted signature verified
-under ``/usr/bin/ssh-keygen`` and a one-bit change to the message did not.
+Stdlib only. The conversion was first run by a test page against a real iPhone (Safari, iCloud passkey, 2026-10-16:
+``/usr/bin/ssh-keygen`` verified it and a one-bit change to the message did not); this module's output for a recorded
+virtual-authenticator assertion is byte-identical to that page's (tests/test_consent_passkey.py verifies it).
 """
 from __future__ import annotations
 

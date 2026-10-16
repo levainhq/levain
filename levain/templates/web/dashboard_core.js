@@ -3006,7 +3006,7 @@
     consentBodies.set(key, got);
     return got;
   }
-  function drawConsentBody(row, slot, b, pending) {
+  function drawConsentBody(row, slot, b, pending, id) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("pre", "consent-display", sv(b.display))];
@@ -3032,8 +3032,117 @@
         line.append(code, btn);
         parts.push(line);
       }
+      if (id && passkeyUsable()) parts.push(passkeyAnswer(id));
     }
     slot.replaceChildren(...parts);
+  }
+
+  // Q6b: answer with a passkey on a page that reached this cockpit over https (a proxy such as `tailscale serve`).
+  // The server hands back the exact answer record and its challenge; the passkey signs it; the consent queue verifies
+  // the signature with the same ssh-keygen check as a terminal answer. The page decides nothing: a refusal is shown
+  // as the server's own words. A passkey is made on this page's host name, and only that name can use it.
+  function passkeyUsable() {
+    const host = location.hostname;
+    return window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
+      && !!(navigator.credentials && navigator.credentials.get) && !/^[0-9.]+$/.test(host) && host.indexOf(":") < 0;
+  }
+  const b64u = (buf) => btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const unb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)), (ch) => ch.charCodeAt(0));
+  function passkeyPost(route, body) {
+    const t = window.LevainCockpitTransport;
+    let headers = {};
+    try { headers = t && typeof t.headers === "function" ? t.headers() : {}; } catch (e) { headers = {}; }
+    return fetch(route, { method: "POST", cache: "no-store", body: JSON.stringify(body),
+                          headers: Object.assign({ "Content-Type": "application/json" }, headers) })
+      .then((res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
+                                     () => ({ ok: false, status: res.status, body: {} })),
+            () => ({ ok: false, status: 0, body: { message: "the cockpit could not be reached" } }));
+  }
+  // one box per request, kept across the board's redraws so a ceremony's progress and an enrolment's commands stay
+  // on screen while fresh views arrive; closeModal clears it with the request bodies
+  const passkeyBoxes = new Map();
+  function passkeyAnswer(id) {
+    const kept = passkeyBoxes.get(id);
+    if (kept) return kept;
+    const box = el("div", "consent-passkey");
+    passkeyBoxes.set(id, box);
+    const note = el("div", "consent-note ext-meta", "");
+    const buttons = el("div", "consent-cmd");
+    const base = "/cockpit/consent/" + encodeURIComponent(id) + "/";
+    let busy = false;
+    const say = (text) => { note.textContent = text; };
+    const answer = (decision, signer) => {
+      if (busy) return;
+      busy = true;
+      say("asking the cockpit for the answer to sign\u2026");
+      const req = signer ? { decision: decision, signer_fp: signer } : { decision: decision };
+      passkeyPost(base + "passkey-challenge", req).then((r) => {
+        if (!r.ok) {
+          if (r.body.error === "choose_passkey" && Array.isArray(r.body.signers)) return choose(decision, r.body.signers);
+          if (r.body.error === "no_passkey") enrolOffer();
+          return say(r.body.message || ("refused (HTTP " + r.status + ")"));
+        }
+        say("confirm with your passkey to " + decision + " this request\u2026");
+        return navigator.credentials.get({ publicKey: { challenge: unb64u(r.body.challenge), rpId: r.body.rp_id,
+                                                        userVerification: "required", timeout: 60000 } })
+          .then((cred) => passkeyPost(base + "passkey-answer", {
+            payload: r.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+            client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }))
+          .then((a) => say(a.ok ? (a.body.decision === "allow" ? "allowed" : "denied") + " \u00b7 signed by " + a.body.signer_fp
+                                : "not answered: " + (a.body.message || ("HTTP " + a.status))),
+                (e) => say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered"));
+      }).finally(() => { busy = false; });
+    };
+    const choose = (decision, signers) => {
+      say("more than one passkey is enrolled for this name; pick the one this device holds:");
+      for (const fp of signers) {
+        const pick = el("button", "undo-btn consent-copy", fp.slice(0, 18) + "\u2026");
+        pick.type = "button";
+        pick.addEventListener("click", () => answer(decision, fp));
+        buttons.appendChild(pick);
+      }
+    };
+    const enrolOffer = () => {
+      if (box.querySelector(".consent-enrol")) return;
+      const btn = el("button", "undo-btn consent-copy consent-enrol", "make a passkey here");
+      btn.type = "button";
+      btn.title = "create a passkey for " + location.hostname + " on this device; the laptop then enrols it";
+      btn.addEventListener("click", () => enrol(btn));
+      box.appendChild(btn);
+    };
+    const enrol = (btn) => {
+      btn.disabled = true;
+      const rand = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return a; };
+      navigator.credentials.create({ publicKey: {
+        rp: { id: location.hostname, name: "levain" }, user: { id: rand(16), name: "levain operator", displayName: "levain operator" },
+        challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
+        authenticatorSelection: { residentKey: "required", userVerification: "required" } } })
+        .then((cred) => passkeyPost("/cockpit/passkey/key-line", { spki: b64u(cred.response.getPublicKey()) }))
+        .then((r) => {
+          if (!r.ok) { btn.disabled = false; return say(r.body.message || ("refused (HTTP " + r.status + ")")); }
+          say("passkey made. On the laptop, run these to enrol it (a passkey cannot enrol itself):"
+              + (r.body.note ? " " + r.body.note : ""));
+          for (const cmd of r.body.commands || []) {
+            const line = el("div", "consent-cmd");
+            const code = el("code", "consent-code", cmd);
+            const copy = el("button", "undo-btn consent-copy", "copy");
+            copy.type = "button";
+            copy.dataset.label = copy.textContent;
+            copy.addEventListener("click", () => copyText(cmd, code, copy));
+            line.append(code, copy);
+            box.appendChild(line);
+          }
+          btn.remove();
+        }, (e) => { btn.disabled = false; say("no passkey was made (" + ((e && e.name) || "cancelled") + ")"); });
+    };
+    for (const decision of ["allow", "deny"]) {
+      const btn = el("button", "undo-btn consent-copy consent-passkey-btn", decision + " with passkey");
+      btn.type = "button";
+      btn.addEventListener("click", () => answer(decision));
+      buttons.appendChild(btn);
+    }
+    box.append(buttons, note);
+    return box;
   }
   function consentRow(o) {
     const c = o.consent;
@@ -3075,7 +3184,7 @@
     }
     const slot = el("div", "consent-body ext-meta", "reading the request\u2026");
     row.appendChild(slot);
-    if (c.id) consentBody(c, row).then((b) => drawConsentBody(row, slot, b, pending));
+    if (c.id) consentBody(c, row).then((b) => drawConsentBody(row, slot, b, pending, c.id));
     else slot.textContent = "this request has no id";
     return row;
   }
@@ -3552,6 +3661,7 @@
     if (overlay) overlay.remove();
     sessionBodies.clear();
     consentBodies.clear();   // request bodies (commands, working directories) are not kept past the view
+    passkeyBoxes.clear();
     consentGen++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
