@@ -449,6 +449,28 @@ def main(argv: list[str] | None = None) -> int:
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
+    ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
+    _ck_common(ck_pending)
+    ck_pending.set_defaults(func=_cmd_cockpit_pending)
+    ck_sign = ck_sub.add_parser(
+        "sign",
+        help="Sign a waiting cockpit pending and send the signature to its running server.",
+        description=(
+            "Read the pending off the journal, print its record in full (the very bytes signed), sign them "
+            "with --signing-key in the cockpit namespace (it may ask for a touch or a passphrase), and POST "
+            "the signature to the running `levain serve --write` at --url, which verifies, decides and "
+            "applies. The write token is read from $LEVAIN_WRITE_TOKEN, else asked for (never an argument). "
+            "A key whose class does not cover the pending's tier is refused before anything is signed."
+        ),
+    )
+    ck_sign.add_argument("pending_id", help="The pending's id (cp...), as `levain cockpit pending` lists it.")
+    ck_sign.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                         help="An enrolled key whose class covers the pending's tier (its private key file, or "
+                              "the .pub of a key an agent holds).")
+    ck_sign.add_argument("--url", default="http://127.0.0.1:7420",
+                         help="The running server (default: http://127.0.0.1:7420); loopback only.")
+    _ck_common(ck_sign)
+    ck_sign.set_defaults(func=_cmd_cockpit_sign)
     ck_ledger = ck_sub.add_parser("ledger", help="The authority log itself.")
     ck_ledger_sub = ck_ledger.add_subparsers(dest="ledger_cmd", required=True)
     ck_init = ck_ledger_sub.add_parser(
@@ -2108,6 +2130,103 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
               + (f" ({r.enrolled_at})" if r.enrolled_at else "")
               + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else "")
               + (f"; {notes[r.fingerprint]}" if r.fingerprint in notes else ""))
+    return 0
+
+
+def _sign_refusals() -> tuple[type[BaseException], ...]:
+    from levain.autonomic.journal import JournalCorruptError
+    from levain.cockpit.consent import ConsentError
+    from levain.cockpit.sign_client import SignRefused
+
+    return (SignRefused, JournalCorruptError, ConsentError, *_cockpit_refusals())
+
+
+def _cmd_cockpit_pending(args: argparse.Namespace) -> int:
+    from levain.cockpit.sign_client import journal
+
+    try:
+        now = _utc_now()
+        rows = journal(_cockpit_root(args)).decision_rows(now)
+    except _sign_refusals() as exc:
+        print(f"pending: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    if not rows.pendings:
+        print("no waiting pendings")
+    for p in rows.pendings:
+        where = "/".join(str(p.target.get(k)) for k in ("panel_id", "row_id") if p.target.get(k) is not None)
+        print(_term_safe(f"{p.pending_id}  {p.verb}  {p.tier}  {where or '-'}  by {p.principal}  "
+                         f"issued {p.issued_at}  {_time_left(p.expires_at, now)}"))
+    if rows.skipped:
+        print(f"note: {rows.skipped} corrupt op(s) skipped", file=sys.stderr)
+    return 0
+
+
+def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
+    import getpass
+    import os
+
+    from levain.autonomic.confirm import COCKPIT_NAMESPACE
+    from levain.cockpit.keys import ssh_signer
+    from levain.cockpit.firejournal import CockpitDB, UnknownPending
+    from levain.cockpit.sign_client import (TOKEN_ENV, SignRefused, header_safe_token, journal, key_refusal,
+                                            loopback_url, post_signature, render, server_listening, waiting)
+
+    try:
+        url = loopback_url(args.url)
+        db = journal(_cockpit_root(args))
+        now = _utc_now()
+        view = waiting(db, args.pending_id, now)
+        signer_fp, sign = ssh_signer(args.signing_key, namespace=COCKPIT_NAMESPACE)
+        refusal, key_class = key_refusal(db, signer_fp, view.record["tier"], now=now)
+        if refusal is not None:
+            raise SignRefused(f"{refusal} (nothing signed; the pending stays WAITING)")
+        token = os.environ.get(TOKEN_ENV)
+        if not token:
+            try:
+                token = getpass.getpass(f"write token (or set {TOKEN_ENV}): ")
+            except EOFError:      # no terminal and nothing on stdin
+                token = ""
+        if not token.strip():
+            raise SignRefused(f"no write token: set {TOKEN_ENV} or type the one `levain serve --write` printed")
+        token = header_safe_token(token)
+        server_listening(url)
+        for line in render(view, signer_fp=signer_fp, signer_class=key_class):
+            print(_term_safe(line))
+        sys.stdout.flush()
+        answer = post_signature(url, view.pending_id, sign(view.record_bytes), token)
+    except KeyboardInterrupt:
+        print("sign cancelled", file=sys.stderr)
+        return 1
+    except _sign_refusals() as exc:
+        print(f"sign refused: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    body = answer.body
+    if 300 <= answer.status < 400:
+        print(_term_safe(f"sign refused: HTTP {answer.status} (a redirect, not followed): {answer.raw[:500]}"),
+              file=sys.stderr)
+        return 1
+    if answer.status != 200 or body is None:
+        if body is not None:
+            print(_term_safe(f"sign refused: {body.get('error')}: {body.get('message')}"), file=sys.stderr)
+        else:
+            print(_term_safe(f"sign refused: HTTP {answer.status}: {answer.raw[:500]}"), file=sys.stderr)
+        return 1
+    print(_term_safe(f"{body.get('state')}" + (f" ({body.get('reason')})" if body.get("reason") else "")
+                     + f": decision {body.get('decision_kind')}" + (f", {body.get('label')}" if body.get("label") else "")
+                     + (" (a replay: this pending was already decided)" if body.get("replay") else "")))
+    if not (body.get("replay") is False and body.get("decision_kind") == "ALLOWED" and body.get("state") == "COMMITTED"):
+        return 1
+    # the answer counts only when the journal the operator chose agrees: a listener that is not its server
+    # (another install's, or none of ours) cannot make a success
+    try:
+        after = CockpitDB(db.data_root).load(view.pending_id)
+    except (UnknownPending, *_sign_refusals()) as exc:
+        print(f"sign unconfirmed: the journal could not be re-read ({_term_safe(exc)})", file=sys.stderr)
+        return 1
+    if after.state != "COMMITTED":
+        print(_term_safe(f"sign unconfirmed: the server answered COMMITTED but {view.pending_id} is {after.state} "
+                         f"in {db.path}: the server at {url} does not hold this journal"), file=sys.stderr)
+        return 1
     return 0
 
 
