@@ -406,15 +406,18 @@ sys.exit(main({argv}))
 
 
 def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path | str | None = None,
-            max_hold: float = DEFAULT_MAX_HOLD, allow_untested_agent_version: bool = False) -> tuple[Path, Path]:
+            max_hold: float = DEFAULT_MAX_HOLD, allow_untested_agent_version: bool = False,
+            inbound: str = "hold", outbound: str = "ask") -> tuple[Path, Path]:
     """Install the hook into ``workspace``: ``.claude/hooks/levain_consent.py`` and a ``PermissionRequest``
     entry (matcher ``*``, ``timeout`` = :func:`hook_timeout`) in ``.claude/settings.json``, other
-    settings kept and any earlier levain entry replaced. Raises
+    settings kept and any earlier levain entry replaced, plus the messaging controls ``inbound`` / ``outbound``
+    (:func:`merge_messaging`, never loosening) in the same write. Raises
     :class:`levain.consent.canary.UntestedAgentVersion` when the installed ``claude`` is not a tested version
     (:data:`levain.consent.canary.TESTED_VERSIONS`), unless ``allow_untested_agent_version``. Returns
     (script, settings)."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
         raise ValueError("max_hold must be a finite number of seconds >= 0")
+    merge_messaging({}, inbound=inbound, outbound=outbound)  # refuse an unknown choice before writing anything
     from levain.consent.canary import require_tested_version
     require_tested_version(AGENT, allow_untested=allow_untested_agent_version)
     ws = Path(workspace).resolve()
@@ -448,6 +451,7 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
         if not isinstance(settings, dict):
             raise ValueError(f"{settings_path} is not a JSON object")
         _merge_handler(settings, command, handler, script=script)
+        merge_messaging(settings, inbound=inbound, outbound=outbound)
         if _stat_key(settings_path) != before:
             continue  # changed while we merged: merge again onto the newer file
         _atomic_write(settings_path, json.dumps(settings, indent=2) + "\n", mode=0o644, keep_mode=True)
@@ -511,6 +515,41 @@ def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, An
             kept.append({**group, "hooks": handlers})
     kept.append({"matcher": "*", "hooks": [handler]})
     hooks[EVENT] = kept
+
+
+# Q9, cross-session messaging (DESIGN_Q9). Inbound: Claude Code's `crossSessionInbound`. Outbound: ``ask`` puts
+# `SendMessage` under an explicit ask rule (which no permission mode auto-approves, so every send reaches the
+# PermissionRequest hook above or the human) plus `isolatePeerMachines`; ``deny`` turns sending and listing off.
+# ``unmanaged`` writes nothing for that direction.
+INBOUND_CHOICES = ("hold", "refuse", "unmanaged")
+OUTBOUND_CHOICES = ("ask", "deny", "unmanaged")
+
+
+def merge_messaging(settings: dict[str, Any], *, inbound: str = "hold", outbound: str = "ask") -> None:
+    """Merge the messaging controls into ``settings`` (a Claude Code settings object), never loosening what is
+    there: `crossSessionInbound` becomes the stricter of its value and ``inbound``, a rule is only ever added, and
+    an existing `isolatePeerMachines` true is kept. Raises ValueError on an unknown choice or a malformed
+    `permissions` block (never rewritten into shape)."""
+    from levain.host_guard import stricter_inbound
+
+    if inbound not in INBOUND_CHOICES or outbound not in OUTBOUND_CHOICES:
+        raise ValueError(f"inbound must be one of {INBOUND_CHOICES} and outbound one of {OUTBOUND_CHOICES}")
+    if inbound != "unmanaged":
+        current = settings.get("crossSessionInbound")
+        # an unrecognised value already holds (Claude Code's rule); replacing it with hold or refuse is no loosening
+        settings["crossSessionInbound"] = stricter_inbound(current, inbound) or inbound
+    if outbound == "unmanaged":
+        return
+    perms = settings.setdefault("permissions", {})
+    if not isinstance(perms, dict):
+        raise ValueError("settings 'permissions' is not a JSON object")
+    wanted = {"ask": ("ask", ("SendMessage",)), "deny": ("deny", ("SendMessage", "ListAgents"))}[outbound]
+    rules = perms.setdefault(wanted[0], [])
+    if not isinstance(rules, list):
+        raise ValueError(f"settings 'permissions.{wanted[0]}' is not a list")
+    rules.extend(t for t in wanted[1] if t not in rules)
+    if outbound == "ask":
+        settings["isolatePeerMachines"] = True
 
 
 def _refuse_symlink(path: Path) -> None:
