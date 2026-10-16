@@ -1,10 +1,12 @@
-"""levain.cockpit.team_panels: the cockpit's Team zone, read-only (TEAM_VIEW_PLAN T2).
+"""levain.cockpit.team_panels: the cockpit's Team zone (TEAM_VIEW_PLAN T2; the T3 verbs: levain.team.cockpit_verbs).
 
 ONE ``TeamSource`` reads the install's team ledger (``levain.team.reader.read_team``) and caches the answer for
 ``ttl_s``; every Team panel is a view over that one answer, so a manifest build asks the ledger once however many
 panels draw it, and no panel reads the ledger itself. A cold history read can be slow: the source runs it on a
 worker thread, a caller waits ``wait_s`` for the FIRST answer only, and a later refresh serves the last answer
-while the worker renews it. Nothing here fetches: Sync shows what the transport last recorded.
+while the worker renews it. Nothing here fetches: Sync shows what the transport last recorded. A team verb
+(``levain.team.cockpit_verbs``) that changed the ledger calls ``invalidate``, and the next read waits for a fresh
+answer instead of serving the copy from before the verb.
 
 The panel SET follows the state (a discoverer registered with ``retire``): ``ok`` and ``judged_partial`` draw the
 panes; ``no_team`` and ``unreadable`` draw ONE card, the reader's own ``why`` (its ``detail`` is for a log and is
@@ -27,13 +29,35 @@ from levain.team.ledger_api import open_ledger
 from levain.team.reader import _NO_TEAM, TeamRead, person_text, read_team
 from levain.team.transport import Repo
 
-__all__ = ["TeamSource", "TeamSnapshot", "team_discoverer"]
+__all__ = ["TeamSource", "TeamSnapshot", "team_discoverer", "invalidate", "FETCH_VERB", "ACCEPT_VERB"]
 
 _PENDING = "The team ledger is still being read on this machine; this page will fill in."
 REGION = "team"
 STATUS_ID = "team-status"
-FACETS = frozenset({"entry_type", "entry_owner", "agent", "age_days", "exposure_count"})
+# ``about``: a join row's digest of what accepting it takes (levain.team.reader.join_digest), which the accept signs
+FACETS = frozenset({"entry_type", "entry_owner", "agent", "age_days", "exposure_count", "about"})
 _ROW_MAX = 400
+# the Team zone's verbs (levain.team.cockpit_verbs registers them): Sync offers the fetch while the ledger has a remote,
+# Joins pending offers the accept while a join waits on THIS machine
+FETCH_VERB = "team_fetch"
+ACCEPT_VERB = "team_join_accept"
+
+# Bumped by a team verb after it changed (or tried to change) the ledger: every source's cached answer read before the
+# bump is old, and the next read waits for a fresh one, so the page shows what the verb did, not the copy before it.
+_EPOCH = 0
+_EPOCH_LOCK = threading.Lock()
+
+
+def invalidate() -> None:
+    """Every TeamSource's cached read is old from now: the next ``get`` reads the ledger again."""
+    global _EPOCH
+    with _EPOCH_LOCK:
+        _EPOCH += 1
+
+
+def _epoch() -> int:
+    with _EPOCH_LOCK:
+        return _EPOCH
 
 
 @dataclass(frozen=True)
@@ -49,8 +73,17 @@ def _unreadable(why: str) -> TeamSnapshot:
 
 class TeamSource:
     """The cached, single-flight read of one install's team ledger. ``start`` is where the ledger is looked for
-    (never the process's working directory: a caller names it); ``load`` is for tests. A renewal still running
-    after ``stuck_s`` is stuck: the last answer is then served marked old, and a new worker may take over."""
+    (never the process's working directory: a caller names it); ``load`` is for tests.
+
+    At most ONE worker reads per source (T3 L3 r1 codex MED 4): an invalidation while it runs starts no second read;
+    when it finishes, its answer is kept (as the old answer, if an invalidation came meanwhile) and exactly one
+    follow-up read starts for the newer epoch. The one exception is a worker still running after ``stuck_s``: it is
+    stuck, the last answer is served marked old, and a new worker takes over (the stuck one commits nothing).
+
+    A ``get`` returns an answer as current only if its epoch is the epoch at return (codex MED 3). Otherwise it waits
+    ``wait_s`` once, and past the wait serves the last answer marked old. One wait is paid per epoch, not per get: an
+    epoch whose wait ran out, or whose read failed, is remembered, and later gets in it serve at once (complement
+    LOW 3; the first read's cold wait is the same rule)."""
 
     def __init__(self, start: Path | str | None = None, *, ttl_s: float = 15.0, wait_s: float = 8.0,
                  stuck_s: float = 60.0, load: Callable[[], TeamSnapshot] | None = None,
@@ -61,9 +94,11 @@ class TeamSource:
         self._lock = threading.Lock()
         self._snap: TeamSnapshot | None = None
         self._at = 0.0
-        self._done: threading.Event | None = None     # set while a worker is reading
+        self._snap_epoch = -1                         # the epoch the answer was read in
+        self._work_epoch = -1                         # the epoch the running worker started in
+        self._done: threading.Event | None = None     # the ONE live worker's event (None: no worker is reading)
         self._began = 0.0                             # when that worker started
-        self._cold_late = False                       # a first read outran its wait: later callers do not wait again
+        self._late_epoch = -1                         # an epoch whose wait ran out or whose read failed: no more waits
 
     def _load_ledger(self) -> TeamSnapshot:
         repo = Repo.discover(self._start) if self._start is not None else None
@@ -75,7 +110,13 @@ class TeamSource:
             sync["remote"] = gl.remote
         return TeamSnapshot(read_team(gl), sync)
 
-    def _work(self, done: threading.Event) -> None:
+    def _spawn(self, epoch: int) -> None:
+        """Start the one worker for ``epoch``. The caller holds ``_lock`` and has checked no live worker runs."""
+        done = threading.Event()
+        self._done, self._began, self._work_epoch = done, self._clock(), epoch
+        threading.Thread(target=self._work, args=(done, epoch), daemon=True, name="team-read").start()
+
+    def _work(self, done: threading.Event, epoch: int) -> None:
         snap = None
         try:
             snap = self._load()
@@ -83,33 +124,45 @@ class TeamSource:
             snap = _unreadable(f"The team ledger could not be read on this machine ({type(exc).__name__}).")
         finally:
             with self._lock:
-                if self._done is done:       # a worker a newer one took over from commits nothing
-                    if snap is not None:
-                        self._snap, self._at = snap, self._clock()
-                    self._done, self._cold_late = None, False
+                if self._done is done:       # a stuck worker a newer one took over from commits nothing
+                    if snap is not None:     # kept even when an invalidation came meanwhile: it is the old answer
+                        self._snap, self._at, self._snap_epoch = snap, self._clock(), epoch
+                    else:
+                        self._late_epoch = max(self._late_epoch, epoch)     # a failed read: no more waits in it
+                    self._done = None
+                    now_epoch = _epoch()
+                    if now_epoch != epoch:   # invalidated while it ran: exactly one follow-up, for the newest epoch
+                        self._spawn(now_epoch)
             done.set()
 
+    def _old(self, snap: TeamSnapshot | None, age: float) -> TeamSnapshot:
+        """The last answer, known not to be current: it carries its age, so it reads as old (or the pending card)."""
+        return _unreadable(_PENDING) if snap is None else dataclasses.replace(snap, age_s=max(age, 0.001))
+
     def get(self) -> TeamSnapshot:
+        epoch = _epoch()
         with self._lock:
             now = self._clock()
             age = now - self._at
-            if self._snap is not None and age < self._ttl:
-                return self._snap
+            have, current = self._snap, self._snap_epoch == epoch
+            if have is not None and age < self._ttl and current:
+                return have
             if self._done is None or now - self._began > self._stuck:
-                self._done, self._began = threading.Event(), now
-                threading.Thread(target=self._work, args=(self._done,), daemon=True, name="team-read").start()
-            have, done = self._snap, self._done
-            if have is not None:
-                # a renewal that has outrun `stuck_s` is not "being renewed": the answer reads as old
+                self._spawn(epoch)           # the one worker (a stuck one is abandoned: it commits nothing)
+            done = self._done
+            if have is not None and current:
+                # a renewal within the epoch: the answer stands meanwhile; one that has outrun `stuck_s` reads as old
                 return dataclasses.replace(have, age_s=age) if age > self._stuck else have
-            if self._cold_late:
-                return _unreadable(_PENDING)
+            if self._late_epoch == epoch:
+                return self._old(have, age)
+        # a first read, or an answer a team verb made old: wait once for the new one
         done.wait(self._wait)
         with self._lock:
-            if self._snap is not None:
+            if self._snap is not None and self._snap_epoch == _epoch():
                 return self._snap
-            self._cold_late = True
-        return _unreadable(_PENDING)
+            # past the wait, or answered for an epoch superseded during it: the old answer, marked old
+            self._late_epoch = max(self._late_epoch, epoch)
+            return self._old(self._snap, self._clock() - self._at)
 
 
 def _one_line(text: object, limit: int = _ROW_MAX) -> str:
@@ -205,13 +258,23 @@ def _member_rows(members: list[dict]) -> tuple[RowIn, ...]:
     return tuple(out)
 
 
+# a join that waits on THIS machine names the laptop command that does the act today: the member's own signed act
+_MINE_LINE = {"key": "this machine's key is proposed for {h}; run `levain team key confirm` on this machine to bring "
+                     "it into force",
+              "owner-offer": "ownership is offered to you; run `levain team accept` on this machine to take it"}
+
+
 def _join_rows(joins: list[dict]) -> tuple[RowIn, ...]:
     out = []
     for j in joins:
         title = _one_line(f"{j['kind']} · {j['handle']}")
-        body = _one_line(" · ".join(p for p in (j.get("line"), j.get("fingerprint")) if p))
+        mine = _MINE_LINE.get(j["kind"]) if j.get("mine") else None
+        line = mine.format(h=j["handle"]) if mine else j.get("line")
+        body = _one_line(" · ".join(p for p in (line, j.get("fingerprint")) if p))
+        about = j.get("about")
         out.append(RowIn(id=f"join:{j['kind']}:{j['handle']}:{j.get('n', 0)}", title=title, body=body,
-                         stored={"title": title, "body": body}))
+                         facets={"about": about} if isinstance(about, str) else {},
+                         stored={"title": title, "body": body, "about": about}))
     return tuple(out)
 
 
@@ -277,6 +340,16 @@ def team_discoverer(src: TeamSource) -> Callable[[ReadContext], list[ProviderSpe
                                  order="legacy.source", version_fields=("*",), size="short", span=3)]
         return [ProviderSpec(pid, "list", title, "feed", _pane_read(src, build), region=REGION, rank=rank,
                              order="legacy.source", facets=FACETS, version_fields=("*",), empty=empty, size=size,
-                             span=span)
+                             span=span, verbs=_offers(pid, snap))
                 for pid, title, empty, size, span, rank, build in _PANES]
     return discover
+
+
+def _offers(pid: str, snap: TeamSnapshot) -> tuple[str, ...]:
+    """What a pane offers, from the same snapshot it draws: a write re-asks the discoverer (``offer_spec``), so an
+    offer that no longer holds is refused there, and the store decides again under the team op lock at apply."""
+    if pid == "team-sync" and snap.sync.get("remote"):
+        return (FETCH_VERB,)
+    if pid == "team-joins" and any(j.get("mine") for j in (snap.read.model or {}).get("joins") or ()):
+        return (ACCEPT_VERB,)
+    return ()
