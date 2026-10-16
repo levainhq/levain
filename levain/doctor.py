@@ -1440,6 +1440,63 @@ def _check_transcript_hooks(install: Path, hooks: Any, events: Sequence[str], ag
                         f"nothing for those events", "Run `levain update` to add them.", warn=True)]
 
 
+def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[CheckResult]:
+    """The consent hook `levain init` wires (S1436): whether the PermissionRequest entry runs this install's
+    script, the away mode the hook will read, and which cockpit its grants and signed answers verify against.
+    Advisory only (at most a WARN): with no hook, no settings or no cockpit the agent's own dialog answers."""
+    from levain.consent.adapters import claude_code, codex
+    from levain.consent.adapters.claude_code import CLEANUP_RESERVE, DEFAULT_MAX_HOLD
+    from levain.install import CONSENT_HOOK_SCRIPTS, PENDING_REL, _consent_queue_dir, consent_cockpit_root
+
+    label = "Claude Code" if adapter == "claude-code" else "Codex"
+    mod = claude_code if adapter == "claude-code" else codex
+    out: list[CheckResult] = []
+    if _hooks_wired_anywhere(hooks, "PermissionRequest", install, CONSENT_HOOK_SCRIPTS[adapter]):
+        out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
+    else:
+        staged = install.joinpath(*PENDING_REL, *((".claude", "settings.json") if adapter == "claude-code"
+                                                  else ("codex-home", "hooks.json")))
+        hint = (f"`levain update` staged levain's version at {staged}: merge its PermissionRequest entry."
+                if staged.is_file() else "Run `levain update` to wire it.")
+        out.append(CheckResult(f"{label} consent hook", True,
+                               "not wired: the agent's own dialog answers every permission; no grant or away "
+                               "answer can reach it", hint, warn=True))
+    qdir = _consent_queue_dir()
+    settings = mod.load_settings(qdir)
+    if not settings.away_mode:
+        out.append(CheckResult(f"{label} away mode", True,
+                               f"off: an unanswered request goes straight to {label}'s own dialog"))
+    else:
+        hold = int(min(settings.away_hold_seconds, max(0.0, DEFAULT_MAX_HOLD - CLEANUP_RESERVE)))
+        if adapter == "claude-code":
+            out.append(CheckResult(f"{label} away mode", True,
+                                   f"on, hold {hold}s: Claude Code shows its dialog during the hold; an expired "
+                                   "hold leaves it standing"))
+        else:
+            out.append(CheckResult(f"{label} away mode", True,
+                                   f"on, hold {hold}s: Codex shows NO dialog during the hold (\"Running hook\", "
+                                   f"up to {hold}s), then its own dialog",
+                                   f"Away mode is your opt-in, set in {qdir / mod.SETTINGS_NAME}.", warn=True))
+    ours = os.path.realpath(consent_cockpit_root(install))
+    name = f"{label} consent authority"
+    root = settings.cockpit_data_root
+    if root is None:
+        out.append(CheckResult(name, True, f"{qdir / mod.SETTINGS_NAME} names no cockpit, so no grant or signed "
+                                           "answer can answer the hook",
+                               f"Add \"cockpit_data_root\": \"{ours}\" to it to verify against this install's.",
+                               warn=True))
+    elif root != ours:
+        out.append(CheckResult(name, True, f"grants verify against {root} (queue {qdir}), not this install's "
+                                           f"{ours}",
+                               "One cockpit per agent per machine: that file is kept as it is.", warn=True))
+    elif not (Path(root) / "cockpit.db").is_file():
+        out.append(CheckResult(name, True, f"this install's cockpit {root} (queue {qdir}); no cockpit.db there yet, "
+                                           "so no grant can answer until a cockpit holds enrolled keys"))
+    else:
+        out.append(CheckResult(name, True, f"this install's cockpit {root} (queue {qdir})"))
+    return out
+
+
 _MIRROR_OFF = {"off", "0", "false", "no"}
 
 
@@ -2611,6 +2668,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             results.extend(_check_automemory_mirror(install, hooks))
             results.extend(_check_transcript_hooks(
                 install, hooks, ("Stop", "PostToolUse", "PostToolUseFailure"), "Claude Code"))
+            results.extend(_check_consent_wiring(install, hooks, "claude-code"))
 
             allow = settings.get("permissions", {}).get("allow", [])
             # Match the exact server name or `server__tool` form — not any
@@ -2785,6 +2843,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
             # only while the file is this install's: otherwise the rows above already say it is not wired
             if _hook_command_targets(ss, install, "session_start.py"):
                 results.extend(_check_transcript_hooks(install, hh, ("Stop", "PostToolUse"), "Codex"))
+                results.extend(_check_consent_wiring(install, hh, "codex"))
 
     if not config_path.is_file():
         results.append(

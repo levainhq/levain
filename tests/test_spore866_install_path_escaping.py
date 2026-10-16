@@ -93,13 +93,14 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
     for cmd in commands:
         # The shell hands the hook exactly the interpreter and script levain meant.
         argv = _run(
-            ["sh", "-c", f"set -- {cmd}; printf '%s\\n' \"$1\" \"$2\""],
+            ["sh", "-c", f"set -- {cmd}; printf '%s\\n' \"$@\""],
             capture_output=True, text=True, check=True,
             env={**os.environ, "CLAUDE_PROJECT_DIR": "/proj"},
         ).stdout.splitlines()
         assert argv[0] == python
         if script_dir is not None:
-            assert argv[1].startswith(script_dir) and argv[1].endswith(".py")
+            script = argv[2] if argv[1] == "-EP" else argv[1]  # the consent hook runs its script with -EP
+            assert script.startswith(script_dir) and script.endswith(".py")
         # doctor's and verify's reader agrees (they substitute the harness's own variable too)
         tokens = [t.replace("${CLAUDE_PROJECT_DIR}", "/proj") for t in shlex.split(cmd)]
         assert tokens[:len(argv)] == argv
