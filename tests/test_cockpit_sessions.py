@@ -74,6 +74,22 @@ def test_sessions_group_by_recency_with_the_measured_words_and_the_consent_join(
     assert [r["facets"]["agent"] for r in p["rows"]][:2] == ["codex", "claude_code"]    # newest first within Active
 
 
+def test_two_sessions_in_one_workspace_say_when_each_started_and_a_unique_row_does_not(tmp_path, monkeypatch):
+    root, src = _fixture(tmp_path, monkeypatch)
+    # a second Claude Code session in the active one's workspace (the Q7a RUN's two "claude_code · ccinst" rows)
+    _put(root, "claude_code", "zq-session-id-cc2-8815", str(tmp_path / "work"), timedelta(minutes=2),
+         first_seen=_stamp(timedelta(minutes=40)))
+    ck = build_default_cockpit(src)
+    rows = ck.panel("sessions", credential_class="none")["rows"]
+    twins = [r for r in rows if r["title"] == "claude_code \u00b7 work"]
+    assert len(twins) == 2
+    started = sorted(c for r in twins for c in r["facets"]["legacy_meta"].split(" \u00b7 ") if c.startswith("started "))
+    assert started == ["started 1h ago", "started 40m ago"]
+    others = [r for r in rows if r["title"] != "claude_code \u00b7 work"]
+    assert others and not any("started " in r["facets"]["legacy_meta"] for r in others)
+    assert "zq-session-id-cc2-8815" not in json.dumps(rows)
+
+
 def test_the_listing_reads_the_newest_fifty_and_the_caveat_is_doctors_own_words(tmp_path, monkeypatch):
     root, src = _fixture(tmp_path, monkeypatch)
     for i in range(SESSIONS_SHOWN + 5):

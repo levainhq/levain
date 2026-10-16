@@ -974,7 +974,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                         waiting[k] = waiting.get(k, 0) + 1
             except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting
                 consent_read = False
-        rows: list[RowIn] = []
+        listed: list[tuple[dict[str, Any], list[str], str, bool]] = []
         bad = 0
         sandbox: dict[str, str] = {}
         for _mt, path in found[:SESSIONS_SHOWN]:
@@ -999,7 +999,18 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
             work = "".join(c for c in work if c.isprintable())[:64]
-            active = age < SESSION_ACTIVE_S
+            listed.append((rec, chips, work, age < SESSION_ACTIVE_S))
+        # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
+        # started (never the session id, ruling 4). Two whose starts round alike (same minute; past an hour, same
+        # hour) still read alike (known edge).
+        titles: dict[tuple[str, str], int] = {}
+        for rec, _chips, work, _active in listed:
+            titles[(rec["agent"], work)] = titles.get((rec["agent"], work), 0) + 1
+        rows: list[RowIn] = []
+        for rec, chips, work, active in listed:
+            if titles[(rec["agent"], work)] > 1:
+                started = _session_stamp(rec["first_seen"])
+                chips.insert(1, f"started {_ago((ctx.now - started).total_seconds())}")
             rows.append(RowIn(
                 id=f"session:{rec['_stem']}", title=f"{rec['agent']} · {work}",
                 facets={"agent": rec["agent"], "last_seen": rec["last_seen"], "source": work,
