@@ -1365,6 +1365,31 @@ def _normalize_expect_disposition(value: Any) -> str | None:
     return value
 
 
+def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, spore_id: str) -> Any:
+    """The disposition compare-and-set a rendered-row spore write must carry (spore-174).
+
+    The precondition is the one the CLIENT rendered, never the server's own fresh read: a
+    server-read CAS closes only the server's read→write window, not the operator's
+    render→click window. When the request carries ``expect_disposition`` it is normalized and
+    compared with the RAW disposition of the first store read; a difference raises ``stale``
+    (409) here, before any note gate or demote-confirm gate can answer for a row that has since
+    moved. Returns the value to hand anneal as its CAS, or ``_NO_CAS`` when the request carries
+    no snapshot (old callers, the CLI: behaviour unchanged). An id the store does not hold is
+    left to the write's own refusal."""
+    if "expect_disposition" not in req:
+        return _NO_CAS
+    expect = _normalize_expect_disposition(req["expect_disposition"])
+    if current is not None:
+        found = current.get("disposition")
+        if found != expect:
+            raise EditError(
+                "stale", 409,
+                f"disposition changed since read (expected {expect!r}, found {found!r}); "
+                "re-read the spore and retry.",
+            )
+    return expect
+
+
 class _VersionGuard:
     """A spore write bound to the row version the caller read (design §4.4). anneal recomputes the
     version inside its write transaction with ``version_of`` (the cockpit's own row version,
@@ -1506,13 +1531,17 @@ def _apply_spore_verb(
         # CLOSED (SporeError → stale, read back in _spore_refusal) rather than transmute a now-note. The CAS mirrors
         # the one `update` already uses (anneal `AM-SPORE-CAS`).
         current = store.get(spore_id)
+        snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the note gate
         if current is not None and is_note(current):
             raise EditError(
                 "not_ascendable", 409,
                 "a Keep note is durable reference, not a prospective loop — it can't be "
                 "promoted/ascended; remove it (descend) instead",
             )
-        ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
+        if snapshot is not _NO_CAS:
+            ascend_expect = cast("str | None", snapshot)
+        else:
+            ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
     try:
         if verb == "touch":
             store.touch(spore_id, **_guard_kwargs(guard))
@@ -1720,6 +1749,7 @@ def _apply_spore_set_disposition(
     current = store.get(spore_id)
     # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
+    snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the confirm gate
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
     # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
     # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop
@@ -1758,7 +1788,8 @@ def _apply_spore_set_disposition(
     # ``loop`` → clear the tag (metabolize to a key-free loop); a Tray value → set it.
     anneal_disposition = None if disposition == LOOP_DISPOSITION else disposition
     update_kwargs: dict[str, Any] = {
-        "disposition": anneal_disposition, "expect_disposition": prior_raw,
+        "disposition": anneal_disposition,
+        "expect_disposition": prior_raw if snapshot is _NO_CAS else snapshot,
     }
     if set_next:
         update_kwargs["next"] = next_value  # None ⇒ clear (incl. the →note force-clear); a date ⇒ set — SAME atomic write
@@ -1773,7 +1804,7 @@ def _apply_spore_set_disposition(
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
-        raise _spore_refusal(guard, exc, store, spore_id, prior_raw) from exc
+        raise _spore_refusal(guard, exc, store, spore_id, update_kwargs["expect_disposition"]) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1902,6 +1933,7 @@ def _apply_spore_update(
     store = SporeStore(paths.spores_json)
     current = store.get(spore_id)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
+    tier_snapshot = _client_snapshot(req, current, spore_id) if has_tier else _NO_CAS
 
     # RECLASSIFY GATE — type is plastic ONLY while forming (a Tray item). A committed loop
     # or a Keep note has a LOCKED type; the immune property binds at the cognition boundary,
@@ -1931,25 +1963,13 @@ def _apply_spore_update(
     #    vacuously). anneal.update already supports the param — no anneal change for this half.
     # A text-only edit is disposition-independent → no CAS (a benign concurrent re-route mustn't
     # spuriously reject a text refine). Absent snapshot on a tier edit ⇒ no CAS (back-compat).
-    client_snapshot_present = "expect_disposition" in req
-    client_snapshot = (
-        _normalize_expect_disposition(req["expect_disposition"]) if client_snapshot_present else None
-    )
+    # A combined type+tier edit CASes the server-read prior_raw (closing its own window for both
+    # fields); the tier snapshot was already compared with that same read above, so a re-route
+    # fails closed rather than half-guard.
     if has_type:
         kwargs["expect_disposition"] = prior_raw
-        # Combined type+tier edit (no surface emits one — type-only reclassify vs tier-only park).
-        # The type gate CASes the server-read prior_raw, which closes the read→write window for
-        # BOTH fields; but a client tier-snapshot would otherwise be silently dropped, leaving the
-        # tier route's render→submit window unguarded [L1/L2 #4]. If a snapshot was sent and
-        # disagrees with the server read, a re-route already happened → fail closed, don't half-guard.
-        if has_tier and client_snapshot_present and client_snapshot != prior_raw:
-            raise EditError(
-                "stale", 409,
-                f"disposition changed since read (expected {client_snapshot!r}, "
-                f"found {prior_raw!r}); re-read the spore and retry.",
-            )
-    elif has_tier and client_snapshot_present:
-        kwargs["expect_disposition"] = client_snapshot
+    elif tier_snapshot is not _NO_CAS:
+        kwargs["expect_disposition"] = tier_snapshot
     try:
         store.update(spore_id, **kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation

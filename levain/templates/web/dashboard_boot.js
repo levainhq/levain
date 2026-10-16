@@ -148,7 +148,7 @@
       // the refusal for a moment, so the next click acts on the current row instead of re-firing the old one. The
       // re-read is PASSIVE, so an editor the operator opened meanwhile is never rebuilt away; one timer at a time.
       if (res.status === 409 && data.error === "stale" && !staleReread) {
-        staleReread = setTimeout(() => { staleReread = null; load({ passive: true }); }, 2500);
+        staleReread = setTimeout(() => { staleReread = null; rereadLatched(); }, 2500);
       }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
@@ -242,9 +242,27 @@
   // The render core calls this when the LAST active job poll terminates → flush a board reload a
   // sibling write deferred while the job was polling (L3 codex MED). A passive reload (the editor
   // baseline still applies); if an edit is now open it defers again via the normal load() guard.
-  function onJobsIdle() {
-    if (deferredReload) { deferredReload = false; load({ passive: true }); }
+  function onJobsIdle() { flushDeferred(); }
+
+  // A re-read this page OWES (a stale refusal, a write that landed while a job polled) is latched in
+  // `deferredReload` until a load actually renders: a passive load that cannot run now (an editor open, a
+  // load in flight, a job polling, a failed read) leaves the latch set, and every moment the block can lift
+  // (a job ends, an editor closes, an in-flight load lands) flushes it. Without it a refused stale row
+  // stayed on screen and could be sent again.
+  function flushDeferred() {
+    if (!deferredReload) return;
+    deferredReload = false;
+    rereadLatched();
   }
+  function rereadLatched() {
+    return load({ passive: true }).then(function (ok) { if (ok === false) deferredReload = true; return ok; });
+  }
+  // An editor closing lifts the block: the render core announces a retired stale form, and any other editor
+  // closes by a click (cancel, save) or Escape; check after that handler has run.
+  document.addEventListener("levain:editor-closed", function () { setTimeout(flushIfIdle, 0); });
+  document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); });
+  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); });
+  function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
   // would discard an in-progress edit/capture textarea (spore-108). The PASSIVE triggers
@@ -402,7 +420,7 @@
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
-      load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
+      rereadLatched();   // a re-read that never discards an open form: it defers while one is dirty, and stays owed
       return { ok: false, error: code, message: text };
     }
     return { ok: false, error: code, message: text };
@@ -664,6 +682,7 @@
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
     if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
     inflight = true;
+    let landed = false;
     if (btn) btn.disabled = true;
     try {
       if (useManifest) {
@@ -679,6 +698,7 @@
         }
         status("read " + new Date().toLocaleTimeString());
         showNotice();
+        landed = true;
         return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
@@ -722,6 +742,7 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
+      landed = true;
       return true;
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
@@ -732,6 +753,9 @@
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
       // Always non-passive → never deferred, so a saved edit's state always lands.
       if (pendingReload) { pendingReload = false; load(); }
+      // a passive read dropped because THIS load was in flight is still owed: flush once this one has rendered
+      // (never after a failed read, which would loop on a dead server)
+      else if (landed) flushIfIdle();
     }
   }
 

@@ -797,7 +797,8 @@ def test_handle_verb_keep_activate_dispatches_by_row_type(monkeypatch):
     # a NOTE → metabolize into a loop (set_disposition{loop})
     vnote = SubstrateView(paths=p, keep=[_spore("spore-n", disposition="note")])
     _tui_curses._handle_verb(None, _model_on(vnote, "keep", read_only=False), None, verb)
-    assert cap["req"] == {"kind": "spore_set_disposition", "spore_id": "spore-n", "disposition": "loop"}
+    assert cap["req"] == {"kind": "spore_set_disposition", "spore_id": "spore-n", "disposition": "loop",
+                          "expect_disposition": "note"}
     # a parked LOOP → un-park (spore_update{tier:warm}) — the SAME key, different op. The
     # rendered snapshot ('loop' — a parked plain loop) rides as expect_disposition (spore-173):
     # a concurrent re-route to a note now fails closed server-side instead of tier-warming a note.
@@ -998,3 +999,12 @@ def test_masthead_line_falls_back_to_db_stem():
 
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     assert _masthead_line(v) == " Levain — memory"
+
+
+def test_rendered_row_ascend_and_set_disposition_builders_carry_the_snapshot_only_when_given():
+    # spore-174: the snapshot rides the request when supplied (null is a real value), and is absent otherwise.
+    assert "expect_disposition" not in tui.build_ascend_req("s1", "project", "r")
+    assert tui.build_ascend_req("s1", "project", "r", expect_disposition="loop")["expect_disposition"] == "loop"
+    assert "expect_disposition" not in tui.build_set_disposition_req("s1", "seed")
+    assert tui.build_set_disposition_req("s1", "seed", surface_at="2026-07-01",
+                                         expect_disposition="note")["expect_disposition"] == "note"

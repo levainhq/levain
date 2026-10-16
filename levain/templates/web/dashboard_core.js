@@ -2036,7 +2036,8 @@
       // silent-loss direction, so no confirm); the type LOCKS at this boundary.
       wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop" });
+        const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop",
+          expect_disposition: s.disposition });
         if (res && res.ok) return;  // re-rendered
         b.disabled = false;
         verbErr(wrap, res);
@@ -2067,14 +2068,16 @@
         // every governed transition (L2 2026-06-23, intentional narrowing — "human dumps, AI sorts").
         wrap.appendChild(verbBtn("→ tray", "promote to the Tray inbox — surfaces for triage at next session", async (ev) => {
           const b = ev.currentTarget; b.disabled = true;
-          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "seed" });
+          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "seed",
+          expect_disposition: s.disposition });
           if (res && res.ok) return;  // re-rendered
           b.disabled = false;
           verbErr(wrap, res);
         }));
         wrap.appendChild(verbBtn("activate", "metabolize into a live cognition loop", async (ev) => {
           const b = ev.currentTarget; b.disabled = true;
-          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop" });
+          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop",
+          expect_disposition: s.disposition });
           if (res && res.ok) return;  // re-rendered
           b.disabled = false;
           verbErr(wrap, res);
@@ -2181,6 +2184,17 @@
   // trigger buttons, mount a form, wire cancel + Escape (stopPropagation so it doesn't nuke an
   // enclosing focus-modal), and run `onConfirm` which returns the commit request (or null to
   // validate-fail with `msg`). One form per row at a time.
+  // A write refused as stale (spore-174) leaves the form that submitted it pointing at a row this page no
+  // longer has right. Retire THAT form only: its inputs stop counting as unsaved text (so the re-read that
+  // replaces the row is not held off by the refused request's own leftovers) and its buttons stay off so the old
+  // request cannot be sent again. Other open editors are untouched. The boot layer re-reads on the event.
+  function retireStaleForm(form) {
+    for (const v of form.querySelectorAll(".verb-ref, .tray-dump-ta")) v.value = "";
+    for (const v of form.querySelectorAll(".verb-edit-ta, .verb-domain")) v.value = v.dataset.orig || "";
+    for (const b of form.querySelectorAll("button")) b.disabled = true;
+    document.dispatchEvent(new CustomEvent("levain:editor-closed"));
+  }
+
   function openRowForm(host, buildFields, onConfirm, confirmLabel, danger) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
@@ -2210,6 +2224,7 @@
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
+      if (res && res.error === "stale") { retireStaleForm(form); return; }
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -2296,7 +2311,8 @@
       return { nodes: [input], focus: input, input };
     }, (f, msg) => {
       if (!f.input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date"; return null; }
-      return { kind: "spore_set_disposition", spore_id: s.id, disposition: "seed", surface_at: f.input.value };
+      return { kind: "spore_set_disposition", spore_id: s.id, disposition: "seed", surface_at: f.input.value,
+               expect_disposition: s.disposition };
     }, "remind me", false);
   }
 
@@ -2405,10 +2421,10 @@
     });
     go.addEventListener("click", async () => {
       const req = { kind: kind, spore_id: s.id, spore_kind: sel.value, confirm: true };
-      // spore-173: a DESCEND's face (compost/dismiss) was chosen off the rendered snapshot → CAS
-      // that snapshot so a concurrent re-route in the confirm window fails closed. ASCEND keeps
-      // its own server-read CAS (its is_note gate reads fresh) — don't double-guard with a snapshot.
-      if (kind === "spore_descend") req.expect_disposition = s.disposition;
+      // spore-173/174: the face (compost/dismiss) and the promote were chosen off the rendered row, so
+      // that row's disposition rides the request and the server compares it first; a re-route in the
+      // confirm window answers stale instead of acting on a row the operator never saw.
+      req.expect_disposition = s.disposition;
       if (needsRef) {
         const ref = refInput.value.trim();
         if (!ref) { msg.className = "edit-msg err"; msg.textContent = "a ref is required"; return; }
@@ -2419,6 +2435,7 @@
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
+      if (res && res.error === "stale") { retireStaleForm(form); return; }
       go.disabled = false; cancel.disabled = false;
     });
   }

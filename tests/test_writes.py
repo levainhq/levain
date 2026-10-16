@@ -1475,6 +1475,74 @@ class TestSporeUpdate:
         assert ei.value.code == "not_ascendable" and ei.value.http_status == 409
         assert any(s["id"] == nid for s in _spore_store(install).list_open())  # untouched
 
+    def test_ascend_with_a_stale_snapshot_beats_the_note_gate_and_writes_nothing(self, install: Path) -> None:
+        # spore-174: rendered as a loop, re-routed to a Keep note before the click. The snapshot is the
+        # client's: the answer is stale (re-read), not not_ascendable (which would leave the old row up).
+        sid = _add_spore(install)
+        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+                                     "disposition": "note", "confirm": True})
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "ref": "p", "confirm": True, "expect_disposition": "loop"})
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        assert _spore_store(install).get(sid)["disposition"] == "note"
+
+    def test_ascend_with_a_stale_snapshot_does_not_resolve_a_loop_that_left_cognition(self, install: Path) -> None:
+        # the r1 HIGH: rendered as a loop, re-routed to the Tray; the server's own fresh read used to pass.
+        sid = _add_spore(install)
+        _spore_store(install).update(sid, disposition="seed")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "ref": "p", "confirm": True, "expect_disposition": "loop"})
+        assert ei.value.code == "stale"
+        assert any(r["id"] == sid for r in _spore_store(install).list_open())
+
+    def test_ascend_with_a_matching_snapshot_and_without_one_both_land(self, install: Path) -> None:
+        a, b = _add_spore(install), _add_spore(install)
+        for sid, extra in ((a, {"expect_disposition": "loop"}), (b, {})):
+            res = apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+                "ref": "p", "confirm": True, **extra})
+            assert res["ok"]
+        assert not any(r["id"] in (a, b) for r in _spore_store(install).list_open())
+
+    def test_note_rendered_as_a_note_still_answers_not_ascendable_with_a_snapshot(self, install: Path) -> None:
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
+                "ref": "p", "confirm": True, "expect_disposition": "note"})
+        assert ei.value.code == "not_ascendable"
+
+    def test_set_disposition_stale_snapshot_beats_confirm_required(self, install: Path) -> None:
+        # rendered as a Keep note, activated to a loop elsewhere: "-> tray" used to answer confirm_required
+        # (never a re-read). It is stale, and nothing is written.
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "n", "disposition": "note"})["spore_id"]
+        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+                                         "disposition": "seed", "expect_disposition": "note"})
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        assert "disposition" not in _spore_store(install).get(sid)
+
+    def test_set_disposition_stale_snapshot_between_two_tray_values_does_not_overwrite(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "t", "disposition": "seed"})["spore_id"]
+        _spore_store(install).update(sid, disposition="handoff")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+                                         "disposition": "loop", "expect_disposition": "seed"})
+        assert ei.value.code == "stale"
+        assert _spore_store(install).get(sid)["disposition"] == "handoff"
+
+    def test_set_disposition_without_a_snapshot_is_unchanged(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "t", "disposition": "seed"})["spore_id"]
+        _spore_store(install).update(sid, disposition="handoff")
+        assert apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+                                            "disposition": "loop"})["ok"]
+
     def test_note_can_be_removed_via_descend(self, install: Path) -> None:
         # the legitimate resolution for reference: remove = descend composted.
         nid = apply_edit(_scope(install), {

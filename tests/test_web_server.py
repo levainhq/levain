@@ -515,6 +515,24 @@ class TestAssets:
         # a board-reloading write defers while a job polls (L3 codex MED — no detached result box)
         assert "deferredReload" in boot and "jobsActive()" in boot
 
+    def test_every_rendered_row_spore_route_write_carries_its_snapshot_and_a_stale_refresh_latches(self) -> None:
+        """spore-174: the page sends the disposition it rendered on every route-dependent spore write, and a
+        stale refresh stays owed until a load renders (a blocked passive load latches, and the latch flushes
+        when an editor closes or an in-flight load lands)."""
+        import re
+        core = load_web_asset("dashboard_core.js")
+        boot = load_web_asset("dashboard_boot.js")
+        for m in re.finditer(r'kind: "spore_set_disposition"[^}]*\}', core):
+            assert "expect_disposition: s.disposition" in m.group(0), m.group(0)
+        assert len(re.findall(r'kind: "spore_set_disposition"', core)) == 4
+        assert "req.expect_disposition = s.disposition;" in core
+        assert 'if (kind === "spore_descend") req.expect_disposition' not in core
+        assert "retireStaleForm(form)" in core and "levain:editor-closed" in core
+        assert "function rereadLatched" in boot and "deferredReload = true" in boot
+        assert boot.count("rereadLatched()") >= 2            # the legacy timer and the manifest fault path
+        assert "else if (landed) flushIfIdle()" in boot       # an in-flight load settling flushes the latch
+        assert 'addEventListener("levain:editor-closed"' in boot
+
     def test_action_params_coercion_behavioral(self, tmp_path: Path) -> None:
         """Behavioral oracle (not source-presence) for the compose-affordance field→params
         coercion (collectActionParams) — the bug-class L1+L2 flagged (a divergent/stale params

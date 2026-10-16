@@ -342,14 +342,21 @@ def build_descend_req(
     return req
 
 
-def build_ascend_req(spore_id: str, spore_kind: str, ref: str) -> dict[str, Any]:
-    return {
+def build_ascend_req(
+    spore_id: str, spore_kind: str, ref: str, *, expect_disposition: Any = _UNSET
+) -> dict[str, Any]:
+    """Promote a loop. ``expect_disposition`` (when supplied) is the rendered row's snapshot;
+    the server compares it before any other gate, so a row that moved answers ``stale``."""
+    req: dict[str, Any] = {
         "kind": "spore_ascend",
         "spore_id": spore_id,
         "spore_kind": spore_kind,
         "ref": ref,
         "confirm": True,
     }
+    if expect_disposition is not _UNSET:
+        req["expect_disposition"] = expect_disposition
+    return req
 
 
 def build_tombstone_req(episode_id: str) -> dict[str, Any]:
@@ -370,7 +377,8 @@ def build_seed_req(text: str, disposition: str) -> dict[str, Any]:
 
 
 def build_set_disposition_req(
-    spore_id: str, disposition: str, *, surface_at: Any = _UNSET
+    spore_id: str, disposition: str, *, surface_at: Any = _UNSET,
+    expect_disposition: Any = _UNSET,
 ) -> dict[str, Any]:
     """Re-route a spore's disposition (metabolize Tray→loop, promote a Keep note
     →loop/→tray). ``surface_at`` is OMITTED unless supplied — present (a ``YYYY-MM-DD``)
@@ -381,6 +389,8 @@ def build_set_disposition_req(
     }
     if surface_at is not _UNSET:
         req["surface_at"] = surface_at
+    if expect_disposition is not _UNSET:
+        req["expect_disposition"] = expect_disposition
     return req
 
 

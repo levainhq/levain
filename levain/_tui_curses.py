@@ -369,7 +369,7 @@ def _handle_verb(
             return replace(model, status="cancelled")
         if not _confirm(stdscr, f"promote {s.id} → '{ref}' as '{chosen}'?"):
             return replace(model, status="cancelled")
-        return _apply(model, source, build_ascend_req(s.id, chosen, ref), f"promoted {s.id}")
+        return _apply(model, source, build_ascend_req(s.id, chosen, ref, expect_disposition=s.disposition), f"promoted {s.id}")
 
     # ---- Slice-3b operator-I/O verbs (the curses peer of the web dump/sort/promote verbs) ----
 
@@ -417,7 +417,7 @@ def _handle_verb(
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
-        return _apply(model, source, build_set_disposition_req(s.id, "loop"),
+        return _apply(model, source, build_set_disposition_req(s.id, "loop", expect_disposition=s.disposition),
                       f"metabolized {s.id} → loop")
 
     if kind == "spore_schedule":  # surface_at on a loop/Tray item ('-' clears the alarm)
@@ -447,7 +447,7 @@ def _handle_verb(
         s = current_row(model)
         if s is None:
             return replace(model, status="no note selected")
-        return _apply(model, source, build_set_disposition_req(s.id, "seed"),
+        return _apply(model, source, build_set_disposition_req(s.id, "seed", expect_disposition=s.disposition),
                       f"promoted {s.id} → Tray")
 
     if kind == "keep_activate":  # row-dispatched: a note → loop; a parked loop → un-park
@@ -456,7 +456,7 @@ def _handle_verb(
             return replace(model, status="no item selected")
         if getattr(s, "disposition", None) == "note":
             # note → loop: backstopped server-side (set_disposition CASes the disposition).
-            return _apply(model, source, build_set_disposition_req(s.id, "loop"),
+            return _apply(model, source, build_set_disposition_req(s.id, "loop", expect_disposition=s.disposition),
                           f"activated {s.id} → loop")
         # parked loop → un-park: CAS-GUARDED (spore-173) — the note-vs-parked route is read off
         # the SNAPSHOT, so the snapshot disposition rides the tier update as expect_disposition;
@@ -473,7 +473,7 @@ def _handle_verb(
         date = _prompt_line(stdscr, f"remind ({s.id}) in the Tray on (YYYY-MM-DD):")
         if not date:
             return replace(model, status="cancelled")
-        return _apply(model, source, build_set_disposition_req(s.id, "seed", surface_at=date),
+        return _apply(model, source, build_set_disposition_req(s.id, "seed", surface_at=date, expect_disposition=s.disposition),
                       f"reminder: {s.id} → Tray on {date}")
 
     if kind == "episode_tombstone":
