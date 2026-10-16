@@ -248,6 +248,7 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     assert any("zq-decided-marker" in t for t in out[-1])
 
 
+@needs_browser
 def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypatch):
     q = _home_queue(tmp_path, monkeypatch)
     gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "echo zq-retry-marker"},
