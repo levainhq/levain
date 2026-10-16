@@ -1841,6 +1841,7 @@ class Cockpit:
                 held = len(rows_all)
                 if spec.search_scope == "store" and spec.search is not None:
                     got, total, err = self._store_search(spec, q, limit)
+                    held_rows = []  # a store search answers from the store alone, held rows included
                     if err is None:
                         try:
                             for x in got:
@@ -1859,7 +1860,7 @@ class Cockpit:
                             err = f"search hook returned unusable rows: {_safe_str(exc)}"
                     if err is not None:
                         out["search_error"] = err
-                        rows_all, matched, held_rows = [], None, []
+                        rows_all, matched = [], None
                 else:
                     keep = [r for r in rows_all if _terms_match([_field_text(r, f) for f in fields], q)]
                     held_rows = [r for r in held_rows if _terms_match([_field_text(r, f) for f in fields], q)]

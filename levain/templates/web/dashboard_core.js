@@ -1335,6 +1335,8 @@
           label();
           // one state, every mounted Tray (the board's and the focus modal's) redraws on a change
           heldMounts.add({ tog, sync: () => { label(); redraw(); } });
+          // drop the mounts a re-render replaced; after this task, so a Tray built but not yet attached stays
+          setTimeout(() => { for (const m of [...heldMounts]) if (!m.tog.isConnected) heldMounts.delete(m); }, 0);
           tog.addEventListener("click", () => {
             trayHeldShown = !trayHeldShown; saveHeldShown();
             for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }

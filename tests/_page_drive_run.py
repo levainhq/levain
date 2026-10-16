@@ -40,6 +40,10 @@ def run(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[s
                         pipe.close()
                 except OSError:
                     pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
         _keep_partial(sys.exc_info()[1], out, err)
         raise
     else:
