@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ from anneal_memory import Store
 
 from levain.writes import ActionVerb
 from tests._inbox_fake import inbox_downstream
+from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS
 
@@ -29,7 +29,7 @@ needs_browser = pytest.mark.skipif(NODE is None or not Path(CHROME).exists(), re
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
     f.write_text(json.dumps(steps))
-    res = subprocess.run([NODE, str(DRIVE), CHROME, url, str(f)], capture_output=True, text=True, timeout=300)
+    res = run_driver([NODE, str(DRIVE), CHROME, url, str(f)], timeout=300)
     assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)
 

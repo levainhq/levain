@@ -581,7 +581,7 @@ class TestManifestMapperParses:
 
 
 def _dump_dom(url: str) -> str:
-    return subprocess.run([CHROME, "--headless=new", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
+    return subprocess.run([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
                           capture_output=True, text=True, timeout=60).stdout
 
 

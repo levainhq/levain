@@ -16,9 +16,15 @@ const steps = JSON.parse(readFileSync(stepsPath, "utf8"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
-const chrome = spawn(chromePath, ["--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+const chrome = spawn(chromePath, ["--headless=new", "--use-mock-keychain", "--password-store=basic", `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
   "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
 const done = (code) => { chrome.kill(); try { rmSync(prof, { recursive: true, force: true }); } catch {} process.exit(code); };
+// Chrome must not outlive this process on any exit node can see: a signal, a thrown error, or the normal exit.
+// (SIGKILL is invisible to node; the Python runner owns that case by killing the whole process group.)
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => done(130));
+process.on("uncaughtException", (e) => { console.error(e && e.stack || String(e)); done(1); });
+process.on("unhandledRejection", (e) => { console.error(e && e.stack || String(e)); done(1); });
+process.on("exit", () => { try { chrome.kill(); } catch {} });
 let targets = null;
 for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
 if (!targets) { console.error("chrome never answered"); done(2); }

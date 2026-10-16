@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const [chrome, outdir = '-'] = process.argv.slice(2);
 const here = dirname(fileURLToPath(import.meta.url));
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
-const proc = spawn(chrome, ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
+const proc = spawn(chrome, ['--headless=new', '--use-mock-keychain', '--password-store=basic', '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Chrome picks a free port itself (port 0) and writes it to <profile>/DevToolsActivePort, the way Puppeteer finds
