@@ -1255,6 +1255,9 @@ body.ke .row > .clause.clampable { grid-column: 1 / 7; grid-row: 2; font-size: v
 body.ke .row > .clause-toggle { grid-column: 7; grid-row: 2; align-self: start; }
 body.ke .row:has(> .clause.clampable) > :not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) { grid-row: 3; margin-right: var(--sp-3);
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* a row whose meta line is its content (the sessions' chips): the whole line, wrapped, so nothing a chip says is cut */
+body.ke .row.meta-wrap:has(> .clause.clampable) > :not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) { grid-column: 1 / -1;
+  overflow: visible; text-overflow: clip; white-space: normal; line-height: var(--lh-list); min-height: 0; margin-right: 0; }
 body.ke .row > .ck-rowaddr { grid-column: 1 / -1; grid-row: 1; }
 body.ke .row:has(> .clause.clampable) > .sid, body.ke .row:has(> .clause.clampable) > [data-ck-tag], body.ke .row:has(> .clause.clampable) > .muted,
 body.ke .row:has(> .clause.clampable) > .ext-meta { font-size: var(--fs-meta); line-height: var(--lh-tight); min-height: var(--ctl-row); display: block; line-height: var(--ctl-row); }

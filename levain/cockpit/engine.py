@@ -571,6 +571,12 @@ class Cockpit:
             if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
                 self._install_decisions_locked()
 
+    @property
+    def consent_reader(self) -> Callable[[datetime], Any] | None:
+        """The reader ``attach_consent_rows`` was given (None before one is attached): the sessions panel joins
+        a session to the requests it has waiting through the same read-only listing."""
+        return self._dec.consent
+
     def _install_decisions_locked(self) -> None:
         """(Re)register the kernel's ``decisions`` panel over the current contributors."""
         src = self._dec.source

@@ -188,6 +188,9 @@
                   // whether the read behind this panel is clean and fresh (a widget's definitive zero needs it)
                   clean: (head.status === undefined || head.status === "ok" || head.status === "empty") && !(head.skipped || []).length && !(head.filtered || []).length };
     if (kind === "list" || kind === "count-queue") {
+      // the sessions panel's note is what its readings do not see (sandbox is configured, not confirmed; no session end
+      // is announced): it closes the focus modal and stays off the tile, where a long sentence would crowd the figure
+      if (head.id === "sessions" && typeof head.note === "string") { out.footer = head.note; out.note = ""; }
       const compose = composeOf(panel.compose);
       // an addressed list draws every row as `source -> for`. Its address is the compose's recipient field when
       // the panel declares a compose; a read-only serve declares none (no send verb), but the panel still DECLARES
@@ -210,6 +213,7 @@
         const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        if (head.id === "sessions") line.wrapMeta = true;
         if (grouped) line.grp = grp;
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
@@ -1336,7 +1340,7 @@
   function shapeOf(entry, data) {
     const sr = data.search || {};
     return JSON.stringify([entry.title, entry.edit_class || "", entry.source || "", entry.modes || "", entry.banner || null,
-      data.kind, !!data.typed, data.error || "", data.markdown != null, data.note || "",
+      data.kind, !!data.typed, data.error || "", data.markdown != null, data.note || "", data.footer || "",
       sr.on === true, sr.scope || "", sr.fields || [],
       data.action ? [data.action.verb, data.action.fields] : null, data.form ? data.form.verb : null,
       data.kind === "ambient" && !!data.sky]);
@@ -1465,6 +1469,7 @@
       s.body.appendChild(more);
     }
     if (store && s.results && s.results.label && !err) s.body.appendChild(el("p", "xnote", s.results.label));
+    if (s.modal && d.footer) s.body.appendChild(el("p", "xnote panel-foot", d.footer));
   }
 
   function setQuery(s, q, now) {

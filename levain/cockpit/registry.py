@@ -104,6 +104,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn")),
     "consent_tier": ("str", _is_str),
     "decided_at": ("timestamp", _is_str),    # a decided request's time (an unswept one: its expiry); `at` stays the filing
+    "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
 
 
@@ -324,6 +325,25 @@ register_ordering(
 )
 register_ordering(Ordering("exposure.desc", _exposure_key), builtin=True)
 register_ordering(Ordering("crystal.level", _crystal_key), builtin=True)
+
+
+def _session_group(row: RowIn, today: date) -> str:
+    return "quiet" if row.facets.get("session_activity") == "quiet" else "active"
+
+
+def _session_key(row: RowIn, today: date) -> tuple:
+    # most recently active first; a row with no stamp goes last
+    seen = str(row.facets.get("last_seen") or "")
+    return (0 if seen else 1, tuple(-ord(c) for c in seen), row.id)
+
+
+# Q7a: the agent sessions this install's hooks have seen. Only the Active group counts: a Quiet one is
+# listed beside it and is not a figure on the glance tile
+register_ordering(
+    Ordering("session.recency", _session_key, _session_group,
+             (("active", "Active"), ("quiet", "Quiet")), uncounted=frozenset({"quiet"})),
+    builtin=True,
+)
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable
 # sort keeps the source's own order
 register_ordering(Ordering("legacy.source", lambda row, today: ()), builtin=True)

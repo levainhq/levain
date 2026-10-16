@@ -3067,6 +3067,7 @@
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
+      if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {

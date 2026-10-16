@@ -832,6 +832,164 @@ def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadConte
     return read_one
 
 
+# --- Q7a: the agent sessions this install's hooks have seen ---------------------------------------------------
+# A DISPLAY, never an authority (DESIGN_Q7 ruling 1): the files are written by hooks running as the operator's uid,
+# so any same-uid process can forge one, and nothing here decides anything from them. The words say what was
+# measured (ruling 2): the hook fired this long ago, never "running" and never "ended".
+SESSIONS_SHOWN = 50                 # the newest records read, by mtime
+SESSIONS_SCAN = 1000                # directory entries looked at before the listing gives up counting
+SESSION_FILE_MAX = 16 * 1024        # a longer file is not a record of the contract's shape
+SESSION_ACTIVE_S = 15 * 60          # Active: last hook event under 15 minutes ago
+SESSION_LISTED_S = 24 * 3600        # Quiet until 24 hours; older is not listed
+SESSION_SKEW_S = 300                # a last_seen further ahead than this is not a record of ours
+SESSION_AGENTS = ("claude_code", "codex")
+SESSION_EVENTS = ("SessionStart", "UserPromptSubmit")
+# doctor's own list of what the settings readers cannot see (levain/doctor.py, the sandbox check); a test holds the two together
+SANDBOX_UNSEEN = "CLAUDE_CONFIG_DIR relocation, --settings, server-managed settings"
+SESSIONS_NOTE = ("Sandbox is what the settings files say for each session's working directory, not proof it is confined; "
+                 f"not visible to doctor or here: {SANDBOX_UNSEEN}. A session shows when it last fired a hook; "
+                 "nothing says when one ends, so a silent one goes Quiet.")
+SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta"})
+
+
+def _session_stamp(v: Any) -> datetime | None:
+    if not isinstance(v, str) or len(v) > 40:
+        return None
+    try:
+        t = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+    except ValueError:
+        return None
+    return t if t.tzinfo is not None else None
+
+
+def _session_record(path: Path) -> dict[str, Any] | None:
+    """One registry file (the contract in DESIGN_Q7.md) as a dict, or None for any other shape: a bounded read,
+    and a name that is not the hash of the agent and session id it holds is not a record of ours."""
+    import hashlib
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(SESSION_FILE_MAX + 1)
+        if len(raw) > SESSION_FILE_MAX:
+            return None
+        d = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(d, dict) or d.get("v") != 1 or d.get("agent") not in SESSION_AGENTS:
+        return None
+    sid, cwd = d.get("session_id"), d.get("cwd")
+    if not (isinstance(sid, str) and sid and isinstance(cwd, str)) or d.get("last_event") not in SESSION_EVENTS:
+        return None
+    if path.stem != hashlib.sha1(f"{d['agent']}:{sid}".encode("utf-8", "surrogatepass")).hexdigest()[:24]:
+        return None
+    if d.get("context_delivered") not in (True, False, None) or _session_stamp(d.get("first_seen")) is None:
+        return None
+    seen = _session_stamp(d.get("last_seen"))
+    if seen is None:
+        return None
+    return {**d, "_seen": seen, "_stem": path.stem}
+
+
+def _ago(secs: float) -> str:
+    m = int(max(secs, 0) // 60)
+    return "just now" if m < 1 else (f"{m}m ago" if m < 60 else f"{m // 60}h ago")
+
+
+def _sandbox_layer(source: str) -> str:
+    p = Path(source)
+    if p == Path(os.path.expanduser("~")) / ".claude" / "settings.json":
+        return "user settings"
+    if p.parent.name == ".claude" and p.name in ("settings.json", "settings.local.json"):
+        return "project settings"
+    return "managed settings"
+
+
+def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
+    """Claude Code's sandbox as CONFIGURED for the session's working directory (doctor's reader); never "confined".
+    Codex has no reader here: it says so."""
+    if agent != "claude_code" or not os.path.isabs(cwd):
+        return "sandbox not read"
+    if cwd not in cache:
+        try:
+            from levain import host_guard
+
+            on, source = host_guard.cc_sandbox_state(cwd)
+            cache[cwd] = f"sandbox configured on ({_sandbox_layer(source)})" if on else "sandbox configured off"
+        except Exception:  # noqa: BLE001 - an unreadable settings layer is "not read", never a dark panel
+            cache[cwd] = "sandbox not read"
+    return cache[cwd]
+
+
+def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime], Any] | None]
+              ) -> Callable[[ReadContext], Result]:
+    def read(ctx: ReadContext) -> Result:
+        if source.install_root is None:
+            return Absent("no install root: the sessions are kept in the install")
+        sdir = source.install_root / ".levain" / "sessions"
+        found: list[tuple[float, Path]] = []
+        try:
+            with os.scandir(sdir) as it:
+                for n, e in enumerate(it):
+                    if n >= SESSIONS_SCAN:
+                        break
+                    if e.name.endswith(".json") and e.is_file(follow_symlinks=False):
+                        found.append((e.stat(follow_symlinks=False).st_mtime, Path(e.path)))
+        except FileNotFoundError:
+            return Read(rows=(), note=SESSIONS_NOTE)
+        except OSError as exc:
+            return Fault(f"the sessions directory cannot be read: {type(exc).__name__}")
+        found.sort(key=lambda p: p[0], reverse=True)
+        waiting: dict[tuple[str, str], int] = {}
+        consent_read = True
+        reader = consent()
+        if reader is not None:
+            try:
+                for e in reader(ctx.now).pending:
+                    if e.state == "pending":
+                        k = (e.request.agent, e.request.agent_session_id)
+                        waiting[k] = waiting.get(k, 0) + 1
+            except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting
+                consent_read = False
+        rows: list[RowIn] = []
+        bad = 0
+        sandbox: dict[str, str] = {}
+        for _mt, path in found[:SESSIONS_SHOWN]:
+            rec = _session_record(path)
+            if rec is None:
+                bad += 1
+                continue
+            age = (ctx.now - rec["_seen"]).total_seconds()
+            if age < -SESSION_SKEW_S:
+                bad += 1
+                continue
+            if age > SESSION_LISTED_S:
+                continue
+            chips = [f"last active {_ago(age)}", _sandbox_chip(rec["agent"], rec["cwd"], sandbox)]
+            if rec["context_delivered"] is True:
+                chips.append("memory loaded at start")
+            elif rec["context_delivered"] is False:
+                chips.append("memory not loaded")
+            if not consent_read:
+                chips.append("consent not read")
+            elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
+                chips.append(f"{n} waiting")
+            work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
+            work = "".join(c for c in work if c.isprintable())[:64]
+            active = age < SESSION_ACTIVE_S
+            rows.append(RowIn(
+                id=f"session:{rec['_stem']}", title=f"{rec['agent']} · {work}",
+                facets={"agent": rec["agent"], "last_seen": rec["last_seen"], "source": work,
+                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(chips)},
+                stored={"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
+                        "active": active, "chips": chips[1:]}))
+        skipped = ((bad, "session record that does not have the registry file's shape"),) if bad else ()
+        more = len(found) - SESSIONS_SHOWN
+        filtered = ((more, f"older session records not read (the newest {SESSIONS_SHOWN} are)"),) if more > 0 else ()
+        return Read(rows=tuple(rows), skipped=skipped, filtered=filtered, note=SESSIONS_NOTE)
+    return read
+
+
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
     episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
@@ -900,6 +1058,11 @@ def build_default_cockpit(
             "jobs", "triage-list", "Recent jobs", "feed", _jobs(job_store), region="operate", rank=70,
             optional=True, order="time.desc", rowset="jobs",
             facets=frozenset({"job_status", "verb", "at"}), version_fields=("*",), empty="No jobs yet."))
+    # Q7a: the sessions tile (a count of the Active ones) opening into the focus modal, like Decisions waiting
+    ck.register(ProviderSpec(
+        "sessions", "triage-list", "Sessions", "gauge", _sessions(source, lambda: ck.consent_reader), region="widgets",
+        rank=20, face="count", optional=True, order="session.recency", rowset="sessions", facets=SESSION_FACETS,
+        version_fields=("*",), empty="No agent session active in the last 15 minutes."))
     ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,

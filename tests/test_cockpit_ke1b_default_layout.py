@@ -37,7 +37,7 @@ class TestDefaultLayout:
 
     def test_health_is_a_widget(self, regions) -> None:
         r, heads = regions
-        assert r["widgets"] == ["health"]
+        assert r["widgets"] == ["sessions", "health"]      # Q7a: the Sessions tile sits ahead of Health
         assert heads["health"]["kind"] == "status-dots"
         assert "health" not in _zone(r, "mind")["panels"]
 
