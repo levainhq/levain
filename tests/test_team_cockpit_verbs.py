@@ -19,6 +19,21 @@ from tests.test_team_git import KEYS, _keys, clone, git, join, record_ruling, te
 PREVIEW = {"tier_seen": "T3", "gesture_seen": "laptop-only"}
 
 
+@pytest.fixture
+def tmp_path():
+    """Every directory of these tests lives under the home directory, as test_cockpit_k2b_broker's do: the broker's
+    signature verifier refuses a signers file whose directories a world-writable parent holds (Linux's /tmp), so a
+    pytest tmp_path there answers every signature `verifier_unavailable` (CI 2026-10-15, reproduced with --basetemp
+    under /tmp). Overriding the name reaches the imported team fixtures too."""
+    import shutil
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix=".levain-t3-", dir=Path.home()))
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _gl(repo: Path) -> GitLedger:
     return GitLedger(Repo.discover(repo))
 
