@@ -476,18 +476,25 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
 
 
 def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: str | None = None,
-                 timeout: float = TRUST_TIMEOUT, queue_dir: Path | str | None = None) -> TrustStatus:
+                 timeout: float = TRUST_TIMEOUT, queue_dir: Path | str | None = None,
+                 hooks_path: Path | None = None, script: Path | None = None) -> TrustStatus:
     """What Codex says about levain's hook in ``workspace``: Codex's own ``hooks/list`` (``trustStatus`` and
     ``enabled``) for the handler levain installed, with the ``trusted_hash`` from CODEX_HOME's ``config.toml``
     (``home``, default :func:`codex_home`) beside it. ``queue_dir`` is the queue the script must name
-    (:func:`script_intact`). Never writes anything."""
-    ws, _, script, hooks_path = _paths(workspace)
+    (:func:`script_intact`). ``hooks_path`` and ``script`` name another hooks file and script than
+    :func:`install`'s workspace pair: `levain init` wires a static script through CODEX_HOME's ``hooks.json``. Such a
+    script is not :data:`HOOK_TEMPLATE`'s rendering, so ``script_intact`` is ``None`` for it. Never writes
+    anything."""
+    ws, _, default_script, default_hooks = _paths(workspace)
+    intact_checked = script is None and hooks_path is None
+    script = script if script is not None else default_script
+    hooks_path = hooks_path if hooks_path is not None else default_hooks
     ours = _our_handler(hooks_path, script)
     if ours is None:
         return TrustStatus("absent", f"no levain PermissionRequest hook in {hooks_path}")
     command, g, h = ours
     key = f"{os.path.realpath(hooks_path)}:{TRUST_EVENT_KEY}:{g}:{h}"
-    intact = script_intact(script, queue_dir=queue_dir)
+    intact = script_intact(script, queue_dir=queue_dir) if intact_checked else None
     chome = home if home is not None else codex_home()
     trusted_hash = None
     try:

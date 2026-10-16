@@ -124,9 +124,14 @@ def _config_references(config: Path, script: Path) -> bool:
 
 
 def _agent_findings(agent: str, install: Path, script: Path, config: Path, codex_home: Path | None,
-                    deadline: float) -> list[Finding]:
+                    deadline: float, *, wired_by_init: bool = False) -> list[Finding]:
+    """``wired_by_init``: ``script`` is the static one `levain init` puts in the activation tree, which is there
+    whether or not ``config`` (for Codex the machine-global hooks.json) still runs it; doctor's wiring row reports
+    that, so this says nothing unless it does."""
     from levain.consent.adapters import codex
     name = f"consent hook ({AGENT_LABELS[agent]})"
+    if wired_by_init and not _config_references(config, script):
+        return []
     if not script.is_file():
         if _config_references(config, script):
             return [Finding(name, f"{config} runs {script}, which does not exist (no consent hook runs)",
@@ -141,7 +146,11 @@ def _agent_findings(agent: str, install: Path, script: Path, config: Path, codex
                            "run `levain consent canary --agent " + agent + "` to check this version", warn=True))
     if agent != "codex":
         return out
-    trust = codex.trust_status(install, home=codex_home, timeout=max(0.5, deadline - time.monotonic()))
+    if wired_by_init:
+        trust = codex.trust_status(install, home=codex_home, timeout=max(0.5, deadline - time.monotonic()),
+                                   hooks_path=config, script=script)
+    else:
+        trust = codex.trust_status(install, home=codex_home, timeout=max(0.5, deadline - time.monotonic()))
     tname = "consent hook trust (Codex)"
     hints = {
         "untrusted": "start `codex` in this directory and trust levain's hook at Codex's 'Hooks need review' "
@@ -152,6 +161,10 @@ def _agent_findings(agent: str, install: Path, script: Path, config: Path, codex
         "unlisted": "Codex does not load this directory's hooks: trust the project in Codex",
         "absent": "the hook script is here but .codex/hooks.json has no levain entry: reinstall it",
     }
+    if wired_by_init:
+        # A user-level hook: what Codex lists for it when it is not loaded is not measured, so no cause is named.
+        hints["unlisted"] = (f"Codex does not list levain's hook from {config}: start `codex` and look at its "
+                             "hooks review screen")
     if trust.status == "trusted":
         out.append(Finding(tname, "Codex trusts levain's PermissionRequest hook"))
     else:
@@ -168,14 +181,22 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
     referenced: nothing). Every finding is at most a WARN: the hooks fail toward the human's own dialog, never
     toward an allow. Waits on the agents at most about :data:`DOCTOR_BUDGET` seconds; an error is a WARN."""
     from levain.consent.adapters import claude_code, codex
+    from levain.install import CONSENT_HOOK_SCRIPTS
     deadline = time.monotonic() + DOCTOR_BUDGET
     out: list[Finding] = []
-    for agent, script, config in (
+    hooks_dir = install / "activation" / "hooks"
+    chome = codex_home if codex_home is not None else codex.codex_home()
+    for agent, script, config, by_init in (
             ("claude_code", install / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME,
-             install / ".claude" / "settings.json"),
-            ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json")):
+             install / ".claude" / "settings.json", False),
+            ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json",
+             False),
+            # the shape `levain init` wires: a static script in the activation tree
+            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"], install / ".claude" / "settings.json",
+             True),
+            ("codex", hooks_dir / CONSENT_HOOK_SCRIPTS["codex"], chome / "hooks.json", True)):
         try:
-            out += _agent_findings(agent, install, script, config, codex_home, deadline)
+            out += _agent_findings(agent, install, script, config, codex_home, deadline, wired_by_init=by_init)
         except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
             out.append(Finding(f"consent hook ({AGENT_LABELS[agent]})", f"could not be checked: {exc}"[:300],
                                warn=True))

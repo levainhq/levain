@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 
@@ -52,6 +53,47 @@ def _isolate_activation_env(monkeypatch):
     # auto-memory sweep rooted at levain/templates/ (measured: it wrote .levain/ state there).
     # tests/test_automemory_mirror.py builds its own env and sets this deliberately.
     monkeypatch.setenv("LEVAIN_AUTOMEMORY_MIRROR", "off")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_consent_hook_wiring(monkeypatch, tmp_path_factory):
+    """`levain init` creates the consent adapter's settings file in levain's consent queue directory, which
+    defaults to the REAL `~/.levain/consent` of whoever runs the suite, and reports the installed agent's version
+    by running the real `claude` / `codex`; doctor also asks the real `codex app-server` about hook trust. Every
+    test gets its own queue directory (made on first use), no agent version and no codex to ask. A test that means to exercise either sets its own. A call
+    that names a binary, or finds one a test put on PATH under the pytest tmp dir, still runs it."""
+    import levain.consent.canary as canary
+    import levain.install as install
+
+    made: list = []
+
+    def queue_dir():
+        if not made:
+            made.append(tmp_path_factory.mktemp("consent-home") / "consent")
+        return made[0]
+
+    real_version = canary.agent_version
+
+    base = str(tmp_path_factory.getbasetemp())
+
+    def no_ambient_version(agent, *, binary=None, timeout=30.0):
+        # a fake agent a test put on PATH under its tmp dir is still asked; the real one never is
+        found = binary or shutil.which(canary.AGENT_BINS[agent])
+        if found and (binary or os.path.realpath(found).startswith(os.path.realpath(base))):
+            return real_version(agent, binary=found, timeout=timeout)
+        return None
+
+    import levain.consent.adapters.codex as cx
+
+    real_trust = cx.trust_status
+
+    def no_ambient_codex(*args, codex_bin=None, **kwargs):
+        # doctor asks the codex on PATH; a test that means to ask one passes it
+        return real_trust(*args, codex_bin=codex_bin or "/nonexistent/levain-test-codex", **kwargs)
+
+    monkeypatch.setattr(install, "_consent_queue_dir", queue_dir)
+    monkeypatch.setattr(canary, "agent_version", no_ambient_version)
+    monkeypatch.setattr(cx, "trust_status", no_ambient_codex)
 
 
 @pytest.fixture(autouse=True)

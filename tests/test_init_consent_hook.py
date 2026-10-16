@@ -1,0 +1,304 @@
+"""S1436: `levain init` and `levain update` wire the PermissionRequest consent hook for Claude Code and Codex
+through the same renderers as the other hooks, create the adapter settings file once (away mode off), and doctor
+reports the wiring, away mode and the cockpit grants verify against."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from levain import doctor
+from levain import host_guard as hg
+from levain import install as inst
+from levain.consent.adapters import claude_code, codex
+from levain.install import refresh_adapter
+from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
+
+
+def _cj(tmp_path: Path) -> Path:
+    return tmp_path / "codex-home" / "hooks.json"
+
+
+def _consent_groups(path: Path) -> list:
+    return json.loads(path.read_text(encoding="utf-8"))["hooks"].get("PermissionRequest", [])
+
+
+def _rows(results, name: str):
+    return [r for r in results if r.name == name]
+
+
+def _row(results, name: str):
+    (r,) = _rows(results, name)
+    return r
+
+
+# --- the render ----------------------------------------------------------------------------------------------
+
+def test_claude_code_init_wires_the_consent_hook(make_install):
+    cc = make_install("cc")
+    (group,) = _consent_groups(cc / ".claude" / "settings.json")
+    script = cc / "activation" / "hooks" / "consent_claude_code.py"
+    assert group == {"matcher": "*", "hooks": [{
+        "type": "command", "command": claude_code.hook_command(sys.executable, script),
+        "timeout": claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)}]}
+    assert script.is_file()
+    # the other hooks are untouched by the merge
+    hooks = json.loads((cc / ".claude" / "settings.json").read_text())["hooks"]
+    assert {"SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop"} <= set(hooks)
+
+
+def test_codex_init_wires_the_consent_hook_in_the_global_file(make_install, tmp_path):
+    cx = make_install("cx", adapter="codex")
+    (group,) = _consent_groups(_cj(tmp_path))
+    script = cx / "activation" / "hooks" / "consent_codex.py"
+    (handler,) = group["hooks"]
+    assert handler["command"] == claude_code.hook_command(sys.executable, script)
+    assert handler["timeout"] == claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)
+    assert script.is_file() and not (cx / "activation" / "hooks" / "consent_claude_code.py").exists()
+    assert set(json.loads(_cj(tmp_path).read_text())["hooks"]) == {
+        "SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "PermissionRequest"}
+
+
+@pytest.mark.parametrize("adapter", ["claude-code", "codex"])
+def test_init_and_update_render_the_same_bytes(make_install, tmp_path, adapter):
+    install = make_install("x", adapter=adapter)
+    target = install / ".claude" / "settings.json" if adapter == "claude-code" else _cj(tmp_path)
+    before = target.read_bytes()
+    r = refresh_adapter(install, apply=True, emit=lambda _l: None)
+    assert r.refreshed == [] and r.review == [], r
+    assert target.read_bytes() == before
+
+
+def test_a_render_with_another_interpreter_is_still_levains(make_install):
+    """The consent command carries the interpreter, so a file rendered on another machine differs only at a
+    per-machine leaf (_levain_render_variant), as the other hook commands do."""
+    cc = make_install("cc")
+    root = inst._templates_root
+    with root() as templates_root:
+        adapter_root = templates_root / "adapters" / "claude-code"
+        args = (cc, adapter_root)
+        seed = [inst.SeedEntry(name="world.md", path=templates_root / "seed" / "world.md", mode="render")]
+        want = inst._claude_code_files(*args, sys.executable, seed, [])[cc / ".claude" / "settings.json"]
+        other = inst._claude_code_files(*args, "/opt/other/python3", seed, [])[cc / ".claude" / "settings.json"]
+        variant = inst._claude_code_files(*args, inst._VARIABLE, seed, [])[cc / ".claude" / "settings.json"]
+    assert other != want
+    assert inst._levain_render_variant(other, want, variant, install=cc)
+
+
+@pytest.mark.parametrize("adapter", ["claude-code", "codex"])
+def test_the_pin_matches_after_init(make_install, adapter):
+    install = make_install("x", adapter=adapter)
+    (res,) = doctor._check_agent_hook_pins(install)
+    assert res.ok and not res.warn and "match the pin" in res.detail, res
+
+
+def test_the_codex_owner_test_still_reads_the_consent_command(make_install):
+    a = make_install("a", adapter="codex")
+    b = make_install("b", adapter="codex")
+    assert hg.codex_hooks_owner(a) == b and hg.codex_hooks_owner(b) is None
+
+
+def _make_pre_consent(cc: Path) -> Path:
+    """Turn a fresh claude-code install into one made before the consent hook: no entry, no script, receipts and
+    pin saying so."""
+    settings = cc / ".claude" / "settings.json"
+    doc = json.loads(settings.read_text())
+    del doc["hooks"]["PermissionRequest"]
+    text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+    settings.write_text(text, encoding="utf-8")
+    rec = cc.joinpath(*inst.ADAPTER_RECEIPT_REL)
+    data = json.loads(rec.read_text())
+    data["files"][".claude/settings.json"] = hashlib.sha256(text.encode()).hexdigest()
+    rec.write_text(json.dumps(data))
+    script = cc / "activation" / "hooks" / "consent_claude_code.py"
+    script.unlink()
+    act = inst.activation_receipt_path(cc)
+    adata = json.loads(act.read_text())
+    adata["files"].pop("hooks/consent_claude_code.py")
+    act.write_text(json.dumps(adata))
+    hg.repin_agent_hooks(cc)
+    return settings
+
+
+def test_update_wires_a_pre_consent_install_and_keeps_the_pin(make_install):
+    cc = make_install("cc")
+    want = (cc / ".claude" / "settings.json").read_bytes()
+    settings = _make_pre_consent(cc)
+    assert _row(doctor._check_claude_code(cc), "Claude Code consent hook").warn
+    r = refresh_adapter(cc, apply=True, emit=lambda _l: None)
+    assert ".claude/settings.json" in r.refreshed and "activation/hooks/consent_claude_code.py" in r.refreshed, r
+    assert settings.read_bytes() == want
+    assert not _row(doctor._check_claude_code(cc), "Claude Code consent hook").warn
+    (res,) = doctor._check_agent_hook_pins(cc)
+    assert res.ok and not res.warn, res
+
+
+def test_update_stages_an_edited_settings_file_and_doctor_says_where(make_install):
+    cc = make_install("cc")
+    settings = _make_pre_consent(cc)
+    doc = json.loads(settings.read_text())
+    doc["env"] = {"MINE": "1"}  # the operator's edit: no longer what levain last wrote
+    settings.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    r = refresh_adapter(cc, apply=True, emit=lambda _l: None)
+    assert ".claude/settings.json" in r.review, r
+    assert "PermissionRequest" not in json.loads(settings.read_text())["hooks"]
+    row = _row(doctor._check_claude_code(cc), "Claude Code consent hook")
+    assert row.warn and "staged" in row.hint and "pending" in row.hint, row
+
+
+# --- the settings file ---------------------------------------------------------------------------------------
+
+def _settings_file(name: str) -> Path:
+    return inst._consent_queue_dir() / name
+
+
+def test_init_creates_the_settings_file_away_off(make_install):
+    cc = make_install("cc")
+    path = _settings_file(claude_code.SETTINGS_NAME)
+    assert json.loads(path.read_text()) == {"cockpit_data_root": os.path.realpath(cc / ".levain" / "cockpit"),
+                                            "away_mode": False, "away_hold_seconds": 0}
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert os.stat(path.parent).st_mode & 0o777 == 0o700
+
+
+def test_init_never_rewrites_an_existing_settings_file(make_install, capsys):
+    path = _settings_file(codex.SETTINGS_NAME)
+    path.parent.mkdir(mode=0o700, parents=True)
+    mine = {"cockpit_data_root": "/somewhere/else/cockpit", "away_mode": True, "away_hold_seconds": 15}
+    path.write_text(json.dumps(mine), encoding="utf-8")
+    lines: list[str] = []
+    cx = make_install("cx", adapter="codex")
+    inst._write_consent_settings(cx, "codex", lines.append)
+    assert json.loads(path.read_text()) == mine
+    assert any("name another cockpit" in ln and "kept" in ln for ln in lines), lines
+    rows = doctor._check_codex(cx)
+    assert _row(rows, "Codex consent authority").warn
+    away = _row(rows, "Codex away mode")
+    assert away.warn and "NO dialog during the hold" in away.detail and "15s" in away.detail, away
+
+
+def test_a_settings_file_naming_no_cockpit_is_kept_and_reported(make_install):
+    path = _settings_file(claude_code.SETTINGS_NAME)
+    path.parent.mkdir(mode=0o700, parents=True)
+    path.write_text('{"away_mode": false}', encoding="utf-8")
+    cc = make_install("cc")
+    lines: list[str] = []
+    inst._write_consent_settings(cc, "claude-code", lines.append)
+    assert path.read_text() == '{"away_mode": false}'
+    assert any("no cockpit_data_root" in ln for ln in lines), lines
+    assert "names no cockpit" in _row(doctor._check_claude_code(cc), "Claude Code consent authority").detail
+
+
+def test_a_symlinked_settings_file_is_refused_not_followed(make_install, tmp_path):
+    path = _settings_file(claude_code.SETTINGS_NAME)
+    path.parent.mkdir(mode=0o700, parents=True)
+    elsewhere = tmp_path / "elsewhere.json"
+    path.symlink_to(elsewhere)
+    cc = make_install("cc")
+    lines: list[str] = []
+    inst._write_consent_settings(cc, "claude-code", lines.append)
+    assert not elsewhere.exists() and path.is_symlink()
+    assert any("not written" in ln for ln in lines), lines
+
+
+def test_a_group_readable_queue_dir_is_refused(make_install):
+    qdir = inst._consent_queue_dir()
+    qdir.mkdir(mode=0o755, parents=True)
+    os.chmod(qdir, 0o755)
+    cc = make_install("cc")
+    lines: list[str] = []
+    inst._write_consent_settings(cc, "claude-code", lines.append)
+    assert not (qdir / claude_code.SETTINGS_NAME).exists()
+    assert any("not written" in ln and "0700" in ln for ln in lines), lines
+
+
+# --- the version gate: always rendered, WARN when untested ------------------------------------------------------
+
+@pytest.mark.parametrize("version,tested", [(None, False), ("9.9.9", False), ("2.1.301", True)])
+def test_init_reports_the_agent_version_and_renders_anyway(make_install, monkeypatch, capsys, version, tested):
+    monkeypatch.setattr(inst, "_consent_agent_version", lambda adapter: version)
+    lines: list[str] = []
+    cc = make_install("cc")
+    inst._emit_consent_hook(cc, "claude-code", lines.append)
+    (line,) = lines
+    assert line.startswith("  consent hook (Claude Code): wired, away mode off; ")
+    assert ("is a tested version" in line) is tested and ("WARN" in line) is (not tested), line
+    assert _consent_groups(cc / ".claude" / "settings.json")
+
+
+def test_codex_init_says_trust_and_machine_wide(make_install, monkeypatch):
+    lines: list[str] = []
+    cx = make_install("cx", adapter="codex")
+    inst._emit_consent_hook(cx, "codex", lines.append)
+    assert any("Hooks need review" in ln and "every Codex session on this machine" in ln for ln in lines), lines
+
+
+# --- doctor --------------------------------------------------------------------------------------------------
+
+def test_doctor_rows_on_a_fresh_install(make_install):
+    cc = make_install("cc")
+    rows = doctor._check_claude_code(cc)
+    assert not _row(rows, "Claude Code consent hook").warn
+    away = _row(rows, "Claude Code away mode")
+    assert not away.warn and away.detail.startswith("off:"), away
+    auth = _row(rows, "Claude Code consent authority")
+    assert not auth.warn and "no cockpit.db there yet" in auth.detail, auth
+    (Path(os.path.realpath(cc / ".levain" / "cockpit"))).mkdir(parents=True, exist_ok=True)
+    (cc / ".levain" / "cockpit" / "cockpit.db").write_bytes(b"")
+    assert "no cockpit.db" not in _row(doctor._check_claude_code(cc), "Claude Code consent authority").detail
+
+
+def test_doctor_claude_away_on_is_not_a_warning(make_install):
+    cc = make_install("cc")
+    path = _settings_file(claude_code.SETTINGS_NAME)
+    doc = json.loads(path.read_text())
+    path.write_text(json.dumps({**doc, "away_mode": True, "away_hold_seconds": 5000}))
+    away = _row(doctor._check_claude_code(cc), "Claude Code away mode")
+    assert not away.warn and "on, hold 840s" in away.detail and "dialog during the hold" in away.detail, away
+
+
+def test_a_codex_install_that_does_not_own_the_file_gets_no_consent_rows(make_install):
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    assert not _rows(doctor._check_codex(a), "Codex consent hook")
+
+
+def test_canary_findings_cover_the_init_shape(make_install):
+    from levain.consent.canary import doctor_findings
+    cc = make_install("cc")
+    names = [f.name for f in doctor_findings(cc)]
+    assert names == ["consent hook (Claude Code)"], names  # the version row (no version in tests: a WARN)
+    settings = cc / ".claude" / "settings.json"
+    doc = json.loads(settings.read_text())
+    del doc["hooks"]["PermissionRequest"]
+    settings.write_text(json.dumps(doc))
+    assert doctor_findings(cc) == []  # the wiring row says it; the static script alone says nothing
+
+
+def test_canary_findings_ask_trust_for_the_global_codex_hook(make_install, tmp_path):
+    from levain.consent.canary import doctor_findings
+    cx = make_install("cx", adapter="codex")
+    found = {f.name: f for f in doctor_findings(cx, codex_home=tmp_path / "codex-home")}
+    assert set(found) == {"consent hook (Codex)", "consent hook trust (Codex)"}, found
+    assert "consent hook script (Codex)" not in found  # the static script is not install()'s rendering
+    st = codex.trust_status(cx, home=tmp_path / "codex-home", codex_bin="/nonexistent",
+                            hooks_path=_cj(tmp_path), script=cx / "activation" / "hooks" / "consent_codex.py")
+    assert st.status == "unknown" and st.script_intact is None
+    assert st.key is not None and st.key.startswith(f"{os.path.realpath(_cj(tmp_path))}:permission_request:")
+
+
+# --- the static scripts --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rel,module", [
+    ("templates/activation/hooks/consent_claude_code.py", "levain.consent.adapters.claude_code"),
+    ("templates/adapters/codex/activation/hooks/consent_codex.py", "levain.consent.adapters.codex")])
+def test_the_static_scripts_carry_the_isolate_prelude(rel, module):
+    text = (Path(inst.__file__).parent / rel).read_text(encoding="utf-8")
+    assert claude_code.ISOLATE_PRELUDE in text
+    assert f"    from {module} import main\n" in text and text.endswith("sys.exit(main([]))\n")
+    assert "{{" not in text  # nothing for the activation copy to substitute
