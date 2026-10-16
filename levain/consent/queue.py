@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (
-    AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, verify_link_sig,
+    PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
@@ -510,6 +510,14 @@ class ConsentQueue:
             return f"key class {key.key_class} does not cover {request.tier}"
         if not isinstance(signature, str) or not signature:
             return "the answer carries no signature"
+        if key.custody == PASSKEY:
+            # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
+            # verification, not only where the phone port converted the assertion
+            from levain.consent.passkey import answer_signature_problem
+
+            problem = answer_signature_problem(signature, key.public_key)
+            if problem is not None:
+                return problem
         try:
             message = answer_message(dict(payload))
         except ConsentError as exc:

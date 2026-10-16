@@ -98,7 +98,7 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.authority import AnchorError, advance_anchor, anchor_path, presence_missing
+from levain.authority import PASSKEY, AnchorError, advance_anchor, anchor_path, presence_missing
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
 from levain.cockpit.verbs import KERNEL_VERBS
@@ -1003,7 +1003,8 @@ class Broker:
         """The verified signer's fingerprint (§6.5), against a signers file generated from the
         request's authority snapshot (its unrevoked keys) for this verification into a fresh
         ``mkstemp`` file in the data root."""
-        keys = sorted((k.principal, k.public_key) for k in authority.active_keys())
+        # a passkey signs consent answers only: it is never a signer of a pending
+        keys = sorted((k.principal, k.public_key) for k in authority.active_keys() if k.custody != PASSKEY)
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
