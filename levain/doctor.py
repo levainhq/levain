@@ -1361,6 +1361,21 @@ def _python_resolvable(token: str) -> bool:
     return shutil.which(token) is not None
 
 
+_HOOKRUN_OK: dict[str, bool] = {}
+
+
+def _runs_hookrun(python: str) -> bool:
+    """Whether ``python`` can run ``-EP -m levain.hookrun`` the way the Codex hook commands do (cached per run)."""
+    if python not in _HOOKRUN_OK:
+        try:
+            r = subprocess.run([python, "-EP", "-c", "import levain.hookrun"], capture_output=True,
+                               timeout=20, stdin=subprocess.DEVNULL)
+            _HOOKRUN_OK[python] = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _HOOKRUN_OK[python] = False
+    return _HOOKRUN_OK[python]
+
+
 def _extract_command_python(entries: list[dict]) -> str | None:
     """Extract the python interpreter token from the first hook command."""
     tokens = _first_command_tokens(entries)
@@ -2772,6 +2787,17 @@ def _check_codex(install: Path) -> list[CheckResult]:
                             False,
                             f"unresolvable: {py}",
                             "Re-run `levain init` to re-resolve {{PYTHON}}.",
+                        )
+                    )
+                elif py and "levain.hookrun" in (_first_command_tokens(entries) or []) and not _runs_hookrun(py):
+                    results.append(
+                        CheckResult(
+                            f"~/.codex/hooks.json {ev_name} python",
+                            False,
+                            f"{py} cannot import levain, so every levain hook exits 1 and Codex shows "
+                            "\"Hook failed\"",
+                            f"Install levain into {py}, or run `levain update` from the python levain is "
+                            "installed in.",
                         )
                     )
                 else:

@@ -15,6 +15,7 @@ import pytest
 
 from levain import install as install_mod
 from levain import host_guard as hg
+from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
 
 ADAPTER = Path(install_mod.__file__).parent / "templates" / "adapters" / "codex"
 
@@ -77,3 +78,42 @@ def test_the_script_stays_the_last_token_every_reader_takes_as_the_hook(tmp_path
         argv = shlex.split(cmd)
         assert argv[:4] == [sys.executable, "-EP", "-m", "levain.hookrun"]
         assert Path(argv[-1]).parent == tmp_path / "ent" / "activation" / "hooks"
+
+
+def test_a_crash_says_why_on_stderr(tmp_path):
+    s = tmp_path / "h.py"
+    s.write_text("raise RuntimeError('the reason')\n")
+    r = _run(s)
+    assert r.returncode == 1 and "RuntimeError: the reason" in r.stderr
+    s.write_text("import sys; sys.exit('a message')\n")
+    assert "a message" in _run(s).stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Codex runs hooks through sh here")
+def test_a_levain_directory_in_the_sessions_cwd_does_not_run_as_the_entry(tmp_path):
+    """-P: Codex starts hooks in the user's project directory, which can be a levain checkout."""
+    cwd = tmp_path / "proj"
+    (cwd / "levain").mkdir(parents=True)
+    (cwd / "levain" / "__init__.py").write_text("")
+    (cwd / "levain" / "hookrun.py").write_text("print('HIJACK')\n")
+    for cmd in _commands(sys.executable, tmp_path / "gone"):
+        r = subprocess.run(["/bin/sh", "-c", cmd], cwd=cwd, input="{}", capture_output=True, text=True, timeout=60)
+        assert (r.returncode, r.stdout) == (0, ""), cmd
+
+
+def test_doctor_fails_a_hook_interpreter_that_cannot_run_the_entry(make_install, tmp_path):
+    from levain import doctor
+
+    install = make_install("cx", adapter="codex")
+    cj = tmp_path / "codex-home" / "hooks.json"
+
+    def py_rows():
+        doctor._HOOKRUN_OK.clear()
+        return [r for r in doctor._check_codex(install) if r.name.endswith(" python")]
+
+    assert py_rows() == []
+    bare = tmp_path / "bare"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(bare)], check=True)
+    cj.write_text(cj.read_text().replace(json.dumps(sys.executable)[1:-1], str(bare / "bin" / "python")))
+    rows = py_rows()
+    assert len(rows) == 2 and all(not r.ok and "cannot import levain" in r.detail for r in rows), rows

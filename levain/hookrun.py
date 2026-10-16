@@ -8,9 +8,11 @@ turned a deleted or moved install into a block on every Codex prompt.
 
 The rendered command is therefore ``<python> -EP -m levain.hookrun <install>/activation/hooks/<hook>.py``:
 python never opens the script itself. This entry exits 0 printing nothing when the script is not a file,
-runs it as ``__main__`` otherwise, and maps every failure (an exception, a non-zero SystemExit, argparse's 2)
-to exit 1. A deliberate decision is the JSON the script prints on stdout, never an exit code. A missing
-interpreter is the shell's 127 and a venv without levain is python's 1: both fall through as well.
+runs it as ``__main__`` otherwise, and maps every failure that reaches Python (an exception, a non-zero
+SystemExit, argparse's 2) to exit 1, its traceback or message on stderr. ``os._exit`` bypasses this, so a hook
+script never calls it. A deliberate decision is the JSON the script prints on stdout, never an exit code. A missing
+interpreter is the shell's 127 and a venv without levain is python's 1: both fall through as well. ``-P`` is what
+keeps a ``levain`` directory in the session's working directory (a levain checkout) from running as this module.
 
 The script path stays the command's last token, the one every reader of the command shape takes as the hook
 (the Codex owner matcher, the hook pins, doctor's wiring rows, verify-hooks).
@@ -21,6 +23,7 @@ from __future__ import annotations
 import os
 import runpy
 import sys
+import traceback
 
 
 def main(argv: list[str]) -> int:
@@ -33,8 +36,13 @@ def main(argv: list[str]) -> int:
     try:
         runpy.run_path(script, run_name="__main__")
     except SystemExit as exc:
-        return 0 if exc.code in (None, 0) else 1
+        if exc.code in (None, 0):
+            return 0
+        if not isinstance(exc.code, int):
+            print(exc.code, file=sys.stderr)
+        return 1
     except BaseException:
+        traceback.print_exc()
         return 1
     return 0
 
