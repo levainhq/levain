@@ -135,6 +135,10 @@ _COCKPIT_VERB_PATH = "/cockpit/verb"
 _CONSENT_BODY_PREFIX = "/cockpit/consent/"
 _CONSENT_BODY_SUFFIX = ".json"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
+# One agent session's transcript (Q8): GET /cockpit/session/<stem>.json. It names the session id and full cwd and
+# carries the operator's prompts, so it rides the consent body's gate: a surface token on EVERY bind, loopback included.
+_SESSION_LOG_PREFIX = "/cockpit/session/"
+_SESSION_LOG_SUFFIX = ".json"
 _WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
 # The broker's pending routes (K2b design §1, §3.2, §3.5): POST /cockpit/pending/<id>/signature and
 # POST /cockpit/pending/<id>/cancel. They ride the same write gate as _WRITE_ROUTES.
@@ -363,7 +367,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
-_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX,)
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -853,6 +857,37 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _serve_session_log(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/session/<stem>.json``: one agent session's transcript (``session_log.read_session``). The
+        consent body's gate: reached only through ``_route``, then a surface token on every bind, judged by
+        ``_credential``, before the stem is even looked at. Read-only; a bad stem, a missing or foreign record and a
+        server with no install root are all 404."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"a session's transcript needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        stem = path[len(_SESSION_LOG_PREFIX):-len(_SESSION_LOG_SUFFIX)]
+        status, payload = 404, {"error": "not_found", "message": "no such session recorded"}
+        root = self.server.levain_source.install_root
+        if root is not None:     # the stem is checked by read_session (its STEM), the one place it is
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                from levain.cockpit.session_log import read_session
+
+                body = read_session(root, stem, datetime.now(timezone.utc), self.server.consent_reader)
+                if body is not None:
+                    status, payload = 200, body
+            except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
+                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+            finally:
+                self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _acquire_read_slot(self) -> bool:
         """Take a read-pool slot and a ``request_gate`` slot for a cockpit read, waiting up to
         ``_READ_WAIT_SECONDS`` behind at most ``_MAX_READ_WAITERS`` other waiting reads. A read does not take
@@ -986,6 +1021,9 @@ class _Handler(GuardedHandler):
 
         if path.startswith(_CONSENT_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_consent_body(path, head=head)
+            return
+        if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
+            self._serve_session_log(path, head=head)
             return
 
         if is_cockpit_path(path):
