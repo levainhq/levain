@@ -190,14 +190,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     init_p.add_argument(
         "--messaging",
-        choices=["governed", "off", "unmanaged"],
+        choices=["isolate", "governed", "off", "unmanaged"],
         default=None,
         help=(
-            "Claude Code cross-session messaging (claude-code adapter only). `governed` (the default): "
-            "inbound messages are held, outbound sends ask. `off`: inbound refused, sending and listing "
-            "denied. `unmanaged`: none of those keys written; Claude Code's own defaults apply (your own "
-            "trust decision). The choice is kept in .levain/config.json, so `levain update` and "
-            "`init --force` keep it; give --messaging again to change it."
+            "Claude Code cross-session messaging (claude-code adapter only). `isolate` (the default): "
+            "only isolatePeerMachines, so a send to a session on another machine asks; sends between "
+            "sessions on this machine are not queued or recorded, and an incoming message gets Claude "
+            "Code's own per-message default. `governed` (opt in): inbound messages are held and every "
+            "outbound send asks. `off`: inbound refused, sending and "
+            "listing denied. `unmanaged`: none of those keys written. Claude Code never counts a message "
+            "from another session as your consent, whichever you choose. The choice is kept in "
+            ".levain/config.json, so `levain update` and `init --force` keep it; give --messaging again "
+            "to change it."
         ),
     )
     init_p.set_defaults(func=_cmd_init)

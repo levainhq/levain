@@ -860,6 +860,57 @@ def test_agent_pin_never_edits_agent_settings(tmp_path):
     assert (ent / ".claude" / "settings.json").read_bytes() == before[0]
 
 
+def _git(*args):
+    import subprocess
+
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True)
+
+
+def test_a_subdirectory_session_reads_only_its_own_shared_settings_in_both_readers(tmp_path, monkeypatch):
+    """Observed with Claude Code 2.1.301: started in a repo subdirectory it does not load the root's shared
+    settings.json (a Bash write outside the directory landed; started at the root, the same write was denied). Doctor's sandbox reader, the messaging reader and the cockpit chip
+    must all say so; the root itself still reads on."""
+    from levain.cockpit.providers import _sandbox_chip
+
+    home, repo = tmp_path / "home", tmp_path / "home" / "R"
+    (repo / "sub").mkdir(parents=True)
+    _git("init", "-q", str(repo))
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text(json.dumps({
+        "sandbox": {"enabled": True}, "crossSessionInbound": "hold", "permissions": {"ask": ["SendMessage"]}}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(hg, "load_managed_settings", lambda *a, **k: [])
+    sub = repo / "sub"
+    assert hg.cc_sandbox_state(sub, home, managed=[])[0] is False
+    assert str(repo / ".claude" / "settings.json") not in hg.cc_sandbox_sources(sub, home, managed=[])
+    msg = hg.cc_messaging_posture(sub, home, managed=[])
+    assert msg.inbound is None and msg.outbound == "open"
+    assert _sandbox_chip("claude_code", str(sub), {}) == "sandbox configured off"
+    assert hg.cc_sandbox_state(repo, home, managed=[])[0] is True
+    assert _sandbox_chip("claude_code", str(repo), {}) == "sandbox configured on (project settings)"
+
+
+def test_the_local_settings_file_is_read_at_the_repo_root_and_the_main_checkout(tmp_path):
+    home, repo = tmp_path / "home", tmp_path / "home" / "R"
+    (repo / "sub").mkdir(parents=True)
+    _git("init", "-q", str(repo))
+    _git("-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x")
+    (repo / ".claude").mkdir()
+    root_local = repo / ".claude" / "settings.local.json"
+    root_local.write_text(json.dumps({"sandbox": {"enabled": True}}))
+    assert hg.cc_sandbox_state(repo / "sub", home, managed=[]) == (True, str(root_local))
+    _git("-C", str(repo), "worktree", "add", "-q", str(tmp_path / "home" / "wt"))
+    local, shared = hg.cc_project_settings_files(tmp_path / "home" / "wt", home)
+    assert local[0] == root_local and shared == tmp_path / "home" / "wt" / ".claude" / "settings.json"
+    # an older Claude Code's local file in the starting directory is still read, after the root's
+    (repo / "sub" / ".claude").mkdir()
+    (repo / "sub" / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": False}}))
+    assert hg.cc_sandbox_state(repo / "sub", home, managed=[])[0] is True
+    # a repository rooted at the home directory keeps the local file beside the shared one
+    _git("init", "-q", str(home))
+    assert hg.cc_project_settings_files(home / "x", home)[0] == [home / "x" / ".claude" / "settings.local.json"]
+
+
 def test_cc_sandbox_state_precedence(tmp_path):
     ent, _ = _pinned_entity(tmp_path)
     home = tmp_path / "home"

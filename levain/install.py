@@ -1942,12 +1942,13 @@ def _claude_code_files(
 # `levain init --messaging` (the opt-out for Q9). The template carries no messaging keys; the renderer adds
 # them through `merge_messaging`, so the choice is the one place they come from. Key ORDER in the rendered
 # settings.json differs from the old hard-coded template (the three keys follow `hooks`); keys and values are
-# the same for `governed`.
-MESSAGING_CHOICES = ("governed", "off", "unmanaged")
-DEFAULT_MESSAGING = "governed"
+# the same for `governed`. The default is `isolate`: governing messaging is the operator's opt-in,
+# `--messaging governed`.
+MESSAGING_CHOICES = ("isolate", "governed", "off", "unmanaged")
+DEFAULT_MESSAGING = "isolate"
 _MESSAGING_ADAPTER_REFUSAL = ("FAIL: --messaging is for the claude-code adapter only; {adapter} documents no "
                               "cross-session messaging, so there is nothing to opt out of.")
-_MESSAGING_KNOBS = {"governed": ("hold", "ask"), "off": ("refuse", "deny"),
+_MESSAGING_KNOBS = {"isolate": ("unmanaged", "isolate"), "governed": ("hold", "ask"), "off": ("refuse", "deny"),
                     "unmanaged": ("unmanaged", "unmanaged")}
 
 
@@ -1974,13 +1975,24 @@ def _check_messaging(install: Path, chosen: str, messaging: str | None) -> None:
 
 
 def persisted_messaging(install: Path) -> str:
-    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). Absent, unreadable or
-    unrecognised = ``governed``: an install from before the flag, or a hand-edited value, is governed, never
-    silently opened."""
-    from levain.dashboard import _read_levain_config
+    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). No file or no key = the
+    default, ``isolate``. A file that cannot be read as a JSON object, or a value that is not a choice (a hand
+    edit), = ``governed``: what may hold the operator's choice is never read as the looser default."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
 
-    value = _read_levain_config(install).get("messaging")
-    return value if value in MESSAGING_CHOICES else DEFAULT_MESSAGING
+    path = install.joinpath(*LEVAIN_CONFIG_REL)
+    if not os.path.lexists(path):
+        return DEFAULT_MESSAGING
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "governed"
+    if not isinstance(config, dict):
+        return "governed"
+    if "messaging" not in config:
+        return DEFAULT_MESSAGING
+    value = config["messaging"]
+    return value if value in MESSAGING_CHOICES else "governed"
 
 
 def _apply_messaging(settings_text: str, choice: str) -> str:

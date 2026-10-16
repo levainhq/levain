@@ -529,10 +529,11 @@ def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, An
 
 # Q9, cross-session messaging (DESIGN_Q9). Inbound: Claude Code's `crossSessionInbound`. Outbound: ``ask`` puts
 # `SendMessage` under an explicit ask rule (which no permission mode auto-approves, so every send reaches the
-# PermissionRequest hook above or the human) plus `isolatePeerMachines`; ``deny`` turns sending and listing off.
-# ``unmanaged`` writes nothing for that direction.
+# PermissionRequest hook above or the human) plus `isolatePeerMachines`; ``isolate`` writes `isolatePeerMachines`
+# alone (a send beyond this machine asks; one to a session on this machine does not); ``deny`` turns sending and
+# listing off. ``unmanaged`` writes nothing for that direction.
 INBOUND_CHOICES = ("hold", "refuse", "unmanaged")
-OUTBOUND_CHOICES = ("ask", "deny", "unmanaged")
+OUTBOUND_CHOICES = ("ask", "isolate", "deny", "unmanaged")
 
 
 def merge_messaging(settings: dict[str, Any], *, inbound: str = "hold", outbound: str = "ask") -> None:
@@ -549,6 +550,9 @@ def merge_messaging(settings: dict[str, Any], *, inbound: str = "hold", outbound
         # an unrecognised value already holds (Claude Code's rule); replacing it with hold or refuse is no loosening
         settings["crossSessionInbound"] = stricter_inbound(current, inbound) or inbound
     if outbound == "unmanaged":
+        return
+    if outbound == "isolate":
+        settings["isolatePeerMachines"] = True
         return
     if settings.get("permissions") is None:
         settings["permissions"] = {}  # an explicit null holds no rules

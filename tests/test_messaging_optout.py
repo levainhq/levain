@@ -85,13 +85,24 @@ def test_the_renderer_keeps_the_hooks_block_byte_order(choice):
     assert out["hooks"] == base["hooks"] and list(out["hooks"]) == list(base["hooks"])
 
 
-def test_init_default_is_governed_and_records_nothing(env, capsys):
+def test_init_default_is_isolate_only_and_doctor_names_the_gaps(env, capsys):
+    """Messaging is opt-in, isolatePeerMachines on by default: no --messaging writes only isolatePeerMachines;
+    doctor reads the default as the install's choice (not a warning) and says what is not governed."""
+    from levain import doctor
+
     ent = env / "e"
     assert run_init(ent, "claude-code", force=False, answers_file=_answers(env, capsys)) == 0
-    assert _msg(_settings(ent))["inbound"] == "hold" and _settings(ent)["isolatePeerMachines"] is True
-    assert persisted_messaging(ent) == "governed"
+    s = _settings(ent)
+    assert s["isolatePeerMachines"] is True and "crossSessionInbound" not in s
+    assert "SendMessage" not in json.dumps(s.get("permissions", {}))
+    assert persisted_messaging(ent) == "isolate"
     cfg = ent / ".levain" / "config.json"
     assert not cfg.is_file() or "messaging" not in json.loads(cfg.read_text(encoding="utf-8"))
+    (r,) = doctor._check_cc_messaging(ent)
+    assert r.ok and not r.warn and "by this install's choice `isolate`" in r.detail
+    assert "does not queue or record sends" in r.detail and "never counts a message" in r.detail
+    cfg.write_text("{not json")
+    assert persisted_messaging(ent) == "governed"  # a record that cannot be read is never the looser default
 
 
 @pytest.mark.parametrize("choice,inbound", [("off", "refuse"), ("unmanaged", None), ("governed", "hold")])

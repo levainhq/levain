@@ -110,38 +110,42 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 imported by `CLAUDE.md`, so once the entity's first wrap has written it, it is in context
 from the first turn of every session.
 
-### 3. Cross-session messaging — held in, asked out
+### 3. Cross-session messaging — isolated by default, governed on request
 
 Claude Code lets a session message your other sessions. The renderer writes the
-keys below into `.claude/settings.json` (`settings.template.json` carries none of
-them), by default; `levain init --messaging governed|off|unmanaged` picks the posture,
-and the choice is kept in `.levain/config.json` so `levain update` and `init --force`
-keep it. `governed` is the default:
+messaging keys into `.claude/settings.json` (`settings.template.json` carries none
+of them); `levain init --messaging isolate|governed|off|unmanaged` picks the
+posture, and the choice is kept in `.levain/config.json` so `levain update` and
+`init --force` keep it. `isolate` is the default:
 
-- `"crossSessionInbound": "hold"` — a message from another session shows a notice
-  and is not delivered. A workspace `hold` outranks an `accept` in your user
-  settings; to receive messages here, remove the key (or set `"refuse"` to drop
-  them silently).
-- `"permissions": {"ask": ["SendMessage"]}` and `"isolatePeerMachines": true` —
-  Claude asks before every message it sends, in every permission mode, bypass
-  included (`dontAsk` denies the send instead). With
-  levain's consent hook installed the request reaches the consent queue, where a
-  standing grant on `SendMessage` for this workspace can answer it. The same tool
-  resumes subagents and messages agent-team teammates, so those ask too.
-- **Background sessions.** A `claude --bg` session nobody is attached to waits at
-  that prompt until someone answers it, so a fleet of sessions that message each
-  other stalls unless something answers for you: a standing grant
-  (`levain consent grant create --agent claude_code --tool SendMessage
-  --workspace <dir> ...`) answers every send from inside that workspace and
-  leaves a receipt. In `claude -p`, an unanswered send is denied.
-- `levain init --messaging off` refuses inbound (`"crossSessionInbound": "refuse"`)
-  and denies `SendMessage` and `ListAgents`.
-- **`levain init --messaging unmanaged`** writes none of the three keys, so
-  Claude Code's own defaults apply (your own trust decision). On an existing
-  install, run `levain init --path <install> --force --messaging unmanaged`.
+- **`isolate` (default)** writes only `"isolatePeerMachines": true`: Claude asks
+  before a message leaves for a session on another machine, in every permission
+  mode. What it leaves ungoverned, plainly: levain does not queue or record a send
+  to another session on this machine (no receipt, no audit trail), and holds no
+  message arriving from one; Claude Code's own default decides per message from
+  the two sessions' permission modes. `levain doctor` says so on every run.
+- **`governed` (opt in)** adds `"crossSessionInbound": "hold"` (a message from
+  another session shows a notice and is not delivered; a workspace `hold`
+  outranks an `accept` in your user settings) and
+  `"permissions": {"ask": ["SendMessage"]}`: Claude asks before every message it
+  sends, in every permission mode, bypass included (`dontAsk` denies the send
+  instead). With levain's consent hook installed the request reaches the consent
+  queue, where a standing grant on `SendMessage` for this workspace can answer it
+  and leaves a receipt. The same tool resumes subagents and messages agent-team
+  teammates, so those ask too. A `claude --bg` session nobody is attached to waits
+  at that prompt until someone answers it, so sessions that message each other
+  stall unless a standing grant (`levain consent grant create --agent claude_code
+  --tool SendMessage --workspace <dir> ...`) answers for you; in `claude -p`, an
+  unanswered send is denied.
+- **`off`** refuses inbound (`"crossSessionInbound": "refuse"`) and denies
+  `SendMessage` and `ListAgents`.
+- **`unmanaged`** writes none of the keys, so Claude Code's own defaults apply.
 
-`levain doctor` reports the controls that apply here and warns when a direction
-is not governed; it never edits the file.
+Whichever you choose, Claude Code never counts a message from another session as
+your consent: it cannot answer a permission prompt for you. To change an existing
+install, run `levain init --path <install> --force --messaging <choice>`.
+`levain doctor` reports the controls that apply here and names what is not
+governed; it never edits the file.
 
 ## Prerequisites
 

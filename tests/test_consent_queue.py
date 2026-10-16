@@ -720,6 +720,21 @@ def test_display_masks_a_secret_word_inside_a_run_together_key():
     assert '"author": "alice"' in shown and '"auth_url": "http://x"' in shown and '"private": false' in shown
 
 
+def test_display_masks_auth_as_its_own_word_and_a_passphrase():
+    # seen red (run at 3eb69f3): word-token masking showed auth, basic_auth, x-auth and auth_header in clear
+    shown = redact_display("mcp__http__request", {"auth": "Basic dXNlcjpodW50ZXIy", "basic_auth": "k", "proxy_auth": "k",
+                                                   "auth_header": "k", "headers": {"X-Auth": "s3cr3t"},
+                                                   "passphrase": "k", "pass_phrase": "k"})
+    assert "dXNlcjpodW50ZXIy" not in shown and "s3cr3t" not in shown and '"k"' not in shown
+
+
+def test_display_still_shows_keys_about_auth_rather_than_holding_it():
+    shown = redact_display("mcp__x__y", {"auth_url": "http://x", "authType": "oauth", "author": "alice",
+                                         "auth_method": "basic"})
+    assert shown == ('mcp__x__y {"authType": "oauth", "auth_method": "basic", "auth_url": "http://x", '
+                     '"author": "alice"}')
+
+
 def test_policy_seam_decides_nothing_without_a_grant(queue):
     """No standing grant in the log: the seam answers nothing and leaves the request pending."""
     from levain.consent.policy import decide

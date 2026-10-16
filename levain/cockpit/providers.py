@@ -905,20 +905,6 @@ def _sandbox_layer(source: str) -> str:
     return "managed settings"
 
 
-def _project_root(cwd: str) -> str | None:
-    """Claude Code reads project settings from the project root, not the shell's directory: walk up from the session's
-    cwd to the nearest directory holding `.claude` or `.git` (bounded, never the home directory or above)."""
-    home = os.path.expanduser("~")
-    p = Path(cwd)
-    for _ in range(12):
-        if str(p) == home or p == p.parent:
-            return None
-        if (p / ".claude").is_dir() or (p / ".git").exists():
-            return str(p)
-        p = p.parent
-    return None
-
-
 def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
     """Claude Code's sandbox as CONFIGURED for the session's working directory (doctor's reader); never "confined".
     Codex has no reader here: it says so."""
@@ -928,11 +914,8 @@ def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
         try:
             from levain import host_guard
 
-            root = _project_root(cwd)
-            if root is None:
-                cache[cwd] = "sandbox not read"
-                return cache[cwd]
-            on, source = host_guard.cc_sandbox_state(root)
+            # the session's own directory: Claude Code reads the shared settings.json there, never a root's above it
+            on, source = host_guard.cc_sandbox_state(cwd)
             cache[cwd] = f"sandbox configured on ({_sandbox_layer(source)})" if on else "sandbox configured off"
         except Exception:  # noqa: BLE001 - an unreadable settings layer is "not read", never a dark panel
             cache[cwd] = "sandbox not read"

@@ -25,8 +25,8 @@ this file's own location alone, so there is no env coupling left to port.)
 
 FAIL-OPEN — structural rule: the GUARANTEE that a hook never crashes or writes
 stderr noise into the operator's session is enforced at the harness ENTRY
-POINTS — session_start.py and user_prompt_submit.py each wrap their entire
-main() body in a catch-all and exit 0, and guard the import of this module.
+POINTS — every hook script beside this module wraps its entire main() body
+in a catch-all and exits 0, and guards the import of this module.
 The helpers below also aim to fail open, and most are individually guarded —
 but the entry-point guard is the load-bearing structural invariant; a helper
 that raises is caught there.

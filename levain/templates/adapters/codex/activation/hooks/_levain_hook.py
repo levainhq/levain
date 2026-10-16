@@ -29,12 +29,13 @@ and UserPromptSubmit. The Codex-specific divergences are:
   - SessionStart `source` vocabulary is `startup|resume|clear|compact` per
     Codex 0.133 schema (matches Claude Code; empirical 0.132 saw startup|resume
     only but the matcher now covers all four for forward compatibility)
-  - Stop event excluded entirely per Codex Stop output schema constraint above
+  - Stop carries no posture (record-only, prints nothing) per the Codex Stop
+    output schema constraint above
 
 FAIL-OPEN — structural rule: the GUARANTEE that a hook never crashes or writes
 stderr noise into the operator's session is enforced at the harness ENTRY
-POINTS — session_start.py / user_prompt_submit.py each wrap their entire
-main() body in a catch-all and exit 0, and guard the import of this module.
+POINTS — every hook script beside this module wraps its entire main() body
+in a catch-all and exits 0, and guards the import of this module.
 The helpers below also aim to fail open, and most are individually guarded —
 but the entry-point guard is the load-bearing structural invariant; a helper
 that raises is caught there.

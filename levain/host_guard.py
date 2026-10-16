@@ -543,7 +543,7 @@ def cc_messaging_posture(install: str | os.PathLike[str], home: str | os.PathLik
     # its controls there) is credited. settings.local.json is not read: where Claude Code keeps it depends on git
     # worktrees, ownership and home, and a local value can only tighten (a local accept never applies, rules only add),
     # so leaving it out can only under-report, never report governed when it is not.
-    project = [ent / ".claude" / "settings.json"]
+    project = [cc_project_settings_files(ent, hm)[1]]
     managed_docs = list(load_managed_settings() if managed is None else managed)
     # (path, document, kind): managed, then user, then the workspace files
     layers: list[tuple[str, Any, str]] = [(p, d, "managed") for p, d in managed_docs]
@@ -661,13 +661,60 @@ def _workspace_codex_digest(path: Path) -> str:
 
 def _git_root(ent: Path) -> Path | None:
     """The git work tree root above ``ent`` (a ``.git`` directory or file), found by walking up.
-    Claude Code keeps project settings at the repository root, and levain's own team wiring
-    writes at the repo's toplevel, so an entity below a root has settings Claude loads that are
-    not under the entity."""
+    Which root files Claude Code reads is :func:`cc_project_settings_files`'s answer. The hook pin
+    also covers the root's shared settings.json, which a subdirectory session does not load: a pin
+    over-covering can only raise a false alarm, never pass a hook that runs."""
     for d in (ent, *ent.parents):
         if os.path.lexists(d / ".git"):
             return d
     return None
+
+
+def _owned(p: Path) -> bool:
+    try:
+        return os.lstat(p).st_uid == os.getuid()
+    except (OSError, AttributeError):
+        return False
+
+
+def _main_checkout(root: Path) -> Path:
+    """The main checkout's root for a linked worktree (``.git`` is a file naming its gitdir), else ``root``."""
+    dot = root / ".git"
+    if not dot.is_file():
+        return root
+    try:
+        first = dot.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        if not first.startswith("gitdir:"):
+            return root
+        gitdir = Path(first[len("gitdir:"):].strip())
+        gitdir = gitdir if gitdir.is_absolute() else (root / gitdir)
+        common = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+        c = Path(os.path.normpath(gitdir / common))
+    except (OSError, IndexError, ValueError):
+        return root
+    return c.parent if c.name == ".git" else root
+
+
+def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLike[str] | None = None
+                              ) -> tuple[list[Path], Path]:
+    """(local files, shared file): the project settings files Claude Code reads for a session started in ``cwd``,
+    by the vendor's rules (code.claude.com/docs/en/settings, "Where Claude Code keeps the local file in a git
+    repository"). The shared ``.claude/settings.json`` is read from the session's primary working directory only,
+    never from a repository root above it. ``settings.local.json`` is read at the repository root (a linked
+    worktree's main checkout root), except outside git, when that root is the home directory, on Windows, or when
+    the root or its ``.git`` / ``.claude`` entry is not this user's; then it stays beside the shared file. A local
+    file an older Claude Code left in the starting directory is still read after the root's (the root's value wins).
+    Local files come highest precedence first."""
+    d = Path(os.path.abspath(cwd))
+    hm = Path(os.path.abspath(home if home is not None else os.path.expanduser("~")))
+    shared = d / ".claude" / "settings.json"
+    beside = d / ".claude" / "settings.local.json"
+    root = _git_root(d)
+    if root is None or root == hm or sys.platform == "win32" or not all(
+            _owned(p) for p in (root, root / ".git", root / ".claude") if p is root or os.path.lexists(p)):
+        return [beside], shared
+    at_root = _main_checkout(root) / ".claude" / "settings.local.json"
+    return ([at_root] if at_root == beside else [at_root, beside]), shared
 
 
 def _settings_files(ent: Path) -> list[tuple[str, Path]]:
@@ -1152,14 +1199,12 @@ def pin_diffs(old: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
 def _sandbox_docs(ent: Path, hm: Path, managed: Sequence[tuple[str, Any]] | None
                   ) -> list[tuple[str, Any]]:
     """The settings layers doctor can read, in Claude Code's order (managed, project local,
-    project, user). It cannot see CLAUDE_CONFIG_DIR relocation, `--settings`, or server-managed
-    settings, which is why the doctor line names the sources it did read."""
+    project, user), the project files from :func:`cc_project_settings_files`. It cannot see
+    CLAUDE_CONFIG_DIR relocation, `--settings`, or server-managed settings, which is why the doctor
+    line names the sources it did read."""
     docs: list[tuple[str, Any]] = list(load_managed_settings() if managed is None else managed)
-    paths = [ent / ".claude" / "settings.local.json", ent / ".claude" / "settings.json"]
-    root = _git_root(ent)
-    if root is not None and root != ent:
-        paths += [root / ".claude" / "settings.local.json", root / ".claude" / "settings.json"]
-    paths.append(hm / ".claude" / "settings.json")
+    local, shared = cc_project_settings_files(ent, hm)
+    paths = [*local, shared, hm / ".claude" / "settings.json"]
     for p in paths:
         if p.exists():
             try:
