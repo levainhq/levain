@@ -2944,12 +2944,15 @@
   let consentActive = 0;
   let consentGen = 0;   // closeModal bumps it: a job queued before a close whose row has left the page is not fetched
   const consentWaiting = [];
-  // one read with a deadline: a server that never answers frees its slot instead of holding the queue
-  function fetchBounded(url, opts) {
-    if (typeof AbortController !== "function") return fetch(url, opts);
+  // one read with a deadline: the abort stays armed until onRes (which reads the body) settles, so a server that
+  // stalls before the headers or mid-body has the connection itself cancelled, not only the queue slot freed.
+  // Without AbortController the read cannot be cancelled; consentQueued's race still frees the slot.
+  function fetchBounded(url, opts, onRes, onErr) {
+    if (typeof AbortController !== "function") return fetch(url, opts).then(onRes, onErr);
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), CONSENT_FETCH_TIMEOUT_MS);
-    return fetch(url, Object.assign({}, opts, { signal: ac.signal })).finally(() => clearTimeout(timer));
+    return fetch(url, Object.assign({}, opts, { signal: ac.signal })).then(onRes, onErr)
+      .finally(() => clearTimeout(timer));
   }
   function consentPump() {
     while (consentActive < CONSENT_FETCH_MAX && consentWaiting.length) {
@@ -2979,8 +2982,8 @@
     });
   }
   function consentFetch(c, headers, tryNo) {
-    return fetchBounded("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers })
-      .then((res) => {
+    return fetchBounded("/cockpit/consent/" + encodeURIComponent(c.id) + ".json", { cache: "no-store", headers: headers },
+      (res) => {
         if (res.status === 403) return { error: CONSENT_BAD_TOKEN };
         if (res.status === 404) return { error: "this request is no longer listed" };
         if (res.status === 503 && tryNo < CONSENT_TRIES) {
@@ -2989,7 +2992,8 @@
         if (!res.ok) return { error: "the request could not be read (HTTP " + res.status + ")" };
         return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the request could not be read" }),
                                () => ({ error: "the request could not be read" }));
-      }, () => ({ error: "the request could not be read (network)" }));
+      },
+      () => ({ error: "the request could not be read (network)" }));
   }
   function consentBody(c, row) {
     const key = c.id + "|" + c.state;
@@ -3085,8 +3089,8 @@
   const sessionBodies = new Map();   // stem -> the last good body, so a redraw of the modal (a fresh view arrived) keeps an open transcript; closeModal clears it
   const SESS_BAD_TOKEN = "this page's token was not accepted, so the transcript is not shown";
   function sessionFetch(stem, headers, tryNo) {
-    return fetchBounded("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers })
-      .then((res) => {
+    return fetchBounded("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers },
+      (res) => {
         if (res.status === 403) return { error: SESS_BAD_TOKEN };
         if (res.status === 404) return { error: "this session record is gone" };
         if (res.status === 503 && tryNo < CONSENT_TRIES) {
@@ -3095,7 +3099,8 @@
         if (!res.ok) return { error: "the transcript could not be read (HTTP " + res.status + ")" };
         return res.json().then((b) => (b && typeof b === "object" && Array.isArray(b.events) ? b : { error: "the transcript could not be read" }),
                                () => ({ error: "the transcript could not be read" }));
-      }, () => ({ error: "the transcript could not be read (network)" }));
+      },
+      () => ({ error: "the transcript could not be read (network)" }));
   }
   function sessionTranscript(stem, row) {
     const t = window.LevainCockpitTransport;

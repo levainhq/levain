@@ -231,6 +231,17 @@ _RECORD_ONLY = (
 )
 
 
+def _copy_hook_files(src: Path, dest: Path) -> None:
+    """The hooks directory's top-level ``.py`` files into ``dest``, each copied by CONTENT (a symlinked hook file's
+    target is copied, so nothing in the copy resolves back into the install). Subdirectories, directory links and
+    anything that is not a regular file are left out: the hooks are one flat directory, and a link to a large tree
+    must not be walked."""
+    dest.mkdir(parents=True)
+    for entry in sorted(src.iterdir()):
+        if entry.suffix == ".py" and entry.is_file():          # is_file follows a link, and is False for a dir or a fifo
+            shutil.copyfile(entry, dest / entry.name)
+
+
 def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, text: str,
                         python: str) -> VerifyResult:
     """Run a record-only hook from a copy of the installed hooks directory under a temporary install root (the
@@ -240,8 +251,7 @@ def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, 
 
     tmp = Path(tempfile.mkdtemp(prefix="levain-verify-"))
     try:
-        shutil.copytree(hooks_dir, tmp / "activation" / "hooks",
-                        ignore=shutil.ignore_patterns("__pycache__"), symlinks=False)   # a link's target, copied: nothing resolves back into the install
+        _copy_hook_files(hooks_dir, tmp / "activation" / "hooks")
         env = child_env()
         env.pop("LEVAIN_HOOK_SUPPRESS", None)
         env.pop("LEVAIN_SCOPE", None)
