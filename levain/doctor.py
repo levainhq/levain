@@ -1459,9 +1459,19 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
     from levain.consent.adapters.claude_code import CLEANUP_RESERVE, DEFAULT_MAX_HOLD
     from levain.install import CONSENT_HOOK_SCRIPTS, PENDING_REL, _consent_queue_dir, consent_cockpit_root
 
+    from levain.install import persisted_consent_hook
+
     label = "Claude Code" if adapter == "claude-code" else "Codex"
     mod = claude_code if adapter == "claude-code" else codex
     out: list[CheckResult] = []
+    if persisted_consent_hook(install) == "off":
+        if _hooks_wired_anywhere(hooks, "PermissionRequest", install, CONSENT_HOOK_SCRIPTS[adapter]):
+            return [CheckResult(f"{label} consent hook", True,
+                                "off in .levain/config.json, but a PermissionRequest entry still runs this "
+                                "install's consent script", "Run `levain update` to rewrite the hook file.",
+                                warn=True)]
+        return [CheckResult(f"{label} consent hook", True,
+                            "off (.levain/config.json): the agent's own dialog answers every permission")]
     if _hooks_wired_anywhere(hooks, "PermissionRequest", install, CONSENT_HOOK_SCRIPTS[adapter]):
         out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
     else:

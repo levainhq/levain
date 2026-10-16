@@ -487,9 +487,20 @@ def hook_command(python: str, script: Path | str) -> str:
     return f"{shlex.quote(python)} {HOOK_FLAGS} {shlex.quote(str(script))}"
 
 
+# A hook in a MACHINE-WIDE file (Codex's CODEX_HOME/hooks.json) runs its script through `levain.hookrun`, so a gone
+# install exits 0 and a failing hook exits 1, never the 2 that blocks Codex (levain/hookrun.py).
+HOOKRUN = ("-m", "levain.hookrun")
+
+
+def machine_wide_hook_command(python: str, script: Path | str) -> str:
+    """``<python> -EP -m levain.hookrun <script>``: the script stays the last token."""
+    return f"{shlex.quote(python)} {HOOK_FLAGS} {' '.join(HOOKRUN)} {shlex.quote(str(script))}"
+
+
 def _is_ours(h: Any, command: str, script: Path | None) -> bool:
     """A handler this installation owns: its command is exactly ``command``, or it is exactly
-    ``<one interpreter> -EP <this installation's absolute script path>`` or the earlier releases'
+    ``<one interpreter> -EP <this installation's absolute script path>``, the machine-wide
+    ``<one interpreter> -EP -m levain.hookrun <that path>``, or the earlier releases'
     ``<one interpreter> <that path>`` (a reinstall under another Python, or after an upgrade, must replace the old
     handler, not run beside it). Lookalike paths and flags, and any other command shape, are never ours."""
     if not isinstance(h, dict) or not isinstance(h.get("command"), str):
@@ -502,7 +513,8 @@ def _is_ours(h: Any, command: str, script: Path | None) -> bool:
         tokens = shlex.split(h["command"])
     except ValueError:
         return False
-    return len(tokens) in (2, 3) and tokens[-1] == str(script) and tokens[1:-1] in ([], [HOOK_FLAGS])
+    return (len(tokens) >= 2 and tokens[-1] == str(script)
+            and tokens[1:-1] in ([], [HOOK_FLAGS], [HOOK_FLAGS, *HOOKRUN]))
 
 
 def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any],

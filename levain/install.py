@@ -281,6 +281,7 @@ def run_init(
     packs: list[Path] | None = None,
     answers_file: Path | None = None,
     messaging: str | None = None,
+    consent_hook: str | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -324,6 +325,9 @@ def run_init(
 
     if messaging is not None and messaging not in MESSAGING_CHOICES:
         print(f"FAIL: --messaging must be one of {', '.join(MESSAGING_CHOICES)} (got {messaging!r}).")
+        return 1
+    if consent_hook is not None and consent_hook not in CONSENT_HOOK_CHOICES:
+        print(f"FAIL: --consent-hook must be one of {', '.join(CONSENT_HOOK_CHOICES)} (got {consent_hook!r}).")
         return 1
     if messaging is not None and adapter is not None and adapter != "claude-code":
         print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
@@ -533,6 +537,7 @@ def run_init(
                     packs=list(zip(pack_manifests, pack_dirs)),
                     require_empty=not force,
                     messaging=messaging,
+                    consent_hook=consent_hook,
                 )
                 # Interview completed successfully — clear the checkpoint so the next
                 # `levain init --force` doesn't offer to resume stale answers.
@@ -575,6 +580,7 @@ def apply_init(
     emit: Callable[[str], None] = print,
     require_empty: bool = False,
     messaging: str | None = None,
+    consent_hook: str | None = None,
 ) -> InitResult:
     """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
     :class:`InstallBusy` before writing anything when another process holds it.
@@ -599,7 +605,7 @@ def apply_init(
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
-            messaging=messaging,
+            messaging=messaging, consent_hook=consent_hook,
         )
 
 
@@ -617,6 +623,7 @@ def _apply_init(
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
     messaging: str | None = None,
+    consent_hook: str | None = None,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
     `answers`, copy the verbatim seed files (each from its winning layer's source
@@ -737,13 +744,18 @@ def _apply_init(
         kept = persisted_messaging(install)
         if recorded_messaging(install) is not None:
             emit(f"  messaging:  {kept} (kept from .levain/config.json)")
+    if consent_hook is not None and chosen in CONSENT_HOOK_SCRIPTS:
+        # Recorded BEFORE the render: every render (init's, the receipt's, update's) reads the recorded choice.
+        _write_consent_hook_choice(install, consent_hook, emit)
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
     )
     record_adapter_receipt(install, chosen, templates_root, python_path, import_seed,
                            on_demand_seed, emit=emit, messaging=messaging)
-    if chosen in CONSENT_HOOK_SCRIPTS:
+    if chosen in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(install) == "off":
+        emit("  consent hook: off (kept in .levain/config.json; `levain init --force --consent-hook on` wires it)")
+    elif chosen in CONSENT_HOOK_SCRIPTS:
         _emit_consent_hook(install, chosen, emit)
         _write_consent_settings(install, chosen, emit)
     if messaging is not None:
@@ -1962,21 +1974,27 @@ CONSENT_AGENTS = {"claude-code": "claude_code", "codex": "codex"}
 
 def consent_hook_handler(python_path: str, install: Path, adapter: str) -> tuple[str, dict[str, Any], Path]:
     """(command, handler, script) of the consent hook entry levain renders for ``adapter``: the command is
-    ``<python> -EP <install>/activation/hooks/<script>`` with no further arguments, and the timeout is the adapters'
+    ``<python> -EP <install>/activation/hooks/<script>`` (Codex's, in the machine-wide hooks.json:
+    ``<python> -EP -m levain.hookrun <script>``) with nothing after the script, and the timeout is the adapters'
     :func:`hook_timeout` at their default hold ceiling. THE COMMAND SHAPE LIVES HERE, and only here. The script is
     the last token with nothing after it, because levain's ownership checks read the script from that position."""
-    from levain.consent.adapters.claude_code import DEFAULT_MAX_HOLD, hook_command, hook_timeout
+    from levain.consent.adapters.claude_code import (DEFAULT_MAX_HOLD, hook_command, hook_timeout,
+                                                     machine_wide_hook_command)
 
     script = install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS[adapter]
-    command = hook_command(python_path, script)
+    command = (machine_wide_hook_command if adapter == "codex" else hook_command)(python_path, script)
     return command, {"type": "command", "command": command, "timeout": hook_timeout(DEFAULT_MAX_HOLD)}, script
 
 
 def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str) -> str:
     """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry merged in
     through the adapters' own ``_merge_handler`` (only an entry this install owns is replaced; anything else is
-    kept). Always rendered, whatever agent version is installed, so `init` and `update` render the same bytes."""
+    kept). Always rendered, whatever agent version is installed, so `init` and `update` render the same bytes;
+    never while the install records ``consent_hook: off`` (the template carries no consent entry)."""
     from levain.consent.adapters.claude_code import _merge_handler
+
+    if persisted_consent_hook(install) == "off":
+        return text
 
     try:
         doc = json.loads(text)
@@ -2136,6 +2154,49 @@ def persisted_messaging(install: Path) -> str:
     default read here never drops a hold or an ask."""
     recorded = recorded_messaging(install)
     return DEFAULT_MESSAGING if recorded is None else recorded
+
+
+CONSENT_HOOK_CHOICES = ("on", "off")
+
+
+def persisted_consent_hook(install: Path) -> str:
+    """``off`` only when ``.levain/config.json`` records ``"consent_hook": "off"``; anything else, an unreadable
+    file or a hand-edited value included, is ``on``, the default."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    try:
+        config = json.loads(install.joinpath(*LEVAIN_CONFIG_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "on"
+    return "off" if isinstance(config, dict) and config.get("consent_hook") == "off" else "on"
+
+
+def _write_consent_hook_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:
+    """Record ``choice`` in ``.levain/config.json`` beside the adapter marker and brand keys, so `levain update`
+    and `init --force` keep it. Raises InitError when it cannot be recorded: an opt-out the next update would
+    undo must not look done."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing: dict = {}
+    if os.path.lexists(config_path):
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise InitError(".levain/config.json is unreadable, so the consent hook choice cannot be "
+                            f"recorded ({e}); fix it, then re-run.") from e
+        if not isinstance(existing, dict):
+            raise InitError(".levain/config.json is not a JSON object, so the consent hook choice cannot be "
+                            "recorded; fix it, then re-run.")
+    if existing.get("consent_hook") == choice:
+        return
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(config_path, json.dumps({**existing, "consent_hook": choice}, indent=2,
+                                                   ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise InitError(f"could not record the consent hook choice in .levain/config.json ({e}).") from e
+    emit(f"  consent hook: {choice} → .levain/config.json")
 
 
 def _apply_messaging(settings_text: str, choice: str, keep_from: Path | None = None) -> str:
@@ -2418,6 +2479,15 @@ def refresh_adapter(
     out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier)
     if pin_before is not None:
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
+    if apply:
+        # The consent settings file, create-only like init's, or the hook update wired has nothing to answer with.
+        # Not while another install's write holds the machine-wide Codex hooks.json: the file would name this
+        # install's cockpit for that install's hook.
+        root = install.resolve()
+        adapter = effective_adapter(root)
+        if (adapter in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(root) != "off"
+                and (adapter != "codex" or host_guard.codex_hooks_owner(root) is None)):
+            _write_consent_settings(root, adapter, emit)
     return out
 
 
