@@ -183,10 +183,10 @@ def test_codex_on_demand_moves_the_workflow_off_the_numbered_read_list(tmp_path,
 
 
 def test_a_per_agent_choice_changes_only_that_agents_carrier(tmp_path, capsys, make_install):
-    rc, cc, out = _init(tmp_path, capsys, "a", "claude-code", memory_load=["codex=on-demand"])
+    rc, cc, out = _init(tmp_path, capsys, "a", "claude-code", memory_load=["claude-code=eager"])
     assert rc == 0, out
     assert "@seed/memory_workflow.md" in (cc / "CLAUDE.md").read_text(encoding="utf-8")
-    assert _config(cc)["memory_load_by_adapter"] == {"codex": "on-demand"}
+    assert _config(cc)["memory_load_by_adapter"] == {"claude-code": "eager"}
     rc, cx, out = _init(tmp_path, capsys, "b", "codex", memory_load=["codex=on-demand"])
     assert rc == 0, out
     assert "memory_workflow.md" not in (cx / "AGENTS.md").read_text(encoding="utf-8").split(
@@ -329,3 +329,101 @@ def test_update_stages_an_edited_memory_md_and_still_lands_the_new_file(tmp_path
     assert staged.read_text(encoding="utf-8") == (SEED / "memory.md").read_text("utf-8")
     assert (install / "seed" / WORKFLOW).is_file()
     assert "yours is kept" in "\n".join(lines)
+
+
+# --- review round 1: the refresh guard, the flag, the doctor hint -------------------------------------------
+
+def test_a_deleted_recorded_seed_still_holds_the_carrier_back(tmp_path, capsys, make_install):
+    """Positive control: on the first build a seed the operator deleted (it has a receipt record, so the
+    refresh keeps it absent) counted as 'written by this refresh', and the carrier kept importing it."""
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code")
+    assert rc == 0, out
+    (install / "seed" / "partnership.md").unlink()
+    (install / "seed" / WORKFLOW).unlink()
+    lines: list[str] = []
+    r = refresh_adapter(install, apply=True, emit=lines.append)
+    assert "CLAUDE.md" in r.review
+    assert "would load seed file(s) not installed yet" in "\n".join(lines)
+    assert not (install / "seed" / "partnership.md").exists()
+
+
+def test_a_seed_that_fails_to_write_holds_the_carrier_that_imports_it(tmp_path, capsys, make_install, monkeypatch):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code", memory_load=["on-demand"])
+    assert rc == 0, out
+    _as_released_before_the_split(install, "the old whole memory.md\n")
+    (install / "seed" / "memory.md").write_text("the old whole memory.md\n", encoding="utf-8")
+    inst_receipt = inst._read_adapter_receipt(install)
+    inst_receipt["seed/memory.md"] = inst._sha256_text("the old whole memory.md\n")
+    inst._write_adapter_receipt(install, inst_receipt)
+    # flip the install to eager by hand so the carrier WOULD import the new file
+    cfg = install / ".levain" / "config.json"
+    c = json.loads(cfg.read_text(encoding="utf-8"))
+    c["memory_load"] = "eager"
+    cfg.write_text(json.dumps(c), encoding="utf-8")
+    carrier_before = (install / "CLAUDE.md").read_bytes()
+    real = inst._atomic_write_text
+
+    def failing(path, text):
+        if Path(path).name == WORKFLOW:
+            raise OSError("disk full")
+        return real(path, text)
+
+    monkeypatch.setattr(inst, "_atomic_write_text", failing)
+    lines: list[str] = []
+    r = refresh_adapter(install, apply=True, emit=lines.append)
+    assert "CLAUDE.md" in r.review and f"seed/{WORKFLOW}" in r.review
+    assert (install / "CLAUDE.md").read_bytes() == carrier_before
+    assert "@seed/memory_workflow.md" not in (install / "CLAUDE.md").read_text(encoding="utf-8")
+
+
+def test_a_mode_for_an_adapter_the_install_does_not_carry_is_refused(tmp_path, capsys, make_install):
+    for bad in (["codex=on-demand"], ["openhands=on-demand"]):
+        rc, install, out = _init(tmp_path, capsys, "x", "claude-code", memory_load=bad)
+        assert rc == 1 and "does not carry" in out and "claude-code" in out
+        assert not install.exists()
+
+
+def test_a_bare_mode_says_when_a_recorded_agent_entry_keeps_its_own(tmp_path, capsys, make_install):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code", memory_load=["claude-code=eager"])
+    assert rc == 0, out
+    rc, _, out = _init(tmp_path, capsys, "x", "claude-code", force=True, memory_load=["on-demand"])
+    assert rc == 0, out
+    assert "claude-code keeps its own recorded mode (eager)" in out
+    assert WORKFLOW in (install / "CLAUDE.md").read_text(encoding="utf-8")
+
+
+def test_doctor_names_update_for_a_missing_base_seed_and_init_for_a_rendered_one(tmp_path, capsys, make_install):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code")
+    receipt = inst._read_adapter_receipt(install)
+    (install / "seed" / WORKFLOW).unlink()
+    # recorded and deleted: update keeps it deleted, so the hint is init
+    assert "levain init" in _row(doctor._check_install_layout(install), "seed/").hint
+    # an upgrade added it: no record, and update writes it
+    receipt.pop(f"seed/{WORKFLOW}")
+    inst._write_adapter_receipt(install, receipt)
+    assert "levain update" in _row(doctor._check_install_layout(install), "seed/").hint
+    (install / "seed" / "world.md").unlink()
+    assert "levain init" in _row(doctor._check_install_layout(install), "seed/").hint
+
+
+def test_doctor_row_says_when_the_recorded_value_is_unreadable(tmp_path, capsys, make_install):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code")
+    cfg = install / ".levain" / "config.json"
+    c = json.loads(cfg.read_text(encoding="utf-8"))
+    c["memory_load"] = "on_demand"
+    cfg.write_text(json.dumps(c), encoding="utf-8")
+    row = _row(doctor._check_claude_code(install), "memory workflow")
+    assert row.ok and not row.warn
+    assert row.detail == "eager (unreadable value 'on_demand' in .levain/config.json)"
+
+
+def test_update_tells_what_to_remove_from_a_staged_old_memory_md(tmp_path, capsys, make_install):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code")
+    old = "head\n**End of session:** When your operator signals the session is ending\n"
+    _as_released_before_the_split(install, old)
+    mine = old + "- my own rule\n"
+    (install / "seed" / "memory.md").write_text(mine, encoding="utf-8")
+    lines: list[str] = []
+    refresh_adapter(install, apply=True, emit=lines.append)
+    text = "\n".join(lines)
+    assert "now lives in memory_workflow.md" in text and "## Hebbian associations" in text

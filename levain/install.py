@@ -352,6 +352,11 @@ def run_init(
     if consent_hook is not None and chosen not in CONSENT_HOOK_SCRIPTS:
         print(f"FAIL: --consent-hook is for the claude-code and codex adapters; {chosen} wires no consent hook.")
         return 1
+    elsewhere = sorted(a for a in memory_load_by_adapter if a != chosen)
+    if elsewhere:  # an install carries one adapter; a mode for another would be recorded and never read
+        print(f"FAIL: --memory-load {elsewhere[0]}={memory_load_by_adapter[elsewhere[0]]} names an adapter "
+              f"this install does not carry; it carries {chosen}. Use {chosen}=MODE, or a bare MODE.")
+        return 1
 
     if install.exists() and not install.is_dir():
         print(
@@ -785,6 +790,9 @@ def _apply_init(
         _write_memory_load_choice(install, load_default, load_by_adapter, emit)
     elif recorded_memory_load(install) != (None, {}):
         emit(f"  memory load: {load_mode} (kept from .levain/config.json)")
+    if memory_load is not None and chosen in load_by_adapter and chosen not in (memory_load_by_adapter or {}):
+        emit(f"  memory load: {chosen} keeps its own recorded mode ({load_by_adapter[chosen]}); a bare mode sets "
+             f"only the install default. Use {chosen}=MODE to change it.")
     if messaging is not None:
         # Recorded once the adapter files exist: a render that fails leaves no choice behind.
         _write_messaging_choice(install, messaging, emit)
@@ -1855,8 +1863,8 @@ def _fill_seed_on_demand(template_text: str, block: str) -> str:
     Same placeholder-count honesty floor as :func:`_fill_seed_imports`, and for
     the same reason: a template missing it writes a carrier whose on-demand files
     are unreachable. It differs on the EMPTY case, which is legitimate here — an
-    empty :data:`ON_DEMAND_SEED` means nothing was moved behind a load, so the
-    block is dropped along with its surrounding blank line rather than leaving a
+    empty on-demand list (a custom roster, or a mode that moved nothing) means
+    nothing was moved behind a load, so the block is dropped along with its surrounding blank line rather than leaving a
     hole in the rendered file. (The guarantee that a file dropped from the EAGER
     list actually got a pointer is `BASE_SEED_REACHABLE`, enforced in
     `apply_init` — it is a roster-level invariant, not a text-substitution one.)
@@ -2758,17 +2766,23 @@ def _refresh_adapter(
             return out
         _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
+        # The default-mode lists below are the whole seed set on purpose: the eager and
+        # on-demand sets together hold the same files in either mode, and only the split
+        # between them moves.
         try:
             shipped = _base_seed_files(install, templates_root,
                                        [*import_entries(roster), *on_demand_entries(roster)])
         except (OSError, ValueError):
             shipped = {}  # the same read fails again below, where it is reported
         # A base seed file this release adds is installed by this very refresh (nothing of
-        # the operator's is there to keep), so it does not hold the carrier back; only a
-        # file nothing here would write does.
+        # the operator's is there to keep), so it does not hold the carrier back. That is
+        # only a file with no receipt record: a recorded one that is absent was deleted, the
+        # refresh keeps it absent, and the carrier would import it.
+        recorded = _read_adapter_receipt(install) or {}
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
                          if not (install / "seed" / e.name).is_file()
-                         and install / "seed" / e.name not in shipped)
+                         and not (install / "seed" / e.name in shipped
+                                  and f"seed/{e.name}" not in recorded))
         held = None
         if not carrier:
             held = "the pack reconcile above is holding seed changes for review"
@@ -2781,9 +2795,11 @@ def _refresh_adapter(
                          f"(`levain init --force`) or settle that first.")
         else:
             try:
-                files = {**files, **_base_seed_files(
+                # Seeds first: a seed that fails to write holds the carrier that imports it.
+                # The default-mode lists are the whole seed set in either mode (see above).
+                files = {**_base_seed_files(
                     install, templates_root,
-                    [*import_entries(roster), *on_demand_entries(roster)])}
+                    [*import_entries(roster), *on_demand_entries(roster)]), **files}
             except (OSError, ValueError) as e:
                 out.review.append("seed")
                 lines.append(f"  seed files: not refreshed, because this levain's copies "
@@ -2816,7 +2832,7 @@ def _refresh_adapter(
                 # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
-                               variants=variants)
+                               variants=variants, carrier_name=carrier_name)
         if adapter == "codex":
             _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
@@ -2842,15 +2858,19 @@ def _refresh_seeds_only(
     with _templates_root() as templates_root:
         try:
             roster = compose_roster([templates_root, *pack_dirs])
+            # eager plus on-demand is the same seed set in either mode; only the split moves
             entries = [*import_entries(roster), *on_demand_entries(roster)]
             files = _base_seed_files(install, templates_root, entries)
         except (PackError, InitError, OSError, ValueError) as e:
             out.review.append("seed")
             emit(f"\n• seed files NOT refreshed: the package could not be composed ({e}).")
             return out
-        # a base file this release adds is written by this very refresh (see refresh_adapter)
+        # a base file this release adds, with no receipt record, is written by this very
+        # refresh (see refresh_adapter)
+        recorded = _read_adapter_receipt(install) or {}
         missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file()
-                         and install / "seed" / e.name not in files)
+                         and not (install / "seed" / e.name in files
+                                  and f"seed/{e.name}" not in recorded))
         if not carrier:
             lines.append("  seed files: not refreshed, because the pack reconcile above is "
                          "holding seed changes for review.")
@@ -3066,6 +3086,8 @@ def _refresh_activation(
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
+            if key.startswith("seed/"):
+                seed_failed.append(key)
             lines.append(f"  {key}: could not be written ({e}).")
     if apply and new_receipt != record:
         try:
@@ -3341,6 +3363,10 @@ def _levain_render_variant(
     return same(x, y, v)
 
 
+# The opening of the wrap procedure as memory.md carried it before it moved to memory_workflow.md.
+_OLD_WRAP_SENTINEL = "**End of session:** When your operator signals"
+
+
 def _refresh_adapter_files(
     install: Path,
     files: Mapping[Path, str],
@@ -3349,12 +3375,19 @@ def _refresh_adapter_files(
     out: AdapterRefresh,
     lines: list[str],
     variants: Mapping[str, str] | None = None,
+    carrier_name: str | None = None,
 ) -> None:
     receipt = _read_adapter_receipt(install)
     record = receipt or {}
     new_receipt = dict(record)
+    seed_failed: list[str] = []  # seeds that could not be read or written, in this run
     for target, text in files.items():
         key = _adapter_key(install, target)
+        if carrier_name is not None and target.name == carrier_name and seed_failed:
+            out.review.append(key)
+            lines.append(f"  {key}: not refreshed, because it would load seed file(s) that "
+                         f"could not be written: {', '.join(seed_failed)}.")
+            continue
         want_text = text
         want = text.encode("utf-8")
         try:
@@ -3363,6 +3396,8 @@ def _refresh_adapter_files(
             here_text = None
         except (OSError, ValueError) as e:
             out.review.append(key)
+            if key.startswith("seed/"):
+                seed_failed.append(key)
             lines.append(f"  {key}: could not be read ({e}), so whether it is current "
                          f"cannot be told.")
             continue
@@ -3415,6 +3450,10 @@ def _refresh_adapter_files(
                          f"writing it), and this levain renders it differently, now at "
                          f"{where}. Merge it in, or copy it over yours if you never edited "
                          f"it. Listed once: the next update is quiet about it.")
+            if key == "seed/memory.md" and here_text is not None and _OLD_WRAP_SENTINEL in here_text:
+                lines.append("  seed/memory.md: the wrap procedure now lives in memory_workflow.md, so "
+                             "your copy's block from '**Pair with staleness:**' up to '## Hebbian "
+                             "associations' can be removed when you merge; until then it loads twice.")
             continue
         out.refreshed.append(str(target) if key.startswith("codex-home/") else key)
         if not apply:
@@ -3449,6 +3488,8 @@ def _refresh_adapter_files(
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
+            if key.startswith("seed/"):
+                seed_failed.append(key)
             lines.append(f"  {key}: could not be written ({e}).")
     if apply and new_receipt != record:
         try:

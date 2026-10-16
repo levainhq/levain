@@ -110,8 +110,8 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # are-GENERATED disposition (0.9.6 AM-WRAP-GENERATED). That last entry is the first
 # that retires a methodology COMPANION FILE rather than reconciling a description of
 # a feature ("disposition, not text") — and it requires NO Levain template edit: the
-# seed carries no static WRAP_PROTOCOL.md companion to retire, and memory.md's wrap
-# guidance is already INLINE and points at `prepare_wrap` as the source of truth
+# seed carries no static WRAP_PROTOCOL.md companion to retire, and the seed's wrap
+# guidance (memory_workflow.md) is already INLINE and points at `prepare_wrap` as the source of truth
 # ("follow what it emits ... the package carries the authoritative contract") rather
 # than freezing a copy of the steps — exactly the inline-methodology end-state the
 # entry asks for. It is therefore carried as a reviewed `_NO_EDIT_REQUIRED` allowlist

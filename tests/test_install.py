@@ -984,7 +984,7 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1035,7 +1035,7 @@ def test_apply_init_persists_answers_json(tmp_path: Path, monkeypatch):
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [SeedEntry(n, templates_root / "seed" / n, "verbatim")
-             for n in ("partnership.md", "memory.md", "spore_instructions.md",
+             for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
                        "continuity.md", "README.md")],
         )
     stored = _json.loads((install / ".levain" / "answers.json").read_text(encoding="utf-8"))
@@ -1069,7 +1069,7 @@ def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1110,7 +1110,7 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1439,7 +1439,7 @@ def test_apply_init_pack_seed_file_loads_in_both_adapters(tmp_path: Path, monkey
     _apply(cc, "claude-code")
     claude = (cc / "CLAUDE.md").read_text(encoding="utf-8")
     assert "@seed/audit_method.md" in claude
-    # appended AFTER the base curriculum (the last EAGER base import is memory.md;
+    # appended AFTER the base curriculum (the last EAGER base import is memory_workflow.md;
     # spore_instructions.md is on-demand and off this list entirely)
     assert claude.index("@seed/memory.md") < claude.index("@seed/audit_method.md")
 
@@ -1447,7 +1447,7 @@ def test_apply_init_pack_seed_file_loads_in_both_adapters(tmp_path: Path, monkey
     cx.mkdir()
     _apply(cx, "codex")
     agents = (cx / "AGENTS.md").read_text(encoding="utf-8")
-    assert "5. `seed/audit_method.md` — Acme Audit Method" in agents
+    assert "6. `seed/audit_method.md` — Acme Audit Method" in agents
     # the no-H1 override falls back to a BARE entry, curriculum position 2 kept
     assert "2. `seed/partnership.md`\n" in agents
 
