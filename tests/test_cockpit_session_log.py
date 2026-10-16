@@ -56,8 +56,8 @@ def test_events_in_order_with_the_record_fields_and_a_quoted_resume(tmp_path):
     assert body["events"][2] == {"at": "2026-10-15T23:50:00Z", "kind": "reply", "text": "done", "cut": 12}
     assert body["agent"] == "claude_code" and body["workspace"] == CWD and body["skipped"] == 0
     assert set(body) == {"agent", "workspace", "first_seen", "last_seen", "resume", "events", "consent", "skipped"}
-    assert body["resume"] == f"cd {shlex.quote(CWD)} && claude --resume {shlex.quote(SID)}"
-    assert shlex.split(body["resume"])[:2] == ["cd", CWD]          # the space and the quote survive a shell
+    assert body["resume"] == f"cd -- {shlex.quote(CWD)} && claude --resume {shlex.quote(SID)}"
+    assert shlex.split(body["resume"])[:3] == ["cd", "--", CWD]          # the space and the quote survive a shell
     cx = _put(root, "codex", SID, CWD, timedelta(minutes=2))
     assert read_session(root, _stem(cx), _now(), None)["resume"].endswith(f"&& codex resume {SID}")
 
@@ -74,6 +74,7 @@ def test_malformed_lines_are_skipped_and_counted(tmp_path):
         json.dumps({"v": 1, "at": "2026-10-15T23:50:00Z", "kind": "prompt", "text": "x", "cut": True}) + "\n",
         json.dumps({"v": 1, "at": "2026-10-15T23:50:00Z", "kind": "prompt", "text": "x", "cut": -1}) + "\n",
         "[1, 2]\n",
+        json.dumps({"v": True, "at": "2026-10-15T23:50:00Z", "kind": "prompt", "text": "x", "cut": 0}) + "\n",
     ]
     _log(rec, _line("prompt", "kept") + "".join(bad) + "\n" + _line("reply", "kept too"))
     body = read_session(root, _stem(rec), _now(), None)
@@ -107,6 +108,14 @@ def test_a_cut_landing_exactly_on_a_line_boundary_keeps_that_line(tmp_path, monk
     monkeypatch.setattr(session_log, "LOG_TAIL", len(second))      # the window starts exactly at "second"
     body = read_session(root, _stem(rec), _now(), None)
     assert [e["text"] for e in body["events"]] == ["second"] and body["skipped"] == 0
+
+
+def test_an_unterminated_last_line_is_an_append_in_flight_not_a_malformed_line(tmp_path):
+    root, _src, _ids = _install(tmp_path)
+    rec = _put(root, "claude_code", SID, CWD, timedelta(minutes=2))
+    _log(rec, _line("prompt", "whole") + _line("reply", "half written")[:20])
+    body = read_session(root, _stem(rec), _now(), None)
+    assert [e["text"] for e in body["events"]] == ["whole"] and body["skipped"] == 0
 
 
 def test_a_missing_log_is_no_events_and_a_missing_or_foreign_record_is_none(tmp_path):
@@ -148,7 +157,8 @@ def test_consent_joins_this_sessions_requests_pending_and_decided_and_not_anothe
     rec = _put(root, "claude_code", SID, CWD, timedelta(minutes=2))
     rows = read_session(root, _stem(rec), _now(), lambda now: read_listing(now=now))["consent"]
     assert sorted((r["tool"], r["state"]) for r in rows) == [("Bash", "pending"), ("Write", "withdrawn")]
-    assert all(set(r) == {"at", "tool", "state", "via"} for r in rows)
+    assert all(set(r) == {"at", "tool", "state", "via", "decided_at"} for r in rows)
+    assert {r["state"]: r["decided_at"] is None for r in rows} == {"pending": True, "withdrawn": False}
     assert [r["at"] for r in rows] == sorted(r["at"] for r in rows)
 
 

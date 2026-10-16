@@ -882,7 +882,8 @@ class _Handler(GuardedHandler):
                 if body is not None:
                     status, payload = 200, body
             except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never a dead connection
-                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+                _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
+                status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
             finally:
                 self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,

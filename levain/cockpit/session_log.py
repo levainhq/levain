@@ -31,24 +31,31 @@ EVENT_KINDS = ("prompt", "reply", "tool")
 
 
 def _tail(path: Path) -> bytes | None:
-    """The last :data:`LOG_TAIL` bytes of a regular file, cut to whole lines: when the read starts mid-file, the byte
-    before it is read too, and everything through the first newline is dropped (a line the cut split is not a line).
-    None when there is no log (or it is not a regular file of ours)."""
+    """The last :data:`LOG_TAIL` bytes of a regular file as of one fstat, cut to whole lines. The read is a pread
+    bounded to that size, so an append racing it never shifts the window; when the window starts mid-file the byte
+    before it is read too and everything through the first newline is dropped (a line the cut split is not a line),
+    and an unterminated last line (an append in flight) is dropped too. The hooks rewrite the log by tmp + replace,
+    never in place, so the open file is never cut under this read. None when there is no log (or it is not a
+    regular file of ours)."""
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError:     # missing, a symlink (O_NOFOLLOW), unreadable: no log
         return None
-    with os.fdopen(fd, "rb") as fh:
-        st = os.fstat(fh.fileno())
+    try:
+        st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             return None
         start = max(0, st.st_size - LOG_TAIL)
         if start == 0:
-            return fh.read(LOG_TAIL)
-        fh.seek(start - 1)
-        raw = fh.read(LOG_TAIL + 1)
-    nl = raw.find(b"\n")
-    return b"" if nl < 0 else raw[nl + 1:]
+            raw = os.pread(fd, st.st_size, 0)
+        else:
+            raw = os.pread(fd, st.st_size - start + 1, start - 1)
+            nl = raw.find(b"\n")
+            raw = b"" if nl < 0 else raw[nl + 1:]
+    finally:
+        os.close(fd)
+    end = raw.rfind(b"\n")
+    return raw[:end + 1] if end >= 0 else b""
 
 
 def _event(line: bytes) -> dict[str, Any] | None:
@@ -57,7 +64,7 @@ def _event(line: bytes) -> dict[str, Any] | None:
         d = json.loads(line.decode("utf-8"))
     except (ValueError, RecursionError):
         return None
-    if not isinstance(d, dict) or d.get("v") != 1 or d.get("kind") not in EVENT_KINDS:
+    if not isinstance(d, dict) or type(d.get("v")) is not int or d["v"] != 1 or d.get("kind") not in EVENT_KINDS:
         return None
     at, text, cut = d.get("at"), d.get("text"), d.get("cut")
     if not (isinstance(at, str) and at.endswith("Z") and _session_stamp(at) is not None and isinstance(text, str)):
@@ -69,23 +76,25 @@ def _event(line: bytes) -> dict[str, Any] | None:
 
 def _resume(agent: str, cwd: str, sid: str) -> str:
     verb = "claude --resume" if agent == "claude_code" else "codex resume"
-    return f"cd {shlex.quote(cwd)} && {verb} {shlex.quote(sid)}"
+    return f"cd -- {shlex.quote(cwd)} && {verb} {shlex.quote(sid)}"
 
 
 def _consent(consent_reader: Callable[[datetime], Any] | None, now: datetime, agent: str, sid: str
              ) -> list[dict[str, Any]] | None:
-    """This session's consent requests, pending and decided, oldest first; None when the queue could not be read
+    """This session's consent requests, pending and decided, oldest first by when each was filed (``at``;
+    ``decided_at`` is when it was answered or expired, None while pending); None when the queue could not be read
     (said, never drawn as "no requests")."""
     if consent_reader is None:
         return []
     try:
         listing = consent_reader(now)
-        rows = [{"at": e.request.received_at, "tool": e.request.tool_name, "state": e.state, "via": e.via}
+        rows = [{"at": e.request.received_at, "tool": e.request.tool_name, "state": e.state, "via": e.via,
+                 "decided_at": e.decided_at}
                 for e in (*listing.pending, *listing.recent)
                 if e.request.agent == agent and e.request.agent_session_id == sid]
+        rows.sort(key=lambda r: r["at"])
     except Exception:  # noqa: BLE001 - an unread queue is an answer (None), never a dead transcript
         return None
-    rows.sort(key=lambda r: r["at"])
     return rows
 
 
