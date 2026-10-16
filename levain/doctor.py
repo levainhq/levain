@@ -1411,19 +1411,25 @@ def _hooks_wired_anywhere(hooks: Any, event: str, install: Path, script: str) ->
     """Whether ANY hook in ANY group under ``event`` runs this install's ``script`` (a group can carry
     another levain hook first, as PostToolUse carries the auto-memory mirror)."""
     entries = hooks.get(event, []) if isinstance(hooks, dict) else []
-    return any(
-        _hook_command_targets([{"hooks": [h]}], install, script)
-        for group in (entries if isinstance(entries, list) else []) if isinstance(group, dict)
-        for h in (group.get("hooks") or []) if isinstance(h, dict)
-    )
+    for group in (entries if isinstance(entries, list) else []):
+        hs = group.get("hooks") if isinstance(group, dict) else None
+        for h in (hs if isinstance(hs, list) else []):
+            if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+                continue
+            try:  # a hand-edited command (a NUL byte, say) is "not wired", never a doctor crash (L1, run)
+                if _hook_command_targets([{"hooks": [h]}], install, script):
+                    return True
+            except (ValueError, OSError):
+                continue
+    return False
 
 
 def _check_transcript_hooks(install: Path, hooks: Any, events: Sequence[str], agent: str) -> list[CheckResult]:
     """The session transcript hooks (Stop, PostToolUse, and Claude Code's PostToolUseFailure). Advisory only:
     they record what a session did for the cockpit's transcript and change nothing the agent does, so an install
     from before they existed works and simply records no transcript lines."""
-    script = {"Stop": "stop.py"}
-    missing = [e for e in events if not _hooks_wired_anywhere(hooks, e, install, script.get(e, "post_tool_use.py"))]
+    script = {"Stop": "stop.py", "PostToolUse": "post_tool_use.py", "PostToolUseFailure": "post_tool_use.py"}
+    missing = [e for e in events if not _hooks_wired_anywhere(hooks, e, install, script[e])]
     name = f"{agent} transcript hooks"
     if not missing:
         return [CheckResult(name, True, f"{', '.join(events)} wired to this install")]

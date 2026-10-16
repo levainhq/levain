@@ -61,3 +61,26 @@ def test_a_codex_hooks_file_without_stop_warns(make_install, tmp_path):
     cj.write_text(json.dumps(doc), encoding="utf-8")
     r = _row(doctor._check_codex(cx), "Codex")
     assert r.warn and "not wired: Stop, so" in r.detail, r
+
+
+# L1 (run): a hand-edited Stop/PostToolUse entry crashed doctor through this advisory row.
+def test_malformed_transcript_entries_warn_and_never_crash(make_install):
+    cc = make_install("cc")
+    p, doc = _settings(cc)
+    doc["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": 5}]},
+                            {"hooks": "not a list"}, "not a group"]
+    doc["hooks"]["PostToolUseFailure"] = [{"hooks": [{"type": "command", "command": "python /tmp/a\x00b.py"}]}]
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    r = _row(doctor._check_claude_code(cc), "Claude Code")
+    assert r.warn and "Stop" in r.detail and "PostToolUseFailure" in r.detail, r
+
+
+def test_a_stop_hook_running_another_installs_script_is_not_wired(make_install, tmp_path):
+    cc = make_install("cc")
+    other = make_install("other")
+    p, doc = _settings(cc)
+    doc["hooks"]["Stop"] = [{"hooks": [{"type": "command",
+                                        "command": f'python3 "{other}/activation/hooks/stop.py"'}]}]
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    r = _row(doctor._check_claude_code(cc), "Claude Code")
+    assert r.warn and "not wired: Stop, so" in r.detail, r
