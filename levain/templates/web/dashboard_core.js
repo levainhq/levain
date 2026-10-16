@@ -571,9 +571,19 @@
         again.type = "button";
         again.title = "Read the weather again";
         again.setAttribute("aria-label", "Read the weather again");
+        // busy, not disabled: a disabled button drops the keyboard focus of the reader who pressed it
+        let busy = false;
         again.addEventListener("click", () => {
-          again.disabled = true;
-          Promise.resolve().then(() => V.refetchPanel(wx.id)).catch(() => "fault").finally(() => { again.disabled = false; });
+          if (busy) return;
+          busy = true;
+          again.setAttribute("aria-busy", "true");
+          Promise.resolve().then(() => V.refetchPanel(wx.id)).catch(() => "fault").then((r) => {
+            // `false`: the panel cannot be re-read on its own (no longer external, or its shape moved): the board reloads,
+            // as the stream does with the same answer
+            const T = window.LevainCockpitTransport;
+            if (r === false && T && typeof T.reload === "function") return T.reload();
+            return r;
+          }).catch(() => "fault").finally(() => { busy = false; again.removeAttribute("aria-busy"); });
         });
         node.appendChild(again);
       }
@@ -3733,7 +3743,7 @@
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
     try { return render(view, opts); }
-    finally { if (y > 0 && window.scrollY !== y) window.scrollTo(0, y); }
+    finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
   }
 
   window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };

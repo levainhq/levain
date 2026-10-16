@@ -1818,8 +1818,11 @@
         const hovered = hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i));
         const near = hovered || all[0];
         ev.preventDefault();
-        // the hovered panel's box is under the pointer, so the page stays put; the first box on the page may be off-screen
-        near.focus(hovered ? { preventScroll: true } : undefined);
+        // a box already on screen takes focus where it is; one off screen (the page's first box, or a hovered panel the
+        // keyboard scrolled away from) is scrolled to, so the reader sees what they type
+        const r = near.getBoundingClientRect();
+        const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
+        near.focus(onScreen ? { preventScroll: true } : undefined);
         near.select();
       } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
     });

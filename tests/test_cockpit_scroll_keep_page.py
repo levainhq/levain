@@ -23,7 +23,7 @@ TALL = ("(() => { const s = document.createElement('style'); s.textContent = '#b
 COUNT = ("(() => { const L = window.LevainDashboard, r = L.render; window.__renders = 0;"
          " L.render = function () { try { return r.apply(this, arguments); } finally { window.__renders++; } }; return 1; })()")
 WEATHER = {"as_of": "2026-10-16T12:00:00+00:00", "value": 61, "unit": "F", "condition": "clear", "symbol": "clear",
-           "sub": [{"label": "AQI", "value": 42, "band": "good"}]}
+           "sub": [{"label": "AQI", "value": 42, "band": "good"}, {"label": "feels", "value": "59°"}], "hi": 70, "lo": 52}
 
 
 def _weather_cockpit(src: Any) -> Any:
@@ -91,18 +91,24 @@ def test_the_hero_weather_has_a_button_that_rereads_its_panel(tmp_path: Path) ->
         btn = "document.querySelector('[data-ck-hero=weather] button.wx-refresh')"
         out = _drive(tmp_path, f"{url}/", [
             {"until": f"{btn} && 1"},
+            # the button sits in flow: it overlaps none of the figure, the bounds or the sub-readings
+            {"eval": f"(() => {{ const b = {btn}.getBoundingClientRect(); const hit = (e) => {{ const r = e.getBoundingClientRect();"
+                     " return r.width && r.height && b.left < r.right && r.left < b.right && b.top < r.bottom && r.top < b.bottom; };"
+                     " return [...document.querySelectorAll('[data-ck-hero=weather] .wx-main > *, [data-ck-hero=weather] .aqi,"
+                     " [data-ck-hero=weather] .wx-src')].filter(hit).map(e => e.className); })()"},
             # a fetch counter, installed before the click: every GET that names the weather panel
             {"eval": "(() => { const f = window.fetch; window.__wx = []; window.fetch = function (u, o) {"
                      " const url = typeof u === 'string' ? u : u.url; const m = ((o && o.method) || 'GET').toUpperCase();"
                      " if (m === 'GET' && /weather/.test(url)) window.__wx.push(url); return f.apply(this, arguments); }; return 1; })()"},
             {"eval": f"{btn}.click(); 1"},
             {"until": "window.__wx.length >= 1 && window.__wx"},
-            {"until": f"{btn} && !{btn}.disabled && 1"},
+            {"until": f"{btn} && !{btn}.hasAttribute('aria-busy') && !{btn}.disabled && 1"},
         ])
     v = out["values"]
     assert v[0] is True or v[0] == 1, v
-    assert isinstance(v[3], list) and v[3], f"no GET for the weather panel was sent: {v}"
-    assert v[4] in (True, 1), f"the button is gone or stuck disabled after the refetch: {v}"
+    assert v[1] == [], f"the refresh button overlaps the weather: {v[1]}"
+    assert isinstance(v[4], list) and v[4], f"no GET for the weather panel was sent: {v}"
+    assert v[5] in (True, 1), f"the button is gone or stuck busy after the refetch: {v}"
 
 
 @needs_browser
@@ -127,3 +133,31 @@ def test_refocusing_the_filter_box_after_a_reload_does_not_scroll_the_page(tmp_p
     assert v[3][1] is True and abs(v[3][0] - 1500) <= 2, f"the filter box must start off-screen: {v}"
     assert v[6][1] is True, f"the filter box was not refocused after the reload (the test would prove nothing): {v}"
     assert abs(v[6][0] - 1500) <= 2, f"refocusing the filter box scrolled the page: {v}"
+
+
+@needs_browser
+def test_slash_focuses_the_hovered_filter_and_brings_an_off_screen_one_into_view(tmp_path: Path) -> None:
+    """`/` focuses the hovered panel's filter box: where it is when it is on screen, scrolled to when the keyboard
+    has scrolled it away (typing into a box the reader cannot see)."""
+    _root, src, _ids = _install(tmp_path)
+    box = "document.querySelector('#board .xfilter-input')"
+    on_screen = f"(() => {{ const r = {box}.getBoundingClientRect(); return r.bottom > 0 && r.top < innerHeight; }})()"
+    slash = "document.dispatchEvent(new KeyboardEvent('keydown', {key: '/', bubbles: true, cancelable: true})); 1"
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": f"{box} && 1"},
+            {"eval": TALL},
+            {"eval": f"{box}.closest('.panel').dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}})); 1"},
+            # on screen: the page stays where it is
+            {"eval": f"(() => {{ {box}.scrollIntoView({{block: 'center'}}); return window.scrollY; }})()"},
+            {"eval": slash},
+            {"eval": f"[window.scrollY, document.activeElement === {box}]"},
+            # scrolled away by the keyboard: `/` brings it back into view
+            {"eval": f"(() => {{ {box}.blur(); window.scrollTo(0, 2500); return {on_screen}; }})()"},
+            {"eval": slash},
+            {"eval": f"[{on_screen}, document.activeElement === {box}]"},
+        ])
+    v = out["values"]
+    assert v[5][1] is True and abs(v[5][0] - v[3]) <= 2, f"focusing an on-screen box moved the page: {v}"
+    assert v[6] is False, f"the box must start off screen: {v}"
+    assert v[8] == [True, True], f"an off-screen box was focused where the reader cannot see it: {v}"

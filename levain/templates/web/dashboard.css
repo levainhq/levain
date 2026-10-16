@@ -1063,11 +1063,10 @@ body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-
 .aqi b { font-weight: var(--fw-semibold); }
 .aqi .pill { margin-left: 0; }
 .wx-src { font-size: var(--fs-micro); color: var(--meta); margin-top: calc(var(--sp-2) * -1); }
-.hero .wx { position: relative; }
-.wx-refresh { position: absolute; top: var(--sp-5); right: 0; background: none; border: 1px solid var(--hair); border-radius: var(--r-md);
-  color: var(--meta); font: var(--fs-body)/1 var(--sans); padding: var(--sp-2) var(--sp-3); cursor: pointer; }
+.wx-refresh { align-self: flex-start; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md);
+  color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-3) var(--sp-4); cursor: pointer; }
 .wx-refresh:hover { color: var(--text); border-color: var(--hair-2); }
-.wx-refresh:disabled { opacity: .5; cursor: default; }
+.wx-refresh[aria-busy="true"] { opacity: .5; cursor: progress; }
 /* the EPA bands: good is calm, every named band above it is hot, an unknown token stays neutral */
 .band-good { color: var(--ok); } .band-moderate { color: var(--aqi-moderate); } .band-unhealthy-sensitive { color: var(--aqi-sensitive); }
 .band-unhealthy { color: var(--aqi-unhealthy); } .band-very-unhealthy { color: var(--aqi-very); } .band-hazardous { color: var(--aqi-hazard); }
