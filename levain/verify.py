@@ -126,7 +126,8 @@ def run_verify_hooks(path: Path) -> int:
 
     # Resolve the Python the harness will actually use — falls back to
     # sys.executable if no install config nominates one.
-    python = _resolve_install_python(install)
+    launcher = _resolve_install_launcher(install)
+    python = launcher[0]
 
     # Pre-check: the resolved interpreter must exist. Most common operator
     # failure is "I deleted/moved the venv this install was created with."
@@ -154,7 +155,7 @@ def run_verify_hooks(path: Path) -> int:
         # One representative per source equivalence class — see comment on
         # SESSION_START_REPRESENTATIVES above for why this isn't all four.
         for source in SESSION_START_REPRESENTATIVES:
-            r = _invoke(ss, install, {"source": source}, "SessionStart", python)
+            r = _invoke(ss, install, {"source": source}, "SessionStart", launcher)
             # Tag the source onto the result name so failures are localized.
             r = VerifyResult(
                 name=f"session_start.py (source={source})",
@@ -175,7 +176,7 @@ def run_verify_hooks(path: Path) -> int:
 
     ups = hooks_dir / "user_prompt_submit.py"
     if ups.is_file():
-        results.append(_invoke(ups, install, ups_payload(install), "UserPromptSubmit", python))
+        results.append(_invoke(ups, install, ups_payload(install), "UserPromptSubmit", launcher))
     else:
         results.append(
             VerifyResult(
@@ -188,7 +189,7 @@ def run_verify_hooks(path: Path) -> int:
 
     for script, payload, kind, text in _RECORD_ONLY:
         if (hooks_dir / script).is_file():
-            results.append(_invoke_record_only(hooks_dir, script, payload, kind, text, python))
+            results.append(_invoke_record_only(hooks_dir, script, payload, kind, text, launcher))
 
     for r in results:
         _emit(r)
@@ -243,7 +244,7 @@ def _copy_hook_files(src: Path, dest: Path) -> None:
 
 
 def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, text: str,
-                        python: str) -> VerifyResult:
+                        launcher: list[str]) -> VerifyResult:
     """Run a record-only hook from a copy of the installed hooks directory under a temporary install root (the
     hook derives its root from its own file location), then read back the one transcript line it wrote there.
     The temporary root is removed whatever happens; the live install's sessions directory is never touched."""
@@ -256,13 +257,13 @@ def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, 
         env.pop("LEVAIN_HOOK_SUPPRESS", None)
         env.pop("LEVAIN_SCOPE", None)
         try:
-            r = subprocess.run([python, str(tmp / "activation" / "hooks" / script)], cwd=str(tmp),
+            r = subprocess.run([*launcher, str(tmp / "activation" / "hooks" / script)], cwd=str(tmp),
                                input=json.dumps({**payload, "cwd": str(tmp)}), capture_output=True, text=True,
                                timeout=10, env=env)
         except subprocess.TimeoutExpired:
             return VerifyResult(script, False, "timed out after 10s", "A record-only hook must return at once.")
         except OSError as e:
-            return VerifyResult(script, False, f"failed to invoke: {e}", f"Check Python at {python} is runnable.")
+            return VerifyResult(script, False, f"failed to invoke: {e}", f"Check Python at {launcher[0]} is runnable.")
         if r.returncode != 0:
             return VerifyResult(script, False, f"exit {r.returncode}; stderr={r.stderr.strip()[:200]!r}",
                                 "Hooks are fail-open and must always exit 0. Script is corrupt or import is broken.")
@@ -292,7 +293,7 @@ def _invoke(
     install: Path,
     payload: dict,
     expected_event: str,
-    python: str,
+    launcher: list[str],
 ) -> VerifyResult:
     """Run a hook script under conditions that match a harness invocation.
 
@@ -301,7 +302,7 @@ def _invoke(
     from the child env because the parent shell may have it set for some
     other reason, and that would silently make every verification look broken.
 
-    `python` is the interpreter resolved from the install's adapter config
+    `launcher` (the interpreter and its flags) is resolved from the install's adapter config
     (the same one the harness will actually use), not necessarily the one
     running `levain verify-hooks`.
     """
@@ -312,7 +313,7 @@ def _invoke(
 
     try:
         result = subprocess.run(
-            [python, str(script)],
+            [*launcher, str(script)],
             cwd=str(install),
             input=json.dumps(payload),
             capture_output=True,
@@ -332,7 +333,7 @@ def _invoke(
             script.name,
             False,
             f"failed to invoke: {e}",
-            f"Check {script} exists and Python at {python} is runnable.",
+            f"Check {script} exists and Python at {launcher[0]} is runnable.",
         )
 
     if result.returncode != 0:
@@ -405,6 +406,11 @@ def _invoke(
 
 
 def _resolve_install_python(install: Path) -> str:
+    """The interpreter of :func:`_resolve_install_launcher`."""
+    return _resolve_install_launcher(install)[0]
+
+
+def _resolve_install_launcher(install: Path) -> list[str]:
     """Return the Python interpreter path the install's adapter is wired to.
 
     Reads it from `.claude/settings.json` (Claude Code) or `~/.codex/hooks.json`
@@ -428,7 +434,7 @@ def _resolve_install_python(install: Path) -> str:
     """
     # Claude Code: .claude/settings.json — gated by CLAUDE.md tag file.
     if (install / "CLAUDE.md").is_file():
-        py = _python_from_hooks_config(install / ".claude" / "settings.json", install)
+        py = _launcher_from_hooks_config(install / ".claude" / "settings.json", install)
         if py is not None:
             return py
 
@@ -438,11 +444,11 @@ def _resolve_install_python(install: Path) -> str:
         codex_home = (
             Path(codex_home_env) if codex_home_env else Path("~/.codex").expanduser()
         )
-        py = _python_from_hooks_config(codex_home / "hooks.json", install)
+        py = _launcher_from_hooks_config(codex_home / "hooks.json", install)
         if py is not None:
             return py
 
-    return sys.executable
+    return [sys.executable]
 
 
 # Claude Code's settings.template.json writes the hook command with a RUNTIME
@@ -457,8 +463,9 @@ def _resolve_install_python(install: Path) -> str:
 _CLAUDE_PROJECT_DIR_PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
 
 
-def _python_from_hooks_config(path: Path, install: Path) -> str | None:
-    """Walk a hooks-config JSON file and return the python for a hook
+def _launcher_from_hooks_config(path: Path, install: Path) -> list[str] | None:
+    """Walk a hooks-config JSON file and return the launcher (every token before the script: the python and
+    any flags, ``-EP -m levain.hookrun`` on Codex) for a hook
     targeting `install/activation/hooks/`. Skip commands targeting other
     paths (foreign hooks shouldn't donate their python to verify-hooks).
 
@@ -537,7 +544,7 @@ def _python_from_hooks_config(path: Path, install: Path) -> str | None:
                 # still accepting a foreign interpreter genuinely wired to OUR
                 # script (correct — the harness will invoke it; verify-hooks
                 # should smoke-test exactly that and likely go red).
-                for tok in tokens[1:]:
+                for i, tok in enumerate(tokens[1:], 1):
                     candidate = tok.replace(
                         _CLAUDE_PROJECT_DIR_PLACEHOLDER, str(install)
                     )
@@ -551,5 +558,11 @@ def _python_from_hooks_config(path: Path, install: Path) -> str | None:
                         script_path.relative_to(install_hooks_dir)
                     except ValueError:
                         continue
-                    return tokens[0]
+                    return tokens[:i]
     return None
+
+
+def _python_from_hooks_config(path: Path, install: Path) -> str | None:
+    """The interpreter of :func:`_launcher_from_hooks_config`."""
+    launcher = _launcher_from_hooks_config(path, install)
+    return launcher[0] if launcher else None

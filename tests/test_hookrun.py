@@ -101,19 +101,39 @@ def test_a_levain_directory_in_the_sessions_cwd_does_not_run_as_the_entry(tmp_pa
         assert (r.returncode, r.stdout) == (0, ""), cmd
 
 
-def test_doctor_fails_a_hook_interpreter_that_cannot_run_the_entry(make_install, tmp_path):
+def test_doctor_warns_on_another_interpreter_and_never_runs_it(make_install, tmp_path):
     from levain import doctor
 
     install = make_install("cx", adapter="codex")
     cj = tmp_path / "codex-home" / "hooks.json"
 
     def py_rows():
-        doctor._HOOKRUN_OK.clear()
         return [r for r in doctor._check_codex(install) if r.name.endswith(" python")]
 
     assert py_rows() == []
-    bare = tmp_path / "bare"
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(bare)], check=True)
-    cj.write_text(cj.read_text().replace(json.dumps(sys.executable)[1:-1], str(bare / "bin" / "python")))
+    fake = tmp_path / "fake" / "bin" / "python"
+    fake.parent.mkdir(parents=True)
+    marker = tmp_path / "ran.txt"
+    fake.write_text(f"#!/bin/sh\necho ran >> {marker}\n")
+    fake.chmod(0o755)
+    cj.write_text(cj.read_text().replace(json.dumps(sys.executable)[1:-1], str(fake)))
     rows = py_rows()
-    assert len(rows) == 2 and all(not r.ok and "cannot import levain" in r.detail for r in rows), rows
+    assert len(rows) == 2 and all(r.ok and r.warn and "not this levain's interpreter" in r.detail for r in rows), rows
+    assert not marker.exists()  # doctor inspects a hook file; it never runs what it names
+
+
+def test_a_pack_hook_imports_a_sibling_module(tmp_path):
+    d = tmp_path / "hooks"
+    d.mkdir()
+    (d / "shared_helper.py").write_text("VALUE = 'sibling'\n")
+    (d / "h.py").write_text("import shared_helper\nprint(shared_helper.VALUE)\n")
+    r = _run(d / "h.py")
+    assert (r.returncode, r.stdout.strip()) == (0, "sibling"), r.stderr
+
+
+def test_verify_hooks_runs_a_codex_hook_the_way_codex_does(make_install, monkeypatch, tmp_path):
+    from levain import verify
+
+    install = make_install("cx", adapter="codex")
+    assert verify._resolve_install_launcher(install) == [sys.executable, "-EP", "-m", "levain.hookrun"]
+    assert verify.run_verify_hooks(install) == 0

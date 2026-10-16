@@ -1361,19 +1361,15 @@ def _python_resolvable(token: str) -> bool:
     return shutil.which(token) is not None
 
 
-_HOOKRUN_OK: dict[str, bool] = {}
-
-
-def _runs_hookrun(python: str) -> bool:
-    """Whether ``python`` can run ``-EP -m levain.hookrun`` the way the Codex hook commands do (cached per run)."""
-    if python not in _HOOKRUN_OK:
-        try:
-            r = subprocess.run([python, "-EP", "-c", "import levain.hookrun"], capture_output=True,
-                               timeout=20, stdin=subprocess.DEVNULL)
-            _HOOKRUN_OK[python] = r.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            _HOOKRUN_OK[python] = False
-    return _HOOKRUN_OK[python]
+def _is_this_environment(python: str) -> bool:
+    """Whether ``python`` is the interpreter of the environment this levain runs in: its own path, or an
+    interpreter inside ``sys.prefix``. Decided from paths only, so doctor never runs an interpreter a hook file
+    names (a hook file is what doctor inspects)."""
+    p = os.path.abspath(python)
+    if p == os.path.abspath(sys.executable):
+        return True
+    prefix = os.path.abspath(sys.prefix)
+    return os.path.dirname(os.path.dirname(p)) == prefix
 
 
 def _extract_command_python(entries: list[dict]) -> str | None:
@@ -2789,15 +2785,16 @@ def _check_codex(install: Path) -> list[CheckResult]:
                             "Re-run `levain init` to re-resolve {{PYTHON}}.",
                         )
                     )
-                elif py and "levain.hookrun" in (_first_command_tokens(entries) or []) and not _runs_hookrun(py):
+                elif py and "levain.hookrun" in (_first_command_tokens(entries) or []) and not _is_this_environment(py):
                     results.append(
                         CheckResult(
                             f"~/.codex/hooks.json {ev_name} python",
-                            False,
-                            f"{py} cannot import levain, so every levain hook exits 1 and Codex shows "
-                            "\"Hook failed\"",
-                            f"Install levain into {py}, or run `levain update` from the python levain is "
-                            "installed in.",
+                            True,
+                            f"{py} is not this levain's interpreter ({sys.executable}); the hooks need levain "
+                            "importable there, or every one exits 1 and Codex shows \"Hook failed\"",
+                            f"Run `levain doctor` with {py} to check it, or `levain update` from the python "
+                            "levain is installed in.",
+                            warn=True,
                         )
                     )
                 else:

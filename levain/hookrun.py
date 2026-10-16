@@ -8,7 +8,7 @@ turned a deleted or moved install into a block on every Codex prompt.
 
 The rendered command is therefore ``<python> -EP -m levain.hookrun <install>/activation/hooks/<hook>.py``:
 python never opens the script itself. This entry exits 0 printing nothing when the script is not a file,
-runs it as ``__main__`` otherwise, and maps every failure that reaches Python (an exception, a non-zero
+runs it as ``__main__`` otherwise (its own directory first on ``sys.path``, as ``python <script>`` puts it), and maps every failure that reaches Python (an exception, a non-zero
 SystemExit, argparse's 2) to exit 1, its traceback or message on stderr. ``os._exit`` bypasses this, so a hook
 script never calls it. A deliberate decision is the JSON the script prints on stdout, never an exit code. A missing
 interpreter is the shell's 127 and a venv without levain is python's 1: both fall through as well. ``-P`` is what
@@ -33,6 +33,7 @@ def main(argv: list[str]) -> int:
     if not os.path.isfile(script):
         return 0
     sys.argv = [script, *argv[1:]]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(script)))  # as `python <script>` does, for a sibling import
     try:
         runpy.run_path(script, run_name="__main__")
     except SystemExit as exc:
