@@ -1086,7 +1086,7 @@ def read_pack_locks_status(install: Path) -> tuple[list[PackProvenance], PackLoc
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return [], "absent"
-    except OSError:
+    except (OSError, ValueError):  # ValueError: not UTF-8 (UnicodeDecodeError), the file is there and unreadable
         return [], "corrupt"
     try:
         data = json.loads(raw)
