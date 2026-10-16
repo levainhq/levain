@@ -634,10 +634,10 @@ def import_entries(
     """The seed entries that load as always-on harness context, in load order.
 
     Membership: every roster seed file EXCEPT those in :data:`NON_IMPORT_SEED`
-    (continuity.md / README.md, which are not entity context at all) and
-    :data:`ON_DEMAND_SEED` (which IS entity context, reached through a carrier
-    pointer instead of an eager load) — so a pack's new seed file still imports
-    by default.
+    (continuity.md / README.md, which are not entity context at all) and the
+    on-demand set for ``mode`` (:func:`seed_classes`: entity context reached
+    through a carrier pointer instead of an eager load) — so a pack's new seed
+    file still imports by default.
 
     Order: the :data:`BASE_IMPORT_ORDER` curriculum first (for the base files the
     roster actually provides, each taken from its WINNING layer), then any other
@@ -673,10 +673,11 @@ def on_demand_entries(
     roster: Sequence[SeedEntry], mode: str = DEFAULT_MEMORY_LOAD
 ) -> list[SeedEntry]:
     """The seed entries that install to disk and are POINTED AT from the adapter
-    carrier rather than eagerly loaded, in :data:`ON_DEMAND_SEED` order.
+    carrier rather than eagerly loaded, in the on-demand order :func:`seed_classes`
+    gives for ``mode``.
 
-    Peer of :func:`import_entries` over the same roster — an entry is eager XOR
-    on-demand XOR not-context-at-all, and these two functions plus
+    Peer of :func:`import_entries` over the same roster and the same ``mode`` — an
+    entry is eager XOR on-demand XOR not-context-at-all, and these two functions plus
     :data:`NON_IMPORT_SEED` partition the roster exactly. Taken from the WINNING
     layer like every other selector, so a pack overriding an on-demand file's
     CONTENT keeps its on-demand position."""

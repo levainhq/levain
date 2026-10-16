@@ -42,6 +42,7 @@ supported in v1.
 │   ├── partnership.md
 │   ├── world.md                  <- filled by onboarding
 │   ├── memory.md
+│   ├── memory_workflow.md        <- the wrap procedure; imported, or named in the carrier's on-demand block
 │   ├── continuity.md             <- the entity's starting continuity scaffold
 │   └── README.md
 └── activation/

@@ -228,7 +228,7 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
 # files load as harness context (the roster-driven adapter @import list), which
 # are reached on demand through a carrier pointer, and which are not entity
 # context at all (continuity.md / README.md) — lives in `levain.packs`
-# (NON_IMPORT_SEED / ON_DEMAND_SEED / BASE_IMPORT_ORDER / import_entries). A PACK
+# (NON_IMPORT_SEED / seed_classes / import_entries / on_demand_entries). A PACK
 # extends the seed set, so this fixed list checks only the base minimum; if doctor
 # ever needs to validate a pack-layered install's full import list it must read the
 # installed adapter file or a recorded roster, not grow this constant (Slice 3
@@ -642,11 +642,22 @@ def _check_install_layout(install: Path, expect_hooks: bool = True) -> list[Chec
     else:
         missing = [f for f in _SEED_REQUIRED if not (seed / f).is_file()]
         if missing:
+            # `levain update` writes a base seed this package ships verbatim (the rendered ones
+            # are the interview's) when levain has no record of writing it: a package upgrade
+            # that added the file. A recorded file that is gone was deleted, and update keeps
+            # it deleted, so that case still needs init.
+            from levain.install import _read_adapter_receipt
+
+            recorded = _read_adapter_receipt(install) or {}
+            update_writes = all(f not in _RENDER_TARGET_SEEDS and _ships_base_seed(f)
+                                and f"seed/{f}" not in recorded for f in missing)
             results.append(
                 CheckResult(
                     "seed/",
                     False,
                     f"missing required files: {', '.join(missing)}",
+                    "Run `levain update`; this levain ships the file(s)."
+                    if update_writes else
                     "Re-run `levain init` or restore from adapter source.",
                 )
             )
@@ -1947,13 +1958,33 @@ def _carrier_adapter(carrier: Path) -> str:
     return "claude-code" if carrier.name == "CLAUDE.md" else "codex"
 
 
+def _ships_base_seed(name: str) -> bool:
+    """Does the installed package carry ``name`` among its base seed templates?"""
+    from levain.install import _templates_root
+
+    try:
+        with _templates_root() as root:
+            return (root / "seed" / name).is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def _check_memory_load(install: Path, carrier: Path) -> list[CheckResult]:
     """One advisory row: how this adapter's carrier loads the memory wrap procedure. Never a failure: both
     modes are the operator's to choose, and the freshness check owns a carrier that disagrees with it."""
     from levain.install import persisted_memory_load
 
-    mode = persisted_memory_load(install, _carrier_adapter(carrier))
+    from levain.install import recorded_memory_load
+    from levain.packs import MEMORY_LOAD_CHOICES
+
+    adapter = _carrier_adapter(carrier)
+    mode = persisted_memory_load(install, adapter)
+    default, by_adapter = recorded_memory_load(install)
+    named = by_adapter.get(adapter, default)
     detail = "eager" if mode == "eager" else "on-demand (summary in the carrier)"
+    if named is not None and named not in MEMORY_LOAD_CHOICES:
+        # still eager and still advisory: eager loses nothing, but a typo should not read as a choice
+        detail = f"eager (unreadable value {named!r} in .levain/config.json)"
     return [CheckResult("memory workflow", True, detail)]
 
 
@@ -2600,8 +2631,8 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
     #
     # The first version FAILED above the threshold, which meant a fresh base install
     # failed `doctor` on day one for a ratio the operator cannot act on: `memory.md`
-    # is OUR composition choice, and the remedy ("move it on-demand") is a Levain
-    # internals change, not something an operator does. Failing them for our decision
+    # is OUR composition choice, and the remedy (moving its wrap procedure on-demand) is
+    # a per-install setting an operator can make, but the default is ours. Failing them for our decision
     # points the signal at the wrong party — the same defect class this whole change
     # is about. Enforcement belongs where the actor is, so the BUDGET is enforced
     # repo-side in `scripts/check_seed_budget.py`, which fails OUR build.
