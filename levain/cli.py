@@ -2167,8 +2167,9 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
 
     from levain.autonomic.confirm import COCKPIT_NAMESPACE
     from levain.cockpit.keys import ssh_signer
-    from levain.cockpit.sign_client import (TOKEN_ENV, SignRefused, journal, key_refusal, loopback_url,
-                                            post_signature, render, server_listening, waiting)
+    from levain.cockpit.firejournal import CockpitDB, UnknownPending
+    from levain.cockpit.sign_client import (TOKEN_ENV, SignRefused, header_safe_token, journal, key_refusal,
+                                            loopback_url, post_signature, render, server_listening, waiting)
 
     try:
         url = loopback_url(args.url)
@@ -2187,11 +2188,12 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
                 token = ""
         if not token.strip():
             raise SignRefused(f"no write token: set {TOKEN_ENV} or type the one `levain serve --write` printed")
+        token = header_safe_token(token)
         server_listening(url)
         for line in render(view, signer_fp=signer_fp, signer_class=key_class):
             print(_term_safe(line))
         sys.stdout.flush()
-        answer = post_signature(url, view.pending_id, sign(view.record_bytes), token.strip())
+        answer = post_signature(url, view.pending_id, sign(view.record_bytes), token)
     except KeyboardInterrupt:
         print("sign cancelled", file=sys.stderr)
         return 1
@@ -2199,6 +2201,10 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
         print(f"sign refused: {_term_safe(exc)}", file=sys.stderr)
         return 1
     body = answer.body
+    if 300 <= answer.status < 400:
+        print(_term_safe(f"sign refused: HTTP {answer.status} (a redirect, not followed): {answer.raw[:500]}"),
+              file=sys.stderr)
+        return 1
     if answer.status != 200 or body is None:
         if body is not None:
             print(_term_safe(f"sign refused: {body.get('error')}: {body.get('message')}"), file=sys.stderr)
@@ -2208,7 +2214,20 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
     print(_term_safe(f"{body.get('state')}" + (f" ({body.get('reason')})" if body.get("reason") else "")
                      + f": decision {body.get('decision_kind')}" + (f", {body.get('label')}" if body.get("label") else "")
                      + (" (a replay: this pending was already decided)" if body.get("replay") else "")))
-    return 0 if body.get("replay") is False and body.get("decision_kind") == "ALLOWED" else 1
+    if not (body.get("replay") is False and body.get("decision_kind") == "ALLOWED" and body.get("state") == "COMMITTED"):
+        return 1
+    # the answer counts only when the journal the operator chose agrees: a listener that is not its server
+    # (another install's, or none of ours) cannot make a success
+    try:
+        after = CockpitDB(db.data_root).load(view.pending_id)
+    except (UnknownPending, *_sign_refusals()) as exc:
+        print(f"sign unconfirmed: the journal could not be re-read ({_term_safe(exc)})", file=sys.stderr)
+        return 1
+    if after.state == "WAITING":
+        print(_term_safe(f"sign unconfirmed: the server answered COMMITTED but {view.pending_id} is still WAITING "
+                         f"in {db.path}: the server at {url} does not hold this journal"), file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:

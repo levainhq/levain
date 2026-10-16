@@ -6,9 +6,13 @@ is refused)."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
+import threading
+import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -70,6 +74,57 @@ def _state(s: dict[str, Any], pid: str) -> str:
     return CockpitDB(s["data_root"]).load(pid).state
 
 
+def _watch_signer(monkeypatch) -> list[bytes]:
+    """The messages ``ssh_signer``'s sign callable is handed: empty means nothing was signed."""
+    signed: list[bytes] = []
+    real = cockpit_keys.ssh_signer
+
+    def watched(*a: Any, **kw: Any):
+        fp, sign = real(*a, **kw)
+        return fp, lambda m: signed.append(m) or sign(m)
+
+    monkeypatch.setattr(cockpit_keys, "ssh_signer", watched)
+    return signed
+
+
+@pytest.fixture
+def listener() -> Iterator[Any]:
+    """Start loopback HTTP listeners that record every request and give one canned answer:
+    ``listener(status, body, headers)`` returns ``(url, seen)``."""
+    started: list[ThreadingHTTPServer] = []
+
+    def start(status: int, body: dict[str, Any], headers: dict[str, str] | None = None):
+        seen: list[dict[str, Any]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def _answer(self) -> None:
+                seen.append({"path": self.path, "headers": dict(self.headers)})
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                for k, v in {"Content-Type": "application/json", **(headers or {})}.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = do_POST = _answer
+
+            def log_message(self, *a: Any) -> None:
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        started.append(httpd)
+        return f"http://127.0.0.1:{httpd.server_port}", seen
+
+    try:
+        yield start
+    finally:
+        for httpd in started:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 def test_a_default_namespace_signature_is_refused_and_the_cli_signs_the_same_pending(served, monkeypatch, capsys):
     """RUN 15 (probe, bad_signature, unspent) then RUN 16: ssh_signer's default namespace is the authority
     log's, so a CLI that forgot ``namespace=COCKPIT_NAMESPACE`` would sign every pending in vain."""
@@ -81,8 +136,9 @@ def test_a_default_namespace_signature_is_refused_and_the_cli_signs_the_same_pen
     assert _state(s, pid) == "WAITING"
 
     monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
-    assert _sign(s, pid, s["laptop"]) == 0, capsys.readouterr()
-    out = capsys.readouterr().out
+    rc, captured = _sign(s, pid, s["laptop"]), capsys.readouterr()
+    assert rc == 0, captured
+    out = captured.out
     assert f"signing {pid}: spore_seed (sign, T3)" in out and "COMMITTED: decision ALLOWED" in out, out
     assert _state(s, pid) == "COMMITTED"
     assert SporeStore(s["spores"]).get_by_origin_key(f"ck.{pid[2:]}.0")["text"] == "signed from the terminal"
@@ -94,14 +150,7 @@ def test_a_key_whose_class_does_not_cover_the_tier_is_refused_before_signing(ser
     s = served
     pid = _issue(s["url"], "the phone may not sign this")
     monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
-    signed: list[bytes] = []
-    real = cockpit_keys.ssh_signer
-
-    def watched(*a: Any, **kw: Any):
-        fp, sign = real(*a, **kw)
-        return fp, lambda m: signed.append(m) or sign(m)
-
-    monkeypatch.setattr(cockpit_keys, "ssh_signer", watched)
+    signed = _watch_signer(monkeypatch)
     assert _sign(s, pid, s["phone"]) == 1
     assert "key class display-phone does not cover T3" in capsys.readouterr().err
     assert signed == [] and _state(s, pid) == "WAITING"
@@ -112,14 +161,52 @@ def test_no_server_at_the_url_is_refused_before_signing(served, monkeypatch, cap
     s = served
     pid = _issue(s["url"], "nobody is listening")
     monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
-    signed: list[bytes] = []
-    real = cockpit_keys.ssh_signer
-
-    def watched(*a: Any, **kw: Any):
-        fp, sign = real(*a, **kw)
-        return fp, lambda m: signed.append(m) or sign(m)
-
-    monkeypatch.setattr(cockpit_keys, "ssh_signer", watched)
+    signed = _watch_signer(monkeypatch)
     assert _sign(s, pid, s["laptop"], url="http://127.0.0.1:9") == 1
     assert "no server answers at http://127.0.0.1:9" in capsys.readouterr().err
+    assert signed == [] and _state(s, pid) == "WAITING"
+
+
+def test_a_redirect_is_refused_and_no_proxy_is_used(served, listener, monkeypatch, capsys):
+    """B1: urlopen honours HTTP_PROXY and follows a 302 (re-sent as a GET that keeps the token header), so
+    the write token and the signature went wherever either pointed. The CLI sends to --url only: no proxy,
+    and a 3xx is a refusal."""
+    s = served
+    pid = _issue(s["url"], "stay on this machine")
+    proxy, via_proxy = listener(200, {"state": "COMMITTED", "decision_kind": "ALLOWED", "replay": False})
+    elsewhere, redirected = listener(200, {"state": "COMMITTED", "decision_kind": "ALLOWED", "replay": False})
+    moved, _ = listener(302, {"error": "moved"}, {"Location": f"{elsewhere}/cockpit/pending/{pid}/signature"})
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", proxy)
+    monkeypatch.setattr(urllib.request, "_opener", None)    # urlopen caches its proxies at first use
+    monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
+    rc = _sign(s, pid, s["laptop"], url=moved)
+    assert via_proxy == [] and redirected == []
+    assert rc == 1 and "HTTP 302" in capsys.readouterr().err
+    assert _state(s, pid) == "WAITING"
+
+
+def test_an_answer_the_journal_does_not_show_exits_1(served, listener, monkeypatch, capsys):
+    """B2: a listener that is not the journal's server answers COMMITTED/ALLOWED; the pending stays WAITING
+    in the journal the operator chose, so the CLI says so and exits 1."""
+    s = served
+    pid = _issue(s["url"], "an unrelated listener")
+    fake, seen = listener(200, {"state": "COMMITTED", "decision_kind": "ALLOWED", "replay": False})
+    monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
+    assert _sign(s, pid, s["laptop"], url=fake) == 1
+    assert len(seen) == 1
+    assert "still WAITING" in capsys.readouterr().err
+    assert _state(s, pid) == "WAITING"
+
+
+def test_a_token_that_cannot_be_a_header_is_refused_before_signing(served, monkeypatch, capsys):
+    """B4: a newline inside the token made http.client raise ValueError after the signature was made (a
+    touch spent, then a traceback). It is refused before anything is signed."""
+    s = served
+    pid = _issue(s["url"], "a token with a newline")
+    signed = _watch_signer(monkeypatch)
+    monkeypatch.setenv("LEVAIN_WRITE_TOKEN", "row12b\ntoken")
+    assert _sign(s, pid, s["laptop"]) == 1
+    assert "sign refused: the write token" in capsys.readouterr().err
     assert signed == [] and _state(s, pid) == "WAITING"

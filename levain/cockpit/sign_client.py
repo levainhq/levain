@@ -59,7 +59,23 @@ def loopback_url(url: str) -> str:
     if parts.scheme != "http" or not loopback or parts.path not in ("", "/") or parts.query or parts.fragment:
         raise SignRefused(f"--url must be http:// to a loopback address (e.g. {DEFAULT_URL}), not {url!r}: "
                           "the pending is read off this machine's disk, so its server is this machine's")
+    try:
+        port = 80 if parts.port is None else parts.port
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise SignRefused(f"--url {url!r} has no usable port (1-65535)")
     return url.rstrip("/")
+
+
+def header_safe_token(token: str) -> str:
+    """``token`` stripped, refused unless it can travel as one header value (printable ASCII, nothing
+    blank inside): said before anything is signed, so no touch is spent on a request that cannot be sent."""
+    token = token.strip()
+    if not token or not all("!" <= c <= "~" for c in token):
+        raise SignRefused("the write token must be printable ASCII with no spaces or line breaks inside: "
+                          "type the one `levain serve --write` printed")
+    return token
 
 
 def _no_server(base_url: str, why: object) -> SignRefused:
@@ -69,12 +85,13 @@ def _no_server(base_url: str, why: object) -> SignRefused:
 
 def server_listening(base_url: str, *, timeout: float = 3.0) -> None:
     """Refuse before anything is signed (a touch is not spent on a POST nobody receives) when nothing
-    listens at ``base_url``. Only a connect: the POST's own answer still decides."""
+    listens at ``base_url``. Only a connect: it proves nothing about who listens; the POST's answer and the
+    journal read again after it decide the exit code."""
     parts = urllib.parse.urlsplit(base_url)
     try:
-        socket.create_connection((parts.hostname, parts.port or 80), timeout=timeout).close()
-    except OSError as exc:
-        raise _no_server(base_url, exc.strerror or exc) from None
+        socket.create_connection((parts.hostname, 80 if parts.port is None else parts.port), timeout=timeout).close()
+    except (OSError, ValueError) as exc:
+        raise _no_server(base_url, getattr(exc, "strerror", None) or exc) from None
 
 
 def waiting(db: CockpitDB, pending_id: str, now: datetime) -> OpView:
@@ -115,26 +132,38 @@ def _dump(value: Any) -> str:
 
 
 def render(view: OpView, *, signer_fp: str, signer_class: str | None) -> list[str]:
-    """The record ``sign`` will sign, rendered from the very bytes (``view.record_bytes``) and nothing
-    else: no field elided, nothing from the requester. The caller makes each line terminal-safe."""
+    """The record ``sign`` will sign, rendered from the very bytes (``view.record_bytes``): every key of
+    the decoded record, in its stored order, nothing dropped (a list of objects, like ``effects``, one key
+    per line). What the journal keeps beside the record follows under its own heading, because it is not
+    signed. The caller makes each line terminal-safe."""
     rec = json.loads(view.record_bytes)
-    target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
-    fence = rec.get("fence") if isinstance(rec.get("fence"), dict) else {}
+    rec = rec if isinstance(rec, dict) else {"record": rec}
     lines = [f"signing {view.pending_id}: {rec.get('verb')} ({rec.get('intent')}, {rec.get('tier')})",
-             f"  {'target':<15} {_dump(target)}",
-             f"  {'params':<15} {_dump(rec.get('params'))}"]
-    for i, eff in enumerate(rec.get("effects") or ()):
-        eff = eff if isinstance(eff, dict) else {}
-        lines.append(f"  {f'effect {i}':<15} {eff.get('store')} {eff.get('resource_key')}")
-        lines.append(f"  {'  expect':<15} {_dump(eff.get('expect'))}")
-        lines.append(f"  {'  changes':<15} {_dump(eff.get('changes'))}")
-    lines += [f"  {'fence':<15} seq {fence.get('authority_seq')} of {fence.get('authority_store_id')} "
-              f"(head {fence.get('authority_head_hash')})",
-              f"  {'issued':<15} {rec.get('issued_at')}, expires {rec.get('expires_at')}",
-              f"  {'requested by':<15} {view.principal}",
-              f"  {'record sha256':<15} {hashlib.sha256(view.record_bytes).hexdigest()}",
-              f"  {'signer':<15} {signer_fp} ({signer_class})"]
+             "  signed record (the bytes signed):"]
+    for key, value in rec.items():
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            for i, item in enumerate(value):
+                lines.append(f"    {key} {i}")
+                lines += [f"      {sub:<15} {_dump(v)}" for sub, v in item.items()]
+        else:
+            lines.append(f"    {key:<17} {_dump(value)}")
+    lines += [f"    {'(sha256)':<17} {hashlib.sha256(view.record_bytes).hexdigest()}",
+              "  from the journal (not part of the signed bytes):",
+              f"    {'requested by':<17} {view.principal}",
+              f"  {'signer':<19} {signer_fp} ({signer_class})"]
     return lines
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect: the 3xx itself comes back as the answer (an ``HTTPError``), so the token and
+    the signature go to ``--url`` and nowhere else."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 — stdlib signature
+        return None
+
+
+# no proxy (HTTP_PROXY and the system's settings would carry the token off the machine) and no redirect
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
 @dataclass(frozen=True)
@@ -147,17 +176,21 @@ class Answer:
 def post_signature(base_url: str, pending_id: str, signature: str, token: str,
                    *, timeout: float = _POST_TIMEOUT) -> Answer:
     """``POST <base_url>/cockpit/pending/<id>/signature`` with exactly ``{"signature": ...}``. A 4xx/5xx is
-    an :class:`Answer`, not an exception; no server answering is a :class:`SignRefused`."""
+    an :class:`Answer`, not an exception, and so is a 3xx (never followed); no proxy is used. No server
+    answering, or a request that cannot be sent, is a :class:`SignRefused`."""
     url = f"{base_url}/cockpit/pending/{urllib.parse.quote(pending_id, safe='')}/signature"
     req = urllib.request.Request(url, data=json.dumps({"signature": signature}).encode("utf-8"), method="POST",
                                  headers={"Content-Type": "application/json", _WRITE_TOKEN_HEADER: token})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — loopback_url checked the scheme
+        with _OPENER.open(req, timeout=timeout) as resp:  # loopback_url checked the scheme and host
             status, raw = resp.status, resp.read(_BODY_MAX)
     except urllib.error.HTTPError as exc:
-        status, raw = exc.code, exc.read(_BODY_MAX)
+        with exc:
+            status, raw = exc.code, exc.read(_BODY_MAX)
     except (urllib.error.URLError, OSError) as exc:
         raise _no_server(base_url, getattr(exc, "reason", exc)) from None
+    except ValueError as exc:      # (UnicodeEncodeError too) a header or URL http.client will not send
+        raise SignRefused(f"the request to {base_url} could not be sent ({exc}): nothing was decided") from None
     text = raw.decode("utf-8", "replace")
     try:
         body = json.loads(text)
