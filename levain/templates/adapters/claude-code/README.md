@@ -120,7 +120,8 @@ governs both directions for this workspace:
   settings; to receive messages here, remove the key (or set `"refuse"` to drop
   them silently).
 - `"permissions": {"ask": ["SendMessage"]}` and `"isolatePeerMachines": true` —
-  Claude asks before every message it sends, in every permission mode. With
+  Claude asks before every message it sends, in every permission mode, bypass
+  included (`dontAsk` denies the send instead). With
   levain's consent hook installed the request reaches the consent queue, where a
   standing grant on `SendMessage` for this workspace can answer it. The same tool
   resumes subagents and messages agent-team teammates, so those ask too.

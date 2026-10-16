@@ -540,11 +540,15 @@ def merge_messaging(settings: dict[str, Any], *, inbound: str = "hold", outbound
         settings["crossSessionInbound"] = stricter_inbound(current, inbound) or inbound
     if outbound == "unmanaged":
         return
-    perms = settings.setdefault("permissions", {})
+    if settings.get("permissions") is None:
+        settings["permissions"] = {}  # an explicit null holds no rules
+    perms = settings["permissions"]
     if not isinstance(perms, dict):
         raise ValueError("settings 'permissions' is not a JSON object")
     wanted = {"ask": ("ask", ("SendMessage",)), "deny": ("deny", ("SendMessage", "ListAgents"))}[outbound]
-    rules = perms.setdefault(wanted[0], [])
+    if perms.get(wanted[0]) is None:
+        perms[wanted[0]] = []
+    rules = perms[wanted[0]]
     if not isinstance(rules, list):
         raise ValueError(f"settings 'permissions.{wanted[0]}' is not a list")
     rules.extend(t for t in wanted[1] if t not in rules)

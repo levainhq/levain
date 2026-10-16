@@ -81,13 +81,43 @@ def test_an_unrecognised_value_holds_and_in_managed_refuses(env):
     assert posture(ent, home, [("/managed.json", {"crossSessionInbound": 7})]).inbound == "refuse"
 
 
-def test_the_repo_root_settings_count(env, tmp_path):
+def test_below_a_repo_root_the_local_file_is_the_roots_and_the_shared_file_the_workspaces(env, tmp_path):
     ent, home = env
     (tmp_path / ".git").mkdir()
+    # Claude Code reads the shared settings.json from the session's own directory only (settings.md)
     _write(tmp_path / ".claude" / "settings.json", {"crossSessionInbound": "refuse",
                                                     "permissions": {"ask": ["SendMessage"]}})
+    _write(ent / ".claude" / "settings.local.json", {"crossSessionInbound": "refuse"})
     p = posture(ent, home)
-    assert p.inbound == "refuse" and p.outbound == "ask"
+    assert p.inbound is None and p.outbound == "open"
+    # ... and keeps settings.local.json at the repository root
+    _write(tmp_path / ".claude" / "settings.local.json", {"crossSessionInbound": "hold",
+                                                          "permissions": {"deny": ["SendMessage"]}})
+    p = posture(ent, home)
+    assert p.inbound == "hold" and p.outbound == "deny"
+
+
+def test_the_last_managed_file_setting_the_key_wins(env):
+    ent, home = env
+    docs = [("/m/managed-settings.json", {"crossSessionInbound": "refuse"}),
+            ("/m/managed-settings.d/10.json", {"crossSessionInbound": "accept"})]
+    p = posture(ent, home, docs)
+    assert p.inbound == "accept" and p.inbound_source == "/m/managed-settings.d/10.json"
+
+
+def test_a_user_typo_holds_even_under_a_managed_accept(env):
+    ent, home = env
+    _write(home / ".claude" / "settings.json", {"crossSessionInbound": "Hold"})
+    assert posture(ent, home, [("/managed.json", {"crossSessionInbound": "accept"})]).inbound == "hold"
+
+
+def test_a_non_string_value_reads_as_unrecognised(env):
+    ent, home = env
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": ["accept"]})
+    assert posture(ent, home).inbound == "hold"
+    s: dict = {"crossSessionInbound": {"a": 1}}
+    cc.merge_messaging(s)
+    assert s["crossSessionInbound"] == "hold"
 
 
 # --- outbound ---------------------------------------------------------------------------------------------------
@@ -149,6 +179,15 @@ def test_merge_unmanaged_writes_nothing():
 def test_merge_refuses_an_unknown_choice(kw):
     with pytest.raises(ValueError):
         cc.merge_messaging({}, **kw)
+
+
+def test_merge_reads_a_null_permissions_block_as_no_rules():
+    s: dict = {"permissions": None}
+    cc.merge_messaging(s)
+    assert s["permissions"] == {"ask": ["SendMessage"]}
+    s = {"permissions": {"ask": None}}
+    cc.merge_messaging(s)
+    assert s["permissions"] == {"ask": ["SendMessage"]}
 
 
 def test_merge_refuses_a_malformed_permissions_block():

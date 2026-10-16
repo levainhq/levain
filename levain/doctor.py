@@ -1972,8 +1972,8 @@ def _check_cc_sandbox(install: Path) -> list[CheckResult]:
 
 def _check_cc_messaging(install: Path) -> list[CheckResult]:
     """Q9: Claude Code's cross-session messaging for this workspace, read with the vendor's precedence
-    (:func:`levain.host_guard.cc_messaging_posture`). Governed = inbound `hold`/`refuse` and outbound `ask`/`deny`
-    on `SendMessage`: every send then reaches the consent queue or your dialog, in every permission mode. An
+    (:func:`levain.host_guard.cc_messaging_posture`), as the settings files say it. Governed = inbound `hold`/`refuse`
+    and outbound `ask`/`deny` on `SendMessage`. An
     ungoverned direction is a WARN, never a FAIL: it is the operator's own trust decision. Tamper is the hook pin's
     job (its `messaging` components)."""
     from levain import host_guard as hg
@@ -1982,15 +1982,17 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
     if effective_adapter(install) == "codex":
         return []  # Codex documents no cross-session messaging
     p = hg.cc_messaging_posture(install)
-    seen = (f"[read: {', '.join(p.sources) or 'no settings file'}; not visible to doctor: --settings, "
-            "CLAUDE_CONFIG_DIR relocation, server-managed settings]")
+    seen = (f"[per the settings files read: {', '.join(p.sources) or 'none'}; not visible to doctor: --settings, "
+            "--setting-sources, CLAUDE_CONFIG_DIR relocation, MDM-profile and server-managed settings, plugin mods, "
+            "the running Claude Code's version]")
     inbound = (f"inbound {p.inbound} ({p.inbound_source})" if p.inbound in ("hold", "refuse")
                else "inbound NOT governed: " + (f"accept ({p.inbound_source})" if p.inbound == "accept"
                                                  else "no value set, so Claude Code decides per message"))
     if p.outbound == "deny":
         outbound = f"outbound off: SendMessage denied ({p.outbound_source})"
     elif p.outbound == "ask":
-        outbound = (f"outbound asks: every SendMessage reaches the consent queue or your dialog ({p.outbound_source})"
+        outbound = (f"outbound asks: every SendMessage goes to the permission flow (levain's consent hook, any "
+                    f"PermissionRequest hook you installed, or your dialog) ({p.outbound_source})"
                     + ("; cross-machine sends ask (isolatePeerMachines)" if p.isolate else ""))
     else:
         outbound = "outbound NOT governed: no rule asks for or denies SendMessage"

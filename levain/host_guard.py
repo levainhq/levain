@@ -471,10 +471,10 @@ INBOUND_VALUES = ("accept", "hold", "refuse")
 def stricter_inbound(a: str | None, b: str | None) -> str | None:
     """The stricter of two `crossSessionInbound` values (``None`` = unset, looser than any value)."""
     rank = {v: i for i, v in enumerate(INBOUND_VALUES)}
-    if a not in rank:
-        return b if b in rank else None
-    if b not in rank:
-        return a
+    a = a if isinstance(a, str) and a in rank else None
+    b = b if isinstance(b, str) and b in rank else None
+    if a is None or b is None:
+        return a or b
     return a if rank[a] >= rank[b] else b
 
 
@@ -517,43 +517,58 @@ class MessagingPosture:
 
 def cc_messaging_posture(install: str | os.PathLike[str], home: str | os.PathLike[str] | None = None,
                          managed: Sequence[tuple[str, Any]] | None = None) -> MessagingPosture:
-    """Claude Code's effective messaging controls for this workspace, read with the vendor's own precedence (it is not
-    the sandbox's first-layer-wins order): managed settings, then user settings, give the first trusted value; a
-    project or local `hold`/`refuse` (workspace and repo root) applies only when stricter; an unrecognised value holds,
-    and in managed settings counts as `refuse`. Permission rules merge across every layer, and an `isolatePeerMachines`
-    true from any layer applies. Not visible here: `--settings`, CLAUDE_CONFIG_DIR relocation, server-managed
-    settings; none of them can loosen a project `hold`/`refuse` or remove an ask/deny rule."""
+    """Claude Code's messaging controls for this workspace as its settings FILES say them, read with the vendor's own
+    precedence (not the sandbox's first-layer-wins order). The trusted inbound value is managed settings' (the files
+    merge in order, a later drop-in over an earlier one, so the last that sets it), else the user's; a workspace
+    `hold`/`refuse` applies only when stricter; an unrecognised value holds wherever it is, and in managed settings
+    counts as `refuse`. Permission rules merge across layers unless managed `allowManagedPermissionRulesOnly` is true;
+    an `isolatePeerMachines` true from any layer applies. The workspace files are the shared `.claude/settings.json` in
+    the workspace itself (Claude Code reads it from the session's working directory only) and `settings.local.json`,
+    which Claude Code keeps at the repository root when the session starts below one (unless that root is home).
+    Not read: `--settings`, `--setting-sources`, a relocated CLAUDE_CONFIG_DIR, MDM-profile and server-managed
+    settings, plugin mods. `--settings` and the user file cannot loosen a workspace `hold`/`refuse` or remove a rule;
+    a managed source with `allowManagedPermissionRulesOnly` discards the workspace rules."""
     ent = Path(os.path.abspath(install))
     hm = Path(home) if home is not None else Path(os.path.expanduser("~"))
-    local = [ent / ".claude" / "settings.local.json", ent / ".claude" / "settings.json"]
     root = _git_root(ent)
-    if root is not None and root != ent:
-        local += [root / ".claude" / "settings.local.json", root / ".claude" / "settings.json"]
-    # (path, document, kind), in the order the trusted value is looked for: managed, then user, then the project files
-    layers: list[tuple[str, Any, str]] = [(p, d, "managed") for p, d in
-                                          (load_managed_settings() if managed is None else managed)]
-    for kind, paths in (("user", [hm / ".claude" / "settings.json"]), ("project", local)):
+    local_dir = root if root is not None and root != ent and root != hm else ent
+    project = [local_dir / ".claude" / "settings.local.json", ent / ".claude" / "settings.json"]
+    managed_docs = list(load_managed_settings() if managed is None else managed)
+    # (path, document, kind): managed, then user, then the workspace files
+    layers: list[tuple[str, Any, str]] = [(p, d, "managed") for p, d in managed_docs]
+    for kind, paths in (("user", [hm / ".claude" / "settings.json"]), ("project", project)):
         for p in paths:
             if p.exists():
                 try:
                     layers.append((str(p), json.loads(p.read_text(encoding="utf-8")), kind))
                 except (OSError, ValueError):
                     layers.append((str(p), _MISSING, kind))
+
+    def managed_last(key: str) -> tuple[Any, str | None]:
+        for p, d in reversed(managed_docs):
+            v = _get(d, (key,)) if isinstance(d, Mapping) else _MISSING
+            if v is not _MISSING:
+                return v, p
+        return _MISSING, None
+
     inbound: str | None = None
     inbound_source: str | None = None
-    found_trusted = False
+    v, src = managed_last("crossSessionInbound")
+    if v is not _MISSING:
+        inbound, inbound_source = (v if v in INBOUND_VALUES else "refuse"), src
+    else:
+        for path, doc, kind in layers:
+            if kind == "user" and isinstance(doc, Mapping) and doc.get("crossSessionInbound") in INBOUND_VALUES:
+                inbound, inbound_source = doc["crossSessionInbound"], path  # an unrecognised one is the hold below
+                break
     for path, doc, kind in layers:
-        v = _get(doc, ("crossSessionInbound",)) if isinstance(doc, Mapping) else _MISSING
-        if v is _MISSING:
+        if kind == "managed" or not isinstance(doc, Mapping) or "crossSessionInbound" not in doc:
             continue
+        v = doc["crossSessionInbound"]
         if v not in INBOUND_VALUES:
-            v = "refuse" if kind == "managed" else "hold"
-        elif kind == "project" and v == "accept":
-            continue  # a project or local accept never applies
-        elif kind != "project":
-            if found_trusted:
-                continue  # only the first trusted value applies
-            found_trusted = True
+            v = "hold"  # an unrecognised user, project or local value holds over any accept
+        elif kind == "user" or v == "accept":
+            continue  # the user value is the trusted one above; a project or local accept never applies
         new = stricter_inbound(inbound, v)
         if new != inbound:
             inbound, inbound_source = new, path
@@ -561,8 +576,7 @@ def cc_messaging_posture(install: str | os.PathLike[str], home: str | os.PathLik
     outbound_source: str | None = None
     list_denied = isolate = False
     # `allowManagedPermissionRulesOnly` in managed settings makes Claude Code ignore every other layer's rules
-    managed_rules_only = any(kind == "managed" and isinstance(doc, Mapping)
-                             and doc.get("allowManagedPermissionRulesOnly") is True for _p, doc, kind in layers)
+    managed_rules_only = managed_last("allowManagedPermissionRulesOnly")[0] is True
     for path, doc, kind in layers:
         facts = messaging_facts(doc) or {}
         if managed_rules_only and kind != "managed":
