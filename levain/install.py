@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from levain.answers import AnswersError
 from levain.packs import (
@@ -743,6 +743,9 @@ def _apply_init(
     )
     record_adapter_receipt(install, chosen, templates_root, python_path, import_seed,
                            on_demand_seed, emit=emit, messaging=messaging)
+    if chosen in CONSENT_HOOK_SCRIPTS:
+        _emit_consent_hook(install, chosen, emit)
+        _write_consent_settings(install, chosen, emit)
     if messaging is not None:
         # Recorded once the adapter files exist: a render that fails leaves no choice behind.
         _write_messaging_choice(install, messaging, emit)
@@ -1935,6 +1938,7 @@ def _claude_code_files(
     settings_text = (_apply_messaging(settings_text, messaging) if messaging is not None else
                      _apply_messaging(settings_text, persisted_messaging(install),
                                       keep_from=install / ".claude" / "settings.json"))
+    settings_text = _apply_consent_hook(settings_text, python_path, install, "claude-code")
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
@@ -1946,6 +1950,128 @@ def _claude_code_files(
         install / ".claude" / "settings.json": settings_text,
         install / ".mcp.json": mcp_text,
     }
+
+
+# The consent hook (S1436): `init` and `update` wire Claude Code's and Codex's PermissionRequest hook into the same
+# rendered settings / hooks.json as the other hooks, so there is one writer, one receipt and one pin for all of them.
+# The script is a static file in the install's activation tree (copied, refreshed and pinned with the other hooks);
+# the adapters' install() is a library and canary function and is never called from here.
+CONSENT_HOOK_SCRIPTS = {"claude-code": "consent_claude_code.py", "codex": "consent_codex.py"}
+CONSENT_AGENTS = {"claude-code": "claude_code", "codex": "codex"}
+
+
+def consent_hook_handler(python_path: str, install: Path, adapter: str) -> tuple[str, dict[str, Any], Path]:
+    """(command, handler, script) of the consent hook entry levain renders for ``adapter``: the command is
+    ``<python> -EP <install>/activation/hooks/<script>`` with no further arguments, and the timeout is the adapters'
+    :func:`hook_timeout` at their default hold ceiling. THE COMMAND SHAPE LIVES HERE, and only here. The script is
+    the last token with nothing after it, because levain's ownership checks read the script from that position."""
+    from levain.consent.adapters.claude_code import DEFAULT_MAX_HOLD, hook_command, hook_timeout
+
+    script = install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS[adapter]
+    command = hook_command(python_path, script)
+    return command, {"type": "command", "command": command, "timeout": hook_timeout(DEFAULT_MAX_HOLD)}, script
+
+
+def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str) -> str:
+    """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry merged in
+    through the adapters' own ``_merge_handler`` (only an entry this install owns is replaced; anything else is
+    kept). Always rendered, whatever agent version is installed, so `init` and `update` render the same bytes."""
+    from levain.consent.adapters.claude_code import _merge_handler
+
+    try:
+        doc = json.loads(text)
+        if not isinstance(doc, dict):
+            raise ValueError("the rendered hook file is not a JSON object")
+        command, handler, script = consent_hook_handler(python_path, install, adapter)
+        _merge_handler(doc, command, handler, script=script)
+    except ValueError as e:
+        raise InitError(f"the {adapter} hook file could not take the consent hook: {e}") from e
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def _consent_queue_dir() -> Path:
+    """The consent queue directory the installed hook reads at run time (levain's default queue: one per levain
+    home, so one per machine by default, not one per install)."""
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
+
+
+def consent_cockpit_root(install: Path) -> Path:
+    """The cockpit data root whose authority log a grant or signed answer for this install verifies against."""
+    return install / ".levain" / "cockpit"
+
+
+def _consent_agent_version(adapter: str) -> str | None:
+    from levain.consent.canary import agent_version
+
+    return agent_version(CONSENT_AGENTS[adapter], timeout=10.0)
+
+
+def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
+    """Create the consent adapter's settings file (``<queue dir>/claude_code.json`` or ``codex.json``) when there is
+    none: this install's cockpit as ``cockpit_data_root``, away mode off. CREATE-ONLY: an existing file is never
+    written (away mode is the operator's opt-in, and repointing another install's cockpit would make that install's
+    signed answers undeliverable); one naming another cockpit, or none, is reported. Never fails init: a hook with no
+    settings file gives no decision and the agent's own dialog answers."""
+    from levain.consent.adapters import claude_code, codex
+    from levain.consent.adapters.claude_code import _refuse_symlink
+    from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
+
+    mod = claude_code if adapter == "claude-code" else codex
+    qdir = _consent_queue_dir()
+    path = qdir / mod.SETTINGS_NAME
+    ours = os.path.realpath(consent_cockpit_root(install))
+    try:
+        # the queue's own directory rule (0700, owned by this uid, not a symlink), never re-spelled here
+        ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()
+        _refuse_symlink(path)
+        if not os.path.lexists(path):
+            body = json.dumps({"cockpit_data_root": ours, "away_mode": False, "away_hold_seconds": 0},
+                              indent=2) + "\n"
+            fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=qdir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                    fh.flush()
+                    os.fchmod(fh.fileno(), 0o600)
+                    os.fsync(fh.fileno())
+                try:
+                    os.link(tmp, path)  # fails when another writer created it meanwhile: theirs is kept
+                    emit(f"  consent settings: {path} (away mode off; grants verify against {ours})")
+                    return
+                except FileExistsError:
+                    pass
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+        settings = mod.load_settings(qdir)
+        if settings.cockpit_data_root is None:
+            emit(f"  WARN: consent settings {path} name no cockpit_data_root, so no grant or signed answer can "
+                 f"answer the hook; kept as it is (add \"cockpit_data_root\": \"{ours}\" to use this install's).")
+        elif settings.cockpit_data_root != ours:
+            emit(f"  WARN: consent settings {path} name another cockpit ({settings.cockpit_data_root}); kept, so "
+                 f"grants and answers verify there, not against this install's {ours}.")
+    except (OSError, ValueError, QueueStoreError) as e:
+        emit(f"  WARN: consent settings not written ({e}); the consent hook gives no decision until "
+             f"{path} names a cockpit, so the agent's own dialog answers.")
+
+
+def _emit_consent_hook(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
+    """Init's consent hook lines: the agent version against the tested ones (always rendered, never refused), and
+    for Codex that it runs machine-wide and only after the user trusts it."""
+    from levain.consent.canary import AGENT_LABELS, TESTED_VERSIONS, untested_message
+
+    agent = CONSENT_AGENTS[adapter]
+    version = _consent_agent_version(adapter)
+    if version in TESTED_VERSIONS[agent]:
+        note = f"{AGENT_LABELS[agent]} {version} is a tested version"
+    else:
+        note = "WARN: " + untested_message(agent, version).split("; pass")[0]
+    emit(f"  consent hook ({AGENT_LABELS[agent]}): wired, away mode off; {note}")
+    if adapter == "codex":
+        emit("  consent hook (Codex): Codex lists it at its next start under \"Hooks need review\" and runs it only "
+             "once you trust it there; it runs in every Codex session on this machine.")
 
 
 # `levain init --messaging` (the opt-out for Q9). The template carries no messaging keys; the renderer adds
@@ -3435,8 +3561,9 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
     hooks_text = (adapter_root / "hooks.json.template").read_text(encoding="utf-8")
-    return _fill(hooks_text, {"PYTHON": _hook_arg_body(python_path),
-                              "INSTALL_DIR": _hook_arg_body(str(install))})
+    hooks_text = _fill(hooks_text, {"PYTHON": _hook_arg_body(python_path),
+                                    "INSTALL_DIR": _hook_arg_body(str(install))})
+    return _apply_consent_hook(hooks_text, python_path, install, "codex")
 
 
 def _install_openhands(install: Path, *, emit: Callable[[str], None] = print) -> None:
