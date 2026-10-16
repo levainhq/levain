@@ -2223,8 +2223,8 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
     except (UnknownPending, *_sign_refusals()) as exc:
         print(f"sign unconfirmed: the journal could not be re-read ({_term_safe(exc)})", file=sys.stderr)
         return 1
-    if after.state == "WAITING":
-        print(_term_safe(f"sign unconfirmed: the server answered COMMITTED but {view.pending_id} is still WAITING "
+    if after.state != "COMMITTED":
+        print(_term_safe(f"sign unconfirmed: the server answered COMMITTED but {view.pending_id} is {after.state} "
                          f"in {db.path}: the server at {url} does not hold this journal"), file=sys.stderr)
         return 1
     return 0

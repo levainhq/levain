@@ -196,7 +196,7 @@ def test_an_answer_the_journal_does_not_show_exits_1(served, listener, monkeypat
     monkeypatch.setenv("LEVAIN_WRITE_TOKEN", TOKEN)
     assert _sign(s, pid, s["laptop"], url=fake) == 1
     assert len(seen) == 1
-    assert "still WAITING" in capsys.readouterr().err
+    assert "is WAITING" in capsys.readouterr().err
     assert _state(s, pid) == "WAITING"
 
 
