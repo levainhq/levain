@@ -322,6 +322,20 @@
   .consent-code { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; user-select: all; font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--label); }
   .consent-copy { margin-left: 0; flex: 0 0 auto; min-width: 7em; text-align: center; }
   .consent-copy::before { content: none; }
+  /* a session's transcript (Q8): a quiet timeline of text, one small label per event, in the consent body's own tokens */
+  .sess-tx-wrap { flex: 1 1 100%; min-width: 0; margin-top: var(--sp-2); }
+  .sess-tx-btn { margin-left: 0; }
+  .sess-tx-btn::before { content: none; }
+  .sess-tx { display: block; margin-top: var(--sp-3); font: inherit; }
+  .sess-head { display: block; }
+  .sess-tl { margin-top: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-3); }
+  .sess-ev { display: grid; grid-template-columns: 4.5em minmax(0, 1fr); column-gap: var(--sp-3); align-items: baseline; }
+  .sess-kind { color: var(--label); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); }
+  .sess-at { grid-column: 2; grid-row: 1; color: var(--faint); font: var(--fw-regular) var(--fs-micro)/1.6 var(--mono); }
+  .sess-text { grid-column: 2; color: var(--text); font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+  .sess-prompt .sess-kind { color: var(--operate); }
+  .sess-tool .sess-text, .sess-consent .sess-text { color: var(--label); }
+  .sess-cut, .sess-note { display: block; }
   .ext-meta { color: var(--faint); flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round);
     letter-spacing: 0; }
 
@@ -1257,6 +1271,9 @@ body.ke .row:has(> .clause.clampable) > :not(.clause):not(.clause-toggle):not(.c
 /* a row whose meta line is its content (the sessions' chips): the whole line, wrapped, so nothing a chip says is cut */
 body.ke .row.meta-wrap:has(> .clause.clampable) > :not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) { grid-column: 1 / -1;
   overflow: visible; text-overflow: clip; white-space: normal; line-height: var(--lh-list); min-height: 0; margin-right: 0; }
+/* the transcript control sits below the meta line, whole width, and wraps (it must out-rank the row-3 rule above) */
+body.ke .row.meta-wrap:has(> .clause.clampable) > .sess-tx-wrap:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) { grid-column: 1 / -1; grid-row: 4;
+  overflow: visible; text-overflow: clip; white-space: normal; min-height: 0; margin-right: 0; }
 body.ke .row > .ck-rowaddr { grid-column: 1 / -1; grid-row: 1; }
 body.ke .row:has(> .clause.clampable) > .sid, body.ke .row:has(> .clause.clampable) > [data-ck-tag], body.ke .row:has(> .clause.clampable) > .muted,
 body.ke .row:has(> .clause.clampable) > .ext-meta { font-size: var(--fs-meta); line-height: var(--lh-tight); min-height: var(--ctl-row); display: block; line-height: var(--ctl-row); }
