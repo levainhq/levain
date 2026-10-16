@@ -2047,14 +2047,18 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
     chosen = persisted_messaging(install)
     if chosen == "unmanaged" or (chosen == "isolate" and p.isolate):
         # the install's own recorded choice (the default is `isolate`): not a warning, but the gaps said plainly
+        gaps = "levain does not queue or record sends to your other sessions"
+        if p.inbound is None:
+            gaps += (", and holds no message arriving from one (with no value set, Claude Code decides per "
+                     "message from the two sessions' permission modes)")
+        elif p.inbound == "accept":
+            gaps += ", and messages from your other sessions are delivered (accept)"
         return [CheckResult("Claude Code messaging", True,
-                            f"not governed, by this install's choice `{chosen}` (.levain/config.json): levain does not "
-                            "queue or record sends to your other sessions, and holds no message arriving from one "
-                            "(Claude Code's own default decides per message from the two sessions' permission "
-                            "modes). Claude Code never counts a message from another session as your consent, so "
-                            "it cannot answer a permission prompt either way. To govern messaging, a new "
-                            f"`levain init --messaging governed` writes the hold and the ask. {inbound}; {outbound} "
-                            f"{seen}")]
+                            f"not governed, by this install's messaging choice `{chosen}`: {gaps}. Claude Code never "
+                            "counts a message from another session as your consent, so it cannot answer a permission "
+                            "prompt; a delivered message can still lead Claude to act with the permissions the "
+                            "session already has. To govern messaging, a new `levain init --messaging governed` "
+                            f"writes the hold and the ask. {inbound}; {outbound} {seen}")]
     return [CheckResult("Claude Code messaging", True, detail,
                         'Set `crossSessionInbound: "hold"` and `permissions.ask: ["SendMessage"]` in the '
                         "workspace's .claude/settings.json (a new `levain init --messaging governed` writes both; "

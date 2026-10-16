@@ -50,8 +50,8 @@ DISPLAY_MAX = 2000
 _SECRET_WORDS = frozenset({
     "password", "passwd", "secret", "token", "apikey", "authorization", "credential", "cookie", "privatekey",
     "accesskey", "bearer", "passphrase"})
-# `auth` as its own word is a credential (auth, basic_auth, x-auth, auth_header) unless the next word says what kind of
-# thing it is about rather than the thing itself (auth_url, auth_type); inside a longer word (author) it is not one
+# a word that is or ends in `auth` is a credential (auth, basic_auth, x-auth, basicauth, auth_header) unless the next
+# word says what kind of thing it is about rather than the thing itself (auth_url, auth_type); `author` is not one
 _AUTH_ABOUT = frozenset({"url", "uri", "type", "method", "mode", "scheme", "provider", "endpoint", "server", "host",
                          "required", "enabled", "domain", "realm"})
 _KEY_TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+")
@@ -74,7 +74,8 @@ def _secret_named(key: Any) -> bool:
         return False
     tokens = [t.lower() for t in _KEY_TOKEN.findall(key)]
     spans = tokens + [a + b for a, b in zip(tokens, tokens[1:])]
-    if any(t == "auth" and (i + 1 == len(tokens) or tokens[i + 1] not in _AUTH_ABOUT) for i, t in enumerate(tokens)):
+    if any(t.endswith("auth") and (i + 1 == len(tokens) or tokens[i + 1] not in _AUTH_ABOUT)
+           for i, t in enumerate(tokens)):
         return True
     return any(word in span for span in spans for word in _SECRET_WORDS)
 

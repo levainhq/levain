@@ -118,12 +118,16 @@ of them); `levain init --messaging isolate|governed|off|unmanaged` picks the
 posture, and the choice is kept in `.levain/config.json` so `levain update` and
 `init --force` keep it. `isolate` is the default:
 
-- **`isolate` (default)** writes only `"isolatePeerMachines": true`: Claude asks
-  before a message leaves for a session on another machine, in every permission
-  mode. What it leaves ungoverned, plainly: levain does not queue or record a send
-  to another session on this machine (no receipt, no audit trail), and holds no
-  message arriving from one; Claude Code's own default decides per message from
-  the two sessions' permission modes. `levain doctor` says so on every run.
+- **`isolate` (default)** writes only `"isolatePeerMachines": true`: Claude Code
+  asks for your approval before a message leaves for a session beyond this
+  machine (another machine or the cloud), even in `bypassPermissions` mode; an
+  unattended session waits at that prompt. What it leaves ungoverned, plainly:
+  levain does not queue or record a send to another session on this machine (no
+  receipt, no audit trail), and holds no message arriving from one; with no
+  `crossSessionInbound` set anywhere, Claude Code's own default decides per message
+  from the two sessions' permission modes. A delivered message can lead Claude to
+  act with the permissions the session already has. `levain doctor` says so on
+  every run.
 - **`governed` (opt in)** adds `"crossSessionInbound": "hold"` (a message from
   another session shows a notice and is not delivered; a workspace `hold`
   outranks an `accept` in your user settings) and
@@ -142,7 +146,9 @@ posture, and the choice is kept in `.levain/config.json` so `levain update` and
 - **`unmanaged`** writes none of the keys, so Claude Code's own defaults apply.
 
 Whichever you choose, Claude Code never counts a message from another session as
-your consent: it cannot answer a permission prompt for you. To change an existing
+your consent: it cannot answer a permission prompt for you. `init` records the
+choice; an install with no record is read off its own `.claude/settings.json`
+(a hold or an ask there reads `governed`), so a re-render never drops them. To change an existing
 install, run `levain init --path <install> --force --messaging <choice>`.
 `levain doctor` reports the controls that apply here and names what is not
 governed; it never edits the file.

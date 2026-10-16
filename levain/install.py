@@ -746,6 +746,13 @@ def _apply_init(
     if messaging is not None:
         # Recorded once the adapter files exist: a render that fails leaves no choice behind.
         _write_messaging_choice(install, messaging, emit)
+    elif chosen == "claude-code":
+        # the default and a kept choice are recorded too, so a later read never has to guess; a config.json that
+        # cannot take the record already reads `governed` (persisted_messaging), so it is left as it is
+        try:
+            _write_messaging_choice(install, kept, emit)
+        except InitError:
+            pass
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -1975,24 +1982,48 @@ def _check_messaging(install: Path, chosen: str, messaging: str | None) -> None:
 
 
 def persisted_messaging(install: Path) -> str:
-    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). No file or no key = the
-    default, ``isolate``. A file that cannot be read as a JSON object, or a value that is not a choice (a hand
-    edit), = ``governed``: what may hold the operator's choice is never read as the looser default."""
+    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). A file that cannot be read
+    as a JSON object, or a value that is not a choice (a hand edit), = ``governed``. With no record (no file,
+    no key: an install from before init recorded every choice, or a record a dashboard write dropped), the
+    choice is read off the workspace's own `.claude/settings.json` (:func:`_messaging_in_settings`), so a
+    re-render never drops a hold or an ask the file carries; a file with none of them = ``isolate``, the
+    default. What may hold the operator's choice is never read as the looser default."""
     from levain.dashboard import LEVAIN_CONFIG_REL
 
     path = install.joinpath(*LEVAIN_CONFIG_REL)
+    config: object = {}
+    if os.path.lexists(path):
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "governed"
+        if not isinstance(config, dict):
+            return "governed"
+    if isinstance(config, dict) and "messaging" in config:
+        value = config["messaging"]
+        return value if value in MESSAGING_CHOICES else "governed"
+    return _messaging_in_settings(install)
+
+
+def _messaging_in_settings(install: Path) -> str:
+    """The choice the workspace's `.claude/settings.json` already carries: ``off`` when it denies `SendMessage`,
+    ``governed`` when it holds or refuses inbound or asks for `SendMessage` (an unrecognised inbound value holds,
+    Claude Code's rule), else ``isolate``. A file that exists and cannot be read = ``governed``."""
+    from levain.host_guard import messaging_facts
+
+    path = install / ".claude" / "settings.json"
     if not os.path.lexists(path):
         return DEFAULT_MESSAGING
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        facts = messaging_facts(json.loads(path.read_text(encoding="utf-8"))) or {}
+    except (OSError, ValueError, RecursionError):
         return "governed"
-    if not isinstance(config, dict):
+    if "SendMessage" in facts.get("deny", ()):
+        return "off"
+    if "crossSessionInbound" in facts and facts["crossSessionInbound"] != "accept" or "SendMessage" in facts.get(
+            "ask", ()):
         return "governed"
-    if "messaging" not in config:
-        return DEFAULT_MESSAGING
-    value = config["messaging"]
-    return value if value in MESSAGING_CHOICES else "governed"
+    return DEFAULT_MESSAGING
 
 
 def _apply_messaging(settings_text: str, choice: str) -> str:

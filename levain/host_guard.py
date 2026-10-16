@@ -661,9 +661,9 @@ def _workspace_codex_digest(path: Path) -> str:
 
 def _git_root(ent: Path) -> Path | None:
     """The git work tree root above ``ent`` (a ``.git`` directory or file), found by walking up.
-    Which root files Claude Code reads is :func:`cc_project_settings_files`'s answer. The hook pin
-    also covers the root's shared settings.json, which a subdirectory session does not load: a pin
-    over-covering can only raise a false alarm, never pass a hook that runs."""
+    Which root files Claude Code reads is :func:`cc_project_settings_files`'s answer; the hook pin
+    (:func:`_settings_files`) covers those and also the root's shared settings.json, which a
+    subdirectory session does not load (a pin that over-covers raises a false alarm at worst)."""
     for d in (ent, *ent.parents):
         if os.path.lexists(d / ".git"):
             return d
@@ -710,10 +710,11 @@ def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLi
     shared = d / ".claude" / "settings.json"
     beside = d / ".claude" / "settings.local.json"
     root = _git_root(d)
-    if root is None or root == hm or sys.platform == "win32" or not all(
-            _owned(p) for p in (root, root / ".git", root / ".claude") if p is root or os.path.lexists(p)):
+    main = _main_checkout(root) if root is not None else None
+    if main is None or root == hm or main == hm or sys.platform == "win32" or not all(
+            _owned(p) for r in {root, main} for p in (r, r / ".git", r / ".claude") if p is r or os.path.lexists(p)):
         return [beside], shared
-    at_root = _main_checkout(root) / ".claude" / "settings.local.json"
+    at_root = main / ".claude" / "settings.local.json"
     return ([at_root] if at_root == beside else [at_root, beside]), shared
 
 
@@ -725,6 +726,9 @@ def _settings_files(ent: Path) -> list[tuple[str, Path]]:
     if root is not None and root != ent:
         out += [(".claude/settings.json hooks (repo root)", root / ".claude" / "settings.json"),
                 (".claude/settings.local.json hooks (repo root)", root / ".claude" / "settings.local.json")]
+    listed = {p for _, p in out}
+    out += [(".claude/settings.local.json hooks (main checkout)", p)
+            for p in cc_project_settings_files(ent)[0] if p not in listed]
     return out
 
 

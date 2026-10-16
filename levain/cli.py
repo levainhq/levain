@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Claude Code cross-session messaging (claude-code adapter only). `isolate` (the default): "
-            "only isolatePeerMachines, so a send to a session on another machine asks; sends between "
+            "only isolatePeerMachines, so a send to a session beyond this machine asks; sends between "
             "sessions on this machine are not queued or recorded, and an incoming message gets Claude "
             "Code's own per-message default. `governed` (opt in): inbound messages are held and every "
             "outbound send asks. `off`: inbound refused, sending and "

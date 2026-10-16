@@ -95,14 +95,18 @@ def test_init_default_is_isolate_only_and_doctor_names_the_gaps(env, capsys):
     s = _settings(ent)
     assert s["isolatePeerMachines"] is True and "crossSessionInbound" not in s
     assert "SendMessage" not in json.dumps(s.get("permissions", {}))
-    assert persisted_messaging(ent) == "isolate"
     cfg = ent / ".levain" / "config.json"
-    assert not cfg.is_file() or "messaging" not in json.loads(cfg.read_text(encoding="utf-8"))
+    assert json.loads(cfg.read_text(encoding="utf-8"))["messaging"] == "isolate"   # the default is recorded too
     (r,) = doctor._check_cc_messaging(ent)
-    assert r.ok and not r.warn and "by this install's choice `isolate`" in r.detail
+    assert r.ok and not r.warn and "messaging choice `isolate`" in r.detail
     assert "does not queue or record sends" in r.detail and "never counts a message" in r.detail
     cfg.write_text("{not json")
     assert persisted_messaging(ent) == "governed"  # a record that cannot be read is never the looser default
+    # seen red (review round 1): a governed file whose record is gone re-rendered as isolate, dropping the hold
+    cfg.unlink()
+    s["crossSessionInbound"] = "hold"
+    (ent / ".claude" / "settings.json").write_text(json.dumps(s))
+    assert persisted_messaging(ent) == "governed"
 
 
 @pytest.mark.parametrize("choice,inbound", [("off", "refuse"), ("unmanaged", None), ("governed", "hold")])
