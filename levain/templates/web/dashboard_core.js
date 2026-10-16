@@ -141,6 +141,7 @@
   const HELD_KEY = "levain.tray.showHeld";
   let trayHeldShown = false;
   try { trayHeldShown = window.localStorage.getItem(HELD_KEY) === "1"; } catch (e) { trayHeldShown = false; }
+  const heldMounts = new Set();   // each mounted Tray's toggle and its redraw
   const saveHeldShown = () => { try { window.localStorage.setItem(HELD_KEY, trayHeldShown ? "1" : "0"); } catch (e) { /* the choice then lasts this page only */ } };
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // "2026-10-22" -> "Oct 22", from the digits alone (a Date would shift the day by the zone)
@@ -1304,8 +1305,6 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
     const held = entry.kind === "tray" && Array.isArray(view.tray_held) ? view.tray_held : [];
-    // no held row left: forget a stored "show", so the next held item does not appear already open
-    if (entry.kind === "tray" && held.length === 0 && trayHeldShown) { trayHeldShown = false; saveHeldShown(); }
     if ((!list || list.length === 0) && held.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
@@ -1334,7 +1333,12 @@
           tog.dataset.heldToggle = "1";
           const label = () => { tog.textContent = trayHeldShown ? "hide" : "show"; tog.setAttribute("aria-expanded", trayHeldShown ? "true" : "false"); };
           label();
-          tog.addEventListener("click", () => { trayHeldShown = !trayHeldShown; saveHeldShown(); label(); redraw(); });
+          // one state, every mounted Tray (the board's and the focus modal's) redraws on a change
+          heldMounts.add({ tog, sync: () => { label(); redraw(); } });
+          tog.addEventListener("click", () => {
+            trayHeldShown = !trayHeldShown; saveHeldShown();
+            for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
+          });
           line.appendChild(tog);
           bar.after(line);
         }

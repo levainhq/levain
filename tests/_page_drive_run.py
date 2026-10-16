@@ -13,6 +13,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Sequence
@@ -28,7 +29,18 @@ def run(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[s
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
         _sweep(proc.pid)
-        proc.communicate()
+        # bounded: a helper outside the group may still hold the pipes, so never wait on them unboundedly
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired as late:
+            out, err = late.stdout, late.stderr
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except OSError:
+                    pass
+        _keep_partial(sys.exc_info()[1], out, err)
         raise
     else:
         _sweep(proc.pid)
@@ -49,3 +61,9 @@ def _sweep(pgid: int) -> None:
         except (ProcessLookupError, PermissionError):
             return
         time.sleep(0.1)
+
+
+def _keep_partial(exc: BaseException | None, out: object, err: object) -> None:
+    """Keep what the driver printed before it died on the exception that is re-raised (a timeout carries it already)."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        exc.stdout, exc.stderr = out, err

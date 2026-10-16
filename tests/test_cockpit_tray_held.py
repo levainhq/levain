@@ -169,14 +169,18 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     _root, src, ids = _install(tmp_path)
     store = SporeStore(_root / ".levain" / "memory.spores.json")
     real = date.today()
-    store.add(type="task", text="a sooner held seed", disposition="seed", next=(real + timedelta(days=3)).isoformat())
-    store.add(type="task", text="a later held seed", disposition="seed", next=(real + timedelta(days=10)).isoformat())
+    held_ids = [
+        store.add(type="task", text="a sooner held seed", disposition="seed", next=(real + timedelta(days=3)).isoformat())["id"],
+        store.add(type="task", text="a later held seed", disposition="seed", next=(real + timedelta(days=10)).isoformat())["id"],
+    ]
     if not keep_seed:
         # only held rows are left in the Tray: the due seed and the fixture's now-due held seed leave it
         for key in ("seed", "held"):
             assert store.get(ids[key])
             store.update(ids[key], disposition="note")
-    return real, _Served(src, surface_tokens={"browser": "T"}, install_class="reported")
+    served = _Served(src, surface_tokens={"browser": "T"}, install_class="reported")
+    served.store, served.held_ids = store, held_ids + [ids["held"]]  # type: ignore[attr-defined]
+    return real, served
 
 
 def _label(d: date) -> str:
@@ -276,3 +280,50 @@ def test_a_filter_matching_only_hidden_held_rows_says_so_and_offers_to_show_them
     v = out["values"]
     assert "no items match" in v[2][0] and "1 held row matches" in v[2][0] and v[2][1] == 0, v
     assert v[3] == [1, "hide"], v
+
+
+def _filter(q: str) -> str:
+    return (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
+            "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+
+
+@needs_browser
+def test_a_read_with_no_held_rows_does_not_forget_that_they_are_shown(tmp_path: Path) -> None:
+    """A read that carries no held rows (a compact read, a filter matching none) must leave the stored choice alone."""
+    _real, served = _served(tmp_path)
+    strip = ("window.__fetch = window.fetch; window.fetch = async (...a) => { const r = await window.__fetch(...a); "
+             "if (!/panel\\/tray/.test(String(a[0] && a[0].url || a[0]))) return r; const j = await r.json(); "
+             "delete j.held; j.filtered = []; return new Response(JSON.stringify(j), {status: r.status, headers: r.headers}); }; 1")
+    pause = "new Promise(r => setTimeout(() => r(1), 800))"
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": WAIT},
+            {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
+            {"eval": strip},
+            {"eval": "window.LevainCockpitTransport.reload(); 1"},
+            {"eval": pause},
+            {"eval": f"[{TOGGLE} && 1, {HELD_ROWS}.length]"},
+            {"eval": "window.fetch = window.__fetch; window.LevainCockpitTransport.reload(); 1"},
+            {"eval": pause},
+            {"eval": f"[{HELD_ROWS}.length, {TOGGLE}.textContent, localStorage.getItem('levain.tray.showHeld')]"},
+        ])
+    v = out["values"]
+    assert v[1] == 2 and v[5] == [None, 0], v    # the stripped read really carried no held rows
+    assert v[8] == [2, "hide", "1"], v
+
+
+@needs_browser
+def test_toggling_in_the_focus_modal_redraws_the_board_tray_too(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path)
+    modal_toggle = "document.querySelector('#levain-modal [data-held-toggle]')"
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": WAIT},
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": f"{modal_toggle} && 1"},
+            {"eval": f"{modal_toggle}.click(); document.querySelectorAll('#levain-modal .row[data-held]').length"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"eval": f"[{HELD_ROWS}.length, {TOGGLE}.textContent]"},
+        ])
+    v = out["values"]
+    assert v[3] == 2 and v[5] == [2, "hide"], v

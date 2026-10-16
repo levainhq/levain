@@ -1,4 +1,5 @@
-"""Every place that launches headless Chrome takes its flags from the one shared file.
+"""Every file that launches headless Chrome takes its flags from the one shared file (the check is per file,
+not per launch site: a file with several launches passes if it references the shared flags anywhere).
 
 A launcher without ``--use-mock-keychain --password-store=basic`` puts a macOS keychain dialog on the operator's
 screen (a fresh profile asks for Chrome's storage key). The flags live once, in ``tests/chrome_flags.json``; a launch
@@ -42,6 +43,7 @@ def test_the_shared_flags_hold_the_keychain_protection():
 
 
 def test_every_chrome_launch_site_takes_the_shared_flags():
+    """Per file: each file that names a launch marker must also reference the shared flags."""
     files = _tracked_sources()
     sites = [p for p, t in files.items() if p not in EXEMPT and any(m in t for m in LAUNCH_MARKERS)]
     assert sites, "the scan found no launch site at all, so it is not looking where the launchers are"
