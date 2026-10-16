@@ -488,8 +488,11 @@ def test_a_cockpit_with_no_key_and_no_grant_files_nothing(tmp_path):
     import sqlite3
     from datetime import datetime, timezone
 
+    from datetime import timedelta
+
     import levain.authority as auth
     from levain.authority import ReplayCache
+    from levain.cockpit.consent import utc_stamp
     from levain.cockpit.firejournal import CockpitDB
     from tests.test_consent_cc_adapter import Key
 
@@ -506,8 +509,35 @@ def test_a_cockpit_with_no_key_and_no_grant_files_nothing(tmp_path):
                                 "class": "laptop-presence", "custody": "passphrase"},
                          signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
                          clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    ws = Path(os.path.realpath(tmp_path)) / "ws"
+    ws.mkdir()
+    auth.sign_and_append(conn, {"op": "create_grant", "grant": {
+        "id": "g1", "kind": "consent", "agent": "codex", "tools": ["apply_patch"], "workspace": str(ws),
+        "postures": ["default"], "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))}},
+        signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+        clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
     conn.close()
     assert claude_code.nothing_can_decide(settings) is False
+    # the stored shape the predicate reads: a real consent grant replays as one in force
+    from levain.consent.queue import authority_source
+    snap = authority_source(root / "cockpit.db", anchor=None)()
+    assert claude_code._a_consent_grant_in_force(snap.policy.grants.values()) is True
+
+
+def test_only_an_unexpired_consent_grant_is_one_that_can_decide():
+    """L3 r2 codex MED: with no active key, an expired grant or a grant of another kind answers nothing."""
+    from datetime import datetime, timedelta, timezone
+
+    from levain.cockpit.consent import utc_stamp
+
+    later = utc_stamp(datetime.now(timezone.utc) + timedelta(days=1))
+    earlier = utc_stamp(datetime.now(timezone.utc) - timedelta(days=1))
+    f = claude_code._a_consent_grant_in_force
+    assert f([{"kind": "consent", "expires_at": later}]) is True
+    assert f([{"kind": "consent", "expires_at": earlier}]) is False
+    assert f([{"verb": "fire", "expires_at": later}]) is False
+    assert f([{"kind": "consent", "expires_at": "not a stamp"}, "junk"]) is False
+    assert f([]) is False
 
 
 @pytest.mark.parametrize("body,expected", [

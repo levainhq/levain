@@ -177,7 +177,27 @@ def nothing_can_decide(settings: AdapterSettings) -> bool:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
         return True  # an authority that does not replay verifies nothing; the dialog answers
-    return not snap.active_keys() and not snap.policy.grants
+    return not snap.active_keys() and not _a_consent_grant_in_force(snap.policy.grants.values())
+
+
+def _a_consent_grant_in_force(grants: Iterable[Any]) -> bool:
+    """Whether any grant is a consent grant that has not expired: the two criteria of ``grant_refusal`` that hold
+    for every request (L3 r2 codex MED: an expired or other-kind grant answers nothing)."""
+    from datetime import datetime, timezone
+
+    from levain.authority import CONSENT_GRANT_KIND
+    from levain.cockpit.consent import parse_stamp
+
+    now = datetime.now(timezone.utc)
+    for grant in grants:
+        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+            continue
+        try:
+            if now < parse_stamp(grant.get("expires_at")):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _under(path: Path, roots: tuple[str, ...]) -> bool:
