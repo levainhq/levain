@@ -73,17 +73,7 @@ def cmd_owner(gl: LedgerTransport, args) -> int:
 
 def cmd_accept(gl: LedgerTransport, args) -> int:
     gl.require_joined()
-    d = gl.derivation()
-    off = d.tenure.offer
-    fp = gl.own_fingerprint()
-    if not off or fp not in T.key_fps(d.tenure, off["handle"]):
-        raise TeamError("there is no live ownership offer to a member whose key in force is this machine's")
-
-    def accept(team: R.Team, ten: T.Tenure) -> None:
-        team.owner = off["handle"]
-        team.members[off["handle"]] = off.get("email") or team.members[off["handle"]]
-        ten.offer = None
-    print(gl.update_counted(accept, f"levain team: {off['handle']} accepts ownership", push=not args.no_push))
+    print(gl.accept_offer(gl.derivation(), push=not args.no_push))
     return 0
 
 

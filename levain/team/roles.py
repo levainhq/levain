@@ -79,6 +79,18 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
     return t
 
 
+def handle_problem(h: object) -> str | None:
+    """Why ``h`` cannot be a member handle, or None: the one handle rule, for team.toml and for any caller that names a
+    handle before a team change is made from it."""
+    if not isinstance(h, str):
+        return f"member handle {h!r} must be a string"
+    if h.lower().startswith("pack-"):
+        return f"member handle {h!r} is reserved (pack-* is where pack rules are filed)"
+    if not HANDLE_RE.fullmatch(h):
+        return f"member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]*"
+    return None
+
+
 def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.mode not in MODES:
         raise RolesError(f"{where}: mode must be one of {', '.join(MODES)}")
@@ -89,10 +101,9 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")
     for h, mail in t.members.items():
-        if h.lower().startswith("pack-"):
-            raise RolesError(f"{where}: member handle {h!r} is reserved (pack-* is where pack rules are filed)")
-        if not HANDLE_RE.fullmatch(h):
-            raise RolesError(f"{where}: member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]*")
+        problem = handle_problem(h)
+        if problem:
+            raise RolesError(f"{where}: {problem}")
         if "@" not in mail:
             raise RolesError(f"{where}: member {h!r} needs an email (it maps git's user.email to the handle)")
     if not isinstance(t.client_owners, list) or not all(isinstance(c, str) for c in t.client_owners):

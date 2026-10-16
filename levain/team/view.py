@@ -361,7 +361,7 @@ JS = """\
 # ---- the server --------------------------------------------------------------------------------------------
 
 class _ViewServer(ThreadingHTTPServer):
-    # Explicit: if a supported Python ever defaulted this to True, two views could bind one port and both publish.
+    # Explicit: if a supported Python ever defaulted this to True, two views could bind one port.
     allow_reuse_port = False
     allowed_hosts: frozenset[str]
     ledger_reader: Any
@@ -371,7 +371,6 @@ class _ViewServer(ThreadingHTTPServer):
     assets: dict
     model_lock: threading.Lock
     model_lock_timeout: float
-    registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -492,7 +491,6 @@ def make_view_server(gl: LedgerTransport, *, host: str = "127.0.0.1", port: int 
 
 def serve(gl: LedgerTransport, *, host: str, port: int, recheck_days: int, ack_flag: int,
           cockpit_url: str = DEFAULT_COCKPIT_URL) -> int:
-    from . import registry
     httpd = make_view_server(gl, host=host, port=port, recheck_days=recheck_days, ack_flag=ack_flag,
                              cockpit_url=cockpit_url)
     previous = None
@@ -502,18 +500,6 @@ def serve(gl: LedgerTransport, *, host: str, port: int, recheck_days: int, ack_f
         url = f"http://{bh}:{bp}/"
         print(f"Levain team view -> {url}")
         print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
-        # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
-        # written costs the cockpit's Team tab, never the view. Pruning and registering are separate steps, so a
-        # prune failure cannot skip the registration. The socket is already bound, so a published entry always has
-        # its listener behind it.
-        try:
-            registry.prune_dead()
-        except Exception as exc:  # noqa: BLE001
-            print(f"  (registry prune failed: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-        try:
-            httpd.registration = registry.register(str(gl.repo.toplevel), url, gl.team().project)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         try:
             if threading.current_thread() is threading.main_thread():
                 import signal
@@ -523,23 +509,13 @@ def serve(gl: LedgerTransport, *, host: str, port: int, recheck_days: int, ack_f
         except KeyboardInterrupt:
             pass
     finally:
-        # Unpublish, then release the lock, then close the socket, each in its own finally so a failure in one never
-        # skips the next. This order keeps "lock held implies socket held" true on every clean exit.
         try:
             if installed:
                 import signal
                 signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
         except (ValueError, OSError):
             pass
-        try:
-            if httpd.registration is not None:
-                httpd.registration.unpublish()
-        finally:
-            try:
-                if httpd.registration is not None:
-                    httpd.registration.close()
-            finally:
-                httpd.server_close()
+        httpd.server_close()
     return 0
 
 
