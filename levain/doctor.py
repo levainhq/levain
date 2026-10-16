@@ -2034,6 +2034,17 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     problems: list[str] = []
     if stale:
         problems.append("eagerly loads seed file(s) now classified on-demand: " + ", ".join(stale))
+    # The other direction: a file this install's mode says is loaded, with no import (eager) or no
+    # pointer (on-demand). An operator-kept carrier that predates a file is the reachable case.
+    from levain.install import carrier_load_gaps
+
+    gaps = [n for n in carrier_load_gaps(text, _carrier_adapter(carrier),
+                                         persisted_memory_load(install, _carrier_adapter(carrier)))
+            if n not in stale]
+    if gaps:
+        problems.append("does not load seed file(s) this install's memory-load mode expects: "
+                        + ", ".join(gaps)
+                        + (" (the wrap procedure)" if "memory_workflow.md" in gaps else ""))
     if carrier.name == "CLAUDE.md" and not _imports_continuity(text):
         problems.append(f"does not import the living memory ({CONTINUITY_IMPORT}) where "
                         "doctor can confirm Claude Code reads it (a line of its own, above any "

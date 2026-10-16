@@ -427,3 +427,73 @@ def test_update_tells_what_to_remove_from_a_staged_old_memory_md(tmp_path, capsy
     refresh_adapter(install, apply=True, emit=lines.append)
     text = "\n".join(lines)
     assert "now lives in memory_workflow.md" in text and "## Hebbian associations" in text
+
+
+# --- review round 2 --------------------------------------------------------------------------------------------
+
+def test_a_damaged_receipt_does_not_recreate_a_seed_the_operator_deleted(tmp_path, capsys, make_install):
+    """A receipt that is gone reads as 'no record' for every seed; only a seed new to the package may be
+    written on that reading. memory.md is not new, so its absence is the operator's and the carrier is held."""
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code")
+    assert rc == 0, out
+    (install / "seed" / "memory.md").unlink()
+    receipt = install / ".levain" / "adapter-receipt.json"
+    receipt.write_text("{not json", encoding="utf-8")
+    lines: list[str] = []
+    r = refresh_adapter(install, apply=True, emit=lines.append)
+    assert not (install / "seed" / "memory.md").exists()
+    assert "CLAUDE.md" in r.review
+    assert "would load seed file(s) not installed yet: memory.md" in "\n".join(lines)
+
+
+def _carrier_edited_after_the_split(tmp_path, capsys, mode=None, adapter="claude-code"):
+    rc, install, out = _init(tmp_path, capsys, "x", adapter, **({"memory_load": [mode]} if mode else {}))
+    assert rc == 0, out
+    carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
+    old = "head\n**End of session:** When your operator signals the session is ending\n"
+    receipt = inst._read_adapter_receipt(install)
+    (install / "seed" / WORKFLOW).unlink()
+    receipt.pop(f"seed/{WORKFLOW}")
+    (install / "seed" / "memory.md").write_text(old, encoding="utf-8")
+    receipt["seed/memory.md"] = inst._sha256_text(old)
+    carrier = install / carrier_name
+    text = carrier.read_text(encoding="utf-8")
+    text = text.replace("@seed/memory_workflow.md\n", "")
+    import re
+    text = re.sub(r"^\d+\. `seed/memory_workflow.md`.*\n", "", text, flags=re.M)
+    text = re.sub(r"^- `seed/memory_workflow.md`.*\n", "", text, flags=re.M)
+    carrier.write_text(text, encoding="utf-8")
+    receipt[carrier_name] = inst._sha256_text(text)
+    inst._write_adapter_receipt(install, receipt)
+    carrier.write_text(text + "\n- my own line\n", encoding="utf-8")  # the operator's edit: update stages the carrier
+    return install, carrier_name
+
+
+@pytest.mark.parametrize("adapter", ["claude-code", "codex"])
+def test_doctor_reports_a_kept_carrier_that_leaves_the_workflow_unreachable(tmp_path, capsys, make_install, adapter):
+    install, carrier_name = _carrier_edited_after_the_split(tmp_path, capsys, adapter=adapter)
+    lines: list[str] = []
+    r = refresh_adapter(install, apply=True, emit=lines.append)
+    assert carrier_name in r.review and (install / "seed" / WORKFLOW).is_file()
+    assert "memory_workflow.md" in "\n".join(lines) and "wrap procedure" in "\n".join(lines)
+    check = doctor._check_claude_code if adapter == "claude-code" else doctor._check_codex
+    row = _row(check(install), f"{carrier_name} freshness")
+    assert not row.ok and WORKFLOW in row.detail and "merge" in row.hint
+
+
+def test_doctor_checks_the_pointer_direction_for_an_on_demand_install(tmp_path, capsys, make_install):
+    rc, install, out = _init(tmp_path, capsys, "x", "claude-code", memory_load=["on-demand"])
+    carrier = install / "CLAUDE.md"
+    import re
+    text = re.sub(r"^- `seed/memory_workflow.md`.*\n", "", carrier.read_text(encoding="utf-8"), flags=re.M)
+    carrier.write_text(text, encoding="utf-8")
+    row = _row(doctor._check_claude_code(install), "CLAUDE.md freshness")
+    assert not row.ok and WORKFLOW in row.detail
+
+
+@pytest.mark.parametrize("memory_load", [["on-demand"], ["openhands=on-demand"], ["eager"]])
+def test_openhands_has_no_carrier_so_a_memory_load_is_refused_before_any_write(tmp_path, capsys, make_install,
+                                                                               memory_load):
+    rc, install, out = _init(tmp_path, capsys, "x", "openhands", memory_load=memory_load)
+    assert rc == 1 and "no carrier" in out and "openhands" in out
+    assert not install.exists()

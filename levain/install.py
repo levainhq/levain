@@ -57,6 +57,7 @@ from levain.packs import (
     BASE_SEED_REACHABLE,
     DEFAULT_MEMORY_LOAD,
     MEMORY_LOAD_CHOICES,
+    MEMORY_LOAD_SEED,
     ON_DEMAND_SUMMARY,
     PackBrand,
     PackError,
@@ -70,6 +71,7 @@ from levain.packs import (
     on_demand_entries,
     order_activation_roots,
     render_entries,
+    seed_classes,
     verbatim_entries,
 )
 
@@ -356,6 +358,11 @@ def run_init(
     if elsewhere:  # an install carries one adapter; a mode for another would be recorded and never read
         print(f"FAIL: --memory-load {elsewhere[0]}={memory_load_by_adapter[elsewhere[0]]} names an adapter "
               f"this install does not carry; it carries {chosen}. Use {chosen}=MODE, or a bare MODE.")
+        return 1
+
+    if chosen == "openhands" and (memory_load_default is not None or memory_load_by_adapter):
+        print("FAIL: --memory-load has no effect on openhands: that adapter has no carrier to load a seed file "
+              "into. Drop the flag.")
         return 1
 
     if install.exists() and not install.is_dir():
@@ -2776,12 +2783,14 @@ def _refresh_adapter(
             shipped = {}  # the same read fails again below, where it is reported
         # A base seed file this release adds is installed by this very refresh (nothing of
         # the operator's is there to keep), so it does not hold the carrier back. That is
-        # only a file with no receipt record: a recorded one that is absent was deleted, the
-        # refresh keeps it absent, and the carrier would import it.
+        # only a file named in _SEEDS_NEW_TO_THE_PACKAGE with no receipt record: any other
+        # absent seed was deleted (or its record is gone), the refresh keeps it absent, and
+        # the carrier would import it.
         recorded = _read_adapter_receipt(install) or {}
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
                          if not (install / "seed" / e.name).is_file()
-                         and not (install / "seed" / e.name in shipped
+                         and not (e.name in _SEEDS_NEW_TO_THE_PACKAGE
+                                  and install / "seed" / e.name in shipped
                                   and f"seed/{e.name}" not in recorded))
         held = None
         if not carrier:
@@ -2869,7 +2878,8 @@ def _refresh_seeds_only(
         # refresh (see refresh_adapter)
         recorded = _read_adapter_receipt(install) or {}
         missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file()
-                         and not (install / "seed" / e.name in files
+                         and not (e.name in _SEEDS_NEW_TO_THE_PACKAGE
+                                  and install / "seed" / e.name in files
                                   and f"seed/{e.name}" not in recorded))
         if not carrier:
             lines.append("  seed files: not refreshed, because the pack reconcile above is "
@@ -3086,8 +3096,6 @@ def _refresh_activation(
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
-            if key.startswith("seed/"):
-                seed_failed.append(key)
             lines.append(f"  {key}: could not be written ({e}).")
     if apply and new_receipt != record:
         try:
@@ -3363,6 +3371,32 @@ def _levain_render_variant(
     return same(x, y, v)
 
 
+# The base seed files a release adds to installs that never had them. Only these are written on
+# the strength of "no receipt record"; for every other seed that reading also fits a deleted file
+# or a damaged receipt, and the operator's absence is kept.
+_SEEDS_NEW_TO_THE_PACKAGE = frozenset(MEMORY_LOAD_SEED)
+
+
+def carrier_load_gaps(text: str, adapter: str, mode: str) -> list[str]:
+    """Base seed files a carrier's text fails to reach the way ``mode`` classes them: an eager file with
+    no import (claude-code ``@seed/x`` line, codex numbered read-list row) and an on-demand file with no
+    pointer row. Both directions, base files only (a pack's seed files are not read here). A file the
+    carrier loads in the WRONG class is the freshness check's own finding, not repeated here."""
+    import re
+
+    eager, on_demand = seed_classes(mode)
+    gaps: list[str] = []
+    for name in eager:
+        pattern = (rf"^@seed/{re.escape(name)}\s*$" if adapter == "claude-code"
+                   else rf"^\d+\. `seed/{re.escape(name)}`")
+        if not re.search(pattern, text, flags=re.M):
+            gaps.append(name)
+    for name in on_demand:
+        if not re.search(rf"^- `seed/{re.escape(name)}`", text, flags=re.M):
+            gaps.append(name)
+    return gaps
+
+
 # The opening of the wrap procedure as memory.md carried it before it moved to memory_workflow.md.
 _OLD_WRAP_SENTINEL = "**End of session:** When your operator signals"
 
@@ -3450,6 +3484,14 @@ def _refresh_adapter_files(
                          f"writing it), and this levain renders it differently, now at "
                          f"{where}. Merge it in, or copy it over yours if you never edited "
                          f"it. Listed once: the next update is quiet about it.")
+            if carrier_name is not None and target.name == carrier_name and here_text is not None:
+                gaps = carrier_load_gaps(here_text, "claude-code" if carrier_name == "CLAUDE.md" else "codex",
+                                         persisted_memory_load(install, "claude-code" if carrier_name == "CLAUDE.md"
+                                                               else "codex"))
+                if gaps:
+                    lines.append(f"  {key}: your copy does not load {', '.join(gaps)}"
+                                 + (" (the wrap procedure)" if "memory_workflow.md" in gaps else "")
+                                 + f", so the agent is missing it until you merge the staged {key}.")
             if key == "seed/memory.md" and here_text is not None and _OLD_WRAP_SENTINEL in here_text:
                 lines.append("  seed/memory.md: the wrap procedure now lives in memory_workflow.md, so "
                              "your copy's block from '**Pair with staleness:**' up to '## Hebbian "
