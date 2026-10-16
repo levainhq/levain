@@ -652,9 +652,14 @@
         const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
         const ownOf = (a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb);
         // an action a browser cannot perform (laptop-only, refused) draws nothing: the panel's rows already name the laptop command.
-        // A text panel keeps its read-first editor whatever the gesture (its own design, held by the editor tests)
+        // A text panel keeps its read-first editor whatever the gesture (its own design, held by the editor tests):
+        // only the editor verb, the one whose head has exactly one field, new_body (dashboard_core.js mounts that alone as an editor)
         const textPanel = view.extra_panels[pid].markdown != null;
-        const own = pActions.find((a) => ownOf(a) && (isPostable(a) || textPanel));
+        const isEditor = (a) => {
+          const h = view.verb_heads[a.verb];
+          return textPanel && isObj(h) && Array.isArray(h.fields) && h.fields.length === 1 && h.fields[0] === "new_body";
+        };
+        const own = pActions.find((a) => ownOf(a) && (isPostable(a) || isEditor(a)));
         const ownLaptop = !own && pActions.some((a) => ownOf(a) && !isPostable(a));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
         const cmpDecl = view.extra_panels[pid].compose;
