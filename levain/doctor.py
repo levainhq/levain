@@ -1983,13 +1983,15 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
         return []  # Codex documents no cross-session messaging
     p = hg.cc_messaging_posture(install)
     seen = (f"[per the settings files read: {', '.join(p.sources) or 'none'}; not visible to doctor: --settings, "
-            "--setting-sources, CLAUDE_CONFIG_DIR relocation, MDM-profile and server-managed settings, plugin mods, "
+            "--setting-sources, CLAUDE_CONFIG_DIR relocation, settings.local.json, MDM-profile, server-managed and (on WSL) "
+            "inherited Windows settings, plugin mods, "
             "the running Claude Code's version]")
     inbound = (f"inbound {p.inbound} ({p.inbound_source})" if p.inbound in ("hold", "refuse")
                else "inbound NOT governed: " + (f"accept ({p.inbound_source})" if p.inbound == "accept"
                                                  else "no value set, so Claude Code decides per message"))
     if p.outbound == "deny":
-        outbound = f"outbound off: SendMessage denied ({p.outbound_source})"
+        outbound = (f"outbound off: SendMessage denied ({p.outbound_source})"
+                    + ("" if p.list_denied else "; ListAgents not denied, so listing your sessions stays on"))
     elif p.outbound == "ask":
         outbound = (f"outbound asks: every SendMessage goes to the permission flow (levain's consent hook, any "
                     f"PermissionRequest hook you installed, or your dialog) ({p.outbound_source})"

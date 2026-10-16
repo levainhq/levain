@@ -439,9 +439,19 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
     argv = ["--max-hold", repr(float(max_hold))]
     if queue_dir is not None:
         argv += ["--queue-dir", str(Path(queue_dir).resolve())]
-    _atomic_write(script, HOOK_TEMPLATE.format(python=python, argv=repr(argv)), mode=0o755)
     command = hook_command(python, script)
     handler = {"type": "command", "command": command, "timeout": hook_timeout(max_hold)}
+    # merge onto a copy first: a settings file the merge refuses (a malformed `hooks` or `permissions`) stops the
+    # install before the script is written, so no hook script is left without its settings entry
+    try:
+        trial = json.loads(settings_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        trial = {}
+    if not isinstance(trial, dict):
+        raise ValueError(f"{settings_path} is not a JSON object")
+    _merge_handler(trial, command, handler, script=script)
+    merge_messaging(trial, inbound=inbound, outbound=outbound)
+    _atomic_write(script, HOOK_TEMPLATE.format(python=python, argv=repr(argv)), mode=0o755)
     for _ in range(5):
         before = _stat_key(settings_path)
         try:

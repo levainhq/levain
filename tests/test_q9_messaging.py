@@ -68,9 +68,9 @@ def test_managed_is_the_first_trusted_value_and_user_is_then_ignored(env):
     assert posture(ent, home, [("/managed.json", {"crossSessionInbound": "accept"})]).inbound == "accept"
 
 
-def test_a_local_refuse_beats_a_managed_accept(env):
+def test_a_workspace_refuse_beats_a_managed_accept(env):
     ent, home = env
-    _write(ent / ".claude" / "settings.local.json", {"crossSessionInbound": "refuse"})
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "refuse"})
     assert posture(ent, home, [("/managed.json", {"crossSessionInbound": "accept"})]).inbound == "refuse"
 
 
@@ -81,20 +81,39 @@ def test_an_unrecognised_value_holds_and_in_managed_refuses(env):
     assert posture(ent, home, [("/managed.json", {"crossSessionInbound": 7})]).inbound == "refuse"
 
 
-def test_below_a_repo_root_the_local_file_is_the_roots_and_the_shared_file_the_workspaces(env, tmp_path):
+def test_only_the_workspaces_shared_settings_file_is_credited(env, tmp_path):
     ent, home = env
     (tmp_path / ".git").mkdir()
-    # Claude Code reads the shared settings.json from the session's own directory only (settings.md)
+    # Claude Code reads the shared settings.json from the session's own directory only (settings.md); a local file
+    # can only tighten and its location depends on worktrees and ownership, so it is never credited
     _write(tmp_path / ".claude" / "settings.json", {"crossSessionInbound": "refuse",
                                                     "permissions": {"ask": ["SendMessage"]}})
-    _write(ent / ".claude" / "settings.local.json", {"crossSessionInbound": "refuse"})
+    for d in (ent, tmp_path):
+        _write(d / ".claude" / "settings.local.json", {"crossSessionInbound": "refuse",
+                                                       "permissions": {"deny": ["SendMessage"]}})
     p = posture(ent, home)
     assert p.inbound is None and p.outbound == "open"
-    # ... and keeps settings.local.json at the repository root
-    _write(tmp_path / ".claude" / "settings.local.json", {"crossSessionInbound": "hold",
-                                                          "permissions": {"deny": ["SendMessage"]}})
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "hold", "permissions": {"ask": ["SendMessage"]}})
     p = posture(ent, home)
-    assert p.inbound == "hold" and p.outbound == "deny"
+    assert p.inbound == "hold" and p.outbound == "ask"
+
+
+@pytest.mark.parametrize("rule", ["*", "Send*", "*Message"])
+def test_a_glob_rule_naming_the_whole_tool_governs_and_is_pinned(env, rule):
+    ent, home = env
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "hold", "permissions": {"ask": [rule]}})
+    assert posture(ent, home).outbound == "ask"
+    hg.check_agent_hook_pins(ent)
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "hold"})
+    status, diffs = hg.check_agent_hook_pins(ent)
+    assert status == "changed" and any(d.startswith(".claude/settings.json messaging:") for d in diffs)
+
+
+@pytest.mark.parametrize("rule", ["SendMessage(x)", "Send", "SendMessageX", "mcp__*"])
+def test_a_rule_that_does_not_name_the_whole_tool_does_not_govern(env, rule):
+    ent, home = env
+    _write(ent / ".claude" / "settings.json", {"permissions": {"ask": [rule]}})
+    assert posture(ent, home).outbound == "open"
 
 
 def test_the_last_managed_file_setting_the_key_wins(env):
@@ -193,6 +212,29 @@ def test_merge_reads_a_null_permissions_block_as_no_rules():
 def test_merge_refuses_a_malformed_permissions_block():
     with pytest.raises(ValueError):
         cc.merge_messaging({"permissions": ["SendMessage"]})
+
+
+@pytest.mark.parametrize("bad", [{"permissions": ["SendMessage"]}, {"permissions": {"ask": "SendMessage"}},
+                                 {"hooks": []}])
+def test_install_refuses_a_settings_file_it_cannot_merge_before_writing_the_script(tmp_path, bad):
+    ws = tmp_path / "ws"
+    _write(ws / ".claude" / "settings.json", bad)
+    with pytest.raises(ValueError):
+        cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=0,
+                   allow_untested_agent_version=True)
+    assert not (ws / ".claude" / "hooks" / cc.HOOK_SCRIPT_NAME).exists()
+    assert json.loads((ws / ".claude" / "settings.json").read_text()) == bad
+
+
+def test_doctor_names_listing_left_on_when_only_sending_is_denied(env):
+    ent, _ = env
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "refuse", "permissions": {"deny": ["SendMessage"]}})
+    (r,) = doctor._check_cc_messaging(ent)
+    assert "ListAgents not denied" in r.detail
+    _write(ent / ".claude" / "settings.json", {"crossSessionInbound": "refuse",
+                                               "permissions": {"deny": ["SendMessage", "ListAgents"]}})
+    (r,) = doctor._check_cc_messaging(ent)
+    assert "ListAgents not denied" not in r.detail
 
 
 def test_install_writes_the_controls_and_refuses_an_unknown_choice_before_writing(tmp_path):

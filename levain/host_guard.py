@@ -489,10 +489,20 @@ def messaging_facts(doc: Any) -> dict[str, Any] | None:
     if isinstance(perms, Mapping):
         for kind in ("ask", "deny"):
             rules = perms.get(kind)
-            hit = sorted(t for t in MESSAGING_TOOLS if isinstance(rules, list) and t in rules)
+            hit = sorted(t for t in MESSAGING_TOOLS if isinstance(rules, list)
+                         and any(_rule_names_tool(r, t) for r in rules))
             if hit:
                 facts[kind] = hit
     return facts or None
+
+
+def _rule_names_tool(rule: Any, tool: str) -> bool:
+    """A deny or ask rule naming ``tool`` whole: the bare name, or a glob in the tool-name position (Claude Code:
+    "The pattern must match the full tool name: `"*"` matches every tool"). A rule with a specifier (``X(...)``)
+    does not name a tool whole."""
+    if not isinstance(rule, str) or "(" in rule:
+        return False
+    return re.fullmatch(re.escape(rule).replace(r"\*", ".*"), tool) is not None
 
 
 def _messaging_digest(path: Path) -> str:
@@ -522,17 +532,18 @@ def cc_messaging_posture(install: str | os.PathLike[str], home: str | os.PathLik
     merge in order, a later drop-in over an earlier one, so the last that sets it), else the user's; a workspace
     `hold`/`refuse` applies only when stricter; an unrecognised value holds wherever it is, and in managed settings
     counts as `refuse`. Permission rules merge across layers unless managed `allowManagedPermissionRulesOnly` is true;
-    an `isolatePeerMachines` true from any layer applies. The workspace files are the shared `.claude/settings.json` in
-    the workspace itself (Claude Code reads it from the session's working directory only) and `settings.local.json`,
-    which Claude Code keeps at the repository root when the session starts below one (unless that root is home).
-    Not read: `--settings`, `--setting-sources`, a relocated CLAUDE_CONFIG_DIR, MDM-profile and server-managed
-    settings, plugin mods. `--settings` and the user file cannot loosen a workspace `hold`/`refuse` or remove a rule;
+    an `isolatePeerMachines` true from any layer applies. The workspace file is the shared `.claude/settings.json` in
+    the workspace itself (Claude Code reads it from the session's working directory only); `settings.local.json` is not
+    credited (it can only tighten). Not read: `--settings`, `--setting-sources`, a relocated CLAUDE_CONFIG_DIR,
+    MDM-profile, server-managed and (on WSL) inherited Windows settings, plugin mods. `--settings` and the user file cannot loosen a workspace `hold`/`refuse` or remove a rule;
     a managed source with `allowManagedPermissionRulesOnly` discards the workspace rules."""
     ent = Path(os.path.abspath(install))
     hm = Path(home) if home is not None else Path(os.path.expanduser("~"))
-    root = _git_root(ent)
-    local_dir = root if root is not None and root != ent and root != hm else ent
-    project = [local_dir / ".claude" / "settings.local.json", ent / ".claude" / "settings.json"]
+    # Only the shared settings.json Claude Code reads from the session's working directory (the workspace; levain writes
+    # its controls there) is credited. settings.local.json is not read: where Claude Code keeps it depends on git
+    # worktrees, ownership and home, and a local value can only tighten (a local accept never applies, rules only add),
+    # so leaving it out can only under-report, never report governed when it is not.
+    project = [ent / ".claude" / "settings.json"]
     managed_docs = list(load_managed_settings() if managed is None else managed)
     # (path, document, kind): managed, then user, then the workspace files
     layers: list[tuple[str, Any, str]] = [(p, d, "managed") for p, d in managed_docs]
