@@ -2908,15 +2908,17 @@ def test_apply_init_bakes_pack_brand_into_config(tmp_path: Path, monkeypatch):
             "/usr/bin/python3", "anneal-memory", specs, verbatim,
             packs=[(load_pack_manifest(pack), pack)],
         )
+    # init also records the messaging choice in the same file (isolate when none is given).
     assert _read_config(install) == {
         "surface_name": "Acme Solutions Harness",
         "subtitle": "your team's memory",
+        "messaging": "isolate",
     }
 
 
 def test_apply_init_no_pack_writes_no_brand_config(tmp_path: Path, monkeypatch):
     # A base-only install (no --pack) leaves no brand config — surfaces show the
-    # Levain default. (No config.json is created for a fresh brand-less install.)
+    # Levain default. The config file holds only the recorded messaging choice.
     from levain.interview import build_field_plan, parse_template
 
     class _OK:
@@ -2937,7 +2939,7 @@ def test_apply_init_no_pack_writes_no_brand_config(tmp_path: Path, monkeypatch):
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", specs, verbatim, packs=[],
         )
-    assert not (install / ".levain" / "config.json").exists()
+    assert _read_config(install) == {"messaging": "isolate"}
 
 
 def test_write_brand_config_refuses_to_clobber_unreadable_config(tmp_path: Path):
