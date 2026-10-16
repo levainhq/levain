@@ -34,7 +34,8 @@ __all__ = ["TeamSource", "TeamSnapshot", "team_discoverer", "invalidate", "FETCH
 _PENDING = "The team ledger is still being read on this machine; this page will fill in."
 REGION = "team"
 STATUS_ID = "team-status"
-FACETS = frozenset({"entry_type", "entry_owner", "agent", "age_days", "exposure_count"})
+# ``about``: a join row's digest of what accepting it takes (levain.team.reader.join_digest), which the accept signs
+FACETS = frozenset({"entry_type", "entry_owner", "agent", "age_days", "exposure_count", "about"})
 _ROW_MAX = 400
 # the Team zone's verbs (levain.team.cockpit_verbs registers them): Sync offers the fetch while the ledger has a remote,
 # Joins pending offers the accept while a join waits on THIS machine
@@ -247,8 +248,10 @@ def _join_rows(joins: list[dict]) -> tuple[RowIn, ...]:
         mine = _MINE_LINE.get(j["kind"]) if j.get("mine") else None
         line = mine.format(h=j["handle"]) if mine else j.get("line")
         body = _one_line(" · ".join(p for p in (line, j.get("fingerprint")) if p))
+        about = j.get("about")
         out.append(RowIn(id=f"join:{j['kind']}:{j['handle']}:{j.get('n', 0)}", title=title, body=body,
-                         stored={"title": title, "body": body}))
+                         facets={"about": about} if isinstance(about, str) else {},
+                         stored={"title": title, "body": body, "about": about}))
     return tuple(out)
 
 

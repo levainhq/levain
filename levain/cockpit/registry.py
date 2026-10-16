@@ -85,6 +85,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the Team zone's entries (levain.cockpit.team_panels): what an entry is and who holds it
     "entry_type": ("str", _is_str),
     "entry_owner": ("str", _is_str),
+    "about": ("str", _is_str),          # a Joins row: the digest of what accepting it takes (the accept signs it)
     # K1 job rows (design §6.4 item 3: the consult panel's recent-jobs list). Registered here, in
     # the one closed registry, rather than invented by the provider.
     "job_status": ("enum", _enum("pending", "running", "done", "failed")),
