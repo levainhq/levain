@@ -29,6 +29,7 @@ from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.consent import parse_stamp
 from levain.cockpit.firejournal import DB_NAME, CockpitDB, OpView, UnknownPending, _key_problem
+from levain.launch import child_env
 
 DEFAULT_URL = "http://127.0.0.1:7420"
 TOKEN_ENV = "LEVAIN_WRITE_TOKEN"
@@ -138,10 +139,10 @@ def own_listener(host: str, port: int) -> bool:
             return False
         return any(owner == uid and (addr in wanted or addr in _PROC_WILDCARD) for addr, owner in found)
     if sys.platform == "darwin":
-        lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+        lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else (shutil.which("lsof") or "/usr/sbin/lsof")
         try:
             cp = subprocess.run([lsof, "-nP", "-a", "-u", str(uid), f"-iTCP:{port}", "-sTCP:LISTEN", "-Fn"],
-                                capture_output=True, text=True, timeout=5, check=False)
+                                capture_output=True, text=True, timeout=5, check=False, env=child_env())
         except (OSError, subprocess.SubprocessError):
             return False
         names = {ln[1:] for ln in cp.stdout.splitlines() if ln.startswith("n")}
