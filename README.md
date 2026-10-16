@@ -304,7 +304,7 @@ What each custody guarantees, and what it does not:
 - `passphrase`: a typed passphrase per signature, and no defence against same-uid malware (a program running as you can keylog it or copy the file). The lowest class.
 - `tpm`: a non-exportable key, and no presence.
 - `fido`: a touch on a key you plugged in, custody declared.
-- `passkey`: a WebAuthn passkey (Face ID, Touch ID or a device PIN in a browser), for a `display-phone` key only. The one thing a passkey signs in levain is a consent answer, through the cockpit page: it can allow a T2 request, never a T3 one (it can deny either). An iCloud or Google passkey belongs to that account: it syncs to every device signed into it (this laptop included), can be shared with another person, and returns with account recovery, which is why it has its own word. Synced passkeys report no signature counter, so levain cannot detect a cloned one.
+- `passkey`: a WebAuthn passkey (Face ID, Touch ID or a device PIN in a browser), for a `display-phone` key only. The one thing a passkey signs in levain is a consent answer, through the phone page (`levain consent phone`): it can allow a T2 request, never a T3 one (it can deny either). An iCloud or Google passkey belongs to that account: it syncs to every device signed into it (this laptop included), can be shared with another person, and returns with account recovery, which is why it has its own word. Synced passkeys report no signature counter, so levain cannot detect a cloned one.
 - `fido-attested` (not yet): the only class levain would prove; it is refused until attestation at enrol is built.
 
 The custody is a declaration, signed by the key that enrols it, not a proof. A signature from a Secure Enclave key looks the same whether or not the key was made to need a touch, so the touch rests on how the key was made, which is why the helper makes it and confirms it.
@@ -313,22 +313,22 @@ The keys directory (`<levain home>/keys`) is denied to an entity's bash and file
 
 ### Answer an agent from your phone
 
-An agent's consent request can be answered from any browser that reaches the cockpit over https, with a passkey. The cockpit stays bound to loopback; you put an https proxy you trust in front of it. With Tailscale:
+An agent's consent request can be answered from your phone with a passkey. `levain consent phone` serves a small consent page on its own loopback port (7428), separate from the cockpit; you put an https proxy you trust in front of that port, never in front of the cockpit. With Tailscale:
 
 ```
-levain serve --write --tailscale     # finds this machine's tailnet name; prints the phone link and the next line
-tailscale serve --bg --https=443 http://127.0.0.1:7420
+levain consent phone --tailscale     # finds this machine's tailnet name; prints the phone link and the next line
+tailscale serve --bg --https=443 http://127.0.0.1:7428
 ```
 
-Any other https proxy works the same way with `--remote-host <its name>`. Open the printed phone link on the phone (it carries this server's write token, so send it to yourself privately). On a waiting request, "make a passkey here" creates a passkey on the phone and shows two laptop commands that enrol it as a `display-phone` key; a passkey can never enrol itself. After that, a waiting request shows "allow with passkey" and "deny with passkey". The phone signs the exact answer record; the cockpit converts the passkey's signature to an OpenSSH one and the queue checks it with `ssh-keygen`, as for an answer signed in the terminal.
+Any other https proxy works the same way with `--name <its https name>`. Open the printed phone link on the phone (it carries the phone port's own token, so send it to yourself privately). "make a passkey here" creates a passkey on the phone and shows two laptop commands that enrol it as a `display-phone` key; a passkey can never enrol itself. After that, a waiting request shows "allow with passkey" and "deny with passkey" (deny only for a T3 request: its allow is the laptop's). The phone signs the exact answer record; the phone port converts the passkey's signature to an OpenSSH one and the queue checks it with `ssh-keygen`, as for an answer signed in the terminal.
 
 What to know:
 
 - A passkey is made for one https name. Rename the machine or the tailnet and you make and enrol a new one.
 - The passkey prompt shows no request text. The page shows what you are answering; the signature covers exactly that request.
-- A server started with `--remote-host` needs the token for every read, here and on the phone, and from off this machine accepts only passkey answers: no edits and no chat (chat is refused on such a server). levain tells an off-machine request by the header a proxy sets (`X-Forwarded-For`, `Forwarded`, `X-Forwarded-Host`, `X-Real-IP`) or by the browser's Host naming the remote name, so use a proxy that passes the browser's Host through unchanged, as `tailscale serve` does.
-- Anyone who holds the phone link and reaches the name can read the waiting requests. Only an enrolled passkey can answer one.
-- The page you read is served by your own user account, as the terminal you answer in is. Levain does not confine a Claude Code or Codex session, so an agent running as you could stop the cockpit, serve its own page on that port and show you one request while asking you to sign another. Answer only on a cockpit you started, and turn the proxy off when you stop it (`tailscale serve reset`).
+- The phone port serves only the consent page, the waiting requests and the passkey routes: not the cockpit, not your install. Its token opens nothing on the cockpit.
+- Anyone who holds the phone link and reaches the name can read the waiting requests until the phone port stops. Only an enrolled passkey can answer one.
+- The page you read is served by your own user account, as the terminal you answer in is. Levain does not confine a Claude Code or Codex session, so an agent running as you could stop the phone port, serve its own page on that port and show you one request while asking you to sign another. Answer only on a phone port you started, and turn the proxy off when you stop it (`tailscale serve reset`).
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
