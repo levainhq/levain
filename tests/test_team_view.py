@@ -19,7 +19,7 @@ TEAM = R.Team(project="ledgerline", owner="ana", members={"ana": "a@x.io", "ben"
 
 @pytest.fixture(autouse=True)
 def _isolated_levain_home(tmp_path, monkeypatch):
-    # autouse: nothing in this file may reach the real ~/.levain (the view registers there when serve() runs)
+    # autouse: nothing in this file may reach the real ~/.levain or the real home
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
 
