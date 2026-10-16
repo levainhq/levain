@@ -113,6 +113,32 @@ def test_a_downstream_row_with_a_consent_id_is_skipped(tmp_path):
     assert any("consent:" in str(s.get("reason")) for s in p["skipped"])
 
 
+
+def _plain_source(**kw) -> ProviderSpec:
+    return ProviderSpec(
+        "decisions", "triage-list", "Decisions waiting", "gate",
+        lambda ctx: Read(rows=(RowIn(id="np:1", title="Merge release", stored={"s": 1}),)),
+        order="decision.dated", version_fields=("*",), rowset="needs_phill",
+        read_one=lambda ctx, rid: Absent("gone"), **kw)
+
+
+def test_a_source_with_default_search_fields_still_searches_title_body_and_id(tmp_path):
+    ck = _ck()
+    ck.attach_decision_source(_plain_source())
+    ck.attach_consent_rows(lambda now: read_listing(tmp_path / "none", now=now))
+    fields = ck.panel("decisions", credential_class="token")["search"]["fields"]
+    assert {"title", "body", "id", "consent_state", "consent_tier"} <= set(fields)
+
+
+def test_a_changed_search_head_over_unchanged_rows_is_not_a_304(tmp_path):
+    def etag(**kw):
+        ck = _ck()
+        ck.attach_decision_source(_plain_source(**kw))
+        ck.attach_consent_rows(lambda now: read_listing(tmp_path / "none", now=now))
+        return ck.panel("decisions", credential_class="token")["etag"]
+    assert etag(search_fields=("title",)) != etag(search_fields=("body",))
+    assert etag(search_fields=("title",)) == etag(search_fields=("title",))
+
 # --- the page ---------------------------------------------------------------------------------------------
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser          # noqa: E402
@@ -305,3 +331,29 @@ def test_the_decisions_modal_carries_a_filter_that_narrows_by_agent_tool_and_sta
     assert full == 3 and cleared == full, out
     assert (patch, codex, cc) == (1, 2, 1), out
     assert none == [0, "no match"], out
+
+
+@needs_browser
+def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tmp_path, monkeypatch):
+    q = _home_queue(tmp_path, monkeypatch)
+    for i, tool in enumerate(("Bash", "Write", "apply_patch")):
+        q.file(agent="claude_code", agent_session_id="s", tool_name=tool, tool_input={"command": "ls"}, cwd="/w",
+               hold=timedelta(minutes=5), event_id=f"r{i}")
+    _root, src, _ids = _install(tmp_path)
+    typ = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
+           " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
+    rows = "document.querySelectorAll('#levain-modal .consent-row').length"
+    ready = "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{TILE} && /3/.test({TILE}.innerText)"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": ready},
+            {"eval": f"{typ}('apply_patch'); {rows}"},
+            {"eval": "document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x') ? (document.querySelector('#levain-modal .modal-close, #levain-modal [aria-label=Close], #levain-modal button.x').click(), 1) : (document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})), 2)"},
+            {"until": "!document.querySelector('#levain-modal .consent-row')"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": ready},
+            {"eval": rows},
+        ])["values"]
+    assert out[-5] == 1 and out[-1] == 3, out

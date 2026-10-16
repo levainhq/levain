@@ -1386,8 +1386,9 @@
     const metricsOf = data.kind === "status-dots" ? data.metrics : data.kind === "metric-grid" ? data.numbers : null;
     s.filterable = !!(ctx && ctx.modal) && !(ctx && ctx.widget) && Array.isArray(metricsOf) && metricsOf.length >= FILTER_MIN;
     // a fresh open starts unfiltered; the SAME open modal rebuilt by a refresh keeps the query being typed in it
-    if (s.filterable) {
-      const prev = Array.from(states).find((o) => o.modal && o.filterable && o.pid === data.pid && o.body.isConnected);
+    // (a count-face panel's modal is the same: a saved query would hide a newly waiting row behind "1 of 3")
+    if (s.filterable || (s.searchable && s.modal && data.face === "count")) {
+      const prev = Array.from(states).find((o) => o.modal && o.pid === data.pid && o.body.isConnected && (o.filterable || o.searchable));
       s.query = prev ? prev.query : "";
     }
     if (s.searchable || s.filterable) p.appendChild(buildFilter(s));
