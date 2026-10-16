@@ -1002,6 +1002,7 @@ class _Handler(GuardedHandler):
             if not self._peer_open():
                 # the client gave up during its wait: skip the store read nobody will receive
                 self._release_read_slot()
+                self.close_connection = True
                 return
             try:
                 status, body, hdrs = handle_cockpit_get(
@@ -1742,7 +1743,8 @@ def make_server(
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
-    # Bound the expensive routes (store read + writes); past the cap → 503.
+    # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
+    # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
