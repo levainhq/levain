@@ -213,7 +213,11 @@
         const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
-        if (head.id === "sessions") line.wrapMeta = true;
+        if (head.id === "sessions") {
+          line.wrapMeta = true;
+          // the transcript button's key: the row id is "session:<stem>" (the stem is a hash, not the session id)
+          if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
+        }
         if (grouped) line.grp = grp;
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();

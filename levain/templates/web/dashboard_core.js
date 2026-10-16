@@ -3058,6 +3058,104 @@
     return row;
   }
 
+  // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
+  // page holds, as the consent details do, and draws it as text only (textContent, never HTML: the prompts and replies are
+  // whatever an agent said). The record shows the events the hooks kept (cut ones marked) with the session's consent
+  // requests merged in by time; a page without its token says so, and a record that is gone says that.
+  const SESS_NO_TOKEN = "this page carries no token, so the transcript is not shown";
+  const SESS_BAD_TOKEN = "this page's token was not accepted, so the transcript is not shown";
+  function sessionFetch(stem, headers, tryNo) {
+    return fetch("/cockpit/session/" + encodeURIComponent(stem) + ".json", { cache: "no-store", headers: headers })
+      .then((res) => {
+        if (res.status === 403) return { error: SESS_BAD_TOKEN };
+        if (res.status === 404) return { error: "this session record is gone" };
+        if (res.status === 503 && tryNo < CONSENT_TRIES) {
+          return new Promise((r) => setTimeout(r, CONSENT_RETRY_MS)).then(() => sessionFetch(stem, headers, tryNo + 1));
+        }
+        if (!res.ok) return { error: "the transcript could not be read (HTTP " + res.status + ")" };
+        return res.json().then((b) => (b && typeof b === "object" && Array.isArray(b.events) ? b : { error: "the transcript could not be read" }),
+                               () => ({ error: "the transcript could not be read" }));
+      }, () => ({ error: "the transcript could not be read (network)" }));
+  }
+  function sessionTranscript(stem) {
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SESS_NO_TOKEN });
+    return sessionFetch(stem, headers, 1);
+  }
+  const SESS_KIND = { prompt: "you", reply: "agent", tool: "tool", consent: "consent" };
+  function sessionWhen(iso) {
+    const ms = Date.parse(iso);
+    return Number.isFinite(ms) ? new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+  }
+  function sessionConsentLine(c) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const state = sv(c.state) || "unknown";
+    const via = c.via === "signature" ? "signed answer" : c.via === "grant" ? "standing grant" : sv(c.via);
+    let text = "consent: " + (sv(c.tool) || "tool") + " \u2014 " + state + (via ? " (" + via + ")" : "");
+    if (sv(c.decided_at)) text += ", decided " + sessionWhen(c.decided_at);
+    return text;
+  }
+  function drawSessionTranscript(slot, b) {
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const parts = [];
+    parts.push(el("div", "ext-meta sess-head", [sv(b.agent), sv(b.workspace),
+      "started " + sessionWhen(b.first_seen), "last active " + sessionWhen(b.last_seen)].filter(Boolean).join(" \u00b7 ")));
+    if (sv(b.resume)) {
+      const line = el("div", "consent-cmd");
+      const code = el("code", "consent-code", sv(b.resume));
+      const btn = el("button", "undo-btn consent-copy", "copy resume");
+      btn.type = "button";
+      btn.dataset.label = btn.textContent;
+      btn.title = "copy the command that reopens this session; run it in a terminal";
+      btn.addEventListener("click", () => copyText(sv(b.resume), code, btn));
+      line.append(code, btn);
+      parts.push(line);
+    }
+    // one timeline, oldest first: the kept events and the consent requests by when each happened (equal times keep events first)
+    const items = [];
+    for (const e of b.events) if (e && typeof e === "object") items.push({ at: sv(e.at), kind: SESS_KIND[e.kind] ? e.kind : "tool", text: sv(e.text), cut: Number.isInteger(e.cut) ? e.cut : 0 });
+    if (Array.isArray(b.consent)) for (const c of b.consent) if (c && typeof c === "object") items.push({ at: sv(c.at), kind: "consent", text: sessionConsentLine(c), cut: 0 });
+    const keyed = items.map((it, i) => ({ it, i, ms: Date.parse(it.at) }));
+    keyed.sort((x, y) => (Number.isFinite(x.ms) && Number.isFinite(y.ms) && x.ms !== y.ms ? x.ms - y.ms : x.i - y.i));
+    const tl = el("div", "sess-tl");
+    for (const { it } of keyed) {
+      const ev = el("div", "sess-ev sess-" + it.kind);
+      const lab = el("span", "sess-kind", SESS_KIND[it.kind]);
+      const when = el("span", "sess-at", sessionWhen(it.at));
+      const body = el("div", "sess-text");
+      body.textContent = it.text;
+      if (it.cut > 0) body.appendChild(el("span", "ext-meta sess-cut", " (\u2026 " + it.cut + " more characters not kept)"));
+      ev.append(lab, when, body);
+      tl.appendChild(ev);
+    }
+    if (!items.length) tl.appendChild(el("div", "ext-meta", "no events were kept for this session"));
+    parts.push(tl);
+    if (b.consent === null) parts.push(el("div", "ext-meta sess-note", "consent not read"));
+    if (Number.isInteger(b.skipped) && b.skipped > 0) parts.push(el("div", "ext-meta sess-note", b.skipped + " log line" + (b.skipped === 1 ? "" : "s") + " could not be read and " + (b.skipped === 1 ? "is" : "are") + " not shown"));
+    slot.replaceChildren(...parts);
+  }
+  function sessionTxControl(stem) {
+    const wrap = el("div", "sess-tx-wrap");
+    const btn = el("button", "undo-btn sess-tx-btn", "transcript");
+    btn.type = "button";
+    btn.title = "show what this session's hooks recorded";
+    let slot = null;
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      if (!slot) { slot = el("div", "sess-tx ext-meta"); wrap.appendChild(slot); }
+      slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
+      sessionTranscript(stem).then((b) => {
+        drawSessionTranscript(slot, b);
+        btn.disabled = false;
+        if (!b.error) btn.textContent = "refresh";
+      });
+    });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+
   function appendExternalLines(host, lines) {
     let lastGroup = null;
     for (const ln of lines) {
@@ -3084,6 +3182,7 @@
         if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       }
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
+      if (typeof o.session === "string" && o.session) row.appendChild(sessionTxControl(o.session));
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       host.appendChild(row);
     }
