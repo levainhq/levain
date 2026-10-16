@@ -5,6 +5,7 @@ fail-soft. The real hook scripts run as subprocesses against a tmp install, for 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -263,17 +264,155 @@ def test_the_prune_keeps_200_stems_and_removes_a_stems_files_together(agent_root
             os.utime(f, (old + i, old + i))
     # an old stem whose LOG is fresh is a live session: it must survive on the newer mtime of the pair
     os.utime(sdir / f"{0:024x}.log.jsonl", None)
-    stale = sdir / "leak.1.tmp"
+    stale = sdir / f"{5:024x}.log.jsonl.123.tmp"
     stale.write_text("x")
     os.utime(stale, (old, old))
     proc = _run(root, "user_prompt_submit.py", {"session_id": "new", "prompt": "hi", "cwd": "/w"})
     assert proc.returncode == 0
     names = sorted(p.name for p in sdir.iterdir())
-    stems = {n.split(".")[0] for n in names}
+    stems = {n.split(".")[0] for n in names if n != ".lock"}
     assert len(stems) == 200 and _key(agent, "new") in stems
     assert f"{0:024x}" in stems                          # kept by its fresh log
     for stem in stems:                                   # never half a pair among the old ones
         if stem != _key(agent, "new"):
             assert {f"{stem}.json", f"{stem}.log.jsonl"} <= set(names)
-    assert f"{1:024x}" not in stems and "leak.1.tmp" not in names
+    assert f"{1:024x}" not in stems and stale.name not in names
     assert f"{1:024x}.json" not in names and f"{1:024x}.log.jsonl" not in names
+
+
+# ---- Q8 L3 r1 fixes (F1-F5): one sessions-directory lock, exact-name prune, whole writes ----
+
+_GATED = ("import os, runpy, sys, time\n"
+          "go, script = sys.argv[1], sys.argv[2]\n"
+          "while not os.path.exists(go):\n"
+          "    time.sleep(0.0005)\n"
+          "sys.argv = [script]\n"
+          "runpy.run_path(script, run_name='__main__')\n")
+
+
+def _line(i: int, size: int = 900) -> str:
+    return json.dumps({"v": 1, "at": "2026-01-01T00:00:00Z", "kind": "tool",
+                       "text": f"fill-{i}-" + "x" * size, "cut": 0}) + "\n"
+
+
+def test_concurrent_appends_across_the_rotation_lose_no_event(agent_root, tmp_path_factory):
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    path = sdir / f"{_key(agent, 's1')}.log.jsonl"
+    script = root / "activation" / "hooks" / "post_tool_use.py"
+    gate = tmp_path_factory.mktemp("gate") / "go"
+    n_proc, rounds, sent = 12, 6, []
+    for rnd in range(rounds):
+        # top the log up to just under the rotation threshold, so the first append crosses it
+        with open(path, "ab") as fh:
+            i = 0
+            while fh.tell() < 256 * 1024 - 300:
+                fh.write(_line(i).encode()); i += 1
+        gate.unlink(missing_ok=True)
+        procs = []
+        for k in range(n_proc):
+            tag = f"r{rnd}p{k}"
+            sent.append(tag)
+            pr = subprocess.Popen(
+                [sys.executable, "-c", _GATED, str(gate), str(script)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=root,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+            pr.stdin.write(json.dumps({"session_id": "s1", "cwd": "/w", "tool_name": "Task",
+                                       "tool_input": {"file_path": tag}}))
+            pr.stdin.close()
+            procs.append(pr)
+        time.sleep(0.4)                       # every interpreter is up and spinning on the gate
+        gate.write_text("go")
+        for pr in procs:
+            assert pr.wait(timeout=60) == 0 and pr.stdout.read() == "" and pr.stderr.read() == ""
+        # the newest events must all be present: rotation keeps the newest half, so only filler goes
+        texts = [e["text"] for e in _events(root, agent, "s1")]
+        missing = [t for t in sent[-n_proc:] if f"Task: {t}" not in texts]
+        assert not missing, f"round {rnd} lost {missing}"
+
+
+def test_a_held_sessions_lock_drops_the_event_and_the_hook_still_exits_clean(agent_root):
+    fcntl = pytest.importorskip("fcntl")
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(sdir / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        for script, payload in (("post_tool_use.py", {"session_id": "s1", "tool_name": "Bash",
+                                                       "tool_input": {"command": "ls"}}),
+                                ("user_prompt_submit.py", {"session_id": "s1", "prompt": "x", "cwd": "/w"})):
+            t0 = time.monotonic()
+            proc = _run(root, script, payload)
+            assert proc.returncode == 0 and proc.stderr == ""
+            assert time.monotonic() - t0 < 1.5
+            if script == "post_tool_use.py":
+                assert proc.stdout == ""
+        assert not list(sdir.glob("*.log.jsonl")) and not list(sdir.glob("[0-9a-f]*.json"))
+    finally:
+        os.close(fd)
+    assert _run(root, "post_tool_use.py", {"session_id": "s1", "tool_name": "Task"}).returncode == 0
+    assert [e["text"] for e in _events(root, agent, "s1")] == ["Task"]       # the lock is not sticky
+
+
+def test_the_prune_never_touches_a_foreign_file(agent_root):
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 10_000
+    for i in range(205):
+        f = sdir / f"{i:024x}.json"
+        f.write_text("{}")
+        os.utime(f, (old + i, old + i))
+    foreign = {"index.json": "{}", "notes.tmp": "n", "README.log.jsonl": "r", "abc.json": "{}"}
+    for name, body in foreign.items():
+        f = sdir / name
+        f.write_text(body)
+        os.utime(f, (old, old))
+    assert _run(root, "user_prompt_submit.py", {"session_id": "new", "prompt": "hi", "cwd": "/w"}).returncode == 0
+    names = {p.name for p in sdir.iterdir()}
+    assert set(foreign) <= names and ".lock" in names
+    assert f"{0:024x}.json" not in names and _key(agent, "new") + ".json" in names
+
+
+def test_a_log_cut_short_gets_a_fresh_line(agent_root):
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    path = sdir / f"{_key(agent, 's1')}.log.jsonl"
+    first = _line(1, 5)
+    path.write_text(first[:-1])                              # the last byte is not a newline
+    assert _run(root, "post_tool_use.py", {"session_id": "s1", "tool_name": "Task"}).returncode == 0
+    lines = path.read_text().split("\n")
+    assert lines[-1] == "" and len(lines) == 3
+    assert [json.loads(x)["text"] for x in lines[:2]] == [json.loads(first)["text"], "Task"]
+
+
+@pytest.mark.parametrize("agent", sorted(_TREES))
+def test_the_rewrite_does_not_follow_a_symlink(agent, tmp_path):
+    spec = importlib.util.spec_from_file_location(f"_lh_{agent}", _TREES[agent] / "_levain_hook.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    target = tmp_path / "victim.log"
+    target.write_bytes(b"".join(_line(i).encode() for i in range(300)))
+    before = target.read_bytes()
+    link = tmp_path / "x.log.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        mod._log_rewrite_newest_half(link)
+    assert link.is_symlink() and target.read_bytes() == before and not list(tmp_path.glob("*.tmp"))
+
+
+def test_apply_patch_logs_the_patch_path_not_the_patch(agent_root):
+    agent, root = agent_root
+    patch = "*** Begin Patch\n*** Update File: /w/src/a.py\n@@\n-x\n+y\n*** End Patch"
+    for payload in (
+        {"session_id": "s1", "tool_name": "apply_patch", "tool_input": {"command": patch}},
+        {"session_id": "s1", "tool_name": "apply_patch", "tool_input": {"command": "garbage"}},
+        {"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "echo hi"}},
+    ):
+        proc = _run(root, "post_tool_use.py", payload)
+        assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    assert [e["text"] for e in _events(root, agent, "s1")] == [
+        "apply_patch: /w/src/a.py", "apply_patch", "Bash: echo hi"]
