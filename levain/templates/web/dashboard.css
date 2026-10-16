@@ -322,6 +322,9 @@
   .consent-code { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; user-select: all; font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--label); }
   .consent-copy { margin-left: 0; flex: 0 0 auto; min-width: 7em; text-align: center; }
   .consent-copy::before { content: none; }
+  /* Q6b: answering with a passkey on a page reached over https: the same buttons, wrapping on a phone */
+  .consent-passkey .consent-cmd { flex-wrap: wrap; }
+  .consent-passkey .consent-note { margin-top: var(--sp-1); }
   /* a session's transcript (Q8): a quiet timeline of text, one small label per event, in the consent body's own tokens */
   .sess-tx-wrap { flex: 1 1 100%; min-width: 0; margin-top: var(--sp-2); }
   .sess-tx-btn { margin-left: 0; }

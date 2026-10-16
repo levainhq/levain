@@ -57,7 +57,7 @@ def hook_roots(qdir: Path) -> list[Path]:
 
     roots: list[Path] = []
     for adapter in (claude_code, codex):
-        root = adapter.load_settings(qdir).cockpit_data_root      # never raises: a bad file reads as defaults
+        root = adapter.load_settings(qdir).cockpit_data_root
         if root is not None and Path(root) not in roots:
             roots.append(Path(root))
     return roots
