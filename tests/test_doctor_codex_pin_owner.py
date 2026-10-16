@@ -187,13 +187,13 @@ def test_the_takeover_hint_carries_recorded_packs_and_survives_a_bad_manifest(ma
 
     a = make_install("a", adapter="codex")
     make_install("b", adapter="codex")
+    real = manifest.read_pack_locks_status
     monkeypatch.setattr(manifest, "read_pack_locks_status",
                         lambda install: ([SimpleNamespace(source="/packs/one"), SimpleNamespace(source="/packs/two")], "ok"))
     rows = _wiring(a)
     assert rows and all("--pack /packs/one --pack /packs/two" in r.hint for r in rows)
+    monkeypatch.setattr(manifest, "read_pack_locks_status", real)  # only the stub; the fixture's patches stay
     (a / ".levain" / "manifest.json").write_bytes(b"\xff\xfe not utf-8")
-    monkeypatch.undo()
-    monkeypatch.setenv("HOME", str(a.parent / "home"))
-    monkeypatch.setenv("CODEX_HOME", str(a.parent / "codex-home"))
+    assert manifest.read_pack_locks_status(a) == ([], "corrupt")  # at the reader, so every caller is covered
     rows = _wiring(a)
     assert rows and all("pack record cannot be read" in r.hint for r in rows)

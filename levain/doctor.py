@@ -2627,10 +2627,7 @@ def _codex_takeover_hint(install: Path) -> str:
     recorded answers file it says the interview runs again (L3 r1 on the codex pin owner)."""
     from levain import manifest
 
-    try:
-        packs, status = manifest.read_pack_locks_status(install)
-    except (OSError, ValueError):  # a manifest that is not UTF-8 raises past it; a hint never crashes doctor
-        packs, status = [], "corrupt"
+    packs, status = manifest.read_pack_locks_status(install)
     cmd = f"levain init --path {shlex.quote(str(install))} --adapter codex --force"
     cmd += "".join(f" --pack {shlex.quote(str(p.source))}" for p in packs)
     answers = install / ".levain" / "answers.json"
