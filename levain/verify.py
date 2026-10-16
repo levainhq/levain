@@ -16,17 +16,20 @@ testing one representative from each class is the honest coverage. The
 representative-per-class shape leaves room to add a third class without
 forcing the test to grow N×.
 
-UserPromptSubmit is invoked with the payload shape the harness actually
-sends (prompt + cwd + session_id + hook_event_name). The current hook
-discards the payload after a JSON parse, so the "realistic" shape mainly
-hardens against the hook starting to read payload fields in a future
-revision — the parse-and-discard surface is also exercised by an empty
-stub, but the realistic shape documents what callers will send.
+UserPromptSubmit is invoked with the payload shape the harness sends, less
+`session_id` (see `ups_payload`): it runs in the live install, and a session
+id would make it record a session there.
 
 The Python interpreter is resolved from the install's adapter config (the
 exact Python the harness will use), falling back to sys.executable. This
 matters when the venv running `levain verify-hooks` differs from the venv
 the install was created in.
+
+The record-only transcript hooks (stop.py, post_tool_use.py) print nothing, so
+their check is the line they write: each runs, from the installed bytes, in a
+throwaway copy of the hooks directory under a temporary install root, with a
+synthetic event; the check reads the one transcript line back and the
+temporary root is deleted. Nothing is written into the live install.
 
 What it does NOT check: whether the harness itself invokes the hooks. That
 requires an interactive session in the install (see the adapter README's
@@ -38,8 +41,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,15 +175,7 @@ def run_verify_hooks(path: Path) -> int:
 
     ups = hooks_dir / "user_prompt_submit.py"
     if ups.is_file():
-        # Realistic payload shape — what Claude Code actually sends rather
-        # than an empty stub. Exercises the hook's payload-reading path.
-        ups_payload = {
-            "prompt": "verify-hooks smoke test prompt",
-            "cwd": str(install),
-            "session_id": "verify-hooks-session",
-            "hook_event_name": "UserPromptSubmit",
-        }
-        results.append(_invoke(ups, install, ups_payload, "UserPromptSubmit", python))
+        results.append(_invoke(ups, install, ups_payload(install), "UserPromptSubmit", python))
     else:
         results.append(
             VerifyResult(
@@ -188,6 +185,10 @@ def run_verify_hooks(path: Path) -> int:
                 "Re-run `levain init`.",
             )
         )
+
+    for script, payload, kind, text in _RECORD_ONLY:
+        if (hooks_dir / script).is_file():
+            results.append(_invoke_record_only(hooks_dir, script, payload, kind, text, python))
 
     for r in results:
         _emit(r)
@@ -210,6 +211,70 @@ def run_verify_hooks(path: Path) -> int:
         "is a separate question — verify in an interactive session."
     )
     return 0
+
+
+def ups_payload(install: Path) -> dict:
+    """What Claude Code sends UserPromptSubmit, less ``session_id``: with one, the hook (run in the live install,
+    since its output depends on the install's activation files) records a session, its prompt and its state-line
+    mark there, and the cockpit would list a session nobody ran. With none, it records nothing."""
+    return {"prompt": "verify-hooks smoke test prompt", "cwd": str(install), "hook_event_name": "UserPromptSubmit"}
+
+
+# (script, synthetic event, transcript kind, the text it must record). Absent scripts are skipped: an install
+# from before the transcript hooks has none, and doctor's transcript-hooks row says so.
+_RECORD_ONLY = (
+    ("stop.py", {"hook_event_name": "Stop", "session_id": "verify-hooks-session",
+                 "last_assistant_message": "verify-hooks smoke reply"}, "reply", "verify-hooks smoke reply"),
+    ("post_tool_use.py", {"hook_event_name": "PostToolUse", "session_id": "verify-hooks-session",
+                          "tool_name": "Read", "tool_input": {"file_path": "verify-hooks-smoke.txt"}},
+     "tool", "Read: verify-hooks-smoke.txt"),
+)
+
+
+def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, text: str,
+                        python: str) -> VerifyResult:
+    """Run a record-only hook from a copy of the installed hooks directory under a temporary install root (the
+    hook derives its root from its own file location), then read back the one transcript line it wrote there.
+    The temporary root is removed whatever happens; the live install's sessions directory is never touched."""
+    from levain.launch import child_env
+
+    tmp = Path(tempfile.mkdtemp(prefix="levain-verify-"))
+    try:
+        shutil.copytree(hooks_dir, tmp / "activation" / "hooks",
+                        ignore=shutil.ignore_patterns("__pycache__"), symlinks=True)
+        env = child_env()
+        env.pop("LEVAIN_HOOK_SUPPRESS", None)
+        env.pop("LEVAIN_SCOPE", None)
+        try:
+            r = subprocess.run([python, str(tmp / "activation" / "hooks" / script)], cwd=str(tmp),
+                               input=json.dumps({**payload, "cwd": str(tmp)}), capture_output=True, text=True,
+                               timeout=10, env=env)
+        except subprocess.TimeoutExpired:
+            return VerifyResult(script, False, "timed out after 10s", "A record-only hook must return at once.")
+        except OSError as e:
+            return VerifyResult(script, False, f"failed to invoke: {e}", f"Check Python at {python} is runnable.")
+        if r.returncode != 0:
+            return VerifyResult(script, False, f"exit {r.returncode}; stderr={r.stderr.strip()[:200]!r}",
+                                "Hooks are fail-open and must always exit 0. Script is corrupt or import is broken.")
+        if r.stdout.strip():
+            return VerifyResult(script, False, f"printed output: {r.stdout.strip()[:120]!r}",
+                                "A record-only hook prints nothing.")
+        logs = sorted((tmp / ".levain" / "sessions").glob("*.log.jsonl"))
+        lines = [ln for f in logs for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if len(lines) != 1:
+            return VerifyResult(script, False, f"wrote {len(lines)} transcript line(s), expected 1",
+                                "The hook ran but recorded nothing: check its `should_fire()` and session_log.")
+        try:
+            event = json.loads(lines[0])
+        except ValueError as e:
+            return VerifyResult(script, False, f"transcript line is not JSON: {e}", f"Line: {lines[0][:200]!r}")
+        if not (isinstance(event, dict) and event.get("v") == 1 and event.get("kind") == kind
+                and event.get("text") == text and event.get("cut") == 0 and isinstance(event.get("at"), str)):
+            return VerifyResult(script, False, f"transcript line has the wrong shape: {lines[0][:200]!r}",
+                                f"Expected v 1, kind {kind!r}, text {text!r}.")
+        return VerifyResult(script, True, f"recorded a {kind} line (in a temporary copy, since removed)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _invoke(
