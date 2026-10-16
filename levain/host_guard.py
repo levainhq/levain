@@ -830,11 +830,83 @@ def _pins_global_codex(ent: Path, adapter: str | None = None) -> bool:
     return (attested if attested in ("claude-code", "codex") else adapter) == "codex"
 
 
+def _read_small_regular(p: Path, limit: int = 1 << 20) -> bytes | None:
+    """The bytes of ``p`` when it is a regular file of at most ``limit`` bytes, else None. Opened
+    non-blocking and without following a final link, so a FIFO or a device named here cannot hang doctor."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(limit + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def codex_hooks_owner(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                      ) -> Path | None:
+    """The OTHER levain install that the Codex ``hooks.json`` is levain's own write for, else None.
+
+    Codex reads one ``hooks.json`` per CODEX_HOME, so ``levain init --adapter codex`` in another install
+    replaces this install's wiring with that install's. That is levain repointing the file, not an edit,
+    and doctor's wiring rows already say this install is no longer wired. The file counts as another
+    install's only when every hook command runs a script under ``<install>/activation/hooks/`` of ONE
+    install other than this one, and that install's adapter receipt records exactly these bytes as what
+    levain last wrote there (the adapter receipt). Anything else (an edit, an
+    install from before the receipt existed, commands naming two installs) is None. The receipt is a
+    file the operator's uid can write, like the pin itself: this tells levain's own write from an edit;
+    it is not a boundary against a process running as the operator."""
+    from levain.install import ADAPTER_RECEIPT_REL, _adapter_key
+    ent = Path(os.path.abspath(install))
+    cj = _codex_home(codex_home) / "hooks.json"
+    data = _read_small_regular(cj)
+    if data is None:
+        return None
+    try:
+        cmds = _hook_commands([json.loads(data)])
+    except (ValueError, RecursionError):
+        return None
+    owners: set[Path] = set()
+    for cmd in cmds:
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            return None
+        script = Path(argv[-1]) if argv else None
+        if (script is None or not script.is_absolute() or script.parent.name != "hooks"
+                or script.parent.parent.name != "activation"):
+            return None
+        owners.add(script.parent.parent.parent)
+    if len(owners) != 1:
+        return None
+    owner = owners.pop()
+    if os.path.realpath(owner) == os.path.realpath(ent):
+        return None
+    raw = _read_small_regular(owner.joinpath(*ADAPTER_RECEIPT_REL))
+    try:
+        files = json.loads(raw).get("files") if raw is not None else None
+    except (ValueError, AttributeError, RecursionError):
+        return None
+    if not isinstance(files, dict) or files.get(_adapter_key(owner, cj)) != _sha_bytes(data):
+        return None
+    return owner
+
+
 def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None
-                               ) -> tuple[dict[str, str], list[str]]:
+                               ) -> tuple[dict[str, str], list[str], Path | None]:
+    """(pins, unresolved hook commands, the other install the Codex hooks.json now serves or None).
+    While another install owns that file it is not this install's to pin, so neither it nor the
+    commands in it are read here (:func:`_comparable_pin`)."""
     ent = Path(os.path.abspath(install))
     cc = ent / ".claude"
-    cj = _codex_home(codex_home) / "hooks.json" if _pins_global_codex(ent) else None
+    owner = codex_hooks_owner(ent, codex_home) if _pins_global_codex(ent) else None
+    cj = _codex_home(codex_home) / "hooks.json" if _pins_global_codex(ent) and owner is None else None
     pins: dict[str, str] = {}
     errors: list[str] = []
     docs: list[Any] = []
@@ -890,7 +962,7 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
         errors.extend(exc.items)
     if errors:
         raise AgentPinError(errors)
-    return pins, unresolved
+    return pins, unresolved, owner
 
 
 def agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
@@ -978,15 +1050,30 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         if root is not None and root != ent:
             local += [root / ".claude" / "settings.json", root / ".claude" / "settings.local.json"]
         local.append(ent / ".codex" / "config.toml")
-        # a Codex hooks.json already on disk is global and not levain's: unvetted on a Codex install's first use
-        if _pins_global_codex(ent, adapter):
+        # a Codex hooks.json already on disk is global and unvetted on a Codex install's first use, unless it
+        # is levain's own recorded write for another install (a second Codex install's init then pins its own)
+        if _pins_global_codex(ent, adapter) and codex_hooks_owner(ent, codex_home) is None:
             local.append(_codex_home(codex_home) / "hooks.json")
         return "none" if any(os.path.lexists(p) for p in local) else "fresh"
     try:
-        now = agent_hook_pins(ent, codex_home)
+        now, _, owner = _agent_pins_and_unresolved(ent, codex_home)
     except AgentPinError:
         return "changed"
-    return "changed" if pin_diffs(old, now) else "match"
+    return "changed" if pin_diffs(_comparable_pin(old, now, owner), now) else "match"
+
+
+def _comparable_pin(old: Mapping[str, str], now: Mapping[str, str], owner: Path | None) -> Mapping[str, str]:
+    """The pin as it compares to ``now``. While the Codex hooks.json is levain's write for another install
+    (``owner``), the pinned copy of it and the hook commands only it named are not compared: the file now
+    runs that install's hooks, doctor's wiring rows report that, and a takeover by ``levain init --force``
+    here re-pins (its status, taken before the write, is ``match``). A pinned command that is gone can only
+    have come from that file, because every other command source (settings files, the workspace
+    ``.codex/config.toml``) is pinned by its own digest and still compared; the scripts themselves stay
+    covered by the activation tree pin."""
+    if owner is None:
+        return old
+    return {k: v for k, v in old.items()
+            if k != _CODEX_KEY and not (k.startswith("hook command ") and k not in now)}
 
 
 def repin_after_levain_write(install: str | os.PathLike[str], before: Literal["none", "fresh", "match", "changed"],
@@ -1010,23 +1097,27 @@ def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.
                           ) -> tuple[Literal["recorded", "match", "changed"], list[str]]:
     """Trust on first use (only when the pin file does not exist), then compare. Returns the status
     and one named line per problem (for ``recorded``: the components pinned on first use) ("<what>: was <old>, now <new>"). An invalid pin file or a
-    component that cannot be hashed is ``changed``, named, never recorded over. Never edits an
-    agent settings file."""
+    component that cannot be hashed is ``changed``, named, never recorded over. A ``match`` carries one
+    line when the Codex hooks.json was left out because it is levain's write for another install. Never
+    edits an agent settings file."""
     ent = Path(os.path.abspath(install))
     try:
         old = _load_agent_pins(ent)
     except AgentPinError as exc:
         return "changed", [*exc.items, "re-pin explicitly once you have read what is there"]
     try:
-        now = agent_hook_pins(ent, codex_home)
+        now, _, owner = _agent_pins_and_unresolved(ent, codex_home)
     except AgentPinError as exc:
         return "changed", [f"cannot be pinned: {i}" for i in exc.items]
     if old is None:
         repin_agent_hooks(ent, codex_home)
         # what trust-on-first-use just vouched for: every component that exists
         return "recorded", sorted(k for k, v in now.items() if v != "absent")
-    diffs = pin_diffs(old, now)
-    return ("changed" if diffs else "match"), diffs
+    diffs = pin_diffs(_comparable_pin(old, now, owner), now)
+    if diffs:
+        return "changed", diffs
+    return "match", ([] if owner is None else [f"{_CODEX_KEY}: levain's own write for the install at {owner}, "
+                                               "not compared while that install owns it"])
 
 
 def pin_diffs(old: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
