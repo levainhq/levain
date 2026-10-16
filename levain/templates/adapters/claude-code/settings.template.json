@@ -1,7 +1,12 @@
 {
+  "crossSessionInbound": "hold",
+  "isolatePeerMachines": true,
   "permissions": {
     "allow": [
       "mcp__anneal_memory"
+    ],
+    "ask": [
+      "SendMessage"
     ]
   },
   "hooks": {

@@ -110,6 +110,35 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 imported by `CLAUDE.md`, so once the entity's first wrap has written it, it is in context
 from the first turn of every session.
 
+### 3. Cross-session messaging — held in, asked out
+
+Claude Code lets a session message your other sessions. `settings.template.json`
+governs both directions for this workspace:
+
+- `"crossSessionInbound": "hold"` — a message from another session shows a notice
+  and is not delivered. A workspace `hold` outranks an `accept` in your user
+  settings; to receive messages here, remove the key (or set `"refuse"` to drop
+  them silently).
+- `"permissions": {"ask": ["SendMessage"]}` and `"isolatePeerMachines": true` —
+  Claude asks before every message it sends, in every permission mode, bypass
+  included (`dontAsk` denies the send instead). With
+  levain's consent hook installed the request reaches the consent queue, where a
+  standing grant on `SendMessage` for this workspace can answer it. The same tool
+  resumes subagents and messages agent-team teammates, so those ask too.
+- **Background sessions.** A `claude --bg` session nobody is attached to waits at
+  that prompt until someone answers it, so a fleet of sessions that message each
+  other stalls unless something answers for you: a standing grant
+  (`levain consent grant create --agent claude_code --tool SendMessage
+  --workspace <dir> ...`) answers every send from inside that workspace and
+  leaves a receipt. In `claude -p`, an unanswered send is denied.
+- To turn messaging off, deny `SendMessage` and `ListAgents` instead.
+- **To leave messaging ungoverned here** (your own trust decision), delete the
+  three keys above from `.claude/settings.json`, then run
+  `levain doctor --repin-hooks` so the hook pin records your choice.
+
+`levain doctor` reports the controls that apply here and warns when a direction
+is not governed; it never edits the file.
+
 ## Prerequisites
 
 - **`anneal-memory`** installed (`pip install anneal-memory`). Both the MCP
@@ -136,7 +165,9 @@ from the first turn of every session.
    has a `.claude/settings.json`, do not overwrite it — merge: append the
    `SessionStart`, `UserPromptSubmit` and `PostToolUse` entries into the existing `hooks`
    object's arrays for those events (each event's value is an *array* of
-   matcher groups; appending a group is safe, replacing the array is not).
+   matcher groups; appending a group is safe, replacing the array is not), and
+   add the messaging keys of *What the adapter wires* §3, keeping any stricter
+   value you already have.
 5. **Initialize the memory store:**
    `<levain python> -P -m anneal_memory --db <absolute-install-path>/.levain/memory.db init --schema partnership`
 6. **Make the hooks executable:** `chmod +x activation/hooks/*.py` (optional —

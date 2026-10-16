@@ -459,6 +459,149 @@ def _hooks_entry_digest(path: Path) -> str:
     return _sha_bytes(json.dumps(sub, sort_keys=True).encode())
 
 
+# --- Claude Code cross-session messaging (Q9) ------------------------------------------------------------------
+# The tools a permission rule governs messaging with: Claude Code's docs say both take "the bare tool name with no
+# specifier", so a rule matches only as that exact string.
+MESSAGING_TOOLS = ("SendMessage", "ListAgents")
+# `crossSessionInbound` values, least strict first: Claude Code's "`refuse` is stricter than `hold`, and `hold` is
+# stricter than `accept`".
+INBOUND_VALUES = ("accept", "hold", "refuse")
+
+
+def stricter_inbound(a: str | None, b: str | None) -> str | None:
+    """The stricter of two `crossSessionInbound` values (``None`` = unset, looser than any value)."""
+    rank = {v: i for i, v in enumerate(INBOUND_VALUES)}
+    a = a if isinstance(a, str) and a in rank else None
+    b = b if isinstance(b, str) and b in rank else None
+    if a is None or b is None:
+        return a or b
+    return a if rank[a] >= rank[b] else b
+
+
+def messaging_facts(doc: Any) -> dict[str, Any] | None:
+    """The messaging-relevant facts one Claude Code settings document sets: `crossSessionInbound`,
+    `isolatePeerMachines`, and which of :data:`MESSAGING_TOOLS` its `permissions.ask` / `permissions.deny` name.
+    ``None`` when it sets none of them, so a file that never touched messaging pins as absent."""
+    if not isinstance(doc, Mapping):
+        return None
+    facts: dict[str, Any] = {k: doc[k] for k in ("crossSessionInbound", "isolatePeerMachines") if k in doc}
+    perms = doc.get("permissions")
+    if isinstance(perms, Mapping):
+        for kind in ("ask", "deny"):
+            rules = perms.get(kind)
+            hit = sorted(t for t in MESSAGING_TOOLS if isinstance(rules, list)
+                         and any(_rule_names_tool(r, t) for r in rules))
+            if hit:
+                facts[kind] = hit
+    return facts or None
+
+
+def _rule_names_tool(rule: Any, tool: str) -> bool:
+    """A deny or ask rule naming ``tool`` whole: the bare name, or a glob in the tool-name position (Claude Code:
+    "The pattern must match the full tool name: `"*"` matches every tool"). A rule with a specifier (``X(...)``)
+    does not name a tool whole."""
+    if not isinstance(rule, str) or "(" in rule:
+        return False
+    return re.fullmatch(re.escape(rule).replace(r"\*", ".*"), tool) is not None
+
+
+def _messaging_digest(path: Path) -> str:
+    facts = messaging_facts(_read_settings_doc(path))
+    return "absent" if facts is None else _sha_bytes(json.dumps(facts, sort_keys=True, default=repr).encode())
+
+
+@dataclass(frozen=True)
+class MessagingPosture:
+    """What Claude Code applies to cross-session messaging in a workspace, as far as the files doctor reads say.
+    ``inbound``: the effective `crossSessionInbound` (``None``: no value applies, Claude Code decides per message).
+    ``outbound``: ``deny`` when a rule denies `SendMessage`, else ``ask`` when one asks for it, else ``open``.
+    ``isolate``: some layer sets `isolatePeerMachines` true. ``sources``: every file read (``(unreadable)`` marked)."""
+    inbound: str | None
+    inbound_source: str | None
+    outbound: Literal["deny", "ask", "open"]
+    outbound_source: str | None
+    list_denied: bool
+    isolate: bool
+    sources: tuple[str, ...]
+
+
+def cc_messaging_posture(install: str | os.PathLike[str], home: str | os.PathLike[str] | None = None,
+                         managed: Sequence[tuple[str, Any]] | None = None) -> MessagingPosture:
+    """Claude Code's messaging controls for this workspace as its settings FILES say them, read with the vendor's own
+    precedence (not the sandbox's first-layer-wins order). The trusted inbound value is managed settings' (the files
+    merge in order, a later drop-in over an earlier one, so the last that sets it), else the user's; a workspace
+    `hold`/`refuse` applies only when stricter; an unrecognised value holds wherever it is, and in managed settings
+    counts as `refuse`. Permission rules merge across layers unless managed `allowManagedPermissionRulesOnly` is true;
+    an `isolatePeerMachines` true from any layer applies. The workspace file is the shared `.claude/settings.json` in
+    the workspace itself (Claude Code reads it from the session's working directory only); `settings.local.json` is not
+    credited (it can only tighten). Not read: `--settings`, `--setting-sources`, a relocated CLAUDE_CONFIG_DIR,
+    MDM-profile, server-managed and (on WSL) inherited Windows settings, plugin mods. `--settings` and the user file cannot loosen a workspace `hold`/`refuse` or remove a rule;
+    a managed source with `allowManagedPermissionRulesOnly` discards the workspace rules."""
+    ent = Path(os.path.abspath(install))
+    hm = Path(home) if home is not None else Path(os.path.expanduser("~"))
+    # Only the shared settings.json Claude Code reads from the session's working directory (the workspace; levain writes
+    # its controls there) is credited. settings.local.json is not read: where Claude Code keeps it depends on git
+    # worktrees, ownership and home, and a local value can only tighten (a local accept never applies, rules only add),
+    # so leaving it out can only under-report, never report governed when it is not.
+    project = [ent / ".claude" / "settings.json"]
+    managed_docs = list(load_managed_settings() if managed is None else managed)
+    # (path, document, kind): managed, then user, then the workspace files
+    layers: list[tuple[str, Any, str]] = [(p, d, "managed") for p, d in managed_docs]
+    for kind, paths in (("user", [hm / ".claude" / "settings.json"]), ("project", project)):
+        for p in paths:
+            if p.exists():
+                try:
+                    layers.append((str(p), json.loads(p.read_text(encoding="utf-8")), kind))
+                except (OSError, ValueError):
+                    layers.append((str(p), _MISSING, kind))
+
+    def managed_last(key: str) -> tuple[Any, str | None]:
+        for p, d in reversed(managed_docs):
+            v = _get(d, (key,)) if isinstance(d, Mapping) else _MISSING
+            if v is not _MISSING:
+                return v, p
+        return _MISSING, None
+
+    inbound: str | None = None
+    inbound_source: str | None = None
+    v, src = managed_last("crossSessionInbound")
+    if v is not _MISSING:
+        inbound, inbound_source = (v if v in INBOUND_VALUES else "refuse"), src
+    else:
+        for path, doc, kind in layers:
+            if kind == "user" and isinstance(doc, Mapping) and doc.get("crossSessionInbound") in INBOUND_VALUES:
+                inbound, inbound_source = doc["crossSessionInbound"], path  # an unrecognised one is the hold below
+                break
+    for path, doc, kind in layers:
+        if kind == "managed" or not isinstance(doc, Mapping) or "crossSessionInbound" not in doc:
+            continue
+        v = doc["crossSessionInbound"]
+        if v not in INBOUND_VALUES:
+            v = "hold"  # an unrecognised user, project or local value holds over any accept
+        elif kind == "user" or v == "accept":
+            continue  # the user value is the trusted one above; a project or local accept never applies
+        new = stricter_inbound(inbound, v)
+        if new != inbound:
+            inbound, inbound_source = new, path
+    outbound: Literal["deny", "ask", "open"] = "open"
+    outbound_source: str | None = None
+    list_denied = isolate = False
+    # `allowManagedPermissionRulesOnly` in managed settings makes Claude Code ignore every other layer's rules
+    managed_rules_only = managed_last("allowManagedPermissionRulesOnly")[0] is True
+    for path, doc, kind in layers:
+        facts = messaging_facts(doc) or {}
+        if managed_rules_only and kind != "managed":
+            facts = {k: v for k, v in facts.items() if k not in ("ask", "deny")}
+        if "SendMessage" in facts.get("deny", ()):
+            outbound, outbound_source = "deny", path
+        elif "SendMessage" in facts.get("ask", ()) and outbound == "open":
+            outbound, outbound_source = "ask", path
+        list_denied = list_denied or "ListAgents" in facts.get("deny", ())
+        isolate = isolate or facts.get("isolatePeerMachines") is True
+    sources = tuple(p + (" (unreadable)" if d is _MISSING else "") for p, d, _k in layers)
+    return MessagingPosture(inbound, inbound_source, outbound, outbound_source, list_denied, isolate, sources)
+
+
 def _dir_digest(root: Path, _seen: frozenset[str] = frozenset()) -> str:
     """sha256 over every file under ``root`` (relative path and bytes). A symlink contributes its
     link string AND its target's content (a directory link: the target tree's digest), so both a
@@ -704,6 +847,7 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
 
     for name, path in _settings_files(ent):
         run(name, lambda path=path: _hooks_entry_digest(path))
+        run(name.replace(" hooks", " messaging", 1), lambda path=path: _messaging_digest(path))
         try:
             d = _read_settings_doc(path)
             if d is not None:
@@ -842,7 +986,7 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         now = agent_hook_pins(ent, codex_home)
     except AgentPinError:
         return "changed"
-    return "match" if old == now else "changed"
+    return "changed" if pin_diffs(old, now) else "match"
 
 
 def repin_after_levain_write(install: str | os.PathLike[str], before: Literal["none", "fresh", "match", "changed"],
@@ -881,10 +1025,18 @@ def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.
         repin_agent_hooks(ent, codex_home)
         # what trust-on-first-use just vouched for: every component that exists
         return "recorded", sorted(k for k, v in now.items() if v != "absent")
-    diffs = [f"{k}: was {old.get(k, 'not pinned')[:12]}, now {now[k][:12]}"
-             for k in now if old.get(k) != now[k]]
-    diffs += [f"{k}: was {old[k][:12]}, now gone" for k in old if k not in now]
+    diffs = pin_diffs(old, now)
     return ("changed" if diffs else "match"), diffs
+
+
+def pin_diffs(old: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
+    """One named line per component that differs from the pin. A component the pin does not carry and that is
+    absent now is not a difference: a levain upgrade that adds a component (the Q9 messaging pin) must not turn every
+    existing install red when there is nothing there to protect. Once pinned, its removal or edit is a difference."""
+    diffs = [f"{k}: was {old.get(k, 'not pinned')[:12]}, now {now[k][:12]}"
+             for k in now if old.get(k) != now[k] and not (k not in old and now[k] == "absent")]
+    diffs += [f"{k}: was {old[k][:12]}, now gone" for k in old if k not in now]
+    return diffs
 
 
 def _sandbox_docs(ent: Path, hm: Path, managed: Sequence[tuple[str, Any]] | None
