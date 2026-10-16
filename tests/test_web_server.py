@@ -1312,6 +1312,20 @@ class TestClassBRoute:
         assert s1 == 409 and b1["error"] == "confirm_required"
         assert s2 == 200 and b2["ok"] is True
 
+    def test_a_descend_against_a_moved_spore_answers_stale_so_the_page_rereads(self, tmp_path: Path) -> None:
+        # spore-174: the page rendered this spore as a Keep note and chose "remove"; it is a live loop now. The CAS
+        # refuses (nothing composted) and answers "stale", the one refusal the page and the TUI re-read on.
+        src = _make_full_install(tmp_path)
+        sid, _eid = _seed_anneal(src)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+                "expect_disposition": "note",
+            })
+        assert status == 409 and body["error"] == "stale"   # the kernel refuses the moved row before the write
+        from anneal_memory.spores import SporeStore
+        assert any(s["id"] == sid for s in SporeStore(src.install_root / ".levain" / "memory.spores.json").list_open())
+
     def test_spore_touch_fires_and_episode_tombstone_is_refused_needs_broker(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         sid, eid = _seed_anneal(src)

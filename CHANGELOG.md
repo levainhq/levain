@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **A spore action refused because the spore moved now refreshes the view.** When a Tray, Keep or loop row was moved to another list on another surface (the TUI, a second browser tab, the agent) after you saw it, compost, remove, promote, re-tier and re-route were refused (nothing was written), but the cockpit page and the TUI kept showing the old row, so the same click was refused again until a manual reload. The refusal is now "stale" on every path, and both surfaces re-read on it: the TUI rebuilds at once, the page re-reads after showing the refusal for a moment.
+- Known edge: a spore's surface-at date (`next`) is written last-writer-wins. Two surfaces setting the date of one spore at the same moment keep the later one; nothing else on the spore is affected.
+
 ## [0.11.0] — 2026-10-16
 
 ### Added

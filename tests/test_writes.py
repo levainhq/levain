@@ -872,7 +872,7 @@ class TestSporeVerbs:
             apply_edit(_scope(install), {
                 "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
                 "confirm": True, "expect_disposition": "note"})  # stale snapshot
-        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert ei.value.code == "stale" and ei.value.http_status == 409   # spore-174: both surfaces re-read on stale
         assert "changed since read" in str(ei.value)
         assert any(s["id"] == sid for s in _spore_store(install).list_open())  # NOT composted
 
@@ -1564,7 +1564,7 @@ class TestSporeUpdate:
             apply_edit(_scope(install), {
                 "kind": "spore_update", "spore_id": nid, "tier": "warm",
                 "expect_disposition": "loop"})  # stale snapshot
-        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert ei.value.code == "stale" and ei.value.http_status == 409   # spore-174
         assert "changed since read" in str(ei.value)
         rec = _spore_store(install).get(nid)
         assert rec["disposition"] == "note" and rec["tier"] == "cold"  # untouched, still a cold note
@@ -1595,7 +1595,7 @@ class TestSporeUpdate:
             apply_edit(_scope(install), {
                 "kind": "spore_update", "spore_id": sid, "type": "task", "tier": "warm",
                 "expect_disposition": "loop"})  # snapshot disagrees with the server-read "seed"
-        assert ei.value.code == "verb_failed" and "changed since read" in str(ei.value)
+        assert ei.value.code == "stale" and "changed since read" in str(ei.value)
         rec = _spore_store(install).get(sid)
         assert rec["type"] == "thought" and rec["disposition"] == "seed"  # fail-closed: untouched
 

@@ -129,17 +129,23 @@
       });
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
-      if (res.ok) {
-        // Defer the reload while an async job is polling — rebuilding the board would detach the
-        // live consult result box (L3 codex MED). onJobsIdle() flushes it when the job ends.
+      // Defer the reload while an async job is polling — rebuilding the board would detach the
+      // live consult result box (L3 codex MED). onJobsIdle() flushes it when the job ends.
+      const reread = async () => {
         if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function"
             && window.LevainDashboard.jobsActive()) {
           deferredReload = true;
         } else {
           await load();
         }
+      };
+      if (res.ok) {
+        await reread();
         return { ok: true, data: data };
       }
+      // A stale refusal means this page's picture of the row is old (spore-174): re-read it, after the row has shown
+      // the refusal for a moment, so the next click acts on the current row instead of re-firing the old one.
+      if (res.status === 409 && data.error === "stale") setTimeout(() => { reread(); }, 2500);
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
       if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();
