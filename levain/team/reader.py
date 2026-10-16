@@ -20,6 +20,8 @@ Synchronous. A cold history read can take a long time: a caller that serves requ
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -71,12 +73,38 @@ def person_text(text: object, *, said: str = "git could not read its history.", 
     return f"{head}: {said}" if head else fallback
 
 
+def join_digest(d, kind: str, handle: str, fp: str | None = None) -> str | None:
+    """The hex sha256 of exactly what accepting the join ``(kind, handle)`` takes, as the derivation ``d`` has it now,
+    or None when no such join exists. ONE function: the Joins row carries it as ``about`` and the cockpit's accept
+    store recomputes it after its fetch, so a signature over ``about`` binds the thing accepted, not just its name.
+
+    ``key``: the handle and the pending key LINE whose fingerprint is ``fp`` (the line holds the public key, so the
+    fingerprint is bound with it). ``owner-offer``: the current owner and the offer itself (its email included: a
+    re-offer to the same handle with another address is another digest)."""
+    ten = d.tenure
+    if kind == "key":
+        line = None if fp is None else next((x for x in ten.pending_keys.get(handle, []) if _fp_or_none(x) == fp), None)
+        if line is None:
+            return None
+        what: dict = {"kind": "key", "handle": handle, "line": line}
+    elif kind == "owner-offer":
+        off = ten.offer
+        if not off or off.get("handle") != handle:
+            return None
+        what = {"kind": "owner-offer", "owner": d.team.owner, "offer": dict(off)}
+    else:
+        return None
+    raw = json.dumps(what, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def people(d, you: str | None, own_fp: str | None = None) -> tuple[list[dict], list[dict]]:
     """Who is on the team and what waits on whom, from the one derivation ``d``. Pure: no I/O. No email field exists in
     either list (team.toml holds addresses; the zone needs handles). ``since`` is the date of the commit that began the
     handle's CURRENT spell, set only when ``role_changes`` names that commit, else None. ``own_fp`` is this machine's
     signing-key fingerprint: a join is ``mine`` when it waits on THIS machine (its proposed key is that key, or the
-    offer is to ``you``), so only this machine can do the act it waits on."""
+    offer is to ``you``), so only this machine can do the act it waits on. ``about`` is ``join_digest`` of the join:
+    what a signed accept of it binds (a digest, never the email it may cover)."""
     team, ten = d.team, d.tenure
     dates = {sha: date for sha, date, _ in d.role_changes}
     began = {s.handle: s.start_sha for s in d.spells if s.end is None}
@@ -95,7 +123,7 @@ def people(d, you: str | None, own_fp: str | None = None) -> tuple[list[dict], l
         for n, line in enumerate(ten.pending_keys[h]):
             fp = _fp_or_none(line)
             joins.append({"kind": "key", "handle": h, "n": n, "fingerprint": fp,
-                          "mine": own_fp is not None and fp == own_fp,
+                          "mine": own_fp is not None and fp == own_fp, "about": join_digest(d, "key", h, fp),
                           "line": f"{h}'s key is proposed; it comes into force when {h} runs "
                                   "`levain team key confirm` on their own machine"})
     if ten.offer:
@@ -103,6 +131,7 @@ def people(d, you: str | None, own_fp: str | None = None) -> tuple[list[dict], l
         h = str(ten.offer["handle"])
         who, run = ("you", "you run") if h == you else (h, f"{h} runs")
         joins.append({"kind": "owner-offer", "handle": h, "n": 0, "mine": you is not None and h == you,
+                      "about": join_digest(d, "owner-offer", h),
                       "line": f"ownership is offered to {who}; it moves when {run} `levain team accept`"})
     return members, joins
 

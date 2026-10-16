@@ -10,17 +10,22 @@ is T3 because the cockpit server holds the member's signing key outside any agen
 surface token could make the server accept ownership as the operator (a confused deputy). A T3 fires only on a
 ``laptop-presence`` signature over the broker's stored record, which the token cannot make.
 
-What the operator signs is ``(kind, handle)``. The fingerprint is never a param: the store reads this machine's own,
-so a caller cannot name another machine's key. At apply the store decides again, under the team op lock, from ONE
-derivation: the act is done (``GitLedger.confirm_own_key`` / ``GitLedger.accept_offer``, the same acts the laptop
-commands run), found already done (recorded, nothing committed again), or refused naming what moved since the
-signature. Its records live in the clone's own state file, so an ``ALREADY`` survives a restart.
+What the operator signs is ``(kind, handle, about)``: ``about`` is the Joins row's digest of exactly what is accepted
+(``levain.team.reader.join_digest``: the pending key LINE, or the current owner and the offer with its email). The
+fingerprint is never a param: the store reads this machine's own, so a caller cannot name another machine's key. At
+apply the store decides again, under the team op lock, after a fetch, from ONE derivation: the act is done
+(``GitLedger.confirm_own_key`` / ``GitLedger.accept_offer``, the same acts the laptop commands run), found already
+done, or refused naming what moved since the signature (a digest that no longer matches: "what was signed changed").
+Only a PUBLISHED act (or one on a clone with no remote) is recorded APPLIED: a push that fails, or a busy lock, is a
+transient fault and the broker re-drives the pending, which then finds the act done here and pushes it. Its records
+live in the clone's own state file, so an ``ALREADY`` survives a restart.
 
 ``team_verbs(start)`` returns the two specs and the accept's broker effect for ``make_server`` to merge. Nothing here
 reads the ledger at construction: ``start`` is resolved on each fire and each apply.
 """
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -42,7 +47,7 @@ from levain.writes import EditError
 
 from . import tenure as T
 from .ledger_api import LedgerTransport, open_ledger
-from .reader import person_text
+from .reader import join_digest, person_text
 from .roles import handle_problem
 from .transport import Repo, TeamBusy, TeamError
 
@@ -52,10 +57,12 @@ TEAM_VERB_NAMES = (FETCH_VERB, ACCEPT_VERB)
 
 STORE = "team_join"
 KINDS = ("key", "owner-offer")
-FIELDS = ("kind", "handle")
+FIELDS = ("kind", "handle", "about")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 _PREFIX = "team-join:"
 _RECORDS = "cockpit_joins"      # the clone state file's key for this store's records: origin_key -> record
 _BUSY = "another levain team operation on this clone is running"
+_NO_REMOTE = "this team ledger has no remote to fetch from; nothing was fetched"
 # a person's request is open: the op is waited for briefly and each git network call is bounded (the CLI waits minutes)
 OP_WAIT_S = 5.0
 NET_TIMEOUT_S = 20.0
@@ -77,7 +84,12 @@ def _fetch_fire(start: Path):
             gl = _ledger(start)
             if gl is None:
                 raise EditError("refused", 409, "this install has no team ledger to fetch")
-            return {"summary": gl.sync_now(op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)}
+            if not gl.remote:
+                raise EditError("refused", 409, _NO_REMOTE)
+            summary = gl.sync_now(op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)
+            if not gl.remote:          # the remote went between the check and the op: nothing was fetched
+                raise EditError("refused", 409, _NO_REMOTE)
+            return {"summary": summary}
         except TeamBusy:
             raise EditError("busy", 409, _BUSY) from None
         except TeamError as exc:
@@ -93,8 +105,9 @@ def _fetch_fire(start: Path):
 
 def join_effect(params: Mapping[str, Any], *, origin_key: str) -> Effect:
     """The accept's one effect: a create on ``team_join`` keyed by the pending. Pure. ``ValueError`` refuses params
-    (the broker answers it at issue): a kind outside ``KINDS``, a handle the team's own handle rule refuses, or any
-    param but ``kind`` and ``handle``."""
+    (the broker answers it at issue): a kind outside ``KINDS``, a handle the team's own handle rule refuses, an
+    ``about`` that is not a 64-hex sha256 digest (missing included), or any param but ``kind``, ``handle`` and
+    ``about``. All three are the effect's changes, projection and writes, so the signature over the record binds them."""
     extra = sorted(set(params) - set(FIELDS))
     if extra:
         raise ValueError(f"{ACCEPT_VERB} takes only {list(FIELDS)}, not {extra}")
@@ -104,7 +117,10 @@ def join_effect(params: Mapping[str, Any], *, origin_key: str) -> Effect:
     problem = handle_problem(handle)
     if problem:
         raise ValueError(problem)
-    changes = {"kind": kind, "handle": handle}
+    about = params.get("about")
+    if not isinstance(about, str) or not _DIGEST.fullmatch(about):
+        raise ValueError("about must be the join row's digest (64 lowercase hex), as the Joins pane shows it")
+    changes = {"kind": kind, "handle": handle, "about": about}
     return Effect(_PREFIX + origin_key, STORE, {"absent": True}, changes, dict(changes), FIELDS, ())
 
 
@@ -177,21 +193,21 @@ class TeamJoinStore:
         if not effect.is_create:
             raise PermanentApplyRefusal("the team-join store takes creates only")
         key = self._key(effect.resource_key)
-        kind, handle = effect.changes.get("kind"), effect.changes.get("handle")
-        if kind not in KINDS or handle_problem(handle):
+        kind, handle, about = (effect.changes.get(f) for f in FIELDS)
+        if kind not in KINDS or handle_problem(handle) or not isinstance(about, str) or not _DIGEST.fullmatch(about):
             raise PermanentApplyRefusal(f"not a team join: {kind!r} {handle!r}")
         gl = _ledger(self.start)
         if gl is None:
             raise PermanentApplyRefusal("this install has no team ledger")
         try:
             with gl.op(timeout=OP_WAIT_S):
-                return self._apply_in_op(gl, key, str(kind), str(handle))
+                return self._apply_in_op(gl, key, str(kind), str(handle), about)
         except TeamBusy as exc:
             raise TransientApplyFault("TeamBusy", str(exc)) from exc
         finally:
             invalidate()
 
-    def _apply_in_op(self, gl: LedgerTransport, key: str, kind: str, handle: str) -> UnitApplyResult:
+    def _apply_in_op(self, gl: LedgerTransport, key: str, kind: str, handle: str, about: str) -> UnitApplyResult:
         rec = self._records(gl).get(key)
         if isinstance(rec, dict):
             return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(str(rec.get("id")), dict(rec)),))
@@ -208,30 +224,49 @@ class TeamJoinStore:
         except TeamError as exc:      # an unreachable remote, an unreadable ledger or key: the consented act waits
             raise TransientApplyFault("TeamError", person_text(exc)) from exc
         if not _done(d, kind, handle, fp):
+            # not done yet (a done act is a re-drive after a failed push, or a crash before the record: it is
+            # published below and recorded, nothing is committed again)
             why = _moved(d, kind, handle, fp)
             if why is not None:
                 raise PermanentApplyRefusal(why)
+            if join_digest(d, kind, handle, fp) != about:
+                raise PermanentApplyRefusal(f"what was signed changed: the {kind} for {handle} is not the one the "
+                                            "signature was given for; nothing was changed")
             try:
-                # committed here only; the push below is bounded, and one that fails leaves the act for the next sync
+                # committed here only; published below on a bounded wait
                 if kind == "key":
-                    gl.confirm_own_key(d, push=False)
+                    if not gl.confirm_own_key(d, push=False):
+                        raise PermanentApplyRefusal(f"this machine's key is no longer proposed for {handle}; nothing "
+                                                    "was changed")
                 else:
                     gl.accept_offer(d, push=False)
+            except TeamBusy:
+                raise                 # a lock held by another team operation: the pending re-drives
             except TeamError as exc:
                 gl.forget_derivation()
                 if not _done(gl.derivation(), kind, handle, fp):
                     raise PermanentApplyRefusal(person_text(exc)) from exc
-            if gl.remote:
-                try:
-                    gl.sync_now(push=True, op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)
-                except TeamError:
-                    pass      # the act is in force on this clone; the next sync publishes it
-                gl.forget_derivation()
-                if not _done(gl.derivation(), kind, handle, fp):
-                    # the sync re-landed this clone's change on a newer remote, and a change there undid it
-                    raise PermanentApplyRefusal(f"a newer team change landed first; the {kind} for {handle} is not "
-                                                "in force")
-        rec = {"id": gl.head(), "origin_key": key, "kind": kind, "handle": handle, "sha": gl.head(),
+            # on every clone, remote or not: the act counts only if the ledger now says it is in force
+            gl.forget_derivation()
+            if not _done(gl.derivation(), kind, handle, fp):
+                raise PermanentApplyRefusal(f"the {kind} for {handle} is not in force after the act; nothing is "
+                                            "recorded")
+        if gl.remote:
+            # only a published act is APPLIED: a push that fails is a transient fault, the pending re-drives, and the
+            # re-drive finds the act done above and pushes it here (the hook's own sync never pushes)
+            try:
+                gl.sync_now(push=True, op_wait=OP_WAIT_S, timeout=NET_TIMEOUT_S)
+            except TeamBusy:
+                raise
+            except TeamError as exc:
+                raise TransientApplyFault("TeamError", f"the {kind} for {handle} is in force on this clone but not "
+                                          f"yet published: {person_text(exc)}") from exc
+            gl.forget_derivation()
+            if not _done(gl.derivation(), kind, handle, fp):
+                # the sync re-landed this clone's change on a newer remote, and a change there undid it
+                raise PermanentApplyRefusal(f"a newer team change landed first; the {kind} for {handle} is not "
+                                            "in force")
+        rec = {"id": gl.head(), "origin_key": key, "kind": kind, "handle": handle, "about": about, "sha": gl.head(),
                "at": time.time()}
         gl.save_state(_mutate=lambda st: st.__setitem__(_RECORDS, {**dict(st.get(_RECORDS) or {}), key: rec}))
         return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(rec["id"], rec),))
