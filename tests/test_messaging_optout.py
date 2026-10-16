@@ -181,3 +181,75 @@ def test_the_renderer_refuses_a_malformed_permissions_block():
     assert set(_MESSAGING_KNOBS) == set(MESSAGING_CHOICES)
     with pytest.raises(InitError):
         _apply_messaging(json.dumps({"permissions": "nope"}), "governed")
+
+
+# ---- L3 r1 fixes ----
+
+def test_a_failed_render_leaves_the_choice_unrecorded(env, capsys, monkeypatch):
+    """The choice is recorded after the adapter files are written, so an interrupted render cannot leave
+    config.json saying `unmanaged` over a governed settings.json."""
+    ent = env / "e"
+    af = _answers(env, capsys)
+
+    def boom(*a, **kw):
+        raise InitError("render failed")
+
+    monkeypatch.setattr("levain.install._install_claude_code", boom)
+    assert run_init(ent, "claude-code", force=False, answers_file=af, messaging="unmanaged") == 1
+    cfg = ent / ".levain" / "config.json"
+    assert not cfg.is_file() or "messaging" not in json.loads(cfg.read_text(encoding="utf-8"))
+
+
+def test_the_render_uses_the_explicit_choice_not_a_re_read_of_config(env, capsys, monkeypatch):
+    """A config.json that loses the key between the write and the render must not turn `off` into governed."""
+    ent = env / "e"
+    af = _answers(env, capsys)
+    monkeypatch.setattr("levain.install.persisted_messaging", lambda install: "governed")
+    assert run_init(ent, "claude-code", force=False, answers_file=af, messaging="off") == 0
+    assert _msg(_settings(ent))["inbound"] == "refuse"
+
+
+def test_apply_init_refuses_a_bad_pairing_before_any_write(env):
+    from levain.install import _templates_root, apply_init
+
+    ent = env / "e"
+    ent.mkdir()
+    (ent / "seed").mkdir()
+    (ent / "seed" / "world.md").write_text("keep me", encoding="utf-8")
+    with _templates_root() as tr:
+        with pytest.raises(InitError):
+            apply_init(ent, "codex", {}, tr, "python3", "anneal-memory", [], [], messaging="off")
+    assert (ent / "seed" / "world.md").read_text(encoding="utf-8") == "keep me"
+    assert sorted(p.name for p in ent.iterdir()) == ["seed"]
+
+
+@pytest.mark.parametrize("text", ["[]", "null", '"x"'])
+def test_a_non_object_template_is_an_init_error(text):
+    with pytest.raises(InitError):
+        _apply_messaging(text, "governed")
+
+
+def test_a_non_object_config_is_unreadable_and_left_alone(env, capsys):
+    af = _answers(env, capsys)
+    ent = env / "e"
+    assert run_init(ent, "claude-code", force=False, answers_file=af) == 0
+    cfg = ent / ".levain" / "config.json"
+    cfg.write_text("[1, 2]", encoding="utf-8")
+    assert run_init(ent, "claude-code", force=True, answers_file=af, messaging="off") == 1
+    assert cfg.read_text(encoding="utf-8") == "[1, 2]"
+
+
+def test_answers_template_refuses_messaging(env, capsys):
+    from levain import cli
+
+    assert cli.main(["init", "--answers-template", "--messaging", "off"]) == 1
+    assert "--messaging" in capsys.readouterr().out
+
+
+def test_force_says_when_it_keeps_a_prior_opt_out(env, capsys):
+    af = _answers(env, capsys)
+    ent = env / "e"
+    assert run_init(ent, "claude-code", force=False, answers_file=af, messaging="off") == 0
+    capsys.readouterr()
+    assert run_init(ent, "claude-code", force=True, answers_file=af) == 0
+    assert "messaging:  off (kept from .levain/config.json)" in capsys.readouterr().out

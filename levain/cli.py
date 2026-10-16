@@ -1349,6 +1349,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
         if args.web:
             print("levain init: --answers-template cannot be combined with --web.")
             return 1
+        if args.messaging is not None:
+            print("levain init: --answers-template cannot be combined with --messaging (it installs "
+                  "nothing, so there is no posture to set).")
+            return 1
         from levain.install import run_answers_template
 
         return run_answers_template(packs=args.pack)
