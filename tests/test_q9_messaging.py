@@ -13,7 +13,15 @@ from levain import doctor
 from levain import host_guard as hg
 from levain.consent.adapters import claude_code as cc
 
-TEMPLATE = Path(hg.__file__).parent / "templates" / "adapters" / "claude-code" / "settings.template.json"
+_TEMPLATE = Path(hg.__file__).parent / "templates" / "adapters" / "claude-code" / "settings.template.json"
+
+
+class TEMPLATE:  # the template as the installer renders it for the default (governed) choice
+    @staticmethod
+    def read_text() -> str:
+        from levain.install import _apply_messaging
+
+        return _apply_messaging(_TEMPLATE.read_text().replace("{{PYTHON}}", "python3"), "governed")
 
 
 @pytest.fixture

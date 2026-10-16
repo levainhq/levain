@@ -112,8 +112,11 @@ from the first turn of every session.
 
 ### 3. Cross-session messaging — held in, asked out
 
-Claude Code lets a session message your other sessions. `settings.template.json`
-governs both directions for this workspace:
+Claude Code lets a session message your other sessions. The renderer writes the
+keys below into `.claude/settings.json` (`settings.template.json` carries none of
+them), by default; `levain init --messaging governed|off|unmanaged` picks the posture,
+and the choice is kept in `.levain/config.json` so `levain update` and `init --force`
+keep it. `governed` is the default:
 
 - `"crossSessionInbound": "hold"` — a message from another session shows a notice
   and is not delivered. A workspace `hold` outranks an `accept` in your user
@@ -131,10 +134,11 @@ governs both directions for this workspace:
   (`levain consent grant create --agent claude_code --tool SendMessage
   --workspace <dir> ...`) answers every send from inside that workspace and
   leaves a receipt. In `claude -p`, an unanswered send is denied.
-- To turn messaging off, deny `SendMessage` and `ListAgents` instead.
-- **To leave messaging ungoverned here** (your own trust decision), delete the
-  three keys above from `.claude/settings.json`, then run
-  `levain doctor --repin-hooks` so the hook pin records your choice.
+- `levain init --messaging off` refuses inbound (`"crossSessionInbound": "refuse"`)
+  and denies `SendMessage` and `ListAgents`.
+- **`levain init --messaging unmanaged`** writes none of the three keys, so
+  Claude Code's own defaults apply (your own trust decision). On an existing
+  install, run `levain init --path <install> --force --messaging unmanaged`.
 
 `levain doctor` reports the controls that apply here and warns when a direction
 is not governed; it never edits the file.

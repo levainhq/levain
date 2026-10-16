@@ -280,6 +280,7 @@ def run_init(
     force: bool,
     packs: list[Path] | None = None,
     answers_file: Path | None = None,
+    messaging: str | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -321,10 +322,20 @@ def run_init(
             print(f"FAIL: {e}")
             return 1
 
+    if messaging is not None and messaging not in MESSAGING_CHOICES:
+        print(f"FAIL: --messaging must be one of {', '.join(MESSAGING_CHOICES)} (got {messaging!r}).")
+        return 1
+    if messaging is not None and adapter is not None and adapter != "claude-code":
+        print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
+        return 1
+
     try:
         chosen = _resolve_adapter(adapter)
     except _UserCancelled:
         print("Cancelled.")
+        return 1
+    if messaging is not None and chosen != "claude-code":  # the adapter came from the menu
+        print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
         return 1
 
     if install.exists() and not install.is_dir():
@@ -521,6 +532,7 @@ def run_init(
                     activation_roots=activation_roots,
                     packs=list(zip(pack_manifests, pack_dirs)),
                     require_empty=not force,
+                    messaging=messaging,
                 )
                 # Interview completed successfully — clear the checkpoint so the next
                 # `levain init --force` doesn't offer to resume stale answers.
@@ -562,6 +574,7 @@ def apply_init(
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
     require_empty: bool = False,
+    messaging: str | None = None,
 ) -> InitResult:
     """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
     :class:`InstallBusy` before writing anything when another process holds it.
@@ -571,6 +584,7 @@ def apply_init(
     fresh inits could both pass it and the second would overwrite the first's seeds with
     no authorization and no backup (codex L3 on 19811f7, reproduced). Raises
     :class:`InstallTargetTaken` before writing anything."""
+    _check_messaging(install, chosen, messaging)  # before the lock and every write
     with install_lock(install), (
             codex_home_lock(_codex_home()) if chosen == "codex" else contextlib.nullcontext()):
         # The CODEX_HOME lock is taken here, before the first write, so a refusal still
@@ -585,6 +599,7 @@ def apply_init(
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
+            messaging=messaging,
         )
 
 
@@ -601,6 +616,7 @@ def _apply_init(
     activation_roots: Sequence[Path] | None = None,
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
+    messaging: str | None = None,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
     `answers`, copy the verbatim seed files (each from its winning layer's source
@@ -716,12 +732,20 @@ def _apply_init(
     from levain import host_guard
 
     pin_before = host_guard.agent_pin_status(install, adapter=chosen) if _adapter_has_hooks(chosen) else None
+    _check_messaging(install, chosen, messaging)
+    if messaging is None and chosen == "claude-code":
+        kept = persisted_messaging(install)
+        if kept != DEFAULT_MESSAGING:
+            emit(f"  messaging:  {kept} (kept from .levain/config.json)")
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
-        on_demand_seed, activation_roots=roots, emit=emit,
+        on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
     )
     record_adapter_receipt(install, chosen, templates_root, python_path, import_seed,
-                           on_demand_seed, emit=emit)
+                           on_demand_seed, emit=emit, messaging=messaging)
+    if messaging is not None:
+        # Recorded once the adapter files exist: a render that fails leaves no choice behind.
+        _write_messaging_choice(install, messaging, emit)
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1609,7 @@ def _install_adapter(
     *,
     activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
+    messaging: str | None = None,
 ) -> None:
     adapter_root = templates_root / "adapters" / name
 
@@ -1592,7 +1617,7 @@ def _install_adapter(
         _install_claude_code(
             install, templates_root, adapter_root, python_path, anneal_path,
             import_seed, on_demand_seed,
-            activation_roots=activation_roots, emit=emit,
+            activation_roots=activation_roots, emit=emit, messaging=messaging,
         )
         return
 
@@ -1856,6 +1881,7 @@ def _install_claude_code(
     *,
     activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
+    messaging: str | None = None,
 ) -> None:
     # `activation_roots` was resolved up-front (run_init / apply_init) — base
     # (templates/activation) first, then any pack activation/ trees by order.
@@ -1870,7 +1896,7 @@ def _install_claude_code(
     )
 
     for target, text in _claude_code_files(
-        install, adapter_root, python_path, import_seed, on_demand_seed
+        install, adapter_root, python_path, import_seed, on_demand_seed, messaging=messaging
     ).items():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
@@ -1884,10 +1910,12 @@ def _claude_code_files(
     python_path: str,
     import_seed: Sequence[SeedEntry],
     on_demand_seed: Sequence[SeedEntry],
+    messaging: str | None = None,
 ) -> dict[Path, str]:
     """The install-local files the claude-code adapter renders from its templates:
     the carrier, the hook settings and the MCP registration. One builder for both
-    `init` and `levain update`'s refresh, so the two cannot render different bytes."""
+    `init` and `levain update`'s refresh, so the two cannot render different bytes. ``messaging`` is an explicit
+    choice from `init`; without one the recorded choice is read (`update`)."""
     # The @seed import list is roster-driven, not hard-coded — so a pack's added
     # seed file actually LOADS (install-to-disk without import = the bug this seam
     # fixes). Fill {{SEED_IMPORTS}} rather than copy the template byte-for-byte.
@@ -1897,6 +1925,7 @@ def _claude_code_files(
 
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
     settings_text = _fill(settings_text, {"PYTHON": _hook_arg_body(python_path)})
+    settings_text = _apply_messaging(settings_text, messaging or persisted_messaging(install))
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
@@ -1908,6 +1937,93 @@ def _claude_code_files(
         install / ".claude" / "settings.json": settings_text,
         install / ".mcp.json": mcp_text,
     }
+
+
+# `levain init --messaging` (the opt-out for Q9). The template carries no messaging keys; the renderer adds
+# them through `merge_messaging`, so the choice is the one place they come from. Key ORDER in the rendered
+# settings.json differs from the old hard-coded template (the three keys follow `hooks`); keys and values are
+# the same for `governed`.
+MESSAGING_CHOICES = ("governed", "off", "unmanaged")
+DEFAULT_MESSAGING = "governed"
+_MESSAGING_ADAPTER_REFUSAL = ("FAIL: --messaging is for the claude-code adapter only; {adapter} documents no "
+                              "cross-session messaging, so there is nothing to opt out of.")
+_MESSAGING_KNOBS = {"governed": ("hold", "ask"), "off": ("refuse", "deny"),
+                    "unmanaged": ("unmanaged", "unmanaged")}
+
+
+def _check_messaging(install: Path, chosen: str, messaging: str | None) -> None:
+    """Refuse a choice that cannot be honoured (wrong adapter, unknown value, unreadable config.json) before
+    anything is written."""
+    if messaging is None:
+        return
+    if chosen != "claude-code" or messaging not in MESSAGING_CHOICES:
+        raise InitError("messaging applies to the claude-code adapter and is one of "
+                        f"{', '.join(MESSAGING_CHOICES)}.")
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    if config_path.is_file():
+        try:
+            doc = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise InitError(".levain/config.json is unreadable, so the messaging choice cannot be "
+                            f"recorded ({e}); fix it, then re-run.") from e
+        if not isinstance(doc, dict):
+            raise InitError(".levain/config.json is not a JSON object, so the messaging choice cannot be "
+                            "recorded; fix it, then re-run.")
+
+
+def persisted_messaging(install: Path) -> str:
+    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). Absent, unreadable or
+    unrecognised = ``governed``: an install from before the flag, or a hand-edited value, is governed, never
+    silently opened."""
+    from levain.dashboard import _read_levain_config
+
+    value = _read_levain_config(install).get("messaging")
+    return value if value in MESSAGING_CHOICES else DEFAULT_MESSAGING
+
+
+def _apply_messaging(settings_text: str, choice: str) -> str:
+    """``settings_text`` (the rendered claude-code settings JSON) with the messaging keys ``choice`` names."""
+    from levain.consent.adapters.claude_code import merge_messaging
+
+    inbound, outbound = _MESSAGING_KNOBS[choice]
+    try:
+        doc = json.loads(settings_text)
+        if not isinstance(doc, dict):
+            raise ValueError("the settings template is not a JSON object")
+        merge_messaging(doc, inbound=inbound, outbound=outbound)
+    except ValueError as e:
+        raise InitError(f"the claude-code settings template could not take the messaging keys: {e}") from e
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:
+    """Record ``choice`` in ``.levain/config.json``, merged beside the adapter marker and brand keys (the file
+    for install choices that are not interview answers, so `levain update` reads it and `--force` keeps it).
+    Raises InitError when it cannot be recorded: an opt-out that does not persist would be undone by the
+    next update, so it must not look done."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing: dict = {}
+    if config_path.is_file():
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise InitError(".levain/config.json is unreadable, so the messaging choice cannot be "
+                            f"recorded ({e}); fix it, then re-run.") from e
+        if not isinstance(existing, dict):
+            raise InitError(".levain/config.json is not a JSON object, so the messaging choice cannot be "
+                            "recorded; fix it, then re-run.")
+    if existing.get("messaging") == choice:
+        return
+    try:
+        _atomic_write_text(config_path, json.dumps({**existing, "messaging": choice}, indent=2,
+                                                   ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise InitError(f"could not record the messaging choice in .levain/config.json ({e}).") from e
+    emit(f"  messaging:  {choice} → .levain/config.json")
 
 
 def _install_codex(
@@ -2031,12 +2147,13 @@ def _adapter_local_files(
     python_path: str,
     import_seed: Sequence[SeedEntry],
     on_demand_seed: Sequence[SeedEntry],
+    messaging: str | None = None,
 ) -> dict[Path, str]:
     """The adapter's files INSIDE the install. Codex's hooks.json and config.toml live in
     the machine-global ``CODEX_HOME`` and are deliberately not in this set."""
     if adapter == "claude-code":
         return _claude_code_files(install, adapter_root, python_path, import_seed,
-                                  on_demand_seed)
+                                  on_demand_seed, messaging=messaging)
     if adapter == "codex":
         return {install / "AGENTS.md": _codex_agents_md(adapter_root, import_seed,
                                                         on_demand_seed)}
@@ -2047,11 +2164,12 @@ def record_adapter_receipt(
     install: Path, adapter: str, templates_root: Path, python_path: str,
     import_seed: Sequence[SeedEntry], on_demand_seed: Sequence[SeedEntry],
     emit: Callable[[str], None] = print,
+    messaging: str | None = None,
 ) -> None:
     """After an adapter install: record what was written, so a later ``levain update``
     can tell an operator's edit from a file the package has since moved. Best-effort."""
     files = _adapter_local_files(adapter, install, templates_root / "adapters" / adapter,
-                                 python_path, import_seed, on_demand_seed)
+                                 python_path, import_seed, on_demand_seed, messaging=messaging)
     try:
         files = {**files, **_base_seed_files(install, templates_root,
                                              [*import_seed, *on_demand_seed])}
