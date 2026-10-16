@@ -1043,6 +1043,8 @@ def test_apply_init_persists_answers_json(tmp_path: Path, monkeypatch):
     assert read_answers(install) == answers
     # the operator's personal answers must be gitignored
     assert "answers.json" in (install / ".levain" / ".gitignore").read_text(encoding="utf-8")
+    # and so is the hooks' session registry, on a FRESH init too (L3 r2 glm: written before .levain existed, so lost)
+    assert "sessions/" in (install / ".levain" / ".gitignore").read_text(encoding="utf-8").split()
 
 
 def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
