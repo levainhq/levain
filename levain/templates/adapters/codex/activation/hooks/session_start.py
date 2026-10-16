@@ -187,6 +187,12 @@ def main() -> int:
             delivered = hook.emit("\n\n".join(sections), "SessionStart") is True
         if delivered and pending_sig is not None and isinstance(session_id, str) and session_id:
             hook.state_seen_record(session_id, pending_sig)
+        # Session registry: after emit(), so it can never change what was delivered.
+        # context_delivered = this hook actually delivered its context (emit confirmed).
+        try:
+            hook.session_touch(session_id, payload.get("cwd"), "SessionStart", bool(sections) and delivered)
+        except Exception:
+            pass
     except Exception:
         # Structural fail-open: no error escapes a harness entry point.
         pass

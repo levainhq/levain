@@ -158,6 +158,11 @@ def main() -> int:
             delivered = hook.emit("\n\n".join(sections), "UserPromptSubmit") is True
         if delivered and pending_sig is not None:
             hook.state_seen_record(session_id, pending_sig)
+        # Session registry: after emit(), so it can never change what was delivered.
+        try:
+            hook.session_touch(session_id, payload.get("cwd"), "UserPromptSubmit")
+        except Exception:
+            pass
     except Exception:
         # Structural fail-open: no error escapes a harness entry point.
         pass

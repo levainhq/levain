@@ -612,7 +612,7 @@ def _state_seen_read(path: Path) -> str | None:
         return None
 
 
-def _state_seen_prune(directory: Path) -> None:
+def _state_seen_prune(directory: Path, keep: int = _STATE_SEEN_KEEP) -> None:
     """Bound the store: stale *.tmp leaks go, then past _STATE_SEEN_KEEP files the least
     recently prompted (by mtime) go."""
     now = time.time()
@@ -630,7 +630,7 @@ def _state_seen_prune(directory: Path) -> None:
             return 0.0
 
     files = sorted((p for p in directory.iterdir() if not p.name.endswith(".tmp")), key=mtime)
-    for p in files[: max(0, len(files) - _STATE_SEEN_KEEP)]:
+    for p in files[: max(0, len(files) - keep)]:
         try:
             p.unlink(missing_ok=True)
         except OSError:
@@ -651,6 +651,58 @@ def state_seen_record(session_id: str, signature: str) -> None:
         finally:
             tmp.unlink(missing_ok=True)
         _state_seen_prune(path.parent)
+    except Exception:
+        pass
+
+
+# Per-session registry for the cockpit's Sessions panel (a DISPLAY, never an authority: any
+# same-uid process can forge a file here, and nothing reads one to decide anything). One file
+# per (agent, session), same write-isolation and pruning shape as the state-line markers.
+_SESSION_AGENT = "claude_code"
+_SESSIONS_KEEP = 200
+
+
+def session_touch(session_id, cwd, event, context_delivered=None) -> None:
+    """Record that this session just fired `event` ("SessionStart" | "UserPromptSubmit").
+    first_seen and (when `context_delivered` is None) context_delivered are kept from the
+    existing file. Atomic (tmp + replace), pruned to the newest _SESSIONS_KEEP by mtime.
+    Fail-soft: ANY exception is swallowed; a hook never fails a session over this."""
+    try:
+        if not isinstance(session_id, str) or not session_id:
+            return
+        key = hashlib.sha1(f"{_SESSION_AGENT}:{session_id}".encode("utf-8", "replace")).hexdigest()[:24]
+        directory = install_root() / ".levain" / "sessions"
+        path = directory / f"{key}.json"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        first_seen, kept = now, None
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(old, dict):
+                if isinstance(old.get("first_seen"), str):
+                    first_seen = old["first_seen"]
+                if isinstance(old.get("context_delivered"), bool):
+                    kept = old["context_delivered"]
+        except Exception:
+            pass  # absent or corrupt: start the record fresh
+        delivered = context_delivered if isinstance(context_delivered, bool) else kept
+        record = {
+            "v": 1,
+            "agent": _SESSION_AGENT,
+            "session_id": session_id,
+            "cwd": cwd if isinstance(cwd, str) else "",
+            "first_seen": first_seen,
+            "last_seen": now,
+            "last_event": event,
+            "context_delivered": delivered,
+        }
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(record), encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _state_seen_prune(directory, _SESSIONS_KEEP)
     except Exception:
         pass
 
