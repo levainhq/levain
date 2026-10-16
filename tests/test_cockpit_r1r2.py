@@ -22,6 +22,7 @@ import pytest
 from levain.cockpit import Cockpit, Fault, ProviderSpec, Read, RowIn, register_ordering
 from levain.cockpit.registry import Ordering
 from levain.cockpit.text import render_lines, snapshot, visible
+from tests._page_drive_run import run as run_driver
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 NODE = shutil.which("node")
@@ -581,8 +582,8 @@ class TestManifestMapperParses:
 
 
 def _dump_dom(url: str) -> str:
-    return subprocess.run([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
-                          capture_output=True, text=True, timeout=60).stdout
+    return run_driver([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
+                      timeout=60).stdout
 
 
 @pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")

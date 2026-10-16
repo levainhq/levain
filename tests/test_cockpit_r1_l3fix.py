@@ -9,6 +9,7 @@ from pathlib import Path
 from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
+from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
 
@@ -67,7 +68,6 @@ def test_a_canonical_bug_is_logged_before_it_is_mapped_to_transient(tmp_path: Pa
 import json
 import re
 import shutil
-import subprocess
 from datetime import datetime, timezone
 
 import pytest
@@ -76,8 +76,8 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
 def _dump(url: str) -> str:
-    return subprocess.run([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000",
-                           "--window-size=1440,1000", url], capture_output=True, text=True, timeout=90).stdout
+    return run_driver([CHROME, "--headless=new", "--use-mock-keychain", "--password-store=basic", "--dump-dom", "--virtual-time-budget=8000",
+                       "--window-size=1440,1000", url], timeout=90).stdout
 
 
 def _bare_install(tmp_path: Path, texts: list[str]):
