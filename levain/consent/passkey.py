@@ -4,8 +4,11 @@ A passkey cannot sign arbitrary bytes, but it signs ``authenticatorData || SHA-2
 clientDataJSON carries the challenge the page passed in. OpenSSH has a signature type for exactly that,
 ``webauthn-sk-ecdsa-sha2-nistp256@openssh.com`` (OpenSSH PROTOCOL.u2f), which ``ssh-keygen -Y verify`` checks: it
 rebuilds the challenge from the message being verified, requires clientDataJSON to begin with
-``{"type":"webauthn.get","challenge":"<that challenge>","origin":"<the signature's origin>"``, checks the rpId hash
-against the key's application and the user-presence flag, then the ECDSA signature. So:
+``{"type":"webauthn.get","challenge":"<that challenge>","origin":"<the signature's origin>"``, takes the rpId hash
+from the key's application, then checks the ECDSA signature over all of it (flags and counter included). It checks
+neither the user-presence flag nor what the origin is: levain's own presence rule
+(:func:`levain.authority.presence_missing`) refuses a signature without presence, and :func:`to_sshsig` refuses one
+whose origin is not the key's own host or that lacks user verification. So:
 
   - :func:`challenge` is the challenge the page asks the passkey to sign: the whole SSHSIG signed-data blob for the
     answer's message (``"SSHSIG" || string(namespace) || string("") || string("sha512") || string(SHA-512(message))``,
@@ -14,9 +17,10 @@ against the key's application and the user-presence flag, then the ECDSA signatu
     application. The rpId is part of the key: a passkey made on one https name is a different key on any other;
   - :func:`to_sshsig` wraps one assertion as an armored SSHSIG over that key.
 
-This module decides nothing. A wrong conversion makes ``ssh-keygen`` refuse a good answer; it cannot make a bad one
-verify, because every byte that carries trust is checked by the verifier the consent queue already uses
-(:func:`levain.authority.verify_link_sig`). The checks here only refuse input of the wrong SHAPE early, with a reason.
+This module decides nothing on its own. A wrong conversion makes ``ssh-keygen`` refuse a good answer; it cannot make
+a bad one verify, because the message, rpId, flags and signature are checked by the verifier the consent queue already
+uses (:func:`levain.authority.verify_link_sig`). The checks here refuse the wrong shape early, with a reason, and add
+the two (origin host, user verification) that ``ssh-keygen`` does not make.
 
 Stdlib only. The conversion was first run by a test page against a real iPhone (Safari, iCloud passkey, 2026-10-16:
 ``/usr/bin/ssh-keygen`` verified it and a one-bit change to the message did not); this module's output for a recorded
@@ -45,7 +49,7 @@ _HASH_ALG = "sha512"
 _P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
 _POINT_LEN = 65
 _AUTH_DATA_MIN = 37                 # rpIdHash(32) || flags(1) || signCount(4)
-_FLAG_UP, _FLAG_AT, _FLAG_ED = 0x01, 0x40, 0x80
+_FLAG_UP, _FLAG_UV, _FLAG_AT, _FLAG_ED = 0x01, 0x04, 0x40, 0x80
 _FIELD_MAX = 16 * 1024              # any one browser-supplied field; a real one is a few hundred bytes
 # an rpId is a host name: lowercase labels, no port, no scheme (WebAuthn: a registrable domain suffix of the origin)
 _RP_ID = re.compile(r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
@@ -85,11 +89,13 @@ def challenge(message: bytes, namespace: str = ANSWER_NAMESPACE) -> bytes:
 
 def is_host_name(text: object) -> bool:
     """True for a lowercase DNS host name with no scheme, port or path: what an rpId (and a proxied https name) is."""
-    return isinstance(text, str) and _RP_ID.fullmatch(text) is not None
+    if not isinstance(text, str) or _RP_ID.fullmatch(text) is None:
+        return False
+    return not text.rsplit(".", 1)[-1].isdigit()           # an IPv4 literal is never an rpId (WebAuthn)
 
 
 def _rp_id(rp_id: object) -> str:
-    if not isinstance(rp_id, str) or _RP_ID.fullmatch(rp_id) is None:
+    if not is_host_name(rp_id):
         raise PasskeyError(f"rpId {str(rp_id)[:80]!r} is not a lowercase host name")
     return rp_id
 
@@ -182,6 +188,8 @@ def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: byte
     flags = authenticator_data[32]
     if not flags & _FLAG_UP:
         raise PasskeyError("the passkey did not record user presence")
+    if not flags & _FLAG_UV:
+        raise PasskeyError("the passkey did not verify the user (Face ID, Touch ID or the device PIN)")
     if flags & _FLAG_AT:
         raise PasskeyError("authenticatorData carries attested-credential data, which an assertion never does")
     extensions = authenticator_data[_AUTH_DATA_MIN:]
