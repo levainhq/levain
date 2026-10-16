@@ -72,8 +72,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from levain.packs import (  # noqa: E402
-    BASE_IMPORT_ORDER,
     MECHANISM_SHARE_WARN,
+    seed_classes,
     seed_role,
 )
 
@@ -86,13 +86,16 @@ MECHANISM_SHARE_LIMIT = 0.62
 TOTAL_BYTES_LIMIT = 40_000
 
 
-def measure() -> tuple[int, dict[str, int], list[tuple[str, int, str]]]:
-    """(total_bytes, bytes_by_role, [(name, size, role)]) for the BASE eager set."""
+def measure(
+    mode: str = "eager",
+) -> tuple[int, dict[str, int], list[tuple[str, int, str]]]:
+    """(total_bytes, bytes_by_role, [(name, size, role)]) for the BASE eager set
+    under a memory-load ``mode``."""
     seed_root = REPO / "levain" / "templates" / "seed"
     rows: list[tuple[str, int, str]] = []
     by_role: dict[str, int] = {}
     total = 0
-    for name in BASE_IMPORT_ORDER:
+    for name in seed_classes(mode)[0]:
         f = seed_root / name
         if not f.is_file():
             # A base seed missing from the tree is the install honesty floor's job
@@ -148,7 +151,14 @@ def main(argv: list[str]) -> int:
     print(
         f"check_seed_budget: clean — {total:,} B eager, {share:.0%} mechanism "
         f"(limits {TOTAL_BYTES_LIMIT:,} B / {MECHANISM_SHARE_LIMIT:.0%}; "
-        f"target {MECHANISM_SHARE_WARN:.0%} once memory.md moves)"
+        f"target {MECHANISM_SHARE_WARN:.0%})"
+    )
+    # Informational, no gate: eager stays the default, so the limits above bind it.
+    od_total, od_role, _rows = measure("on-demand")
+    od_share = od_role.get("mechanism", 0) / od_total if od_total else 0.0
+    print(
+        f"  on-demand memory workflow: {od_total:,} B eager, {od_share:.0%} mechanism "
+        f"(carrier template only; the pointer block it adds is not counted)"
     )
     return 0
 

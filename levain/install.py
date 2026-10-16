@@ -55,6 +55,8 @@ from typing import TYPE_CHECKING, Any
 from levain.answers import AnswersError
 from levain.packs import (
     BASE_SEED_REACHABLE,
+    DEFAULT_MEMORY_LOAD,
+    MEMORY_LOAD_CHOICES,
     ON_DEMAND_SUMMARY,
     PackBrand,
     PackError,
@@ -282,6 +284,7 @@ def run_init(
     answers_file: Path | None = None,
     messaging: str | None = None,
     consent_hook: str | None = None,
+    memory_load: Sequence[str] | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -331,6 +334,11 @@ def run_init(
         return 1
     if messaging is not None and adapter is not None and adapter != "claude-code":
         print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
+        return 1
+    try:
+        memory_load_default, memory_load_by_adapter = parse_memory_load(memory_load or ())
+    except InitError as e:
+        print(f"FAIL: {e.message}")
         return 1
 
     try:
@@ -541,6 +549,8 @@ def run_init(
                     require_empty=not force,
                     messaging=messaging,
                     consent_hook=consent_hook,
+                    memory_load=memory_load_default,
+                    memory_load_by_adapter=memory_load_by_adapter,
                 )
                 # Interview completed successfully — clear the checkpoint so the next
                 # `levain init --force` doesn't offer to resume stale answers.
@@ -584,6 +594,8 @@ def apply_init(
     require_empty: bool = False,
     messaging: str | None = None,
     consent_hook: str | None = None,
+    memory_load: str | None = None,
+    memory_load_by_adapter: Mapping[str, str] | None = None,
 ) -> InitResult:
     """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
     :class:`InstallBusy` before writing anything when another process holds it.
@@ -594,6 +606,7 @@ def apply_init(
     no authorization and no backup (codex L3 on 19811f7, reproduced). Raises
     :class:`InstallTargetTaken` before writing anything."""
     _check_messaging(install, chosen, messaging)  # before the lock and every write
+    _check_memory_load(install, memory_load, memory_load_by_adapter)
     with install_lock(install), (
             codex_home_lock(_codex_home()) if chosen == "codex" else contextlib.nullcontext()):
         # The CODEX_HOME lock is taken here, before the first write, so a refusal still
@@ -609,6 +622,7 @@ def apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
             messaging=messaging, consent_hook=consent_hook,
+            memory_load=memory_load, memory_load_by_adapter=memory_load_by_adapter,
         )
 
 
@@ -627,6 +641,8 @@ def _apply_init(
     emit: Callable[[str], None] = print,
     messaging: str | None = None,
     consent_hook: str | None = None,
+    memory_load: str | None = None,
+    memory_load_by_adapter: Mapping[str, str] | None = None,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
     `answers`, copy the verbatim seed files (each from its winning layer's source
@@ -704,8 +720,11 @@ def _apply_init(
         SeedEntry(name=spec.path.name, path=spec.path, mode="render") for spec in specs
     ]
     roster_seed = [*render_seed, *verbatim]
-    import_seed = import_entries(roster_seed)
-    on_demand_seed = on_demand_entries(roster_seed)
+    # The mode this adapter's carrier renders with: what this call names, over what the install recorded.
+    load_default, load_by_adapter = _merged_memory_load(install, memory_load, memory_load_by_adapter)
+    load_mode = resolve_memory_load(load_default, load_by_adapter, chosen)
+    import_seed = import_entries(roster_seed, load_mode)
+    on_demand_seed = on_demand_entries(roster_seed, load_mode)
 
     # Honesty floor (the base half): every base methodology-core seed must REACH
     # the entity. A corrupt wheel that dropped one would otherwise generate an
@@ -761,6 +780,11 @@ def _apply_init(
     elif chosen in CONSENT_HOOK_SCRIPTS:
         _emit_consent_hook(install, chosen, emit)
         _write_consent_settings(install, chosen, emit)
+    if memory_load is not None or memory_load_by_adapter:
+        # Recorded once the adapter files exist, as messaging is: a render that fails leaves no choice behind.
+        _write_memory_load_choice(install, load_default, load_by_adapter, emit)
+    elif recorded_memory_load(install) != (None, {}):
+        emit(f"  memory load: {load_mode} (kept from .levain/config.json)")
     if messaging is not None:
         # Recorded once the adapter files exist: a render that fails leaves no choice behind.
         _write_messaging_choice(install, messaging, emit)
@@ -2277,6 +2301,121 @@ def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], No
     emit(f"  messaging:  {choice} → .levain/config.json")
 
 
+def parse_memory_load(specs: Sequence[str]) -> tuple[str | None, dict[str, str]]:
+    """``--memory-load`` values -> (install default or None, {adapter: mode}). A value is a bare MODE (the
+    install's default, given at most once) or ADAPTER=MODE (one agent, a later repeat of the same adapter
+    replacing the earlier). An unknown mode or adapter raises InitError, before anything is written."""
+    default: str | None = None
+    by_adapter: dict[str, str] = {}
+    for spec in specs:
+        adapter, sep, mode = spec.rpartition("=")
+        if mode not in MEMORY_LOAD_CHOICES:
+            raise InitError(f"--memory-load must be one of {', '.join(MEMORY_LOAD_CHOICES)}, or "
+                            f"ADAPTER={'|'.join(MEMORY_LOAD_CHOICES)} (got {spec!r}).")
+        if not sep:
+            if default is not None and default != mode:
+                raise InitError(f"--memory-load names two install defaults ({default}, {mode}); "
+                                f"give one, and use ADAPTER=MODE for a single agent.")
+            default = mode
+        elif adapter in KNOWN_ADAPTERS:
+            by_adapter[adapter] = mode
+        else:
+            raise InitError(f"--memory-load names an unknown adapter {adapter!r} (one of "
+                            f"{', '.join(KNOWN_ADAPTERS)}).")
+    return default, by_adapter
+
+
+def _read_memory_load_config(install: Path) -> dict | None:
+    """The install's ``.levain/config.json`` as an object, ``{}`` when there is none, ``None`` when it cannot
+    be read as a JSON object (a reader treats that as eager; a writer refuses, see :func:`_check_memory_load`)."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    path = install.joinpath(*LEVAIN_CONFIG_REL)
+    if not os.path.lexists(path):
+        return {}
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def recorded_memory_load(install: Path) -> tuple[str | None, dict[str, str]]:
+    """(install default or None, {adapter: mode}) as ``.levain/config.json`` records them (``memory_load``,
+    ``memory_load_by_adapter``). A value that is not a choice is kept as written, so the resolution can read it
+    as eager; a damaged file or an absent key records nothing."""
+    config = _read_memory_load_config(install) or {}
+    default = config.get("memory_load")
+    by_adapter = config.get("memory_load_by_adapter")
+    return (
+        default if isinstance(default, str) else None,
+        {k: v for k, v in by_adapter.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(by_adapter, dict) else {},
+    )
+
+
+def resolve_memory_load(default: str | None, by_adapter: Mapping[str, str], adapter: str) -> str:
+    """The mode ``adapter`` renders with: its own entry, else the install default, else eager. A value that
+    is not a choice reads as eager, because eager loses nothing and on-demand is the opt-in."""
+    mode = by_adapter.get(adapter, default)
+    return mode if mode in MEMORY_LOAD_CHOICES else DEFAULT_MEMORY_LOAD  # type: ignore[return-value]
+
+
+def persisted_memory_load(install: Path, adapter: str) -> str:
+    """The mode ``adapter`` renders with when this run names none (`update`, `init --force` without the flag)."""
+    default, by_adapter = recorded_memory_load(install)
+    return resolve_memory_load(default, by_adapter, adapter)
+
+
+def _merged_memory_load(
+    install: Path, default: str | None, by_adapter: Mapping[str, str] | None
+) -> tuple[str | None, dict[str, str]]:
+    """What this run names laid over what the install recorded: a named default replaces the recorded one, and
+    a named adapter replaces only its own entry."""
+    kept_default, kept_by = recorded_memory_load(install)
+    return (kept_default if default is None else default), {**kept_by, **(by_adapter or {})}
+
+
+def _check_memory_load(
+    install: Path, default: str | None, by_adapter: Mapping[str, str] | None
+) -> None:
+    """Refuse, before any write, a named choice that ``.levain/config.json`` cannot take."""
+    if default is None and not by_adapter:
+        return
+    if _read_memory_load_config(install) is None:
+        raise InitError(".levain/config.json is unreadable or not a JSON object, so the memory load choice "
+                        "cannot be recorded; fix it, then re-run.")
+
+
+def _write_memory_load_choice(
+    install: Path, default: str | None, by_adapter: Mapping[str, str], emit: Callable[[str], None]
+) -> None:
+    """Record the choice in ``.levain/config.json`` beside the other install choices, so `levain update` and
+    `init --force` keep it. Raises InitError when it cannot be recorded."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing = _read_memory_load_config(install)
+    if existing is None:
+        raise InitError(".levain/config.json is unreadable or not a JSON object, so the memory load choice "
+                        "cannot be recorded; fix it, then re-run.")
+    want = dict(existing)
+    if default is not None:
+        want["memory_load"] = default
+    if by_adapter:
+        want["memory_load_by_adapter"] = dict(by_adapter)
+    if want == existing:
+        return
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(config_path, json.dumps(want, indent=2, ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise InitError(f"could not record the memory load choice in .levain/config.json ({e}).") from e
+    shown = ", ".join([f"default {default or DEFAULT_MEMORY_LOAD}",
+                       *(f"{a}={m}" for a, m in sorted(by_adapter.items()))])
+    emit(f"  memory load: {shown} → .levain/config.json")
+
+
 def _install_codex(
     install: Path,
     adapter_root: Path,
@@ -2592,18 +2731,20 @@ def _refresh_adapter(
                 return out
         try:
             roster = compose_roster([templates_root, *pack_dirs])
+            load_mode = persisted_memory_load(install, adapter)
             adapter_root = templates_root / "adapters" / adapter
             base_activation = _base_activation_root(adapter, templates_root)
             activation_roots = order_activation_roots(templates_root, base_activation,
                                                       pack_dirs)
             expected = _expected_activation(activation_roots, anneal_path)
             files = _adapter_local_files(adapter, install, adapter_root, python_path,
-                                         import_entries(roster), on_demand_entries(roster))
+                                         import_entries(roster, load_mode),
+                                         on_demand_entries(roster, load_mode))
             # The same files rendered with a sentinel interpreter: the leaves that differ
             # are the ones levain substitutes per machine (see _levain_render_variant).
             variants = {t.name: x for t, x in _adapter_local_files(
-                adapter, install, adapter_root, _VARIABLE, import_entries(roster),
-                on_demand_entries(roster)).items()}
+                adapter, install, adapter_root, _VARIABLE, import_entries(roster, load_mode),
+                on_demand_entries(roster, load_mode)).items()}
             # `expected` is composed from the LIVE pack sources, so a path a pack changed since
             # it was recorded would be installed in the same run the pack reconcile lists it for
             # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,
@@ -2617,8 +2758,17 @@ def _refresh_adapter(
             return out
         _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
+        try:
+            shipped = _base_seed_files(install, templates_root,
+                                       [*import_entries(roster), *on_demand_entries(roster)])
+        except (OSError, ValueError):
+            shipped = {}  # the same read fails again below, where it is reported
+        # A base seed file this release adds is installed by this very refresh (nothing of
+        # the operator's is there to keep), so it does not hold the carrier back; only a
+        # file nothing here would write does.
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
-                         if not (install / "seed" / e.name).is_file())
+                         if not (install / "seed" / e.name).is_file()
+                         and install / "seed" / e.name not in shipped)
         held = None
         if not carrier:
             held = "the pack reconcile above is holding seed changes for review"
@@ -2698,7 +2848,9 @@ def _refresh_seeds_only(
             out.review.append("seed")
             emit(f"\n• seed files NOT refreshed: the package could not be composed ({e}).")
             return out
-        missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file())
+        # a base file this release adds is written by this very refresh (see refresh_adapter)
+        missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file()
+                         and install / "seed" / e.name not in files)
         if not carrier:
             lines.append("  seed files: not refreshed, because the pack reconcile above is "
                          "holding seed changes for review.")

@@ -246,6 +246,7 @@ _SEED_REQUIRED = (
     "partnership.md",
     "world.md",
     "memory.md",
+    "memory_workflow.md",
     "spore_instructions.md",
 )
 _SEED_EXPECTED = _SEED_REQUIRED + ("continuity.md", "README.md")
@@ -1942,6 +1943,20 @@ def _imports_continuity(text: str) -> bool:
     return False
 
 
+def _carrier_adapter(carrier: Path) -> str:
+    return "claude-code" if carrier.name == "CLAUDE.md" else "codex"
+
+
+def _check_memory_load(install: Path, carrier: Path) -> list[CheckResult]:
+    """One advisory row: how this adapter's carrier loads the memory wrap procedure. Never a failure: both
+    modes are the operator's to choose, and the freshness check owns a carrier that disagrees with it."""
+    from levain.install import persisted_memory_load
+
+    mode = persisted_memory_load(install, _carrier_adapter(carrier))
+    detail = "eager" if mode == "eager" else "on-demand (summary in the carrier)"
+    return [CheckResult("memory workflow", True, detail)]
+
+
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
@@ -1962,7 +1977,12 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     the finding neither the Claude layers nor the open-weight seat produced, because
     it lives in the files this change never touched.
     """
-    from levain.packs import ON_DEMAND_SEED
+    from levain.install import persisted_memory_load
+    from levain.packs import seed_classes
+
+    # The on-demand set is the install's own: memory_workflow.md is on-demand only where this
+    # adapter's recorded memory load says so, and eager everywhere else.
+    on_demand = seed_classes(persisted_memory_load(install, _carrier_adapter(carrier)))[1]
 
     try:
         text = carrier.read_text(encoding="utf-8")
@@ -1974,7 +1994,7 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     # names the file, as ``- `seed/<name>` — summary``, so match the eager forms only.
     stale = [
         name
-        for name in ON_DEMAND_SEED
+        for name in on_demand
         if f"@seed/{name}" in text or f". `seed/{name}`" in text
     ]
     # A Claude Code carrier written before 0.5.5 does not import the live continuity, so the
@@ -2598,6 +2618,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
     results.extend(_check_carrier_freshness(install, install / "CLAUDE.md"))
+    results.extend(_check_memory_load(install, install / "CLAUDE.md"))
     results.extend(_check_context_surface(install, install / "CLAUDE.md"))
 
     settings_path = install / ".claude" / "settings.json"
@@ -2791,6 +2812,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
     results.extend(_check_carrier_freshness(install, install / "AGENTS.md"))
+    results.extend(_check_memory_load(install, install / "AGENTS.md"))
     results.extend(_check_context_surface(install, install / "AGENTS.md"))
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
