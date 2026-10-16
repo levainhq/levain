@@ -881,7 +881,7 @@ def _session_record(path: Path) -> dict[str, Any] | None:
     sid, cwd = d.get("session_id"), d.get("cwd")
     if not (isinstance(sid, str) and sid and isinstance(cwd, str)) or d.get("last_event") not in SESSION_EVENTS:
         return None
-    if path.stem != hashlib.sha1(f"{d['agent']}:{sid}".encode("utf-8", "surrogatepass")).hexdigest()[:24]:
+    if path.stem != hashlib.sha1(f"{d['agent']}:{sid}".encode("utf-8", "replace")).hexdigest()[:24]:
         return None
     if d.get("context_delivered") not in (True, False, None) or _session_stamp(d.get("first_seen")) is None:
         return None
@@ -905,6 +905,20 @@ def _sandbox_layer(source: str) -> str:
     return "managed settings"
 
 
+def _project_root(cwd: str) -> str | None:
+    """Claude Code reads project settings from the project root, not the shell's directory: walk up from the session's
+    cwd to the nearest directory holding `.claude` or `.git` (bounded, never the home directory or above)."""
+    home = os.path.expanduser("~")
+    p = Path(cwd)
+    for _ in range(12):
+        if str(p) == home or p == p.parent:
+            return None
+        if (p / ".claude").is_dir() or (p / ".git").exists():
+            return str(p)
+        p = p.parent
+    return None
+
+
 def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
     """Claude Code's sandbox as CONFIGURED for the session's working directory (doctor's reader); never "confined".
     Codex has no reader here: it says so."""
@@ -914,7 +928,11 @@ def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
         try:
             from levain import host_guard
 
-            on, source = host_guard.cc_sandbox_state(cwd)
+            root = _project_root(cwd)
+            if root is None:
+                cache[cwd] = "sandbox not read"
+                return cache[cwd]
+            on, source = host_guard.cc_sandbox_state(root)
             cache[cwd] = f"sandbox configured on ({_sandbox_layer(source)})" if on else "sandbox configured off"
         except Exception:  # noqa: BLE001 - an unreadable settings layer is "not read", never a dark panel
             cache[cwd] = "sandbox not read"
@@ -925,16 +943,21 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
               ) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         if source.install_root is None:
-            return Absent("no install root: the sessions are kept in the install")
+            # not Absent: an optional tile would read that as "No agent session active", absence drawn as health
+            return Fault("not configured: no install root, the sessions are kept in the install")
         sdir = source.install_root / ".levain" / "sessions"
         found: list[tuple[float, Path]] = []
+        lost = 0
         try:
             with os.scandir(sdir) as it:
                 for n, e in enumerate(it):
                     if n >= SESSIONS_SCAN:
                         break
-                    if e.name.endswith(".json") and e.is_file(follow_symlinks=False):
-                        found.append((e.stat(follow_symlinks=False).st_mtime, Path(e.path)))
+                    try:
+                        if e.name.endswith(".json") and e.is_file(follow_symlinks=False):
+                            found.append((e.stat(follow_symlinks=False).st_mtime, Path(e.path)))
+                    except OSError:    # pruned or replaced between the listing and the stat: that one entry, not the read
+                        lost += 1
         except FileNotFoundError:
             return Read(rows=(), note=SESSIONS_NOTE)
         except OSError as exc:
@@ -984,6 +1007,8 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                 stored={"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
                         "active": active, "chips": chips[1:]}))
         skipped = ((bad, "session record that does not have the registry file's shape"),) if bad else ()
+        if lost:
+            skipped += ((lost, "session record that changed while it was being listed"),)
         more = len(found) - SESSIONS_SHOWN
         filtered = ((more, f"older session records not read (the newest {SESSIONS_SHOWN} are)"),) if more > 0 else ()
         return Read(rows=tuple(rows), skipped=skipped, filtered=filtered, note=SESSIONS_NOTE)

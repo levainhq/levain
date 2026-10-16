@@ -581,6 +581,7 @@ def apply_init(
                 f"`levain init` was running (another init, say). Nothing was written by this "
                 f"one. Re-run with --force to replace it, or choose another path."
             )
+        ensure_runtime_ignored(install)
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
@@ -969,6 +970,12 @@ def _ensure_gitignored(levain_dir: Path, name: str) -> None:
                 fh.write(name + "\n")
     except OSError:
         pass
+
+
+def ensure_runtime_ignored(install: Path) -> None:
+    """Git-ignore the runtime dirs the hooks write under ``.levain/`` (the session registry holds raw
+    session ids and full working directories): an install inside a repo must not commit them."""
+    _ensure_gitignored(install / ".levain", "sessions/")
 
 
 def read_answers(install: Path) -> dict[str, str]:

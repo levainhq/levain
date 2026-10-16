@@ -190,7 +190,7 @@ def main() -> int:
         # Session registry: after emit(), so it can never change what was delivered.
         # context_delivered = this hook actually delivered its context (emit confirmed).
         try:
-            hook.session_touch(session_id, payload.get("cwd"), "SessionStart", bool(sections) and delivered)
+            hook.session_touch(session_id, payload.get("cwd"), "SessionStart", (delivered if sections else None))
         except Exception:
             pass
     except Exception:

@@ -42,7 +42,7 @@ from typing import Callable
 
 from levain import manifest, reconcile
 from levain.launch import NETWORK, child_env
-from levain.install import InstallLockError, install_lock, refresh_adapter
+from levain.install import InstallLockError, ensure_runtime_ignored, install_lock, refresh_adapter
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
 Emit = Callable[[str], None]
@@ -68,6 +68,7 @@ def run_update(
     install = Path(str(path)).expanduser().resolve()
     try:
         with install_lock(install, create=False):
+            ensure_runtime_ignored(install)
             rc = _run_update(path, **kwargs)  # type: ignore[arg-type]
             # anneal 1.0 (KL-19): an update that leaves a usable store also leaves its consolidate
             # baton held by the entity's session, the same rule `init` applies (a store whose claim

@@ -3381,3 +3381,14 @@ def test_a_second_fresh_init_that_lost_the_race_writes_nothing(tmp_path, capsys,
     assert rc_b == 1
     assert "EntityB" not in origin and a["ENTITY_NAME"] in origin
     assert "no longer empty" in capsys.readouterr().out
+
+
+def test_ensure_runtime_ignored_adds_sessions_to_an_existing_gitignore(tmp_path):
+    from levain.install import ensure_runtime_ignored
+
+    lv = tmp_path / ".levain"
+    lv.mkdir()
+    (lv / ".gitignore").write_text("answers.json\ninstall.lock\n", encoding="utf-8")
+    ensure_runtime_ignored(tmp_path)
+    ensure_runtime_ignored(tmp_path)  # idempotent
+    assert (lv / ".gitignore").read_text(encoding="utf-8").split() == ["answers.json", "install.lock", "sessions/"]

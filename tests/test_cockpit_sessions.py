@@ -95,7 +95,8 @@ def test_the_token_free_panel_and_manifest_carry_no_session_id_and_no_full_cwd(t
         for route in ("/cockpit/panel/sessions.json", "/cockpit/manifest.json"):
             with urllib.request.urlopen(url + route, timeout=10) as r:  # noqa: S310 - loopback
                 blobs.append(r.read())
-    assert b"session:" in blobs[0] and b"levain-work" in blobs[0] or b"codex-work" in blobs[0]    # the basename is shown
+    titles = [r["title"] for r in json.loads(blobs[0])["rows"]]
+    assert b"session:" in blobs[0] and "claude_code \u00b7 work" in titles    # the active CC session's basename is shown
     for blob in blobs:
         for marker in (SID_CC, SID_CX, SID_Q, "cc-marker", "cx-marker", "/zq/full"):
             assert marker.encode() not in blob, marker
@@ -117,3 +118,38 @@ def test_the_page_draws_the_tile_and_the_modal_with_groups_chips_and_the_footer(
                  "not visible to doctor"):
         assert want in text, (want, text)
     assert text.index("\nactive\n") < text.index("\nquiet\n")
+
+
+def test_a_record_that_vanishes_between_the_listing_and_the_stat_costs_that_entry_only(tmp_path, monkeypatch):
+    import os
+
+    import levain.cockpit.providers as prov
+
+    root, src = _fixture(tmp_path, monkeypatch)
+    real = os.scandir
+
+    class _Entry:
+        def __init__(self, e):
+            self._e, self.name, self.path = e, e.name, e.path
+
+        def is_file(self, **kw):
+            return self._e.is_file(**kw)
+
+        def stat(self, **kw):
+            if self.name == sorted(os.listdir(os.path.dirname(self.path)))[0]:
+                raise FileNotFoundError(self.path)      # a hook's replace or prune landed between scandir and stat
+            return self._e.stat(**kw)
+
+    class _Scan:
+        def __init__(self, p):
+            self._s = real(p)
+
+        def __enter__(self):
+            return (_Entry(e) for e in self._s.__enter__())
+
+        def __exit__(self, *a):
+            return self._s.__exit__(*a)
+
+    monkeypatch.setattr(prov.os, "scandir", _Scan)
+    p = build_default_cockpit(src).panel("sessions", credential_class="none")
+    assert len(p["rows"]) >= 2 and "changed while it was being listed" in str(p["skipped"])
