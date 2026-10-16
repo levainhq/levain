@@ -66,6 +66,9 @@ def test_installed_hook_never_imports_a_levain_planted_beside_it(tmp_path):
     ws.mkdir()
     script, hooks = cx.install(ws, python=sys.executable, queue_dir=tmp_path / "q", max_hold=0,
                                allow_untested_agent_version=True)
+    # away mode on (no hold), so the real adapter files the request this test reads as proof that it ran
+    (tmp_path / "q").mkdir(mode=0o700, exist_ok=True)
+    (tmp_path / "q" / cx.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "away_hold_seconds": 0}))
     plant = script.parent / "levain" / "consent" / "adapters"
     plant.mkdir(parents=True)
     for d in (plant.parent.parent, plant.parent, plant):

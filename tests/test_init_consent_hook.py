@@ -44,7 +44,7 @@ def test_claude_code_init_wires_the_consent_hook(make_install):
     (group,) = _consent_groups(cc / ".claude" / "settings.json")
     script = cc / "activation" / "hooks" / "consent_claude_code.py"
     assert group == {"matcher": "*", "hooks": [{
-        "type": "command", "command": claude_code.hook_command(sys.executable, script),
+        "type": "command", "command": claude_code.hookrun_command(sys.executable, script),
         "timeout": claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)}]}
     assert script.is_file()
     # the other hooks are untouched by the merge
@@ -58,7 +58,7 @@ def test_codex_init_wires_the_consent_hook_in_the_global_file(make_install, tmp_
     script = cx / "activation" / "hooks" / "consent_codex.py"
     (handler,) = group["hooks"]
     # machine-wide: through levain.hookrun, so a gone install never blocks Codex (exit 2)
-    assert handler["command"] == claude_code.machine_wide_hook_command(sys.executable, script)
+    assert handler["command"] == claude_code.hookrun_command(sys.executable, script)
     assert handler["timeout"] == claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)
     assert script.is_file() and not (cx / "activation" / "hooks" / "consent_claude_code.py").exists()
     assert set(json.loads(_cj(tmp_path).read_text())["hooks"]) == {
@@ -167,7 +167,7 @@ def test_init_creates_the_settings_file_away_off(make_install):
     assert os.stat(path.parent).st_mode & 0o777 == 0o700
 
 
-def test_init_never_rewrites_an_existing_settings_file(make_install, capsys):
+def test_init_never_rewrites_an_existing_settings_file(make_install, capsys, tmp_path):
     path = _settings_file(codex.SETTINGS_NAME)
     path.parent.mkdir(mode=0o700, parents=True)
     mine = {"cockpit_data_root": "/somewhere/else/cockpit", "away_mode": True, "away_hold_seconds": 15}
@@ -178,9 +178,16 @@ def test_init_never_rewrites_an_existing_settings_file(make_install, capsys):
     assert json.loads(path.read_text()) == mine
     assert any("name another cockpit" in ln and "kept" in ln for ln in lines), lines
     rows = doctor._check_codex(cx)
-    assert _row(rows, "Codex consent authority").warn
+    auth = _row(rows, "Codex consent authority")
+    assert not auth.warn and "nothing is answered by a grant" in auth.detail, auth  # no cockpit database anywhere
     away = _row(rows, "Codex away mode")
     assert away.warn and "NO dialog during the hold" in away.detail and "15s" in away.detail, away
+    other = tmp_path / "other" / "cockpit"
+    other.mkdir(parents=True)
+    (other / "cockpit.db").write_bytes(b"")
+    path.write_text(json.dumps({**mine, "cockpit_data_root": str(other)}), encoding="utf-8")
+    auth = _row(doctor._check_codex(cx), "Codex consent authority")
+    assert auth.warn and "not this install's" in auth.detail, auth
 
 
 def test_a_settings_file_naming_no_cockpit_is_kept_and_reported(make_install):
@@ -383,8 +390,63 @@ def test_a_bad_consent_hook_value_is_refused_before_anything_is_written(make_ins
 def test_every_levain_consent_shape_is_ours_and_lookalikes_are_not(tmp_path, shape):
     script = tmp_path / "activation" / "hooks" / "consent_codex.py"
     cmd = {"plain": f"/usr/bin/python3 {script}", "flags": claude_code.hook_command("/usr/bin/python3", script),
-           "hookrun": claude_code.machine_wide_hook_command("/usr/bin/python3", script)}[shape]
+           "hookrun": claude_code.hookrun_command("/usr/bin/python3", script)}[shape]
     assert claude_code._is_ours({"command": cmd}, "other", script)
     for bad in (f"/usr/bin/python3 -m levain.hookrun {script}", f"/usr/bin/python3 -EP -m evil {script}",
                 f"/usr/bin/python3 -EP -m levain.hookrun {script}x"):
         assert not claude_code._is_ours({"command": bad}, "other", script), bad
+
+
+# --- L1/L2 r1 fixes ------------------------------------------------------------------------------------------
+
+def test_a_moved_claude_install_s_consent_command_falls_through(make_install, tmp_path):
+    import subprocess
+
+    cc = make_install("cc")
+    (group,) = _consent_groups(cc / ".claude" / "settings.json")
+    cmd = group["hooks"][0]["command"]
+    os.rename(cc, tmp_path / "moved")
+    r = subprocess.run(["/bin/sh", "-c", cmd], input="{}", capture_output=True, text=True, timeout=60)
+    assert (r.returncode, r.stdout) == (0, ""), r
+
+
+@pytest.mark.parametrize("name", ["consent_claude_code.py", "consent_codex.py", "user_prompt_submit.py"])
+def test_a_write_to_an_install_s_hook_scripts_is_agent_config(tmp_path, name):
+    target = tmp_path / "inst" / "activation" / "hooks" / name
+    assert claude_code.targets_agent_config("Write", {"file_path": str(target), "content": "x"}, str(tmp_path / "inst"),
+                                            home=tmp_path / "home")
+    patch = f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch\n"
+    assert codex.targets_agent_config("apply_patch", {"command": patch}, str(tmp_path / "inst"),
+                                      home=tmp_path / "home", codex_dir=tmp_path / "codex-home")
+
+
+@pytest.mark.parametrize("mod", [claude_code, codex])
+def test_away_off_with_no_cockpit_files_nothing(tmp_path, mod):
+    from levain.consent.queue import ConsentQueue, authority_source
+
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    queue = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
+    cockpit = tmp_path / "cockpit"
+    settings = mod.AdapterSettings(away_mode=False, away_hold_seconds=0, cockpit_data_root=str(cockpit))
+    event = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": str(tmp_path), "session_id": "s1"}
+    import sqlite3
+
+    def rows() -> int:
+        if not (qdir / "queue.db").exists():
+            return 0
+        with sqlite3.connect(qdir / "queue.db") as c:
+            if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'requests'").fetchone():
+                return 0
+            return c.execute("SELECT count(*) FROM requests").fetchone()[0]
+
+    assert mod.decide(event, queue, settings, home=tmp_path / "home") is None
+    assert rows() == 0
+    # control: away mode on files the request (and, with nothing to answer it, withdraws it)
+    away = mod.AdapterSettings(away_mode=True, away_hold_seconds=0, cockpit_data_root=None)
+    assert mod.decide(event, queue, away, home=tmp_path / "home") is None
+    assert rows() == 1
+    cockpit.mkdir()
+    (cockpit / "cockpit.db").write_bytes(b"")
+    assert claude_code.nothing_can_decide(settings) is False

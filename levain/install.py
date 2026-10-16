@@ -341,6 +341,9 @@ def run_init(
     if messaging is not None and chosen != "claude-code":  # the adapter came from the menu
         print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
         return 1
+    if consent_hook is not None and chosen not in CONSENT_HOOK_SCRIPTS:
+        print(f"FAIL: --consent-hook is for the claude-code and codex adapters; {chosen} wires no consent hook.")
+        return 1
 
     if install.exists() and not install.is_dir():
         print(
@@ -1974,15 +1977,14 @@ CONSENT_AGENTS = {"claude-code": "claude_code", "codex": "codex"}
 
 def consent_hook_handler(python_path: str, install: Path, adapter: str) -> tuple[str, dict[str, Any], Path]:
     """(command, handler, script) of the consent hook entry levain renders for ``adapter``: the command is
-    ``<python> -EP <install>/activation/hooks/<script>`` (Codex's, in the machine-wide hooks.json:
-    ``<python> -EP -m levain.hookrun <script>``) with nothing after the script, and the timeout is the adapters'
+    ``<python> -EP -m levain.hookrun <install>/activation/hooks/<script>`` (a gone or moved install never blocks or
+    denies; levain/hookrun.py) with nothing after the script, and the timeout is the adapters'
     :func:`hook_timeout` at their default hold ceiling. THE COMMAND SHAPE LIVES HERE, and only here. The script is
     the last token with nothing after it, because levain's ownership checks read the script from that position."""
-    from levain.consent.adapters.claude_code import (DEFAULT_MAX_HOLD, hook_command, hook_timeout,
-                                                     machine_wide_hook_command)
+    from levain.consent.adapters.claude_code import DEFAULT_MAX_HOLD, hook_timeout, hookrun_command
 
     script = install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS[adapter]
-    command = (machine_wide_hook_command if adapter == "codex" else hook_command)(python_path, script)
+    command = hookrun_command(python_path, script)
     return command, {"type": "command", "command": command, "timeout": hook_timeout(DEFAULT_MAX_HOLD)}, script
 
 
