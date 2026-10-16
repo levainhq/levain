@@ -14,13 +14,13 @@ from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
-NOW = datetime.now(timezone.utc).replace(microsecond=0)
 SID_CC, SID_CX, SID_Q = "zq-session-id-cc-8812", "zq-session-id-cx-8813", "zq-session-id-q-8814"
 CWD_CC, CWD_CX = "/zq/full/path/cc-marker/levain-work", "/zq/full/path/cx-marker/codex-work"
 
 
 def _stamp(ago: timedelta) -> str:
-    return (NOW - ago).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # stamped from the clock at write time: a module-level "now" goes stale by the time a slow CI runner reaches the test
+    return (datetime.now(timezone.utc) - ago).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _put(root: Path, agent: str, sid: str, cwd: str, ago: timedelta, delivered=True, **over) -> Path:
