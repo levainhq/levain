@@ -1990,7 +1990,8 @@ class GitLedger:
     def sync_now(self, *, push: bool = False, op_wait: float = 5.0, timeout: float = 20.0) -> str:
         """One sync now (a fetch and rebase; a push only when ``push``), for a caller that holds a person's request
         open: the op is waited for ``op_wait`` seconds and each git network call gets ``timeout``, never the CLI's
-        minutes. A busy op raises TeamBusy and records nothing (it is not an attempt, as for ``fetch_if_due``); a
+        minutes. ``timeout`` bounds EACH git call, not the sync: one sync may run several (fetch, the strict-ledger
+        fetch, push retries), and its rebase waits up to ``op_wait`` for the worktree lock. A busy op raises TeamBusy and records nothing (it is not an attempt, as for ``fetch_if_due``); a
         fetch that fails is recorded as ``last_fetch_error``, as the hook records one, and raised; a success is
         stamped by the fetch itself."""
         with self.op(timeout=op_wait):
