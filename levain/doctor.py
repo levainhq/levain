@@ -1906,7 +1906,10 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
     try:
         if repin:
             pins = hg.repin_agent_hooks(install)
-            out = [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now")]
+            owner = hg.codex_hooks_owner(install)
+            out = [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now"
+                               + (f"; Codex's hooks.json was NOT pinned: it is levain's write for the install at "
+                                  f"{owner}" if owner else ""))]
             return out + _unpinned_commands_result(install)
         status, diffs = hg.check_agent_hook_pins(install)
     except hg.AgentPinError as exc:
@@ -1922,9 +1925,13 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
                             "(trust on first use): " + (", ".join(diffs) or "nothing present yet"),
                             "If anything here is not yours, fix it before relying on this pin.",
                             warn=True)] + extra
+    if status == "match" and diffs:
+        # another install owns Codex's hooks.json: a WARN, never a clean OK, because what was not compared
+        # rests on a receipt any process running as you can write (L1 on 6087443, reproduced)
+        return [CheckResult(name, True, "hook entries and scripts match the pin; " + "; ".join(diffs),
+                            "The wiring rows below say which install's hooks Codex runs now.", warn=True)] + extra
     if status == "match":
-        return [CheckResult(name, True, "hook entries and scripts match the pin"
-                            + "".join(f"; {d}" for d in diffs))] + extra
+        return [CheckResult(name, True, "hook entries and scripts match the pin")] + extra
     return [CheckResult(name, False, "changed since pinned: " + "; ".join(diffs),
                         "If you made the change, run `levain doctor --path "
                         f"{shlex.quote(str(install))} --repin-hooks`. If you did not, "
@@ -2659,8 +2666,13 @@ def _check_codex(install: Path) -> list[CheckResult]:
             from levain import host_guard as hg
 
             owner = hg.codex_hooks_owner(install, codex_home)
-            takeover = (f"To wire this install again: `levain init --path {shlex.quote(str(install))} "
-                        "--adapter codex --force` (plain `levain init` refuses a directory that is not empty).")
+            q = shlex.quote(str(install))
+            takeover = (f"To wire this install again: `levain init --path {q} --adapter codex --force "
+                        f"--answers {shlex.quote(str(install / '.levain' / 'answers.json'))}` (your recorded "
+                        "answers, so no interview; the store is kept and replaced files are backed up).")
+            if owner:
+                takeover += (f" If you did not run levain init in {owner}, read its activation/hooks/ first: "
+                             "those scripts now run in every Codex session.")
             for ev_name, entries, script_name in ev_scripts:
                 # Exact-path match — substring-only match would false-positive
                 # against ~/levain vs ~/levain-test (prefix overlap).

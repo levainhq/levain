@@ -1059,21 +1059,29 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         now, _, owner = _agent_pins_and_unresolved(ent, codex_home)
     except AgentPinError:
         return "changed"
-    return "changed" if pin_diffs(_comparable_pin(old, now, owner), now) else "match"
+    return "changed" if pin_diffs(_comparable_pin(ent, old, now, owner), now) else "match"
 
 
-def _comparable_pin(old: Mapping[str, str], now: Mapping[str, str], owner: Path | None) -> Mapping[str, str]:
+def _comparable_pin(ent: Path, old: Mapping[str, str], now: Mapping[str, str], owner: Path | None
+                    ) -> Mapping[str, str]:
     """The pin as it compares to ``now``. While the Codex hooks.json is levain's write for another install
     (``owner``), the pinned copy of it and the hook commands only it named are not compared: the file now
     runs that install's hooks, doctor's wiring rows report that, and a takeover by ``levain init --force``
-    here re-pins (its status, taken before the write, is ``match``). A pinned command that is gone can only
-    have come from that file, because every other command source (settings files, the workspace
-    ``.codex/config.toml``) is pinned by its own digest and still compared; the scripts themselves stay
-    covered by the activation tree pin."""
+    here re-pins (its status, taken before the write, is ``match``). Of the pinned commands that are gone,
+    only scripts directly in this install's ``activation/hooks/`` are dropped: that is all levain's Codex
+    hooks.json ever names here, and the activation tree pin still covers them. Any other gone command (one
+    a settings file named, say) is still a difference (L1 on 6087443, reproduced)."""
     if owner is None:
         return old
-    return {k: v for k, v in old.items()
-            if k != _CODEX_KEY and not (k.startswith("hook command ") and k not in now)}
+    hooks_dir = os.path.realpath(ent / "activation" / "hooks")
+
+    def from_codex_file(k: str) -> bool:
+        if not k.startswith("hook command ") or k in now:
+            return False
+        p = Path(k[len("hook command "):])
+        return p.is_absolute() and os.path.realpath(p.parent) == hooks_dir
+
+    return {k: v for k, v in old.items() if k != _CODEX_KEY and not from_codex_file(k)}
 
 
 def repin_after_levain_write(install: str | os.PathLike[str], before: Literal["none", "fresh", "match", "changed"],
@@ -1113,11 +1121,11 @@ def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.
         repin_agent_hooks(ent, codex_home)
         # what trust-on-first-use just vouched for: every component that exists
         return "recorded", sorted(k for k, v in now.items() if v != "absent")
-    diffs = pin_diffs(_comparable_pin(old, now, owner), now)
+    diffs = pin_diffs(_comparable_pin(ent, old, now, owner), now)
     if diffs:
         return "changed", diffs
-    return "match", ([] if owner is None else [f"{_CODEX_KEY}: levain's own write for the install at {owner}, "
-                                               "not compared while that install owns it"])
+    return "match", ([] if owner is None else [f"{_CODEX_KEY} NOT compared: it is levain's write for the install at "
+                                               f"{owner}, whose scripts this pin does not cover"])
 
 
 def pin_diffs(old: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
