@@ -70,7 +70,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "1.0.0rc2"
+KNOWN_GOOD_ANNEAL = "1.0.0"
 
 # The consolidate-baton session id for an install's store (anneal 1.0 KL-19). One constant on purpose: the
 # claim `_init_store` makes, the `serve --session-id` in the MCP launcher and the id `levain wrap` passes
