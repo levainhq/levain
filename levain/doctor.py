@@ -1905,11 +1905,10 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
     name = "agent hook pins"
     try:
         if repin:
-            pins = hg.repin_agent_hooks(install)
-            owner = hg.codex_hooks_owner(install)
+            pins, owner = hg.repin_agent_hooks_with_owner(install)
             out = [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now"
                                + (f"; Codex's hooks.json was NOT pinned: it is levain's write for the install at "
-                                  f"{owner}" if owner else ""))]
+                                  f"{owner}" if owner else ""), warn=owner is not None)]
             return out + _unpinned_commands_result(install)
         status, diffs = hg.check_agent_hook_pins(install)
     except hg.AgentPinError as exc:
@@ -2622,6 +2621,27 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     return results
 
 
+def _codex_takeover_hint(install: Path) -> str:
+    """The command that wires Codex's one hooks.json back to this install. `init --force` reads neither the
+    recorded packs nor the recorded answers by itself, so both are passed when they are on disk; without a
+    recorded answers file it says the interview runs again (L3 r1 on the codex pin owner)."""
+    from levain import manifest
+
+    packs, status = manifest.read_pack_locks_status(install)
+    cmd = f"levain init --path {shlex.quote(str(install))} --adapter codex --force"
+    cmd += "".join(f" --pack {shlex.quote(str(p.source))}" for p in packs)
+    answers = install / ".levain" / "answers.json"
+    if answers.is_file():
+        cmd += f" --answers {shlex.quote(str(answers))}"
+        note = "your recorded answers, so no interview"
+    else:
+        note = "no recorded answers here, so it asks the interview again"
+    if status == "corrupt":
+        note += "; the pack record cannot be read, so add the --pack flags you installed with"
+    return (f"To wire this install again: `{cmd}` ({note}; the store is kept and replaced files are "
+            "backed up).")
+
+
 def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
@@ -2666,10 +2686,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
             from levain import host_guard as hg
 
             owner = hg.codex_hooks_owner(install, codex_home)
-            q = shlex.quote(str(install))
-            takeover = (f"To wire this install again: `levain init --path {q} --adapter codex --force "
-                        f"--answers {shlex.quote(str(install / '.levain' / 'answers.json'))}` (your recorded "
-                        "answers, so no interview; the store is kept and replaced files are backed up).")
+            takeover = _codex_takeover_hint(install)
             if owner:
                 takeover += (f" If you did not run levain init in {owner}, read its activation/hooks/ first: "
                              "those scripts now run in every Codex session.")

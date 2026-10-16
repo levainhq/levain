@@ -637,15 +637,6 @@ def _dir_digest(root: Path, _seen: frozenset[str] = frozenset()) -> str:
     return h.hexdigest()
 
 
-def _codex_hooks_digest(cj: Path) -> str:
-    if not os.path.lexists(cj):
-        return "absent"
-    try:
-        return _sha_bytes(cj.read_bytes())
-    except OSError as exc:
-        raise AgentPinError([f"{cj}: unreadable ({exc.strerror or exc})"]) from None
-
-
 def _read_toml_doc(path: Path) -> Any:
     """The parsed TOML file, or None when absent; AgentPinError when it is there and cannot be read or parsed."""
     try:
@@ -862,12 +853,15 @@ def codex_hooks_owner(install: str | os.PathLike[str], codex_home: str | os.Path
     install from before the receipt existed, commands naming two installs) is None. The receipt is a
     file the operator's uid can write, like the pin itself: this tells levain's own write from an edit;
     it is not a boundary against a process running as the operator."""
-    from levain.install import ADAPTER_RECEIPT_REL, _adapter_key
-    ent = Path(os.path.abspath(install))
     cj = _codex_home(codex_home) / "hooks.json"
     data = _read_small_regular(cj)
-    if data is None:
-        return None
+    return None if data is None else _codex_owner_of(Path(os.path.abspath(install)), cj, data)
+
+
+def _codex_owner_of(ent: Path, cj: Path, data: bytes) -> Path | None:
+    """:func:`codex_hooks_owner` on bytes already read, so a caller that also hashes the file decides
+    both from one snapshot (L3 r1 codex: a file swapped between two reads was neither compared nor pinned)."""
+    from levain.install import ADAPTER_RECEIPT_REL, _adapter_key
     try:
         cmds = _hook_commands([json.loads(data)])
     except (ValueError, RecursionError):
@@ -905,11 +899,27 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
     commands in it are read here (:func:`_comparable_pin`)."""
     ent = Path(os.path.abspath(install))
     cc = ent / ".claude"
-    owner = codex_hooks_owner(ent, codex_home) if _pins_global_codex(ent) else None
-    cj = _codex_home(codex_home) / "hooks.json" if _pins_global_codex(ent) and owner is None else None
     pins: dict[str, str] = {}
     errors: list[str] = []
     docs: list[Any] = []
+    owner: Path | None = None
+    cdoc: Any = None
+    if _pins_global_codex(ent):
+        # read ONCE: the owner decision, the digest and the commands all come from these bytes
+        cj = _codex_home(codex_home) / "hooks.json"
+        try:
+            cdata = cj.read_bytes() if os.path.lexists(cj) else None
+        except OSError as exc:
+            errors.append(f"{_CODEX_KEY}: {cj}: unreadable ({exc.strerror or exc})")
+        else:
+            if cdata is not None and not cj.is_symlink():
+                owner = _codex_owner_of(ent, cj, cdata)
+            if owner is None:
+                pins[_CODEX_KEY] = "absent" if cdata is None else _sha_bytes(cdata)
+                try:
+                    cdoc = json.loads(cdata) if cdata is not None else None
+                except (ValueError, UnicodeDecodeError, RecursionError):
+                    cdoc = None  # not valid JSON: its digest still differs from any pin of a valid file
 
     def run(name: str, fn: Callable[[], str]) -> None:
         try:
@@ -938,8 +948,6 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
         except OSError as exc:
             raise AgentPinError([f"unreadable ({exc.strerror or exc})"]) from None
     run("activation/hooks/ (scripts)", scripts)
-    if cj is not None:
-        run(_CODEX_KEY, lambda: _codex_hooks_digest(cj))
     wcc = ent / ".codex" / "config.toml"
     run(".codex/config.toml [hooks] (workspace)", lambda: _workspace_codex_digest(wcc))
     try:
@@ -949,12 +957,8 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
     except AgentPinError:
         pass
     unresolved: list[str] = []
-    try:
-        cdoc = _read_settings_doc(cj) if cj is not None else None
-        if cdoc is not None:
-            docs.append(cdoc)
-    except AgentPinError:
-        pass
+    if cdoc is not None:
+        docs.append(cdoc)
     try:
         cp, unresolved = _command_pins(ent, docs)
         pins.update(cp)
@@ -1014,8 +1018,15 @@ def repin_agent_hooks(install: str | os.PathLike[str], codex_home: str | os.Path
                       ) -> dict[str, str]:
     """The operator's explicit act: record the pins as they are now. Raises AgentPinError (and
     writes nothing) when any component cannot be read and hashed safely."""
+    return repin_agent_hooks_with_owner(install, codex_home)[0]
+
+
+def repin_agent_hooks_with_owner(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                                 ) -> tuple[dict[str, str], Path | None]:
+    """:func:`repin_agent_hooks`, plus the other install whose Codex hooks.json was left out of the pin
+    (None when it was pinned or this install does not pin it): read from the same snapshot as the pins."""
     ent = Path(os.path.abspath(install))
-    pins = agent_hook_pins(ent, codex_home)
+    pins, _, owner = _agent_pins_and_unresolved(ent, codex_home)
     tmp = ent / ".levain" / f".agent_hook_pins.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
@@ -1028,7 +1039,7 @@ def repin_agent_hooks(install: str | os.PathLike[str], codex_home: str | os.Path
         except OSError:
             pass
         raise
-    return pins
+    return pins, owner
 
 
 def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None,
