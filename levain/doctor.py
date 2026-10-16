@@ -35,6 +35,7 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
 
 def _supports_color() -> bool:
@@ -1406,6 +1407,30 @@ def _hook_command_targets(
     return False
 
 
+def _hooks_wired_anywhere(hooks: Any, event: str, install: Path, script: str) -> bool:
+    """Whether ANY hook in ANY group under ``event`` runs this install's ``script`` (a group can carry
+    another levain hook first, as PostToolUse carries the auto-memory mirror)."""
+    entries = hooks.get(event, []) if isinstance(hooks, dict) else []
+    return any(
+        _hook_command_targets([{"hooks": [h]}], install, script)
+        for group in (entries if isinstance(entries, list) else []) if isinstance(group, dict)
+        for h in (group.get("hooks") or []) if isinstance(h, dict)
+    )
+
+
+def _check_transcript_hooks(install: Path, hooks: Any, events: Sequence[str], agent: str) -> list[CheckResult]:
+    """The session transcript hooks (Stop, PostToolUse, and Claude Code's PostToolUseFailure). Advisory only:
+    they record what a session did for the cockpit's transcript and change nothing the agent does, so an install
+    from before they existed works and simply records no transcript lines."""
+    script = {"Stop": "stop.py"}
+    missing = [e for e in events if not _hooks_wired_anywhere(hooks, e, install, script.get(e, "post_tool_use.py"))]
+    name = f"{agent} transcript hooks"
+    if not missing:
+        return [CheckResult(name, True, f"{', '.join(events)} wired to this install")]
+    return [CheckResult(name, True, f"not wired: {', '.join(missing)}, so the cockpit's session transcript records "
+                        f"nothing for those events", "Run `levain update` to add them.", warn=True)]
+
+
 _MIRROR_OFF = {"off", "0", "false", "no"}
 
 
@@ -2552,6 +2577,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
                 )
 
             results.extend(_check_automemory_mirror(install, hooks))
+            results.extend(_check_transcript_hooks(
+                install, hooks, ("Stop", "PostToolUse", "PostToolUseFailure"), "Claude Code"))
 
             allow = settings.get("permissions", {}).get("allow", [])
             # Match the exact server name or `server__tool` form — not any
@@ -2723,6 +2750,9 @@ def _check_codex(install: Path) -> list[CheckResult]:
                             f"wired to this install ({py})" if py else "wired",
                         )
                     )
+            # only while the file is this install's: otherwise the rows above already say it is not wired
+            if _hook_command_targets(ss, install, "session_start.py"):
+                results.extend(_check_transcript_hooks(install, hh, ("Stop", "PostToolUse"), "Codex"))
 
     if not config_path.is_file():
         results.append(
