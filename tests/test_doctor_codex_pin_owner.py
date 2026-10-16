@@ -176,3 +176,24 @@ def test_a_symlinked_hooks_file_is_never_another_installs(make_install, cj, tmp_
     cj.symlink_to(real)
     assert hg.codex_hooks_owner(a) is None
     assert not _pin_check(a).ok
+
+
+# L3 r2 (complement LOW, codex MED): the recorded packs reach the hint, and a manifest that cannot be decoded
+# leaves a hint that says so instead of crashing doctor.
+def test_the_takeover_hint_carries_recorded_packs_and_survives_a_bad_manifest(make_install, monkeypatch):
+    from types import SimpleNamespace
+
+    from levain import manifest
+
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    monkeypatch.setattr(manifest, "read_pack_locks_status",
+                        lambda install: ([SimpleNamespace(source="/packs/one"), SimpleNamespace(source="/packs/two")], "ok"))
+    rows = _wiring(a)
+    assert rows and all("--pack /packs/one --pack /packs/two" in r.hint for r in rows)
+    (a / ".levain" / "manifest.json").write_bytes(b"\xff\xfe not utf-8")
+    monkeypatch.undo()
+    monkeypatch.setenv("HOME", str(a.parent / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(a.parent / "codex-home"))
+    rows = _wiring(a)
+    assert rows and all("pack record cannot be read" in r.hint for r in rows)
