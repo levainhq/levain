@@ -1308,7 +1308,7 @@ class _Handler(GuardedHandler):
         from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
         from levain.consent.passkey import PasskeyError, b64url_decode, challenge, to_sshsig
         from levain.consent.queue import (
-            AnswerRefused, ConsentQueue, QueueStoreError, authority_source, default_queue_dir,
+            AnswerRefused, ConsentQueue, QueueStoreError, authority_source, class_covers, default_queue_dir,
         )
         from levain.consent.record import DECISIONS, answer_message
 
@@ -1348,6 +1348,9 @@ class _Handler(GuardedHandler):
                     fp = next(iter(keys))
                 if fp not in keys:
                     raise EditError("no_passkey", 422, f"{str(fp)[:80]} is not an active passkey enrolled for {rp_id}")
+                if decision == "allow" and not class_covers(keys[fp].key_class, request.tier):
+                    raise EditError("answer_refused", 422, f"a {keys[fp].key_class} passkey cannot allow a "
+                                                           f"{request.tier} request: allow it from the laptop")
                 payload = queue.answer_payload(request_id, decision, fp)
                 blob = challenge(answer_message(payload))
                 return {"payload": payload, "rp_id": rp_id,
