@@ -863,6 +863,25 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     web_p.add_argument(
+        "--remote-host",
+        default=None,
+        dest="remote_host",
+        metavar="NAME",
+        help=(
+            "The https name a proxy you run serves this cockpit on (for example `tailscale serve` in front of the "
+            "loopback port), so a phone can answer consent requests with a passkey. The server stays bound to "
+            "loopback; a proxied request needs the write token for every read, as an off-box one does. Needs --write."
+        ),
+    )
+    web_p.add_argument(
+        "--tailscale",
+        action="store_true",
+        help=(
+            "Take --remote-host from this machine's Tailscale name (`tailscale status`) and print the "
+            "`tailscale serve` line that puts the cockpit on it. Changes nothing in Tailscale itself."
+        ),
+    )
+    web_p.add_argument(
         "--install-class",
         choices=["reported"],
         default=None,
@@ -1971,51 +1990,19 @@ def _cmd_consent_pending(args: argparse.Namespace) -> int:
 
 
 def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
-    """The cockpit data root an answer to ``request`` is verified against: the one the hook for its agent
-    replays (``cockpit_data_root`` in the queue directory's adapter settings), so a recorded answer is one the
-    hook can deliver. ``--data-root`` / ``--path`` naming another directory is refused; with no setting (the
-    hook then verifies nothing) one of them is required."""
-    import os
+    """The cockpit data root an answer to ``request`` is verified against (``levain.consent.answering.answer_root``,
+    shared with the cockpit's passkey route); ``--data-root`` / ``--path`` must name that same directory."""
+    from levain.consent.answering import answer_root
 
-    from levain.consent.adapters import claude_code, codex
-    from levain.consent.queue import AnswerRefused
-
-    adapter = {"claude_code": claude_code, "codex": codex}.get(request.agent)
-    if adapter is None:
-        raise AnswerRefused(f"no consent hook files for agent {request.agent!r}")
-    hook = adapter.load_settings(qdir).cockpit_data_root
     named = None if args.data_root is None and args.path is None else Path(_cockpit_root(args)).expanduser()
-    if hook is None:
-        if named is None:
-            raise AnswerRefused(f"the queue's {adapter.SETTINGS_NAME} names no cockpit_data_root for "
-                                f"{request.agent}; pass --data-root")
-        return _holding_a_cockpit(named)
-    if named is not None:
-        try:
-            same = os.path.samefile(named, hook)
-        except OSError:
-            same = False
-        if not same:
-            raise AnswerRefused(f"{named} is not the cockpit the hook verifies against ({hook}, the queue's "
-                                f"{adapter.SETTINGS_NAME}): an answer verified there would never be delivered")
-    return _holding_a_cockpit(Path(hook))
-
-
-def _holding_a_cockpit(root: Path) -> Path:
-    """``root``, refused before anything is signed when it holds no cockpit journal: an answer verified there
-    could only be refused after the signature."""
-    from levain.consent.queue import AnswerRefused
-
-    if not (root / "cockpit.db").is_file():
-        raise AnswerRefused(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root")
-    return root
+    return answer_root(qdir, request, named)
 
 
 def _cmd_consent_answer(args: argparse.Namespace) -> int:
     from levain.authority import anchor_path
     from levain.cockpit.consent import ConsentError, utc_stamp
     from levain.cockpit.keys import ssh_signer
-    from levain.consent.listing import UNSHOWN
+    from levain.consent.answering import refuse_cut_display
     from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source
     from levain.consent.record import ANSWER_NAMESPACE, answer_message, answer_payload
 
@@ -2027,10 +2014,7 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
         request, state = got
         if state != "pending":
             raise AnswerRefused(f"request {request.id} is already {state}")
-        if _filed_input(request) is UNSHOWN:
-            raise AnswerRefused(f"request {request.id}'s input is too long to show here (the queue keeps a display "
-                                "cut at its limit), so it is not signed from the terminal; the agent's own dialog "
-                                "stands")
+        refuse_cut_display(request, "from the terminal")
         root = _answer_root(args, qdir, request)
         queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
         signer_fp, sign = ssh_signer(args.signing_key, namespace=ANSWER_NAMESPACE)
@@ -2421,6 +2405,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         max_iterations=args.max_iterations,
         turn_seconds=args.turn_seconds,
         install_class=args.install_class,
+        remote_host=args.remote_host,
+        tailscale=args.tailscale,
     )
 
 
