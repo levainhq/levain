@@ -803,7 +803,7 @@ class _Handler(GuardedHandler):
         read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
         unauthenticated by design)."""
         return (
-            (not self.server.is_loopback_bind or self._proxied())
+            (not self.server.is_loopback_bind or self._proxied() or bool(getattr(self.server, "remote_hosts", ())))
             and self.server.levain_source.write_scope is not None
         )
 
@@ -811,7 +811,12 @@ class _Handler(GuardedHandler):
         """True when a reverse proxy carried this request (it set one of _PROXY_HEADERS): its client is not on
         this machine whatever Host it sent, so it is off-box. A local client sending one only meets the stricter
         rule."""
-        return any(self.headers.get(h) is not None for h in _PROXY_HEADERS)
+        if any(self.headers.get(h) is not None for h in _PROXY_HEADERS):
+            return True
+        # a proxy that sets none of those headers still sends the name it serves on: a Host naming a remote host is
+        # off-box too (a local client that sends it only meets the stricter rule)
+        name = host_header_name(self.headers.get("Host"))
+        return name is not None and name in getattr(self.server, "remote_hosts", frozenset())
 
     def _credential(self) -> dict[str, Any]:
         """The credential THIS request carries, verified here and never claimed (design §5.1): a
@@ -1338,6 +1343,8 @@ class _Handler(GuardedHandler):
                 if decision not in DECISIONS:
                     raise EditError("bad_request", 400, f"decision must be one of {list(DECISIONS)}")
                 fp = req.get("signer_fp")
+                if fp is not None and not isinstance(fp, str):
+                    raise EditError("bad_request", 400, "signer_fp must be a key fingerprint string")
                 if fp is None:
                     if not keys:
                         raise EditError("no_passkey", 422, f"no passkey is enrolled for {rp_id}: enrol this "
@@ -1393,7 +1400,7 @@ class _Handler(GuardedHandler):
         name = f"passkey-{rp_id.split('.')[0]}.pub"
         roots = hook_roots(self.server.consent_queue_dir or default_queue_dir())
         enrol = [f"levain cockpit enroll {name} --class display-phone --custody passkey --data-root {shlex.quote(str(r))} "
-                 "--signing-key <your laptop-presence key>" for r in roots]
+                 "--signing-key YOUR_LAPTOP_PRESENCE_KEY" for r in roots]
         return {"public_key": line, "rp_id": rp_id, "file": name,
                 "commands": [f"printf '%s\\n' '{line}' > {name}", *enrol],
                 "note": None if roots else ("no consent hook names a cockpit yet (run `levain init` with the consent "
@@ -1447,6 +1454,10 @@ class _Handler(GuardedHandler):
         # READ-ONLY surface has no write path, so it falls through to the 422 'read_only' refusal
         # below, NOT a token-403 [codex L3].
         route = self.path.split("?", 1)[0]
+        if (self._proxied() and _consent_passkey_route(route) is None and route != _PASSKEY_KEY_LINE_PATH):
+            # off this machine the cockpit only answers consent requests with a passkey: an install's seed, config
+            # and every other write stay loopback-only, as for an off-box bind (refused before the body is read)
+            return self._reject(403, "off_box_write", "from off this machine only a passkey answer can be posted")
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
             # refused before a byte of the body is read
@@ -1942,6 +1953,9 @@ def make_server(
     if remote and source.write_scope is None:
         httpd.server_close()
         raise ValueError("a remote host is for answering consent requests, which needs a writable cockpit (--write)")
+    if remote and chat_host is not None:
+        httpd.server_close()
+        raise ValueError("a remote host cannot serve chat: chat makes an entity act and spend, and stays loopback-only")
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | set(remote)
     httpd.remote_hosts = frozenset(remote)
     httpd.consent_queue_dir = consent_queue_dir

@@ -304,7 +304,7 @@ What each custody guarantees, and what it does not:
 - `passphrase`: a typed passphrase per signature, and no defence against same-uid malware (a program running as you can keylog it or copy the file). The lowest class.
 - `tpm`: a non-exportable key, and no presence.
 - `fido`: a touch on a key you plugged in, custody declared.
-- `passkey`: a WebAuthn passkey (Face ID, Touch ID or a device PIN in a browser), for a `display-phone` key only. The one thing a passkey signs in levain is a consent answer, through the cockpit page: it can allow a T2 request, never a T3 one (it can deny either). An iCloud or Google passkey syncs to every device on that account, which is why it has its own word.
+- `passkey`: a WebAuthn passkey (Face ID, Touch ID or a device PIN in a browser), for a `display-phone` key only. The one thing a passkey signs in levain is a consent answer, through the cockpit page: it can allow a T2 request, never a T3 one (it can deny either). An iCloud or Google passkey belongs to that account: it syncs to every device signed into it (this laptop included), can be shared with another person, and returns with account recovery, which is why it has its own word. Synced passkeys report no signature counter, so levain cannot detect a cloned one.
 - `fido-attested` (not yet): the only class levain would prove; it is refused until attestation at enrol is built.
 
 The custody is a declaration, signed by the key that enrols it, not a proof. A signature from a Secure Enclave key looks the same whether or not the key was made to need a touch, so the touch rests on how the key was made, which is why the helper makes it and confirms it.
@@ -326,8 +326,9 @@ What to know:
 
 - A passkey is made for one https name. Rename the machine or the tailnet and you make and enrol a new one.
 - The passkey prompt shows no request text. The page shows what you are answering; the signature covers exactly that request.
-- A request that arrives through a proxy is treated as off this machine: every read needs the token, as for an off-box bind. levain recognises a proxied request by the header the proxy sets (`X-Forwarded-For`, `Forwarded`, `X-Forwarded-Host` or `X-Real-IP`). A plain TCP forward sets none of them, so do not expose the cockpit that way.
+- A server started with `--remote-host` needs the token for every read, here and on the phone, and from off this machine accepts only passkey answers: no edits and no chat (chat is refused on such a server). levain tells an off-machine request by the header a proxy sets (`X-Forwarded-For`, `Forwarded`, `X-Forwarded-Host`, `X-Real-IP`) or by the browser's Host naming the remote name, so use a proxy that passes the browser's Host through unchanged, as `tailscale serve` does.
 - Anyone who holds the phone link and reaches the name can read the waiting requests. Only an enrolled passkey can answer one.
+- The page you read is served by your own user account, as the terminal you answer in is. Levain does not confine a Claude Code or Codex session, so an agent running as you could stop the cockpit, serve its own page on that port and show you one request while asking you to sign another. Answer only on a cockpit you started, and turn the proxy off when you stop it (`tailscale serve reset`).
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
