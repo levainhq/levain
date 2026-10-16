@@ -273,3 +273,35 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
         ])["values"]
     assert out[-1][0] == 1, out
     assert "zq-retry-marker" in out[-1][1]
+
+
+@needs_browser
+def test_the_decisions_modal_carries_a_filter_that_narrows_by_agent_tool_and_state(tmp_path, monkeypatch):
+    q = _home_queue(tmp_path, monkeypatch)
+    q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
+           hold=timedelta(minutes=5), event_id="f1")
+    q.file(agent="codex", agent_session_id="s", tool_name="apply_patch", tool_input={"command": "x"}, cwd="/w",
+           hold=timedelta(minutes=5), event_id="f2")
+    gone = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
+                  hold=timedelta(minutes=5), event_id="f3")
+    q.withdraw(gone.id)
+    _root, src, _ids = _install(tmp_path)
+    typ = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
+           " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
+    rows = "document.querySelectorAll('#levain-modal .consent-row').length"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": "document.querySelector('#levain-modal .xfilter-input') && document.querySelector('#levain-modal .consent-row')"},
+            {"eval": rows},
+            {"eval": f"{typ}('apply_patch'); {rows}"},
+            {"eval": f"{typ}('codex'); {rows}"},
+            {"eval": f"{typ}('claude_code'); {rows}"},
+            {"eval": f"{typ}('no-such-thing'); [{rows}, document.querySelector('#levain-modal .empty') && document.querySelector('#levain-modal .empty').textContent]"},
+            {"eval": f"{typ}(''); {rows}"},
+        ])["values"]
+    full, patch, codex, cc, none, cleared = out[-6:]
+    assert full == 3 and cleared == full, out
+    assert (patch, codex, cc) == (1, 2, 1), out
+    assert none == [0, "no match"], out

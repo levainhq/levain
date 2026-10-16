@@ -1102,6 +1102,8 @@ def build_default_cockpit(
     ck.register(ProviderSpec(
         "sessions", "triage-list", "Sessions", "gauge", _sessions(source, lambda: ck.consent_reader), region="widgets",
         rank=20, face="count", optional=True, order="session.recency", rowset="sessions", facets=SESSION_FACETS,
+        # a row shows its agent and workspace (the title) and its chips (legacy_meta): never the id, never the full cwd
+        search_fields=("title", "legacy_meta"),
         version_fields=("*",), empty="No agent session active in the last 15 minutes."))
     ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))

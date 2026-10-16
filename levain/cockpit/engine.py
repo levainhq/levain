@@ -588,7 +588,9 @@ class Cockpit:
             refresh_every_s=src.refresh_every_s if src else None,
             stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
-            version_fields=("*",), search_fields=src.search_fields if src else ("title", "body"),
+            version_fields=("*",),
+            # what a decisions row shows: who asks and for which tool (the title) and its state word and tier
+            search_fields=tuple(dict.fromkeys((*(src.search_fields if src else ("title", "body")), "consent_state", "consent_tier"))),
             search_default_visible=src.search_default_visible if src else 10,
             read_one=lambda ctx, row_id: Fault("the decisions panel routes read_one by row id"),
             note=src.note if src else "", empty=src.empty if src else "Nothing is waiting on you.",
@@ -1448,7 +1450,10 @@ class Cockpit:
         (``search.fields``, ``scope``), never WHETHER."""
         if spec.kind not in ROW_KINDS:
             return {"search": None, "searchable": False, "window": None}
-        searchable = spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+        # a panel drawn as a count opens into a focus modal that is its whole list (Decisions waiting, Sessions): it
+        # carries the box from the first row, since the tile is where it is short and the modal is where it is read
+        searchable = (spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+                      or (spec.face == "count" and (count or 0) > 0))
         return {
             "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
                        "default_visible": roster_visible(spec), "hook": spec.search is not None},

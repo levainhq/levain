@@ -184,3 +184,31 @@ def test_a_record_that_vanishes_between_the_listing_and_the_stat_costs_that_entr
     monkeypatch.setattr(prov.os, "scandir", _Scan)
     p = build_default_cockpit(src).panel("sessions", credential_class="none")
     assert len(p["rows"]) >= 2 and "changed while it was being listed" in str(p["skipped"])
+
+
+_TYPE = ("(v => { const i = document.querySelector('#levain-modal .xfilter-input'); i.value = v;"
+         " i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })")
+
+
+@needs_browser
+def test_the_sessions_modal_carries_a_filter_that_narrows_by_agent_and_workspace_and_chip(tmp_path, monkeypatch):
+    _root, src = _fixture(tmp_path, monkeypatch)
+    tile = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Sessions/i.test(c.innerText))"
+    rows = "document.querySelectorAll('#levain-modal .row').length"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{tile} && /2/.test({tile}.innerText)"},
+            {"eval": f"{tile}.click(); 1"},
+            {"until": "document.querySelector('#levain-modal .xfilter-input')"},
+            {"eval": rows},
+            {"eval": f"{_TYPE}('codex'); {rows}"},
+            {"eval": "document.querySelector('#levain-modal .xfilter-count').textContent"},
+            {"eval": f"{_TYPE}('1 waiting'); [{rows}, document.getElementById('levain-modal').innerText.includes('1 waiting')]"},
+            {"eval": f"{_TYPE}('no-such-thing'); document.querySelector('#levain-modal .empty') && document.querySelector('#levain-modal .empty').textContent"},
+            {"eval": f"{_TYPE}(''); {rows}"},
+        ])["values"]
+    full, codex, count, waiting, none, cleared = out[-6:]
+    assert full == 3 and cleared == full, out         # the quiet one is a row of the modal too
+    assert codex == 1 and count == "1 of 3", out
+    assert waiting[0] == 1 and waiting[1] is True, out
+    assert none == "no match", out
