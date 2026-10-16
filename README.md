@@ -304,11 +304,30 @@ What each custody guarantees, and what it does not:
 - `passphrase`: a typed passphrase per signature, and no defence against same-uid malware (a program running as you can keylog it or copy the file). The lowest class.
 - `tpm`: a non-exportable key, and no presence.
 - `fido`: a touch on a key you plugged in, custody declared.
+- `passkey`: a WebAuthn passkey (Face ID, Touch ID or a device PIN in a browser), for a `display-phone` key only. The one thing a passkey signs in levain is a consent answer, through the cockpit page: it can allow a T2 request, never a T3 one (it can deny either). An iCloud or Google passkey syncs to every device on that account, which is why it has its own word.
 - `fido-attested` (not yet): the only class levain would prove; it is refused until attestation at enrol is built.
 
 The custody is a declaration, signed by the key that enrols it, not a proof. A signature from a Secure Enclave key looks the same whether or not the key was made to need a touch, so the touch rests on how the key was made, which is why the helper makes it and confirms it.
 
 The keys directory (`<levain home>/keys`) is denied to an entity's bash and file editor, read and write.
+
+### Answer an agent from your phone
+
+An agent's consent request can be answered from any browser that reaches the cockpit over https, with a passkey. The cockpit stays bound to loopback; you put an https proxy you trust in front of it. With Tailscale:
+
+```
+levain serve --write --tailscale     # finds this machine's tailnet name; prints the phone link and the next line
+tailscale serve --bg --https=443 http://127.0.0.1:7420
+```
+
+Any other https proxy works the same way with `--remote-host <its name>`. Open the printed phone link on the phone (it carries this server's write token, so send it to yourself privately). On a waiting request, "make a passkey here" creates a passkey on the phone and shows two laptop commands that enrol it as a `display-phone` key; a passkey can never enrol itself. After that, a waiting request shows "allow with passkey" and "deny with passkey". The phone signs the exact answer record; the cockpit converts the passkey's signature to an OpenSSH one and the queue checks it with `ssh-keygen`, as for an answer signed in the terminal.
+
+What to know:
+
+- A passkey is made for one https name. Rename the machine or the tailnet and you make and enrol a new one.
+- The passkey prompt shows no request text. The page shows what you are answering; the signature covers exactly that request.
+- A request that arrives through a proxy is treated as off this machine: every read needs the token, as for an off-box bind. levain recognises a proxied request by the header the proxy sets (`X-Forwarded-For`, `Forwarded`, `X-Forwarded-Host` or `X-Real-IP`). A plain TCP forward sets none of them, so do not expose the cockpit that way.
+- Anyone who holds the phone link and reaches the name can read the waiting requests. Only an enrolled passkey can answer one.
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
