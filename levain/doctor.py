@@ -1402,17 +1402,20 @@ def _hook_command_targets(
         try:
             if Path(candidate).resolve() == expected:
                 return True
-        except OSError:
+        except (OSError, RuntimeError):  # RuntimeError: a symlink loop before Python 3.13 (L3 r1)
             continue
     return False
 
 
 def _hooks_wired_anywhere(hooks: Any, event: str, install: Path, script: str) -> bool:
-    """Whether ANY hook in ANY group under ``event`` runs this install's ``script`` (a group can carry
-    another levain hook first, as PostToolUse carries the auto-memory mirror)."""
+    """Whether ANY hook in ANY matcherless group under ``event`` runs this install's ``script`` (a group can
+    carry another levain hook first, as PostToolUse carries the auto-memory mirror)."""
     entries = hooks.get(event, []) if isinstance(hooks, dict) else []
     for group in (entries if isinstance(entries, list) else []):
-        hs = group.get("hooks") if isinstance(group, dict) else None
+        # a group with a tool matcher fires for some tools only, so it does not record every event (L3 r1 codex)
+        if not isinstance(group, dict) or group.get("matcher") not in (None, "", "*"):
+            continue
+        hs = group.get("hooks")
         for h in (hs if isinstance(hs, list) else []):
             if not isinstance(h, dict) or not isinstance(h.get("command"), str):
                 continue

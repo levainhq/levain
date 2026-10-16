@@ -84,3 +84,27 @@ def test_a_stop_hook_running_another_installs_script_is_not_wired(make_install, 
     p.write_text(json.dumps(doc), encoding="utf-8")
     r = _row(doctor._check_claude_code(cc), "Claude Code")
     assert r.warn and "not wired: Stop, so" in r.detail, r
+
+
+# L3 r1 (codex): a group restricted to some tools does not record every PostToolUse event.
+def test_a_matcher_restricted_post_tool_use_group_is_not_wired(make_install):
+    cc = make_install("cc")
+    p, doc = _settings(cc)
+    for g in doc["hooks"]["PostToolUse"]:
+        if "post_tool_use.py" in json.dumps(g):
+            g["matcher"] = "Write"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    r = _row(doctor._check_claude_code(cc), "Claude Code")
+    assert r.warn and "not wired: PostToolUse, so" in r.detail, r
+
+
+# L3 r1 (complement + codex): a symlink loop raised RuntimeError from Path.resolve() before Python 3.13.
+def test_a_symlink_loop_in_a_command_is_not_wired_and_never_crashes(make_install, tmp_path):
+    cc = make_install("cc")
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    p, doc = _settings(cc)
+    doc["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": f"python3 {loop}/stop.py"}]}]
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    r = _row(doctor._check_claude_code(cc), "Claude Code")
+    assert r.warn and "not wired: Stop, so" in r.detail, r
