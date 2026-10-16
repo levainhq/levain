@@ -1198,7 +1198,7 @@ def test_a_cockpit_act_signed_without_user_presence_is_refused_like_a_link(monke
     from levain.cockpit import broker as broker_mod
 
     pk = _sk_public_key()
-    key = SimpleNamespace(principal="laptop", public_key=pk, active=True)
+    key = SimpleNamespace(principal="laptop", public_key=pk, active=True, custody="fido")
     authority = SimpleNamespace(active_keys=lambda: [key], key=lambda fp: key if fp == FAKE_FP else None)
     me = SimpleNamespace(data_root=tmp_path, ssh_keygen="/usr/bin/ssh-keygen")
     monkeypatch.setattr(broker_mod, "verify_cockpit_signature",
