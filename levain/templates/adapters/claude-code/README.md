@@ -124,7 +124,16 @@ governs both directions for this workspace:
   levain's consent hook installed the request reaches the consent queue, where a
   standing grant on `SendMessage` for this workspace can answer it. The same tool
   resumes subagents and messages agent-team teammates, so those ask too.
+- **Background sessions.** A `claude --bg` session nobody is attached to waits at
+  that prompt until someone answers it, so a fleet of sessions that message each
+  other stalls unless something answers for you: a standing grant
+  (`levain consent grant create --agent claude_code --tool SendMessage
+  --workspace <dir> ...`) answers every send from inside that workspace and
+  leaves a receipt. In `claude -p`, an unanswered send is denied.
 - To turn messaging off, deny `SendMessage` and `ListAgents` instead.
+- **To leave messaging ungoverned here** (your own trust decision), delete the
+  three keys above from `.claude/settings.json`, then run
+  `levain doctor --repin-hooks` so the hook pin records your choice.
 
 `levain doctor` reports the controls that apply here and warns when a direction
 is not governed; it never edits the file.
