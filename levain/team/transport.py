@@ -249,13 +249,17 @@ class GitLedger:
                 fh.flush()
                 os.fsync(fh.fileno())   # durable before it replaces: the cockpit's accept marker is read after a crash
             os.replace(tmp, self.state_path)
-            dfd = os.open(self.state_path.parent, os.O_RDONLY)
             try:
-                os.fsync(dfd)
+                dfd = os.open(self.state_path.parent, os.O_RDONLY)
             except OSError:
-                pass        # a filesystem that cannot sync a directory still has the file synced
-            finally:
-                os.close(dfd)
+                dfd = None  # a directory that cannot be opened to sync: the file itself is synced and in place
+            if dfd is not None:
+                try:
+                    os.fsync(dfd)
+                except OSError:
+                    pass    # a filesystem that cannot sync a directory still has the file synced
+                finally:
+                    os.close(dfd)
         finally:
             os.close(fd)
 

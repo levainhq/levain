@@ -181,11 +181,14 @@ class TeamJoinStore:
         return dict(recs) if isinstance(recs, dict) else {}
 
     @staticmethod
-    def _final(rec: Any) -> bool:
-        """A record of an applied accept: the shape :meth:`_apply_in_op` writes last (an ``acting`` marker, or a
-        malformed entry, is not one, so it never stands in for the act)."""
-        return isinstance(rec, dict) and "state" not in rec and isinstance(rec.get("id"), str) \
-            and isinstance(rec.get("origin_key"), str)
+    def _final(rec: Any, key: str | None = None) -> bool:
+        """A record of an applied accept: exactly the shape :meth:`_apply_in_op` writes last, for ``key`` when given
+        (an ``acting`` marker, or a malformed entry, is not one, so it never stands in for the act)."""
+        return (isinstance(rec, dict) and set(rec) == {"id", "origin_key", "kind", "handle", "about", "sha", "at"}
+                and isinstance(rec["id"], str) and rec["id"] == rec["sha"] and rec["kind"] in KINDS
+                and isinstance(rec["handle"], str) and isinstance(rec["about"], str)
+                and isinstance(rec["at"], (int, float)) and not isinstance(rec["at"], bool)
+                and (key is None or rec["origin_key"] == key))
 
     @staticmethod
     def _save(gl: LedgerTransport, key: str, rec: dict[str, Any]) -> None:
@@ -195,7 +198,7 @@ class TeamJoinStore:
         key = self._key(resource_key)
         gl = _ledger(self.start)
         rec = None if gl is None else self._records(gl).get(key)
-        return Snapshot(dict(rec), str(rec.get("sha") or "")) if self._final(rec) else Snapshot(None, None)
+        return Snapshot(dict(rec), str(rec.get("sha") or "")) if self._final(rec, key) else Snapshot(None, None)
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
         return [ApplyUnit(STORE, (i,), (e,)) for i, e in effects]
@@ -234,7 +237,7 @@ class TeamJoinStore:
         already in force was not done by this signature and is refused, then what moved, then the digest, then the
         act. A fault of the environment (a fetch, a lock, a missing agent key) waits for repair: transient."""
         rec = self._records(gl).get(key)
-        if self._final(rec):
+        if self._final(rec, key):
             return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(str(rec.get("id")), dict(rec)),))
         marker = {"state": _ACTING, "origin_key": key, "kind": kind, "handle": handle, "about": about}
         acting = isinstance(rec, dict) and all(rec.get(f) == marker[f] for f in ("state", "kind", "handle", "about"))

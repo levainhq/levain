@@ -2970,7 +2970,10 @@
         }
         let p;
         try { p = Promise.resolve(job()); } catch (e) { p = Promise.resolve(bad); }
-        return p.catch(() => bad).then(resolve);      // every job settles; the pump releases its slot on both paths
+        // the whole job (the response and its body) races the deadline: a server that stalls mid-body frees the slot
+        const late = new Promise((r) => setTimeout(() => r({ error: (badError || "the request could not be read") + " (timed out)" }),
+                                                   CONSENT_FETCH_TIMEOUT_MS + 1000));
+        return Promise.race([p.catch(() => bad), late]).then(resolve);   // every job settles; the pump releases its slot
       });
       consentPump();
     });
@@ -2995,7 +2998,7 @@
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN });
     const got = consentQueued(() => consentFetch(c, headers, 1), undefined, row)
-      .then((b) => { if (b.error) consentBodies.delete(key); return b; });
+      .then((b) => { if (b.error && consentBodies.get(key) === got) consentBodies.delete(key); return b; });
     consentBodies.set(key, got);
     return got;
   }
@@ -3094,12 +3097,12 @@
                                () => ({ error: "the transcript could not be read" }));
       }, () => ({ error: "the transcript could not be read (network)" }));
   }
-  function sessionTranscript(stem) {
+  function sessionTranscript(stem, row) {
     const t = window.LevainCockpitTransport;
     let headers;
     try { headers = t && typeof t.headers === "function" ? t.headers() : {}; } catch (e) { return Promise.resolve({ error: SESS_BAD_READ }); }
     if (!headers || !headers["X-Levain-Write-Token"]) return Promise.resolve({ error: SESS_NO_TOKEN });
-    return consentQueued(() => sessionFetch(stem, headers, 1), SESS_BAD_READ);   // the consent fetches' two-at-a-time queue: a long Sessions list cannot stampede the server
+    return consentQueued(() => sessionFetch(stem, headers, 1), SESS_BAD_READ, row);   // the consent fetches' two-at-a-time queue: a long Sessions list cannot stampede the server
   }
   const SESS_KIND = { prompt: "you", reply: "agent", tool: "tool", consent: "consent" };
   function sessionWhen(iso) {
@@ -3166,7 +3169,7 @@
       btn.disabled = true;
       if (!slot) { slot = el("div", "sess-tx ext-meta"); wrap.appendChild(slot); }
       slot.replaceChildren(document.createTextNode("reading the transcript\u2026"));
-      sessionTranscript(stem).then((b) => {
+      sessionTranscript(stem, wrap).then((b) => {
         drawSessionTranscript(slot, b);
         if (!b.error) { btn.textContent = "refresh"; sessionBodies.set(stem, b); }
       }).catch(() => {

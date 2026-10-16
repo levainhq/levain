@@ -733,8 +733,11 @@ def _sessions_dir(directory: Path) -> None:
     """The sessions directory, this user's only (0700): its files name sessions, their working directories and
     what was said in them."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if directory.stat().st_mode & 0o077:
-        os.chmod(directory, 0o700)
+    st = os.lstat(directory)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"{directory} is not a plain directory; nothing is recorded there")
+    if st.st_mode & 0o077:
+        os.chmod(directory, 0o700, follow_symlinks=False)
 
 
 def session_touch(session_id, cwd, event, context_delivered=None) -> None:

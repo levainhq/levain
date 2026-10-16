@@ -241,7 +241,7 @@ def _invoke_record_only(hooks_dir: Path, script: str, payload: dict, kind: str, 
     tmp = Path(tempfile.mkdtemp(prefix="levain-verify-"))
     try:
         shutil.copytree(hooks_dir, tmp / "activation" / "hooks",
-                        ignore=shutil.ignore_patterns("__pycache__"), symlinks=True)
+                        ignore=shutil.ignore_patterns("__pycache__"), symlinks=False)   # a link's target, copied: nothing resolves back into the install
         env = child_env()
         env.pop("LEVAIN_HOOK_SUPPRESS", None)
         env.pop("LEVAIN_SCOPE", None)

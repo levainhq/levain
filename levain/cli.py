@@ -2219,7 +2219,9 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
         for line in render(view, signer_fp=signer_fp, signer_class=key_class):
             print(_term_safe(line))
         sys.stdout.flush()
-        answer = post_signature(url, view.pending_id, sign(view.record_bytes), token)
+        signature = sign(view.record_bytes)
+        server_listening(url)   # again after the touch, which takes seconds: the listener must still be this user's
+        answer = post_signature(url, view.pending_id, signature, token)
     except KeyboardInterrupt:
         print("sign cancelled", file=sys.stderr)
         return 1
