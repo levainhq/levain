@@ -216,6 +216,21 @@ def main(argv: list[str] | None = None) -> int:
             "it; give --consent-hook again to change it."
         ),
     )
+    init_p.add_argument(
+        "--memory-load",
+        action="append",
+        default=None,
+        metavar="MODE | ADAPTER=MODE",
+        help=(
+            "How the memory wrap procedure (seed/memory_workflow.md) reaches your agent. MODE is `eager` "
+            "(the default: loaded with the rest of the seed, always in context) or `on-demand` (kept out of the "
+            "always-on context; the carrier holds a short summary and the agent reads the file when it wraps). "
+            "A bare MODE sets the install's default; ADAPTER=MODE (say `codex=on-demand`) sets one agent, and "
+            "may be given again. The rest of the memory instructions (recording, recall) load either way. The "
+            "choice is kept in .levain/config.json, so `levain update` and `init --force` keep it; give "
+            "--memory-load again to change it."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -1374,6 +1389,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print("levain init: --answers-template cannot be combined with --consent-hook (it installs "
                   "nothing).")
             return 1
+        if args.memory_load is not None:
+            print("levain init: --answers-template cannot be combined with --memory-load (it installs "
+                  "nothing).")
+            return 1
         from levain.install import run_answers_template
 
         return run_answers_template(packs=args.pack)
@@ -1381,6 +1400,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if args.consent_hook is not None and args.web:
         print("levain init: --consent-hook cannot be combined with --web; drop --web, or run "
               "`levain init --consent-hook ...` in the terminal.")
+        return 1
+
+    if args.memory_load is not None and args.web:
+        print("levain init: --memory-load cannot be combined with --web; drop --web, or run "
+              "`levain init --memory-load ...` in the terminal.")
         return 1
 
     if args.messaging is not None and args.web:
@@ -1431,6 +1455,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         answers_file=args.answers,
         messaging=args.messaging,
         consent_hook=args.consent_hook,
+        memory_load=args.memory_load,
     )
 
 

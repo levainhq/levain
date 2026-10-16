@@ -472,7 +472,7 @@ class ConfigDoc:
       draft lumped it with the operator's ``world.md`` as Class A — corrected). The
       operator's legitimate influence on the entity's self is the future
       correction-as-input channel (§9), not a file rewrite; until then it reads.
-    - the constitution (``partnership.md`` / ``memory.md`` / ``spore_instructions.md``)
+    - the constitution (``partnership.md`` / ``memory.md`` / ``memory_workflow.md`` / ``spore_instructions.md``)
       → **Class C-view** (the advanced "fork my methodology" edit is Slice 2+).
 
     All live in the Identity zone. ``heading`` is the exact ``## `` section heading
@@ -1152,6 +1152,7 @@ def installed_adapter(install_root: Path) -> str | None:
 _CONSTITUTION = (
     ("partnership.md", "Constitution · how we work"),
     ("memory.md", "Constitution · your memory"),
+    ("memory_workflow.md", "Constitution · your memory's wrap"),
     ("spore_instructions.md", "Constitution · open loops"),
 )
 

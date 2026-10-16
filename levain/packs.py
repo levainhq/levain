@@ -454,6 +454,14 @@ NON_IMPORT_SEED: tuple[str, ...] = ("continuity.md", "README.md")
 # inline (reachable), the exact procedure one read away.
 ON_DEMAND_SEED: tuple[str, ...] = ("spore_instructions.md",)
 
+# The wrap procedure is the one base file whose load class is the operator's choice,
+# per install and per agent. Eager is the default (an entity that never opens a file
+# it was only pointed at loses the procedure with it); on-demand is the opt-in, which
+# moves the file behind the carrier's pointer block like the files above.
+MEMORY_LOAD_CHOICES: tuple[str, ...] = ("eager", "on-demand")
+DEFAULT_MEMORY_LOAD = "eager"
+MEMORY_LOAD_SEED: tuple[str, ...] = ("memory_workflow.md",)
+
 # The retention summary per on-demand seed: what the entity must retain WITHOUT
 # opening the file, plus when to open it. Keyed by filename; `test_packs` asserts
 # every ON_DEMAND_SEED name has one, so adding to that tuple without writing the
@@ -470,6 +478,19 @@ ON_DEMAND_SUMMARY: dict[str, str] = {
         "before you plant, resolve, or reason about an open loop** — it holds the "
         "typed lifecycle, the germination surface, and the ascend membrane into "
         "your retrospective memory."
+    ),
+    "memory_workflow.md": (
+        "**Every session ends with a wrap: `prepare_wrap` -> compress -> "
+        "`save_continuity`, all three, once.** When your operator signals the end "
+        "(\"let's wrap up\", \"save memory\", \"we're done\" or any natural "
+        "equivalent), run it rather than acknowledging it; an unwrapped session's "
+        "experiences were never consolidated. The compression step is the thinking, "
+        "not filing. A `graduations_demoted` result is the system working: never "
+        "re-run `save_continuity` to chase a clean report. **Read this file before "
+        "you run a wrap, or call `prepare_wrap` mid-session for stale-pattern "
+        "warnings** — it holds the pre-compose recall, the contradiction scan, "
+        "cold-pattern routing, durable facts and what the citation check does and "
+        "does not catch."
     ),
 }
 
@@ -488,6 +509,7 @@ BASE_IMPORT_ORDER: tuple[str, ...] = (
     "partnership.md",
     "world.md",
     "memory.md",
+    "memory_workflow.md",
 )
 
 # Every base methodology-core seed that must reach the entity SOMEHOW — eagerly
@@ -516,6 +538,7 @@ SEED_ROLE: dict[str, str] = {
     "world.md": "identity",
     "partnership.md": "method",
     "memory.md": "mechanism",
+    "memory_workflow.md": "mechanism",
     "spore_instructions.md": "mechanism",
 }
 
@@ -582,7 +605,32 @@ def check_seed_classes_disjoint(
 check_seed_classes_disjoint(BASE_IMPORT_ORDER, ON_DEMAND_SEED, NON_IMPORT_SEED)
 
 
-def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
+def seed_classes(mode: str = DEFAULT_MEMORY_LOAD) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(eager import order, on-demand names) for a memory-load ``mode``.
+
+    The one place the mode decides a seed file's class: on-demand is
+    :data:`ON_DEMAND_SEED` plus :data:`MEMORY_LOAD_SEED`, removed from the import
+    order. Every per-install reader goes through here, so the two partitions cannot
+    be computed twice. An unknown ``mode`` raises: callers resolve a recorded value
+    to a choice before asking."""
+    if mode not in MEMORY_LOAD_CHOICES:
+        raise ValueError(f"memory load must be one of {', '.join(MEMORY_LOAD_CHOICES)} (got {mode!r})")
+    if mode == "eager":
+        return BASE_IMPORT_ORDER, ON_DEMAND_SEED
+    moved = set(MEMORY_LOAD_SEED)
+    return (
+        tuple(n for n in BASE_IMPORT_ORDER if n not in moved),
+        (*ON_DEMAND_SEED, *MEMORY_LOAD_SEED),
+    )
+
+
+for _mode in MEMORY_LOAD_CHOICES:
+    check_seed_classes_disjoint(*seed_classes(_mode), NON_IMPORT_SEED)
+
+
+def import_entries(
+    roster: Sequence[SeedEntry], mode: str = DEFAULT_MEMORY_LOAD
+) -> list[SeedEntry]:
     """The seed entries that load as always-on harness context, in load order.
 
     Membership: every roster seed file EXCEPT those in :data:`NON_IMPORT_SEED`
@@ -595,11 +643,13 @@ def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     roster actually provides, each taken from its WINNING layer), then any other
     importable file appended in roster order — so a pack's additions land after
     the base curriculum. Override-stable: overriding a base file's CONTENT keeps
-    its curriculum position (the lookup is by filename, the entry is the winner)."""
+    its curriculum position (the lookup is by filename, the entry is the winner).
+    ``mode`` is the memory-load mode (:func:`seed_classes`)."""
+    order, on_demand = seed_classes(mode)
     by_name = {e.name: e for e in roster}
     ordered: list[SeedEntry] = []
     seen: set[str] = set()
-    for name in BASE_IMPORT_ORDER:
+    for name in order:
         entry = by_name.get(name)
         if entry is not None and name not in NON_IMPORT_SEED:
             ordered.append(entry)
@@ -607,19 +657,21 @@ def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     for entry in roster:
         if entry.name in seen or entry.name in NON_IMPORT_SEED:
             continue
-        if entry.name in ON_DEMAND_SEED:
+        if entry.name in on_demand:
             continue
         ordered.append(entry)
         seen.add(entry.name)
     return ordered
 
 
-def import_names(roster: Sequence[SeedEntry]) -> list[str]:
+def import_names(roster: Sequence[SeedEntry], mode: str = DEFAULT_MEMORY_LOAD) -> list[str]:
     """The importable seed filenames, in load order (see :func:`import_entries`)."""
-    return [e.name for e in import_entries(roster)]
+    return [e.name for e in import_entries(roster, mode)]
 
 
-def on_demand_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
+def on_demand_entries(
+    roster: Sequence[SeedEntry], mode: str = DEFAULT_MEMORY_LOAD
+) -> list[SeedEntry]:
     """The seed entries that install to disk and are POINTED AT from the adapter
     carrier rather than eagerly loaded, in :data:`ON_DEMAND_SEED` order.
 
@@ -631,11 +683,11 @@ def on_demand_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     by_name = {e.name: e for e in roster}
     return [
         entry
-        for entry in (by_name.get(name) for name in ON_DEMAND_SEED)
+        for entry in (by_name.get(name) for name in seed_classes(mode)[1])
         if entry is not None
     ]
 
 
-def on_demand_names(roster: Sequence[SeedEntry]) -> list[str]:
+def on_demand_names(roster: Sequence[SeedEntry], mode: str = DEFAULT_MEMORY_LOAD) -> list[str]:
     """The on-demand seed filenames, in load order (see :func:`on_demand_entries`)."""
-    return [e.name for e in on_demand_entries(roster)]
+    return [e.name for e in on_demand_entries(roster, mode)]

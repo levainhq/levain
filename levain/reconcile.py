@@ -37,6 +37,8 @@ from levain.install import (
     _templates_root,
     _timestamped_backup_path,
     _write_brand_config,
+    effective_adapter,
+    persisted_memory_load,
     read_answers,
     write_answers,
 )
@@ -49,8 +51,8 @@ from levain.manifest import (
     read_pack_locks_status,
 )
 from levain.packs import (
-    ON_DEMAND_SEED,
     PackError,
+    seed_classes,
     PackManifest,
     SeedEntry,
     compose_brand,
@@ -370,6 +372,12 @@ def _emit_changelog_context(source: Path, name: str, emit: Callable[[str], None]
             emit(f"    {ln}")
 
 
+def _on_demand_names(install: Path) -> tuple[str, ...]:
+    """The seed files this install's carrier points at instead of importing: the memory
+    load recorded for its adapter decides whether the wrap procedure is among them."""
+    return seed_classes(persisted_memory_load(install, effective_adapter(install) or "claude-code"))[1]
+
+
 def _show_winner(
     install: Path,
     drift: PackDrift,
@@ -417,7 +425,7 @@ def _show_winner(
     except OSError as e:
         flag(rel, f"was dropped, but the copy another layer ships could not be restored ({e})")
         return
-    if fname in ON_DEMAND_SEED:
+    if fname in _on_demand_names(install):
         flag(rel, "now comes from another layer, but the carrier's retained summary for "
                   "it still describes the dropped override")
 
@@ -626,7 +634,7 @@ def reconcile_pack(
     # same thing from _show_winner.
     for rel in drift.added:
         fname = rel[len("seed/"):] if rel.startswith("seed/") else ""
-        if (fname in ON_DEMAND_SEED and _owner(fname) == "self"
+        if (fname in _on_demand_names(install) and _owner(fname) == "self"
                 and not stack.is_new_to_roster(fname)):
             _flag(rel, "now overrides a lower layer's on-demand seed, but the carrier's "
                        "retained summary for it still describes the file it replaced")
@@ -861,7 +869,7 @@ def _reconcile_moved_wins(
                 f"{backup.name}" if backup is not None else "")
         emit(f"  pack {d.name!r}: {rel} {verb} by the copy from {now}, which wins it "
              f"after a pack `order` change{kept}.")
-        if fname in ON_DEMAND_SEED:
+        if fname in _on_demand_names(install):
             r.review.append(rel)
             emit(f"  pack {d.name!r}: {rel} now comes from another layer, but the "
                  f"carrier's retained summary for it still describes the old one — "
