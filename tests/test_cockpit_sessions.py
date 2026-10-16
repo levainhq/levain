@@ -88,6 +88,21 @@ def test_two_sessions_in_one_workspace_say_when_each_started_and_a_unique_row_do
     others = [r for r in rows if r["title"] != "claude_code \u00b7 work"]
     assert others and not any("started " in r["facets"]["legacy_meta"] for r in others)
     assert "zq-session-id-cc2-8815" not in json.dumps(rows)
+    # the started words are display only: three minutes later they read differently and the row version does not move
+    pid = next(r["id"] for r in twins if "40m ago" in r["facets"]["legacy_meta"])
+    later = build_default_cockpit(src, clock=lambda: datetime.now(timezone.utc) + timedelta(minutes=3))
+    moved = next(r for r in later.panel("sessions", credential_class="none")["rows"] if r["id"] == pid)
+    assert "started 43m ago" in moved["facets"]["legacy_meta"]
+    assert moved["version"] == next(r for r in twins if r["id"] == pid)["version"]
+
+
+def test_a_start_after_the_last_hook_is_not_shown_as_a_start(tmp_path, monkeypatch):
+    root, src = _fixture(tmp_path, monkeypatch)
+    _put(root, "claude_code", "zq-session-id-cc3-8816", str(tmp_path / "work"), timedelta(minutes=2),
+         first_seen=_stamp(-timedelta(days=2)))                       # a damaged record: started in the future
+    rows = build_default_cockpit(src).panel("sessions", credential_class="none")["rows"]
+    metas = [r["facets"]["legacy_meta"] for r in rows if r["title"] == "claude_code \u00b7 work"]
+    assert len(metas) == 2 and sum("started " in m for m in metas) == 1 and "started just now" not in " ".join(metas)
 
 
 def test_the_listing_reads_the_newest_fifty_and_the_caveat_is_doctors_own_words(tmp_path, monkeypatch):

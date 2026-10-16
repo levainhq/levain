@@ -1008,15 +1008,19 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             titles[(rec["agent"], work)] = titles.get((rec["agent"], work), 0) + 1
         rows: list[RowIn] = []
         for rec, chips, work, active in listed:
-            if titles[(rec["agent"], work)] > 1:
-                started = _session_stamp(rec["first_seen"])
-                chips.insert(1, f"started {_ago((ctx.now - started).total_seconds())}")
+            stored = {"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
+                      "active": active, "chips": chips[1:]}
+            started = _session_stamp(rec["first_seen"]) if titles[(rec["agent"], work)] > 1 else None
+            meta = chips
+            if started is not None and started <= rec["_seen"]:
+                # clock-relative words stay out of `stored` (like "last active"); the raw stamp is what it versions
+                meta = [chips[0], f"started {_ago((ctx.now - started).total_seconds())}", *chips[1:]]
+                stored["first_seen"] = rec["first_seen"]
             rows.append(RowIn(
                 id=f"session:{rec['_stem']}", title=f"{rec['agent']} · {work}",
                 facets={"agent": rec["agent"], "last_seen": rec["last_seen"], "source": work,
-                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(chips)},
-                stored={"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
-                        "active": active, "chips": chips[1:]}))
+                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(meta)},
+                stored=stored))
         skipped = ((bad, "session record that does not have the registry file's shape"),) if bad else ()
         if lost:
             skipped += ((lost, "session record that changed while it was being listed"),)
