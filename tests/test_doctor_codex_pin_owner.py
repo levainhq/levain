@@ -149,3 +149,30 @@ def test_repin_while_another_install_owns_it_says_the_file_was_not_pinned(make_i
     b = make_install("b", adapter="codex")
     (res,) = doctor._check_agent_hook_pins(a, repin=True)
     assert "NOT pinned" in res.detail and str(b) in res.detail, res
+
+
+# L3 r1 (codex MED, complement LOW): an install with no recorded answers file was told to pass one.
+def test_the_takeover_hint_without_recorded_answers_says_the_interview_runs(make_install):
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    (a / ".levain" / "answers.json").unlink()
+    rows = _wiring(a)
+    assert rows and all("--answers" not in r.hint and "interview again" in r.hint for r in rows)
+
+
+def test_repin_while_repointed_is_a_warning(make_install):
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    (res,) = doctor._check_agent_hook_pins(a, repin=True)
+    assert res.ok and res.warn, res
+
+
+def test_a_symlinked_hooks_file_is_never_another_installs(make_install, cj, tmp_path):
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    real = tmp_path / "dotfiles-hooks.json"
+    real.write_bytes(cj.read_bytes())
+    cj.unlink()
+    cj.symlink_to(real)
+    assert hg.codex_hooks_owner(a) is None
+    assert not _pin_check(a).ok
