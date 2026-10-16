@@ -1388,10 +1388,17 @@ class GitLedger:
 
     def sync(self, *, push: bool = True) -> str:
         with self.op():      # the recovery too (code L3 r7 codex 1)
-            self.require_joined()
-            with self.lock():
-                self._recover_dirty()
+            self._sync_preamble()
             return self._sync(push=push)
+
+    def _sync_preamble(self, lock_timeout: float = 30.0) -> None:
+        """What every sync runs first, under the op it holds: this clone has joined, a moved or COPIED clone's worktree
+        is relinked to this repository (else every rebase would land in the original's), and an interrupted operation
+        is recovered. The ONE copy: ``sync`` and ``sync_now`` both call it (T3 L3 r1 codex HIGH 1)."""
+        self._require_op()
+        self.require_joined()
+        with self.lock(timeout=lock_timeout):
+            self._recover_dirty()
 
     def _fetch(self, remote: str, rref: str, timeout: float) -> bool:
         """Fetch the ledger branch. False when the remote has no ledger branch yet."""
@@ -1991,11 +1998,14 @@ class GitLedger:
         """One sync now (a fetch and rebase; a push only when ``push``), for a caller that holds a person's request
         open: the op is waited for ``op_wait`` seconds and each git network call gets ``timeout``, never the CLI's
         minutes. ``timeout`` bounds EACH git call, not the sync: one sync may run several (fetch, the strict-ledger
-        fetch, push retries), and its rebase waits up to ``op_wait`` for the worktree lock. A busy op raises TeamBusy and records nothing (it is not an attempt, as for ``fetch_if_due``); a
+        fetch, push retries), and its rebase waits up to ``op_wait`` for the worktree lock. It runs ``sync``'s own
+        preamble first (``_sync_preamble``: joined, a copied clone's worktree relinked, an interrupted op recovered).
+        A busy op raises TeamBusy and records nothing (it is not an attempt, as for ``fetch_if_due``); a
         fetch that fails is recorded as ``last_fetch_error``, as the hook records one, and raised; a success is
         stamped by the fetch itself."""
         with self.op(timeout=op_wait):
             try:
+                self._sync_preamble(lock_timeout=op_wait)
                 return self._sync_in_op(push=push, timeout=timeout, net_timeout=op_wait, lock_timeout=op_wait)
             except TeamBusy:
                 raise
