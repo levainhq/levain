@@ -416,3 +416,25 @@ def test_apply_patch_logs_the_patch_path_not_the_patch(agent_root):
         assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
     assert [e["text"] for e in _events(root, agent, "s1")] == [
         "apply_patch: /w/src/a.py", "apply_patch", "Bash: echo hi"]
+
+
+def test_what_the_hooks_write_is_what_the_cockpit_reader_reads(agent_root):
+    """The writer (these hooks) and the reader (levain.cockpit.session_log) meet only at the file: one real run of
+    each hook, read back by the real reader, nothing skipped."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.session_log import read_session
+
+    agent, root = agent_root
+    pl = _PAYLOADS[agent]
+    for script, payload in (
+        ("session_start.py", {"session_id": "s1", "cwd": "/w", "source": "startup", "hook_event_name": "SessionStart"}),
+        ("user_prompt_submit.py", {"session_id": "s1", "prompt": "x" * 5000, "cwd": "/w"}),
+        ("post_tool_use.py", pl["tool"]),
+        ("stop.py", {"session_id": "s1", "cwd": "/w", "last_assistant_message": "all done", "stop_hook_active": False}),
+    ):
+        assert _run(root, script, payload).returncode == 0
+    body = read_session(root, _key(agent, "s1"), datetime.now(timezone.utc), None)
+    assert body is not None and body["agent"] == agent and body["skipped"] == 0
+    assert [(e["kind"], e["cut"]) for e in body["events"]] == [("prompt", 1000), ("tool", 0), ("reply", 0)]
+    assert body["events"][-1]["text"] == "all done" and body["resume"].startswith("cd -- /w && ")
