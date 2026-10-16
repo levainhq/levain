@@ -164,10 +164,20 @@ def _is_config_path(path: Path) -> bool:
 
 
 def nothing_can_decide(settings: AdapterSettings) -> bool:
-    """Away mode off and no cockpit database where the settings point: no grant or signed answer can verify and no
-    hold is asked, so the hook files nothing (a queue row is kept for good) and the agent's own dialog answers."""
+    """Away mode off and the cockpit the settings point at replays to no active key and no standing grant (or
+    has no database, or does not replay): no grant or signed answer can verify and no hold is asked, so the hook
+    files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
+    before any key was enrolled is not something that can decide (L3 r1 codex MED)."""
+    if settings.away_mode:
+        return False
     root = settings.cockpit_data_root
-    return not settings.away_mode and not (root and (Path(root) / "cockpit.db").is_file())
+    if not root or not (Path(root) / "cockpit.db").is_file():
+        return True
+    try:
+        snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
+    except Exception:
+        return True  # an authority that does not replay verifies nothing; the dialog answers
+    return not snap.active_keys() and not snap.policy.grants
 
 
 def _under(path: Path, roots: tuple[str, ...]) -> bool:

@@ -2072,6 +2072,10 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
         elif settings.cockpit_data_root != ours:
             emit(f"  WARN: consent settings {path} name another cockpit ({settings.cockpit_data_root}); kept, so "
                  f"grants and answers verify there, not against this install's {ours}.")
+        if settings.away_mode:
+            # an existing file is kept as it is, so init reports the away mode the hook will read (L3 r1 codex LOW)
+            emit(f"  consent settings {path} kept: away mode ON (holds up to {settings.away_hold_seconds:g}s before "
+                 f"the agent's own dialog).")
     except (OSError, ValueError, QueueStoreError) as e:
         emit(f"  WARN: consent settings not written ({e}); the consent hook gives no decision until "
              f"{path} names a cockpit, so the agent's own dialog answers.")
@@ -2088,7 +2092,7 @@ def _emit_consent_hook(install: Path, adapter: str, emit: Callable[[str], None])
         note = f"{AGENT_LABELS[agent]} {version} is a tested version"
     else:
         note = "WARN: " + untested_message(agent, version).split("; pass")[0]
-    emit(f"  consent hook ({AGENT_LABELS[agent]}): wired, away mode off; {note}")
+    emit(f"  consent hook ({AGENT_LABELS[agent]}): wired; {note}")
     if adapter == "codex":
         emit("  consent hook (Codex): Codex lists it at its next start under \"Hooks need review\" and runs it only "
              "once you trust it there; it runs in every Codex session on this machine.")
@@ -2162,15 +2166,24 @@ CONSENT_HOOK_CHOICES = ("on", "off")
 
 
 def persisted_consent_hook(install: Path) -> str:
-    """``off`` only when ``.levain/config.json`` records ``"consent_hook": "off"``; anything else, an unreadable
-    file or a hand-edited value included, is ``on``, the default."""
+    """``on``, the default, when ``.levain/config.json`` or its ``consent_hook`` key is absent, or it records
+    ``"on"``. A file that cannot be read as a JSON object, or a value that is not a choice (a hand edit), is
+    ``off``: what may hold the operator's opt-out is never read as the hook switched on (as
+    :func:`recorded_messaging` reads a damaged record as its stricter choice)."""
     from levain.dashboard import LEVAIN_CONFIG_REL
 
-    try:
-        config = json.loads(install.joinpath(*LEVAIN_CONFIG_REL).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    path = install.joinpath(*LEVAIN_CONFIG_REL)
+    if not os.path.lexists(path):
         return "on"
-    return "off" if isinstance(config, dict) and config.get("consent_hook") == "off" else "on"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "off"
+    if not isinstance(config, dict):
+        return "off"
+    if "consent_hook" not in config:
+        return "on"
+    return config["consent_hook"] if config["consent_hook"] in CONSENT_HOOK_CHOICES else "off"
 
 
 def _write_consent_hook_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:
@@ -2483,14 +2496,32 @@ def refresh_adapter(
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
     if apply:
         # The consent settings file, create-only like init's, or the hook update wired has nothing to answer with.
-        # Not while another install's write holds the machine-wide Codex hooks.json: the file would name this
-        # install's cockpit for that install's hook.
+        # For Codex, only while the machine-wide hooks.json runs THIS install's consent script: when it runs another
+        # install's (or an edited file the refresh only staged), the file would name this install's cockpit for
+        # that install's hook (L3 r1 codex HIGH: "not another install's" is not "this install's").
         root = install.resolve()
         adapter = effective_adapter(root)
         if (adapter in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(root) != "off"
-                and (adapter != "codex" or host_guard.codex_hooks_owner(root) is None)):
+                and (adapter != "codex" or _codex_runs_this_consent_hook(root))):
             _write_consent_settings(root, adapter, emit)
     return out
+
+
+def _codex_runs_this_consent_hook(root: Path) -> bool:
+    """Whether the machine-wide Codex ``hooks.json`` has a PermissionRequest entry running this install's consent
+    script, read by doctor's own wiring reader. A file that is missing, unreadable or not JSON is False."""
+    from levain import host_guard
+    from levain.doctor import _hooks_wired_anywhere
+
+    data = host_guard._read_small_regular(host_guard._codex_home(None) / "hooks.json")
+    if data is None:
+        return False
+    try:
+        doc = json.loads(data)
+    except (ValueError, RecursionError):
+        return False
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    return _hooks_wired_anywhere(hooks, "PermissionRequest", root, CONSENT_HOOK_SCRIPTS["codex"])
 
 
 def _refresh_adapter(

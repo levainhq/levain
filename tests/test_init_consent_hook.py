@@ -234,7 +234,7 @@ def test_init_reports_the_agent_version_and_renders_anyway(make_install, monkeyp
     cc = make_install("cc")
     inst._emit_consent_hook(cc, "claude-code", lines.append)
     (line,) = lines
-    assert line.startswith("  consent hook (Claude Code): wired, away mode off; ")
+    assert line.startswith("  consent hook (Claude Code): wired; ")
     assert ("is a tested version" in line) is tested and ("WARN" in line) is (not tested), line
     assert _consent_groups(cc / ".claude" / "settings.json")
 
@@ -333,6 +333,35 @@ def test_update_of_an_install_whose_codex_file_another_holds_writes_no_settings(
     path.unlink()
     refresh_adapter(a, apply=True, emit=lambda _l: None)
     assert not path.exists()
+
+
+def test_update_writes_no_codex_settings_when_the_live_file_is_an_edited_copy_of_another_install_s(make_install,
+                                                                                                    tmp_path):
+    """L3 r1 codex HIGH: an edited hooks.json still running install B's consent hook has no owner by the receipt
+    test, and "not another install's" was read as "this install's": updating A named A's cockpit for B's hook."""
+    a = make_install("a", adapter="codex")
+    make_install("b", adapter="codex")
+    cj = _cj(tmp_path)
+    doc = json.loads(cj.read_text())
+    doc["hooks"].setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "echo hand-added"}]})
+    cj.write_text(json.dumps(doc))
+    assert hg.codex_hooks_owner(a) is None  # the premise: an edit leaves no owner
+    path = _settings_file(codex.SETTINGS_NAME)
+    path.unlink()
+    refresh_adapter(a, apply=True, emit=lambda _l: None)
+    assert not path.exists()
+    assert not inst._codex_runs_this_consent_hook(a.resolve())
+
+
+def test_update_writes_codex_settings_when_the_live_file_runs_this_install_s_hook(make_install):
+    """The control for the test above: the one Codex install whose consent hook the live hooks.json runs gets its
+    missing settings file back from `levain update`, naming its own cockpit."""
+    a = make_install("a", adapter="codex")
+    assert inst._codex_runs_this_consent_hook(a.resolve())
+    path = _settings_file(codex.SETTINGS_NAME)
+    path.unlink()
+    refresh_adapter(a, apply=True, emit=lambda _l: None)
+    assert json.loads(path.read_text())["cockpit_data_root"] == os.path.realpath(a / ".levain" / "cockpit")
 
 
 def _init(tmp_path, capsys, name, adapter, **kw):
@@ -449,4 +478,47 @@ def test_away_off_with_no_cockpit_files_nothing(tmp_path, mod):
     assert rows() == 1
     cockpit.mkdir()
     (cockpit / "cockpit.db").write_bytes(b"")
+    assert claude_code.nothing_can_decide(settings) is True  # a database that does not replay verifies nothing
+
+
+def test_a_cockpit_with_no_key_and_no_grant_files_nothing(tmp_path):
+    """L3 r1 codex MED: a cockpit.db the cockpit made before any key was enrolled is not something that can decide,
+    so a default install files no request (each kept for good, a shell command's secrets unmasked); one enrolled key
+    makes it one."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+    from levain.cockpit.firejournal import CockpitDB
+    from tests.test_consent_cc_adapter import Key
+
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    settings = claude_code.AdapterSettings(away_mode=False, away_hold_seconds=0, cockpit_data_root=str(root))
+    assert (root / "cockpit.db").is_file()
+    assert claude_code.nothing_can_decide(settings) is True
+    key = Key(tmp_path, "laptop")
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    auth.sign_and_append(conn, {"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key,
+                                "class": "laptop-presence", "custody": "passphrase"},
+                         signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                         clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
     assert claude_code.nothing_can_decide(settings) is False
+
+
+@pytest.mark.parametrize("body,expected", [
+    (None, "on"), ("{}", "on"), ('{"consent_hook": "on"}', "on"), ('{"consent_hook": "off"}', "off"),
+    ('{"consent_hook": "Off"}', "off"), ('{"consent_hook": "of', "off"), ("[]", "off"),
+])
+def test_a_damaged_consent_hook_record_reads_as_off(tmp_path, body, expected):
+    """L3 r1 codex HIGH: a config that may hold the operator's opt-out is never read as the hook switched on; only
+    a missing file or key is the default."""
+    install = tmp_path / "i"
+    (install / ".levain").mkdir(parents=True)
+    if body is not None:
+        (install / ".levain" / "config.json").write_text(body, encoding="utf-8")
+    assert inst.persisted_consent_hook(install) == expected
