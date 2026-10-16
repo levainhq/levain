@@ -82,6 +82,7 @@ import re
 import urllib.parse
 import secrets
 import select
+import time
 import socket
 import ipaddress
 import logging
@@ -202,15 +203,20 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 
 # Bounded concurrency for the expensive routes (the per-request store read + writes).
 # ThreadingHTTPServer spawns a thread per connection; without a gate a burst could
-# pile up unbounded store reads / file writes. Past the cap a request gets a clean
-# 503. Static assets (cached bytes) bypass the gate.
+# pile up unbounded store reads / file writes. Static assets (cached bytes) bypass the gate.
+# Past the cap the POSTs, the substrate read and a consent body get a clean instant 503; the
+# cockpit GET reads (below) wait instead. The cap of 8 holds for every gated route together.
 _MAX_INFLIGHT = 8
+# The cockpit reads also share a smaller pool, so a read burst can never hold every slot:
+# this many stay free for the instant-503 routes (a write must not 503 for a whole burst).
+_RESERVED_SLOTS = 2
+_MAX_READ_INFLIGHT = _MAX_INFLIGHT - _RESERVED_SLOTS
 
 # The cockpit's GET reads (the manifest and one request per panel; a page load bursts ~28 of them, two
 # open pages double it) wait this long for a slot before the 503, and at most ``_MAX_READ_WAITERS`` of them
 # wait at once, so a flood still cannot pile up threads without bound. Every other gated route (the POSTs,
-# the substrate read, a consent body) keeps the instant 503: a write must not queue behind reads, and a
-# caller that retries those has the answer at once.
+# the substrate read, a consent body) keeps the instant 503 past the cap, but reads hold at most
+# ``_MAX_READ_INFLIGHT`` slots, so those routes always find ``_RESERVED_SLOTS`` free of a read burst.
 _READ_WAIT_SECONDS = 5.0
 _MAX_READ_WAITERS = 64
 
@@ -623,6 +629,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
+    read_gate: threading.BoundedSemaphore
     read_waiters: int
     read_waiters_lock: threading.Lock
     # ``is_loopback_bind`` is computed from the ACTUAL bound address (un-foolable) and gates
@@ -847,21 +854,36 @@ class _Handler(GuardedHandler):
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
     def _acquire_read_slot(self) -> bool:
-        """Take a ``request_gate`` slot for a cockpit read, waiting up to ``_READ_WAIT_SECONDS`` behind at
-        most ``_MAX_READ_WAITERS`` other waiting reads. False (the caller answers 503) when the wait times
-        out or the waiting room is full."""
+        """Take a read-pool slot and a ``request_gate`` slot for a cockpit read, waiting up to
+        ``_READ_WAIT_SECONDS`` behind at most ``_MAX_READ_WAITERS`` other waiting reads. A read does not take
+        the fast path while others wait, so it cannot barge past them. False (the caller answers 503) when
+        the wait times out or the waiting room is full. Pair with ``_release_read_slot``."""
         srv = self.server
-        if srv.request_gate.acquire(blocking=False):
-            return True
+        deadline = time.monotonic() + _READ_WAIT_SECONDS
         with srv.read_waiters_lock:
-            if srv.read_waiters >= _MAX_READ_WAITERS:
+            if srv.read_waiters == 0 and srv.read_gate.acquire(blocking=False):
+                queued = False
+            elif srv.read_waiters >= _MAX_READ_WAITERS:
                 return False
-            srv.read_waiters += 1
-        try:
-            return srv.request_gate.acquire(timeout=_READ_WAIT_SECONDS)
-        finally:
-            with srv.read_waiters_lock:
-                srv.read_waiters -= 1
+            else:
+                srv.read_waiters += 1
+                queued = True
+        if queued:
+            try:
+                got = srv.read_gate.acquire(timeout=_READ_WAIT_SECONDS)
+            finally:
+                with srv.read_waiters_lock:
+                    srv.read_waiters -= 1
+            if not got:
+                return False
+        if srv.request_gate.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            return True
+        srv.read_gate.release()
+        return False
+
+    def _release_read_slot(self) -> None:
+        self.server.request_gate.release()
+        self.server.read_gate.release()
 
     def _peer_open(self) -> bool:
         """False once the client has closed its end. A stream never reads the request body, so any readable
@@ -977,6 +999,10 @@ class _Handler(GuardedHandler):
             if not self._acquire_read_slot():
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
+            if not self._peer_open():
+                # the client gave up during its wait: skip the store read nobody will receive
+                self._release_read_slot()
+                return
             try:
                 status, body, hdrs = handle_cockpit_get(
                     self._cockpit(), self.path, credential=self._credential(),
@@ -986,7 +1012,7 @@ class _Handler(GuardedHandler):
                 status, hdrs = 500, [("Vary", COCKPIT_VARY)]
                 body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
             finally:
-                self.server.request_gate.release()
+                self._release_read_slot()
             self._send(body, "application/json; charset=utf-8", status=status, head=head,
                        headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
             return
@@ -1718,6 +1744,7 @@ def make_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
     # Bound the expensive routes (store read + writes); past the cap → 503.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
