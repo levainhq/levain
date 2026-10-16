@@ -356,3 +356,155 @@ def test_a_confirm_that_did_nothing_on_a_clone_with_no_remote_is_not_applied(two
         g = _gl(c)
         g.forget_derivation()
         assert g.own_fingerprint() not in T_key_fps(g, "ben")
+
+
+# --- r2 fixes (T3_r2_findings.md FIX 1-5, from L3 r1) -----------------------------------------------------------------
+
+
+def test_fetch_now_in_a_copied_clone_relinks_its_worktree_and_never_touches_the_original(two):
+    """FIX 1 (codex HIGH 1): ``sync_now`` runs ``sync``'s own preamble. A joined clone copied while the original exists
+    keeps a worktree whose link names the ORIGINAL repository; Fetch now relinks it first (as ``sync`` does), so the
+    fetch and rebase land in the copy and the original's refs are untouched."""
+    import shutil
+    from levain.team.cockpit_verbs import _fetch_fire
+    tmp, ana, ben = two
+    copy = tmp / "ben_copy"
+    shutil.copytree(ben, copy, symlinks=True)
+    assert not GitLedger(Repo.discover(copy))._wt_is_ours()      # the copy's worktree still drives the original
+    refs = git("for-each-ref", cwd=ben)
+    assert record_ruling(ana) == 0                               # the remote moves
+    assert _fetch_fire(copy)(None, {}, {}, False) == {"summary": "fetched"}
+    g = GitLedger(Repo.discover(copy))
+    assert g._wt_is_ours()
+    assert "Per-line rounding stays." in {e["words"] for e in g.ledger().in_force}
+    assert git("for-each-ref", cwd=ben) == refs                  # the original was not written
+
+
+def _origin_key(held: dict) -> str:
+    from levain.cockpit.effects import create_origin_key
+    return create_origin_key(held["pending_id"], 0)
+
+
+def _joins(repo: Path) -> dict:
+    return dict(_gl(repo).state().get("cockpit_joins") or {})
+
+
+def test_a_crash_before_the_final_record_then_a_new_offer_still_applies_the_accept(two, tmp_path, monkeypatch):
+    """FIX 2 (glm HIGH): the accept is committed and published, then the final record's save fails (a crash there).
+    Before the re-drive the new owner offers ownership on to ana. The re-drive finds THIS pending's ``acting`` marker
+    and ben the owner: the act is its own, it is recorded APPLIED (a new offer does not undo an accept)."""
+    tmp, ana, ben = two
+    assert team("owner", "ben", repo=ana) == 0
+    real = GitLedger.save_state
+    failed: list[int] = []
+
+    def crash_once(self, _mutate=None, **changes):
+        if _mutate is not None and not failed:
+            probe: dict = {}
+            _mutate(probe)
+            if any(isinstance(r, dict) and "sha" in r for r in (probe.get("cockpit_joins") or {}).values()):
+                failed.append(1)
+                raise OSError("the final record could not be saved (test)")
+        return real(self, _mutate, **changes)
+    monkeypatch.setattr(GitLedger, "save_state", crash_once)
+    with _cockpit(ben) as (url, httpd):
+        lp = Key(tmp_path, "lp").enroll(httpd.broker, "laptop-presence")
+        assert _fetch(url, "f1")[0] == 200
+        status, held = _accept(url, "owner-offer", "ben")
+        out = _sign(url, held, lp)
+        assert out["state"] == "applying" and failed == [1], out
+        assert _joins(ben)[_origin_key(held)]["state"] == "acting"
+        assert team("owner", "ana", repo=ben) == 0                            # ben, now owner, offers it on
+        out = _settled(url, held, out, lp)
+        assert out["state"] == "COMMITTED", out
+        rec = _joins(ben)[_origin_key(held)]
+        assert "state" not in rec and rec["sha"], rec                         # the final record replaced the marker
+    g = _gl(ana)
+    g.sync(push=False)
+    g.forget_derivation()
+    d = g.derivation()
+    assert d.team.owner == "ben" and d.tenure.offer["handle"] == "ana"
+
+
+def test_an_accept_already_done_on_the_laptop_is_refused_as_changing_nothing(two, tmp_path):
+    """FIX 2 (codex MED 2 + complement LOW 4): with no marker, an act found in force was not done by this signature.
+    ben accepts on the laptop first; the signature is then refused, truthfully, and nothing is committed or recorded."""
+    tmp, ana, ben = two
+    assert team("owner", "ben", repo=ana) == 0
+    with _cockpit(ben) as (url, httpd):
+        lp = Key(tmp_path, "lp").enroll(httpd.broker, "laptop-presence")
+        assert _fetch(url, "f1")[0] == 200
+        about = _about(url, "owner-offer", "ben")
+        status, held = _accept(url, "owner-offer", "ben", about)
+        assert held["state"] == "WAITING", held
+        assert team("accept", repo=ben) == 0                                  # the laptop command, the same act
+        before = _gl(ben).head()
+        out = _sign(url, held, lp)
+        assert out["state"] == "COMMITTED_INCOMPLETE" and out["reason"].endswith(": refused"), out
+        assert _gl(ben).head() == before and _origin_key(held) not in _joins(ben)
+    # the refusal's words (the broker keeps only "refused"): the store itself, on the same signed params
+    from levain.cockpit.effects import ApplyUnit, PermanentApplyRefusal
+    from levain.team.cockpit_verbs import TeamJoinStore, join_effect
+    eff = join_effect({"kind": "owner-offer", "handle": "ben", "about": about}, origin_key="ck.direct.0")
+    with pytest.raises(PermanentApplyRefusal, match="already in force; this signature changed nothing"):
+        TeamJoinStore(ben).apply_unit(ApplyUnit("team_join", (0,), (eff,)))
+    assert _gl(ben).head() == before and "ck.direct.0" not in _joins(ben)
+
+
+def test_an_acting_marker_whose_act_did_not_land_is_applied_by_the_re_drive(two, tmp_path):
+    """FIX 2: a marker is saved and the process dies before the act lands. The marker proves nothing landed is not
+    this pending's to skip: the re-drive (here the signature's own apply) finds the act not done and makes it, every
+    fresh check included."""
+    tmp, ana, ben = two
+    c = _second_machine(tmp, ben)
+    with _cockpit(c) as (url, httpd):
+        lp = Key(tmp_path, "lp").enroll(httpd.broker, "laptop-presence")
+        assert _fetch(url, "f1")[0] == 200
+        about = _about(url, "key", "ben")
+        status, held = _accept(url, "key", "ben", about)
+        key = _origin_key(held)
+        marker = {"state": "acting", "origin_key": key, "kind": "key", "handle": "ben", "about": about}
+        _gl(c).save_state(_mutate=lambda st: st.__setitem__("cockpit_joins", {key: marker}))
+        out = _sign(url, held, lp)
+        assert out["state"] == "COMMITTED", out
+        assert _gl(c).own_fingerprint() in _keys_of("ben", ben)
+        assert "state" not in _joins(c)[key]
+
+
+def test_an_environment_fault_in_the_act_is_transient_and_the_re_drive_applies_it(two, tmp_path, monkeypatch):
+    """FIX 4 (complement MED 1): a ``TeamError`` from the act (no key in the agent) is an environment fault: the
+    signature is not spent, and once the key is loaded the re-drive applies it."""
+    from levain.team.transport import TeamError
+    tmp, ana, ben = two
+    c = _second_machine(tmp, ben)
+    real = GitLedger.confirm_own_key
+    calls: list[int] = []
+
+    def no_agent_once(self, d, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TeamError("could not sign the ledger commit (levain writes nothing unsigned): no identities in agent")
+        return real(self, d, **kw)
+    monkeypatch.setattr(GitLedger, "confirm_own_key", no_agent_once)
+    with _cockpit(c) as (url, httpd):
+        lp = Key(tmp_path, "lp").enroll(httpd.broker, "laptop-presence")
+        assert _fetch(url, "f1")[0] == 200
+        status, held = _accept(url, "key", "ben")
+        out = _sign(url, held, lp)
+        assert out["state"] == "applying", out                                # not REFUSED, not spent
+        out = _settled(url, held, out, lp)
+        assert (out["state"], len(calls)) == ("COMMITTED", 2), out
+        assert _gl(c).own_fingerprint() in _keys_of("ben", ben)
+
+
+def test_every_ledger_member_the_store_calls_is_in_the_wire_neutral_protocol():
+    """FIX 5 (codex MED 5): the store holds a ``LedgerTransport``; every member it calls on it is in the protocol
+    (``head`` was not), so a second wire cannot pass the type and crash after the act."""
+    import ast
+    import inspect
+    from levain.team import cockpit_verbs
+    from levain.team.ledger_api import LedgerTransport
+    called = {n.attr for n in ast.walk(ast.parse(inspect.getsource(cockpit_verbs)))
+              if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "gl"}
+    assert "head" in called and called <= set(LedgerTransport.__protocol_attrs__), \
+        called - set(LedgerTransport.__protocol_attrs__)

@@ -73,8 +73,17 @@ def _unreadable(why: str) -> TeamSnapshot:
 
 class TeamSource:
     """The cached, single-flight read of one install's team ledger. ``start`` is where the ledger is looked for
-    (never the process's working directory: a caller names it); ``load`` is for tests. A renewal still running
-    after ``stuck_s`` is stuck: the last answer is then served marked old, and a new worker may take over."""
+    (never the process's working directory: a caller names it); ``load`` is for tests.
+
+    At most ONE worker reads per source (T3 L3 r1 codex MED 4): an invalidation while it runs starts no second read;
+    when it finishes, its answer is kept (as the old answer, if an invalidation came meanwhile) and exactly one
+    follow-up read starts for the newer epoch. The one exception is a worker still running after ``stuck_s``: it is
+    stuck, the last answer is served marked old, and a new worker takes over (the stuck one commits nothing).
+
+    A ``get`` returns an answer as current only if its epoch is the epoch at return (codex MED 3). Otherwise it waits
+    ``wait_s`` once, and past the wait serves the last answer marked old. One wait is paid per epoch, not per get: an
+    epoch whose wait ran out, or whose read failed, is remembered, and later gets in it serve at once (complement
+    LOW 3; the first read's cold wait is the same rule)."""
 
     def __init__(self, start: Path | str | None = None, *, ttl_s: float = 15.0, wait_s: float = 8.0,
                  stuck_s: float = 60.0, load: Callable[[], TeamSnapshot] | None = None,
@@ -87,9 +96,9 @@ class TeamSource:
         self._at = 0.0
         self._snap_epoch = -1                         # the epoch the answer was read in
         self._work_epoch = -1                         # the epoch the running worker started in
-        self._done: threading.Event | None = None     # set while a worker is reading
+        self._done: threading.Event | None = None     # the ONE live worker's event (None: no worker is reading)
         self._began = 0.0                             # when that worker started
-        self._cold_late = False                       # a first read outran its wait: later callers do not wait again
+        self._late_epoch = -1                         # an epoch whose wait ran out or whose read failed: no more waits
 
     def _load_ledger(self) -> TeamSnapshot:
         repo = Repo.discover(self._start) if self._start is not None else None
@@ -101,6 +110,12 @@ class TeamSource:
             sync["remote"] = gl.remote
         return TeamSnapshot(read_team(gl), sync)
 
+    def _spawn(self, epoch: int) -> None:
+        """Start the one worker for ``epoch``. The caller holds ``_lock`` and has checked no live worker runs."""
+        done = threading.Event()
+        self._done, self._began, self._work_epoch = done, self._clock(), epoch
+        threading.Thread(target=self._work, args=(done, epoch), daemon=True, name="team-read").start()
+
     def _work(self, done: threading.Event, epoch: int) -> None:
         snap = None
         try:
@@ -109,37 +124,45 @@ class TeamSource:
             snap = _unreadable(f"The team ledger could not be read on this machine ({type(exc).__name__}).")
         finally:
             with self._lock:
-                if self._done is done:       # a worker a newer one took over from commits nothing
-                    if snap is not None:
+                if self._done is done:       # a stuck worker a newer one took over from commits nothing
+                    if snap is not None:     # kept even when an invalidation came meanwhile: it is the old answer
                         self._snap, self._at, self._snap_epoch = snap, self._clock(), epoch
-                    self._done, self._cold_late = None, False
+                    else:
+                        self._late_epoch = max(self._late_epoch, epoch)     # a failed read: no more waits in it
+                    self._done = None
+                    now_epoch = _epoch()
+                    if now_epoch != epoch:   # invalidated while it ran: exactly one follow-up, for the newest epoch
+                        self._spawn(now_epoch)
             done.set()
+
+    def _old(self, snap: TeamSnapshot | None, age: float) -> TeamSnapshot:
+        """The last answer, known not to be current: it carries its age, so it reads as old (or the pending card)."""
+        return _unreadable(_PENDING) if snap is None else dataclasses.replace(snap, age_s=max(age, 0.001))
 
     def get(self) -> TeamSnapshot:
         epoch = _epoch()
         with self._lock:
             now = self._clock()
             age = now - self._at
-            current = self._snap_epoch == epoch
-            if self._snap is not None and age < self._ttl and current:
-                return self._snap
-            # a worker started before an invalidation reads the ledger as it was: a new one takes over
-            if self._done is None or now - self._began > self._stuck or self._work_epoch != epoch:
-                self._done, self._began, self._work_epoch = threading.Event(), now, epoch
-                threading.Thread(target=self._work, args=(self._done, epoch), daemon=True, name="team-read").start()
-            have, done = self._snap, self._done
+            have, current = self._snap, self._snap_epoch == epoch
+            if have is not None and age < self._ttl and current:
+                return have
+            if self._done is None or now - self._began > self._stuck:
+                self._spawn(epoch)           # the one worker (a stuck one is abandoned: it commits nothing)
+            done = self._done
             if have is not None and current:
-                # a renewal that has outrun `stuck_s` is not "being renewed": the answer reads as old
+                # a renewal within the epoch: the answer stands meanwhile; one that has outrun `stuck_s` reads as old
                 return dataclasses.replace(have, age_s=age) if age > self._stuck else have
-            if have is None and self._cold_late:
-                return _unreadable(_PENDING)
-        # a first read, or an answer a team verb made old: wait for the new one; past the wait the old one is served
+            if self._late_epoch == epoch:
+                return self._old(have, age)
+        # a first read, or an answer a team verb made old: wait once for the new one
         done.wait(self._wait)
         with self._lock:
-            if self._snap is not None:
+            if self._snap is not None and self._snap_epoch == _epoch():
                 return self._snap
-            self._cold_late = True
-        return _unreadable(_PENDING)
+            # past the wait, or answered for an epoch superseded during it: the old answer, marked old
+            self._late_epoch = max(self._late_epoch, epoch)
+            return self._old(self._snap, self._clock() - self._at)
 
 
 def _one_line(text: object, limit: int = _ROW_MAX) -> str:

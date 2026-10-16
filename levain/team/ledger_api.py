@@ -106,6 +106,11 @@ class LedgerTransport(Protocol):
         ...
 
     # ---- reads ------------------------------------------------------------------------------------------------
+    def head(self) -> str:
+        """The version of the ledger this clone holds now (on git, the tip commit of the ledger branch): the id a
+        caller records beside an act it just made. Refused (``TeamError``) when this clone holds no ledger."""
+        ...
+
     def snapshot(self) -> tuple[str, R.Team, I.Ledger]:
         """(version, team, ledger), all read from one consistent version of the ledger."""
         ...

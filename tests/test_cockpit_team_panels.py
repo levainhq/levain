@@ -167,3 +167,108 @@ def test_members_and_joins_panes_draw_rows_without_an_address_and_retire_with_th
     assert empty.panel("team-joins")["rows"] == []
     gone = _cockpit([TeamRead("unreadable", None, "The team ledger could not be read.")], [])
     assert _panels(gone) == ["team-status"]
+
+
+# --- T3 L3 r1 FIX 3: one worker per source, the epoch at return, one wait per epoch -----------------------------------
+
+
+def _gated(gate, loads: list[int], live: list[int], peak: list[int]):
+    """A load that counts itself, counts how many run at once, and blocks on ``gate``."""
+    import threading
+    mu = threading.Lock()
+
+    def load() -> TeamSnapshot:
+        with mu:
+            loads.append(1)
+            live.append(1)
+            peak[0] = max(peak[0], len(live))
+        try:
+            gate.wait(5)
+            return TeamSnapshot(TeamRead("ok", MODEL), {"n": len(loads)})
+        finally:
+            with mu:
+                live.pop()
+    return load
+
+
+def test_a_burst_of_invalidations_runs_one_read_and_exactly_one_follow_up():
+    import threading
+    from levain.cockpit.team_panels import invalidate
+    gate = threading.Event()
+    gate.set()
+    loads, live, peak = [], [], [0]
+    src = TeamSource(load=_gated(gate, loads, live, peak), ttl_s=60.0, wait_s=0.01)
+    assert src.get().read.state == "ok" and len(loads) == 1
+    gate.clear()
+    for _ in range(20):                      # a burst of verbs, each followed by a panel read
+        invalidate()
+        src.get()
+    assert len(loads) == 2 and peak[0] == 1, (len(loads), peak)   # one read running, none beside it
+    gate.set()
+    for _ in range(200):
+        if src.get().sync.get("n") == 3 and src._done is None:
+            break
+        time.sleep(0.01)
+    # the read the burst found running finished stale: exactly one follow-up read the newest epoch
+    assert len(loads) == 3 and peak[0] == 1 and src.get().age_s == 0.0, (len(loads), peak)
+
+
+def test_a_waiter_is_not_handed_an_answer_whose_epoch_was_superseded_during_its_wait():
+    import threading
+    from levain.cockpit.team_panels import invalidate
+    gates = [threading.Event() for _ in range(3)]    # read i returns once gates[i] is set
+    gates[0].set()
+    started: list[int] = []
+
+    def load() -> TeamSnapshot:
+        i = len(started)
+        started.append(i)
+        gates[i].wait(5)
+        return TeamSnapshot(TeamRead("ok", MODEL), {"n": i})
+    src = TeamSource(load=load, ttl_s=60.0, wait_s=3.0)
+    assert src.get().sync["n"] == 0
+    invalidate()                             # verb 1: the next read waits for a fresh answer
+    got = []
+    t = threading.Thread(target=lambda: got.append(src.get()))
+    t.start()
+    for _ in range(200):
+        if len(started) == 2:
+            break
+        time.sleep(0.01)
+    invalidate()                             # verb 2, while verb 1's read runs: that read is old before it lands
+    gates[1].set()                           # verb 1's read lands; the follow-up (read 2) stays blocked
+    t.join(5)
+    (snap,) = got
+    assert snap.sync["n"] == 1 and snap.age_s > 0, snap      # verb 1's read, served marked old, never as current
+    gates[2].set()
+    for _ in range(200):
+        if src.get().sync.get("n") == 2:
+            break
+        time.sleep(0.01)
+    assert src.get().sync["n"] == 2 and src.get().age_s == 0.0 and len(started) == 3
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_failing_read_costs_one_wait_per_epoch_not_one_per_get():
+    from levain.cockpit.team_panels import invalidate
+
+    class Die(BaseException):
+        pass
+    ok = [True]
+
+    def load() -> TeamSnapshot:
+        if ok[0]:
+            return TeamSnapshot(TeamRead("ok", MODEL), {})
+        time.sleep(0.3)
+        raise Die()
+    src = TeamSource(load=load, ttl_s=60.0, wait_s=2.0)
+    assert src.get().read.state == "ok"
+    ok[0] = False
+    invalidate()
+    t0 = time.monotonic()
+    first = src.get()
+    t1 = time.monotonic()
+    second = src.get()
+    t2 = time.monotonic()
+    assert t1 - t0 >= 0.25 and t2 - t1 < 0.1, (t1 - t0, t2 - t1)     # one wait, then none again in the same epoch
+    assert first.read.state == second.read.state == "ok" and first.age_s > 0 and second.age_s > 0   # marked old
