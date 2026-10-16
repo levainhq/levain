@@ -280,6 +280,7 @@ def run_init(
     force: bool,
     packs: list[Path] | None = None,
     answers_file: Path | None = None,
+    messaging: str | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -321,10 +322,20 @@ def run_init(
             print(f"FAIL: {e}")
             return 1
 
+    if messaging is not None and messaging not in MESSAGING_CHOICES:
+        print(f"FAIL: --messaging must be one of {', '.join(MESSAGING_CHOICES)} (got {messaging!r}).")
+        return 1
+    if messaging is not None and adapter is not None and adapter != "claude-code":
+        print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
+        return 1
+
     try:
         chosen = _resolve_adapter(adapter)
     except _UserCancelled:
         print("Cancelled.")
+        return 1
+    if messaging is not None and chosen != "claude-code":  # the adapter came from the menu
+        print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
         return 1
 
     if install.exists() and not install.is_dir():
@@ -521,6 +532,7 @@ def run_init(
                     activation_roots=activation_roots,
                     packs=list(zip(pack_manifests, pack_dirs)),
                     require_empty=not force,
+                    messaging=messaging,
                 )
                 # Interview completed successfully — clear the checkpoint so the next
                 # `levain init --force` doesn't offer to resume stale answers.
@@ -562,6 +574,7 @@ def apply_init(
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
     require_empty: bool = False,
+    messaging: str | None = None,
 ) -> InitResult:
     """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
     :class:`InstallBusy` before writing anything when another process holds it.
@@ -585,6 +598,7 @@ def apply_init(
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
+            messaging=messaging,
         )
 
 
@@ -601,6 +615,7 @@ def _apply_init(
     activation_roots: Sequence[Path] | None = None,
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
+    messaging: str | None = None,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
     `answers`, copy the verbatim seed files (each from its winning layer's source
@@ -716,6 +731,11 @@ def _apply_init(
     from levain import host_guard
 
     pin_before = host_guard.agent_pin_status(install, adapter=chosen) if _adapter_has_hooks(chosen) else None
+    if messaging is not None:
+        if chosen != "claude-code" or messaging not in MESSAGING_CHOICES:
+            raise InitError("messaging applies to the claude-code adapter and is one of "
+                            f"{', '.join(MESSAGING_CHOICES)}.")
+        _write_messaging_choice(install, messaging, emit)  # before the adapter render reads it
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit,
@@ -1897,6 +1917,7 @@ def _claude_code_files(
 
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
     settings_text = _fill(settings_text, {"PYTHON": _hook_arg_body(python_path)})
+    settings_text = _apply_messaging(settings_text, persisted_messaging(install))
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
@@ -1908,6 +1929,68 @@ def _claude_code_files(
         install / ".claude" / "settings.json": settings_text,
         install / ".mcp.json": mcp_text,
     }
+
+
+# `levain init --messaging` (the opt-out for Q9). The template carries no messaging keys; the renderer adds
+# them through `merge_messaging`, so the choice is the one place they come from. Key ORDER in the rendered
+# settings.json differs from the old hard-coded template (the three keys follow `hooks`); keys and values are
+# the same for `governed`.
+MESSAGING_CHOICES = ("governed", "off", "unmanaged")
+DEFAULT_MESSAGING = "governed"
+_MESSAGING_ADAPTER_REFUSAL = ("FAIL: --messaging is for the claude-code adapter only; {adapter} documents no "
+                              "cross-session messaging, so there is nothing to opt out of.")
+_MESSAGING_KNOBS = {"governed": ("hold", "ask"), "off": ("refuse", "deny"),
+                    "unmanaged": ("unmanaged", "unmanaged")}
+
+
+def persisted_messaging(install: Path) -> str:
+    """The messaging choice recorded in ``.levain/config.json`` (``messaging``). Absent, unreadable or
+    unrecognised = ``governed``: an install from before the flag, or a hand-edited value, is governed, never
+    silently opened."""
+    from levain.dashboard import _read_levain_config
+
+    value = _read_levain_config(install).get("messaging")
+    return value if value in MESSAGING_CHOICES else DEFAULT_MESSAGING
+
+
+def _apply_messaging(settings_text: str, choice: str) -> str:
+    """``settings_text`` (the rendered claude-code settings JSON) with the messaging keys ``choice`` names."""
+    from levain.consent.adapters.claude_code import merge_messaging
+
+    inbound, outbound = _MESSAGING_KNOBS[choice]
+    try:
+        doc = json.loads(settings_text)
+        merge_messaging(doc, inbound=inbound, outbound=outbound)
+    except ValueError as e:
+        raise InitError(f"the claude-code settings template could not take the messaging keys: {e}") from e
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:
+    """Record ``choice`` in ``.levain/config.json``, merged beside the adapter marker and brand keys (the file
+    for install choices that are not interview answers, so `levain update` reads it and `--force` keeps it).
+    Raises InitError when it cannot be recorded: an opt-out that does not persist would be undone by the
+    next update, so it must not look done."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing: dict = {}
+    if config_path.is_file():
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise InitError(".levain/config.json is unreadable, so the messaging choice cannot be "
+                            f"recorded ({e}); fix it, then re-run.") from e
+        if not isinstance(existing, dict):
+            existing = {}
+    if existing.get("messaging") == choice:
+        return
+    try:
+        _atomic_write_text(config_path, json.dumps({**existing, "messaging": choice}, indent=2,
+                                                   ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise InitError(f"could not record the messaging choice in .levain/config.json ({e}).") from e
+    emit(f"  messaging:  {choice} → .levain/config.json")
 
 
 def _install_codex(

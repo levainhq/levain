@@ -188,6 +188,18 @@ def main(argv: list[str] | None = None) -> int:
             "`levain init --answers-template > answers.json`."
         ),
     )
+    init_p.add_argument(
+        "--messaging",
+        choices=["governed", "off", "unmanaged"],
+        default=None,
+        help=(
+            "Claude Code cross-session messaging (claude-code adapter only). `governed` (the default): "
+            "inbound messages are held, outbound sends ask. `off`: inbound refused, sending and listing "
+            "denied. `unmanaged`: none of those keys written; Claude Code's own defaults apply (your own "
+            "trust decision). The choice is kept in .levain/config.json, so `levain update` and "
+            "`init --force` keep it; give --messaging again to change it."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -1341,6 +1353,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
         return run_answers_template(packs=args.pack)
 
+    if args.messaging is not None and args.web:
+        print("levain init: --messaging cannot be combined with --web; drop --web, or run "
+              "`levain init --messaging ...` in the terminal.")
+        return 1
+
     if args.answers is not None and args.web:
         # --web IS the interactive onboarding surface; pairing it with a file that
         # exists to avoid interaction is a contradiction, not a preference to resolve.
@@ -1382,6 +1399,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         force=args.force,
         packs=args.pack,
         answers_file=args.answers,
+        messaging=args.messaging,
     )
 
 
