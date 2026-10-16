@@ -689,7 +689,95 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
-        _state_seen_prune(directory, _SESSIONS_KEEP)
+        _sessions_prune(directory)
+    except Exception:
+        pass
+
+
+def _sessions_prune(directory: Path, keep: int = _SESSIONS_KEEP) -> None:
+    """Bound the sessions directory by SESSIONS, not files: a stem is `<stem>.json` (the registry
+    record) plus `<stem>.log.jsonl` (the transcript). Past `keep` stems the least recently touched
+    (the newer mtime of the pair) go, both files together; stale *.tmp leaks go too. The state-line
+    store keeps its own file-count prune (_state_seen_prune); this one is the sessions dir's alone."""
+    now = time.time()
+    stems: dict[str, float] = {}
+    for p in directory.iterdir():
+        try:
+            if p.name.endswith(".tmp"):
+                if now - p.stat().st_mtime > 3600:
+                    p.unlink(missing_ok=True)
+                continue
+            for suffix in (".log.jsonl", ".json"):
+                if p.name.endswith(suffix):
+                    stem = p.name[: -len(suffix)]
+                    stems[stem] = max(stems.get(stem, 0.0), p.stat().st_mtime)
+                    break
+        except OSError:
+            pass
+    for stem in sorted(stems, key=stems.__getitem__)[: max(0, len(stems) - keep)]:
+        for suffix in (".json", ".log.jsonl"):
+            try:
+                (directory / f"{stem}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+# The per-session transcript the cockpit reads back (Q8): `<stem>.log.jsonl` beside the registry
+# file, one line per event {"v","at","kind","text","cut"}. A DISPLAY, never an authority.
+_LOG_TEXT_MAX = 4000
+_LOG_ROTATE_AT = 256 * 1024
+
+
+def _log_rewrite_newest_half(path: Path) -> None:
+    """Rewrite `path` to its newest half of WHOLE lines via tmp + os.replace, never in place: the
+    reader holds the file open and must not see it cut under a read."""
+    data = path.read_bytes()
+    start = len(data) // 2
+    if start > 0 and data[start - 1:start] != b"\n":
+        nl = data.find(b"\n", start)
+        start = len(data) if nl < 0 else nl + 1
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, data[start:])
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def session_log(session_id, kind, text) -> None:
+    """Append one transcript event for this session: `kind` is "prompt" | "reply" | "tool". Text is
+    capped at _LOG_TEXT_MAX chars (`cut` = chars dropped). ONE os.write on an O_APPEND fd (mode 0600,
+    no symlink followed); past _LOG_ROTATE_AT the file is rewritten to its newest half. Fail-soft:
+    ANY exception is swallowed; a hook never fails a session over this."""
+    try:
+        if not isinstance(session_id, str) or not session_id or not isinstance(text, str):
+            return
+        key = hashlib.sha1(f"{_SESSION_AGENT}:{session_id}".encode("utf-8", "replace")).hexdigest()[:24]
+        directory = install_root() / ".levain" / "sessions"
+        path = directory / f"{key}.log.jsonl"
+        directory.mkdir(parents=True, exist_ok=True)
+        event = {
+            "v": 1,
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "kind": kind,
+            "text": text[:_LOG_TEXT_MAX],
+            "cut": max(0, len(text) - _LOG_TEXT_MAX),
+        }
+        line = (json.dumps(event) + "\n").encode("ascii")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, line)
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if size > _LOG_ROTATE_AT:
+            _log_rewrite_newest_half(path)
+        if size == len(line):   # a new stem: the only moment the count of sessions grows
+            _sessions_prune(directory)
     except Exception:
         pass
 

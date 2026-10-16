@@ -163,6 +163,12 @@ def main() -> int:
             hook.session_touch(session_id, payload.get("cwd"), "UserPromptSubmit")
         except Exception:
             pass
+        # Transcript line (Q8): the operator's prompt, for the cockpit's read-only view.
+        try:
+            if isinstance(prompt, str):
+                hook.session_log(session_id, "prompt", prompt)
+        except Exception:
+            pass
     except Exception:
         # Structural fail-open: no error escapes a harness entry point.
         pass

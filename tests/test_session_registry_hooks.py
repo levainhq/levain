@@ -7,9 +7,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,7 +21,8 @@ _TREES = {
     "claude_code": _TEMPLATES / "activation" / "hooks",
     "codex": _TEMPLATES / "adapters" / "codex" / "activation" / "hooks",
 }
-_HOOK_FILES = ("_levain_hook.py", "session_start.py", "user_prompt_submit.py", "automemory_mirror.py")
+_HOOK_FILES = ("_levain_hook.py", "session_start.py", "user_prompt_submit.py", "automemory_mirror.py",
+               "stop.py", "post_tool_use.py")
 
 
 def _install(root: Path, tree: Path) -> Path:
@@ -99,3 +102,178 @@ def test_unwritable_sessions_dir_changes_nothing_the_hook_says(agent_root, tmp_p
     assert ctx(proc) == ctx(base)
     up = _run(root, "user_prompt_submit.py", {"session_id": "s1", "prompt": "x", "cwd": "/w"})
     assert up.returncode == 0 and up.stderr == ""
+
+
+# ---- Q8: the transcript log (<stem>.log.jsonl) beside the registry file ----
+
+_STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+
+
+def _key(agent: str, sid: str) -> str:
+    return hashlib.sha1(f"{agent}:{sid}".encode()).hexdigest()[:24]
+
+
+def _event(line: str):
+    """The lane-B reader's validation (levain/cockpit/session_log.py `_event`), per the Contract."""
+    d = json.loads(line)
+    assert isinstance(d, dict) and set(d) == {"v", "at", "kind", "text", "cut"}
+    assert type(d["v"]) is int and d["v"] == 1 and d["kind"] in ("prompt", "reply", "tool")
+    assert isinstance(d["at"], str) and _STAMP.fullmatch(d["at"])
+    assert isinstance(d["text"], str) and type(d["cut"]) is int and d["cut"] >= 0
+    return d
+
+
+def _events(root: Path, agent: str, sid: str) -> list[dict]:
+    path = root / ".levain" / "sessions" / f"{_key(agent, sid)}.log.jsonl"
+    return [_event(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+_PAYLOADS = {   # shapes from Q8_PROBE/REPORT.md
+    "claude_code": {
+        "tool": {"session_id": "s1", "cwd": "/w", "tool_name": "Bash",
+                 "tool_input": {"command": "ls -la\necho second line", "description": "list"},
+                 "tool_response": {"stdout": "SECRET-OUT", "stderr": "", "interrupted": False}},
+        "file": {"session_id": "s1", "cwd": "/w", "tool_name": "Edit",
+                 "tool_input": {"file_path": "/w/a.py", "old_string": "x", "new_string": "y"},
+                 "tool_response": {"filePath": "/w/a.py"}},
+    },
+    "codex": {
+        "tool": {"session_id": "s1", "cwd": "/w", "tool_name": "Bash", "tool_input": {"command": "ls -la\necho second line"},
+                 "tool_response": "SECRET-OUT", "turn_id": "t1"},
+        "file": {"session_id": "s1", "cwd": "/w", "tool_name": "apply_patch", "tool_input": {"file_path": "/w/a.py"},
+                 "tool_response": "ok", "turn_id": "t1"},
+    },
+}
+
+
+def test_the_three_hooks_write_contract_lines(agent_root):
+    agent, root = agent_root
+    pl = _PAYLOADS[agent]
+    stops = []
+    for script, payload in (
+        ("user_prompt_submit.py", {"session_id": "s1", "prompt": "do the thing", "cwd": "/w"}),
+        ("post_tool_use.py", pl["tool"]),
+        ("post_tool_use.py", pl["file"]),
+        ("stop.py", {"session_id": "s1", "cwd": "/w", "last_assistant_message": "all done",
+                     "stop_hook_active": False}),
+    ):
+        proc = _run(root, script, payload)
+        assert proc.returncode == 0 and proc.stderr == ""
+        stops.append(proc.stdout)
+    assert stops[1] == stops[2] == stops[3] == ""     # PostToolUse and Stop print nothing
+    ev = _events(root, agent, "s1")
+    assert [(e["kind"], e["text"], e["cut"]) for e in ev] == [
+        ("prompt", "do the thing", 0),
+        ("tool", "Bash: ls -la", 0),
+        ("tool", f"{pl['file']['tool_name']}: /w/a.py", 0),
+        ("reply", "all done", 0),
+    ]
+    raw = (root / ".levain" / "sessions" / f"{_key(agent, 's1')}.log.jsonl").read_text()
+    assert "SECRET-OUT" not in raw                    # tool_response is never read
+    path = root / ".levain" / "sessions" / f"{_key(agent, 's1')}.log.jsonl"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    # the registry record is untouched by Stop / PostToolUse (last_event stays a registry value)
+    assert _record(root, agent, "s1")["last_event"] == "UserPromptSubmit"
+
+
+def test_a_tool_without_a_summary_is_just_its_name(agent_root):
+    agent, root = agent_root
+    _run(root, "post_tool_use.py", {"session_id": "s1", "tool_name": "Task", "tool_input": {"x": 1}})
+    _run(root, "post_tool_use.py", {"session_id": "s1", "tool_name": "Read", "tool_input": "weird"})
+    assert [e["text"] for e in _events(root, agent, "s1")] == ["Task", "Read"]
+
+
+def test_long_text_is_cut_and_counted(agent_root):
+    agent, root = agent_root
+    _run(root, "user_prompt_submit.py", {"session_id": "s1", "prompt": "p" * 5000, "cwd": "/w"})
+    _run(root, "stop.py", {"session_id": "s1", "last_assistant_message": "r" * 4001})
+    _run(root, "stop.py", {"session_id": "s1", "last_assistant_message": ""})   # empty: no line
+    p, r = _events(root, agent, "s1")
+    assert (len(p["text"]), p["cut"]) == (4000, 1000) and (len(r["text"]), r["cut"]) == (4000, 1)
+
+
+def test_the_log_is_rewritten_to_its_newest_half_by_replace(agent_root):
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    path = sdir / f"{_key(agent, 's1')}.log.jsonl"
+    old = [json.dumps({"v": 1, "at": "2026-01-01T00:00:00Z", "kind": "tool", "text": f"old-{i}-" + "x" * 900,
+                       "cut": 0}) + "\n" for i in range(280)]
+    path.write_text("".join(old))
+    assert path.stat().st_size > 256 * 1024
+    inode = path.stat().st_ino
+    proc = _run(root, "stop.py", {"session_id": "s1", "last_assistant_message": "newest"})
+    assert proc.returncode == 0 and proc.stdout == ""
+    assert path.stat().st_ino != inode                  # replaced, never truncated in place
+    assert path.stat().st_size < 160 * 1024
+    ev = _events(root, agent, "s1")                     # every line whole and valid
+    assert ev[-1]["text"] == "newest" and 100 < len(ev) < 180
+    texts = [e["text"] for e in ev[:-1]]
+    assert texts[-1].startswith("old-279-") and texts == sorted(texts, key=lambda t: int(t.split("-")[1]))
+    assert not list(sdir.glob("*.tmp"))
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.parametrize("script", ["stop.py", "post_tool_use.py"])
+def test_stop_and_post_tool_use_are_silent_whatever_goes_wrong(agent_root, script):
+    agent, root = agent_root
+    good = {"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "ls"},
+            "last_assistant_message": "hi"}
+    (root / ".levain" / "sessions").write_text("a file where the directory should be")
+    proc = _run(root, script, good)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    (root / ".levain" / "sessions").unlink()
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir()
+    sdir.chmod(0o500)                                   # read-only directory
+    try:
+        proc = _run(root, script, good)
+        assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+        for stdin in ("not json at all", "", "[1, 2]", '{"session_id": 5, "tool_name": 7}'):
+            proc = subprocess.run(
+                [sys.executable, str(root / "activation" / "hooks" / script)], input=stdin,
+                capture_output=True, text=True, cwd=root, timeout=60,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+            assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    finally:
+        sdir.chmod(0o700)
+    assert not list(sdir.iterdir())
+
+
+def test_a_symlinked_log_is_not_followed(agent_root, tmp_path_factory):
+    agent, root = agent_root
+    target = tmp_path_factory.mktemp("elsewhere") / "victim.txt"
+    target.write_text("keep")
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / f"{_key(agent, 's1')}.log.jsonl").symlink_to(target)
+    proc = _run(root, "stop.py", {"session_id": "s1", "last_assistant_message": "x"})
+    assert (proc.returncode, proc.stdout) == (0, "") and target.read_text() == "keep"
+
+
+def test_the_prune_keeps_200_stems_and_removes_a_stems_files_together(agent_root):
+    agent, root = agent_root
+    sdir = root / ".levain" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 10_000
+    for i in range(205):                                 # 205 stems, each a pair, aged oldest-first
+        for suffix in (".json", ".log.jsonl"):
+            f = sdir / f"{i:024x}{suffix}"
+            f.write_text("{}")
+            os.utime(f, (old + i, old + i))
+    # an old stem whose LOG is fresh is a live session: it must survive on the newer mtime of the pair
+    os.utime(sdir / f"{0:024x}.log.jsonl", None)
+    stale = sdir / "leak.1.tmp"
+    stale.write_text("x")
+    os.utime(stale, (old, old))
+    proc = _run(root, "user_prompt_submit.py", {"session_id": "new", "prompt": "hi", "cwd": "/w"})
+    assert proc.returncode == 0
+    names = sorted(p.name for p in sdir.iterdir())
+    stems = {n.split(".")[0] for n in names}
+    assert len(stems) == 200 and _key(agent, "new") in stems
+    assert f"{0:024x}" in stems                          # kept by its fresh log
+    for stem in stems:                                   # never half a pair among the old ones
+        if stem != _key(agent, "new"):
+            assert {f"{stem}.json", f"{stem}.log.jsonl"} <= set(names)
+    assert f"{1:024x}" not in stems and "leak.1.tmp" not in names
+    assert f"{1:024x}.json" not in names and f"{1:024x}.log.jsonl" not in names
