@@ -25,7 +25,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.install import SeedEntry, apply_init
+from levain.install import apply_init
+from levain.packs import compose_roster
 from levain.verify import _python_from_hooks_config
 from tests.test_install import _templates_root
 
@@ -57,9 +58,9 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
         apply_init(
             install, adapter, answers, templates_root, python, anneal, specs,
-            [SeedEntry(n, templates_root / "seed" / n, "verbatim")
-             for n in ("partnership.md", "memory.md", "spore_instructions.md",
-                       "continuity.md", "README.md")],
+            # the rest of the base roster, derived so a seed file the package adds is never missing here
+            [e for e in compose_roster([templates_root])
+             if e.name not in ("world.md", "origin.md")],
         )
 
     store = f"{install}/.levain/memory.db"

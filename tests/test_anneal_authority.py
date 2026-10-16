@@ -23,7 +23,7 @@ import pytest
 from levain import manifest
 from levain.install import _templates_root, apply_init
 from levain.interview import build_field_plan, parse_template
-from levain.packs import SeedEntry
+from levain.packs import compose_roster
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX executable decoy")
 
@@ -105,11 +105,9 @@ def test_init_wires_mcp_to_levains_own_interpreter(tmp_path, monkeypatch, adapte
         apply_init(
             install, adapter, answers, templates_root,
             python_path, "/decoy/anneal-memory", specs,
-            [
-                SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "spore_instructions.md",
-                          "continuity.md", "README.md")
-            ],
+            # the rest of the base roster, derived so a seed file the package adds is never missing here
+            [e for e in compose_roster([templates_root])
+             if e.name not in ("world.md", "origin.md")],
         )
 
     if adapter == "claude-code":
