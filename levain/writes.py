@@ -1503,7 +1503,7 @@ def _apply_spore_verb(
         # 2026-06-23): the disposition we read here is passed as `expect_disposition` to
         # `store.ascend`, which CAS-checks it INSIDE the resolve transaction — so a concurrent
         # writer flipping loop→note between this read and the resolve makes the ascend FAIL
-        # CLOSED (SporeError → verb_failed) rather than transmute a now-note. The CAS mirrors
+        # CLOSED (SporeError → stale, read back in _spore_refusal) rather than transmute a now-note. The CAS mirrors
         # the one `update` already uses (anneal `AM-SPORE-CAS`).
         current = store.get(spore_id)
         if current is not None and is_note(current):

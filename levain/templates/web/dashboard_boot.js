@@ -120,6 +120,7 @@
   // also carries the write token via writeHeaders). On success it reloads so the dashboard
   // reflects the saved state; on refusal it returns {ok:false, error, message} so the render
   // core can surface it inline.
+  let staleReread = null;   // the one pending re-read after a stale refusal
   async function postWrite(route, body) {
     try {
       const res = await fetch(route, {
@@ -144,8 +145,11 @@
         return { ok: true, data: data };
       }
       // A stale refusal means this page's picture of the row is old (spore-174): re-read it, after the row has shown
-      // the refusal for a moment, so the next click acts on the current row instead of re-firing the old one.
-      if (res.status === 409 && data.error === "stale") setTimeout(() => { reread(); }, 2500);
+      // the refusal for a moment, so the next click acts on the current row instead of re-firing the old one. The
+      // re-read is PASSIVE, so an editor the operator opened meanwhile is never rebuilt away; one timer at a time.
+      if (res.status === 409 && data.error === "stale" && !staleReread) {
+        staleReread = setTimeout(() => { staleReread = null; load({ passive: true }); }, 2500);
+      }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
       if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();

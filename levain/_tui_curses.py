@@ -328,7 +328,7 @@ def _handle_verb(
         # CAS-GUARDED (spore-173): the kind/face is chosen off the SNAPSHOT row, so the
         # snapshot disposition rides the request as expect_disposition; the server descend
         # CASes it (anneal AM-SPORE-CAS-DESCEND, parity with ascend), so a cross-process
-        # re-route in the confirm window FAILS CLOSED (verb_failed → re-read) rather than
+        # re-route in the confirm window FAILS CLOSED (stale → re-read, spore-174) rather than
         # composting a now-live loop under a Keep-"remove" intent. (s.disposition is the
         # rendered value; the server normalizes 'loop'→key-absent for the raw compare.)
         s = current_row(model)
@@ -460,7 +460,7 @@ def _handle_verb(
                           f"activated {s.id} → loop")
         # parked loop → un-park: CAS-GUARDED (spore-173) — the note-vs-parked route is read off
         # the SNAPSHOT, so the snapshot disposition rides the tier update as expect_disposition;
-        # a stale note now FAILS CLOSED (verb_failed → re-read) instead of accepting tier=warm +
+        # a stale note now FAILS CLOSED (stale → re-read, spore-174) instead of accepting tier=warm +
         # falsely reporting "reactivated" while it stays a note.
         return _apply(model, source,
                       build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition),
