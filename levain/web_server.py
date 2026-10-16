@@ -81,6 +81,7 @@ import hmac
 import re
 import urllib.parse
 import secrets
+import shlex
 import select
 import time
 import socket
@@ -89,7 +90,7 @@ import logging
 import json
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -116,7 +117,8 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import GuardedHandler
+from levain.http_guards import GuardedHandler, host_header_name
+from levain.consent.passkey import is_host_name
 from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -146,6 +148,29 @@ _PENDING_PREFIX = "/cockpit/pending/"
 _PENDING_ACTIONS = ("signature", "cancel")
 
 
+# Q6b: a consent answer signed with a passkey, from a browser that reaches this cockpit over https (a proxy such as
+# `tailscale serve` in front of the loopback port). POST /cockpit/consent/<request_id>/passkey-challenge returns the
+# answer record to sign and its WebAuthn challenge; .../passkey-answer carries the assertion, which the queue verifies
+# with the same ssh-keygen check as a terminal answer. POST /cockpit/passkey/key-line turns a new passkey's public
+# key into the OpenSSH key and the laptop command that enrols it (a passkey never enrols itself). All ride the write
+# gate.
+_PASSKEY_ACTIONS = ("passkey-challenge", "passkey-answer")
+_PASSKEY_KEY_LINE_PATH = "/cockpit/passkey/key-line"
+# Headers a reverse proxy sets. `tailscale serve` passes the client's Host through unchanged and SETS
+# X-Forwarded-For (measured 2026-10-16), so Host cannot tell a proxied request from a local one; these can.
+_PROXY_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Forwarded-Host", "X-Real-IP")
+
+
+def _consent_passkey_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for a passkey answer route, else None."""
+    if not route.startswith(_CONSENT_BODY_PREFIX):
+        return None
+    rid, sep, action = route[len(_CONSENT_BODY_PREFIX):].partition("/")
+    if not sep or _CONSENT_ID.fullmatch(rid) is None or action not in _PASSKEY_ACTIONS:
+        return None
+    return rid, action
+
+
 def _pending_route(route: str) -> "tuple[str, str] | None":
     """``(pending_id, action)`` for a broker pending route, else None."""
     if not route.startswith(_PENDING_PREFIX):
@@ -157,7 +182,8 @@ def _pending_route(route: str) -> "tuple[str, str] | None":
 
 
 def _is_write_route(route: str) -> bool:
-    return route in _WRITE_ROUTES or _pending_route(route) is not None
+    return (route in _WRITE_ROUTES or route == _PASSKEY_KEY_LINE_PATH or _pending_route(route) is not None
+            or _consent_passkey_route(route) is not None)
 
 
 def _consent_reader() -> Any:
@@ -777,9 +803,15 @@ class _Handler(GuardedHandler):
         read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
         unauthenticated by design)."""
         return (
-            not self.server.is_loopback_bind
+            (not self.server.is_loopback_bind or self._proxied())
             and self.server.levain_source.write_scope is not None
         )
+
+    def _proxied(self) -> bool:
+        """True when a reverse proxy carried this request (it set one of _PROXY_HEADERS): its client is not on
+        this machine whatever Host it sent, so it is off-box. A local client sending one only meets the stricter
+        rule."""
+        return any(self.headers.get(h) is not None for h in _PROXY_HEADERS)
 
     def _credential(self) -> dict[str, Any]:
         """The credential THIS request carries, verified here and never claimed (design §5.1): a
@@ -1254,6 +1286,116 @@ class _Handler(GuardedHandler):
     def _install_class(self) -> str:
         return broker_install_class(self.server)
 
+    def _passkey_rp_id(self) -> str:
+        """The rpId a passkey on this request's page uses: the page's own host name (the Host the browser sent,
+        already allowlisted). Every byte of trust stays in the signature: a passkey signs its own rpId's hash, and
+        the key it is checked against was enrolled with that rpId as its application."""
+        name = host_header_name(self.headers.get("Host"))
+        if name is None or not is_host_name(name):
+            raise EditError("bad_request", 400, "this page's host is not a name a passkey can be made on")
+        return name
+
+    def _passkey_answer_post(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``POST /cockpit/consent/<id>/passkey-challenge`` ({decision, signer_fp?}) -> the answer record to sign
+        and its WebAuthn challenge; ``.../passkey-answer`` ({payload, authenticator_data, client_data_json,
+        signature}, base64url) -> the queue's verdict. The queue decides, verifying the assertion as an OpenSSH
+        signature against the authority log the agent's hook replays, exactly as for ``levain consent answer``."""
+        import base64
+        import sqlite3
+
+        from levain.authority import AuthorityError, VerifierUnavailable, anchor_path
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
+        from levain.consent.passkey import PasskeyError, b64url_decode, challenge, to_sshsig
+        from levain.consent.queue import (
+            AnswerRefused, ConsentQueue, QueueStoreError, authority_source, default_queue_dir,
+        )
+        from levain.consent.record import DECISIONS, answer_message
+
+        allowed = {"passkey-challenge": ({"decision"}, {"signer_fp"}),
+                   "passkey-answer": ({"payload", "authenticator_data", "client_data_json", "signature"}, set())}
+        need, may = allowed[action]
+        if not isinstance(req, dict) or not need <= set(req) or set(req) - need - may:
+            raise EditError("bad_request", 400, f"request keys must be {sorted(need)} (optional {sorted(may)})")
+        if self._credential().get("class") not in ("token", "device"):
+            raise EditError("credential_required", 403, "a write needs a credential (the write token)")
+        rp_id = self._passkey_rp_id()
+        qdir = self.server.consent_queue_dir or default_queue_dir()
+        try:
+            got = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None)).get(request_id)  # read-only
+            if got is None:
+                raise EditError("not_found", 404, "no such consent request")
+            request, state = got
+            if state != "pending":
+                raise EditError("conflict", 409, f"request {request_id} is already {state}")
+            refuse_cut_display(request, "from a page")
+            root = answer_root(qdir, request)
+            source = authority_source(root / "cockpit.db", anchor=anchor_path(root))
+            queue = ConsentQueue(qdir, authority=source)
+            keys = {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
+            if action == "passkey-challenge":
+                decision = req["decision"]
+                if decision not in DECISIONS:
+                    raise EditError("bad_request", 400, f"decision must be one of {list(DECISIONS)}")
+                fp = req.get("signer_fp")
+                if fp is None:
+                    if not keys:
+                        raise EditError("no_passkey", 422, f"no passkey is enrolled for {rp_id}: enrol this "
+                                                           "device's passkey from the laptop first")
+                    if len(keys) > 1:
+                        raise EditError("choose_passkey", 409, "more than one passkey is enrolled for this name",
+                                        {"signers": sorted(keys)})
+                    fp = next(iter(keys))
+                if fp not in keys:
+                    raise EditError("no_passkey", 422, f"{str(fp)[:80]} is not an active passkey enrolled for {rp_id}")
+                payload = queue.answer_payload(request_id, decision, fp)
+                blob = challenge(answer_message(payload))
+                return {"payload": payload, "rp_id": rp_id,
+                        "challenge": base64.urlsafe_b64encode(blob).decode("ascii").rstrip("="),
+                        "display": request.display, "cwd": request.cwd, "tier": request.tier}
+            payload = req["payload"]
+            fp = payload.get("signer_fp") if isinstance(payload, dict) else None
+            key = keys.get(fp) if isinstance(fp, str) else None
+            if key is None:
+                raise EditError("no_passkey", 422, f"the answer's signer is not an active passkey enrolled for {rp_id}")
+            signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
+                                  b64url_decode(req["client_data_json"], "client_data_json"),
+                                  b64url_decode(req["signature"], "signature"))
+            decided = queue.answer(request_id, payload, signature)
+        except (AnswerRefused, PasskeyError, ConsentError) as exc:
+            raise EditError("answer_refused", 422, str(exc)) from None
+        except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
+            raise EditError("unavailable", 503, f"the consent queue cannot answer now: {exc}") from None
+        return {"request_id": decided.request_id, "decision": decided.decision, "signer_fp": decided.signer_fp,
+                "decided_at": decided.decided_at}
+
+    def _passkey_key_line_post(self, req: Any) -> dict[str, Any]:
+        """``POST /cockpit/passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url) -> the
+        passkey's OpenSSH public key on this page's host, and the laptop commands that enrol it. Nothing is
+        enrolled here: an enrolment is signed by a laptop-presence key, which a browser never holds."""
+        from levain.consent.passkey import PasskeyError, b64url_decode, public_key_line
+
+        if not isinstance(req, dict) or set(req) != {"spki"}:
+            raise EditError("bad_request", 400, "request keys must be ['spki']")
+        if self._credential().get("class") not in ("token", "device"):
+            raise EditError("credential_required", 403, "a write needs a credential (the write token)")
+        rp_id = self._passkey_rp_id()
+        try:
+            line = public_key_line(b64url_decode(req["spki"], "spki"), rp_id)
+        except PasskeyError as exc:
+            raise EditError("bad_passkey", 422, str(exc)) from None
+        from levain.consent.answering import hook_roots
+        from levain.consent.queue import default_queue_dir
+
+        name = f"passkey-{rp_id.split('.')[0]}.pub"
+        roots = hook_roots(self.server.consent_queue_dir or default_queue_dir())
+        enrol = [f"levain cockpit enroll {name} --class display-phone --custody passkey --data-root {shlex.quote(str(r))} "
+                 "--signing-key <your laptop-presence key>" for r in roots]
+        return {"public_key": line, "rp_id": rp_id, "file": name,
+                "commands": [f"printf '%s\\n' '{line}' > {name}", *enrol],
+                "note": None if roots else ("no consent hook names a cockpit yet (run `levain init` with the consent "
+                                            "hook first); then enrol into the cockpit it names")}
+
     def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
         ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's, each lifted to the
@@ -1371,8 +1513,13 @@ class _Handler(GuardedHandler):
                 return
             try:
                 pending = _pending_route(route)
+                passkey = _consent_passkey_route(route)
                 if pending is not None:
                     result = self._pending_post(pending[0], pending[1], req)
+                elif passkey is not None:
+                    result = self._passkey_answer_post(passkey[0], passkey[1], req)
+                elif route == _PASSKEY_KEY_LINE_PATH:
+                    result = self._passkey_key_line_post(req)
                 else:
                     # one dispatch for the cockpit route and both legacy aliases (design §4.3)
                     result = dispatch_verb(
@@ -1430,6 +1577,8 @@ def make_server(
     cockpit: "Cockpit | None" = None,
     install_class: str | None = None,
     extra_effects: "Mapping[str, DownstreamEffect] | None" = None,
+    remote_hosts: "Sequence[str]" = (),
+    consent_queue_dir: "Path | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1781,7 +1930,18 @@ def make_server(
         )
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
-    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
+    remote = tuple(remote_hosts)
+    for name in remote:
+        if not is_host_name(name):
+            httpd.server_close()
+            raise ValueError(f"refusing remote host {str(name)[:80]!r}: a lowercase DNS name (the https name a proxy "
+                             "serves this cockpit on), no scheme, port or path")
+    if remote and source.write_scope is None:
+        httpd.server_close()
+        raise ValueError("a remote host is for answering consent requests, which needs a writable cockpit (--write)")
+    httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | set(remote)
+    httpd.remote_hosts = frozenset(remote)
+    httpd.consent_queue_dir = consent_queue_dir
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
@@ -1813,6 +1973,39 @@ def _open_browser(url: str, unlocked: str) -> None:
     open_browser(url, unlocked)
 
 
+_TAILSCALE_SOCKETS = (None, "/var/run/tailscale/tailscaled.sock")   # the CLI's default, then the open-source daemon's
+
+
+def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
+    """``(this machine's Tailscale DNS name, "")``, or ``(None, why not)``: read from ``tailscale status --json``
+    (the default socket, then ``/var/run/tailscale/tailscaled.sock``). Nothing is changed in Tailscale."""
+    import json
+    import shutil
+    import subprocess
+
+    exe = shutil.which("tailscale")
+    if exe is None:
+        return None, "no `tailscale` command on PATH; pass --remote-host NAME for any https proxy instead"
+    why = "tailscale is not running"
+    for sock in _TAILSCALE_SOCKETS:
+        argv = [exe, *([] if sock is None else [f"--socket={sock}"]), "status", "--json"]
+        try:
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            data = json.loads(cp.stdout) if cp.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            continue
+        if data.get("BackendState") != "Running":
+            why = f"tailscale is {data.get('BackendState')!r}, not Running"
+            continue
+        name = str((data.get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+        if is_host_name(name):
+            return name, ""
+        why = "tailscale reports no DNS name for this machine (MagicDNS off?)"
+    return None, why
+
+
 def run_web_server(
     path: Path,
     *,
@@ -1827,6 +2020,8 @@ def run_web_server(
     max_iterations: int | None = None,
     turn_seconds: float | None = None,
     install_class: str | None = None,
+    remote_host: str | None = None,
+    tailscale: bool = False,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -1881,7 +2076,13 @@ def run_web_server(
             return 1
 
     try:
-        httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class)
+        if tailscale and remote_host is None:
+            remote_host, tailscale_note = tailscale_name()
+            if remote_host is None:
+                print(f"--tailscale: {tailscale_note}", file=sys.stderr)
+                return 2
+        httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
+                            remote_hosts=() if remote_host is None else (remote_host,))
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1
@@ -1926,6 +2127,12 @@ def run_web_server(
         unlocked += ("&" if "#" in unlocked else "#") + "write_token=" + urllib.parse.quote(httpd.write_token, safe="")
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
+    for name in sorted(httpd.remote_hosts):
+        remote = f"https://{name}/" + unlocked[len(url):]
+        print(f"  answer from a phone (over the https proxy you run for {name}): {remote}", flush=True)
+        if tailscale:
+            print(f"  put it on your tailnet: tailscale serve --bg --https=443 http://127.0.0.1:{bound_port}"
+                  "   (stop: tailscale serve reset)", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
