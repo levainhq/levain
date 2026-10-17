@@ -44,6 +44,7 @@ BASE_RENDER = ["world.md", "origin.md"]  # ordered = the interview sequence
 BASE_VERBATIM = {
     "partnership.md",
     "memory.md",
+    "memory_workflow.md",  # spore-451: the wrap procedure split out of memory.md
     "spore_instructions.md",
     "continuity.md",
     "README.md",
@@ -738,7 +739,10 @@ def test_budget_guard_rejects_the_pre_f2_composition():
 
     # the pre-F2 eager set: spore_instructions.md loaded rather than pointed at
     seed_root = budget.REPO / "levain" / "templates" / "seed"
-    pre_f2 = ("origin.md", "partnership.md", "world.md", "memory.md", "spore_instructions.md")
+    # spore-451 split memory.md's wrap procedure into memory_workflow.md; the pre-F2 composition
+    # loaded that procedure inside memory.md, so both files count here, in the same eager set.
+    pre_f2 = ("origin.md", "partnership.md", "world.md", "memory.md", "memory_workflow.md",
+              "spore_instructions.md")
     total = sum((seed_root / n).stat().st_size for n in pre_f2)
     mechanism = sum(
         (seed_root / n).stat().st_size
