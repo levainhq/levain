@@ -74,8 +74,6 @@ AGENT = "codex"
 EVENT = "PermissionRequest"
 SETTINGS_NAME = "codex.json"
 HOOK_SCRIPT_NAME = "levain_consent.py"
-# Codex's name for its shell tool in hook events (measured, 0.162.1). A shell request is never parsed (ruling 1).
-SHELL_TOOLS = frozenset({"Bash"})
 PATCH_TOOL = "apply_patch"
 # The file headers of Codex's patch format; their paths are the files a patch touches. Indentation is allowed, in
 # case Codex's parser trims it: any other line starting ``***`` that is not a patch marker makes the patch unreadable.
@@ -154,8 +152,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     ``.codex/hooks.json`` and ``config.toml``, the levain package, the adapter's own queue and authority), plus
     anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). An MCP tool's targets are its
     :data:`MCP_PATH_FIELDS` and every other string in its input (:func:`levain.consent.policy.mcp_config_candidates`). A patch whose headers name no file
-    is tagged, as is a non-string MCP path. Shell requests (:data:`SHELL_TOOLS`) and every other tool are never
-    tagged: a command is not parsed (ruling 1)."""
+    is tagged, as is a non-string MCP path. Shell requests (:data:`levain.authority.CONSENT_SHELL_TOOLS`) and every
+    other tool are never tagged: a command is not parsed (ruling 1)."""
     home = home if home is not None else Path.home()
     codex_dir = codex_dir if codex_dir is not None else codex_home()
     if tool_name == PATCH_TOOL:

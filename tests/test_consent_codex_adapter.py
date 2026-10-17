@@ -238,7 +238,7 @@ def test_a_grant_never_answers_shell_input_codex_types_into_a_running_terminal(t
         _granted_codex_hook(tmp_path / "a", ["write_stdin"])
     (tmp_path / "b").mkdir()
     with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
-        m.setattr(auth, "_consent_shell_check", lambda grants: None)
+        m.setattr(auth, "_consent_tool_check", lambda grants, after="": None)
         ws, connect, key, run = _granted_codex_hook(tmp_path / "b", ["apply_patch", "write_stdin"])
     inp = {**_WRITE_STDIN_INPUT, "cwd": f"file://{ws}"}
     assert run("write_stdin", inp) == ""
@@ -247,6 +247,39 @@ def test_a_grant_never_answers_shell_input_codex_types_into_a_running_terminal(t
     now = datetime.now(timezone.utc)
     conn = connect()
     with pytest.raises(auth.AuthorityError, match="names the shell tool 'write_stdin'"):
+        auth.sign_and_append(conn, {"op": "renew", "grant_id": "gx", "expires_at": utc_stamp(now + timedelta(days=5)),
+                                    "signed_at": utc_stamp(now)},
+                             signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE), clock=lambda: now,
+                             cache=ReplayCache(), anchor=None)
+    conn.close()
+
+
+def test_a_codex_grant_answers_only_a_tool_levain_knows_for_codex(tmp_path, monkeypatch):
+    """Complement MED, L3 round 1 on 1b24c31: a shell denylist fails open for the next unlisted shell-capable name,
+    as write_stdin did. Reproduced on 1b24c31 with the real CLI: ``--agent codex --tool SomeNewTool`` (and ``Edit``,
+    Claude Code's name) were accepted, and a SomeNewTool grant answered a SomeNewTool request. A Codex grant may now
+    name only apply_patch or an MCP read tool: the log refuses the rest, one signed before the rule answers nothing,
+    and its renew is refused with the way out."""
+    from datetime import datetime, timedelta, timezone
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+    from levain.cockpit.consent import utc_stamp
+
+    for i, tool in enumerate(("SomeNewTool", "Edit")):
+        (tmp_path / str(i)).mkdir()
+        with pytest.raises(auth.AuthorityError, match=f"'{tool}' is not a tool levain knows for codex"):
+            _granted_codex_hook(tmp_path / str(i), [tool])
+    (tmp_path / "b").mkdir()
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
+        m.setattr(auth, "_consent_tool_check", lambda grants, after="": None)
+        ws, connect, key, run = _granted_codex_hook(tmp_path / "b", ["SomeNewTool", "apply_patch"])
+    assert run("SomeNewTool", {"anything": "goes"}) == ""
+    patch = {"command": f"*** Begin Patch\n*** Add File: {ws / 'a.txt'}\n+hi\n*** End Patch"}
+    assert json.loads(run("apply_patch", patch))["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    now = datetime.now(timezone.utc)
+    conn = connect()
+    with pytest.raises(auth.AuthorityError, match="'gx' was signed before this rule: revoke it .* create a new one"):
         auth.sign_and_append(conn, {"op": "renew", "grant_id": "gx", "expires_at": utc_stamp(now + timedelta(days=5)),
                                     "signed_at": utc_stamp(now)},
                              signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE), clock=lambda: now,
@@ -278,4 +311,3 @@ def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
                 found += 1
                 assert {n.lower() for n in names} <= CONSENT_SHELL_TOOLS, path
     assert found >= 2      # both PostToolUse templates (Claude Code's and Codex's)
-    assert {n.lower() for n in cx.SHELL_TOOLS} <= CONSENT_SHELL_TOOLS

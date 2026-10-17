@@ -7,7 +7,8 @@ re-verifies in another fresh replay every time it is delivered (:meth:`ConsentQu
 allows; there are no deny grants. Every request no grant covers goes to a signed answer or to the human.
 
 The criteria, all of which must hold: the request is not agent config (tier :data:`AGENT_CONFIG_TIER`, never); the
-grant names the request's agent, its exact tool, and the posture the agent's own event reported (a request with no
+grant names the request's agent, its exact tool (one levain knows for that agent and never a shell:
+:func:`levain.authority.consent_tool_problem`), and the posture the agent's own event reported (a request with no
 posture matches nothing); the grant's workspace is, at decision, the very directory it was signed for (its realpath
 is the signed string, checked at append too) and not ``/``, this machine's home or above it; the request's working
 directory resolves inside it; every target path the request names (:func:`grant_targets`: a file tool's target and
@@ -34,8 +35,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import (CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_mcp_input_fits,
-                              consent_mcp_tool_problem, consent_root_problem)
+from levain.authority import CONSENT_GRANT_KIND, consent_mcp_input_fits, consent_root_problem, consent_tool_problem
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
 
@@ -294,11 +294,10 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     if grant.get("agent") != request.agent:
         return "the grant is for another agent"
     tools = grant.get("tools")
-    if request.tool_name.lower() in CONSENT_SHELL_TOOLS or not isinstance(tools, (list, tuple)) \
-            or request.tool_name not in tools:
+    if not isinstance(tools, (list, tuple)) or request.tool_name not in tools:
         return "the grant does not name this tool"
-    if consent_mcp_tool_problem(request.tool_name) is not None:
-        return "an MCP tool that may write is never answered by a grant"   # one signed before the append rule
+    if consent_tool_problem(request.agent, request.tool_name) is not None:   # one signed before the append rule
+        return "a grant never answers this tool (a shell, an MCP tool that may write, or a tool levain does not know)"
     if request.tool_name.startswith("mcp__") and not consent_mcp_input_fits(request.tool_name, tool_input):
         return "the input is not one the read tool levain knows takes"  # another server's read_file, say
     postures = grant.get("postures")
