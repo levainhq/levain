@@ -1,14 +1,14 @@
 # Levain
 
-**A portable cognitive-partnership memory + methodology kit. You ship the seed that grows a practice, not the practice.**
+**A consent queue and memory harness for Claude Code and Codex. Permission prompts are answered by signed standing grants or signed human answers, with an audit trail, and your partner's memory persists across sessions.**
 
 ```
 pip install levain
 ```
 
-Levain gives your AI partner a memory that persists across sessions, and keeps that memory **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
+Levain does two things for Claude Code and Codex. It runs a consent queue: each agent's permission prompt reaches a hook that answers it only with a signed standing grant or a signed answer from you, and otherwise leaves the agent's own dialog to ask you (see *The consent queue* below). And it gives your AI partner a memory that persists across sessions, and keeps that memory **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
 
-Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
+Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also ship, as is (see *Run a sovereign entity*).
 
 ![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from the author's own long-running memory store.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-health-trace.png)
 
@@ -20,7 +20,7 @@ Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
 
 If you've worked with an AI partner long enough to feel the session-amnesia problem — every conversation starts cold, every insight gets re-explained, the *quality* of the partnership keeps resetting — Levain is the kit you'd otherwise build for yourself.
 
-It packages four things that work together:
+It packages five things that work together:
 
 1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, a record of which memories you cite together (links form at each wrap and are there to inspect; recall follows the evidence a pattern cites), and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
 
@@ -28,19 +28,21 @@ It packages four things that work together:
 
 3. **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
 
-4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
+4. **A cross-agent consent queue.** Claude Code's and Codex's `PermissionRequest` hooks file each permission prompt into one queue that you answer with a signed standing grant (`levain consent grant create`) or a signed answer (`levain consent answer`, or a passkey from your phone). Details in *The consent queue*.
 
-## Three ways to run it
+5. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
 
-Levain isn't a tool you adopt in one place. It's a governed substrate you can apply wherever you already work, in any combination.
+## Where it runs
 
-**Inside the harness you're already using.** Claude Code and Codex CLI both wire in via hooks — your partner stops starting cold, and its proven patterns and open loops fire on their own, per turn, without you asking.
+Levain wires into the agent you already use, and ships two other modes as is.
 
-**As its own sovereign partner.** `levain init --adapter openhands` scaffolds an entity that isn't wired into anything — its own identity, its own memory store, its own hands on your real repos, running on an open model you choose rather than a frontier vendor's hosted assistant (point it at a local Ollama model to also keep the compute itself on your machine). It talks to you as a REPL (`levain run`) or takes one task and exits (`levain run --task`), and it consolidates its own memory with its own mind (`levain wrap`).
+**Inside the harness you're already using (the main path).** Claude Code and Codex CLI both wire in via hooks — your partner stops starting cold, its proven patterns and open loops fire on their own, per turn, without you asking, and each permission prompt goes through the consent queue. Levain installs hooks and consent paths in these agents; it does not confine a Claude Code or Codex session.
 
-**On a schedule, unattended.** `levain daemon install-seat` runs that same sovereign entity on a cadence — every hour, every day, whatever you set — while you're away. It's not autonomous in the sense that should worry you: every action the entity takes that reaches outside itself halts and reports back to you before it lands, because with nobody watching there's nobody to ask. See *Hand it a schedule* below for exactly what that means.
+**As its own sovereign partner (OpenHands, shipped as is).** `levain init --adapter openhands` scaffolds an entity that isn't wired into anything — its own identity, its own memory store, its own hands on your real repos, running on an open model you choose rather than a frontier vendor's hosted assistant (point it at a local Ollama model to also keep the compute itself on your machine). It talks to you as a REPL (`levain run`) or takes one task and exits (`levain run --task`), and it consolidates its own memory with its own mind (`levain wrap`).
 
-All three modes share one store discipline and one governance model. You're not choosing between three products.
+**On a schedule, unattended (the same OpenHands entity, shipped as is).** `levain daemon install-seat` runs that same sovereign entity on a cadence — every hour, every day, whatever you set — while you're away. It's not autonomous in the sense that should worry you: every action the entity takes that reaches outside itself halts and reports back to you before it lands, because with nobody watching there's nobody to ask. See *Hand it a schedule* below for exactly what that means.
+
+All three modes share one store discipline. The consent queue applies to Claude Code and Codex; the efferent gate and the confinement floor described below apply to OpenHands entities only.
 
 ## Why a seed, not a finished methodology
 
@@ -77,7 +79,8 @@ This creates `./my-partner`, runs the interview, lays down the seed, registers t
 ```
 levain init                          # install into the current directory (must be empty)
 levain init --force                  # install into an existing workspace (backs up anything it touches)
-levain init --adapter claude-code    # or --adapter codex, or --adapter openhands; prompts if omitted
+levain init --adapter claude-code    # or --adapter codex (or --adapter openhands, shipped as is); prompts if omitted
+levain init --consent-hook off       # claude-code and codex: wire no consent hook (the default is on)
 levain init --web                    # fill the same interview in a browser form, localhost only
 ```
 
@@ -111,6 +114,20 @@ your name and your partner's, which an entity is not allowed to be missing.
 `--answers` requires `--adapter`, and it never prompts for anything. If a field is
 missing, unknown, or has plainly landed in the wrong slot, it says so and installs
 nothing — rather than writing a half-captured partner and reporting success.
+
+## The consent queue
+
+Claude Code and Codex ask before they edit a file or run a tool. With the consent hook on (the default for both adapters), each of those permission prompts is filed into one queue by levain's `PermissionRequest` hook, and the hook answers it in one of two ways, or leaves it alone:
+
+- **A standing grant.** `levain consent grant create` signs a grant for one agent, exact tools, one workspace and the permission modes you name, for at most 30 days. `levain consent grant list` and `revoke` manage them.
+- **A signed answer.** `levain consent pending` lists what is waiting; `levain consent answer <id> allow|deny --signing-key <key>` shows the request and signs your answer. You can also answer from your phone with a passkey (*Answer an agent from your phone*), and the cockpit's Decisions panel lists the waiting requests.
+- **Neither.** The agent's own dialog asks you, as it would without levain.
+
+Shell commands (Bash) are never granted: they always reach you. Edits of agent config or hooks always reach you. Each request that reaches a final state (allowed, denied, expired or withdrawn) is written to the queue with an append-only receipt, and a grant is a link in the cockpit's signed authority log.
+
+A message that says "yes" is never authority. Only a signature from an enrolled key is: the queue checks each answer against the authority log before the hook delivers it. Keys and their custody are in *The cockpit's signing keys*. `levain consent canary` checks that an agent's hook fires.
+
+What this does not do: levain does not confine a Claude Code or Codex session. The hooks and consent paths are installed in the agent's configuration, and an agent running as you shares your user account.
 
 ## Composing a domain — AgentPacks
 
@@ -158,7 +175,7 @@ Team ledgers from levain 0.6.x (the unsigned `levain-ledger` branch) are not rea
 
 ## Run a sovereign entity
 
-`levain init --adapter openhands` scaffolds something different from the hook-wired adapters above: an entity that is its *own* partner, not a layer inside a harness you're already running. Its own identity, its own memory store, never a hook into your Claude Code or Codex session, never a reach into `~/.anneal-memory` or any other store on your machine — that isolation is checked and enforced, not assumed.
+This mode ships as is and gets no new features for 1.0. `levain init --adapter openhands` scaffolds something different from the hook-wired adapters above: an entity that is its *own* partner, not a layer inside a harness you're already running. Its own identity, its own memory store, never a hook into your Claude Code or Codex session, never a reach into `~/.anneal-memory` or any other store on your machine — that isolation is checked and enforced, not assumed.
 
 ```
 pip install 'levain[openhands]'
@@ -184,11 +201,11 @@ The interactive `levain run` REPL still runs bash as you, because you drive it a
 
 **The workspace.** The entity works in a directory outside your home, `/Users/Shared/levain/<user>/workspace` on macOS or `/var/lib/levain/<user>/workspace` on Linux.
 
-<!-- FOR PHILL'S WORDS: the paragraph below is a draft in his register, not final copy -->
+<!-- DRAFT: the paragraph below is a draft in the operator's register, not final copy -->
 **You change the workspace through the entity.** Everything in it belongs to the entity's user. You can read all of it, but you don't write there yourself, and I think that's the right way to work anyway: you're the operator, so you tell the entity what to change, it changes it, and you review what it did. When you need to hand something over directly, there's a door for it. `levain ws-put` copies a file in. `levain ws-adopt` brings one of your repositories in as a copy the entity owns, with every branch, and leaves yours where it is. `levain ws-git` runs git on the entity's repositories as the entity's user, so you can look at its work and drive it. And there's the remote, where the entity pushes a branch with its own key and you review and merge it like any other contributor's.
 
 It closes a real hole, too. Git refuses to read the settings of, or run the hooks of, a repository you don't own, so your git refuses every repository in there, and nothing the entity writes into one can run as you. But for a bare repository git only checks who owns that one folder. If any folder in the workspace were yours and the entity could write to it, the entity could build a repository there that your git would trust. Nothing in the workspace is yours, so there's no folder like that. `levain doctor` fails if one ever shows up, and warns you to set `safe.bareRepository = explicit` and to drop any `safe.directory = *`.
-<!-- END FOR PHILL'S WORDS -->
+<!-- END DRAFT -->
 
 **One session at a time, and nothing left running.** Only one session of the entity runs bash as its user at a time; a second is refused until the first ends. When a session ends, levain stops every process of the entity's user, including anything a command started in its own session. If something can't be stopped, the session says so, and `ws-git` and `ws-adopt` wait until levain exits. Before a session starts, levain stops anything of that user an earlier run left behind (a levain that was killed, say), and refuses to start if it can't.
 
@@ -218,7 +235,7 @@ When it undoes, everything the entity created stays owned by its retired user id
 levain daemon install-seat --path ./ada --task "check the queue and report" --interval 3600
 ```
 
-This is the part that separates a governed seat from the always-on personal-agent runtimes that make headlines for the wrong reasons. **We never ask the model whether what it's about to do is safe.** The gate that halts an action reads the *tool*, not the model's opinion of itself — because a gate the entity can talk its way through is not a gate. By default, every action the seat takes that reaches outside itself — a shell command, a file write, anything efferent — halts before it executes: exit code 4 in the seat's log, the activity that led up to it right there for you to read. It's not a permission prompt, because an unattended seat has nobody to ask, and there's no queue holding the action for you to approve later — the halt ends that run, and the next scheduled turn starts fresh (and will halt again at the same point if the task still needs that action). Because bash is classified as efferent by *kind*, not by what the command actually does, a seat task that needs the shell at all will halt on it every run, even for something as harmless as `ls` — plan seat tasks around the file-editor hand where you can, or expect to be reading a lot of exit-4 logs. This default can be turned off per entity (`efferent_gate: "ungated"` in `.levain/confinement.json`), which is a real escape hatch and not a decision to make lightly for something that runs unattended.
+**We never ask the model whether what it's about to do is safe.** The gate that halts an action reads the *tool*, not the model's opinion of itself — because a gate the entity can talk its way through is not a gate. By default, every action the seat takes that reaches outside itself — a shell command, a file write, anything efferent — halts before it executes: exit code 4 in the seat's log, the activity that led up to it right there for you to read. It's not a permission prompt, because an unattended seat has nobody to ask, and there's no queue holding the action for you to approve later — the halt ends that run, and the next scheduled turn starts fresh (and will halt again at the same point if the task still needs that action). Because bash is classified as efferent by *kind*, not by what the command actually does, a seat task that needs the shell at all will halt on it every run, even for something as harmless as `ls` — plan seat tasks around the file-editor hand where you can, or expect to be reading a lot of exit-4 logs. This default can be turned off per entity (`efferent_gate: "ungated"` in `.levain/confinement.json`), which is a real escape hatch and not a decision to make lightly for something that runs unattended.
 
 The seat is wall-clock bounded (`--max-seconds`), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." And it consolidates its own memory — after each scheduled turn it checks the backlog and consolidates once enough new episodes have accumulated (`--consolidate-every N` is an episode count, not a cadence; default: the wrap-nudge threshold) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized, always-loaded tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
 
@@ -252,7 +269,7 @@ levain tui                # a full-screen interactive terminal view
 levain docs               # the operator manual, composed with any pack's own chapters
 ```
 
-**`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
+**`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, your State / Active-Threads narrative, and in the Decisions panel the consent requests waiting on you. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
 
 ### Chat with a sovereign entity from the cockpit
 
@@ -383,7 +400,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 ## Boundaries, kept honest
 
-- **Harnesses:** Claude Code and Codex CLI (hook-wired), plus `openhands` (hookless, scaffolds a sovereign entity). One adapter per install — separate installs if you need more than one.
+- **Harnesses:** Claude Code and Codex CLI (hook-wired, with the consent queue), plus `openhands` (hookless, scaffolds a sovereign entity; shipped as is). One adapter per install — separate installs if you need more than one.
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
 - **Always-on daemon and governed seats:** macOS (launchd) and Linux (`systemd --user`); Windows is planned.
 - **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) needs an OS sandbox: `sandbox-exec` on macOS, `bwrap` on Linux. Where there is none, or the host refuses it (see the Linux section above), the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
@@ -391,8 +408,9 @@ Operator-class developers: the people who already feel session-amnesia as a real
 - **Cockpit chat:** OpenHands entities only, loopback only, conversations held in server memory (a restart ends them), and headless, so under the default gate a held action waits for your Approve or Reject (an `ungated` entity's actions run without asking), and the standard credential stores are denied unless the entity sets `deny_standard_creds` to false. `--path` and `--chat` are not checked against each other.
 - **One seat at a time:** a governed seat runs one entity on one schedule. Coordinating several seats as a fleet is not built yet — see *Where this is going* below.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
-- **No security absolutes.** The confinement floor is real and load-bearing, but it's a floor, not a guarantee — it denies a fixed set of crown-jewel paths and known escape routes, not "everything dangerous." Read the module docstrings in `levain/firing/confinement.py` if you're deciding whether to trust it with something that matters.
-- **On macOS, other programs' environments are visible to the entity's shell.** macOS lets any process read the environment and command line of every other process running as the same user, and no sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. Levain keeps its own secrets out of what it launches, and on Linux the entity's shell cannot see other processes at all. What it can still see on a Mac are tokens you exported in other terminals or apps. Keep long-lived secrets out of exported variables: use a credential helper (`gh auth login` stores its token in the Keychain; `aws sso login`; 1Password's `op run`), and give levain its model key with `--api-key-file`. A future release runs the entity's shell as its own macOS user, which hides other programs' environments from it; command lines, and any secret placed in a LaunchAgent's environment, stay visible to every local user, so keep secrets out of both.
+- **Levain confines no Claude Code or Codex session.** For those agents it installs hooks and consent paths. A consent hook answers a permission prompt; it does not stop an agent running as your user from doing what your user can do outside that prompt.
+- **No security absolutes.** The confinement floor (OpenHands entities only) is real and load-bearing, but it's a floor, not a guarantee — it denies a fixed set of crown-jewel paths and known escape routes, not "everything dangerous." Read the module docstrings in `levain/firing/confinement.py` if you're deciding whether to trust it with something that matters.
+- **On macOS, other programs' environments are visible to the entity's shell.** macOS lets any process read the environment and command line of every other process running as the same user, and no sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. Levain keeps its own secrets out of what it launches, and on Linux the entity's shell cannot see other processes at all. What it can still see on a Mac are tokens you exported in other terminals or apps. Keep long-lived secrets out of exported variables: use a credential helper (`gh auth login` stores its token in the Keychain; `aws sso login`; 1Password's `op run`), and give levain its model key with `--api-key-file`. `sudo levain setup-isolation` runs the entity's shell as its own macOS user, which hides other programs' environments from it (see *Running the entity's bash as its own user*); without it, the above holds. Command lines, and any secret placed in a LaunchAgent's environment, stay visible to every local user, so keep secrets out of both.
 
 ## What it's built on
 
@@ -421,7 +439,7 @@ Everything above is installable today. This section is future tense on purpose �
 - **The pack will carry your domain's judgment, and something will route on it.** Path-shaped judgment is enforced today through `judgment.toml` and `levain team` (above). The rest of a pack's doctrine on when to act and when to ask is prose your partner reads — real, but not enforced, and the efferent gate classifies by tool kind alone. The design calls for every install to carry a pack, and for that pack to declare its domain's automation threshold: which kinds of steps are *eligible* to run on their own and which always need a person. Eligibility isn't the same as being allowed to run unwatched, though — the design is explicit that a below-threshold step doesn't skip the gate on day one just because a pack says it's eligible. It has to earn that by running gated for a while and building a clean track record under a floor it can't buy its way past; only then does it graduate to executing on its own with a quiet receipt instead of a halt. A step above the threshold still gates the way every efferent action does today, and a step that starts below the threshold but turns into something above it mid-run pops back to the gate before it acts. It's still undecided which layer would own that routing — the gate Levain ships today, a separate always-on autonomic layer, or something in the pack itself — so read "the gate" above as "whatever ends up enforcing this," not a claim about today's `firing/gate.py`.
 - **A fleet of seats.** `daemon install-seat` runs one governed entity on one schedule. Coordinating several seats — an inter-entity bus, cross-seat aggregation, one place to see and steer them from — is a real target but a later one, and it inherits the same gate discipline: nothing about running more entities relaxes what any single one is allowed to do unattended.
 
-None of this changes what ships today. Nothing gets looser just because a pack declares a step eligible — that eligibility still has to be earned, gated, under a floor — and until any of this ships, the only automatic way past the gate is the same all-or-nothing `ungated` override that exists now; the other way is a person approving a held call, as the cockpit chat lets you.
+None of this changes what ships today. Nothing gets looser just because a pack declares a step eligible — that eligibility still has to be earned, gated, under a floor — and until any of this ships, the only automatic way past an OpenHands entity's efferent gate is the same all-or-nothing `ungated` override that exists now; the other way is a person approving a held call, as the cockpit chat lets you. (Claude Code and Codex permission prompts are a different gate, answered by the consent queue.)
 
 ## License
 

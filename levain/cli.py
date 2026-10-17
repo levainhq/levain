@@ -56,8 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="levain",
         description=(
-            "A portable cognitive-partnership memory + methodology kit. "
-            "Ship the seed that grows a practice, not the practice."
+            "A consent queue and memory harness for Claude Code and Codex: permission prompts "
+            "answered by signed standing grants or signed human answers, with an audit trail, "
+            "plus memory that persists across sessions."
         ),
     )
     parser.add_argument(
@@ -845,8 +846,7 @@ def main(argv: list[str] | None = None) -> int:
             "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
             "the same governed seam `levain tui` uses; every write needs the write token "
             "the server prints at start). "
-            "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
-            "is the parked alternative."
+            "`serve-app` is the in-host MCP App alternative."
         ),
     )
     web_p.add_argument(
