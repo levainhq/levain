@@ -22,7 +22,7 @@ from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
 
-__all__ = ["ConsentGrant", "create_grant", "list_grants", "list_inert_grants", "revoke_grant"]
+__all__ = ["ConsentGrant", "create_grant", "grant_listing", "list_grants", "list_inert_grants", "revoke_grant"]
 
 
 @dataclass(frozen=True)
@@ -104,21 +104,29 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
 def list_grants(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 marker_directory: Path | None = None) -> list[ConsentGrant]:
     """Every consent grant the authority log's replay holds now, expired ones included, by id."""
-    db = _journal(data_root, marker_directory=marker_directory)
-    state = _signing_authority(_capture(db, now, ssh_keygen))
-    return [ConsentGrant.of(g, state.grant_link(gid)) for gid, g in sorted(state.policy.grants.items())
-            if consent_grant(g)]
+    return grant_listing(data_root, now=now, ssh_keygen=ssh_keygen, marker_directory=marker_directory)[0]
 
 
 def list_inert_grants(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                       marker_directory: Path | None = None) -> list[tuple[str, str, str, int | None]]:
     """``(id, kind, expires_at, link seq)`` of every grant the replay holds of a kind this levain does not know
     (one a newer levain wrote): held inert, it answers nothing here, and ``revoke_grant`` removes it."""
+    return grant_listing(data_root, now=now, ssh_keygen=ssh_keygen, marker_directory=marker_directory)[1]
+
+
+def grant_listing(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                  marker_directory: Path | None = None
+                  ) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None]]]:
+    """``(consent grants, inert grants)`` from ONE capture and one snapshot, so a grant is in exactly one of them
+    even while a link lands (two separate captures could show it twice or not at all)."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
-    out = []
+    consent: list[ConsentGrant] = []
+    inert: list[tuple[str, str, str, int | None]] = []
     for gid, g in sorted(state.policy.grants.items()):
-        if inert_grant(g):
-            link = state.grant_link(gid)
-            out.append((gid, str(g["kind"]), str(g["expires_at"]), None if link is None else link[0]))
-    return out
+        link = state.grant_link(gid)
+        if consent_grant(g):
+            consent.append(ConsentGrant.of(g, link))
+        elif inert_grant(g):
+            inert.append((gid, str(g["kind"]), str(g["expires_at"]), None if link is None else link[0]))
+    return consent, inert
