@@ -929,3 +929,18 @@ def test_the_budget_stops_the_walk_early():
     assert cc.targets_agent_config("mcp__x__w", {"v": ["file:///" + "%61" * 1200] * 4095}, "/w", home=Path("/h"))
     assert cc.targets_agent_config("mcp__x__w", {"v": [0] * 20000}, "/w", home=Path("/h"))
     assert time.monotonic() - t0 < 2
+
+
+@pytest.mark.parametrize("value", [
+    "file:///work/proj/" + "a/../" * 14000 + ".claude/settings.json?raw=1",  # L3 r2 codex HIGH
+    "/" * 70000 + "%2Eclaude/settings.json", "file://" + "/" * 70000 + "/%2Eclaude/settings.json",  # complement MED
+    "a/%2E%2E/" * 9000 + ".claude/settings.json",
+])
+def test_a_long_string_is_collapsed_then_decoded(value):
+    assert cc.targets_agent_config("mcp__x__write", {"filepath": value}, "/work/proj", home=Path("/home/u"))
+
+
+def test_long_content_is_not_tagged():
+    body = "def f(x):\n    return x / 2  # 50% of it\n" * 3000
+    assert not cc.targets_agent_config("mcp__x__write", {"path": "src/a.py", "content": body}, "/work/proj",
+                                       home=Path("/home/u"))

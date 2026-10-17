@@ -97,8 +97,10 @@ _CANDIDATE_MAX_DEPTH = 64
 _CANDIDATE_MAX_TOTAL = 256 * 1024
 
 
-# a string longer than this is only trimmed and normalised (each linear in its length), never decoded
+# a string longer than this is normalised (linear) before it is decoded; decoding reads at most
+# _CANDIDATE_RAW_MAX characters across one input
 _CANDIDATE_DECODE_MAX = 64 * 1024
+_CANDIDATE_RAW_MAX = 4 * 1024 * 1024
 # the most spellings one string yields, and the most JSON nodes (strings, containers, scalars) one input holds
 _SPELLINGS_PER_STRING = 16
 _CANDIDATE_MAX_NODES = 4 * _CANDIDATE_MAX_COUNT
@@ -123,13 +125,24 @@ def _decoded(form: str) -> list[str]:
 
 
 def _spellings(value: str) -> list[str] | None:
-    """The paths one input string can reach a server as: cut at its first NUL (a C server stops there); then, to a
-    fixed point, trimmed, percent-decoded and read as a ``file:`` URI (:func:`_decoded`; a string over
-    :data:`_CANDIDATE_DECODE_MAX` is only trimmed); each as given and lexically normalised (a server's
+    """The paths one input string can reach a server as: cut at its first NUL (a C server stops there); a string over
+    :data:`_CANDIDATE_DECODE_MAX` first trimmed and normalised, and ``None`` if what is left is still that long and
+    holds an encoded dot or slash or a ``file:`` scheme; then, to a fixed point, trimmed, percent-decoded and read
+    as a ``file:`` URI (:func:`_decoded`); each as given and lexically normalised (a server's
     ``path.resolve`` / ``abspath`` / ``filepath.Clean`` collapses ``./``, ``..`` and slash runs before it opens).
     Only the non-empty ones at most :data:`_CANDIDATE_MAX_LEN` long are kept. ``None`` past
     :data:`_SPELLINGS_PER_STRING` forms (the caller tags the request)."""
     head = value.split("\x00", 1)[0]
+    if len(head) > _CANDIDATE_DECODE_MAX:
+        # collapse first (linear), then decode what that leaves when it is short; a long string a server could
+        # still decode into a shorter path (an encoded dot or slash, a file: URI) goes to the human
+        short = os.path.normpath(head.strip())
+        if len(short) > _CANDIDATE_DECODE_MAX:
+            low = short.lower()
+            if "%2e" in low or "%2f" in low or "%5c" in low or "file:" in low[:16]:
+                return None
+            return [short] if len(short) <= _CANDIDATE_MAX_LEN else []
+        head = short
     forms = [head]
     todo = [head]
     while todo:
@@ -155,7 +168,7 @@ def mcp_config_candidates(tool_input: Any) -> list[str] | None:
     an item of a nested list), so tagging reads every string key and value at any depth, not only
     :data:`MCP_PATH_FIELDS`, in each of its :func:`_spellings`; the input need not be an object. ``None`` (the
     caller tags the request), decided as the walk goes, when the input holds more than :data:`_CANDIDATE_MAX_COUNT`
-    strings or :data:`_CANDIDATE_MAX_NODES` nodes, nests deeper than :data:`_CANDIDATE_MAX_DEPTH`, a string has too
+    strings or :data:`_CANDIDATE_MAX_NODES` nodes, more than :data:`_CANDIDATE_RAW_MAX` characters to decode, nests deeper than :data:`_CANDIDATE_MAX_DEPTH`, a string has too
     many spellings, or the kept spellings total more than :data:`_CANDIDATE_MAX_TOTAL` characters. Over-matching
     only sends a request to the human; a grant's own criteria still read the named fields alone
     (:func:`grant_targets`). This is best effort by construction: MCP declares no path fields (a tool's
@@ -163,7 +176,7 @@ def mcp_config_candidates(tool_input: Any) -> list[str] | None:
     whole (a root it was configured with, an encoding other than these) is not seen, a known edge in the
     CHANGELOG."""
     out: list[str] = []
-    strings = nodes = total = 0
+    strings = nodes = total = raw = 0
     stack: list[tuple[Any, int]] = [(tool_input, 0)]
     while stack:
         value, depth = stack.pop()
@@ -172,7 +185,8 @@ def mcp_config_candidates(tool_input: Any) -> list[str] | None:
             return None
         if isinstance(value, str):
             strings += 1
-            got = _spellings(value) if strings <= _CANDIDATE_MAX_COUNT else None
+            raw += min(len(value), _CANDIDATE_DECODE_MAX)
+            got = _spellings(value) if strings <= _CANDIDATE_MAX_COUNT and raw <= _CANDIDATE_RAW_MAX else None
             if got is None:
                 return None
             total += sum(map(len, got))
