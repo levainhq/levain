@@ -557,3 +557,109 @@ def test_the_session_known_hosts_holds_the_checked_keys_of_each_keys_hosts_and_g
     assert found.returncode == 0
     ssh_agent.stop(agent)
     assert not agent.dir.exists()
+
+
+# --- B1 r1 B-H2: a pid is pinned before it is checked, and signalled only while it is that process ----
+
+def _term_ignoring_child() -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
+                             "signal.SIG_IGN); print('up', flush=True); time.sleep(30)"], stdout=subprocess.PIPE)
+
+
+def test_a_pid_reused_after_the_term_gets_no_kill_off_linux(tmp_path, monkeypatch):
+    """The start-time path (no pidfd): the agent answered on its socket, ignored SIGTERM, and its pid is
+    another process by the time SIGKILL would go. Real child and real signals; the reuse is stood in
+    for by the start time changing after the TERM (a pid cannot be made to recycle on demand)."""
+    child = _term_ignoring_child()
+    child.stdout.readline()   # the TERM handler is set
+    sent: list[int] = []
+    reused = []
+    real_kill = os.kill
+
+    def kill(pid, sig):
+        if pid == child.pid and sig:
+            sent.append(sig)
+            if sig == ssh_agent.signal.SIGTERM:
+                reused.append(1)
+        real_kill(pid, sig)
+
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(ssh_agent, "_STOP_WAIT", 0.3)
+    monkeypatch.setattr(ssh_agent, "peer_pid", lambda sock: child.pid)
+    monkeypatch.setattr(ssh_agent, "_start_mark", lambda pid: "B" if reused else "A", raising=False)
+    try:
+        agent = ssh_agent.ScopedAgent("0" * 12, str(tmp_path / "agent.sock"), child.pid)
+        ssh_agent.stop(agent)
+        assert sent == [ssh_agent.signal.SIGTERM], f"signals to a reused pid: {sent}"
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_on_linux_the_agent_is_pinned_by_a_pidfd_before_the_socket_check(tmp_path, monkeypatch):
+    """The pidfd path, mocked (os.pidfd_open and signal.pidfd_send_signal are stand-ins here; on Linux CI
+    too, so no real pidfd is signalled): the pidfd is opened before the peer check, both signals go
+    through it, and no signal goes to the pid by number."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    order: list[str] = []
+    via_pidfd: list[int] = []
+    by_number: list[int] = []
+    fds: list[int] = []
+    real_kill = os.kill
+
+    def pidfd_open(pid, flags=0):
+        order.append("pidfd_open")
+        fds.append(os.open(os.devnull, os.O_RDONLY))
+        return fds[-1]
+
+    def peer(sock):
+        order.append("peer_pid")
+        return child.pid
+
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open, raising=False)
+    monkeypatch.setattr(ssh_agent.signal, "pidfd_send_signal", lambda fd, sig: via_pidfd.append(sig), raising=False)
+    monkeypatch.setattr(ssh_agent, "_pidfd_exited", lambda fd, timeout: False, raising=False)
+    monkeypatch.setattr(ssh_agent, "peer_pid", peer)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: by_number.append(sig) if sig else real_kill(pid, sig))
+    monkeypatch.setattr(ssh_agent, "_STOP_WAIT", 0.2)
+    try:
+        ssh_agent.stop(ssh_agent.ScopedAgent("0" * 12, str(tmp_path / "agent.sock"), child.pid))
+        assert by_number == [], f"signalled by pid number: {by_number}"
+        assert order == ["pidfd_open", "peer_pid"]
+        assert via_pidfd == [ssh_agent.signal.SIGTERM, ssh_agent.signal.SIGKILL]
+        with pytest.raises(OSError):
+            os.fstat(fds[0])   # the pidfd is closed
+    finally:
+        child.kill()
+        child.wait()
+
+
+def _orphan_dir(owner: int, owner_start: str | None) -> Path:
+    root = ssh_agent.run_root()
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    d = root / "abcdef012345"
+    d.mkdir(mode=0o700)
+    rec = {"session_id": d.name, "pid": 2 ** 22 + 7, "owner": owner, "entity": "", "socket": str(d / "agent.sock"),
+           "lifetime": 60, "started_at": 0, "ssh_mode": "agent", "keys": []}
+    if owner_start is not None:
+        rec["owner_start"] = owner_start
+    ssh_agent.write_record(d, rec)
+    return d
+
+
+def test_an_owner_pid_held_by_another_process_does_not_keep_its_agent(home):
+    """complement LOW2: the owner is alive only while its pid holds the process that started (its start
+    time is recorded). Real process and real start-time read (/proc on Linux, ps elsewhere)."""
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        d = _orphan_dir(other.pid, "not the start time of the process at that pid")
+        assert ssh_agent.sweep_orphans() == [d.name]
+        assert not d.exists()
+        assert ssh_agent._start_mark(other.pid) is not None
+        d = _orphan_dir(other.pid, ssh_agent._start_mark(other.pid))
+        assert ssh_agent.sweep_orphans() == []   # the owner is that process: left alone
+        assert d.exists()
+    finally:
+        other.kill()
+        other.wait()
