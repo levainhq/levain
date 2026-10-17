@@ -36,6 +36,7 @@ import errno
 import fnmatch
 import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -2312,6 +2313,8 @@ def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], No
     new = {**existing, "messaging": choice}
     if changed is not None:
         new["messaging_changed"] = changed  # the audit stamp of `messaging set`, written with the record
+    elif existing.get("messaging") != choice:
+        new.pop("messaging_changed", None)  # a stamp describes the choice it recorded; this is another choice
     try:
         _atomic_write_text(config_path, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
@@ -2367,6 +2370,44 @@ def _workspace_carries(install: Path, choice: str) -> bool | None:
     return facts == (messaging_facts(expected) or {})
 
 
+def _effective_messaging(install: Path) -> tuple[str | None, str]:
+    """The ONE reading of an install's messaging choice, for `show` and for `set`'s ``previous``: the recorded
+    choice; else, with the workspace file carrying messaging controls, the choice those controls EXACTLY match
+    (:func:`_workspace_carries`), named "inferred ... no record"; else ``None`` (custom: they match no choice);
+    else, with no controls at all, the default. Returns ``(choice or None, source text)``."""
+    recorded = recorded_messaging(install)
+    if recorded is not None:
+        return recorded, "recorded in .levain/config.json"
+    facts = _workspace_facts(install)
+    if facts:
+        for choice in _MESSAGING_STRICTNESS:
+            if _workspace_carries(install, choice):
+                return choice, "inferred from .claude/settings.json; no record"
+        return None, "no record: the workspace settings carry messaging controls that match no choice"
+    return DEFAULT_MESSAGING, "the default; no record"
+
+
+def _commit_messaging_if_applied(install: Path, choice: str, previous: str, emit: Callable[[str], None]) -> bool:
+    """THE commit gate of `messaging set`, used by the success path and the exception path alike (under the
+    install lock): when the workspace settings carry EXACTLY ``choice``'s controls and the install's hook pin
+    covers that file, record the choice with its stamp (and print LOOSENED when it is looser). Returns whether it
+    recorded."""
+    from datetime import datetime, timezone
+
+    from levain.host_guard import workspace_settings_pin_matches
+
+    if not (_workspace_carries(install, choice) and workspace_settings_pin_matches(install)):
+        return False
+    change = None
+    if previous != choice:
+        change = {"from": previous, "to": choice,
+                  "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    _write_messaging_choice(install, choice, emit, changed=change)
+    if change is not None and _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous):
+        emit(f"LOOSENED {previous} -> {choice}")
+    return True
+
+
 def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
     """`levain messaging` / `messaging show`: the effective choice, whether it is recorded, inferred or the default,
     and whether the workspace's settings carry its controls. Read-only; reads only the workspace
@@ -2379,20 +2420,19 @@ def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
     if chosen != "claude-code":
         emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
         return 1
-    recorded = recorded_messaging(install)
-    facts = _workspace_facts(install)
-    if recorded is not None:
-        effective, source = recorded, "recorded in .levain/config.json"
-    elif facts and (facts.get("crossSessionInbound") in ("hold", "refuse") or facts.get("ask") or facts.get("deny")):
-        effective, source = "governed", "inferred from .claude/settings.json; no record"
+    effective, source = _effective_messaging(install)
+    if effective is None:
+        emit(f"messaging: custom ({source})")
     else:
-        effective, source = DEFAULT_MESSAGING, "the default; no record"
-    emit(f"messaging: {effective} ({source})")
+        emit(f"messaging: {effective} ({source})")
     change = messaging_change(install)
     if change is not None:
         emit(f"  last changed by `messaging set`: {change['from']} -> {change['to']} at {change['at']}")
-    carries = _workspace_carries(install, effective)
-    if carries is None:
+    carries = _workspace_carries(install, effective) if effective is not None else False
+    if effective is None:
+        emit("  .claude/settings.json: carries messaging controls that match no choice "
+             "(`levain messaging set` replaces them with the choice's controls).")
+    elif carries is None:
         emit("  .claude/settings.json: cannot be read, so whether it carries these controls cannot be told.")
     elif carries:
         emit(f"  .claude/settings.json: carries the {effective} controls.")
@@ -2420,53 +2460,54 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
     review as well as for errors, and is only reported. Nothing is recorded otherwise, and nothing is rolled back:
     a plain update never loosens a carried control and re-renders the recorded choice, so a run cut short fails
     safe. An exception propagates and records nothing. Exit code = update's."""
-    from datetime import datetime, timezone
-
     from levain.update import run_update
 
     install = Path(str(path)).expanduser().resolve()
-    adapter = effective_adapter(install)
-    if adapter is None:
-        emit(f"FAIL: {install} is not a levain install (run `levain init` first, or pass --path).")
-        return 1
-    if adapter != "claude-code":
-        emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
-        return 1
-    try:
-        _check_messaging(install, adapter, choice)
-    except InitError as e:
-        emit(f"FAIL: {e}")
-        return 1
     staged = install.joinpath(*PENDING_REL, ".claude", "settings.json")
     try:
-        with install_lock(install, create=False):  # reentrant: run_update's own acquire is then a no-op
-            previous = persisted_messaging(install)
+        with install_lock(install, create=False):  # ALL validation and the update run under this one hold
+            adapter = effective_adapter(install)
+            if adapter is None:
+                emit(f"FAIL: {install} is not a levain install (run `levain init` first, or pass --path).")
+                return 1
+            if adapter != "claude-code":
+                emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
+                return 1
+            _check_messaging(install, adapter, choice)
+            previous = _effective_messaging(install)[0] or persisted_messaging(install)
             before = _pending_snapshot(staged)
             emit("  running `levain update` to apply it")
-            rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
-            carries = _workspace_carries(install, choice)
-            from levain.host_guard import workspace_settings_pin_matches
-
-            if carries and workspace_settings_pin_matches(install):
-                change = None
-                if previous != choice:
-                    change = {"from": previous, "to": choice,
-                              "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                _write_messaging_choice(install, choice, emit, changed=change)
-                if (change is not None and
-                        _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous)):
-                    emit(f"LOOSENED {previous} -> {choice}")
+            try:
+                rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
+            except BaseException:
+                # the file may be written and pinned before the exception: the same gate as success
+                try:
+                    _commit_messaging_if_applied(install, choice, previous, emit)
+                except Exception:
+                    pass  # the update's exception is the one that propagates
+                raise
+            if _commit_messaging_if_applied(install, choice, previous, emit):
                 if rc:
                     emit(f"messaging: {choice} applied and recorded; `levain update` also reported something above "
                          "to review")
                 return rc
+            carries = _workspace_carries(install, choice)
             if _pending_snapshot(staged) not in (None, before):
                 emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json was held for review "
                      f"(you edited it). The staged copy is at {staged}; merge it (until then the old controls stay in "
                      f"force), then run `levain messaging set {choice}` again.")
             elif carries:
+                from levain.host_guard import _load_agent_pins
+
+                try:
+                    nopin = _load_agent_pins(Path(os.path.abspath(install))) is None
+                except Exception:
+                    nopin = False  # a damaged pin is doctor's FAIL row to name, not a missing one
+                q = shlex.quote(str(install))
+                fix = (f"`levain doctor --path {q}` shows the hook pin row; if you made the change, "
+                       f"`levain doctor --path {q} --repin-hooks` re-pins. " if nopin else "")
                 emit(f"messaging: {choice} is NOT recorded: the file carries it but the hook pin does not cover it "
-                     f"(update exit {rc}); its output above says why. Fix that, then run "
+                     f"(update exit {rc}); its output above says why. {fix}Then run "
                      f"`levain messaging set {choice}` again.")
             else:
                 emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json does not carry its "
