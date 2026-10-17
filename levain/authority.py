@@ -44,13 +44,14 @@ from typing import Any
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
 __all__ = [
-    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
+    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
+    "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_grant", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_grant", "consent_grant_tool_problem", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -152,6 +153,12 @@ _GRANT_VERBS = frozenset({"push", "fetch"})
 # ``kind`` is an egress grant (the fields above, unchanged); a consent grant carries exactly these.
 CONSENT_GRANT_KIND = "consent"
 _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "expires_at"})
+# A consent-mcp grant is a consent grant that also DECLARES the input fields of MCP tools it names (``mcp_fields``:
+# tool -> field -> kind, :data:`CONSENT_MCP_FIELD_KINDS`), so a declared tool off
+# :data:`CONSENT_MCP_READ_ONLY_TOOLS` may be named (ruling #3 (b)). A kind of its own, never an optional field on
+# ``consent``: a kind's field set stays closed, and a levain that does not know this kind holds it inert (0.11.5).
+CONSENT_MCP_GRANT_KIND = "consent-mcp"
+_CONSENT_MCP_GRANT_FIELDS = _CONSENT_GRANT_FIELDS | {"mcp_fields"}
 CONSENT_AGENTS = ("claude_code", "codex")
 # Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Both agents
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1's exec_command, measured in Q0 item
@@ -171,9 +178,9 @@ _REPLAY_SHELL_TOOLS = frozenset({"bash"})
 # declares no path fields and its annotations are untrusted (spec 2025-06-18, server/tools), so a grant's workspace
 # bound reads only the fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``): a grant on a tool that writes
 # could answer a write anywhere, and one on another server's ``read_file`` taking its path in another field a read
-# anywhere. Until a grant can declare its tool's path fields, an MCP tool off this list is refused at append and
-# answers nothing at decision, and a request on a listed tool whose input is not one that tool's schema accepts
-# matches no grant: it goes to you. Kinds: "str", "int" (a JSON integer), "strs" (a list of strings), and a
+# anywhere. An MCP tool off this list is refused at append and answers nothing at decision unless a consent-mcp
+# grant declares its fields (:data:`CONSENT_MCP_GRANT_KIND`), and a request on a listed tool the grant does not
+# declare whose input is not one that tool's schema accepts matches no grant: it goes to you. Kinds: "str", "int" (a JSON integer), "strs" (a list of strings), and a
 # frozenset of the allowed string values.
 _PATH, _COUNT, _STRS = "str", "int", "strs"
 CONSENT_MCP_READ_ONLY_TOOLS: Mapping[str, tuple[Mapping[str, Any], frozenset[str]]] = MappingProxyType({
@@ -214,6 +221,50 @@ def consent_mcp_input_fits(tool: str, tool_input: Any) -> bool:
         if not ok:
             return False
     return True
+
+
+# The kinds a consent-mcp grant declares a field of: ``path`` (a string, a target path), ``paths`` (a non-empty list
+# of strings, each a target path), ``str``, ``strs`` (a list of strings), ``int`` (a JSON integer, not a boolean),
+# ``bool``. A declared tool is answered only for an input of declared fields, each value of its kind, every ``path``
+# value and ``paths`` item inside the workspace (``levain.consent.policy.grant_refusal``).
+CONSENT_MCP_FIELD_KINDS = frozenset({"path", "paths", "str", "strs", "int", "bool"})
+_CONSENT_MCP_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
+_CONSENT_MCP_FIELDS_MAX = 32
+
+
+def consent_mcp_declaration(grant: Any, tool: Any) -> Mapping[str, str] | None:
+    """The fields a consent-mcp grant declares for the MCP tool ``tool`` (field -> kind), or ``None``: a grant of any
+    other kind declares nothing, and neither does one whose declarations do not name ``tool``."""
+    if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_MCP_GRANT_KIND or not isinstance(tool, str):
+        return None
+    declared = grant.get("mcp_fields")
+    fields = declared.get(tool) if isinstance(declared, Mapping) else None
+    return fields if isinstance(fields, Mapping) and fields else None
+
+
+def _validate_mcp_fields(declared: Any, tools: Any, what: str) -> None:
+    """``mcp_fields``: a non-empty mapping whose every key is an MCP tool the grant names, each declaring 1 to
+    :data:`_CONSENT_MCP_FIELDS_MAX` fields, each named by :data:`_CONSENT_MCP_FIELD` with a kind in
+    :data:`CONSENT_MCP_FIELD_KINDS`."""
+    if not isinstance(declared, Mapping) or not declared:
+        raise AuthorityError(f"{what}.mcp_fields must map the MCP tools it declares to their fields")
+    for tool, fields in declared.items():
+        if not isinstance(tool, str) or not tool.startswith("mcp__") or not _CONSENT_MCP_TOOL.fullmatch(tool) \
+                or tool not in tools:
+            raise AuthorityError(f"{what}.mcp_fields declares {str(tool)[:200]!r}, which is not an MCP tool the "
+                                 "grant names")
+        if not isinstance(fields, Mapping) or not 1 <= len(fields) <= _CONSENT_MCP_FIELDS_MAX:
+            raise AuthorityError(f"{what}.mcp_fields[{tool[:200]!r}] must declare 1 to {_CONSENT_MCP_FIELDS_MAX} "
+                                 "fields")
+        for name, kind in fields.items():
+            if not isinstance(name, str) or not _CONSENT_MCP_FIELD.fullmatch(name):
+                raise AuthorityError(f"{what}.mcp_fields[{tool[:200]!r}] has the field name {str(name)[:80]!r} "
+                                     "(letters, digits, _ . -; at most 64)")
+            if not isinstance(kind, str) or kind not in CONSENT_MCP_FIELD_KINDS:
+                raise AuthorityError(f"{what}.mcp_fields[{tool[:200]!r}][{name!r}] must be one of "
+                                     f"{', '.join(sorted(CONSENT_MCP_FIELD_KINDS))}")
+
+
 # The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
 # permission modes (Q0 measured ``default``); Codex: the value its event carries (Q0 item 6, Q3: ``default``).
 CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({
@@ -695,6 +746,24 @@ def _validate_consent_grant(grant: Mapping[str, Any], what: str, at: datetime | 
         raise AuthorityError(f"{what} (a consent grant) must carry exactly {', '.join(sorted(_CONSENT_GRANT_FIELDS))}")
     if grant["kind"] != CONSENT_GRANT_KIND:
         raise AuthorityError(f"{what}.kind must be {CONSENT_GRANT_KIND!r}")
+    return _consent_grant_body(grant, what, at)
+
+
+def _validate_consent_mcp_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A consent-mcp grant's shape: exactly a consent grant's fields and ``mcp_fields``, the consent fields under the
+    consent grant's own rules, and the declarations under :func:`_validate_mcp_fields`."""
+    if set(grant) != _CONSENT_MCP_GRANT_FIELDS:
+        raise AuthorityError(f"{what} (a consent-mcp grant) must carry exactly "
+                             f"{', '.join(sorted(_CONSENT_MCP_GRANT_FIELDS))}")
+    if grant["kind"] != CONSENT_MCP_GRANT_KIND:
+        raise AuthorityError(f"{what}.kind must be {CONSENT_MCP_GRANT_KIND!r}")
+    out = _consent_grant_body(grant, what, at)
+    _validate_mcp_fields(grant["mcp_fields"], grant["tools"], what)
+    return out
+
+
+def _consent_grant_body(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """The rules a consent grant and a consent-mcp grant share, past their own field set and kind."""
     if not isinstance(grant["id"], str) or not grant["id"]:
         raise AuthorityError(f"{what}.id must be a non-empty string")
     agent = grant["agent"]
@@ -896,6 +965,15 @@ def _consent_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dat
     return "tight" if narrower and n_exp <= o_exp else "loose"
 
 
+def _consent_mcp_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A consent-mcp grant's change: a consent grant's (:func:`_consent_grant_change`), except that every tool the new
+    grant names must carry the very declaration it had (any change to one, a field added, dropped or of another
+    kind, or a listed read tool's declaration dropped so it falls back to levain's own schema, is ``loose``)."""
+    if any(consent_mcp_declaration(n, t) != consent_mcp_declaration(o, t) for t in n["tools"]):
+        return "loose"
+    return _consent_grant_change(o, n, o_exp, n_exp)
+
+
 def _inert_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
     """A change to a grant of a kind this levain does not know: ``renew`` when only its expiry moved later, else
     ``loose`` (never ``tight``: what would be narrower is the newer levain's to say). Fail-closed on purpose, and the
@@ -939,6 +1017,11 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     CONSENT_GRANT_KIND: _GrantKind(validate=_validate_consent_grant, change=_consent_grant_change,
                                    append_checks=(lambda g: _consent_home_check(g), lambda g: _consent_tool_check(g)),
                                    renew_checks=(lambda g, after: _consent_tool_check(g, after),), consent=True),
+    CONSENT_MCP_GRANT_KIND: _GrantKind(validate=_validate_consent_mcp_grant, change=_consent_mcp_grant_change,
+                                       append_checks=(lambda g: _consent_home_check(g),
+                                                      lambda g: _consent_mcp_tool_check(g)),
+                                       renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
+                                       consent=True),
 })
 
 
@@ -1386,6 +1469,30 @@ def _consent_tool_check(grants: list[Any], after: str = "") -> None:
         tools = grant.get("tools")
         for tool in tools if isinstance(tools, (list, tuple)) else ():
             problem = consent_tool_problem(grant.get("agent"), tool)
+            if problem is not None:
+                raise AuthorityError(problem + after)
+
+
+def consent_grant_tool_problem(grant: Any, tool: Any) -> str | None:
+    """Why ``grant`` may not name ``tool`` (``None`` when it may): :func:`consent_tool_problem` for the grant's agent,
+    except that an MCP tool a consent-mcp grant declares (:func:`consent_mcp_declaration`) may be named whether or not
+    it is on :data:`CONSENT_MCP_READ_ONLY_TOOLS`. A shell name is refused whatever is declared. Read at append (for a
+    consent-mcp grant) and at every decision."""
+    if isinstance(tool, str) and tool.lower() not in CONSENT_SHELL_TOOLS \
+            and consent_mcp_declaration(grant, tool) is not None:
+        return None
+    return consent_tool_problem(grant.get("agent") if isinstance(grant, Mapping) else None, tool)
+
+
+def _consent_mcp_tool_check(grants: list[Any], after: str = "") -> None:
+    """At append, every tool a consent-mcp grant a link brings in or extends names is one
+    :func:`consent_grant_tool_problem` allows; ``after`` is added to the refusal."""
+    for grant in grants:
+        if not isinstance(grant, Mapping):
+            continue
+        tools = grant.get("tools")
+        for tool in tools if isinstance(tools, (list, tuple)) else ():
+            problem = consent_grant_tool_problem(grant, tool)
             if problem is not None:
                 raise AuthorityError(problem + after)
 
