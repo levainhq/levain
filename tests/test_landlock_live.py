@@ -98,3 +98,16 @@ def test_t6_leaves_pathname_sockets_reachable(policy) -> None:
         srv.close()
         d.cleanup()
     assert "CONNECTED" in r.output, r.output
+
+
+def test_a_rename_across_directories_works_on_every_landlock_tier(policy) -> None:
+    """B1 r1 B-M1: any enforced Landlock ruleset denies REFER unless it is granted, so a T6 scope-only
+    ruleset made `mv a/f a/sub/f` fail EXDEV. On T6 and T9 the stub grants REFER beneath "/"; on T0
+    nothing is applied, and the rename is the same check."""
+    shell = BwrapProvider().spawn_shell(policy)
+    try:
+        r = shell.run("mkdir -p lvmv/sub && : > lvmv/f && mv lvmv/f lvmv/sub/f && ln lvmv/sub/f lvmv/g "
+                      "&& echo MOVED; rm -rf lvmv")
+    finally:
+        shell.close()
+    assert "MOVED" in r.output, f"({TIER}, ABI {ABI}) {r.output}"
