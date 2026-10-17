@@ -972,8 +972,13 @@ class EntitySession:
                 conversation._ensure_agent_ready()
                 tools_map = conversation.agent.tools_map
                 hands = [t for n, t in tools_map.items() if n in ("file_editor", "terminal")]
-                if "file_editor" not in tools_map or any(
-                    getattr(t.executor, "_policy", None) != conv_binding.floor for t in hands
+                # Each hand reads one shared floor, built from this session's binding. Its ``bound`` is
+                # compared, not the policy it enforces: that one may be stronger (with gpg's extra socket
+                # granted, gnupg's programs are write-denied too), and stronger is not a mismatch.
+                floors = {id(getattr(t.executor, "_floor", None)) for t in hands}
+                if "file_editor" not in tools_map or len(floors) != 1 or any(
+                    getattr(getattr(t.executor, "_floor", None), "bound", None) != conv_binding.floor
+                    for t in hands
                 ):
                     raise BindingError(
                         "the conversation's hands did not report the floor this session resolved "
