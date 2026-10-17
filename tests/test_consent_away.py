@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import subprocess
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -164,7 +164,7 @@ def test_a_fifo_or_oversized_or_deep_file_is_refused_without_blocking(qdir):
 
 
 def test_a_huge_integer_hold_falls_back_to_the_default(qdir, cockpit):
-    (qdir / cc.SETTINGS_NAME).write_text('{"cockpit_data_root": "%s", "away_hold_seconds": %s}' % (cockpit, "9" * 400))
+    (qdir / cc.SETTINGS_NAME).write_text(f'{{"cockpit_data_root": "{cockpit}", "away_hold_seconds": {"9" * 400}}}')
     assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     assert cc.load_settings(qdir).away_hold_seconds == away.DEFAULT_HOLDS["claude_code"]
 
