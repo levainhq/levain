@@ -2964,6 +2964,11 @@
   }
 
   function renderExternal(entry, view, opts) {
+    const p = renderExternalBody(entry, view, opts);
+    if (p.dataset && p.dataset.proposalSlot === "pending") { p.dataset.proposalSlot = "mounted"; p.appendChild(proposalSlot()); }
+    return p;
+  }
+  function renderExternalBody(entry, view, opts) {
     const p = panel(entry);
     const data = (view.extra_panels || {})[entry.id] || {};
     if (data.error) {
@@ -2986,6 +2991,10 @@
       else if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
     if (data.note) p.appendChild(el("div", "ext-note", data.note));
+    // the Decisions panel carries proposal cards whatever rows it holds (three old hand-allows make a card on a panel with
+    // nothing pending): decided by panel id, never by the presence of a consent row. The cards lead the rows when there are
+    // any (appendExternalLines mounts them); a panel that drew none gets them after the body (renderExternal, below)
+    if (entry.id === "decisions") p.dataset.proposalSlot = "pending";
     // Prose external panels (e.g. the morning-ritual reports) carry a `markdown` string instead of
     // `lines` — render it via the shipped CSP-safe markdown renderer (textContent-only, the same one
     // the section/config panels use). Falls through to the lines model when `markdown` is absent, so
@@ -3357,13 +3366,17 @@
 
   function appendExternalLines(host, lines) {
     let lastGroup = null;
-    // the Decisions view (the only one whose lines are consent requests) leads with its proposal cards
-    if (lines.some((ln) => ln && ln.consent)) host.appendChild(proposalSlot());
+    // the Decisions panel's proposal cards (see renderExternalBody) follow the live requests, which are on a clock, and come
+    // before the decided ones: ahead of the first "Resolved" / "Outcomes" heading, else after the last row
+    const owner = host.closest ? host.closest("[data-proposal-slot]") : null;
+    let slotDue = !!(owner && owner.dataset.proposalSlot === "pending");
+    if (slotDue) owner.dataset.proposalSlot = "mounted";
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
       if (typeof o.grp === "string" && o.grp !== lastGroup) {
         lastGroup = o.grp;
+        if (slotDue && (o.grp === "Resolved" || o.grp === "Outcomes")) { slotDue = false; host.appendChild(proposalSlot()); }
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
@@ -3387,6 +3400,7 @@
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       host.appendChild(row);
     }
+    if (slotDue) host.appendChild(proposalSlot());
   }
 
   function renderEdits(entry, view) {

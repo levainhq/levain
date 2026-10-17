@@ -69,6 +69,10 @@ def _proposable(agent: str, tool: str, workspace: str) -> bool:
         return False
     if consent_mcp_tool_problem(tool) is not None:
         return False
+    if tool.startswith("mcp__"):     # mcp__<server>__<tool>, both parts named: the log's read-only check lets "mcp____x" by
+        server, sep, name = tool[len("mcp__"):].partition("__")
+        if not (server and sep and name):
+            return False
     return consent_workspace_problem(workspace) is None and consent_root_problem(workspace) is None
 
 
@@ -90,7 +94,7 @@ def propose(history: ConsentListing) -> list[Proposal]:
     for (agent, tool, cwd), entries in by_key.items():
         if not _proposable(agent, tool, cwd):
             continue
-        entries.sort(key=lambda e: e.decided_at or "")
+        entries.sort(key=lambda e: (e.decided_at or "", e.request.id))    # a tie in the stamp: the later id
         if any(e.state == "denied" for e in entries) or entries[-1].via == "grant":
             continue
         hand = [e for e in entries if e.state == "allowed" and e.via == "signature" and e.request.tier != AGENT_CONFIG_TIER]

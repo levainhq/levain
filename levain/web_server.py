@@ -166,7 +166,11 @@ def _consent_reader() -> Any:
     directory, read-only; no queue directory means no rows and no note."""
     from levain.consent.listing import read_listing
 
-    return lambda now: read_listing(now=now)
+    def reader(now: datetime) -> Any:
+        return read_listing(now=now)
+
+    reader.directory = None     # type: ignore[attr-defined]   # the default queue; the proposals route reads the same one
+    return reader
 
 
 def broker_install_class(httpd: Any) -> str:
@@ -853,7 +857,8 @@ class _Handler(GuardedHandler):
                     from levain.consent.listing import read_history
 
                     status, payload = 200, {"proposals": [p.as_dict() for p in
-                                                          propose(read_history(now=datetime.now(timezone.utc)))]}
+                                                          propose(read_history(getattr(self.server.consent_reader, "directory", None),
+                                                                      now=datetime.now(timezone.utc)))]}
                 else:
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:

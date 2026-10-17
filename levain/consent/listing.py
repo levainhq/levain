@@ -158,18 +158,22 @@ def _grant_id_of(answer: Any) -> str | None:
 
 
 def read_history(directory: Path | str | None = None, *, now: datetime) -> ConsentListing:
-    """The decided requests of the last :data:`HISTORY` (newest :data:`HISTORY_CAP`), as :func:`read_listing` reads
-    them with a longer look-back: what the page's standing-rule proposals count. Same read-only rules."""
-    return read_listing(directory, now=now, span=HISTORY, cap=HISTORY_CAP)
+    """The answered requests (``allowed`` and ``denied``, nothing else) of the last :data:`HISTORY`, as
+    :func:`read_listing` reads them with a longer look-back: what the page's standing-rule proposals count. Same
+    read-only rules. The bound: the newest :data:`HISTORY_CAP` allowed-or-denied rows, plus, read apart, the newest
+    :data:`HISTORY_CAP` denials, so a busy queue (or a flood of allows) can never crowd out the denial that must
+    withdraw a card; at most twice the cap is read, and none of it is cut afterwards."""
+    return read_listing(directory, now=now, span=HISTORY, cap=HISTORY_CAP, decided_only=True)
 
 
 def read_listing(directory: Path | str | None = None, *, now: datetime, span: timedelta = RECENT,
-                 cap: int = RECENT_CAP) -> ConsentListing:
+                 cap: int = RECENT_CAP, decided_only: bool = False) -> ConsentListing:
     """The queue in ``directory`` (default :func:`~levain.consent.queue.default_queue_dir`) as of ``now``.
     ``span`` and ``cap`` bound the terminal requests read (the last day and :data:`RECENT_CAP` by default).
     No directory or no file is an empty listing and nothing is created. A store that cannot be trusted (another
     format, a directory others can reach) raises :class:`~levain.consent.queue.QueueStoreError`; a database
-    that cannot be read raises ``sqlite3.Error``: the caller's note, never a dark panel."""
+    that cannot be read raises ``sqlite3.Error``: the caller's note, never a dark panel. ``decided_only`` reads no
+    pending or expired request and only ``allowed`` / ``denied`` rows (see :func:`read_history` for its bound)."""
     from levain.consent.queue import DB_NAME, STORE_FORMAT, QueueStoreError, default_queue_dir
 
     base = Path(directory) if directory is not None else default_queue_dir()
@@ -194,17 +198,27 @@ def read_listing(directory: Path | str | None = None, *, now: datetime, span: ti
         # never scanned. The live pending come soonest-expiring first, one past the cap, so overflow is known
         # without counting every row; the unswept expired ones (which would crowd the live ones out of that
         # order) are read apart, newest expiry first, within the recent cap
-        rows = conn.execute(
-            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at > ? "
-            "ORDER BY expires_at ASC, rowid ASC LIMIT ?", (stamp, PENDING_CAP + 1)).fetchall()
-        overflow = len(rows) > PENDING_CAP
-        rows = rows[:PENDING_CAP]
-        rows += conn.execute(
-            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
-            "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, cap)).fetchall()
-        rows += conn.execute(
-            f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
-            "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
+        if decided_only:
+            rows = conn.execute(
+                f"SELECT {cols} FROM requests WHERE state IN ('allowed', 'denied') AND decided_at >= ? "
+                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
+            seen = {r[0] for r in rows}      # the denials, apart: never crowded out by newer allows
+            rows += [r for r in conn.execute(
+                f"SELECT {cols} FROM requests WHERE state = 'denied' AND decided_at >= ? "
+                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall() if r[0] not in seen]
+            overflow = False
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at > ? "
+                "ORDER BY expires_at ASC, rowid ASC LIMIT ?", (stamp, PENDING_CAP + 1)).fetchall()
+            overflow = len(rows) > PENDING_CAP
+            rows = rows[:PENDING_CAP]
+            rows += conn.execute(
+                f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
+                "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, cap)).fetchall()
+            rows += conn.execute(
+                f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
+                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -238,4 +252,4 @@ def read_listing(directory: Path | str | None = None, *, now: datetime, span: ti
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
-    return ConsentListing(tuple(pending), tuple(recent[:cap]), skipped, overflow)
+    return ConsentListing(tuple(pending), tuple(recent if decided_only else recent[:cap]), skipped, overflow)
