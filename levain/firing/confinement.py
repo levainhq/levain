@@ -555,6 +555,26 @@ def _spellings(spec: str | Path) -> list[Path]:
             pass
     return list(_dedup_paths(out))
 
+
+def _required_spellings(spec: str | Path, what: str) -> list[Path]:
+    """The ordinary :func:`_spellings`, but refuse if canonical spellings are unknowable.
+
+    `_spellings` deliberately keeps a lexical belt when resolution loops. That is not enough for
+    an execution-bearing persistence path: Seatbelt canonicalises data writes, so a lexical-only
+    rule would be inert. These paths use the shared spelling machinery with fail-closed resolution.
+    """
+    s = str(spec)
+    raw = Path.home() / s[2:] if s == "~" or s.startswith("~/") else Path(s)
+    try:
+        raw.parent.resolve()
+        raw.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfinementError(
+            f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
+            "refusing to build the floor (fail-closed)"
+        ) from exc
+    return _spellings(spec)
+
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
 # ⛔ A REACHABLE CONTAINER DAEMON IS A TOTAL BYPASS OF EVERYTHING ELSE IN THIS MODULE, and it
@@ -1173,6 +1193,11 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
         lines.append(GRANTS_NOT_APPLIED_LINE)
     else:
         for g in (grants.get() if grants is not None else load_operator_grants()):
+            if system == "Darwin":
+                detail = ("gpg extra sockets are not mapped to gpg's standard socket"
+                          if g.gpg_extra else "the listener cannot be shown not to be an ssh agent")
+                lines.append(f"refused on macOS (operator grant) {g.name}: {g.path} ({detail})")
+                continue
             extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
             lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
     for d in DEFAULT_GRANT_LINES.get(system, ()):
@@ -1383,6 +1408,11 @@ class CrownJewelsPolicy:
     # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
     # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
     # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
+    persistence_home_dirs: tuple[Path, ...] = ()  # immediate children are WRITE-denied on macOS
+    persistence_write_subtrees: tuple[Path, ...] = ()  # bin/hooks/LaunchAgents/git config trees
+    persistence_write_files: tuple[Path, ...] = ()  # shell/git startup + Codex config/hooks
+    persistence_settings_dirs: tuple[Path, ...] = ()  # immediate settings*.json are WRITE-denied
+    persistence_protected_names: tuple[Path, ...] = ()  # exact .claude/.codex roots: no link planting
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -2075,9 +2105,9 @@ def build_policy(
     # ancestors (an intermediate symlink in the path must not be swappable), and the home dir itself is
     # ancestor-write-denied (``--bind P P``: rename EBUSY, file creation inside still OK, so trustdb and
     # keyring writes are unaffected).
-    for home in gnupg_homes:
+    for gnupg_home in gnupg_homes:
         for conf in _GNUPG_CONF_WRITE_DENIED:
-            deny_write_files_l.extend(_spellings(home / conf))
+            deny_write_files_l.extend(_spellings(gnupg_home / conf))
     # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
     deny_write_files_l.extend(_dirmngr_home_conf_spellings())
     # The programs the operator's gpg-agent.conf names (_GPG_AGENT_PROGRAMS), resolved, with their ancestors
@@ -2226,6 +2256,56 @@ def build_policy(
         own_memory_files_l.append(_lexical)
     own_memory_files_t = _dedup(own_memory_files_l)
 
+    # macOS persistence floor, represented in the shared policy so the Seatbelt hand and the
+    # in-process editor consume one source. Every path keeps its lexical and canonical spellings;
+    # unlike ordinary jewels, an unresolvable spelling refuses the floor because Seatbelt's
+    # canonical data-write matching would make a lexical-only deny inert.
+    persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
+    persistence_write_subtrees = _dedup([
+        p
+        for root, label in (
+            (home / "bin", "operator bin"),
+            (home / ".local" / "bin", "operator local bin"),
+            (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
+            (home / ".config" / "git", "operator git config"),
+            (home / ".claude" / "hooks", "operator Claude hooks"),
+            (ws / ".claude" / "hooks", "workspace Claude hooks"),
+        )
+        for p in _required_spellings(root, label)
+    ])
+    persistence_write_files = _dedup([
+        p
+        for root, label in (
+            *((home / name, "operator shell/git startup") for name in (
+                ".zshrc", ".zprofile", ".zlogin", ".zshenv", ".bashrc", ".bash_profile",
+                ".bash_login", ".profile", ".gitconfig",
+            )),
+            (home / ".codex" / "hooks.json", "operator Codex hooks"),
+            (home / ".codex" / "config.toml", "operator Codex config"),
+            (ws / ".codex" / "hooks.json", "workspace Codex hooks"),
+            (ws / ".codex" / "config.toml", "workspace Codex config"),
+        )
+        for p in _required_spellings(root, label)
+    ])
+    persistence_settings_dirs = _dedup([
+        p
+        for root, label in (
+            (home / ".claude", "operator Claude settings"),
+            (ws / ".claude", "workspace Claude settings"),
+        )
+        for p in _required_spellings(root, label)
+    ])
+    persistence_protected_names = _dedup([
+        p
+        for root, label in (
+            (home / ".claude", "operator Claude root"),
+            (home / ".codex", "operator Codex root"),
+            (ws / ".claude", "workspace Claude root"),
+            (ws / ".codex", "workspace Codex root"),
+        )
+        for p in _required_spellings(root, label)
+    ])
+
     # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, the entity's
     # own store files, AND the config file (all relocate the same way). Including ``deny_write_files_t``
     # here write-denies ~/.ssh (the persistence-vector dir anchor) so it can't be renamed/replaced to
@@ -2238,7 +2318,9 @@ def build_policy(
     # test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it.
     all_jewels = (
         list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t)
-        + list(own_memory_files_t) + [config_file]
+        + list(own_memory_files_t) + list(persistence_write_subtrees)
+        + list(persistence_write_files) + list(persistence_settings_dirs)
+        + list(persistence_protected_names) + [config_file]
     )
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
@@ -2299,6 +2381,11 @@ def build_policy(
         ro_tool_dirs=tuple(tool_dirs),
         cred_dir_sources=tuple(cred_dir_sources),
         trusted_roots=_trusted_roots(entity_dir, workspace),
+        persistence_home_dirs=persistence_home_dirs,
+        persistence_write_subtrees=persistence_write_subtrees,
+        persistence_write_files=persistence_write_files,
+        persistence_settings_dirs=persistence_settings_dirs,
+        persistence_protected_names=persistence_protected_names,
     )
 
 
@@ -2662,6 +2749,19 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
     if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
         return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
+    for subtree in policy.persistence_write_subtrees:
+        if _ci_within(p, subtree):
+            return f"{p} is under the write-protected persistence subtree {subtree}"
+    for protected in policy.persistence_write_files:
+        if _canon(str(p)) == _canon(str(protected)):
+            return f"{p} is a write-protected agent configuration or hook file"
+    for settings_dir in policy.persistence_settings_dirs:
+        if (_canon(str(p.parent)) == _canon(str(settings_dir))
+                and p.name.startswith("settings") and p.name.endswith(".json")):
+            return f"{p} is a write-protected Claude settings file"
+    for protected in policy.persistence_protected_names:
+        if _canon(str(p)) == _canon(str(protected)):
+            return f"{p} is a protected agent-config root and cannot be created or replaced"
     # Container sockets are write-denied through the SAME ``deny_write_files`` list as the ssh
     # vectors (build_policy arm (ii)), so the loop below must say WHICH it matched or it tells an
     # operator that ``/var/run/docker.sock`` is "an ssh persistence/exec vector
@@ -4485,53 +4585,40 @@ def _macos_socket_grant_paths(
     ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
 ) -> tuple[str, ...]:
     """The exact pathname capabilities a macOS profile allows after its all-Unix-sockets deny."""
-    paths = [_MACOS_MDNS_SOCKET, *(g.path for g in grants)]
+    paths = [_MACOS_MDNS_SOCKET, *(os.path.realpath(g.path) for g in grants)]
     if ssh_agent is not None:
-        paths.append(ssh_agent.socket)
+        paths.append(os.path.realpath(ssh_agent.socket))
     return tuple(dict.fromkeys(paths))
 
 
 def _validate_macos_grant(grant: SocketGrant) -> None:
-    """Validate one macOS pathname grant at entry.
+    """Reject Darwin operator grants until their listener can be classified soundly.
 
-    Unlike Linux, a user-writable parent is admissible because the Seatbelt profile write-denies the
-    socket's whole parent and pins every ancestor against relocation.  The object still must be the
-    exact, non-linked, operator-owned socket declared before entry, with no other-user-writable parent.
+    Darwin has no Linux-style ``SO_PEERCRED`` plus ``/proc/<pid>/comm`` proof here. An arbitrary
+    listener therefore cannot be shown *not* to be a second SSH agent. GPG's restricted extra
+    socket has a separate correctness gap: macOS has no protected mapping onto the standard socket
+    pathname used by gpg. Levain's own scoped agent takes its separate, pid-checked path below.
     """
-    p = grant.path
-
-    def refuse(why: str) -> NoReturn:
-        raise ConfinementError(
-            f"the operator grant {grant.name!r} ({p}) {why}. Refusing to grant bash hands "
-            f"(fail-closed); fix or remove it in {grants_file()}."
-        )
-
-    if os.path.realpath(p) != p:
-        refuse(f"is reached through a link (it resolves to {os.path.realpath(p)}); name the real path")
-    agent = _ssh_agent_refusal(p)
-    if agent is not None:
-        refuse(agent)
-    try:
-        st = os.lstat(p)
-    except OSError as exc:
-        refuse(f"cannot be opened ({exc.strerror or exc})")
-    if not stat.S_ISSOCK(st.st_mode):
-        refuse("is not a socket")
-    if st.st_uid != os.geteuid():
-        refuse(f"is owned by uid {st.st_uid}, not you")
-    for parent in Path(p).parents:
-        try:
-            pst = os.stat(parent)
-        except OSError as exc:
-            refuse(f"has a parent {parent} that cannot be read ({exc.strerror or exc})")
-        if pst.st_uid not in (0, os.geteuid()) or (
-            pst.st_mode & 0o022 and not (pst.st_uid == 0 and pst.st_mode & stat.S_ISVTX)
-        ):
-            refuse(f"has a parent {parent} that another user can write")
+    if grant.gpg_extra:
+        why = ("is gpg's extra socket, but macOS has no protected mapping from it to the standard "
+               "agent socket used by gpg")
+    else:
+        why = ("cannot be shown not to be an ssh agent on macOS; Darwin exposes no trustworthy "
+               "listener identity to this grant check")
+    raise ConfinementError(
+        f"the operator grant {grant.name!r} ({grant.path}) {why}. Refusing to grant bash hands "
+        f"(fail-closed); remove it from {grants_file()}."
+    )
 
 
 def _validate_macos_ssh_agent(agent: "_ssh_agent.ScopedAgent") -> None:
     """Show that the literal scoped-agent grant still names the agent levain started."""
+    canonical_socket = os.path.realpath(agent.socket)
+    if canonical_socket != agent.socket or Path(canonical_socket).parent != agent.dir:
+        raise ConfinementError(
+            f"levain's scoped ssh agent ({agent.socket}) is not canonical (real path "
+            f"{canonical_socket}) — refusing to grant bash hands (fail-closed)."
+        )
     try:
         st = os.lstat(agent.socket)
     except OSError as exc:
@@ -4574,31 +4661,23 @@ def _validate_macos_ssh_agent(agent: "_ssh_agent.ScopedAgent") -> None:
 
 
 def _macos_persistence_lines(policy: CrownJewelsPolicy) -> list[str]:
-    """Seatbelt file-write rules for operator-home and agent-config persistence plants."""
-    home = Path.home()
-    workspace = policy.workspace
+    """Render the persistence descriptions carried by the shared crown-jewels policy."""
     lines = [
         ";; HOME PERSISTENCE — immediate home entries cannot be created, replaced or renamed.",
         ";; Execution-bearing subtrees and only the named agent config/hook paths are write-denied.",
         "(deny file-write*",
-        f'    (regex #"^{_sbpl_regex(str(home))}\\/[^\\/]+$")',
-        f'    (subpath "{_sbpl_string(str(home / "bin"))}")',
-        f'    (subpath "{_sbpl_string(str(home / ".local" / "bin"))}")',
-        f'    (subpath "{_sbpl_string(str(home / "Library" / "LaunchAgents"))}")',
-        f'    (subpath "{_sbpl_string(str(home / ".config" / "git"))}")',
-        f'    (regex #"^{_sbpl_regex(str(home / ".claude"))}\\/settings[^\\/]*\\.json$")',
-        f'    (subpath "{_sbpl_string(str(home / ".claude" / "hooks"))}")',
-        f'    (literal "{_sbpl_string(str(home / ".codex" / "hooks.json"))}")',
-        f'    (literal "{_sbpl_string(str(home / ".codex" / "config.toml"))}")',
-        f'    (literal "{_sbpl_string(str(workspace / ".claude"))}")',
-        f'    (regex #"^{_sbpl_regex(str(workspace / ".claude"))}\\/settings[^\\/]*\\.json$")',
-        f'    (subpath "{_sbpl_string(str(workspace / ".claude" / "hooks"))}")',
-        f'    (literal "{_sbpl_string(str(workspace / ".codex"))}")',
-        f'    (literal "{_sbpl_string(str(workspace / ".codex" / "hooks.json"))}")',
-        f'    (literal "{_sbpl_string(str(workspace / ".codex" / "config.toml"))}")',
-        ")",
-        "",
     ]
+    for home in policy.persistence_home_dirs:
+        lines.append(f'    (regex #"^{_sbpl_regex(str(home))}\\/[^\\/]+$")')
+    for subtree in policy.persistence_write_subtrees:
+        lines.append(f'    (subpath "{_sbpl_string(str(subtree))}")')
+    for settings_dir in policy.persistence_settings_dirs:
+        lines.append(
+            f'    (regex #"^{_sbpl_regex(str(settings_dir))}\\/settings[^\\/]*\\.json$")'
+        )
+    for path in (*policy.persistence_write_files, *policy.persistence_protected_names):
+        lines.append(f'    (literal "{_sbpl_string(str(path))}")')
+    lines += [")", ""]
     return lines
 
 
@@ -4636,6 +4715,9 @@ class SeatbeltProvider(ConfinementProvider):
             ";; structurally DENY the sovereignty crown jewels no matter what the model is told.",
             ";; A default-allow profile needs NO system allow-set (tools load their own libs freely).",
             "(allow default)",
+            "",
+            ";; Fixed, environment-independent oracle used by `levain ssh-add` to detect this floor.",
+            f'(deny file-write* (literal "{_sbpl_string(_ssh_agent.MACOS_CONFINEMENT_SENTINEL)}"))',
             "",
         ]
 
@@ -4684,7 +4766,7 @@ class SeatbeltProvider(ConfinementProvider):
         lines.append("")
 
         protected_socket_dirs = tuple(dict.fromkeys(
-            str(Path(path).parent)
+            str(Path(os.path.realpath(path)).parent)
             for path in _macos_socket_grant_paths(grants, ssh_agent)
             if path != _MACOS_MDNS_SOCKET
         ))
@@ -4916,11 +4998,11 @@ class SeatbeltProvider(ConfinementProvider):
         shell_env.pop("SSH_AUTH_SOCK", None)
         if ssh_agent is not None:
             shell_env["SSH_AUTH_SOCK"] = ssh_agent.socket
-            if "GIT_SSH_COMMAND" not in shell_env and "GIT_SSH" not in shell_env:
-                shell_env["GIT_SSH_COMMAND"] = (
-                    "ssh -o IdentityAgent=SSH_AUTH_SOCK -o UserKnownHostsFile="
-                    + shlex.quote(str(ssh_agent.dir / _ssh_agent.KNOWN_HOSTS_NAME))
-                )
+            shell_env.pop("GIT_SSH", None)
+            shell_env["GIT_SSH_COMMAND"] = (
+                "ssh -o IdentityAgent=SSH_AUTH_SOCK -o UserKnownHostsFile="
+                + shlex.quote(str(ssh_agent.dir / _ssh_agent.KNOWN_HOSTS_NAME))
+            )
         shell = _SeatbeltShell(
             argv=argv,
             cwd=policy.workspace,
@@ -5469,7 +5551,8 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
         sockets += [b for rd in _runtime_dirs()
                     for b in (Path(rd) / "bus", Path(rd) / "systemd" / "private")]
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
-             *policy.sqlite_sidecars, *sockets]
+             *policy.sqlite_sidecars, *policy.persistence_write_files,
+             *policy.persistence_protected_names, *sockets]
     if policy.config_file is not None:
         named.append(policy.config_file)
     for f in named:
@@ -5480,8 +5563,22 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             return
         unverifiable(str(exc.filename or "a crown-jewel directory"), exc)
 
-    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
-                   key=lambda p: str(p))
+    def scan_children(root: Path, predicate: Callable[[str], bool]) -> None:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if predicate(entry.name):
+                        note(entry.path, follow=True)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError as exc:
+            unverifiable(str(root), exc)
+
+    for root in policy.persistence_settings_dirs:
+        scan_children(root, lambda name: name.startswith("settings") and name.endswith(".json"))
+
+    roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees,
+                    *([policy.ssh_dir] if policy.ssh_dir else [])}, key=lambda p: str(p))
     walked: list[Path] = []
     for root in roots:
         if any(root == w or root.is_relative_to(w) for w in walked):
@@ -8113,7 +8210,9 @@ def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
 #: fails while a path field is in neither, so a new one gets a decision.
 _HANDS_POLICY_NARROWED = ("deny_read_write", "deny_files", "deny_write_dirs", "deny_write_files", "deny_sockets",
                           "socket_spellings", "own_memory_files", "sqlite_sidecars", "trust_spellings",
-                          "ssh_dir", "config_file")
+                          "ssh_dir", "config_file", "persistence_home_dirs",
+                          "persistence_write_subtrees", "persistence_write_files",
+                          "persistence_settings_dirs", "persistence_protected_names")
 _HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs", "cred_dir_sources",
                       "trusted_roots")
 

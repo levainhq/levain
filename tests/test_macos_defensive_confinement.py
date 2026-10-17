@@ -5,9 +5,13 @@ Nothing in this module starts the Seatbelt driver or applies a profile.
 from __future__ import annotations
 
 import ctypes
+import os
 from pathlib import Path
 
+import pytest
+
 from levain.firing import confinement as conf
+from levain.firing import seatbelt_guard
 from levain.firing import ssh_agent
 
 
@@ -30,14 +34,15 @@ def test_profile_default_denies_unix_and_allows_only_declared_paths(tmp_path, mo
     mdns = ('(allow network-outbound (remote unix-socket '
             '(path-literal "/private/var/run/mDNSResponder")))')
     gpg = ('(allow network-outbound (remote unix-socket '
-           '(path-literal "/tmp/gpg/S.gpg-agent.extra")))')
+           f'(path-literal "{os.path.realpath(grant.path)}")))')
     scoped = ('(allow network-outbound (remote unix-socket '
-              '(path-literal "/tmp/scoped/agent.sock")))')
+              f'(path-literal "{os.path.realpath(agent.socket)}")))')
     assert text.count(deny) == 1
     assert all(text.index(rule) > text.index(deny) for rule in (mdns, gpg, scoped))
     assert "S.gpg-agent\"" not in text
     assert "S.gpg-agent.ssh" not in text and "S.gpg-agent.browser" not in text
-    assert '(subpath "/tmp/gpg")' in text and '(subpath "/tmp/scoped")' in text
+    assert f'(subpath "{Path(os.path.realpath(grant.path)).parent}")' in text
+    assert f'(subpath "{Path(os.path.realpath(agent.socket)).parent}")' in text
     assert ('(allow file-read* file-write* '
             '(literal "/tmp/scoped/known_hosts"))') in text
 
@@ -72,6 +77,97 @@ def test_profile_denies_home_and_agent_persistence_but_not_the_workspace(tmp_pat
     assert f'(subpath "{home / ".codex"}")' not in text
 
 
+def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monkeypatch) -> None:
+    policy = _policy(tmp_path, monkeypatch)
+    workspace = policy.workspace
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for path in (
+        workspace / ".codex" / "config.toml",
+        workspace / ".codex" / "hooks.json",
+        workspace / ".claude" / "settings.local.json",
+        workspace / ".claude" / "hooks" / "plant.sh",
+    ):
+        assert conf.crown_jewel_reason(policy, path) is not None
+    assert conf.crown_jewel_reason(policy, workspace / ".codex" / "notes.txt") is None
+    assert conf.crown_jewel_reason(policy, workspace / "ordinary.txt") is None
+    for path in policy.persistence_write_files:
+        assert f'(literal "{path}")' in text
+    for path in policy.persistence_write_subtrees:
+        assert f'(subpath "{path}")' in text
+
+
+def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    real_codex = workspace / "real-codex"
+    real_claude = workspace / "real-claude"
+    real_codex.mkdir(parents=True)
+    real_claude.mkdir()
+    workspace.mkdir(exist_ok=True)
+    (workspace / ".codex").symlink_to(real_codex, target_is_directory=True)
+    (workspace / ".claude").symlink_to(real_claude, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    assert conf.crown_jewel_reason(policy, workspace / ".codex" / "config.toml") is not None
+    assert conf.crown_jewel_reason(policy, real_codex / "config.toml") is not None
+    assert conf.crown_jewel_reason(policy, workspace / ".claude" / "settings.json") is not None
+    assert conf.crown_jewel_reason(policy, real_claude / "settings.json") is not None
+    assert f'(literal "{workspace / ".codex"}")' in text
+    assert f'(literal "{real_codex / "config.toml"}")' in text
+
+
+def test_looping_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".codex").symlink_to(workspace / ".codex")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+    with pytest.raises(conf.ConfinementError, match="protected persistence path.*cannot be resolved"):
+        conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+
+@pytest.mark.parametrize("kind", ["config", "hook"])
+def test_hardlink_alias_of_persistence_file_refuses_spawn(tmp_path, monkeypatch, kind) -> None:
+    policy = _policy(tmp_path, monkeypatch)
+    home, workspace = Path.home(), policy.workspace
+    if kind == "config":
+        protected = home / ".codex" / "config.toml"
+    else:
+        protected = home / ".claude" / "hooks" / "commit.sh"
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    protected.write_text("protected")
+    workspace.mkdir(parents=True, exist_ok=True)
+    os.link(protected, workspace / f"{kind}-alias")
+    policy = conf.build_policy(policy.entity_dir, workspace=workspace, deny_standard_creds=False)
+    with pytest.raises(conf.ConfinementError, match="crown jewel with 2 names"):
+        conf._refuse_multiply_linked_jewels(policy)
+
+
+def test_profile_matrix_never_contains_a_kernel_mask_token(tmp_path, monkeypatch) -> None:
+    policy = _policy(tmp_path, monkeypatch)
+    grant = conf.SocketGrant("/tmp/gpg/S.gpg-agent.extra", "gpg", "signing", gpg_home="/g")
+    agent = ssh_agent.ScopedAgent("0123456789ab", "/tmp/scoped/agent.sock", 123)
+    for grants in ((), (grant,)):
+        for scoped in (None, agent):
+            for keychain in (False, True):
+                for localhost in (False, True):
+                    cell = conf.replace(policy, deny_keychain=keychain,
+                                        deny_localhost_outbound=localhost)
+                    text = conf.SeatbeltProvider().render_profile(
+                        cell, grants=grants, ssh_agent=scoped
+                    )
+                    assert "syscall" not in text.lower()
+                    assert seatbelt_guard.scan(text) == []
+
+
 def test_macos_spawn_strips_the_ambient_agent_and_sets_only_the_scoped_one(
     tmp_path, monkeypatch
 ) -> None:
@@ -95,7 +191,8 @@ def test_macos_spawn_strips_the_ambient_agent_and_sets_only_the_scoped_one(
 
     shell = conf.SeatbeltProvider()._spawn_shell_impl(
         policy,
-        env={"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/operator/agent"},
+        env={"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/operator/agent",
+             "GIT_SSH": "/attacker/git-ssh", "GIT_SSH_COMMAND": "/attacker/wrapper"},
         grants=(grant,),
         ssh_agent=agent,
     )
@@ -104,6 +201,8 @@ def test_macos_spawn_strips_the_ambient_agent_and_sets_only_the_scoped_one(
     assert shell.env["SSH_AUTH_SOCK"] == agent.socket
     assert "IdentityAgent=SSH_AUTH_SOCK" in shell.env["GIT_SSH_COMMAND"]
     assert str(agent.dir / ssh_agent.KNOWN_HOSTS_NAME) in shell.env["GIT_SSH_COMMAND"]
+    assert "/attacker/wrapper" not in shell.env["GIT_SSH_COMMAND"]
+    assert "GIT_SSH" not in shell.env
     profile = shell.argv[shell.argv.index("-p") + 1]
     assert grant.path in profile and agent.socket in profile
 
@@ -132,6 +231,7 @@ def test_macos_context_query_declares_the_fixed_variadic_abi(monkeypatch) -> Non
             assert self.argtypes == [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
             assert args[1].value == b"file-write-data"
             assert args[2].value == 1
+            assert args[3].value == os.fsencode(ssh_agent.MACOS_CONFINEMENT_SENTINEL)
             return 0
 
     check = Check()
@@ -141,6 +241,49 @@ def test_macos_context_query_declares_the_fixed_variadic_abi(monkeypatch) -> Non
         lambda *args, **kwargs: type("Lib", (), {"sandbox_check": check})(),
     )
     assert ssh_agent._macos_confinement_state() is False
+
+
+def test_macos_context_query_treats_negative_as_uncertainty(monkeypatch) -> None:
+    class Check:
+        restype = None
+        argtypes = None
+
+        def __call__(self, *_args):
+            return -1
+
+    check = Check()
+    monkeypatch.setattr(
+        ssh_agent.ctypes,
+        "CDLL",
+        lambda *args, **kwargs: type("Lib", (), {"sandbox_check": check})(),
+    )
+    assert ssh_agent._macos_confinement_state() is None
+
+
+def test_macos_profile_always_denies_the_fixed_context_sentinel(tmp_path, monkeypatch) -> None:
+    text = conf.SeatbeltProvider().render_profile(_policy(tmp_path, monkeypatch))
+    assert (f'(deny file-write* (literal "{ssh_agent.MACOS_CONFINEMENT_SENTINEL}"))'
+            in text)
+
+
+@pytest.mark.parametrize("gpg", [False, True])
+def test_macos_operator_grants_fail_closed_without_listener_identity_or_gpg_mapping(gpg) -> None:
+    grant = conf.SocketGrant("/private/tmp/service.sock", "service", "work",
+                             gpg_home="/g" if gpg else None)
+    with pytest.raises(conf.ConfinementError, match=(
+        "no protected mapping" if gpg else "cannot be shown not to be an ssh agent"
+    )):
+        conf._validate_macos_grant(grant)
+
+
+def test_macos_scoped_agent_refuses_a_noncanonical_socket_spelling(tmp_path) -> None:
+    real = tmp_path / "real" / "0123456789ab"
+    real.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path / "real", target_is_directory=True)
+    agent = ssh_agent.ScopedAgent("0123456789ab", str(alias / "0123456789ab" / "agent.sock"), 123)
+    with pytest.raises(conf.ConfinementError, match="is not canonical"):
+        conf._validate_macos_ssh_agent(agent)
 
 
 def test_macos_status_names_the_stricter_same_domain_cost(monkeypatch) -> None:
