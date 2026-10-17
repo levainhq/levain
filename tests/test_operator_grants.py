@@ -822,3 +822,13 @@ def test_the_run_banner_lists_the_grants_the_conversation_took_not_the_file_now(
         assert "waiver (operator grant) podman" in out and "waiver (operator grant) docker" not in out, out
     finally:
         s.close()
+
+
+def test_doctor_fails_the_unix_sockets_row_when_its_code_cannot_be_imported(tmp_path, monkeypatch):
+    """B1 L3 r1 B-L1 (codex LOW): an import failure passed the row as "not determinable"; levain run
+    cannot confine bash without that module either, so the row fails."""
+    from levain import doctor
+
+    monkeypatch.setitem(sys.modules, "levain.firing.confinement", None)   # import raises ImportError
+    (r,) = doctor._check_unix_sockets(_entity(tmp_path))
+    assert not r.ok and "not determinable" in r.detail
