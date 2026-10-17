@@ -148,16 +148,21 @@ USER_CONFIG_NAME = ".claude.json"
 CONFIG_DIR_NAMES = frozenset({".claude", ".codex", ".claude-plugin"})
 
 
-def names_config_dir(target: str, cwd: str, home: Path) -> bool:
+def _home_spellings(home: Path) -> frozenset[str]:
+    return frozenset({os.path.normpath(home).lower(), os.path.realpath(home).lower()})
+
+
+def names_config_dir(target: str, cwd: str, home: Path, homes: frozenset[str] | None = None) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) IS a directory agent config lives
     in (a ``.claude``, ``.codex`` or ``.claude-plugin`` directory, or the home directory, where ``.claude.json``
     is), or its file name is ``.claude.json`` wherever it sits (a server that joins a relative name to a root of
-    its own, home among them). Over-matching only sends the request to the human."""
+    its own, home among them). Over-matching only sends the request to the human. ``homes``: ``home``'s spellings,
+    computed once by a caller checking many targets."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
-    homes = {os.path.normpath(home).lower(), os.path.realpath(home).lower()}
+    homes = homes if homes is not None else _home_spellings(home)
     for p in (os.path.normpath(raw), os.path.realpath(raw)):
         low = p.lower()
         name = os.path.basename(low)
@@ -280,8 +285,9 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
     missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
     targets = _targets(tool_name, tool_input)
-    if targets is None:
+    if targets is None and not tool_name.startswith("mcp__"):
         return False
+    targets = targets or []
     extra: list[str] = []
     if tool_name.startswith("mcp__"):
         got = mcp_config_candidates(tool_input)
@@ -316,7 +322,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
             return True
     try:
-        return any(names_config_dir(target, cwd, Path(home)) for target in extra)
+        homes = _home_spellings(Path(home)) if extra else frozenset()
+        return any(names_config_dir(target, cwd, Path(home), homes) for target in extra)
     except (OSError, ValueError):
         return True
 

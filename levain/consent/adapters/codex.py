@@ -169,7 +169,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         targets: list[Any] | None = patch_targets(command)
         if targets is None:
             return True
-    elif tool_name.startswith("mcp__") and isinstance(tool_input, Mapping):
+    elif tool_name.startswith("mcp__"):
         # the Claude Code check reads the whole MCP input once (named fields, every-string candidates, config
         # directories); what is left per path is CODEX_HOME and any .codex/
         if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):

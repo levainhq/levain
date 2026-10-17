@@ -911,3 +911,21 @@ def test_the_scan_has_a_bound_and_tags_past_it():
     # 4095 values + the key "v" = 4096 strings, the most read; one more is past the bound
     assert not cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4095}, "/work/proj", home=Path("/home/u"))
     assert cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4096}, "/work/proj", home=Path("/home/u"))
+
+
+@pytest.mark.parametrize("inp", [
+    {"uri": "file:///work/proj/.claude/settings.json?raw=1"},  # L3 r1 codex: a query fileURLToPath drops
+    {"uri": " file:///work/proj/%2Eclaude/settings.json "},  # trim, then file:, then decode, composed
+    {"uri": "file://localhost/home/u/.claude.json#x"}, {"f": "%20.claude/settings.json%0A"},
+    ["~/.claude/settings.json"], "~/.claude/hooks/h.sh",  # an input that is not an object (L3 r1 glm)
+])
+def test_l3_r1_spellings_are_tagged(inp):
+    assert cc.targets_agent_config("mcp__x__write", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_the_budget_stops_the_walk_early():
+    """L3 r1 codex MED: 4095 percent-encoded file: strings of ~3.5 KiB built ~53 MiB before the total was checked."""
+    t0 = time.monotonic()
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["file:///" + "%61" * 1200] * 4095}, "/w", home=Path("/h"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": [0] * 20000}, "/w", home=Path("/h"))
+    assert time.monotonic() - t0 < 2

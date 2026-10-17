@@ -158,3 +158,9 @@ def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
                 {"name": ".claude.json"}):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home,
                                        codex_dir=tmp_path / "ch"), inp
+
+
+def test_a_codex_mcp_input_that_is_not_an_object_is_still_read(tmp_path):
+    for inp in ([".codex/config.toml"], [{"file": ".codex/config.toml"}], "file:///x/.codex/hooks.json?a=1"):
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=tmp_path / "h",
+                                       codex_dir=tmp_path / "ch"), inp

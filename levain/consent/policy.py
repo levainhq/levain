@@ -97,21 +97,50 @@ _CANDIDATE_MAX_DEPTH = 64
 _CANDIDATE_MAX_TOTAL = 256 * 1024
 
 
-def _spellings(value: str) -> list[str]:
-    """The paths one input string can reach a server as: cut at its first NUL (a C server stops there), also
-    with surrounding whitespace stripped, percent-decoded and with a ``file:`` scheme removed (a URI field), each as given and lexically normalised (a
-    server's ``path.resolve`` / ``abspath`` / ``filepath.Clean`` collapses ``./`` and ``..`` runs before it opens);
-    only the non-empty ones at most :data:`_CANDIDATE_MAX_LEN` long."""
-    from urllib.parse import unquote
+# a string longer than this is only trimmed and normalised (each linear in its length), never decoded
+_CANDIDATE_DECODE_MAX = 64 * 1024
+# the most spellings one string yields, and the most JSON nodes (strings, containers, scalars) one input holds
+_SPELLINGS_PER_STRING = 16
+_CANDIDATE_MAX_NODES = 4 * _CANDIDATE_MAX_COUNT
 
+
+def _decoded(form: str) -> list[str]:
+    """One decoding step of ``form``: trimmed, percent-decoded, and as a ``file:`` URI's path (its authority,
+    query and fragment dropped, the path percent-decoded, as Node's ``fileURLToPath`` and Python's ``url2pathname``
+    read it)."""
+    from urllib.parse import unquote, urlsplit
+
+    out = [form.strip()]
+    if "%" in form:
+        out.append(unquote(form))
+    lead = form.lstrip()
+    if lead[:5].lower() == "file:":
+        try:
+            out.append(unquote(urlsplit(lead).path))
+        except ValueError:
+            out.append(lead[5:])
+    return out
+
+
+def _spellings(value: str) -> list[str] | None:
+    """The paths one input string can reach a server as: cut at its first NUL (a C server stops there); then, to a
+    fixed point, trimmed, percent-decoded and read as a ``file:`` URI (:func:`_decoded`; a string over
+    :data:`_CANDIDATE_DECODE_MAX` is only trimmed); each as given and lexically normalised (a server's
+    ``path.resolve`` / ``abspath`` / ``filepath.Clean`` collapses ``./``, ``..`` and slash runs before it opens).
+    Only the non-empty ones at most :data:`_CANDIDATE_MAX_LEN` long are kept. ``None`` past
+    :data:`_SPELLINGS_PER_STRING` forms (the caller tags the request)."""
     head = value.split("\x00", 1)[0]
-    forms = [head] + ([head.strip()] if head.strip() != head else [])
-    if "%" in head:
-        forms.append(unquote(head))
-    for form in list(forms):
-        if form[:5].lower() == "file:":
-            rest = form[5:]
-            forms.append("/" + rest.lstrip("/") if rest.startswith("/") else rest)
+    forms = [head]
+    todo = [head]
+    while todo:
+        form = todo.pop()
+        for nxt in (_decoded(form) if len(form) <= _CANDIDATE_DECODE_MAX else [form.strip()]):
+            nxt = nxt.split("\x00", 1)[0]
+            if nxt not in forms:
+                if len(forms) >= _SPELLINGS_PER_STRING:
+                    return None
+                forms.append(nxt)
+                todo.append(nxt)
     out: list[str] = []
     for form in forms:
         for spelled in (form, os.path.normpath(form) if form else form):
@@ -124,27 +153,44 @@ def mcp_config_candidates(tool_input: Any) -> list[str] | None:
     """Every string in an MCP tool's input that could name a file, for agent-config tagging only (ruling 3b item 1):
     an MCP server can take its path in a field of any name (``filepath``, ``file``, a key of a path-to-content map,
     an item of a nested list), so tagging reads every string key and value at any depth, not only
-    :data:`MCP_PATH_FIELDS`, in each of its :func:`_spellings`. ``None`` (the caller tags the request) when the input
-    holds more than :data:`_CANDIDATE_MAX_COUNT` strings, nests deeper than :data:`_CANDIDATE_MAX_DEPTH`, or its
-    kept spellings total more than :data:`_CANDIDATE_MAX_TOTAL` characters. Over-matching only sends a request to the human; a grant's own criteria still read the named fields alone
-    (:func:`grant_targets`). A path a server builds from what no string holds whole (a root it was configured with,
-    an encoding other than these) is not seen: a known edge in the CHANGELOG."""
+    :data:`MCP_PATH_FIELDS`, in each of its :func:`_spellings`; the input need not be an object. ``None`` (the
+    caller tags the request), decided as the walk goes, when the input holds more than :data:`_CANDIDATE_MAX_COUNT`
+    strings or :data:`_CANDIDATE_MAX_NODES` nodes, nests deeper than :data:`_CANDIDATE_MAX_DEPTH`, a string has too
+    many spellings, or the kept spellings total more than :data:`_CANDIDATE_MAX_TOTAL` characters. Over-matching
+    only sends a request to the human; a grant's own criteria still read the named fields alone
+    (:func:`grant_targets`). This is best effort by construction: MCP declares no path fields (a tool's
+    annotations are untrusted, access control is the server's), so a path a server builds from what no string holds
+    whole (a root it was configured with, an encoding other than these) is not seen, a known edge in the
+    CHANGELOG."""
     out: list[str] = []
-    seen = 0
+    strings = nodes = total = 0
     stack: list[tuple[Any, int]] = [(tool_input, 0)]
     while stack:
         value, depth = stack.pop()
+        nodes += 1
+        if nodes > _CANDIDATE_MAX_NODES:
+            return None
         if isinstance(value, str):
-            seen += 1
-            if seen > _CANDIDATE_MAX_COUNT:
+            strings += 1
+            got = _spellings(value) if strings <= _CANDIDATE_MAX_COUNT else None
+            if got is None:
                 return None
-            out += _spellings(value)
+            total += sum(map(len, got))
+            if total > _CANDIDATE_MAX_TOTAL:
+                return None
+            out += got
         elif isinstance(value, (Mapping, list, tuple)):
-            if depth >= _CANDIDATE_MAX_DEPTH:
+            if depth >= _CANDIDATE_MAX_DEPTH or len(value) > _CANDIDATE_MAX_NODES:
                 return None
-            items = [x for kv in value.items() for x in kv] if isinstance(value, Mapping) else list(value)
-            stack.extend((x, depth + 1) for x in items)
-    return out if sum(map(len, out)) <= _CANDIDATE_MAX_TOTAL else None
+            for item in (value.items() if isinstance(value, Mapping) else value):
+                if isinstance(value, Mapping):
+                    stack.append((item[0], depth + 1))
+                    stack.append((item[1], depth + 1))
+                else:
+                    stack.append((item, depth + 1))
+            if len(stack) > _CANDIDATE_MAX_NODES:
+                return None
+    return out
 
 
 def grant_targets(tool_name: str, tool_input: Any) -> list[Any]:
