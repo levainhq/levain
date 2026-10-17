@@ -724,7 +724,7 @@ class SocketGrant:
 
 
 def grants_apply(system: str | None = None) -> bool:
-    """Whether operator grants are bound into bash's view here: Linux only, until levain's macOS tier (B2)."""
+    """Whether operator grants are bound into bash's view here: Linux only, until levain's macOS socket rule."""
     return (system or platform.system()) == "Linux"
 
 
@@ -1096,7 +1096,8 @@ GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not i
 
 
 HANDS_GRANTS_LINE = "operator grants: none (the entity's own user)"
-GRANTS_NOT_APPLIED_LINE = "operator grants: not applied on this platform (until B2)"
+GRANTS_NOT_APPLIED_LINE = ("operator grants: not applied on this platform "
+                           "(until levain's macOS socket rule)")
 
 
 @dataclass(frozen=True)
