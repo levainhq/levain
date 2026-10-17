@@ -327,3 +327,69 @@ def test_a_change_of_kind_is_a_loosen():
     assert auth.classify(policy_of(plain), policy_of(declared)) == auth.LOOSEN
     # narrower in effect, but across kinds nothing is provably tighter: fail closed
     assert auth.classify(policy_of(declared), policy_of(plain)) == auth.LOOSEN
+
+
+# L3 r1 (codex HIGH): an MCP tool whose own name is a shell name (mcp__shell__exec_command) was matched against
+# CONSENT_SHELL_TOOLS by its full name, so a consent-mcp grant declaring it `command=str` answered `rm -rf`.
+_SHELL_MCP = sorted({f"mcp__{server}__{case(name)}" for name in auth.CONSENT_SHELL_TOOLS
+                     for server in ("shell", "x") for case in (str.lower, str.upper, str.title)})
+
+
+def test_a_declared_mcp_shell_tool_is_refused_at_create(scratch, capsys):
+    tool = "mcp__shell__exec_command"
+    assert scratch.create("--mcp-field", f"{tool}:command=str", tool=tool, gid="mcp-shell") == 1
+    assert "names the shell tool" in capsys.readouterr().err
+    assert "mcp-shell" not in scratch.state().policy.grants
+
+
+def test_a_declared_mcp_shell_tool_signed_before_the_rule_answers_nothing(scratch, monkeypatch):
+    tool = "mcp__shell__exec_command"
+    with monkeypatch.context() as m:
+        m.setattr(auth, "_consent_mcp_tool_check", lambda grants, after="": None)
+        assert scratch.create("--mcp-field", f"{tool}:command=str", tool=tool, gid="mcp-shell") == 0
+    assert "mcp-shell" in scratch.state().policy.grants
+    assert scratch.ask({"command": "rm -rf /tmp/x"}, tool=tool) is None
+
+
+@pytest.mark.parametrize("tool", _SHELL_MCP)
+def test_every_shell_name_as_an_mcp_leaf_is_refused_at_append_and_at_decision(tool):
+    grant = _consent(tools=[tool], mcp_fields={tool: {"command": "str"}})
+    problem = auth.consent_grant_tool_problem(grant, tool)
+    assert problem is not None and "names the shell tool" in problem
+    assert "names the shell tool" in (auth.consent_tool_problem("claude_code", tool) or "")
+    with pytest.raises(auth.AuthorityError, match="names the shell tool"):
+        auth._consent_mcp_tool_check([grant])
+    with pytest.raises(auth.AuthorityError, match="names the shell tool"):
+        auth._consent_tool_check([{k: v for k, v in grant.items() if k != "mcp_fields"}])
+
+
+@pytest.mark.parametrize("tool", ["mcp__a__b__exec_command", "MCP__shell__bash", "mcp__shell__Bash"])
+def test_a_shell_leaf_behind_a_server_name_with_a_double_underscore_or_any_case_is_refused(tool):
+    assert "names the shell tool" in (auth.consent_grant_tool_problem(
+        _consent(tools=[tool], mcp_fields={tool: {"command": "str"}}), tool) or "")
+
+
+def test_an_mcp_tool_whose_name_only_contains_a_shell_name_is_not_a_shell():
+    for tool in ("mcp__fsw__bash_history_reader", "mcp__shell__run"):
+        assert not auth._consent_shell_name(tool), tool
+
+
+@pytest.mark.parametrize("tool", ["mcp__shell__exec_command", "mcp__terminal__write_stdin", "mcp__x__Bash"])
+def test_a_loosen_to_a_declared_mcp_shell_tool_is_refused(declared, tool):
+    pol = auth._thaw(declared.state().policy.as_dict())
+    g = pol["grants"]["declared-write"]
+    g["tools"] = sorted({*g["tools"], tool})
+    g["mcp_fields"] = {**g["mcp_fields"], tool: {"command": "str"}}
+    with pytest.raises(auth.AuthorityError, match="names the shell tool"):
+        declared.link({"op": "loosen", "policy": pol})
+
+
+def test_a_renew_of_a_declared_mcp_shell_tool_signed_before_the_rule_is_refused(scratch, monkeypatch):
+    tool = "mcp__terminal__write_stdin"
+    with monkeypatch.context() as m:
+        m.setattr(auth, "_consent_mcp_tool_check", lambda grants, after="": None)
+        assert scratch.create("--mcp-field", f"{tool}:chars=str", tool=tool, gid="mcp-shell") == 0
+    t = datetime.now(timezone.utc)
+    with pytest.raises(auth.AuthorityError, match="names the shell tool"):
+        scratch.link({"op": "renew", "grant_id": "mcp-shell", "expires_at": utc_stamp(t + timedelta(hours=3)),
+                      "signed_at": utc_stamp(t)}, at=t)
