@@ -909,3 +909,15 @@ def test_the_banner_no_longer_says_no_operator_socket_list_exists(tmp_path, caps
     assert "No operator socket list exists yet" not in out
     assert "operator socket list (grants.json) applies on Linux only" in out
     assert "on Linux, through the session's scoped agent" in out
+
+
+def test_the_lines_a_user_reads_carry_no_internal_plan_label(grants, monkeypatch):
+    """L2 integration (public source): a user cannot know what "B2" or "B2b" is."""
+    import re
+
+    monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))
+    grants([])
+    agent, why = conf.start_session_ssh_agent("e", system="Darwin")
+    lines = [*conf.unix_socket_lines(None, system="Darwin"), why, conf._ssh_agent.DARWIN_LINE,
+             conf._ssh_agent.confinement_refusal("Darwin")]
+    assert agent is None and not [ln for ln in lines if re.search(r"\bB\d", ln)], lines

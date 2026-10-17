@@ -1,4 +1,4 @@
-"""levain.firing.ssh_agent — the scoped ssh agent bash uses (B2a; design 1012-gpgesc rev 6 §7.2, §8.5).
+"""levain.firing.ssh_agent — the scoped ssh agent bash uses.
 
 WHY ONE OF OUR OWN. bash never gets the operator's ``$SSH_AUTH_SOCK``: that agent holds every key, for
 every host, for as long as it runs. Each entity session gets its own ``ssh-agent`` instead, started by
@@ -578,7 +578,7 @@ def confinement_refusal(system: str | None = None) -> str | None:
     process that has it, or cannot tell, is refused. Off Linux there is no scoped agent to add to yet."""
     system = system or platform.system()
     if system != "Linux":
-        return f"levain's scoped ssh agent is not wired on {system} yet (B2b)"
+        return f"levain's scoped ssh agent is not wired on {system} yet (until levain's macOS socket rule)"
     nnp = _no_new_privs()
     if nnp is None:
         return "this process cannot read /proc/self/status, so it cannot show it is outside a levain confinement"
@@ -812,8 +812,8 @@ def _add_key(key: Path, hosts: list[str], *, lifetime: int, session: str | None,
 
 # --- the run/doctor lines (D2) --------------------------------------------------------------------
 
-DARWIN_LINE = ("ssh agent: $SSH_AUTH_SOCK is passed to bash; macOS has no unix-socket rule until levain's "
-               "macOS tier (B2b), so bash running as you can reach your agent")
+DARWIN_LINE = ("ssh agent: $SSH_AUTH_SOCK is passed to bash; levain has no unix-socket rule on macOS yet, "
+               "so bash running as you can reach your agent")
 _NO_AGENT_TAIL = "$SSH_AUTH_SOCK is not passed to bash, so git over ssh inside bash fails"
 
 
