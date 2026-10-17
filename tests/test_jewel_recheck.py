@@ -393,8 +393,8 @@ def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_p
     vault = entity / ".levain" / "vaultdir"
     real_plan = conf._bwrap_plan
 
-    def plan_then_race(policy):
-        out = real_plan(policy)
+    def plan_then_race(policy, *args, **kwargs):
+        out = real_plan(policy, *args, **kwargs)
         vault.mkdir()                      # the host creates it right after the plan read the disk
         return out
 
