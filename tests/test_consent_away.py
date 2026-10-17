@@ -157,8 +157,9 @@ def test_a_fifo_or_oversized_or_deep_file_is_refused_without_blocking(qdir):
     os.mkfifo(path)
     assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
     path.unlink()
-    path.write_text("[" * 20000 + "]" * 20000)
-    assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
+    path.write_text("[" * 20000 + "]" * 20000)  # show: what the hook reads (defaults); on: refused
+    assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "on", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
     path.write_text(json.dumps({"x": "a" * (70 * 1024)}))
     assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
 
@@ -203,3 +204,8 @@ def test_a_huge_integer_hold_reads_as_malformed_everywhere(qdir, cockpit, action
 def test_both_hooks_and_the_verb_share_one_reader(qdir):
     (qdir / cx.SETTINGS_NAME).write_text("[" * 20000 + "]" * 20000)
     assert cx.load_settings(qdir) == cc.AdapterSettings()  # deep nesting -> defaults, no RecursionError
+
+
+def test_a_huge_integer_hold_from_a_library_caller_is_a_value_error(qdir):
+    with pytest.raises(ValueError):
+        away.set_away(qdir, "claude_code", True, int("9" * 400))

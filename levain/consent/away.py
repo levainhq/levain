@@ -133,11 +133,11 @@ def why_unanswerable(adapter_settings: Any) -> str | None:
 def set_away(qdir: Path, agent: str, on: bool, hold: float | None = None) -> dict[str, Any]:
     """Turn ``agent``'s away mode on (holding up to ``hold`` seconds; default: the file's hold when it is above
     zero, else the agent's :data:`DEFAULT_HOLDS`) or off; ``on`` refuses when :func:`why_unanswerable` names a
-    reason (a hold nobody can answer only delays the agent), by an atomic replace of its settings file; returns the new settings.
+    reason (a hold nobody can answer only delays the agent), by an atomic replace of its settings file; returns
+    the new settings.
     Raises ``ValueError`` for a hold outside (0, :data:`MAX_HOLD`], a missing settings file, or a queue directory
     that breaks the queue's own rule (``QueueStoreError``)."""
-    if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold)
-                             or not 0 < hold <= MAX_HOLD):
+    if hold is not None and _valid_hold(hold) is None:
         raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
     check_queue_dir(qdir)
     got = _read_keyed(qdir, agent)

@@ -1998,7 +1998,16 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     rc, seen = 0, 0
     for agent in agents:
         try:
-            if away.read(qdir, agent) is None:
+            try:
+                present = away.read(qdir, agent) is not None
+            except ValueError as e:
+                if args.action != "show" or "does not parse" not in str(e):
+                    raise
+                # the hook reads a file that does not parse as the defaults; show says both
+                print(f"{agent}: away mode off (the hook reads the defaults: {e})")
+                seen += 1
+                continue
+            if not present:
                 msg = f"{agent}: no settings file in {qdir} (`levain init` with the consent hook on writes it)"
                 if args.agent == "all":
                     print(f"{agent}: skipped, no settings file")
