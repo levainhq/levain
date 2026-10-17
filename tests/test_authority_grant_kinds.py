@@ -130,7 +130,7 @@ def test_the_inert_grant_renews_and_revokes_but_is_never_created_or_changed_here
     log.link({"op": "loosen", "policy": pol})            # the push grant carried unchanged
     assert main(["consent", "grant", "list", "--data-root", str(log.root)]) == 0
     out = capsys.readouterr().out
-    assert f"{PUSH}  kind push  until" in out and "held inert" in out
+    assert f"{PUSH!r}  kind push  until" in out and "held inert" in out
     assert main(["consent", "grant", "revoke", PUSH, "--data-root", str(log.root), "--signing-key",
                  str(log.key)]) == 0
     assert PUSH not in log.state().policy.grants
@@ -168,3 +168,61 @@ def test_a_known_kind_stays_closed(tmp_path):
          "postures": ["default"], "expires_at": utc_stamp(datetime(2026, 10, 18, tzinfo=timezone.utc)), "extra": 1}
     with pytest.raises(auth.AuthorityError, match="must carry exactly"):
         auth._validate_grant(g, "grant")
+
+
+def test_a_tighten_declared_change_of_an_inert_grant_is_refused_at_replay(log, monkeypatch):
+    """A newer writer that narrows a grant of a kind this reader does not know, under an op declaring TIGHTEN, is
+    read here as a loose change: the op/delta mismatch stops the log at that seq (fail-closed; the rule is on
+    :func:`levain.authority._inert_grant_change`)."""
+    def narrow_as_tight(o, n, o_exp, n_exp):
+        return "tight" if len(n["branches"]) < len(o["branches"]) else auth._inert_grant_change(o, n, o_exp, n_exp)
+
+    with monkeypatch.context() as m:
+        m.setitem(auth._OP_FIELDS, "narrow", auth._OP_FIELDS["loosen"])
+        m.setitem(auth._OP_DELTAS, "narrow", {auth.TIGHTEN})
+        real = auth._apply_policy_op
+        m.setattr(auth, "_apply_policy_op", lambda p, rec: real(p, dict(rec, op="loosen")) if rec["op"] == "narrow"
+                  else real(p, rec))
+        with monkeypatch.context() as w:                  # the newer writer knows push, and calls a narrowing tight
+            w.setattr(auth, "_GRANT_KINDS", MappingProxyType({**auth._GRANT_KINDS, "push": auth._GrantKind(
+                validate=auth._validate_inert_grant, change=narrow_as_tight)}))
+            pol = auth._thaw(log.state().policy.as_dict())
+            pol["grants"][PUSH]["branches"] = []
+            log.link({"op": "narrow", "policy": pol})
+        with pytest.raises(auth.ReplayError, match="narrow link computes to a loosen change"):
+            log.state()
+
+
+def test_one_grant_list_is_one_snapshot(log, monkeypatch):
+    """``consent grant list`` partitions ONE capture into (consent, inert): a link landing between two captures
+    cannot show a grant twice or not at all."""
+    from levain.consent import grants as g
+
+    calls = []
+    real = g._capture
+    monkeypatch.setattr(g, "_capture", lambda *a, **k: calls.append(1) or real(*a, **k))
+    consent, inert = g.grant_listing(log.root, now=datetime.now(timezone.utc))
+    assert [c.id for c in consent] == ["undeclared-read"] and [i[0] for i in inert] == [PUSH]
+    assert len(calls) == 1
+    calls.clear()
+    g.list_grants(log.root, now=datetime.now(timezone.utc))
+    g.list_inert_grants(log.root, now=datetime.now(timezone.utc))
+    assert len(calls) == 2                                # each public function is one capture of its own
+
+
+def test_an_inert_grant_id_is_printed_as_a_repr(log, monkeypatch, capsys):
+    from levain.consent import grants as g
+    real = g.grant_listing
+    monkeypatch.setattr("levain.consent.grants.grant_listing", lambda *a, **k: (
+        lambda c, i: (c, [("bad\x1b[31mid", *i[0][1:])]))(*real(*a, **k)))
+    assert main(["consent", "grant", "list", "--data-root", str(log.root)]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "'bad\\x1b[31mid'" in out
+
+
+def test_a_replay_key_error_names_the_missing_key(log, monkeypatch):
+    def boom(*a, **k):
+        raise KeyError("branches")
+    monkeypatch.setattr(auth, "_apply_op", boom)
+    with pytest.raises(auth.ReplayError, match=r"malformed field \(missing key 'branches'\)"):
+        log.state()

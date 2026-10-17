@@ -35,10 +35,9 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import CONSENT_GRANT_KIND, consent_mcp_input_fits, consent_root_problem, consent_tool_problem
+from levain.authority import consent_grant, consent_mcp_input_fits, consent_root_problem, consent_tool_problem
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
-from levain.authority import consent_grant
 
 if TYPE_CHECKING:
     from levain.consent.queue import ConsentQueue, Decision

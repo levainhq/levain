@@ -898,7 +898,10 @@ def _consent_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dat
 
 def _inert_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
     """A change to a grant of a kind this levain does not know: ``renew`` when only its expiry moved later, else
-    ``loose`` (never ``tight``: what would be narrower is the newer levain's to say)."""
+    ``loose`` (never ``tight``: what would be narrower is the newer levain's to say). Fail-closed on purpose, and the
+    rule a newer writer is held to: it changes a grant of a kind an older reader does not know only by create/loosen,
+    renew or revoke; any new op, or a change that declares TIGHTEN, is a log FORMAT bump. An older reader replays a
+    tighten-declared change to such a grant as an op/delta mismatch and stops the log at that seq."""
     rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
     return "renew" if rest(o) == rest(n) and n_exp > o_exp else "loose"
 
@@ -1140,7 +1143,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         raise ReplayError(seq, str(exc)) from None
     except (TypeError, ValueError, KeyError, UnicodeError, OverflowError, RecursionError) as exc:
         # a field of a shape no rule above anticipated: still a refusal at this seq, never an escape
-        raise ReplayError(seq, f"a malformed field ({type(exc).__name__})") from None
+        detail = f"missing key {exc.args[0]!r}" if isinstance(exc, KeyError) and exc.args else type(exc).__name__
+        raise ReplayError(seq, f"a malformed field ({detail})") from None
 
     if check_signature:
         ok = verify_link_sig(_message(prev, row.record), row.signature, public_key=signer.public_key,
