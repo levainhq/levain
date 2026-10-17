@@ -5390,12 +5390,13 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     return _bwrap_plan(policy)[0]
 
 
-def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
+def _bwrap_plan(policy: CrownJewelsPolicy,
+                runtime_roots: list[Path] | None = None) -> tuple[list[str], list[str]]:
     """:func:`_bwrap_plan_impl`, with a filesystem error while inspecting the host (an unlistable
     store, an entry vanishing mid-walk) turned into the fail-closed :class:`ConfinementError` every
     caller handles — not a raw ``OSError`` that crashes the tool call (codex, L3 r1)."""
     try:
-        return _bwrap_plan_impl(policy)
+        return _bwrap_plan_impl(policy, runtime_roots)
     except ConfinementError:
         # A deliberate refusal already names its cause. ConfinementError is a RuntimeError, so
         # without this it was re-wrapped as "could not inspect the host", a false reason.
@@ -5743,8 +5744,8 @@ def _runtime_roots() -> list[Path]:
     return [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
 
 
-def _runtime_view(policy: CrownJewelsPolicy,
-                  dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
+def _runtime_view(policy: CrownJewelsPolicy, dirmngr: list[Path] | None = None,
+                  roots: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
     """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
     user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and nothing of the host's
     comes back into it on its own: no agent socket is bound back because it is running or named in the
@@ -5765,8 +5766,11 @@ def _runtime_view(policy: CrownJewelsPolicy,
     comes back as its file's content, read-only (a sibling it leads to is read-only too). The costs: gpg inside bash cannot
     replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
     and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
-    does not see the lock."""
-    roots = _runtime_roots()
+    does not see the lock.
+
+    ``roots``: the runtime dirs as the caller read them (:func:`_runtime_roots`), so one spawn's views,
+    grant binds, agent bind and ``SSH_AUTH_SOCK`` are made from one value; read here when not given."""
+    roots = list(roots) if roots is not None else _runtime_roots()
     for root in roots:
         for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), Path.home().resolve()):
             if held == root or held.is_relative_to(root):
@@ -5829,7 +5833,8 @@ def _runtime_view(policy: CrownJewelsPolicy,
     return ops, roots + homes, pins
 
 
-def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
+def _bwrap_plan_impl(policy: CrownJewelsPolicy,
+                     runtime_roots: list[Path] | None = None) -> tuple[list[str], list[str]]:
     """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
     with two views, never two builders that can drift (the ``two_things_that_should_be_one`` class
@@ -6230,7 +6235,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     denied_both_targets = set(masked_both)
     # Read ONCE: the views and the masks of step (7b) must see the same dirmngr sockets.
     dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
-    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr)
+    # ``runtime_roots`` given: the spawn's one read of the runtime dirs (`BwrapProvider._prepare`), which
+    # its grant, agent and environment steps use too; the views here are made from that same value.
+    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr, runtime_roots)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
@@ -8738,7 +8745,7 @@ class BwrapProvider(ConfinementProvider):
                  grants: tuple[SocketGrant, ...] = (), gpg_view: Path | None = None,
                  ssh_agent: "_ssh_agent.ScopedAgent | None" = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
-        ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
+        ``(argv, create_first, mounted, unmounted, manifest, runtime_roots)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
         # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
         # and the manifest (an absent root created as a directory, say) would be recorded in its new
@@ -8754,7 +8761,11 @@ class BwrapProvider(ConfinementProvider):
         # be missing from the step (0) view (codex, closing pass). Not a jail — reach is
         # default-allowed; Popen needs it to exist.
         policy.workspace.mkdir(parents=True, exist_ok=True)
-        argv, create_first = _bwrap_plan(policy)
+        # The runtime dirs, read ONCE for this spawn: the plan's views, the grant and agent binds, and
+        # the shell's SSH_AUTH_SOCK are all made from this one value (B1 L3 r1: a second read could see
+        # another XDG_RUNTIME_DIR answer, binding a socket into a dir that has no view).
+        runtime_roots = _runtime_roots()
+        argv, create_first = _bwrap_plan(policy, runtime_roots)
         mounted, unmounted = _mount_plan_paths(argv, policy)
         if hands is not None:
             # The policy was narrowed to the view's jewels before this plan (`_spawn_bwrap`); what bwrap
@@ -8785,11 +8796,11 @@ class BwrapProvider(ConfinementProvider):
         # checked now and bound after every view, each passed to the stub by its view path; the default
         # grant (/dev/log) is bound on both floors. On every tier the bind happens; the tier line says
         # what is enforced (`unix_socket_lines`).
-        grant_ops, grant_views = _grant_ops(grants, _runtime_roots(), gpg_view) if grants else ([], [])
+        grant_ops, grant_views = _grant_ops(grants, runtime_roots, gpg_view) if grants else ([], [])
         # The session's scoped ssh agent, operator floor only: bound like a grant into the runtime view and
         # passed to the stub by that path, its socket watched like a grant's (a replaced one closes the shell).
         if ssh_agent is not None and hands is None:
-            agent_ops, agent_view = _ssh_agent_ops(ssh_agent, _runtime_roots())
+            agent_ops, agent_view = _ssh_agent_ops(ssh_agent, runtime_roots)
             grant_ops, grant_views = [*grant_ops, *agent_ops], [*grant_views, agent_view]
         landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
                                        canary=canary.view_path if canary is not None else None,
@@ -8835,7 +8846,7 @@ class BwrapProvider(ConfinementProvider):
             # Only what the hands view shows is watched: a jewel outside it (the operator editing
             # ~/.ssh/config, say) is absent from bash's view and must not close the shell.
             manifest = {q: v for q, v in manifest.items() if _in_hands_view(q, hands)}
-        return argv, create_first, mounted, unmounted, manifest
+        return argv, create_first, mounted, unmounted, manifest, runtime_roots
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """The bwrap invocation as shell-quoted text.
@@ -8959,7 +8970,7 @@ class BwrapProvider(ConfinementProvider):
                 grants = tuple(grants) if hands is None else ()
                 gpg_view = (gpg_agent_view_path(env if env is not None else _default_shell_env())
                             if any(g.gpg_extra for g in grants) else None)
-                argv, create_first, mounted, unmounted, manifest = self._prepare(
+                argv, create_first, mounted, unmounted, manifest, runtime_roots = self._prepare(
                     policy, made, hands, relay.sockdir if relay is not None else None, canary, tier,
                     grants, gpg_view, ssh_agent)
             finally:
@@ -8992,7 +9003,7 @@ class BwrapProvider(ConfinementProvider):
             # because an IdentityAgent in the operator's ~/.ssh/config, which bash reads, overrides
             # $SSH_AUTH_SOCK, and a command-line -o is the first value obtained, so it wins (L2 #3).
             # Plain `ssh` in bash still reads ~/.ssh/known_hosts and config (no variable reaches it).
-            root = _runtime_roots()[0]
+            root = runtime_roots[0]   # the root `_prepare` bound the agent under (`_ssh_agent_ops`)
             shell_env["SSH_AUTH_SOCK"] = str(_ssh_agent.view_socket(root))
             if "GIT_SSH_COMMAND" not in shell_env and "GIT_SSH" not in shell_env:
                 shell_env["GIT_SSH_COMMAND"] = git_ssh_command(root)

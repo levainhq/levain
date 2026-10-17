@@ -436,6 +436,30 @@ def test_the_spawn_binds_each_grant_and_hands_the_stub_its_view_path(rd, grants,
             s.close()
 
 
+def test_one_spawn_reads_the_runtime_dirs_once_and_every_step_uses_that_value(rd, grants, tmp_path, monkeypatch):
+    """B1 L3 r1 B-M2: the plan's views and the grant binds were made from two reads of the runtime dirs.
+    A second read that answers differently (XDG_RUNTIME_DIR changed between them) would bind a socket
+    under a dir that has no view; now the spawn reads once and passes that value down."""
+    srv = _listen(rd / "podman" / "p.sock")
+    reads = []
+    real = conf._runtime_roots
+
+    def counted():
+        reads.append(1)
+        return real()
+
+    monkeypatch.setattr(conf, "_runtime_roots", counted)
+    grants([{"path": str(rd / "podman" / "p.sock"), "name": "podman", "why": "builds"}])
+    try:
+        sh = _spawn(tmp_path, monkeypatch, {"PATH": "/usr/bin"})
+        assert len(reads) == 1, f"the runtime dirs were read {len(reads)} times in one spawn"
+        argv = sh._argv
+        assert ["--perms", "0700", "--tmpfs", str(rd)] == argv[argv.index(str(rd)) - 3:argv.index(str(rd)) + 1]
+        sh.close()
+    finally:
+        srv.close()
+
+
 def test_a_grant_that_does_not_resolve_refuses_the_spawn_naming_it(rd, grants, tmp_path, monkeypatch):
     grants([{"path": str(rd / "podman" / "gone.sock"), "name": "podman", "why": "builds"}])
     with pytest.raises(ConfinementError, match="operator grant 'podman'.*cannot be opened"):
