@@ -89,20 +89,21 @@ def tier_for(abi):
     return "T9" if abi >= UNIX_RESOLVE_ABI else "T6" if abi >= SCOPE_ABI else "T0"
 def plan(abi, grants=(), private_tmp=None):
     # (tier, ruleset_attr bytes or None, [(path, access, kind)]): the ruleset for THIS abi only.
-    # T9 handles only connect-relevant rights. REFER is handled and granted beneath "/": the kernel
-    # documentation says of LANDLOCK_ACCESS_FS_REFER "This is the only access right which is denied by
-    # default by any ruleset, even if the right is not specified as handled at ruleset creation time",
-    # so without the grant every rename or link across directories would fail, a change to what bash
-    # may do with files. "The reparented file may not gain more access rights in the destination
-    # directory" (EXDEV) binds only where the unix-resolve right differs: the granted socket inodes and
-    # the private tmp, when one is given.
+    # T6 scopes (abstract sockets, signals); T9 also handles the connect-relevant right. On BOTH, REFER
+    # is handled and granted beneath "/": the kernel documentation says of LANDLOCK_ACCESS_FS_REFER
+    # "This is the only access right which is denied by default by any ruleset, even if the right is
+    # not specified as handled at ruleset creation time", so without the grant every rename or link
+    # across directories would fail (EXDEV), a change to what bash may do with files; a T6 scope-only
+    # ruleset is a ruleset too. REFER exists from ABI 2, below T6. "The reparented file may not gain
+    # more access rights in the destination directory" (EXDEV) binds only where the unix-resolve right
+    # differs: on T9 the granted socket inodes and the private tmp, when one is given; never on T6.
     tier = tier_for(abi)
     if tier == "T0":
         return tier, None, []
     scoped = SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
-    if tier == "T6":
-        return tier, struct.pack("=QQQ", 0, 0, scoped), []
     rules = [("/", FS_REFER, "dir")]
+    if tier == "T6":
+        return tier, struct.pack("=QQQ", FS_REFER, 0, scoped), rules
     rules += [(g, FS_RESOLVE_UNIX, "socket") for g in grants]
     if private_tmp is not None:
         rules.append((private_tmp, FS_RESOLVE_UNIX, "dir"))

@@ -32,12 +32,23 @@ def test_below_abi_6_there_is_no_ruleset_at_all(abi):
 
 
 @pytest.mark.parametrize("abi", [6, 8])
-def test_abi_6_to_8_scopes_only_and_never_handles_the_unix_resolve_right(abi):
+def test_abi_6_to_8_scopes_and_never_handles_the_unix_resolve_right(abi):
     tier, attr, rules = L.plan(abi, ["/run/agent.sock"], "/tmp/private")
     fs, net, scoped = struct.unpack("=QQQ", attr)
-    assert tier == "T6" and rules == []
-    assert fs == 0 and net == 0
+    assert tier == "T6"
+    assert not fs & NS["FS_RESOLVE_UNIX"] and net == 0
     assert scoped == NS["SCOPE_ABSTRACT_UNIX_SOCKET"] | NS["SCOPE_SIGNAL"]
+
+
+@pytest.mark.parametrize("abi", [6, 8])
+def test_abi_6_to_8_handles_refer_and_grants_it_beneath_root_so_renames_work(abi):
+    """B1 r1 B-M1: any enforced ruleset denies REFER unless granted (kernel landlock.rst), so a scope-only
+    T6 ruleset made `mv ws/a ws/sub/a` fail EXDEV. REFER is handled and granted beneath "/", as on T9,
+    and nothing else: no socket or private-tmp rule on T6. Plan only; the rename itself is the VM's."""
+    tier, attr, rules = L.plan(abi, ["/run/agent.sock"], "/tmp/private")
+    fs, _net, _scoped = struct.unpack("=QQQ", attr)
+    assert fs == NS["FS_REFER"]
+    assert rules == [("/", NS["FS_REFER"], "dir")]
 
 
 @pytest.mark.parametrize("abi", [9, 10])
