@@ -245,3 +245,144 @@ def test_a_page_without_its_token_draws_no_card(tmp_path, monkeypatch):
             {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('#levain-modal [data-consent-proposal]').length), 1500))"},
         ])
     assert out["values"][-1] == 0
+
+
+# ---- L3 r1 fixes (head triage 1017+4) -------------------------------------------------------------------------
+
+def test_f2_a_busy_queue_does_not_crowd_out_the_denial_or_the_allows(seed, monkeypatch):
+    import levain.consent.listing as listing
+
+    monkeypatch.setattr(listing, "HISTORY_CAP", 8)
+    seed.decide("denied", ago=timedelta(days=12))
+    for i in range(3):
+        seed.decide(ago=timedelta(days=10, hours=i), cwd="/work/other")
+    for i in range(8):                      # newer terminal rows that are not decisions: they must not crowd anything out
+        seed.decide("withdrawn", via=None, cwd="/work/noise", ago=timedelta(hours=1 + i))
+    for i in range(3):                      # three newer allows of the denied key and cap-many newer allows of another
+        seed.decide(ago=timedelta(days=1, hours=i))
+    assert [p.workspace for p in seed.propose()] == ["/work/other"]    # WS carries a denial: withdrawn, not dropped
+    kept = {(e.state) for e in read_history(seed.dir, now=NOW).recent}
+    assert kept <= {"allowed", "denied"}
+
+
+def test_f2_the_allows_survive_a_cap_filled_with_newer_allows_of_other_keys(seed, monkeypatch):
+    import levain.consent.listing as listing
+
+    monkeypatch.setattr(listing, "HISTORY_CAP", 4)
+    for i in range(3):
+        seed.decide(ago=timedelta(days=9, hours=i), cwd="/work/old")
+    for i in range(6):
+        seed.decide("withdrawn", via=None, ago=timedelta(hours=1 + i))
+    assert [p.workspace for p in seed.propose()] == ["/work/old"]
+
+
+def test_f3_an_mcp_tool_with_an_empty_server_is_never_proposed(seed):
+    for _ in range(3):
+        seed.decide(tool="mcp____read_text_file", tool_input={"path": f"{WS}/a"})
+    assert seed.propose() == []
+
+
+def test_f4_a_tie_in_decided_at_picks_the_later_row(seed):
+    import dataclasses
+
+    from levain.consent.listing import ConsentEntry, ConsentListing
+
+    for _ in range(4):
+        seed.decide()
+    base = [e for e in read_history(seed.dir, now=NOW).recent]
+    at = base[0].decided_at
+
+    def listing(grant_id: str, hand_id_base: str) -> ConsentListing:
+        rows = [ConsentEntry(dataclasses.replace(e.request, id=f"{hand_id_base}{i}"), "allowed", "signature", "fp", None, at)
+                for i, e in enumerate(base[:3])]
+        rows.append(ConsentEntry(dataclasses.replace(base[3].request, id=grant_id), "allowed", "grant", None, "g1", at))
+        return ConsentListing(recent=tuple(rows[::-1]))     # the input order must not decide
+
+    assert propose(listing("zzz", "a")) == []               # the grant row is the later: it is already answering
+    assert len(propose(listing("000", "a"))) == 1           # the hand row is the later: still proposed
+
+
+def test_f5_the_route_reads_the_directory_the_server_was_given(seed, monkeypatch, tmp_path):
+    import threading
+    from types import SimpleNamespace
+
+    import levain.web_server as ws
+
+    for _ in range(3):
+        seed.decide()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("LEVAIN_HOME", str(elsewhere))           # the default queue is a different (empty) one
+    reader = (lambda now: read_listing(seed.dir, now=now))
+    reader.directory = seed.dir
+    h = ws._Handler.__new__(ws._Handler)
+    sent: list = []
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=reader)
+    h._off_box_token_valid = lambda: True
+    h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
+    h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
+    assert sent[0][0] == 200 and [p["tool"] for p in sent[0][1]["proposals"]] == ["Edit"]
+    assert ws._consent_reader().directory is None               # the default reader: the default queue
+
+
+@needs_browser
+def test_f1_a_page_with_only_old_history_shows_the_card(tmp_path, monkeypatch):
+    seed = Seed(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    for i in range(3):
+        seed.decide(ago=timedelta(days=3 + i))        # decided days ago: no pending row, nothing in the last 24 h
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": f"{_CARDS}.length === 1"},
+            {"eval": f"{_CARDS}[0].querySelector('.consent-code').textContent"},
+        ])
+    assert out["values"][-1].startswith("levain consent grant create --agent claude_code --tool Edit ")
+
+
+@needs_browser
+def test_f6_a_rejected_read_is_not_cached_for_thirty_seconds(tmp_path, monkeypatch):
+    seed = Seed(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    for i in range(3):
+        seed.decide(ago=timedelta(days=3 + i))
+    _root, src, _ids = _install(tmp_path)
+    close = "(document.querySelector('#levain-modal .modal-close, #levain-modal [data-close], #levain-modal button.close')||{click(){}}).click()"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE},
+            # the first proposals read is refused; the second (the view reopened) must read again, not reuse the failure
+            {"eval": "(() => { const f = window.fetch; let n = 0; window.__calls = 0; window.fetch = function (u, o) {"
+                     " if (String(u).includes('proposals.json')) { window.__calls++; if (n++ === 0) return Promise.reject(new TypeError('boom')); }"
+                     " return f.apply(this, arguments); }; return 1; })()"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": "window.__calls >= 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
+            {"eval": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": f"{_CARDS}.length === 1"},
+            {"eval": "window.__calls"},
+        ])
+    assert out["values"][-1] == 2
+
+
+@needs_browser
+def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path, monkeypatch):
+    seed = Seed(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    for i in range(3):
+        seed.decide(ago=timedelta(hours=2 + i))
+    seed.clock[0] = datetime.now(timezone.utc)
+    seed.q.file(agent="claude_code", agent_session_id="live", tool_name="Edit", tool_input={"file_path": "/w/a"},
+                cwd="/w", hold=timedelta(minutes=30), event_id="live")
+    _root, src, _ids = _install(tmp_path)
+    heads = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].map(h => h.textContent.trim().toLowerCase())"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": f"{_CARDS}.length === 1"},
+            {"eval": heads},
+        ])
+    assert out["values"][-1] == ["agents waiting on you", "standing rule proposals", "resolved"]
