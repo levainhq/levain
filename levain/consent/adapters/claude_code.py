@@ -237,12 +237,12 @@ def _a_consent_grant_in_force(grants: Iterable[Any]) -> bool:
     for every request (L3 r2 codex MED: an expired or other-kind grant answers nothing)."""
     from datetime import datetime, timezone
 
-    from levain.authority import CONSENT_GRANT_KIND
+    from levain.authority import consent_grant
     from levain.cockpit.consent import parse_stamp
 
     now = datetime.now(timezone.utc)
     for grant in grants:
-        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+        if not consent_grant(grant):
             continue
         try:
             if now < parse_stamp(grant.get("expires_at")):

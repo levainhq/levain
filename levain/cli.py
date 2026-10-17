@@ -2307,15 +2307,16 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
     from levain.authority import consent_tool_problem
-    from levain.consent.grants import list_grants
+    from levain.consent.grants import list_grants, list_inert_grants
 
     try:
         now = _utc_now()
         grants = list_grants(_cockpit_root(args), now=now)
+        inert = list_inert_grants(_cockpit_root(args), now=now)
     except _cockpit_refusals() as exc:
         print(f"grants: {exc}", file=sys.stderr)
         return 1
-    if not grants:
+    if not grants and not inert:
         print("no consent grants")
     stamp = utc_stamp(now)
     for g in grants:
@@ -2326,6 +2327,10 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         print(f"{g.id}  {g.agent}  {','.join(map(str, g.tools))}  {g.workspace}  postures {','.join(map(str, g.postures))}  "
               f"{state}  "
               f"(seq {g.seq})")
+    for gid, kind, expires_at, seq in inert:
+        state = "expired" if expires_at <= stamp else f"until {expires_at}"
+        print(f"{gid}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
+              "answers nothing here (upgrade levain to use it; `levain consent grant revoke` removes it)")
     return 0
 
 
