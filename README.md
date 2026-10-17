@@ -52,7 +52,7 @@ It packages these, grouped by what they govern:
 
 **How it behaves**
 
-- **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. The seed and a posture string carry the pressure at the start of the context; a hook injects one of several rotated directives before every prompt, so the pressure is also at the end. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
+- **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. The seed and a posture string carry the pressure at the start of the context; a hook injects one of several differently-framed directives, picked at random, before every prompt, so the pressure is also at the end. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
 - **Calibration per substrate.** The seed names the pulls it expects from a model's training (gentling, hedging, rushing, declaring done before verifying), and tells your partner that it will fail in its own ways. When you correct a drift, your partner records it as an episode; over time those episodes become its calibration. The directives file is yours to edit as they accumulate.
 
 **Getting started**
