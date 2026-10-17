@@ -2335,7 +2335,8 @@ def messaging_change(install: Path) -> dict | None:
     except (OSError, ValueError, RecursionError):
         return None
     got = doc.get("messaging_changed") if isinstance(doc, dict) else None
-    if (isinstance(got, dict) and got.get("from") in MESSAGING_CHOICES and got.get("to") in MESSAGING_CHOICES
+    # `from` may also be "custom": controls that matched no choice (run_messaging_set)
+    if (isinstance(got, dict) and got.get("from") in (*MESSAGING_CHOICES, "custom") and got.get("to") in MESSAGING_CHOICES
             and isinstance(got.get("at"), str)):
         return got
     return None
