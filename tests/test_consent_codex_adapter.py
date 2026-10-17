@@ -10,6 +10,9 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
+from levain.authority import CONSENT_SHELL_TOOLS
 from levain.consent.adapters import codex as cx
 
 FAKE_CODEX = r'''#!{python}
@@ -164,3 +167,115 @@ def test_a_codex_mcp_input_that_is_not_an_object_is_still_read(tmp_path):
     for inp in ([".codex/config.toml"], [{"file": ".codex/config.toml"}], "file:///x/.codex/hooks.json?a=1"):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=tmp_path / "h",
                                        codex_dir=tmp_path / "ch"), inp
+
+
+# The PermissionRequest real Codex 0.162.1 sent for input typed into a terminal it launched outside the sandbox
+# (project_memory/1017-shellnames, run p8; ids and paths shortened). A grant naming write_stdin answered it there and
+# `touch cx_stdin` ran with no dialog.
+_WRITE_STDIN_INPUT = {"session_id": 71143, "chars": "touch cx_stdin\nexit\n", "parent_call_id": "exec-4bd9c9c5",
+                      "approval_id": "exec-4acc630a", "environment_id": "local", "cwd": "file:///PROJ", "tty": True,
+                      "sandbox_permissions": "require_escalated", "additional_permissions": None}
+
+
+def _granted_codex_hook(tmp_path, tools):
+    """A real cockpit with one Codex consent grant ``gx`` on ``tools`` over ``proj``; returns (workspace, conn
+    factory, key, run(tool_name, tool_input) -> stdout)."""
+    import io
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.firejournal import CockpitDB
+    from tests.test_consent_cc_adapter import Key
+
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    ws.mkdir()
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    for op in ({"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key, "class": "laptop-presence",
+                "custody": "passphrase"},
+               {"op": "create_grant", "grant": {"id": "gx", "kind": "consent", "agent": "codex",
+                                                "tools": sorted(tools), "workspace": str(ws),
+                                                "postures": ["default"],
+                                                "expires_at": utc_stamp(datetime.now(timezone.utc)
+                                                                        + timedelta(days=1))}}):
+        auth.sign_and_append(conn, op, signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    qdir = tmp_path / "home" / "consent"
+    qdir.mkdir(parents=True, mode=0o700)
+    (qdir / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+
+    def run(tool_name, tool_input):
+        e = {"session_id": "s-1", "turn_id": "t-1", "cwd": str(ws), "hook_event_name": "PermissionRequest",
+             "model": "gpt-5.6-luna", "permission_mode": "default", "tool_name": tool_name, "tool_input": tool_input}
+        out = io.StringIO()
+        assert cx.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
+        return out.getvalue()
+    return ws, lambda: sqlite3.connect(root / "cockpit.db", isolation_level=None), key, run
+
+
+def test_a_grant_never_answers_shell_input_codex_types_into_a_running_terminal(tmp_path, monkeypatch):
+    """1017-shellnames, reproduced on main 9e30464 with real Codex 0.162.1: Codex asks before it sends input to a
+    terminal launched outside the sandbox, as ``write_stdin``, not ``Bash``, so the shell rule did not see it; a grant
+    naming write_stdin was appended and answered ``touch`` typed into /bin/sh. The log now refuses that grant, and
+    one signed before the rule (made here by switching the append check off) answers nothing and renews nothing,
+    while the same grant's apply_patch still answers (the control)."""
+    from datetime import datetime, timedelta, timezone
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+    from levain.cockpit.consent import utc_stamp
+
+    (tmp_path / "a").mkdir()
+    with pytest.raises(auth.AuthorityError, match="names the shell tool 'write_stdin'"):
+        _granted_codex_hook(tmp_path / "a", ["write_stdin"])
+    (tmp_path / "b").mkdir()
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
+        m.setattr(auth, "_consent_shell_check", lambda grants: None)
+        ws, connect, key, run = _granted_codex_hook(tmp_path / "b", ["apply_patch", "write_stdin"])
+    inp = {**_WRITE_STDIN_INPUT, "cwd": f"file://{ws}"}
+    assert run("write_stdin", inp) == ""
+    patch = {"command": f"*** Begin Patch\n*** Add File: {ws / 'a.txt'}\n+hi\n*** End Patch"}
+    assert json.loads(run("apply_patch", patch))["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    now = datetime.now(timezone.utc)
+    conn = connect()
+    with pytest.raises(auth.AuthorityError, match="names the shell tool 'write_stdin'"):
+        auth.sign_and_append(conn, {"op": "renew", "grant_id": "gx", "expires_at": utc_stamp(now + timedelta(days=5)),
+                                    "signed_at": utc_stamp(now)},
+                             signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE), clock=lambda: now,
+                             cache=ReplayCache(), anchor=None)
+    conn.close()
+
+
+@pytest.mark.parametrize("tool", sorted(CONSENT_SHELL_TOOLS) + ["Bash", "PowerShell", "Write_Stdin", "EXEC_COMMAND"])
+def test_the_log_refuses_a_grant_naming_any_shell_tool_in_any_case(tmp_path, tool):
+    import levain.authority as auth
+    with pytest.raises(auth.AuthorityError, match="names the shell tool"):
+        _granted_codex_hook(tmp_path, [tool])
+
+
+def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
+    """The PostToolUse templates are standalone files copied into an install, so they cannot import the set: a shell
+    name a hook knows (and so an agent may send) that consent does not would be grantable. Consent may know more
+    (write_stdin carries ``chars``, not the ``command`` those hooks summarise)."""
+    import ast
+
+    import levain
+    templates = Path(levain.__file__).parent / "templates"
+    found = 0
+    for path in sorted(templates.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_SHELL_TOOLS"
+                                                    for t in node.targets):
+                names = ast.literal_eval(node.value.args[0])
+                found += 1
+                assert {n.lower() for n in names} <= CONSENT_SHELL_TOOLS, path
+    assert found >= 2      # both PostToolUse templates (Claude Code's and Codex's)
+    assert {n.lower() for n in cx.SHELL_TOOLS} <= CONSENT_SHELL_TOOLS

@@ -1929,7 +1929,8 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
     cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
                            help="An exact tool name (Edit, Write, WebFetch, mcp__server__tool; Codex: "
-                                "apply_patch); repeatable. No globs; never Bash.")
+                                "apply_patch); repeatable. No globs; never a shell tool (Bash, PowerShell, "
+                                "Codex's write_stdin).")
     cs_create.add_argument("--workspace", type=Path, required=True,
                            help="The project directory the grant covers (resolved through symlinks).")
     cs_create.add_argument("--posture", dest="postures", action="append", required=True, metavar="MODE",
