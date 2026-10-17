@@ -3295,8 +3295,70 @@
     return wrap;
   }
 
+  // Standing-rule proposals (rows 13/17): when the operator has allowed the same agent + tool + working directory by hand
+  // three times, the Decisions view offers the one `levain consent grant create` line that would make it a grant. The page
+  // never signs; the card is text and a copy button. Fetched from /cockpit/consent/proposals.json with the page's token
+  // through the consent queue above, and kept for 30 s so a redraw does not re-read it. No token, or a read that fails:
+  // no card (a proposal is an offer, never a gate).
+  const PROPOSAL_SHOWN = 3, PROPOSAL_TTL_MS = 30000;
+  let proposalRead = null, proposalAt = 0;
+  function proposalFetch() {
+    if (proposalRead && Date.now() - proposalAt < PROPOSAL_TTL_MS) return proposalRead;
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve([]);
+    proposalAt = Date.now();
+    const got = consentQueued(() => fetchBounded("/cockpit/consent/proposals.json", { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.proposals) ? b.proposals : null), () => null) : null),
+      () => null), "the proposals could not be read").then((b) => {
+        if (!Array.isArray(b)) { if (proposalRead === got) proposalRead = null; return []; }
+        return b;
+      });
+    proposalRead = got;
+    return got;
+  }
+  function proposalCard(p) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row proposal-row ext-accent");
+    row.setAttribute("data-consent-proposal", "");
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", sv(p.agent) || "agent"));
+    head.appendChild(el("b", "consent-tool", sv(p.tool)));
+    head.appendChild(el("span", "ext-meta", "standing rule?"));
+    head.appendChild(el("span", "consent-left", "allowed by hand " + (Number.isInteger(p.count) ? p.count : "") + "\u00d7"));
+    row.appendChild(head);
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "in " + sv(p.workspace)));
+    facts.appendChild(el("span", "ext-meta", "for " + sv(p.expires) + ", " + sv(p.posture) + " mode"));
+    row.appendChild(facts);
+    const cmd = sv(p.command);
+    if (cmd) {
+      const line = el("div", "consent-cmd");
+      const code = el("code", "consent-code", cmd);
+      const btn = el("button", "undo-btn consent-copy", "copy command");
+      btn.type = "button";
+      btn.dataset.label = btn.textContent;
+      btn.title = "copy the grant command; run it in a terminal with your signing key. This page signs nothing";
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      line.append(code, btn);
+      row.appendChild(line);
+    }
+    if (sv(p.note)) row.appendChild(el("div", "consent-note ext-meta", sv(p.note)));
+    return row;
+  }
+  function proposalSlot() {
+    const slot = el("div", "proposal-slot");
+    proposalFetch().then((list) => {
+      const cards = list.slice(0, PROPOSAL_SHOWN).map(proposalCard);
+      if (cards.length) slot.replaceChildren(el("div", "ext-grouphead", "standing rule proposals"), ...cards);
+    }).catch(() => {});
+    return slot;
+  }
+
   function appendExternalLines(host, lines) {
     let lastGroup = null;
+    // the Decisions view (the only one whose lines are consent requests) leads with its proposal cards
+    if (lines.some((ln) => ln && ln.consent)) host.appendChild(proposalSlot());
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
