@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.5] — 2026-10-17
+
+### Security
+- **A standing consent grant now names only a tool levain knows for its agent, and never a shell under any name.** Codex 0.162.1 asks before it types into a terminal it launched outside the sandbox as `write_stdin`, not `Bash`. In 0.11.4 `levain consent grant create --agent codex --tool write_stdin` was accepted, and that grant answered a `touch` typed into `/bin/sh` with no dialog (reproduced with real Codex). The log now refuses a grant naming any shell name levain knows (`Bash`, `PowerShell`, `write_stdin`, `shell`, `exec_command`, `shell_command`, `local_shell`, in any case), and any tool not on levain's list for the agent: for Claude Code `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Read`, `Grep`, `Glob`, `LS`, `NotebookRead`, `WebFetch` and `SendMessage`; for Codex `apply_patch`; for either, the filesystem server's MCP read tools. `WebFetch` and `SendMessage` name no path and are matched on the working directory alone, so a `SendMessage` grant answers every send from the workspace, one that resumes a subagent included. A tool an agent adds in a later release, or Claude Code's `Task` (which runs a subagent on any prompt), now comes to you rather than to a grant. A grant already signed on any other tool answers nothing for it and cannot be renewed: revoke it and create a new one. `levain consent grant list` marks it.
+
+### Added
+- A grant of a kind this levain does not know (one a newer levain wrote) is held inert: the authority log still replays, the grant answers nothing, `levain consent grant list` shows it and `levain consent grant revoke` removes it; this levain never creates or changes one.
+- **Known edge:** levain 0.11.4 and older refuse, for good, an authority log that holds a grant of a kind they do not know. Their hook then stays silent and Claude Code's own dialog asks you every time (with away mode on, the phone gets a request it cannot answer); `levain consent grant list` shows the refusal. Revoking the grant does not undo it: upgrade every levain that shares the levain home.
+
 ## [0.11.4] — 2026-10-17
 
 ### Added
