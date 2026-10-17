@@ -28,7 +28,7 @@ It packages five things that work together:
 
 3. **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
 
-4. **A cross-agent consent queue.** Claude Code's and Codex's `PermissionRequest` hooks file each permission prompt into one queue that you answer with a signed standing grant (`levain consent grant create`) or a signed answer (`levain consent answer`, or a passkey from your phone). Details in *The consent queue*.
+4. **A cross-agent consent queue.** Claude Code's and Codex's `PermissionRequest` hooks file each permission prompt they receive into one queue that you answer with a signed standing grant (`levain consent grant create`) or a signed answer (`levain consent answer`, or a passkey from your phone). Details in *The consent queue*.
 
 5. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
 
@@ -36,7 +36,7 @@ It packages five things that work together:
 
 Levain wires into the agent you already use, and ships two other modes as is.
 
-**Inside the harness you're already using (the main path).** Claude Code and Codex CLI both wire in via hooks — your partner stops starting cold, its proven patterns and open loops fire on their own, per turn, without you asking, and each permission prompt goes through the consent queue. Levain installs hooks and consent paths in these agents; it does not confine a Claude Code or Codex session.
+**Inside the harness you're already using (the main path).** Claude Code and Codex CLI both wire in via hooks — your partner stops starting cold, its proven patterns and open loops fire on their own, per turn, without you asking, and each permission prompt the agent's hook receives goes through the consent queue (Codex fires that hook in interactive sessions, not in `codex exec`). Levain installs hooks and consent paths in these agents; it does not confine a Claude Code or Codex session.
 
 **As its own sovereign partner (OpenHands, shipped as is).** `levain init --adapter openhands` scaffolds an entity that isn't wired into anything — its own identity, its own memory store, its own hands on your real repos, running on an open model you choose rather than a frontier vendor's hosted assistant (point it at a local Ollama model to also keep the compute itself on your machine). It talks to you as a REPL (`levain run`) or takes one task and exits (`levain run --task`), and it consolidates its own memory with its own mind (`levain wrap`).
 
@@ -120,10 +120,10 @@ nothing — rather than writing a half-captured partner and reporting success.
 Claude Code and Codex ask before they edit a file or run a tool. With the consent hook on (the default for both adapters), each of those permission prompts is filed into one queue by levain's `PermissionRequest` hook, and the hook answers it in one of two ways, or leaves it alone:
 
 - **A standing grant.** `levain consent grant create` signs a grant for one agent, exact tools, one workspace and the permission modes you name, for at most 30 days. `levain consent grant list` and `revoke` manage them.
-- **A signed answer.** `levain consent pending` lists what is waiting; `levain consent answer <id> allow|deny --signing-key <key>` shows the request and signs your answer. You can also answer from your phone with a passkey (*Answer an agent from your phone*), and the cockpit's Decisions panel lists the waiting requests.
+- **A signed answer, in away mode.** Away mode is off by default: the hook then asks only your grants and, with none matching, withdraws the request at once and leaves the agent's dialog to ask you, so a signed answer has nothing to land on. With away mode on, the hook holds each request for the hold you set while you answer it: `levain consent pending` lists what is waiting; `levain consent answer <id> allow|deny --signing-key <key>` shows the request and signs your answer. You can also answer from your phone with a passkey (*Answer an agent from your phone*), and the cockpit's Decisions panel lists the waiting requests. Away mode is set in `<levain home>/consent/claude_code.json` and `codex.json` (`"away_mode": true`, `"away_hold_seconds": <seconds>`); there is no command for it yet.
 - **Neither.** The agent's own dialog asks you, as it would without levain.
 
-Shell commands (Bash) are never granted: they always reach you. Edits of agent config or hooks always reach you. Each request that reaches a final state (allowed, denied, expired or withdrawn) is written to the queue with an append-only receipt, and a grant is a link in the cockpit's signed authority log.
+Shell commands (Bash) are never granted: they always reach you. Edits of agent config or hooks always reach you. Each request that reaches a final state (allowed, denied, expired or withdrawn) is written to the queue with an append-only receipt (an expiry is recorded when the queue is next read or written), and a grant is a link in the cockpit's signed authority log.
 
 A message that says "yes" is never authority. Only a signature from an enrolled key is: the queue checks each answer against the authority log before the hook delivers it. Keys and their custody are in *The cockpit's signing keys*. `levain consent canary` checks that an agent's hook fires.
 
