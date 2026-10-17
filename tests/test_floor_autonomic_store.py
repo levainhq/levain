@@ -282,23 +282,27 @@ def test_a_levain_home_inside_the_entity_is_denied_whole(home, monkeypatch):
 
 def test_every_levain_home_reader_is_named_for_the_fallback():
     """The fallback names directories one at a time, so it must know every one: each module that reads
-    ``$LEVAIN_HOME`` (outside the floor itself) builds one directory under it, and that directory's name
-    must be in :data:`LEVAIN_HOME_STATE_DIRS`. A new reader fails here until it is added."""
+    ``$LEVAIN_HOME`` builds directories under it, and each one's name must be in
+    :data:`LEVAIN_HOME_STATE_DIRS`. A new reader, or a new read in a module already listed, fails here
+    until its directory is added."""
     import re
     import levain
     from levain.autonomic.db import default_store_dir
     from levain.cockpit.custody import default_key_dir
     from levain.consent.queue import default_queue_dir
-    from levain.firing.confinement import LEVAIN_HOME_STATE_DIRS
+    from levain.firing import ssh_agent
+    from levain.firing.confinement import GRANTS_DIR, LEVAIN_HOME_STATE_DIRS
 
     pkg = Path(levain.__file__).parent
-    readers = sorted(
-        str(p.relative_to(pkg)) for p in pkg.rglob("*.py")
-        if p.name != "confinement.py" and re.search(r"""(?:environ(?:\.get\(|\[)|getenv\()\s*["']LEVAIN_HOME["']""",
-                                                    p.read_text(encoding="utf-8"))
-    )
-    assert readers == ["autonomic/db.py", "cockpit/custody.py", "consent/queue.py"], readers
-    names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name}
+    pattern = re.compile(r"""(?:environ(?:\.get\(|\[)|getenv\()\s*["']LEVAIN_HOME["']""")
+    reads = {str(p.relative_to(pkg)): len(pattern.findall(p.read_text(encoding="utf-8")))
+             for p in pkg.rglob("*.py")}
+    reads = {k: v for k, v in reads.items() if v}
+    # confinement.py: the floor's own resolution of the home, and grants_file().
+    assert reads == {"autonomic/db.py": 1, "cockpit/custody.py": 1, "consent/queue.py": 1,
+                     "firing/confinement.py": 2, "firing/ssh_agent.py": 1}, reads
+    names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name, GRANTS_DIR,
+             ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR}
     assert names == set(LEVAIN_HOME_STATE_DIRS)
 
 
