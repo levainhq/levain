@@ -1,12 +1,12 @@
 # Levain
 
-**A consent queue and memory harness for Claude Code and Codex. Permission prompts are answered by signed standing grants or signed human answers, with an audit trail, and your partner's memory persists across sessions.**
+**A harness for working with an AI agent as a partner: it grows its own memory and identity, pushes back on its training's worst habits, and answers to you, always.**
 
 ```
 pip install levain
 ```
 
-Levain does two things for Claude Code and Codex. It runs a consent queue: each agent's permission prompt reaches a hook that answers it only with a signed standing grant or a signed answer from you, and otherwise leaves the agent's own dialog to ask you (see *The consent queue* below). And it gives your AI partner a memory that persists across sessions, and keeps that memory **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
+Levain wraps Claude Code and Codex. It runs a consent queue: each agent's permission prompt reaches a hook that answers it only with a signed standing grant or a signed answer from you, and otherwise leaves the agent's own dialog to ask you (see *The consent queue* below). It gives your AI partner a memory that persists across sessions, an identity it grows instead of one you declare, and standing pressure against the habits its training rewards (see *What this is* below). The memory stays **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
 
 Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also ship, as is (see *Run a sovereign entity*).
 
@@ -28,7 +28,9 @@ If you run coding agents for real, you hit the permission prompt fast. The usual
 
 Levain is the option that doesn't make you pick. Signed grants answer the routine. In away mode, everything else waits for your signed decision, at your desk or on your phone. Every answer levain gives, yours or a grant's, is on the record. It's one queue for Claude Code and Codex, not one per vendor. How it works, and what it does not cover: *The consent queue*.
 
-The memory half is the same idea pointed the other way. Consent governs what your agent *does*; memory governs what it *becomes*. Nothing graduates into long-term memory without cited evidence, and every governed change is recorded in a tamper-evident log. Both answer the same question: **is this agent working under your authority, and can you prove it?**
+The prompt is only the first place it breaks. Over weeks the agent forgets what you told it, or remembers the wrong things and builds on them. It drifts toward the helpful average its training rewards: it flatters, hedges, and calls work done before it is. And if someone declared it a personality in a system prompt, it wears that personality like a costume; nothing about it was earned.
+
+Levain treats the agent as a partner and you as the one it answers to, and that does not relax as trust grows. The split is plain: the agent does the mechanical work alone and brings you the judgment calls. In the consent queue that is the difference between a standing grant (you decide once, for the routine case) and a signed answer (you decide each time, where judgment is left). Everything on the record is yours to read and check. The longer version of the argument is the essay [Anarchism with Invariants](https://nemooperans.com/anarchism-with-invariants).
 
 ---
 
@@ -36,17 +38,26 @@ The memory half is the same idea pointed the other way. Consent governs what you
 
 If you've worked with an AI partner long enough to feel the session-amnesia problem — every conversation starts cold, every insight gets re-explained, the *quality* of the partnership keeps resetting — Levain is the kit you'd otherwise build for yourself.
 
-It packages five things that work together:
+It packages these, grouped by what they govern:
 
-1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, a record of which memories you cite together (links form at each wrap and are there to inspect; recall follows the evidence a pattern cites), and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
+**What it does**
 
-2. **A methodology-core seed.** A small, dense set of files defining who your partner is, how the partnership works, how memory accrues, and who you are to it. Written so your partner lives *inside* the method instead of pointing at it.
+- **A cross-agent consent queue.** Claude Code's and Codex's `PermissionRequest` hooks file each permission prompt they receive into one queue that you answer with a signed standing grant (`levain consent grant create`) or a signed answer (`levain consent answer`, or a passkey from your phone). Details in *The consent queue*.
+- **An efferent gate, for OpenHands entities.** Every action a scheduled or `run --task` entity takes that reaches outside itself halts before it executes, by default. Details in *Hand it a schedule*.
 
-3. **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
+**What it becomes**
 
-4. **A cross-agent consent queue.** Claude Code's and Codex's `PermissionRequest` hooks file each permission prompt they receive into one queue that you answer with a signed standing grant (`levain consent grant create`) or a signed answer (`levain consent answer`, or a passkey from your phone). Details in *The consent queue*.
+- **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, a record of which memories you cite together (links form at each wrap and are there to inspect; recall follows the evidence a pattern cites), and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
+- **A methodology-core seed, and an identity grown from it.** A small, dense set of files defining how the partnership works, how memory accrues, and who you are to your partner. It gives your partner facts and a method, never a personality: the seed tells it to grow its own shape and become someone, from what it lives. Written so your partner lives *inside* the method instead of pointing at it.
 
-5. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
+**How it behaves**
+
+- **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. The seed and a posture string carry the pressure at the start of the context; a hook injects one of several rotated directives before every prompt, so the pressure is also at the end. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
+- **Calibration per substrate.** The seed names the pulls it expects from a model's training (gentling, hedging, rushing, declaring done before verifying), and tells your partner that it will fail in its own ways. When you correct a drift, your partner records it as an episode; over time those episodes become its calibration. The directives file is yours to edit as they accumulate.
+
+**Getting started**
+
+- **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
 
 ## Where it runs
 
