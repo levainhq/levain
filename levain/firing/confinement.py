@@ -694,8 +694,8 @@ class FloorRefreshError(ConfinementError):
 # the homes whose agent programs the floor write-denies; a name never makes one. Any other path named
 # ``S.gpg-agent.extra`` is another home's agent and is refused. An ssh agent is never a grant: a path
 # that resolves to the socket the operator's ``$SSH_AUTH_SOCK`` names, or to gpg-agent's ssh socket, is
-# refused (:func:`_ssh_agent_refusal`). Grants apply on Linux only (macOS gets
-# its unix-socket rule with B2).
+# refused (:func:`_ssh_agent_refusal`). Linux binds grants into its runtime view; macOS admits the
+# checked literal path through its Unix-socket default deny.
 GRANTS_DIR = "confinement"
 GRANTS_FILE = "grants.json"
 GPG_EXTRA_SOCKET = "S.gpg-agent.extra"
@@ -724,8 +724,8 @@ class SocketGrant:
 
 
 def grants_apply(system: str | None = None) -> bool:
-    """Whether operator grants are bound into bash's view here: Linux only, until levain's macOS socket rule."""
-    return (system or platform.system()) == "Linux"
+    """Whether operator grants are enforced for an operator-floor shell on this platform."""
+    return (system or platform.system()) in ("Linux", "Darwin")
 
 
 def _gpgconf_dir(name: str, *, home: str | None = None, homedir: str | None = None) -> Path | None:
@@ -1068,13 +1068,13 @@ def git_ssh_command(runtime_root: Path) -> str:
 def start_session_ssh_agent(entity: str, *, system: str | None = None, ssh_mode: str = "agent"
                             ) -> "tuple[_ssh_agent.ScopedAgent | None, str | None]":
     """Start the scoped ssh agent for one operator-floor session: ``(agent, None)``, or ``(None, why
-    not)``. Started only where it is bound into bash (Linux, as grants are: :func:`grants_apply`) and a
-    user runtime dir exists to bind it into. Never raises: a session without an agent still runs, and
-    its ssh line says why there is none."""
+    not)``. On Linux its socket is bound into a user runtime view; on macOS the checked host path is a
+    literal Seatbelt grant. Never raises: a session without an agent still runs, and its ssh line says
+    why there is none."""
     system = system or platform.system()
     if not grants_apply(system):
         return None, f"levain's scoped agent is not wired on {system} yet"
-    if not _runtime_roots():
+    if system == "Linux" and not _runtime_roots():
         return None, "no user runtime dir ($XDG_RUNTIME_DIR, /run/user/<uid>) to bind the agent into"
     try:
         return _ssh_agent.start(entity=entity, ssh_mode=ssh_mode), None
@@ -1109,8 +1109,11 @@ GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not i
 
 
 HANDS_GRANTS_LINE = "operator grants: none (the entity's own user)"
-GRANTS_NOT_APPLIED_LINE = ("operator grants: not applied on this platform "
-                           "(until levain's macOS socket rule)")
+GRANTS_NOT_APPLIED_LINE = "operator grants: not applied on this platform"
+MACOS_SOCKET_TIER_LINE = (
+    "unix sockets (M: pathname connects default-denied; exact grants are path capabilities; "
+    "sockets created inside the sandbox are denied too)"
+)
 
 
 @dataclass(frozen=True)
@@ -1156,9 +1159,12 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
     and reads the file."""
     system = system or platform.system()
     abi, reason = _landlock.host_read(system)
-    if system != "Linux" and reason is None:
-        reason = f"{system} has no Landlock"
-    lines = [_landlock.tier_line(abi, reason)]
+    if system == "Darwin":
+        lines = [MACOS_SOCKET_TIER_LINE]
+    else:
+        if system != "Linux" and reason is None:
+            reason = f"{system} has no Landlock"
+        lines = [_landlock.tier_line(abi, reason)]
     if cfg is not None and getattr(cfg, "hands_user", None) is not None:
         lines.append(HANDS_GRANTS_LINE)
     elif not grants_apply(system):
@@ -4471,6 +4477,131 @@ def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
     return any(_ci_within(p, sub) for sub in policy.deny_read_write)
 
 
+_MACOS_MDNS_SOCKET = "/private/var/run/mDNSResponder"
+
+
+def _macos_socket_grant_paths(
+    grants: tuple[SocketGrant, ...] = (),
+    ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
+) -> tuple[str, ...]:
+    """The exact pathname capabilities a macOS profile allows after its all-Unix-sockets deny."""
+    paths = [_MACOS_MDNS_SOCKET, *(g.path for g in grants)]
+    if ssh_agent is not None:
+        paths.append(ssh_agent.socket)
+    return tuple(dict.fromkeys(paths))
+
+
+def _validate_macos_grant(grant: SocketGrant) -> None:
+    """Validate one macOS pathname grant at entry.
+
+    Unlike Linux, a user-writable parent is admissible because the Seatbelt profile write-denies the
+    socket's whole parent and pins every ancestor against relocation.  The object still must be the
+    exact, non-linked, operator-owned socket declared before entry, with no other-user-writable parent.
+    """
+    p = grant.path
+
+    def refuse(why: str) -> NoReturn:
+        raise ConfinementError(
+            f"the operator grant {grant.name!r} ({p}) {why}. Refusing to grant bash hands "
+            f"(fail-closed); fix or remove it in {grants_file()}."
+        )
+
+    if os.path.realpath(p) != p:
+        refuse(f"is reached through a link (it resolves to {os.path.realpath(p)}); name the real path")
+    agent = _ssh_agent_refusal(p)
+    if agent is not None:
+        refuse(agent)
+    try:
+        st = os.lstat(p)
+    except OSError as exc:
+        refuse(f"cannot be opened ({exc.strerror or exc})")
+    if not stat.S_ISSOCK(st.st_mode):
+        refuse("is not a socket")
+    if st.st_uid != os.geteuid():
+        refuse(f"is owned by uid {st.st_uid}, not you")
+    for parent in Path(p).parents:
+        try:
+            pst = os.stat(parent)
+        except OSError as exc:
+            refuse(f"has a parent {parent} that cannot be read ({exc.strerror or exc})")
+        if pst.st_uid not in (0, os.geteuid()) or (
+            pst.st_mode & 0o022 and not (pst.st_uid == 0 and pst.st_mode & stat.S_ISVTX)
+        ):
+            refuse(f"has a parent {parent} that another user can write")
+
+
+def _validate_macos_ssh_agent(agent: "_ssh_agent.ScopedAgent") -> None:
+    """Show that the literal scoped-agent grant still names the agent levain started."""
+    try:
+        st = os.lstat(agent.socket)
+    except OSError as exc:
+        raise ConfinementError(
+            f"levain's scoped ssh agent ({agent.socket}) cannot be read ({exc.strerror or exc}) — "
+            "refusing to grant bash hands (fail-closed)."
+        ) from None
+    problem = _ssh_agent._chain_problem(agent.dir)
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid() or problem is not None:
+        detail = problem or "is not a socket you own"
+        raise ConfinementError(
+            f"levain's scoped ssh agent ({agent.socket}) {detail} — refusing to grant bash hands "
+            "(fail-closed)."
+        )
+    try:
+        answering = _ssh_agent.peer_pid(agent.socket)
+    except _ssh_agent.AgentError as exc:
+        raise ConfinementError(
+            f"levain's scoped ssh agent ({agent.socket}) {exc} — refusing to grant bash hands "
+            "(fail-closed)."
+        ) from None
+    if answering != agent.pid:
+        raise ConfinementError(
+            f"levain's scoped ssh agent ({agent.socket}) is answered by pid {answering}, not the agent "
+            f"levain started (pid {agent.pid}) — refusing to grant bash hands (fail-closed)."
+        )
+    kh = agent.dir / _ssh_agent.KNOWN_HOSTS_NAME
+    try:
+        kst = os.lstat(kh)
+    except OSError as exc:
+        raise ConfinementError(
+            f"levain's scoped ssh agent has no session known_hosts {kh} ({exc.strerror or exc}) — "
+            "refusing to grant bash hands (fail-closed)."
+        ) from None
+    if not stat.S_ISREG(kst.st_mode) or kst.st_uid != os.geteuid():
+        raise ConfinementError(
+            f"levain's scoped ssh agent has a session known_hosts {kh} that is not a regular file you "
+            "own — refusing to grant bash hands (fail-closed)."
+        )
+
+
+def _macos_persistence_lines(policy: CrownJewelsPolicy) -> list[str]:
+    """Seatbelt file-write rules for operator-home and agent-config persistence plants."""
+    home = Path.home()
+    workspace = policy.workspace
+    lines = [
+        ";; HOME PERSISTENCE — immediate home entries cannot be created, replaced or renamed.",
+        ";; Execution-bearing subtrees and only the named agent config/hook paths are write-denied.",
+        "(deny file-write*",
+        f'    (regex #"^{_sbpl_regex(str(home))}\\/[^\\/]+$")',
+        f'    (subpath "{_sbpl_string(str(home / "bin"))}")',
+        f'    (subpath "{_sbpl_string(str(home / ".local" / "bin"))}")',
+        f'    (subpath "{_sbpl_string(str(home / "Library" / "LaunchAgents"))}")',
+        f'    (subpath "{_sbpl_string(str(home / ".config" / "git"))}")',
+        f'    (regex #"^{_sbpl_regex(str(home / ".claude"))}\\/settings[^\\/]*\\.json$")',
+        f'    (subpath "{_sbpl_string(str(home / ".claude" / "hooks"))}")',
+        f'    (literal "{_sbpl_string(str(home / ".codex" / "hooks.json"))}")',
+        f'    (literal "{_sbpl_string(str(home / ".codex" / "config.toml"))}")',
+        f'    (literal "{_sbpl_string(str(workspace / ".claude"))}")',
+        f'    (regex #"^{_sbpl_regex(str(workspace / ".claude"))}\\/settings[^\\/]*\\.json$")',
+        f'    (subpath "{_sbpl_string(str(workspace / ".claude" / "hooks"))}")',
+        f'    (literal "{_sbpl_string(str(workspace / ".codex"))}")',
+        f'    (literal "{_sbpl_string(str(workspace / ".codex" / "hooks.json"))}")',
+        f'    (literal "{_sbpl_string(str(workspace / ".codex" / "config.toml"))}")',
+        ")",
+        "",
+    ]
+    return lines
+
+
 class SeatbeltProvider(ConfinementProvider):
     """macOS ``sandbox-exec`` (seatbelt / SBPL) provider.
 
@@ -4490,7 +4621,13 @@ class SeatbeltProvider(ConfinementProvider):
         function so there is ONE definition of "is the macOS driver usable", not two."""
         return sandbox_exec_available()
 
-    def render_profile(self, policy: CrownJewelsPolicy) -> str:
+    def render_profile(
+        self,
+        policy: CrownJewelsPolicy,
+        *,
+        grants: tuple[SocketGrant, ...] = (),
+        ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
+    ) -> str:
         lines: list[str] = [
             "(version 1)",
             "",
@@ -4531,6 +4668,38 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append("(deny network-outbound")
             for p_ in policy.deny_sockets:
                 lines.append(f'    (literal "{_sbpl_string(str(p_))}")')
+            lines.append(")")
+            lines.append("")
+
+        # Measured on macOS 26.6.2 / 25G83: this covers pathname Unix stream connects and datagram
+        # sends. The allows are exact path capabilities and must follow the broad deny (last match
+        # wins). mDNS is levain's one built-in grant; every other pathname is fixed before entry.
+        lines.append(";; UNIX SOCKETS — default-deny, then exact levain/operator path capabilities.")
+        lines.append("(deny network-outbound (remote unix-socket))")
+        for socket_path in _macos_socket_grant_paths(grants, ssh_agent):
+            lines.append(
+                '(allow network-outbound (remote unix-socket '
+                f'(path-literal "{_sbpl_string(socket_path)}")))'
+            )
+        lines.append("")
+
+        protected_socket_dirs = tuple(dict.fromkeys(
+            str(Path(path).parent)
+            for path in _macos_socket_grant_paths(grants, ssh_agent)
+            if path != _MACOS_MDNS_SOCKET
+        ))
+        if protected_socket_dirs:
+            lines.append(";; Granted socket directories are immutable to the confined shell.")
+            lines.append("(deny file-write*")
+            for directory in protected_socket_dirs:
+                lines.append(f'    (subpath "{_sbpl_string(directory)}")')
+            for ancestor in sorted({
+                str(parent)
+                for directory in protected_socket_dirs
+                for parent in Path(directory).parents
+                if parent != Path("/")
+            }):
+                lines.append(f'    (literal "{_sbpl_string(ancestor)}")')
             lines.append(")")
             lines.append("")
 
@@ -4678,6 +4847,20 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append(")")
             lines.append("")
 
+        # Last: no convenience allow above may override the persistence floor. Ordinary workspace
+        # paths are not matched; only its Claude/Codex config and hook paths are.
+        lines.extend(_macos_persistence_lines(policy))
+
+        if ssh_agent is not None:
+            # The agent directory is hidden with levain's home and write-denied again as a grant dir.
+            # Re-open only this session-local host-key file, never the operator's known_hosts.
+            known_hosts = ssh_agent.dir / _ssh_agent.KNOWN_HOSTS_NAME
+            lines.append(";; scoped ssh service: its session-local known_hosts, and no operator key file")
+            lines.append(
+                f'(allow file-read* file-write* (literal "{_sbpl_string(str(known_hosts))}"))'
+            )
+            lines.append("")
+
         return "\n".join(lines).rstrip() + "\n"
 
     def _spawn_shell_impl(
@@ -4687,13 +4870,23 @@ class SeatbeltProvider(ConfinementProvider):
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
+        grants: tuple[SocketGrant, ...] = (),
+        ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
     ) -> SandboxedShell:
         if not sandbox_exec_available():
             raise ConfinementError(
                 f"{SANDBOX_EXEC} is not available — cannot establish the macOS confinement floor. "
                 "Refusing to grant bash hands without the sandbox (fail-closed)."
             )
-        profile_text = self.render_profile(policy)
+        if hands is not None and (grants or ssh_agent is not None):
+            raise ConfinementError(
+                "a hands-user macOS floor takes no operator socket or ssh-agent grant (fail-closed)."
+            )
+        for grant in grants:
+            _validate_macos_grant(grant)
+        if ssh_agent is not None:
+            _validate_macos_ssh_agent(ssh_agent)
+        profile_text = self.render_profile(policy, grants=grants, ssh_agent=ssh_agent)
         _refuse_kernel_mask_rules(profile_text)
         if hands is not None:
             # The floor is rendered for the hands workspace (the binding fenced it there), and the
@@ -4719,10 +4912,19 @@ class SeatbeltProvider(ConfinementProvider):
         # A fresh entity's cwd is its workspace; ensure it exists (the shell's Popen(cwd=) needs a real
         # dir). Broad reach is default-allowed, so this is a convenience starting point, not a jail.
         policy.workspace.mkdir(parents=True, exist_ok=True)
+        shell_env = dict(env if env is not None else _default_shell_env())
+        shell_env.pop("SSH_AUTH_SOCK", None)
+        if ssh_agent is not None:
+            shell_env["SSH_AUTH_SOCK"] = ssh_agent.socket
+            if "GIT_SSH_COMMAND" not in shell_env and "GIT_SSH" not in shell_env:
+                shell_env["GIT_SSH_COMMAND"] = (
+                    "ssh -o IdentityAgent=SSH_AUTH_SOCK -o UserKnownHostsFile="
+                    + shlex.quote(str(ssh_agent.dir / _ssh_agent.KNOWN_HOSTS_NAME))
+                )
         shell = _SeatbeltShell(
             argv=argv,
             cwd=policy.workspace,
-            env=env if env is not None else _default_shell_env(),
+            env=shell_env,
             default_timeout=default_timeout,
         )
         return shell.start()

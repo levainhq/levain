@@ -656,13 +656,14 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
     assert lines[5].startswith("ignored: runtime_sockets in .levain/confinement.json (podman/podman.sock)")
     monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))
     mac = conf.unix_socket_lines(None, system="Darwin")
-    assert mac[0].startswith("unix sockets (T0: Darwin has no Landlock)")
+    assert mac[0] == conf.MACOS_SOCKET_TIER_LINE
+    assert any(line.startswith("waiver (operator grant) gpg:") for line in mac)
+    assert any(line.startswith("waiver (operator grant) podman:") for line in mac)
     assert "default grant: /private/var/run/mDNSResponder (name resolution)" in mac
-    # Never bound on macOS, so one line says so, and the file is neither read nor validated here (a
-    # Linux gpg path, or a broken file, does not fail this host's doctor).
-    assert conf.GRANTS_NOT_APPLIED_LINE in mac and not any("waiver" in ln for ln in mac)
+    # macOS reads the same operator authority file and fails closed on malformed content.
     grants("{broken")
-    assert conf.GRANTS_NOT_APPLIED_LINE in conf.unix_socket_lines(None, system="Darwin")
+    with pytest.raises(conf.ConfinementError, match="not valid JSON"):
+        conf.unix_socket_lines(None, system="Darwin")
 
 
 def test_a_hands_users_entity_reads_and_reports_no_operator_grant(grants, tmp_path, monkeypatch):
@@ -947,8 +948,11 @@ def test_the_lines_a_user_reads_carry_no_internal_plan_label(grants, monkeypatch
     import re
 
     monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))
+    fake = conf._ssh_agent.ScopedAgent("0123456789ab", "/tmp/agent.sock", 123)
+    monkeypatch.setattr(conf._ssh_agent, "start", lambda **kwargs: fake)
+    monkeypatch.setattr(conf._ssh_agent, "_macos_confinement_state", lambda: False)
     grants([])
     agent, why = conf.start_session_ssh_agent("e", system="Darwin")
     lines = [*conf.unix_socket_lines(None, system="Darwin"), why, conf._ssh_agent.DARWIN_LINE,
              conf._ssh_agent.confinement_refusal("Darwin")]
-    assert agent is None and not [ln for ln in lines if re.search(r"\bB\d", ln)], lines
+    assert agent == fake and why is None and not [ln for ln in lines if ln and re.search(r"\bB\d", ln)], lines

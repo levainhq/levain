@@ -19,9 +19,7 @@ __all__ = ["scan"]
 # match (e.g. ".../xsyscall-unixy").
 _TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_*-])("
-    r"syscall\*"
-    r"|syscall-(?:unix|mach|mig|number)"
-    r"|syscall-group-[A-Za-z0-9-]+"
+    r"syscall(?:\*|-[A-Za-z0-9-]+)?"
     r"|machtrap-number"
     r"|kernel-mig-routine"
     r")(?![A-Za-z0-9_-])",
@@ -44,14 +42,18 @@ def scan(profile_text: str) -> list[str]:
     and computed-operation forms (``eval``, ``load``, ``import`` ...). Empty means it may run."""
     text = profile_text or ""
     hits: list[str] = []
-    for m in _TOKEN_RE.finditer(text):
+    # A pathname is data, not an operation. Blank string literals for the operation scan, but retain
+    # comments: a dangerous token in a comment is refused too, so it cannot be uncommented by a
+    # renderer/template mistake without changing what this guard sees.
+    token_text = _STRING_RE.sub('""', text)
+    for m in _TOKEN_RE.finditer(token_text):
         t = m.group(1).lower()
         if t not in hits:
             hits.append(t)
     # Computed-operation forms are code, so they are looked for in code only: string literals are
-    # blanked, then each line is cut at its first ";" (an SBPL comment). The token scan above runs on
-    # the whole text, comments included, and so fails closed.
-    code = "\n".join(line.split(";", 1)[0] for line in _STRING_RE.sub('""', text).splitlines())
+    # blanked, then each line is cut at its first ";" (an SBPL comment). The token scan above retains
+    # comments but has already blanked strings.
+    code = "\n".join(line.split(";", 1)[0] for line in token_text.splitlines())
     for form in _META_RE.findall(code):
         if form not in hits:
             hits.append(form)

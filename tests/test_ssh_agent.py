@@ -296,12 +296,15 @@ def test_gits_ssh_names_the_scoped_agent_over_any_identity_agent_in_the_ssh_conf
     assert "identityagent /nonexistent/other-agent.sock" in control.stdout   # the config wins without the -o
 
 
-def test_no_agent_is_started_where_it_is_not_bound_into_bash(home):
+def test_macos_starts_the_agent_that_seatbelt_grants(home, monkeypatch):
     from levain.firing.confinement import start_session_ssh_agent
 
+    fake = ssh_agent.ScopedAgent("0123456789ab", str(home / "run" / "s" / "agent.sock"), 123)
+    seen = []
+    monkeypatch.setattr(ssh_agent, "start", lambda **kwargs: seen.append(kwargs) or fake)
     agent, why = start_session_ssh_agent("e", system="Darwin")
-    assert agent is None and "not wired on Darwin" in why
-    assert not (home / "run").exists()
+    assert (agent, why) == (fake, None)
+    assert seen == [{"entity": "e", "ssh_mode": "agent"}]
 
 
 @needs_openssh

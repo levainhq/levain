@@ -31,6 +31,7 @@ A levain that is killed leaves its agent running until the next levain start swe
 from __future__ import annotations
 
 import base64
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -585,10 +586,19 @@ def _no_new_privs() -> bool | None:
 def confinement_refusal(system: str | None = None) -> str | None:
     """Why this process must not add keys, from a test of its own context, never the environment: on
     Linux every levain confinement runs with ``no_new_privs`` (bwrap and the Landlock stub set it), so a
-    process that has it, or cannot tell, is refused. Off Linux there is no scoped agent to add to yet."""
+    process that has it, or cannot tell, is refused. On macOS, ask Seatbelt whether this process may
+    write levain's hidden run root: levain's profile denies it, while the operator's shell may write it."""
     system = system or platform.system()
+    if system == "Darwin":
+        confined = _macos_confinement_state()
+        if confined is None:
+            return "this process cannot ask Seatbelt whether it is inside a levain confinement"
+        if confined:
+            return ("this process is denied access to levain's protected run root, as every levain macOS "
+                    "confinement is; run `levain ssh-add` from your own shell")
+        return None
     if system != "Linux":
-        return f"levain's scoped ssh agent is not wired on {system} yet (until levain's macOS socket rule)"
+        return f"levain's scoped ssh agent is not wired on {system}"
     nnp = _no_new_privs()
     if nnp is None:
         return "this process cannot read /proc/self/status, so it cannot show it is outside a levain confinement"
@@ -597,6 +607,31 @@ def confinement_refusal(system: str | None = None) -> str | None:
                 "from your own shell (a shell that is not inside a levain session can have it too: Claude Code's "
                 "own sandbox, a flatpak or snap terminal, a container, or a systemd unit with NoNewPrivileges=yes)")
     return None
+
+
+def _macos_confinement_state() -> bool | None:
+    """Whether this process's Seatbelt policy denies a write to levain's protected run root.
+
+    ``sandbox_check`` only queries the policy already on this process; it does not apply a profile.
+    ``SANDBOX_FILTER_PATH`` is 1 in Darwin's sandbox API.  None is fail-closed uncertainty.
+    """
+    try:
+        check = ctypes.CDLL(None, use_errno=True).sandbox_check
+        check.restype = ctypes.c_int
+        # ``sandbox_check`` is variadic.  ctypes must still know the fixed arguments: without
+        # ``argtypes`` arm64 macOS passes the filter discriminator in the wrong ABI shape and the
+        # live API returns -1/EINVAL, which looks like a sandbox denial and would refuse the
+        # operator's own shell.
+        check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        result = check(
+            ctypes.c_int(os.getpid()),
+            ctypes.c_char_p(b"file-write-data"),
+            ctypes.c_int(1),
+            ctypes.c_char_p(os.fsencode(run_root())),
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return result != 0
 
 
 def _manifest_problem(f: Path) -> str | None:
@@ -822,8 +857,8 @@ def _add_key(key: Path, hosts: list[str], *, lifetime: int, session: str | None,
 
 # --- the run/doctor lines (D2) --------------------------------------------------------------------
 
-DARWIN_LINE = ("ssh agent: $SSH_AUTH_SOCK is passed to bash; levain has no unix-socket rule on macOS yet, "
-               "so bash running as you can reach your agent")
+DARWIN_LINE = ("ssh agent: levain starts a scoped one for each session's bash, never yours; add keys "
+               "from your own shell with `levain ssh-add <key> -h <host>` (none running now)")
 _NO_AGENT_TAIL = "$SSH_AUTH_SOCK is not passed to bash, so git over ssh inside bash fails"
 
 
@@ -922,15 +957,13 @@ def status_lines(system: str, *, agent: ScopedAgent | None = None, note: str | N
     Landlock tier (:func:`levain.firing.landlock.tier_for`): only at T9 are pathname unix sockets
     outside the sandbox refused, so only there does bash reach the scoped agent alone; unknown is
     read as below T9."""
-    if system == "Darwin":
-        return [DARWIN_LINE]
-    if system != "Linux":
+    if system not in ("Linux", "Darwin"):
         return []
     if hands:
         return [f"ssh agent: none (the entity's own user); {_NO_AGENT_TAIL}"]
     if agent is not None:
         rec = read_record(agent.dir) or {"keys": []}
-        reach = ("bash reaches only it, at its $SSH_AUTH_SOCK" if tier == "T9" else
+        reach = ("bash reaches only it, at its $SSH_AUTH_SOCK" if system == "Darwin" or tier == "T9" else
                  f"bash's $SSH_AUTH_SOCK is it; an agent socket elsewhere in bash's view (e.g. /tmp) stays "
                  f"reachable at this tier ({tier or 'unknown'}, pathname unix sockets are refused only at T9)")
         return [f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, {agent.socket}); {reach}",
@@ -942,7 +975,8 @@ def status_lines(system: str, *, agent: ScopedAgent | None = None, note: str | N
         return [f"ssh agent: none; levain starts no scoped agent here ({problem}); {_NO_AGENT_TAIL}"]
     running = [(d, rec) for d, rec in sessions() if live(d, rec)]
     if not running:
-        return ["ssh agent: levain starts a scoped one for each session's bash, never yours; add keys from "
+        return [DARWIN_LINE if system == "Darwin" else
+                "ssh agent: levain starts a scoped one for each session's bash, never yours; add keys from "
                 "your own shell with `levain ssh-add <key> -h <host>` (none running now)"]
     out = []
     for d, rec in running:

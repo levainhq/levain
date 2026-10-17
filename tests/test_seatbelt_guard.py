@@ -18,6 +18,8 @@ from levain.firing.seatbelt_guard import scan
     "(allow syscall-mach)",
     "(deny syscall-mig)",
     "(deny syscall*)",
+    "(deny syscall)",
+    "(deny syscall-unknown)",
     "(deny syscall-group-foo)",
     "(deny machtrap-number 26)",
     "(deny kernel-mig-routine)",
@@ -46,7 +48,11 @@ def test_scan_refuses_computed_operation_forms(form) -> None:
 @pytest.mark.parametrize("deny_creds", [False, True])
 @pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
 @pytest.mark.parametrize("deny_localhost", [False, True])
-def test_levains_own_rendered_profile_passes_the_guard(tmp_path, ssh_mode, deny_creds, deny_localhost) -> None:
+@pytest.mark.parametrize("with_grants", [False, True])
+@pytest.mark.parametrize("with_agent", [False, True])
+def test_levains_own_rendered_profile_passes_the_guard(
+    tmp_path, ssh_mode, deny_creds, deny_localhost, with_grants, with_agent
+) -> None:
     # A guard that refuses levain's own profile would refuse every shell. The first draft did, on
     # the words "load" and "read" inside the profile's ;; comments.
     entity = tmp_path / "ent"
@@ -55,7 +61,12 @@ def test_levains_own_rendered_profile_passes_the_guard(tmp_path, ssh_mode, deny_
         entity, ssh_mode=ssh_mode, deny_standard_creds=deny_creds,
         deny_localhost_outbound=deny_localhost,
     )
-    assert scan(confinement.SeatbeltProvider().render_profile(policy)) == []
+    grants = ((confinement.SocketGrant("/tmp/g.sock", "g", "test"),) if with_grants else ())
+    agent = (confinement._ssh_agent.ScopedAgent("0123456789ab", "/tmp/a.sock", 123)
+             if with_agent else None)
+    profile = confinement.SeatbeltProvider().render_profile(policy, grants=grants, ssh_agent=agent)
+    assert "syscall" not in profile.lower()
+    assert scan(profile) == []
 
 
 def test_a_comment_cannot_hide_a_kernel_mask_token() -> None:
@@ -67,7 +78,7 @@ def test_levains_own_spawn_refuses_a_profile_carrying_a_mask_rule(tmp_path, monk
     monkeypatch.setattr(confinement, "sandbox_exec_available", lambda: True)
     monkeypatch.setattr(
         confinement.SeatbeltProvider, "render_profile",
-        lambda self, policy: "(version 1)\n(allow default)\n(deny syscall-unix)\n",
+        lambda self, policy, **kwargs: "(version 1)\n(allow default)\n(deny syscall-unix)\n",
     )
     monkeypatch.setattr(confinement, "_SeatbeltShell", lambda *a, **k: executed.append(a) or None)
     monkeypatch.setattr(confinement.subprocess, "Popen", lambda *a, **k: executed.append(a))
