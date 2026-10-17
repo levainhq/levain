@@ -168,7 +168,8 @@ CONSENT_AGENTS = ("claude_code", "codex")
 # the other shell names levain's PostToolUse hooks know (shell, exec_command, shell_command, local_shell) are too.
 # A grant naming any of them is refused at append (:func:`consent_tool_problem`) and answers nothing at decision
 # (``levain.consent.policy.grant_refusal``). The replay holds only Bash (:data:`_REPLAY_SHELL_TOOLS`), so a log
-# that already holds a grant on another of them still replays. Compared case-insensitively.
+# that already holds a grant on another of them still replays. Compared case-insensitively, on the whole name and on
+# an MCP tool's own name (mcp__shell__exec_command is exec_command: :func:`_consent_shell_name`).
 CONSENT_SHELL_TOOLS = frozenset({"bash", "powershell", "write_stdin", "shell", "exec_command", "shell_command",
                                  "local_shell"})
 _REPLAY_SHELL_TOOLS = frozenset({"bash"})
@@ -1439,13 +1440,23 @@ def _shell_refusal(what: str, tool: str) -> str:
             "allow every command; shell requests go to you")
 
 
+def _consent_shell_name(tool: str) -> bool:
+    """Whether ``tool`` is a shell by name: it, or the name after any ``__`` in it (an MCP tool's own name after
+    ``mcp__<server>__``, whatever ``__`` the server name holds), is in :data:`CONSENT_SHELL_TOOLS`, any case. The
+    single judgement of a shell name for a grant, at append and at decision; a tool's fields are never read."""
+    name = tool.lower()
+    return name in CONSENT_SHELL_TOOLS or any(
+        name[i + 2:] in CONSENT_SHELL_TOOLS for i in range(len(name) - 1) if name.startswith("__", i))
+
+
 def consent_tool_problem(agent: str, tool: str) -> str | None:
     """Why a consent grant for ``agent`` may not name ``tool`` (``None`` when it may): a shell tool
-    (:data:`CONSENT_SHELL_TOOLS`, any case), an MCP tool :func:`consent_mcp_tool_problem` refuses, or any other
+    (:func:`_consent_shell_name`: a name in :data:`CONSENT_SHELL_TOOLS`, any case, bare or as an MCP tool's own
+    name), an MCP tool :func:`consent_mcp_tool_problem` refuses, or any other
     name that is not in :data:`CONSENT_GRANTABLE_TOOLS` for ``agent``. Read at append and at every decision."""
     if not isinstance(tool, str):
         return "a grant's tool must be a name"
-    if tool.lower() in CONSENT_SHELL_TOOLS:
+    if _consent_shell_name(tool):
         return _shell_refusal("grant", tool)
     if "__" in tool:
         return consent_mcp_tool_problem(tool)
@@ -1476,9 +1487,9 @@ def _consent_tool_check(grants: list[Any], after: str = "") -> None:
 def consent_grant_tool_problem(grant: Any, tool: Any) -> str | None:
     """Why ``grant`` may not name ``tool`` (``None`` when it may): :func:`consent_tool_problem` for the grant's agent,
     except that an MCP tool a consent-mcp grant declares (:func:`consent_mcp_declaration`) may be named whether or not
-    it is on :data:`CONSENT_MCP_READ_ONLY_TOOLS`. A shell name is refused whatever is declared. Read at append (for a
-    consent-mcp grant) and at every decision."""
-    if isinstance(tool, str) and tool.lower() not in CONSENT_SHELL_TOOLS \
+    it is on :data:`CONSENT_MCP_READ_ONLY_TOOLS`. A shell name (:func:`_consent_shell_name`, an MCP tool's own name
+    included) is refused whatever is declared. Read at append (for a consent-mcp grant) and at every decision."""
+    if isinstance(tool, str) and not _consent_shell_name(tool) \
             and consent_mcp_declaration(grant, tool) is not None:
         return None
     return consent_tool_problem(grant.get("agent") if isinstance(grant, Mapping) else None, tool)
