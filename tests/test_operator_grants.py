@@ -875,3 +875,23 @@ def test_a_listener_whose_backlog_is_full_costs_the_grant_check_about_a_second(t
         for c in held:
             c.close()
         ls.close()
+
+
+def test_doctor_reports_unix_sockets_only_for_an_entity_levain_run_runs(grants, tmp_path, capsys, monkeypatch):
+    """L2 integration: the row describes `levain run`'s bash. A Claude Code or Codex install is one levain
+    run refuses, its Bash is the host agent's, and the row contradicted that install's own sandbox row
+    (and FAILED it on a broken grants.json). It is printed for a clean openhands entity only."""
+    from levain.doctor import run_doctor
+
+    monkeypatch.setattr(conf, "grants_apply", lambda system=None: True)
+    monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))   # no syscall
+    grants("{broken")
+    cc = tmp_path / "cc"
+    cc.mkdir()
+    (cc / "CLAUDE.md").write_text("# entity\n")
+    run_doctor(cc)
+    assert "unix sockets" not in capsys.readouterr().out
+    oh = _entity(tmp_path)
+    (oh / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    run_doctor(oh)
+    assert "unix sockets" in capsys.readouterr().out
