@@ -301,6 +301,14 @@ def test_concurrent_appends_across_the_rotation_lose_no_event(agent_root, tmp_pa
     sdir.mkdir(parents=True, exist_ok=True)
     path = sdir / f"{_key(agent, 's1')}.log.jsonl"
     script = root / "activation" / "hooks" / "post_tool_use.py"
+    # This test proves rotation loses nothing under contention. The 0.25 s lock give-up (a held lock
+    # drops the event by design, covered by the held-lock test below) is a scheduling race on a loaded
+    # host: the 12th process can wait past it. The installed copy gets a long wait so a give-up cannot
+    # read as a rotation loss.
+    hook = root / "activation" / "hooks" / "_levain_hook.py"
+    src = hook.read_text()
+    assert "_SESSIONS_LOCK_WAIT = 0.25\n" in src
+    hook.write_text(src.replace("_SESSIONS_LOCK_WAIT = 0.25\n", "_SESSIONS_LOCK_WAIT = 30.0\n"))
     gate = tmp_path_factory.mktemp("gate") / "go"
     n_proc, rounds, sent = 12, 6, []
     for rnd in range(rounds):
