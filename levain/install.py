@@ -2316,6 +2316,130 @@ def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], No
     emit(f"  messaging:  {choice} → .levain/config.json")
 
 
+def _restore_messaging_record(install: Path, previous: str | None) -> None:
+    """Put ``messaging`` in ``.levain/config.json`` back to ``previous`` (``None``: remove the key), leaving every
+    other key as it is now. Used only by a verb that recorded a choice and must undo it."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    try:
+        doc = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return
+        if previous is None:
+            doc.pop("messaging", None)
+        else:
+            doc["messaging"] = previous
+        _atomic_write_text(config_path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def _workspace_carries(install: Path, choice: str) -> bool | None:
+    """Whether the workspace's ``.claude/settings.json`` carries the controls ``choice`` maps to (the keys
+    ``_MESSAGING_KNOBS`` names, read through ``host_guard.messaging_facts``). ``None``: the file cannot be read."""
+    from levain.host_guard import messaging_facts
+
+    path = install / ".claude" / "settings.json"
+    if not os.path.lexists(path):
+        facts: dict = {}
+    else:
+        try:
+            facts = messaging_facts(json.loads(path.read_text(encoding="utf-8"))) or {}
+        except (OSError, ValueError, RecursionError):
+            return None
+    ask, deny = facts.get("ask", ()), facts.get("deny", ())
+    inbound = facts.get("crossSessionInbound")
+    if choice == "isolate":
+        return facts.get("isolatePeerMachines") is True
+    if choice == "governed":
+        return inbound == "hold" and "SendMessage" in ask
+    if choice == "off":
+        return inbound == "refuse" and "SendMessage" in deny and "ListAgents" in deny
+    return not facts
+
+
+def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
+    """`levain messaging` / `messaging show`: the effective choice, whether it is recorded or the default, and
+    whether the workspace's settings carry its controls. Read-only."""
+    install = Path(str(path)).expanduser().resolve()
+    chosen = effective_adapter(install)
+    if chosen is None:
+        emit(f"FAIL: {install} is not a levain install (run `levain init` first, or pass --path).")
+        return 1
+    if chosen != "claude-code":
+        emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
+        return 1
+    recorded = recorded_messaging(install)
+    effective = persisted_messaging(install)
+    source = "recorded in .levain/config.json" if recorded is not None else "the default, nothing recorded"
+    emit(f"messaging: {effective} ({source})")
+    carries = _workspace_carries(install, effective)
+    if carries is None:
+        emit("  .claude/settings.json: cannot be read, so whether it carries these controls cannot be told.")
+    elif carries:
+        emit(f"  .claude/settings.json: carries the {effective} controls.")
+    else:
+        emit(f"  .claude/settings.json: does not carry the {effective} controls "
+             f"(`levain update` renders them from the record; `levain doctor` says more).")
+    return 0
+
+
+def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: bool = False,
+                      emit: Callable[[str], None] = print) -> int:
+    """`levain messaging set MODE`: validate, record ``choice`` through :func:`_write_messaging_choice`, then run
+    `levain update` for the install (the one renderer, receipt and pin path). An update that errors restores the
+    previous record; one that holds settings.json for review keeps the record. Exit code = update's."""
+    from levain.update import run_update
+
+    install = Path(str(path)).expanduser().resolve()
+    chosen = effective_adapter(install)
+    if chosen is None:
+        emit(f"FAIL: {install} is not a levain install (run `levain init` first, or pass --path).")
+        return 1
+    if chosen != "claude-code":
+        emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
+        return 1
+    try:
+        _check_messaging(install, chosen, choice)
+    except InitError as e:
+        emit(f"FAIL: {e}")
+        return 1
+    previous = recorded_messaging(install)
+    try:
+        with install_lock(install, create=False):
+            _write_messaging_choice(install, choice, emit)
+    except InstallLockError as e:
+        emit(f"FAIL: {e.message}")
+        return 1
+    except InitError as e:
+        emit(f"FAIL: {e}")
+        return 1
+    staged = install.joinpath(*PENDING_REL, ".claude", "settings.json")
+    emit("  running `levain update` to apply it")
+    try:
+        rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit)
+    except BaseException:
+        _restore_messaging_record(install, previous)
+        emit("FAIL: `levain update` errored; the previous messaging choice is restored.")
+        raise
+    carries = _workspace_carries(install, choice)
+    if carries:
+        return rc
+    if os.path.lexists(staged):
+        emit(f"messaging: {choice} is recorded, but .claude/settings.json was held for review (you edited it). "
+             f"Merge the staged copy at {staged} to apply it.")
+        return rc
+    _restore_messaging_record(install, previous)
+    if rc == 0:
+        emit(f"FAIL: `levain update` did not apply {choice} (an update never loosens a control the workspace's "
+             f"settings already carry); the previous messaging choice is restored. To loosen, run "
+             f"`levain init --force --messaging {choice}`.")
+        return 1
+    emit("FAIL: `levain update` did not finish; the previous messaging choice is restored.")
+    return rc
+
+
 def parse_memory_load(specs: Sequence[str]) -> tuple[str | None, dict[str, str]]:
     """``--memory-load`` values -> (install default or None, {adapter: mode}). A value is a bare MODE (the
     install's default, given at most once) or ADAPTER=MODE (one agent, a later repeat of the same adapter

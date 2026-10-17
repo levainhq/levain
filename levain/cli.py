@@ -200,8 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             "outbound send asks. `off`: inbound refused, sending and "
             "listing denied. `unmanaged`: none of those keys written. Claude Code never counts a message "
             "from another session as your consent, whichever you choose. The choice is kept in "
-            ".levain/config.json, so `levain update` and `init --force` keep it; give --messaging again "
-            "to change it."
+            ".levain/config.json, so `levain update` and `init --force` keep it. To change it on an existing "
+            "install, run `levain messaging set MODE` (it records the choice and runs `levain update`)."
         ),
     )
     init_p.add_argument(
@@ -1213,6 +1213,33 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     upd_p.set_defaults(func=_cmd_update)
+
+    msg_p = subparsers.add_parser(
+        "messaging",
+        help="Show or change the Claude Code cross-session messaging choice of an install.",
+        description=(
+            "`levain messaging` (or `messaging show`) prints the effective choice, whether it is recorded or the "
+            "default (isolate), and whether the workspace's .claude/settings.json carries its controls. "
+            "`levain messaging set MODE` records the choice in .levain/config.json and runs `levain update` "
+            "(claude-code adapter only). MODE is isolate, governed, off or unmanaged."
+        ),
+    )
+    msg_p.add_argument("--path", type=Path, default=Path.cwd(), help="Install directory (default: cwd).")
+    msg_sub = msg_p.add_subparsers(dest="messaging_cmd")
+    msg_show = msg_sub.add_parser("show", help="Print the effective choice (read-only).")
+    msg_show.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Install directory (default: cwd).")
+    msg_set = msg_sub.add_parser(
+        "set",
+        help="Record the choice and run `levain update`.",
+        description=("Records the choice in .levain/config.json and runs `levain update` for the install, which "
+                     "renders the controls, re-pins and writes the receipt. An update that errors restores the "
+                     "previous choice; a settings.json held for review keeps the record."),
+    )
+    msg_set.add_argument("mode", choices=("isolate", "governed", "off", "unmanaged"))
+    msg_set.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Install directory (default: cwd).")
+    msg_set.add_argument("--yes", action="store_true", help="Auto-confirm update's pip step.")
+    msg_set.add_argument("--no-pip", action="store_true", dest="no_pip", help="Skip update's pip step.")
+    msg_p.set_defaults(func=_cmd_messaging)
 
     adopt_p = subparsers.add_parser(
         "adopt-answers",
@@ -2947,6 +2974,14 @@ def _cmd_update(args: argparse.Namespace) -> int:
         no_pip=args.no_pip,
         ack=args.ack,
     )
+
+
+def _cmd_messaging(args: argparse.Namespace) -> int:
+    from levain.install import run_messaging_set, run_messaging_show
+
+    if getattr(args, "messaging_cmd", None) == "set":
+        return run_messaging_set(args.path, args.mode, yes=args.yes, no_pip=args.no_pip)
+    return run_messaging_show(args.path)
 
 
 def _cmd_adopt_answers(args: argparse.Namespace) -> int:

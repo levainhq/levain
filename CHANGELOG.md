@@ -6,8 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-### Changed
-- The phone consent page (`levain consent phone`) now matches the cockpit's look (palette, type, card shapes, buttons; light and dark by the phone's setting); nothing it shows or signs changed. Known edges, phone page look: the waiting card's accent top line stays on a card already answered until you refresh (the page's script draws it, outside a look-only change); in light mode allow and deny differ mainly by hue, so the words "allow" and "deny" are always spelled out.
+### Added
+- **`levain messaging set isolate|governed|off|unmanaged` changes an install's messaging choice without re-running `init`; `levain messaging` (or `messaging show`) reads it.** `set` checks the choice first (claude-code adapter only, a readable `.levain/config.json`; nothing is written on a refusal), records it in `.levain/config.json` the way `init --messaging` does, and runs `levain update` for the install, which renders the controls, re-pins and writes the receipt, so the settings file is the same bytes a fresh `init --messaging` of the same choice gives. An update that errors restores the previous record. If `.claude/settings.json` was edited by you, update stages its version under `.levain/pending/`; the choice stays recorded and `set` says to merge the staged copy. `show` prints the effective choice, whether it is recorded or the default (`isolate`), and whether the workspace's settings carry its controls; it writes nothing. `--path` defaults to the current directory. Known edge: `levain update` never loosens a control the settings file carries, so moving to a looser choice (for example `governed` to `unmanaged`) is refused with the record restored; use `levain init --path <install> --force --messaging <choice>` for that.
 
 ## [0.11.2] — 2026-10-16
 
