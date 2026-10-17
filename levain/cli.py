@@ -1960,24 +1960,32 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
 
 
 def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
-    """``levain consent away [show|on|off]`` under the ``consent`` subparsers ``cs_sub``."""
+    """``levain consent away [show|on|off|auto]`` under the ``consent`` subparsers ``cs_sub``."""
     away = cs_sub.add_parser(
         "away", help="Show or set away mode: whether the consent hook holds a request for a signed answer.",
-        description="Away mode off (the default): the hook answers only by a standing grant and otherwise leaves "
+        description="Away mode off: the hook answers only by a standing grant and otherwise leaves "
                     "the agent's own dialog to ask you at once, so a signed answer has nothing to land on. On: the "
                     "hook holds each request no grant answers for up to --hold seconds so you can answer it with "
                     "`levain consent answer` or your phone. Claude Code shows its own dialog during the hold too "
                     "(an allow from the hook dismisses it); Codex shows no dialog until the hold ends, so for Codex "
-                    "away means away. `on` refuses when no enrolled key in the install's cockpit could sign an "
-                    "answer. Changes only away_mode and away_hold_seconds in <queue dir>/claude_code.json and "
-                    "codex.json; grants nothing (every answer still verifies as a signature). Takes effect at the "
-                    "next request.")
-    away.add_argument("action", nargs="?", choices=("show", "on", "off"), default="show")
+                    "away means away. `on` and `off` are your word and stand until `auto` clears it; with no word "
+                    "(the default), away mode is on while this Mac has had no keyboard, mouse or trackpad input for "
+                    "--idle-after seconds (default 600) and an enrolled key could sign an answer; there is no input-"
+                    "idle source on other platforms, so there only `on` turns it on. A held request ends early when "
+                    "away mode turns off (your input, or `off`), leaving the agent's own dialog to ask. `on` refuses "
+                    "when no enrolled key in the install's cockpit could sign an answer. Changes only away_mode, "
+                    "away_word, away_hold_seconds and away_idle_seconds in <queue dir>/claude_code.json and "
+                    "codex.json; grants nothing (every answer still verifies as a signature). `show` says which "
+                    "source decides now.")
+    away.add_argument("action", nargs="?", choices=("show", "on", "off", "auto"), default="show")
     away.add_argument("--agent", choices=("claude_code", "codex", "all"), default="all",
                       help="Which agent's settings (default: every agent that has a settings file).")
     away.add_argument("--hold", type=float, default=None,
                       help="Seconds to hold a request in away mode, more than 0 and at most 840, the longest the "
                            "hook waits (default: the file's hold, else 300 for Claude Code and 120 for Codex).")
+    away.add_argument("--idle-after", dest="idle_after", type=float, default=None,
+                      help="With `auto`: seconds of no input after which away mode turns on (default: the file's, "
+                           "else 600).")
     away.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                       help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     away.set_defaults(func=_cmd_consent_away)
@@ -1985,13 +1993,17 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
 
 def _cmd_consent_away(args: argparse.Namespace) -> int:
     from levain.consent import away
+    from levain.consent.auto_away import away_state, hold_seconds
     from levain.consent.queue import QueueStoreError, default_queue_dir
 
     # abspath, not resolve(): the queue directory's symlink check must see the path as given (L3 r1)
     qdir = Path(os.path.abspath(args.queue_dir.expanduser())) if args.queue_dir is not None else default_queue_dir()
     agents = list(away.AGENTS) if args.agent == "all" else [args.agent]
     if args.action == "show" and args.hold is not None:
-        print("levain consent away: --hold goes with `on` or `off`", file=sys.stderr)
+        print("levain consent away: --hold goes with `on`, `off` or `auto`", file=sys.stderr)
+        return 2
+    if args.action != "auto" and args.idle_after is not None:
+        print("levain consent away: --idle-after goes with `auto`", file=sys.stderr)
         return 2
     try:
         away.check_queue_dir(qdir)
@@ -2019,21 +2031,31 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                     rc = 1
                 continue
             if args.action != "show":
-                away.set_away(qdir, agent, args.action == "on", args.hold)
+                word = {"on": True, "off": False, "auto": None}[args.action]
+                away.set_away(qdir, agent, word, args.hold, args.idle_after)
             got = away.settings(qdir, agent)  # what the hook reads, not the raw file
             seen += 1
         except (OSError, ValueError, QueueStoreError) as e:
             print(f"levain consent away: {agent}: {e}", file=sys.stderr)
             rc = 1
             continue
-        if got.away_mode:
-            line = f"{agent}: away mode ON, holds up to {min(got.away_hold_seconds, away.MAX_HOLD):g}s"
+        on, source, why = away_state(got)
+        reason = away.why_unanswerable(got)
+        if on and source == "idle" and reason:
+            on, why = False, f"{why}, but nothing can sign an answer"
+        if on:
+            hold = min(hold_seconds(got, agent, source), away.MAX_HOLD)
+            line = f"{agent}: away mode ON, holds up to {hold:g}s"
             line += " (Claude Code's own dialog shows meanwhile)" if agent == "claude_code" else \
                 " (Codex shows no dialog until the hold ends)"
         else:
             line = f"{agent}: away mode off"
-        reason = away.why_unanswerable(got)
         line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
+        line += f"; set by {why}"
+        if source == "word":
+            line += "; `levain consent away auto` hands it back to input idle"
+        elif source == "idle" and not on:
+            line += f"; on after {got.away_idle_seconds:g}s of no keyboard, mouse or trackpad input"
         print(line)
     if seen == 0 and rc == 0:
         print(f"levain consent away: no consent settings in {qdir}; `levain init` with the consent hook on writes "

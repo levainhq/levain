@@ -13,6 +13,15 @@ from tests.autonomic_test_only_confinement import test_only_confined_executor  #
 
 
 @pytest.fixture(autouse=True)
+def _no_input_idle_source(monkeypatch):
+    """The consent hook reads this Mac's real input idle (`levain.consent.auto_away.input_idle_seconds`), so a
+    suite run while nobody touches the machine would hold requests no test meant to hold. Every in-process test
+    gets "no idle source"; a test of input idle passes its own reader."""
+    import levain.consent.auto_away as auto_away
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _test_uid_may_own_the_test_signers_file():
     """TEST ONLY: the throwaway key the tests enrol (``tests/autonomic_confirm_keys.py``) is in a file this
     process's uid owns, where a deployment's allowed-signers file must be root's

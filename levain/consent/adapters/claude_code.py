@@ -10,8 +10,10 @@ hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it an
    event's ``permission_mode``) and the tool input the request was filed for; it answers only with a standing
    consent grant the queue verified. A request that targets agent config or hooks (:func:`targets_agent_config`)
    is never eligible for one;
-3. when away mode is on (an adapter setting, default off, default hold 0 s) waits up to the hold for a signed
-   answer the core verifies, and withdraws the request if none came (one whose hold ran out is expired);
+3. when away mode is on (:func:`levain.consent.auto_away.away_state`: the operator's explicit word, else input
+   idle on macOS, else off) waits up to the hold for a signed answer the core verifies, re-reading away mode while
+   it waits and stopping when the operator is back, and withdraws the request if none came (one whose hold ran out
+   is expired);
 4. prints ``allow`` only for a verified allow (with a line naming the grant when a grant answered) and ``deny``
    only for a verified deny. Anything else, including any exception, prints nothing and exits 0: the native
    dialog stands and the human answers it.
@@ -23,7 +25,9 @@ Settings live in ``<levain home>/consent/claude_code.json`` (:data:`SETTINGS_NAM
 
     {"cockpit_data_root": "/absolute/cockpit/data/root", "away_mode": false, "away_hold_seconds": 0}
 
-Missing or unreadable settings mean away mode off and no authority (so no answer can verify). :func:`install`
+plus, once ``levain consent away`` has written them, ``away_word`` (``"on"`` / ``"off"``, absent for input idle)
+and ``away_idle_seconds``. Missing or unreadable settings mean no explicit word and no authority (so no answer can
+verify, and nothing is held). :func:`install`
 writes the hook script (:data:`HOOK_TEMPLATE`) and the ``PermissionRequest`` entry into ONE workspace's project
 settings; wiring into user settings is a later slice.
 """
@@ -54,6 +58,7 @@ from levain.consent.policy import PolicyNotEligible as PolicyNotEligible
 from levain.consent.policy import guarded_policy as guarded_policy
 from levain.consent.policy import mcp_config_candidates
 from levain.consent.policy import targets as _targets
+from levain.consent.auto_away import IDLE_THRESHOLD, WORDS, away_state, hold_seconds
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
 
@@ -83,9 +88,13 @@ DEFAULT_TIER = "T2"
 
 @dataclass(frozen=True)
 class AdapterSettings:
+    # away_mode is the explicit word on, explicit_off the explicit word off; with neither, input idle decides
+    # (levain.consent.auto_away.away_state)
     away_mode: bool = False
     away_hold_seconds: float = 0.0
     cockpit_data_root: str | None = None
+    explicit_off: bool = False
+    away_idle_seconds: float = IDLE_THRESHOLD
 
 
 def load_settings(queue_dir: Path) -> AdapterSettings:
@@ -106,17 +115,29 @@ def read_settings_file(path: Path) -> AdapterSettings:
 
 def settings_from(data: Any) -> AdapterSettings:
     """The settings a parsed settings file means, as both adapters' hooks and ``levain consent away`` read it:
-    away mode only when ``away_mode`` is ``true``, a hold only when it is a finite number >= 0 (an integer too
-    large for a float is malformed), a cockpit root only when absolute (:func:`_absolute_root`)."""
+    the explicit word ``away_word`` (``"on"`` or ``"off"``; a file without one and ``away_mode`` ``true``, as
+    releases before input idle wrote it, is the word on): away mode for the word on, ``explicit_off`` for off; a
+    hold only when it is a finite number >= 0 (an integer too large for a float is malformed), an idle threshold
+    (``away_idle_seconds``) only when it is a finite number > 0, else :data:`IDLE_THRESHOLD`, a cockpit root only
+    when absolute (:func:`_absolute_root`)."""
     if not isinstance(data, dict):
         return AdapterSettings()
-    hold = data.get("away_hold_seconds", 0)
+    word = data.get("away_word")
+    if word not in WORDS:
+        word = "on" if data.get("away_mode") is True else None
+    return AdapterSettings(away_mode=word == "on", away_hold_seconds=_seconds(data.get("away_hold_seconds", 0), 0.0),
+                           cockpit_data_root=_absolute_root(data.get("cockpit_data_root")), explicit_off=word == "off",
+                           away_idle_seconds=_seconds(data.get("away_idle_seconds"), IDLE_THRESHOLD, positive=True))
+
+
+def _seconds(value: Any, default: float, *, positive: bool = False) -> float:
+    """``value`` as a finite float >= 0 (> 0 when ``positive``); ``default`` for anything else."""
     try:
-        ok = not isinstance(hold, bool) and isinstance(hold, (int, float)) and math.isfinite(float(hold)) and hold >= 0
+        ok = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) \
+            and (value > 0 if positive else value >= 0)
     except OverflowError:
         ok = False
-    return AdapterSettings(away_mode=data.get("away_mode") is True, away_hold_seconds=float(hold) if ok else 0.0,
-                           cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
+    return float(value) if ok else default
 
 
 def _absolute_root(root: Any) -> str | None:
@@ -216,8 +237,9 @@ def _is_config_path(path: Path) -> bool:
 
 
 def nothing_can_decide(settings: AdapterSettings) -> bool:
-    """Away mode off and the cockpit the settings point at replays to no active key and no standing grant (or
-    has no database, or does not replay): no grant or signed answer can verify and no hold is asked, so the hook
+    """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
+    has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
+    holds only for an enrolled key, :func:`away_hold`), so the hook
     files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED)."""
     if settings.away_mode:
@@ -373,12 +395,73 @@ def hook_output(decision: Decision) -> dict[str, Any]:
     return out
 
 
+def _can_sign(settings: AdapterSettings) -> bool:
+    """The cockpit the settings name replays to at least one active key, so a held request can get a signed
+    answer."""
+    root = settings.cockpit_data_root
+    if not root or not (Path(root) / "cockpit.db").is_file():
+        return False
+    try:
+        return bool(authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))().active_keys())
+    except Exception:
+        return False  # an authority that does not replay verifies nothing
+
+
+def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | None] | None = None) -> float:
+    """Seconds the hook holds a request for a signed answer under ``settings``: 0 unless
+    :func:`levain.consent.auto_away.away_state` says away (``idle`` is its idle source). Away by input idle holds
+    only when an enrolled key could sign an answer (:func:`_can_sign`): the explicit word on checks that when it
+    is set; nothing sets input idle."""
+    away, source, _why = away_state(settings, idle)
+    if not away or (source == "idle" and not _can_sign(settings)):
+        return 0.0
+    return hold_seconds(settings, agent, source)
+
+
+# While a request is held, away mode is read again this often: an operator who comes back (input, or the word off)
+# gets the agent's own dialog within about this long, plus one idle read (levain.consent.auto_away.IDLE_READ_TIMEOUT)
+RECHECK_EVERY = 1.0
+
+
+def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: float, *, tool_input: Any,
+                    posture: str | None, still_away: Callable[[], tuple[bool, str, str]] | None = None,
+                    ) -> tuple[Decision | None, str | None]:
+    """Wait up to ``wait`` seconds for a verified decision on ``request``: ``(decision, None)``, or
+    ``(None, why)`` when ``still_away`` (re-read every :data:`RECHECK_EVERY` seconds) says the operator is back,
+    ``why`` its reason, or ``(None, None)`` when the wait ran out or the request stopped being pending. With no
+    ``still_away`` it is one :meth:`ConsentQueue.await_decision` of ``wait``. The wait can run past ``wait`` by one
+    ``still_away`` call."""
+    if still_away is None:
+        return _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture), request), \
+            None
+    end = time.monotonic() + wait
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return None, None
+        piece, started = min(left, RECHECK_EVERY), time.monotonic()
+        got = _verified(queue.await_decision(request.id, piece, tool_input=tool_input, posture=posture), request)
+        if got is not None:
+            return got, None
+        if time.monotonic() - started < piece or end - time.monotonic() <= 0:
+            # await_decision returns before its timeout only when the request is no longer pending
+            return None, None
+        away, _source, why = still_away()
+        if not away:
+            return None, why
+
+
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
            policy: Policy | None = None,
-           home: Path | None = None, clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+           home: Path | None = None, clock: Callable[[], float] = time.monotonic,
+           idle: Callable[[], float | None] | None = None,
+           still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
-    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. ``policy``
+    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
+    :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
+    passes a re-read of the settings file and input idle) ends a hold early when it says the operator is back,
+    leaving the native dialog to ask. ``policy``
     (default :func:`levain.consent.policy.decide`) is only ever reached through :func:`guarded_policy`, called with
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
     request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
@@ -407,7 +490,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if policy is None and nothing_can_decide(settings):
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
-    hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0
+    hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
@@ -419,12 +502,15 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
             got = _verified(guarded_policy(request, queue, posture=posture, tool_input=tool_input, policy=policy),
                             request)
         wait = min(hold, max(0.0, deadline - clock()))
+        back = None
         if got is None and wait > 0:
-            got = _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture),
-                            request)
+            got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
+                                        still_away=still_away)
         if got is None:
+            note = f"the operator is back ({back}); the native dialog stands" if back else \
+                "the hook stopped waiting; the native dialog stands"
             # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
-            if not queue.withdraw(request.id, note="the hook stopped waiting; the native dialog stands"):
+            if not queue.withdraw(request.id, note=note):
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
         settled = True
@@ -462,7 +548,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
-        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold)
+        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
+                     still_away=lambda: away_state(load_settings(queue_dir)))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

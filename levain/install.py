@@ -2070,8 +2070,9 @@ def _consent_agent_version(adapter: str) -> str | None:
 
 def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
     """Create the consent adapter's settings file (``<queue dir>/claude_code.json`` or ``codex.json``) when there is
-    none: this install's cockpit as ``cockpit_data_root``, away mode off. CREATE-ONLY: an existing file is never
-    written (away mode is the operator's opt-in, and repointing another install's cockpit would make that install's
+    none: this install's cockpit as ``cockpit_data_root``, no explicit away word (so input idle decides,
+    :func:`levain.consent.auto_away.away_state`). CREATE-ONLY: an existing file is never
+    written (its away word is the operator's, and repointing another install's cockpit would make that install's
     signed answers undeliverable); one naming another cockpit, or none, is reported. Never fails init: a hook with no
     settings file gives no decision and the agent's own dialog answers."""
     from levain.consent.adapters import claude_code, codex
@@ -2098,7 +2099,8 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
                     os.fsync(fh.fileno())
                 try:
                     os.link(tmp, path)  # fails when another writer created it meanwhile: theirs is kept
-                    emit(f"  consent settings: {path} (away mode off; grants verify against {ours})")
+                    emit(f"  consent settings: {path} (away mode follows input idle on macOS, off elsewhere "
+                         f"until `levain consent away on`; grants verify against {ours})")
                     return
                 except FileExistsError:
                     pass
