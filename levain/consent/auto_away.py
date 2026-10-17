@@ -20,8 +20,8 @@ from typing import Any
 
 __all__ = ["DEFAULT_HOLDS", "IDLE_THRESHOLD", "WORDS", "away_state", "hold_seconds", "input_idle_seconds"]
 
-# the operator's explicit words, as the settings file's ``away_word`` holds them
-WORDS = ("on", "off")
+# the settings file's ``away_word``: the operator's explicit words, or ``auto`` for none (input idle decides)
+WORDS = ("on", "off", "auto")
 # input silence after which the operator reads as away: 10 minutes
 IDLE_THRESHOLD = 600.0
 # Claude Code shows its own dialog at once while the hook holds (an allow from the hook dismisses it), so a long
@@ -54,6 +54,9 @@ def away_state(settings: Any, idle: Callable[[], float | None] | None = None) ->
     if settings.away_mode:
         return True, "word", "explicit word: on"
     if settings.explicit_off:
+        if getattr(settings, "legacy", False):
+            return False, "word", ("explicit word: off (set before auto-away existed); `levain consent away auto` "
+                                   "lets input idle decide")
         return False, "word", "explicit word: off"
     seconds = (idle or input_idle_seconds)()
     if seconds is None:

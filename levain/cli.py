@@ -1967,7 +1967,8 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                     "`levain consent answer` or your phone. Claude Code shows its own dialog during the hold too "
                     "(an allow from the hook dismisses it); Codex shows no dialog until the hold ends, so for Codex "
                     "away means away. `on` and `off` are your word and stand until `auto` clears it; with no word "
-                    "(the default), away mode is on while this Mac has had no keyboard, mouse or trackpad input for "
+                    "(the default `levain init` writes; a settings file from before auto-away keeps its on or off "
+                    "as your word), away mode is on while this Mac has had no keyboard, mouse or trackpad input for "
                     "--idle-after seconds (default 600) and an enrolled key could sign an answer; there is no input-"
                     "idle source on other platforms, so there only `on` turns it on. A held request ends early when "
                     "away mode turns off (your input, or `off`), leaving the agent's own dialog to ask. `on` refuses "
@@ -1991,7 +1992,8 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
 
 def _cmd_consent_away(args: argparse.Namespace) -> int:
     from levain.consent import away
-    from levain.consent.auto_away import away_state, hold_seconds
+    from levain.consent.adapters.claude_code import effective_away
+    from levain.consent.auto_away import hold_seconds
     from levain.consent.queue import QueueStoreError, default_queue_dir
 
     # abspath, not resolve(): the queue directory's symlink check must see the path as given (L3 r1)
@@ -2037,10 +2039,8 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
             print(f"levain consent away: {agent}: {e}", file=sys.stderr)
             rc = 1
             continue
-        on, source, why = away_state(got)
+        on, source, why = effective_away(got)
         reason = away.why_unanswerable(got)
-        if on and source == "idle" and reason:
-            on, why = False, f"{why}, but nothing can sign an answer"
         if on:
             hold = min(hold_seconds(got, agent, source), away.MAX_HOLD)
             line = f"{agent}: away mode ON, holds up to {hold:g}s"
@@ -2050,7 +2050,7 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
             line = f"{agent}: away mode off"
         line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
         line += f"; set by {why}"
-        if source == "word":
+        if source == "word" and not got.legacy:
             line += "; `levain consent away auto` hands it back to input idle"
         elif source == "idle" and not on:
             line += f"; on after {got.away_idle_seconds:g}s of no keyboard, mouse or trackpad input"

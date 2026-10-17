@@ -12,7 +12,7 @@ hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it an
    is never eligible for one;
 3. when away mode is on (:func:`levain.consent.auto_away.away_state`: the operator's explicit word, else input
    idle on macOS, else off) waits up to the hold for a signed answer the core verifies, re-reading away mode while
-   it waits and stopping when the operator is back, and withdraws the request if none came (one whose hold ran out
+   it waits and stopping when away mode ends, and withdraws the request if none came (one whose hold ran out
    is expired);
 4. prints ``allow`` only for a verified allow (with a line naming the grant when a grant answered) and ``deny``
    only for a verified deny. Anything else, including any exception, prints nothing and exits 0: the native
@@ -89,12 +89,14 @@ DEFAULT_TIER = "T2"
 @dataclass(frozen=True)
 class AdapterSettings:
     # away_mode is the explicit word on, explicit_off the explicit word off; with neither, input idle decides
-    # (levain.consent.auto_away.away_state)
+    # (levain.consent.auto_away.away_state). legacy: the file holds no away_word (written before auto-away
+    # existed), so its away_mode is read as the word
     away_mode: bool = False
     away_hold_seconds: float = 0.0
     cockpit_data_root: str | None = None
     explicit_off: bool = False
     away_idle_seconds: float = IDLE_THRESHOLD
+    legacy: bool = False
 
 
 def load_settings(queue_dir: Path) -> AdapterSettings:
@@ -106,28 +108,39 @@ def load_settings(queue_dir: Path) -> AdapterSettings:
 def read_settings_file(path: Path) -> AdapterSettings:
     """:func:`settings_from` the JSON in ``path``; defaults when it is missing, does not parse or nests too deep.
     The Codex adapter reads its own file through this too."""
+    got = try_read_settings_file(path)
+    return AdapterSettings() if got is None else got
+
+
+def try_read_settings_file(path: Path) -> AdapterSettings | None:
+    """:func:`settings_from` the JSON in ``path``, or ``None`` when it is missing, does not parse or nests too
+    deep (a re-read during a hold keeps what the hold started with, :func:`still_away_from`)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
-        return AdapterSettings()
+        return None
     return settings_from(data)
 
 
 def settings_from(data: Any) -> AdapterSettings:
     """The settings a parsed settings file means, as both adapters' hooks and ``levain consent away`` read it:
-    the explicit word ``away_word`` (``"on"`` or ``"off"``; a file without one and ``away_mode`` ``true``, as
-    releases before input idle wrote it, is the word on): away mode for the word on, ``explicit_off`` for off; a
-    hold only when it is a finite number >= 0 (an integer too large for a float is malformed), an idle threshold
+    the explicit word ``away_word``: ``"on"`` (away mode), ``"off"`` (``explicit_off``) or ``"auto"`` (input idle
+    decides). A file without a valid one was written before auto-away existed (``legacy``): its ``away_mode`` is
+    the word, ``true`` on and anything else off, whether ``levain init`` or the operator wrote it (the two cannot
+    be told apart, and an operator's off is never undone by an upgrade); a hold only when it is a finite number >= 0
+    (an integer too large for a float is malformed), an idle threshold
     (``away_idle_seconds``) only when it is a finite number > 0, else :data:`IDLE_THRESHOLD`, a cockpit root only
     when absolute (:func:`_absolute_root`)."""
     if not isinstance(data, dict):
         return AdapterSettings()
     word = data.get("away_word")
-    if word not in WORDS:
-        word = "on" if data.get("away_mode") is True else None
+    legacy = word not in WORDS
+    if legacy:
+        word = "on" if data.get("away_mode") is True else "off"
     return AdapterSettings(away_mode=word == "on", away_hold_seconds=_seconds(data.get("away_hold_seconds", 0), 0.0),
                            cockpit_data_root=_absolute_root(data.get("cockpit_data_root")), explicit_off=word == "off",
-                           away_idle_seconds=_seconds(data.get("away_idle_seconds"), IDLE_THRESHOLD, positive=True))
+                           away_idle_seconds=_seconds(data.get("away_idle_seconds"), IDLE_THRESHOLD, positive=True),
+                           legacy=legacy)
 
 
 def _seconds(value: Any, default: float, *, positive: bool = False) -> float:
@@ -407,15 +420,32 @@ def _can_sign(settings: AdapterSettings) -> bool:
         return False  # an authority that does not replay verifies nothing
 
 
+def effective_away(settings: AdapterSettings, idle: Callable[[], float | None] | None = None
+                   ) -> tuple[bool, str, str]:
+    """:func:`levain.consent.auto_away.away_state`, except that away by input idle is away only while an enrolled
+    key could sign an answer (:func:`_can_sign`; source ``idle_unsignable`` otherwise): the explicit word on
+    checks that when it is set, nothing sets input idle. Read at a hold's start and at every recheck, and by
+    ``levain consent away``."""
+    away, source, why = away_state(settings, idle)
+    if away and source == "idle" and not _can_sign(settings):
+        return False, "idle_unsignable", f"{why}, but no enrolled key could sign an answer"
+    return away, source, why
+
+
 def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | None] | None = None) -> float:
-    """Seconds the hook holds a request for a signed answer under ``settings``: 0 unless
-    :func:`levain.consent.auto_away.away_state` says away (``idle`` is its idle source). Away by input idle holds
-    only when an enrolled key could sign an answer (:func:`_can_sign`): the explicit word on checks that when it
-    is set; nothing sets input idle."""
-    away, source, _why = away_state(settings, idle)
-    if not away or (source == "idle" and not _can_sign(settings)):
-        return 0.0
-    return hold_seconds(settings, agent, source)
+    """Seconds the hook holds a request for a signed answer under ``settings``: 0 unless :func:`effective_away`
+    says away (``idle`` is its idle source)."""
+    away, source, _why = effective_away(settings, idle)
+    return hold_seconds(settings, agent, source) if away else 0.0
+
+
+def still_away_from(path: Path, started: AdapterSettings) -> Callable[[], tuple[bool, str, str]]:
+    """The recheck a hook entry point holds with: :func:`effective_away` of a fresh read of the settings file at
+    ``path``, or of ``started`` (what the hold started with) when that read fails."""
+    def recheck() -> tuple[bool, str, str]:
+        fresh = try_read_settings_file(path)
+        return effective_away(fresh if fresh is not None else started)
+    return recheck
 
 
 # While a request is held, away mode is read again this often: an operator who comes back (input, or the word off)
@@ -427,8 +457,9 @@ def hold_for_answer(queue: ConsentQueue, request: ExternalGateRequest, wait: flo
                     posture: str | None, still_away: Callable[[], tuple[bool, str, str]] | None = None,
                     ) -> tuple[Decision | None, str | None]:
     """Wait up to ``wait`` seconds for a verified decision on ``request``: ``(decision, None)``, or
-    ``(None, why)`` when ``still_away`` (re-read every :data:`RECHECK_EVERY` seconds) says the operator is back,
-    ``why`` its reason, or ``(None, None)`` when the wait ran out or the request stopped being pending. With no
+    ``(None, why)`` when ``still_away`` (re-read every :data:`RECHECK_EVERY` seconds) says away mode ended (the
+    operator is back, or no key could sign), ``why`` its reason, or ``(None, None)`` when the wait ran out or the
+    request stopped being pending. With no
     ``still_away`` it is one :meth:`ConsentQueue.await_decision` of ``wait``. The wait can run past ``wait`` by one
     ``still_away`` call."""
     if still_away is None:
@@ -460,8 +491,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
     decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
     :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
-    passes a re-read of the settings file and input idle) ends a hold early when it says the operator is back,
-    leaving the native dialog to ask. ``policy``
+    passes :func:`still_away_from`) ends a hold early when it says away mode ended (the operator is back, or no
+    key could sign), leaving the native dialog to ask. ``policy``
     (default :func:`levain.consent.policy.decide`) is only ever reached through :func:`guarded_policy`, called with
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
     request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
@@ -507,7 +538,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away)
         if got is None:
-            note = f"the operator is back ({back}); the native dialog stands" if back else \
+            note = f"away mode ended ({back}); the native dialog stands" if back else \
                 "the hook stopped waiting; the native dialog stands"
             # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
             if not queue.withdraw(request.id, note=note):
@@ -549,7 +580,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
         out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     still_away=lambda: away_state(load_settings(queue_dir)))
+                     still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

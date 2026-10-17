@@ -1527,9 +1527,10 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
     qdir = _consent_queue_dir()
     settings = mod.load_settings(qdir)
     if settings.explicit_off:
+        when = " (set before auto-away existed)" if settings.legacy else ""
         out.append(CheckResult(f"{label} away mode", True,
-                               f"off by your word: an unanswered request goes straight to {label}'s own dialog "
-                               "(`levain consent away auto` hands it back to input idle)"))
+                               f"off by your word{when}: an unanswered request goes straight to {label}'s own "
+                               "dialog; `levain consent away auto` lets input idle decide"))
     elif not settings.away_mode:
         out.append(CheckResult(f"{label} away mode", True,
                                f"follows input idle: after {settings.away_idle_seconds:g}s of no keyboard, mouse "

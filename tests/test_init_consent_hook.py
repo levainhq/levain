@@ -162,7 +162,7 @@ def test_init_creates_the_settings_file_away_off(make_install):
     cc = make_install("cc")
     path = _settings_file(claude_code.SETTINGS_NAME)
     assert json.loads(path.read_text()) == {"cockpit_data_root": os.path.realpath(cc / ".levain" / "cockpit"),
-                                            "away_mode": False, "away_hold_seconds": 0}
+                                            "away_mode": False, "away_word": "auto", "away_hold_seconds": 0}
     assert os.stat(path).st_mode & 0o777 == 0o600
     assert os.stat(path.parent).st_mode & 0o777 == 0o700
 
@@ -265,7 +265,7 @@ def test_doctor_claude_away_on_is_not_a_warning(make_install):
     cc = make_install("cc")
     path = _settings_file(claude_code.SETTINGS_NAME)
     doc = json.loads(path.read_text())
-    path.write_text(json.dumps({**doc, "away_mode": True, "away_hold_seconds": 5000}))
+    path.write_text(json.dumps({**doc, "away_mode": True, "away_word": "on", "away_hold_seconds": 5000}))
     away = _row(doctor._check_claude_code(cc), "Claude Code away mode")
     assert not away.warn and "on, hold 840s" in away.detail and "dialog during the hold" in away.detail, away
 

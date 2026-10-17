@@ -64,13 +64,12 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
-    hold_for_answer, hook_command, read_settings_file,
+    hold_for_answer, hook_command, read_settings_file, still_away_from,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
-from levain.consent.auto_away import away_state
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
 
@@ -247,7 +246,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away)
         if got is None:
-            note = f"the operator is back ({back}); Codex's approval dialog stands" if back else \
+            note = f"away mode ended ({back}); Codex's approval dialog stands" if back else \
                 "the hook stopped waiting; Codex's approval dialog stands"
             if not queue.withdraw(request.id, note=note):
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
@@ -283,7 +282,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
         out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     still_away=lambda: away_state(load_settings(queue_dir)))
+                     still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

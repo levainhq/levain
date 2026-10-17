@@ -43,7 +43,8 @@ def test_pending_and_terminal_requests_are_listed_and_the_row_is_not_swept(tmp_p
     got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
     assert [e.request.id for e in got.pending] == [waiting.id]
     assert [(e.request.id, e.state) for e in got.recent] == [(gone.id, "withdrawn")]
-    assert audit_line(got.recent[0]) == "withdrawn"
+    assert audit_line(got.recent[0]) == ("withdrawn to the agent's own dialog; in the agent's dialog: no outcome "
+                                         "seen yet, unsigned")
     # a terminal request older than 24 hours is not listed
     assert read_listing(q.directory, now=T0 + timedelta(hours=25)).recent == ()
 
