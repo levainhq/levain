@@ -1203,6 +1203,27 @@ def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.
                                                f"{owner}, whose scripts this pin does not cover"])
 
 
+def workspace_settings_pin_matches(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                                   ) -> bool:
+    """Whether the install's hook pin covers the workspace ``.claude/settings.json`` as it is now: both of that
+    file's components (its hooks entry and its messaging facts) compare equal under the same comparison doctor
+    runs (:func:`_comparable_pin` then :func:`pin_diffs`). Only those two components are asked, so another
+    file's drift does not answer for this one. No pin, an invalid pin or a component that cannot be hashed is
+    ``False``. Never writes."""
+    ent = Path(os.path.abspath(install))
+    try:
+        old = _load_agent_pins(ent)
+        if old is None:
+            return False
+        now, _, owner = _agent_pins_and_unresolved(ent, codex_home)
+    except AgentPinError:
+        return False
+    mine = (".claude/settings.json hooks", ".claude/settings.json messaging")
+    diffs = pin_diffs({k: v for k, v in _comparable_pin(ent, old, now, owner).items() if k in mine},
+                      {k: v for k, v in now.items() if k in mine})
+    return not diffs
+
+
 def pin_diffs(old: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
     """One named line per component that differs from the pin. A component the pin does not carry and that is
     absent now is not a difference: a levain upgrade that adds a component (the Q9 messaging pin) must not turn every

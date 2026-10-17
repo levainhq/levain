@@ -2414,9 +2414,12 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
                       emit: Callable[[str], None] = print) -> int:
     """`levain messaging set MODE`: under ONE hold of the install lock, validate, run `levain update` for the install
     with ``choice`` explicit (the one renderer, receipt and pin path), and only then, if the workspace
-    settings carry exactly that choice's controls and the update finished, record it (with a ``messaging_changed``
-    stamp). Nothing is recorded otherwise, and nothing is rolled back: a plain update never loosens a carried
-    control and re-renders the recorded choice, so a run cut short fails safe. Exit code = update's."""
+    settings carry exactly that choice's controls AND the install's hook pin for that file matches it (levain's own
+    write of the file completed; ``host_guard.workspace_settings_pin_matches``, doctor's comparison), record it
+    (with a ``messaging_changed`` stamp). The update's exit code is NOT the condition: it is 1 for files held for
+    review as well as for errors, and is only reported. Nothing is recorded otherwise, and nothing is rolled back:
+    a plain update never loosens a carried control and re-renders the recorded choice, so a run cut short fails
+    safe. An exception propagates and records nothing. Exit code = update's."""
     from datetime import datetime, timezone
 
     from levain.update import run_update
@@ -2442,7 +2445,9 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
             emit("  running `levain update` to apply it")
             rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
             carries = _workspace_carries(install, choice)
-            if carries and rc == 0:
+            from levain.host_guard import workspace_settings_pin_matches
+
+            if carries and workspace_settings_pin_matches(install):
                 change = None
                 if previous != choice:
                     change = {"from": previous, "to": choice,
@@ -2451,14 +2456,18 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
                 if (change is not None and
                         _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous)):
                     emit(f"LOOSENED {previous} -> {choice}")
-                return 0
+                if rc:
+                    emit(f"messaging: {choice} applied and recorded; `levain update` also reported something above "
+                         "to review")
+                return rc
             if _pending_snapshot(staged) not in (None, before):
                 emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json was held for review "
                      f"(you edited it). The staged copy is at {staged}; merge it (until then the old controls stay in "
                      f"force), then run `levain messaging set {choice}` again.")
             elif carries:
-                emit(f"messaging: {choice} is NOT recorded: `levain update` did not finish (exit {rc}); its output "
-                     f"above says why. Fix that, then run `levain messaging set {choice}` again.")
+                emit(f"messaging: {choice} is NOT recorded: the file carries it but the hook pin does not cover it "
+                     f"(update exit {rc}); its output above says why. Fix that, then run "
+                     f"`levain messaging set {choice}` again.")
             else:
                 emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json does not carry its "
                      "controls; `levain update`'s output above names the cause.")

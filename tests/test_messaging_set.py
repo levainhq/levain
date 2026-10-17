@@ -112,7 +112,9 @@ def test_the_install_lock_is_held_across_the_whole_verb_and_run_update_is_reentr
     assert _config(ent)["messaging"] == "governed"
 
 
-@pytest.mark.parametrize("fail", ["rc", "raise"])
+# only "raise" remains: a nonzero rc no longer decides recording (the "rc" case moved to the held-file and
+# pin-failure tests below), but an exception still propagates and records nothing
+@pytest.mark.parametrize("fail", ["raise"])
 def test_a_forced_update_error_records_nothing_and_a_plain_update_repairs_toward_the_record(
         env, capsys, monkeypatch, fail):
     from levain import update as upd
@@ -256,3 +258,27 @@ def test_show_reads_recorded_default_and_file(env, capsys):
     assert "messaging: isolate (the default" in out and "does not carry the isolate controls" in out
     # read-only
     assert "messaging" not in _config(ent)
+
+
+def test_another_file_held_for_review_does_not_stop_the_choice_being_recorded(env, capsys):
+    ent = _init(env, capsys, "a", messaging="governed")
+    (ent / "seed" / "partnership.md").unlink()  # the carrier imports it: update holds the carrier for review
+    rc = _set(ent, "unmanaged")
+    out = capsys.readouterr().out
+    assert rc != 0 and "applied and recorded" in out and "LOOSENED governed -> unmanaged" in out
+    cfg = _config(ent)
+    assert cfg["messaging"] == "unmanaged" and cfg["messaging_changed"]["to"] == "unmanaged"
+    assert cli.main(["update", "--path", str(ent), "--no-pip"]) != 0  # the carrier is still held
+    capsys.readouterr()
+    assert _config(ent)["messaging"] == "unmanaged"
+    assert "crossSessionInbound" not in json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
+
+
+def test_a_pin_write_that_fails_after_the_settings_file_is_written_records_nothing(env, capsys, monkeypatch):
+    ent = _init(env, capsys, "a", messaging="governed")
+    cfg0 = _config(ent)
+    monkeypatch.setattr(hg, "repin_after_levain_write", lambda *a, **k: False)
+    _set(ent, "unmanaged")
+    out = capsys.readouterr().out
+    assert "crossSessionInbound" not in json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
+    assert _config(ent) == cfg0 and "NOT recorded" in out and "LOOSENED" not in out
