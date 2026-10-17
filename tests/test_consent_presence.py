@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
-import sys
+import subprocess
 import threading
 import time
 
@@ -28,7 +29,11 @@ def cockpit(tmp_path_factory):
 
 @pytest.fixture
 def qdir(tmp_path, cockpit):
-    return _queue(tmp_path, cockpit)
+    """A queue whose settings files are what `levain init` writes now: away_word auto."""
+    q = _queue(tmp_path, cockpit)
+    for name in (cc.SETTINGS_NAME, cx.SETTINGS_NAME):
+        (q / name).write_text(json.dumps({**json.loads((q / name).read_text()), "away_word": "auto"}))
+    return q
 
 
 @pytest.fixture
@@ -88,10 +93,10 @@ def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, capsys):
         assert not t.is_alive() and time.monotonic() - flipped < cc.RECHECK_EVERY + 3
         assert out.getvalue() == ""  # no decision: the agent's own dialog asks
         state, note = _row(qdir)
-        assert state == "withdrawn" and note.startswith("the operator is back (explicit word: off)")
+        assert state == "withdrawn" and note.startswith("away mode ended (explicit word: off)")
 
 
-def test_input_idle_holds_and_input_releases(qdir, idle, capsys):
+def test_input_idle_holds_and_input_releases(qdir, idle, capsys, tmp_path):
     # runs S0, I1 and X1: an init file (no word) holds while input idle is past the threshold, and stops holding
     # when input idle drops under it (lane B measured HIDIdleTime snapping to ~0 on input)
     idle[0] = 700.0
@@ -100,12 +105,40 @@ def test_input_idle_holds_and_input_releases(qdir, idle, capsys):
     idle[0] = 2.0
     t.join(10)
     assert not t.is_alive() and out.getvalue() == ""
-    assert _row(qdir) == ("withdrawn", "the operator is back (input idle 2s < 600s); the native dialog stands")
+    assert _row(qdir) == ("withdrawn", "away mode ended (input idle 2s < 600s); the native dialog stands")
+    # run_h2 (a): an idle hold whose cockpit can no longer sign (its database gone) is released at the recheck
+    (tmp_path / "own").mkdir()
+    own = _cockpit(tmp_path / "own")
+    settings = json.loads((qdir / cc.SETTINGS_NAME).read_text())
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({**settings, "cockpit_data_root": str(own)}))
+    idle[0] = 700.0
+    t, out, _ = _hook(cc, {**EVENTS["claude_code"][1], "tool_use_id": "tu-2"}, qdir)
+    _wait_pending(qdir)
+    os.rename(own / "cockpit.db", own / "cockpit.db.gone")
+    t.join(10)
+    assert not t.is_alive() and out.getvalue() == "" and _row(qdir) == (
+        "withdrawn", "away mode ended (input idle 700s >= 600s, but no enrolled key could sign an answer); the "
+                     "native dialog stands")
 
 
 def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, capsys):
     # runs S0, I1, I2 and I3: off holds nothing however idle, on holds however present, auto hands it back to
-    # idle; `show` names the source each time
+    # idle; `show` names the source each time. Run H1: a file levain 0.11.4 wrote (its own `away on --hold 90`
+    # then `away off`, from PyPI) is the word off, never handed to input idle by the upgrade
+    legacy = qdir.parent / "legacy"
+    legacy.mkdir(mode=0o700)
+    os.chmod(legacy, 0o700)
+    root = json.loads((qdir / cx.SETTINGS_NAME).read_text())["cockpit_data_root"]
+    (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": False,
+                                                       "away_hold_seconds": 90.0}, indent=2) + "\n")
+    idle[0] = 4000.0
+    cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(legacy)])
+    assert "codex: away mode off;" in (out := capsys.readouterr().out)
+    assert "set by explicit word: off (set before auto-away existed); `levain consent away auto` lets input idle " \
+           "decide" in out
+    cli(["consent", "away", "auto", "--agent", "codex", "--queue-dir", str(legacy)])
+    assert "away mode ON, holds up to 90s" in capsys.readouterr().out  # the 0.11.4 hold is kept, not defaulted
+    assert json.loads((legacy / cx.SETTINGS_NAME).read_text())["away_hold_seconds"] == 90.0
     idle[0] = 213.0
     cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(qdir)])
     assert "codex: away mode off; answers verify against" in (out := capsys.readouterr().out)
@@ -126,16 +159,23 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
     assert cli(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (True, "word")
     assert cli(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
-    assert "away_word" not in json.loads((qdir / cc.SETTINGS_NAME).read_text())
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "auto"
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (False, "idle")
+    assert cli(["consent", "away", "auto", "--idle-after", str(10 ** 400), "--queue-dir", str(qdir)]) == 1
 
 
 def test_a_failed_idle_read_is_no_idle_source_never_away(monkeypatch):
-    # run_idle_read: the real read on this Mac; a missing, hung or unparseable ioreg reads as no source
-    if sys.platform == "darwin":
-        assert real_idle_read() >= 0
-    else:
-        assert real_idle_read() is None
+    # run_idle_read: ioreg's HIDIdleTime line read as seconds; a missing, hung or unparseable ioreg reads as no
+    # source. Off macOS there is no source at all. (Whether this host's own ioreg answers is not asserted.)
+    got = real_idle_read()
+    assert got is None or got >= 0
+    monkeypatch.setattr(auto_away.sys, "platform", "linux")
+    assert real_idle_read() is None
+    monkeypatch.setattr(auto_away.sys, "platform", "darwin")
+    canned = subprocess.CompletedProcess([], 0, stdout=b'    | |   "HIDIdleTime" = 384984607958\n')
+    monkeypatch.setattr(auto_away.subprocess, "run", lambda *a, **k: canned)
+    assert abs(real_idle_read() - 384.984607958) < 1e-9
+    monkeypatch.undo()
     monkeypatch.setattr(auto_away.sys, "platform", "darwin")
     for argv in (("/nonexistent/ioreg",), ("/bin/sleep", "5"), ("/bin/echo", "nothing here")):
         monkeypatch.setattr(auto_away, "_IOREG", argv)

@@ -191,11 +191,12 @@ def test_the_wait_never_exceeds_the_installed_hold():
 
 def test_settings_default_to_away_off(tmp_path):
     assert cc.load_settings(tmp_path) == cc.AdapterSettings()
+    # a file with no away_word predates auto-away: its away_mode is the word, anything but true is off
     (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"away_mode": "yes", "away_hold_seconds": float("nan")}))
-    assert cc.load_settings(tmp_path) == cc.AdapterSettings()
+    assert cc.load_settings(tmp_path) == cc.AdapterSettings(explicit_off=True, legacy=True)
     (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "away_hold_seconds": 90,
                                                          "cockpit_data_root": "/r"}))
-    assert cc.load_settings(tmp_path) == cc.AdapterSettings(True, 90.0, "/r")
+    assert cc.load_settings(tmp_path) == cc.AdapterSettings(True, 90.0, "/r", legacy=True)
 
 
 def test_policy_answer_is_delivered_without_a_wait(monkeypatch):

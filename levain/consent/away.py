@@ -4,8 +4,9 @@ Away mode is what lets a signed answer reach the agent: with it off, the hook as
 with none matching, withdraws the request at once so the agent's own dialog asks; with it on, the hook holds each
 request up to ``away_hold_seconds`` while ``levain consent answer`` or the phone signs one. Whether it is on is
 :func:`levain.consent.auto_away.away_state`: the operator's explicit word (``away_word``, set here by
-:func:`set_away`), else input idle past ``away_idle_seconds`` on macOS, else off; a file ``levain init`` wrote
-holds no word, so input idle decides. Claude Code shows its own dialog during the hold (an allow from the hook
+:func:`set_away`; ``auto``, the one ``levain init`` writes, is none), else input idle past ``away_idle_seconds`` on
+macOS, else off. A file with no ``away_word`` was written before auto-away existed: its ``away_mode`` is the word.
+Claude Code shows its own dialog during the hold (an allow from the hook
 dismisses it); Codex shows none until the hold ends. The file is the adapter's own (``<queue dir>/claude_code.json``
 or ``codex.json``, read by :func:`levain.consent.adapters.claude_code.load_settings`); this module changes only
 ``away_mode``, ``away_word``, ``away_hold_seconds`` and ``away_idle_seconds`` in it and keeps every other key,
@@ -133,9 +134,11 @@ def why_unanswerable(adapter_settings: Any) -> str | None:
 def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
              idle_after: float | None = None) -> dict[str, Any]:
     """Set ``agent``'s explicit word: away mode on (holding up to ``hold`` seconds; default: the file's hold when
-    it is above zero, else the agent's :data:`DEFAULT_HOLDS`), off, or, for ``on=None``, no word, so input idle
-    past ``idle_after`` seconds (default: the file's, else :data:`levain.consent.auto_away.IDLE_THRESHOLD`) decides,
-    holding as ``on`` does. ``on`` refuses when :func:`why_unanswerable` names a reason (a hold nobody can answer
+    it is above zero, else the agent's :data:`DEFAULT_HOLDS`), off, or, for ``on=None``, ``auto``: no word, so
+    input idle past ``idle_after`` seconds (default: the file's, else
+    :data:`levain.consent.auto_away.IDLE_THRESHOLD`) decides, holding ``hold`` when given, else the file's hold
+    when above zero, else the default (:func:`levain.consent.auto_away.hold_seconds`). ``on`` refuses when
+    :func:`why_unanswerable` names a reason (a hold nobody can answer
     only delays the agent); no word never holds without an enrolled key (the hook checks). By an atomic replace of
     its settings file; returns the new settings.
     Raises ``ValueError`` for a hold outside (0, :data:`MAX_HOLD`], an ``idle_after`` that is not a finite number
@@ -143,28 +146,29 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     (``QueueStoreError``)."""
     if hold is not None and _valid_hold(hold) is None:
         raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
-    if idle_after is not None and not (not isinstance(idle_after, bool) and isinstance(idle_after, (int, float))
-                                       and math.isfinite(idle_after) and idle_after > 0):
-        raise ValueError("--idle-after must be a finite number of seconds above 0")
+    if idle_after is not None:
+        try:
+            ok = not isinstance(idle_after, bool) and isinstance(idle_after, (int, float)) \
+                and math.isfinite(float(idle_after)) and idle_after > 0
+        except OverflowError:   # an integer too large for a float
+            ok = False
+        if not ok:
+            raise ValueError("--idle-after must be a finite number of seconds above 0")
     check_queue_dir(qdir)
     got = _read_keyed(qdir, agent)
     if got is None:
         raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
                          "names the install's cockpit; away mode is set in that file")
     data, key = got
-    if on is None or on:
-        if hold is None:
-            hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
+    if on and hold is None:
+        hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
     if on:
         # the snapshot being written is the one checked (L3 r1: a re-read could validate another file's root)
         reason = why_unanswerable(claude_code.settings_from(data))
         if reason:
             raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
     data["away_mode"] = on is True
-    if on is None:
-        data.pop("away_word", None)
-    else:
-        data["away_word"] = "on" if on else "off"
+    data["away_word"] = "auto" if on is None else "on" if on else "off"
     if hold is not None:
         data["away_hold_seconds"] = float(hold)
     if idle_after is not None:

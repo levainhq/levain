@@ -2070,8 +2070,8 @@ def _consent_agent_version(adapter: str) -> str | None:
 
 def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
     """Create the consent adapter's settings file (``<queue dir>/claude_code.json`` or ``codex.json``) when there is
-    none: this install's cockpit as ``cockpit_data_root``, no explicit away word (so input idle decides,
-    :func:`levain.consent.auto_away.away_state`). CREATE-ONLY: an existing file is never
+    none: this install's cockpit as ``cockpit_data_root``, ``away_word`` ``auto`` (no explicit word, so input idle
+    decides, :func:`levain.consent.auto_away.away_state`). CREATE-ONLY: an existing file is never
     written (its away word is the operator's, and repointing another install's cockpit would make that install's
     signed answers undeliverable); one naming another cockpit, or none, is reported. Never fails init: a hook with no
     settings file gives no decision and the agent's own dialog answers."""
@@ -2088,7 +2088,8 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
         ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()
         _refuse_symlink(path)
         if not os.path.lexists(path):
-            body = json.dumps({"cockpit_data_root": ours, "away_mode": False, "away_hold_seconds": 0},
+            body = json.dumps({"cockpit_data_root": ours, "away_mode": False, "away_word": "auto",
+                               "away_hold_seconds": 0},
                               indent=2) + "\n"
             fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=qdir)
             try:
