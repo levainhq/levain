@@ -8,8 +8,9 @@ account (the SQLite plant refusal is for a database that sits in a writable dire
 
 from __future__ import annotations
 
-import platform
 import json
+import os
+import platform
 import sqlite3
 from pathlib import Path
 
@@ -269,6 +270,16 @@ def test_a_named_dir_that_is_the_entity_refuses_the_floor(home, tmp_path, monkey
         build_policy(ent)
 
 
+def test_a_levain_home_inside_the_entity_is_denied_whole(home, monkeypatch):
+    """Hiding a directory inside the entity hides nothing the entity needs, so the whole home is denied
+    (L3 r1: the stricter trust-store test had dropped this layout to the by-name fallback)."""
+    ent = _entity(home)
+    monkeypatch.setenv("LEVAIN_HOME", str(ent / "state"))
+    policy = build_policy(ent)
+    assert (ent / "state").resolve() in policy.deny_read_write
+    assert not _covered(ent, policy) and not _covered(ent / "workspace", policy)
+
+
 def test_every_levain_home_reader_is_named_for_the_fallback():
     """The fallback names directories one at a time, so it must know every one: each module that reads
     ``$LEVAIN_HOME`` (outside the floor itself) builds one directory under it, and that directory's name
@@ -283,7 +294,7 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     pkg = Path(levain.__file__).parent
     readers = sorted(
         str(p.relative_to(pkg)) for p in pkg.rglob("*.py")
-        if p.name != "confinement.py" and re.search(r"""environ(?:\.get\(|\[)\s*["']LEVAIN_HOME["']""",
+        if p.name != "confinement.py" and re.search(r"""(?:environ(?:\.get\(|\[)|getenv\()\s*["']LEVAIN_HOME["']""",
                                                     p.read_text(encoding="utf-8"))
     )
     assert readers == ["autonomic/db.py", "cockpit/custody.py", "consent/queue.py"], readers
@@ -353,6 +364,52 @@ def test_a_cockpit_root_that_holds_the_entity_refuses_the_floor(home, tmp_path):
         build_policy(ent)
 
 
+@pytest.mark.parametrize("shape", ["fifo", "huge", "symlink"])
+def test_a_consent_settings_file_levain_did_not_write_refuses_the_floor(home, tmp_path, shape):
+    """An entity that wrote the queue directory before this floor existed may have left a FIFO (the build
+    would hang), a huge file, or a link the hook would follow: the floor refuses rather than read it."""
+    from levain.consent.adapters.claude_code import SETTINGS_NAME
+    from levain.consent.queue import default_queue_dir
+    from levain.firing.confinement import ConfinementError
+
+    q = default_queue_dir()
+    q.mkdir(parents=True)
+    target = q / SETTINGS_NAME
+    if shape == "fifo":
+        os.mkfifo(target)
+    elif shape == "huge":
+        target.write_text(json.dumps({"cockpit_data_root": str(tmp_path), "pad": "x" * 70000}), encoding="utf-8")
+    else:
+        real = tmp_path / "elsewhere.json"
+        real.write_text(json.dumps({"cockpit_data_root": str(tmp_path / "c")}), encoding="utf-8")
+        target.symlink_to(real)
+    with pytest.raises(ConfinementError, match="regular file"):
+        build_policy(_entity(home))
+
+
+def test_a_cockpit_root_spelled_through_a_symlink_refuses_the_floor(home, tmp_path):
+    from levain.consent.adapters.claude_code import SETTINGS_NAME
+    from levain.consent.queue import default_queue_dir
+    from levain.firing.confinement import ConfinementError
+
+    real = tmp_path / "real-proj"
+    (real / ".levain" / "cockpit").mkdir(parents=True)
+    (tmp_path / "link-proj").symlink_to(real)
+    _name_cockpit(default_queue_dir(), SETTINGS_NAME, tmp_path / "link-proj" / ".levain" / "cockpit")
+    with pytest.raises(ConfinementError, match="symbolic link"):
+        build_policy(_entity(home))
+
+
+def test_malformed_consent_settings_name_nothing(home):
+    from levain.consent.adapters.claude_code import SETTINGS_NAME
+    from levain.consent.queue import default_queue_dir
+
+    q = default_queue_dir()
+    q.mkdir(parents=True)
+    (q / SETTINGS_NAME).write_text("{not json", encoding="utf-8")
+    build_policy(_entity(home))   # the hook reads it as naming no root, so the floor adds none
+
+
 @live
 def test_live_confined_shell_cannot_replace_the_cockpit_authority(home, tmp_path):
     from levain.consent.adapters.claude_code import SETTINGS_NAME
@@ -366,10 +423,12 @@ def test_live_confined_shell_cannot_replace_the_cockpit_authority(home, tmp_path
     with select_provider().spawn_shell(build_policy(entity)) as sh:
         ok = sh.run(f"touch '{entity}/workspace/control' 2>&1", timeout=20)
         assert ok.exit_code == 0, ok.output
-        for cmd in (f"cat '{root}/cockpit.db'", f"rm -r '{root}/anchor'", f"printf x > '{root}/cockpit.db'"):
+        for cmd in (f"cat '{root}/cockpit.db'", f"rm -r '{root}/anchor'", f"printf x > '{root}/cockpit.db'",
+                    f"mv '{tmp_path}/proj' '{tmp_path}/proj-moved'"):
             r = sh.run(cmd + " 2>&1", timeout=20)
             assert r.exit_code != 0, f"{cmd!r} succeeded: {r.output!r}"
     assert (root / "cockpit.db").read_bytes() == b"real" and (root / "anchor").is_dir()
+    assert not (tmp_path / "proj-moved").exists()
 
 
 @live
