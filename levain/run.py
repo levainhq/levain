@@ -824,7 +824,8 @@ def _print_banner(
             print("             ~/.ssh: not reachable; the entity's ssh uses its own key")
             print(f"               (~{hands_user}/.ssh/id_ed25519); your ssh-agent is not passed to it")
         elif ssh_mode == "agent":
-            print("             ~/.ssh key material (agent-auth only — keys usable, not readable)")
+            print("             ~/.ssh key material (agent-auth only — keys usable, not readable;")
+            print("               on Linux, through the session's scoped agent: `levain ssh-add`)")
         else:
             print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED;")
             print("               ssh authorized_keys/config/rc WRITE denied; other writes are NOT)")
@@ -861,7 +862,8 @@ def _print_banner(
                 print("             \u26a0 NOT covered: a custom $DOCKER_HOST, a TCP daemon endpoint, or a")
                 print("               runtime whose socket is not in that list — the deny is BY NAME,")
             print("               and pinning one in deny_files does NOT close it (that denies the")
-            print("               FILE, not the connect). No operator socket list exists yet.")
+            print("               FILE, not the connect). An operator socket list (grants.json)")
+            print("               applies on Linux only: its grants are the waivers under sockets.")
             print("             \u26a0 coverage is a SPAWN-TIME SNAPSHOT: the list is re-resolved each")
             print("               time a shell starts, so a listed socket created BEFORE that is")
             print("               covered. One created AFTER, pointing somewhere unlisted, is not.")

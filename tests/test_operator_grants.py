@@ -895,3 +895,17 @@ def test_doctor_reports_unix_sockets_only_for_an_entity_levain_run_runs(grants, 
     (oh / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
     run_doctor(oh)
     assert "unix sockets" in capsys.readouterr().out
+
+
+def test_the_banner_no_longer_says_no_operator_socket_list_exists(tmp_path, capsys):
+    """L2 integration #3: grants.json is that list on Linux, and the banner's own sockets lines print it;
+    and an agent-mode ~/.ssh key is usable on Linux only once added to the session agent."""
+    from levain.run import _print_banner
+
+    binding = SimpleNamespace(episodic_path=tmp_path / "e", crystal_path=tmp_path / "c")
+    _print_banner(tmp_path / "ent", binding, model="m", with_tools=True, bash_ok=True, ssh_mode="agent",
+                  socket_lines=["waiver (operator grant) podman: /run/user/1/podman/podman.sock (builds)"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "No operator socket list exists yet" not in out
+    assert "operator socket list (grants.json) applies on Linux only" in out
+    assert "on Linux, through the session's scoped agent" in out
