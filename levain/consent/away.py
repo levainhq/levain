@@ -16,6 +16,7 @@ import contextlib
 import json
 import math
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,8 @@ from levain.consent.adapters.claude_code import (
 )
 from levain.consent.queue import ConsentQueue, authority_source
 
-__all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "read", "set_away", "settings", "why_unanswerable"]
+__all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "read", "set_away", "settings",
+           "why_unanswerable"]
 
 # agent -> its settings file name in the queue directory
 AGENTS = {"claude_code": claude_code.SETTINGS_NAME, "codex": codex.SETTINGS_NAME}
@@ -48,24 +50,60 @@ def _settings_path(qdir: Path, agent: str) -> Path:
     return qdir / AGENTS[agent]
 
 
-def read(qdir: Path, agent: str) -> dict[str, Any] | None:
-    """The agent's settings as a JSON object, ``None`` when there is no file. Raises ``ValueError`` for a symlinked,
-    oversized or unparsable file, or one that is not an object."""
+def check_queue_dir(qdir: Path) -> None:
+    """``qdir`` as the queue requires it (a real directory, not a symlink, owned by this uid, 0700), never creating
+    it. Raises ``ValueError`` (missing) or ``QueueStoreError``."""
+    if not os.path.lexists(qdir):
+        raise ValueError(f"no consent queue directory at {qdir}; run `levain init` with the consent hook on first")
+    ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()
+
+
+def _stat_key(st: os.stat_result) -> tuple[int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _read_keyed(qdir: Path, agent: str) -> tuple[dict[str, Any], tuple[int, int, int, int]] | None:
     path = _settings_path(qdir, agent)
-    _refuse_symlink(path)
     try:
-        raw = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
+    except OSError as e:
+        raise ValueError(f"{path} cannot be read as a settings file ({e}; a symlink is refused)") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        raw = os.read(fd, _MAX_BYTES + 1)
+    finally:
+        os.close(fd)
     if len(raw) > _MAX_BYTES:
-        raise ValueError(f"{path} is larger than a consent settings file ({len(raw)} bytes)")
+        raise ValueError(f"{path} is larger than a consent settings file")
     try:
         data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as e:
-        raise ValueError(f"{path} does not parse ({e}); fix or remove it, then run `levain init`") from e
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise ValueError(f"{path} does not parse ({type(e).__name__}); fix or remove it, then run `levain init`") \
+            from e
     if not isinstance(data, dict):
         raise ValueError(f"{path} is not a JSON object")
-    return data
+    return data, _stat_key(st)
+
+
+def read(qdir: Path, agent: str) -> dict[str, Any] | None:
+    """The agent's settings as a JSON object, ``None`` when there is no file. Raises ``ValueError`` for a symlink, a
+    non-regular or oversized file (read bounded, never followed), or one that does not parse to an object."""
+    got = _read_keyed(qdir, agent)
+    return None if got is None else got[0]
+
+
+def _valid_hold(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        f = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) and 0 < f <= MAX_HOLD else None
 
 
 def settings(qdir: Path, agent: str) -> Any:
@@ -100,21 +138,18 @@ def set_away(qdir: Path, agent: str, on: bool, hold: float | None = None) -> dic
     if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold)
                              or not 0 < hold <= MAX_HOLD):
         raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
-    if not qdir.is_dir():
-        raise ValueError(f"no consent queue directory at {qdir}; run `levain init` with the consent hook on first")
-    ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))._check_directory()  # 0700, ours, no symlink
-    data = read(qdir, agent)
-    if data is None:
+    check_queue_dir(qdir)
+    got = _read_keyed(qdir, agent)
+    if got is None:
         raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
                          "names the install's cockpit; away mode is set in that file")
-    old_hold = data.get("away_hold_seconds")
+    data, key = got
     if on:
         if hold is None:
-            hold = DEFAULT_HOLDS[agent]
-            if isinstance(old_hold, (int, float)) and not isinstance(old_hold, bool) and math.isfinite(old_hold) \
-                    and 0 < old_hold <= MAX_HOLD:
-                hold = float(old_hold)
-        reason = why_unanswerable(settings(qdir, agent))
+            hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
+        # the snapshot being written is the one checked (L3 r1: a re-read could validate another file's root)
+        reason = why_unanswerable(claude_code.AdapterSettings(
+            cockpit_data_root=claude_code._absolute_root(data.get("cockpit_data_root"))))
         if reason:
             raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
         data["away_mode"] = True
@@ -124,14 +159,23 @@ def set_away(qdir: Path, agent: str, on: bool, hold: float | None = None) -> dic
         if hold is not None:
             data["away_hold_seconds"] = float(hold)
     path = _settings_path(qdir, agent)
+    body = json.dumps(data, indent=2) + "\n"
+    if len(body.encode("utf-8")) > _MAX_BYTES:
+        raise ValueError(f"{path} would be larger than a consent settings file once written; not changed")
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=qdir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2) + "\n")
+            fh.write(body)
             fh.flush()
             os.fchmod(fh.fileno(), 0o600)
             os.fsync(fh.fileno())
         _refuse_symlink(path)
+        try:
+            now = _stat_key(os.lstat(path))
+        except FileNotFoundError:
+            now = None
+        if now != key:
+            raise ValueError(f"{path} changed while away mode was being set; nothing written, run it again")
         os.replace(tmp, path)
     finally:
         with contextlib.suppress(OSError):

@@ -1984,11 +1984,17 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     from levain.consent import away
     from levain.consent.queue import QueueStoreError, default_queue_dir
 
-    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+    # abspath, not resolve(): the queue directory's symlink check must see the path as given (L3 r1)
+    qdir = Path(os.path.abspath(args.queue_dir.expanduser())) if args.queue_dir is not None else default_queue_dir()
     agents = list(away.AGENTS) if args.agent == "all" else [args.agent]
     if args.action == "show" and args.hold is not None:
         print("levain consent away: --hold goes with `on` or `off`", file=sys.stderr)
         return 2
+    try:
+        away.check_queue_dir(qdir)
+    except (OSError, ValueError, QueueStoreError) as e:
+        print(f"levain consent away: {e}", file=sys.stderr)
+        return 1
     rc, seen = 0, 0
     for agent in agents:
         try:

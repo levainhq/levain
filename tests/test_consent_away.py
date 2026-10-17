@@ -148,3 +148,43 @@ def test_show_reports_what_the_hook_reads_and_names_a_skipped_agent(tmp_path, ca
     out = capsys.readouterr().out
     assert "claude_code: away mode off; WARN: the settings name no cockpit_data_root" in out
     assert "codex: skipped, no settings file" in out
+
+
+def test_a_fifo_or_oversized_or_deep_file_is_refused_without_blocking(qdir):
+    """L3 r1 codex: read_bytes() before the size check, a FIFO blocked, deep nesting raised RecursionError."""
+    path = qdir / cx.SETTINGS_NAME
+    path.unlink()
+    os.mkfifo(path)
+    assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
+    path.unlink()
+    path.write_text("[" * 20000 + "]" * 20000)
+    assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
+    path.write_text(json.dumps({"x": "a" * (70 * 1024)}))
+    assert main(["consent", "away", "--agent", "codex", "--queue-dir", str(qdir)]) == 1
+
+
+def test_a_huge_integer_hold_falls_back_to_the_default(qdir, cockpit):
+    (qdir / cc.SETTINGS_NAME).write_text('{"cockpit_data_root": "%s", "away_hold_seconds": %s}' % (cockpit, "9" * 400))
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert cc.load_settings(qdir).away_hold_seconds == away.DEFAULT_HOLDS["claude_code"]
+
+
+def test_a_symlinked_or_open_queue_dir_is_refused_for_show_too(qdir, tmp_path):
+    link = tmp_path / "qlink"
+    link.symlink_to(qdir)
+    assert main(["consent", "away", "--queue-dir", str(link)]) == 1
+    assert main(["consent", "away", "on", "--queue-dir", str(link)]) == 1
+    os.chmod(qdir, 0o755)
+    assert main(["consent", "away", "--queue-dir", str(qdir)]) == 1
+
+
+def test_a_file_changed_mid_write_is_not_overwritten(qdir, monkeypatch):
+    """L3 r1 complement + codex: read-modify-replace could write a stale snapshot over a newer file."""
+    real = away.why_unanswerable
+
+    def swap(s):
+        (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": "/newer", "x": 2}))
+        return real(s)
+    monkeypatch.setattr(away, "why_unanswerable", swap)
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text()) == {"cockpit_data_root": "/newer", "x": 2}
