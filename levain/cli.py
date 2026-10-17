@@ -2323,7 +2323,8 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         refused = [t for t in g.tools if consent_tool_problem(g.agent, t) is not None]
         if refused:
             state += f" (answers nothing for {','.join(map(str, refused))}: a tool a grant may not name)"
-        print(f"{g.id}  {g.agent}  {','.join(g.tools)}  {g.workspace}  postures {','.join(g.postures)}  {state}  "
+        print(f"{g.id}  {g.agent}  {','.join(map(str, g.tools))}  {g.workspace}  postures {','.join(map(str, g.postures))}  "
+              f"{state}  "
               f"(seq {g.seq})")
     return 0
 
