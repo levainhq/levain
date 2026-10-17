@@ -432,14 +432,16 @@ def test_live_confined_shell_cannot_replace_the_cockpit_authority(home, tmp_path
 
 
 @live
-def test_live_confined_shell_cannot_read_or_rewrite_the_consent_settings(home):
+def test_live_confined_shell_cannot_read_or_rewrite_the_consent_settings(home, tmp_path):
     from levain.consent.adapters.claude_code import SETTINGS_NAME
     from levain.consent.queue import default_queue_dir
 
     queue = default_queue_dir()
     queue.mkdir(parents=True)
     settings = queue / SETTINGS_NAME
-    settings.write_text('{"cockpit_data_root": "/real/root"}', encoding="utf-8")
+    # A root the floor can cover: on Linux a missing one needs a creatable parent for its placeholder.
+    body = json.dumps({"cockpit_data_root": str(tmp_path / "real-root")})
+    settings.write_text(body, encoding="utf-8")
     entity = _entity(home)
     with select_provider().spawn_shell(build_policy(entity)) as sh:
         ok = sh.run(f"touch '{entity}/workspace/control' 2>&1", timeout=20)
@@ -449,4 +451,4 @@ def test_live_confined_shell_cannot_read_or_rewrite_the_consent_settings(home):
             r = sh.run(cmd + " 2>&1", timeout=20)
             assert r.exit_code != 0, f"{cmd!r} succeeded: {r.output!r}"
             assert any(m in r.output for m in _REFUSALS), f"{cmd!r} failed for another reason: {r.output!r}"
-    assert settings.read_text(encoding="utf-8") == '{"cockpit_data_root": "/real/root"}'
+    assert settings.read_text(encoding="utf-8") == body
