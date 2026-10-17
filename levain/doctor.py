@@ -121,8 +121,11 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
-    core.extend(_check_unix_sockets(install))
     if hookless:
+        # Both rows describe `levain run`'s bash, which runs only a clean openhands entity: on a Claude
+        # Code or Codex install the Bash is the host agent's, and these rows would describe a shell that
+        # install never gets.
+        core.extend(_check_unix_sockets(install))
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
