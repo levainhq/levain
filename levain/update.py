@@ -57,12 +57,13 @@ def run_update(
     ack: bool = False,
     emit: Emit = print,
     confirm: Callable[[str], bool] | None = None,
+    _messaging: str | None = None,
 ) -> int:
     """:func:`_run_update` under the per-install lock (``install.install_lock``), so it
     never interleaves with an ``init --force`` on the same install. ``--dry-run`` writes
     nothing and takes no lock."""
     kwargs = dict(dry_run=dry_run, yes=yes, no_pip=no_pip, ack=ack, emit=emit,
-                  confirm=confirm)
+                  confirm=confirm, _messaging=_messaging)
     if dry_run:
         return _run_update(path, **kwargs)  # type: ignore[arg-type]
     install = Path(str(path)).expanduser().resolve()
@@ -95,6 +96,7 @@ def _run_update(
     ack: bool = False,
     emit: Emit = print,
     confirm: Callable[[str], bool] | None = None,
+    _messaging: str | None = None,
 ) -> int:
     """Reconcile the install's set to the declared known-good. Returns 0 when
     the set is at (or was brought to) known-good, 1 when actionable drift
@@ -142,7 +144,7 @@ def _run_update(
         engine_clean = not drift.has_actionable_drift and not drift.has_unknown
         if packs_drifted:
             reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
-        plan = refresh_adapter(install, apply=False, emit=emit, carrier=not packs_drifted)
+        plan = refresh_adapter(install, apply=False, emit=emit, carrier=not packs_drifted, messaging=_messaging)
         if engine_clean and not packs_drifted and not plan.refreshed and not plan.review:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
@@ -155,7 +157,7 @@ def _run_update(
     if not drift.has_actionable_drift and not drift.has_unknown and not packs_drifted:
         # An upgrade with the lock already current still leaves the activation tree and
         # adapter files at the previous release (gap #19), so this runs here too.
-        adapter = refresh_adapter(install, apply=True, emit=emit)
+        adapter = refresh_adapter(install, apply=True, emit=emit, messaging=_messaging)
         if adapter.review:
             emit("\nAdapter files need your review (listed above) — merge by hand or "
                  "re-onboard (`levain init --force`), then re-run `levain update`.")
@@ -260,7 +262,7 @@ def _run_update(
     # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
     #    `pip install -U levain` changes neither; only `init --force` used to). After the
     #    pack reconcile, which may have changed the roster the carrier lists. --
-    adapter = refresh_adapter(install, apply=True, emit=emit, carrier=not pack_needs_review)
+    adapter = refresh_adapter(install, apply=True, emit=emit, carrier=not pack_needs_review, messaging=_messaging)
     adapter_needs_review = bool(adapter.review)
 
     # -- 3.7 record the `--ack` decided at step 3, now that everything that can rewrite an

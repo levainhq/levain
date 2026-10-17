@@ -151,8 +151,7 @@ your consent: it cannot answer a permission prompt for you. `init` records the
 choice; an install with no record is read off its own `.claude/settings.json`
 (a hold or an ask there reads `governed`), so a re-render never drops them. To change an existing
 install, run `levain messaging set <choice> --path <install>` (it records the choice and runs `levain update`;
-`levain messaging` shows the current one). Moving to a looser choice than the settings file carries is done with
-`levain init --path <install> --force --messaging <choice>`, because an update never loosens.
+`levain messaging` shows the current one; it also loosens, since the choice is explicit. A plain `levain update` never loosens).
 `levain doctor` reports the controls that apply here and names what is not
 governed; it never edits the file.
 
