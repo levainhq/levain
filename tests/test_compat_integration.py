@@ -354,11 +354,11 @@ _COVERAGE_SENTINELS = {
     # feature: (owning seed file, sentinel text)
     "AM-SPORES-BOUNDARY": ("spore_instructions.md", "spore_add"),      # prospective-layer tools
     "AM-MIGRATE-NOTIFY": ("memory.md", "levain update"),               # the upgrade habit
-    "AM-CRYSTAL": ("memory.md", "crystallization candidates"),         # crystallize-OUT routing
+    "AM-CRYSTAL": ("memory_workflow.md", "crystallization candidates"),  # crystallize-OUT routing (moved with the wrap procedure, spore-451)
     "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
     "AM-LINKGATE": ("memory.md", "[evidence: <id1>, <id2>"),           # the honest multi-episode example
     "AM-HOP-RETIRED": ("memory.md", "recall follows the episodes a pattern's evidence cites"),
-    "AM-DURABLE-FACTS": ("memory.md", "`- fact — cues: a, b, c`"),     # the section's line + cue form
+    "AM-DURABLE-FACTS": ("memory_workflow.md", "`- fact — cues: a, b, c`"),     # the section's line + cue form
 }
 # EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
 # sentinel" is a reviewed decision rather than an omission.
@@ -468,12 +468,18 @@ def test_am_wrap_generated_inline_end_state_is_structurally_guarded():
     # silently making the init-ack dishonest (L1 MED-1, spore-218).
     templates_root = Path(install.__file__).parent / "templates"
     memory_md = (templates_root / "seed" / "memory.md").read_text(encoding="utf-8")
+    # spore-451: the wrap procedure MOVED from memory.md into the base seed memory_workflow.md.
+    # The guarantee holds in two halves: memory.md still names the procedure and its file, and the
+    # file that now holds the procedure carries the prepare_wrap-is-authoritative sentence.
+    workflow_md = (templates_root / "seed" / "memory_workflow.md").read_text(encoding="utf-8")
+    assert "prepare_wrap" in memory_md and "memory_workflow.md" in memory_md, (
+        "seed/memory.md no longer points at memory_workflow.md / prepare_wrap for the wrap")
 
     # (1) Positive: the wrap guidance is inline and defers to `prepare_wrap` as the
     #     authoritative source — not a frozen, drifting copy of the mechanics.
-    assert "prepare_wrap" in memory_md
-    assert "the package carries the authoritative contract" in memory_md, (
-        "seed/memory.md no longer points at `prepare_wrap` as the wrap-mechanics "
+    assert "prepare_wrap" in workflow_md
+    assert "the package carries the authoritative contract" in workflow_md, (
+        "seed/memory_workflow.md no longer points at `prepare_wrap` as the wrap-mechanics "
         "source of truth — AM-WRAP-GENERATED's inline end-state is broken, so the "
         "init-ack at the 0.9.6 cap would silently suppress a now-legitimate proposal."
     )
