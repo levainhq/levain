@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- The phone consent page (`levain consent phone`) now matches the cockpit's look (palette, type, card shapes, buttons; light and dark by the phone's setting); nothing it shows or signs changed.
+
 ## [0.11.2] — 2026-10-16
 
 ### Added
