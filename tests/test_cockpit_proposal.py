@@ -270,17 +270,24 @@ def test_g2_more_than_500_newer_denials_of_other_keys_do_not_hide_the_keys_denia
     assert WS not in [p.workspace for p in seed.propose()]      # the older denial still withdraws the card
 
 
-def test_g2_withdrawn_rows_are_not_evidence_and_the_key_count_is_bounded(seed, monkeypatch):
-    import levain.consent.listing as listing
-
+def test_g2_withdrawn_rows_are_not_evidence_and_keys_come_most_answered_first(seed):
     for i in range(6):
         seed.decide("withdrawn", via=None, ago=timedelta(hours=1 + i))
     assert seed.evidence() == []
-    monkeypatch.setattr(listing, "EVIDENCE_KEYS", 2)
     for k in range(4):
         for _ in range(3 + k):
             seed.decide(cwd=f"/work/p{k}")
-    assert [e.cwd for e in seed.evidence()] == ["/work/p3", "/work/p2"]       # keys bounded, most answered first
+    assert [e.cwd for e in seed.evidence()] == ["/work/p3", "/work/p2", "/work/p1", "/work/p0"]
+
+
+def test_k1_200_unproposable_keys_with_more_allows_do_not_crowd_out_a_valid_card(seed):
+    for k in range(210):
+        for _ in range(4):
+            seed.decide(cwd=f"/work/d{k}", ago=timedelta(hours=3))
+        seed.decide("denied", cwd=f"/work/d{k}", ago=timedelta(hours=2))
+    for _ in range(3):
+        seed.decide(ago=timedelta(hours=1))
+    assert [p.workspace for p in seed.propose()] == [WS]
 
 
 def test_f3_an_mcp_tool_with_an_empty_server_is_never_proposed(seed):
@@ -409,6 +416,8 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     for i in range(3):
         seed.decide(ago=timedelta(hours=2 + i))
+    for i in range(11):                                  # more than ten resolved rows: the "show all" control exists
+        seed.decide(cwd=f"/work/x{i}", tool="Write", ago=timedelta(hours=1, minutes=i))
     seed.clock[0] = datetime.now(timezone.utc)
     seed.q.file(agent="claude_code", agent_session_id="live", tool_name="Edit", tool_input={"file_path": "/w/a"},
                 cwd="/w", hold=timedelta(minutes=30), event_id="live")
@@ -423,8 +432,9 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
             {"eval": typed % "zzz-nothing-matches"}, {"eval": pause},
             {"eval": typed % ""}, {"eval": pause},
             {"eval": f"{_CARDS}.length"},
-            {"eval": "(() => { const m = [...document.querySelectorAll('#levain-modal button')].find(b => /show all/i.test(b.textContent)); if (m) m.click(); return 1; })()"},
+            {"eval": "(() => { const m = [...document.querySelectorAll('#levain-modal button')].find(b => /show all/i.test(b.textContent)); if (!m) return 0; m.click(); return 1; })()"},
             {"eval": pause},
             {"eval": f"{_CARDS}.length"},
         ])
+    assert out["values"][-3] == 1, "the show-all control was not found, so it was never clicked"
     assert out["values"][-4] == 1 and out["values"][-1] == 1

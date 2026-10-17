@@ -28,14 +28,13 @@ from typing import Any
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.record import ExternalGateRequest
 
-__all__ = ["ConsentEntry", "ConsentListing", "EVIDENCE_KEYS", "HISTORY", "KeyEvidence", "PENDING_CAP", "RECENT", "RECENT_CAP",
+__all__ = ["ConsentEntry", "ConsentListing", "HISTORY", "KeyEvidence", "PENDING_CAP", "RECENT", "RECENT_CAP",
            "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_evidence",
            "read_listing"]
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
 RECENT_CAP = 50
 HISTORY = timedelta(days=14)        # how far back the standing-rule proposals read decided requests
-EVIDENCE_KEYS = 200                 # keys the proposals' evidence returns (a bound on keys, never on the rows counted)
 PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
 UNSHOWN = object()
 TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
@@ -194,12 +193,12 @@ def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude
             "SELECT agent, tool_name, cwd, "
             "SUM(CASE WHEN state = 'allowed' AND via = 'signature' AND tier != ?1 THEN 1 ELSE 0 END) AS hand, "
             "MAX(CASE WHEN state = 'allowed' AND via = 'signature' AND tier != ?1 THEN decided_at END), "
-            "MAX(CASE WHEN state = 'denied' THEN 1 ELSE 0 END), "
+            "MAX(CASE WHEN state = 'denied' THEN 1 ELSE 0 END) AS denied, "
             "(SELECT r2.via FROM requests r2 WHERE r2.agent = r.agent AND r2.tool_name = r.tool_name AND r2.cwd = r.cwd "
-            "AND r2.state IN ('allowed', 'denied') AND r2.decided_at >= ?2 ORDER BY r2.decided_at DESC, r2.id DESC LIMIT 1) "
+            "AND r2.state IN ('allowed', 'denied') AND r2.decided_at >= ?2 ORDER BY r2.decided_at DESC, r2.id DESC LIMIT 1) AS latest_via "
             "FROM requests r WHERE state IN ('allowed', 'denied') AND decided_at >= ?2 "
-            "GROUP BY agent, tool_name, cwd HAVING hand >= ?3 "
-            "ORDER BY hand DESC, MAX(decided_at) DESC LIMIT ?4", (exclude_tier, horizon, min_hand, EVIDENCE_KEYS)).fetchall()
+            "GROUP BY agent, tool_name, cwd HAVING hand >= ?3 AND denied = 0 AND latest_via IS NOT 'grant' "
+            "ORDER BY hand DESC, MAX(decided_at) DESC", (exclude_tier, horizon, min_hand)).fetchall()
         conn.execute("COMMIT")
     finally:
         conn.close()
