@@ -2304,6 +2304,7 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
+    from levain.authority import consent_mcp_tool_problem
     from levain.consent.grants import list_grants
 
     try:
@@ -2317,6 +2318,8 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     stamp = utc_stamp(now)
     for g in grants:
         state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
+        if any(consent_mcp_tool_problem(t) is not None for t in g.tools):
+            state += " (answers nothing: an MCP tool that may write)"
         print(f"{g.id}  {g.agent}  {','.join(g.tools)}  {g.workspace}  postures {','.join(g.postures)}  {state}  "
               f"(seq {g.seq})")
     return 0

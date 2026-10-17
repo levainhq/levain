@@ -897,7 +897,34 @@ def test_a_grant_on_a_known_read_tool_still_answers_inside_its_workspace(tmp_pat
     assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
     assert run(event("mcp__fs__read_text_file", {"path": "/etc/hosts"}, cwd=str(ws))) == ""  # outside: no answer
     assert auth.consent_mcp_tool_problem("mcp__my_fs__list_directory") is None
-    assert auth.consent_mcp_tool_problem("mcp__fs__read_text_file_and_write") is not None
+    for name in ("mcp__fs__read_text_file_and_write", "fs__write_file", "MCP__fs__read_file", "mcp__a__b__read_file"):
+        assert auth.consent_mcp_tool_problem(name) is not None, name  # an MCP tool spelled otherwise fails closed
+
+
+@pytest.mark.parametrize("inp", [{"filepath": "/etc/hosts"}, {"relative_path": "../../etc/hosts"},
+                                 {"path": "src/a.py", "root": "/"}, ["src/a.py"]])
+def test_another_servers_read_tool_with_a_field_the_reference_tool_does_not_take_matches_no_grant(tmp_path, inp):
+    """L1 + L2 on 1ae0546: the read list is by tool name, so another server's ``read_file`` taking its path in
+    ``filepath`` (or Serena's ``relative_path``) was matched on the working directory alone and read anywhere. A
+    request now matches only when its input carries just the fields the reference tool's schema declares."""
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_file")
+    assert run(event("mcp__fs__read_file", inp, cwd=str(ws))) == ""
+    out = json.loads(run(event("mcp__fs__read_file", {"path": "src/a.py", "head": 5}, cwd=str(ws))))
+    assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+
+
+@pytest.mark.parametrize("config_file", [
+    ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/h.sh", ".claude/agents/a.md",
+    ".claude/skills/s/SKILL.md", ".claude/commands/c.md", ".claude/plugins/p/hooks/h.json", ".codex/hooks.json",
+    ".codex/config.toml", "activation/hooks/consent_claude_code.py", "p/.claude-plugin/plugin.json",
+])
+def test_the_directory_holding_each_config_file_is_tagged(config_file):
+    """L1 on 1ae0546 (the class of the finding it closes): the probes are a list too, so tie them to the file
+    checks: wherever a file is tagged, a server given its directory and its name in two fields is tagged."""
+    cwd, home = "/work/proj", Path("/home/u")
+    assert cc.targets_agent_config("Write", {"file_path": f"{cwd}/{config_file}"}, cwd, home=home)
+    parent, name = os.path.split(config_file)
+    assert cc.targets_agent_config("mcp__fs__w", {"directory": f"{cwd}/{parent}", "n": "zz-" + name}, cwd, home=home)
 
 
 @pytest.mark.parametrize("where", ["activation-hooks", "activation-hooks-relative", "site-dir"])

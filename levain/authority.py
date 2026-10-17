@@ -157,16 +157,25 @@ CONSENT_AGENTS = ("claude_code", "codex")
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1, measured in Q0 item 6 and Q3).
 # Compared case-insensitively.
 CONSENT_SHELL_TOOLS = frozenset({"bash"})
-# The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``: the reference filesystem
-# server's tools that declare ``readOnlyHint: true`` (github.com/modelcontextprotocol/servers, src/filesystem/server.ts,
-# read 2026-10-17). MCP declares no path fields and its annotations are untrusted (spec 2025-06-18, server/tools), so
-# a grant's workspace bound reads only the fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``) and a grant
-# on a tool that writes could answer a write anywhere. Until a grant can declare its tool's path fields, an MCP tool
-# off this list is refused at append and answers nothing at decision: it goes to you. A server is the operator's own
-# install, so a tool named here that writes is that server's lie, not a request's.
-CONSENT_MCP_READ_ONLY_TOOLS = frozenset({
-    "read_file", "read_text_file", "read_media_file", "read_multiple_files", "list_directory",
-    "list_directory_with_sizes", "directory_tree", "search_files", "get_file_info", "list_allowed_directories",
+# The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``, each with the input fields
+# its schema declares: the reference filesystem server's tools that declare ``readOnlyHint: true``
+# (github.com/modelcontextprotocol/servers, src/filesystem/server.ts, read 2026-10-17). MCP declares no path fields
+# and its annotations are untrusted (spec 2025-06-18, server/tools), so a grant's workspace bound reads only the
+# fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``): a grant on a tool that writes could answer a write
+# anywhere, and one on another server's ``read_file`` taking its path in another field a read anywhere. Until a grant
+# can declare its tool's path fields, an MCP tool off this list is refused at append and answers nothing at
+# decision, and a request on one on it whose input carries a field not listed here matches no grant: it goes to you.
+CONSENT_MCP_READ_ONLY_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
+    "read_file": frozenset({"path", "head", "tail"}),
+    "read_text_file": frozenset({"path", "head", "tail"}),
+    "read_media_file": frozenset({"path"}),
+    "read_multiple_files": frozenset({"paths"}),
+    "list_directory": frozenset({"path"}),
+    "list_directory_with_sizes": frozenset({"path", "sortBy"}),
+    "directory_tree": frozenset({"path", "excludePatterns"}),
+    "search_files": frozenset({"path", "pattern", "excludePatterns"}),
+    "get_file_info": frozenset({"path"}),
+    "list_allowed_directories": frozenset(),
 })
 # The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
 # permission modes (Q0 measured ``default``); Codex: the value its event carries (Q0 item 6, Q3: ``default``).
@@ -1182,10 +1191,11 @@ def consent_root_problem(workspace: str) -> str | None:
 
 def consent_mcp_tool_problem(tool: str) -> str | None:
     """Why a consent grant may not name ``tool``, when it is an MCP tool (``mcp__<server>__<tool>``, the server name
-    ending at its first ``__``) whose own name is not in :data:`CONSENT_MCP_READ_ONLY_TOOLS`; ``None`` otherwise."""
-    if not isinstance(tool, str) or not tool.startswith("mcp__"):
-        return None
-    if tool[len("mcp__"):].partition("__")[2] in CONSENT_MCP_READ_ONLY_TOOLS:
+    ending at its first ``__``) whose own name is not in :data:`CONSENT_MCP_READ_ONLY_TOOLS`, or any other name with
+    a ``__`` in it (an agent that spelled its MCP tools otherwise would fail closed); ``None`` otherwise."""
+    if not isinstance(tool, str) or "__" not in tool:
+        return None     # a built-in tool (Claude Code's and Codex's names carry no "__")
+    if tool.startswith("mcp__") and tool[len("mcp__"):].partition("__")[2] in CONSENT_MCP_READ_ONLY_TOOLS:
         return None
     return (f"{tool[:200]!r} is an MCP tool levain does not know to be read-only: MCP does not say which of a "
             "tool's fields are paths, so a grant could not keep its writes inside the workspace; its requests go "
