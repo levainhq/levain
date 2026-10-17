@@ -16,6 +16,22 @@ Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also
 
 ---
 
+## Why Levain
+
+If you run coding agents for real, you hit the permission prompt fast. The usual answers each cost something.
+
+**Babysit every prompt.** Every file write, every shell command, every tool call waits on you to click yes. One agent, that's annoying. I run 10 to 15 at a time, and the prompt is the first thing that broke: agents sat frozen for an hour at a dialog nobody was looking at.
+
+**Skip permissions.** It scales, and now the agent acts with your full authority and nothing records what it decided on your behalf.
+
+**Let a classifier decide, or write your own rules.** Claude Code's auto mode hands each call to a second model that judges whether it's safe. For a lot of developers that's as much friction as babysitting, sometimes more, because its refusals land on work you already meant to allow. Well-tuned custom permission rules get the friction exactly where you want it. But the prompts that are left still only reach you at the terminal, or on your phone if you turn on Remote Control, which routes your session through Anthropic's servers to the Claude app, something plenty of people and companies won't allow. And however good the rules are, Claude Code can log each decision and whether a rule, a hook or you made it, but nothing signs that record, so it can't prove who approved what.
+
+Levain is the option that doesn't make you pick. You say once what an agent may do, as a signed standing grant, and routine prompts get answered without you. Everything else comes to you as a real decision, at the desk or, with the phone page levain serves behind an https proxy you trust, on your phone. Your answer is signed too, so an agent can't just type "yes" for you: a message is never an answer, only a signature from a key you enrolled, and a Touch ID key or a phone passkey needs your touch for each one. Every answer levain gives, yours or a grant's, lands in an audit trail. It's one queue for Claude Code and Codex, not one per vendor.
+
+The memory half is the same idea pointed the other way. Consent governs what your agent *does*; memory governs what it *becomes*. Nothing graduates into long-term memory without cited evidence, and every change is recorded in a tamper-evident log. Both answer the same question: **is this agent working under your authority, and can you prove it?**
+
+---
+
 ## What this is
 
 If you've worked with an AI partner long enough to feel the session-amnesia problem — every conversation starts cold, every insight gets re-explained, the *quality* of the partnership keeps resetting — Levain is the kit you'd otherwise build for yourself.
