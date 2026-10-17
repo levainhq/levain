@@ -107,7 +107,7 @@ def test_verified_allow_is_delivered(monkeypatch):
     assert rc == 0
     assert json.loads(out) == {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
                                                       "decision": {"behavior": "allow"}}}
-    assert q.waited == [20.0] and q.withdrawn == []
+    assert q.waited == [cc.RECHECK_EVERY] and q.withdrawn == []  # main() holds in pieces, re-reading away mode
     assert q.filed[0]["agent"] == "claude_code" and q.filed[0]["tier"] == "T2" and q.filed[0]["event_id"] is None
 
 
