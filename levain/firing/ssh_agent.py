@@ -38,12 +38,14 @@ import os
 import platform
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
 import stat
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -280,6 +282,105 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def process_start(pid: int) -> str | None:
+    """Linux: when ``pid`` started (``/proc/<pid>/stat`` field 22, clock ticks since boot, read after
+    the last ``)`` because comm may hold one), so a reused pid is told from the process it was; None
+    when it cannot be read (no such process, not Linux)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        return data[data.rindex(")") + 1:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _start_mark(pid: int) -> str | None:
+    """Which process holds ``pid`` now, as its start time: :func:`process_start` on Linux, ``ps -o
+    lstart=`` elsewhere (to the second: a pid reused within the same second reads as the same process,
+    the residue off Linux, where no session agent starts yet). None when it cannot be read."""
+    if sys.platform.startswith("linux"):
+        return process_start(pid)
+    try:
+        done = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, timeout=5,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    mark = done.stdout.strip()
+    return mark if done.returncode == 0 and mark else None
+
+
+def _owner_alive(rec: dict[str, Any]) -> bool:
+    """Whether the levain process that owns the agent in ``rec`` is still running: its pid is alive and,
+    where the record holds the owner's start time, the process at that pid is the one that started
+    (a reused owner pid keeps no orphan alive). An unreadable start time counts as alive (never sweep
+    on a guess)."""
+    if not _alive(rec["owner"]):
+        return False
+    recorded = rec.get("owner_start")
+    if not isinstance(recorded, str):
+        return True   # a record from before the start time was kept: the pid is all there is
+    now = _start_mark(rec["owner"])
+    return now is None or now == recorded
+
+
+def _pidfd_exited(pidfd: int, timeout: float) -> bool:
+    """Linux: wait up to ``timeout`` seconds for the process behind ``pidfd`` to exit (a pidfd polls
+    readable when it does); whether it did."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return bool(poller.poll(int(timeout * 1000)))
+
+
+def _kill_answering(pid: int, sock: str) -> bool:
+    """SIGTERM, then SIGKILL after :data:`_STOP_WAIT`, the process at ``pid``, only while it is the one
+    that answered on ``sock``; whether it was signalled. A pid is a number the kernel hands out again,
+    so the process is pinned BEFORE the socket check and every signal goes to that pinned process:
+    on Linux a pidfd (``os.pidfd_open`` then ``signal.pidfd_send_signal``; the wait polls the pidfd),
+    elsewhere its start time, read again immediately before each signal. An agent that is not
+    levain's child is reaped by init once it exits; nothing here waits for it."""
+    pidfd: int | None = None
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pidfd = None   # a kernel without pidfds (before 5.3): the start time below
+    try:
+        mark = None if pidfd is not None else _start_mark(pid)
+        if pidfd is None and mark is None:
+            return False   # neither a pidfd nor a start time: the process cannot be pinned, so no signal
+        try:
+            if peer_pid(sock) != pid:
+                return False
+        except AgentError:
+            return False
+        if pidfd is not None:
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                if not _pidfd_exited(pidfd, _STOP_WAIT):
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass   # it exited: the pidfd never names another process
+            return True
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if _start_mark(pid) != mark:
+                return True   # gone, or the pid is another process now: nothing more to send
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return True
+            if sig == signal.SIGTERM:
+                deadline = time.monotonic() + _STOP_WAIT
+                while _alive(pid) and _start_mark(pid) == mark and time.monotonic() < deadline:
+                    time.sleep(0.05)
+        return True
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
 def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str = "agent") -> ScopedAgent:
     """Start one session's agent and return it, or :class:`AgentError` (nothing left behind). Sweeps
     agents a killed levain left first (:func:`sweep_orphans`). ``ssh_mode`` is the entity's floor
@@ -323,7 +424,8 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str =
         if got != proc.pid:
             raise AgentError(f"the process answering on {sock} is pid {got}, not the agent levain started "
                              f"(pid {proc.pid})")
-        write_record(d, {"session_id": sid, "pid": proc.pid, "owner": os.getpid(), "entity": entity,
+        write_record(d, {"session_id": sid, "pid": proc.pid, "owner": os.getpid(),
+                         "owner_start": _start_mark(os.getpid()), "entity": entity,
                          "socket": str(sock), "lifetime": int(lifetime), "started_at": int(time.time()),
                          "ssh_mode": ssh_mode, "keys": []})
     except BaseException:
@@ -374,20 +476,8 @@ def stop(agent: ScopedAgent) -> str | None:
     try:
         if proc is not None:
             _terminate(proc)
-        elif _alive(agent.pid):
-            try:
-                same = peer_pid(agent.socket) == agent.pid
-            except AgentError:
-                same = False
-            if same:
-                os.kill(agent.pid, signal.SIGTERM)
-                deadline = time.monotonic() + _STOP_WAIT
-                while _alive(agent.pid) and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if _alive(agent.pid):
-                    os.kill(agent.pid, signal.SIGKILL)
-            else:
-                left = f"pid {agent.pid} no longer answers on {agent.socket}; it was not signalled"
+        elif _alive(agent.pid) and not _kill_answering(agent.pid, agent.socket):
+            left = f"pid {agent.pid} no longer answers on {agent.socket}; it was not signalled"
     except BaseException as exc:  # noqa: BLE001 — a teardown step; the caller reports the text
         left = f"stopping ssh-agent pid {agent.pid} failed ({exc})"
     _remove_dir(agent.dir)
@@ -425,21 +515,12 @@ def sweep_orphans() -> list[str]:
     record cannot be read is left alone."""
     swept = []
     for d, rec in sessions():
-        if rec["owner"] == os.getpid() or _alive(rec["owner"]):
+        if rec["owner"] == os.getpid() or _owner_alive(rec):
             continue
-        if live(d, rec):
-            try:
-                os.kill(rec["pid"], signal.SIGTERM)
-            except OSError:
-                pass
-            deadline = time.monotonic() + _STOP_WAIT
-            while _alive(rec["pid"]) and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if _alive(rec["pid"]):
-                try:
-                    os.kill(rec["pid"], signal.SIGKILL)
-                except OSError:
-                    pass
+        try:
+            _kill_answering(rec["pid"], str(d / SOCKET_NAME))
+        except OSError:
+            pass   # a signal refused: the directory still goes, the agent's socket with it
         _remove_dir(d)
         swept.append(d.name)
     return swept
