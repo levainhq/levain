@@ -935,14 +935,14 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
 # The autonomic engine's store DIRECTORY (``levain.autonomic.db.default_store_dir``): its binding registry,
-# run journal, SQLite sidecars and effect leases, denied read and write as ONE subtree under the levain
-# home (``$LEVAIN_HOME``, else ``~/.levain``). The database's sidecars live inside it, so bash is not refused.
+# run journal, SQLite sidecars and effect leases. The floor denies it as part of the whole levain home
+# (:func:`build_policy`); the name stays for its readers. A directory, so bash is not refused on its account.
 AUTONOMIC_STORE_DIR = "autonomic"
 # The cockpit's signing keys (``levain.cockpit.custody.default_key_dir``: ``levain cockpit key create``
-# writes the T2/T3 keys, their ``.pub`` and custody sidecar there), denied read and write as one subtree
-# under the levain home for the same reason as ``~/.ssh``: read, a passphrase key goes to offline guessing;
-# written between ``key create`` and ``enroll``, the entity's own key gets enrolled (Diogenes MEDIUM
-# 2026-10-13). ``levain cockpit`` runs outside the floor, so nothing legitimate loses access.
+# writes the T2/T3 keys, their ``.pub`` and custody sidecar there), denied with the whole levain home for
+# the same reason as ``~/.ssh``: read, a passphrase key goes to offline guessing; written between ``key
+# create`` and ``enroll``, the entity's own key gets enrolled (Diogenes MEDIUM 2026-10-13). ``levain
+# cockpit`` runs outside the floor, so nothing legitimate loses access.
 COCKPIT_KEY_DIR = "keys"
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
@@ -1085,7 +1085,6 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
             ) from exc
     canonical = (entity_dir / ".levain" / "memory.db").resolve()
     listed = 0
-    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
     out: list[Path] = []
     seen: set[Path] = set()
     for trust in candidates:
@@ -1109,10 +1108,7 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
                         "directories this user could reach — refusing to build the floor "
                         "(fail-closed). Prune the trust files."
                     )
-                unsafe = (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
-                          or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
-                          or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
-                if unsafe:
+                if _unhideable(d, home, entity_dir, workspace):
                     raise ConfinementError(
                         f"the anneal store {db} (listed in {trust}) sits in {d}, which cannot be "
                         "hidden from the entity without hiding its own home, entity or workspace. "
@@ -1125,6 +1121,90 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
 
 
 _MAX_LISTED_STORES = 256
+
+
+def _unhideable(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
+    """Whether denying the subtree ``d`` would hide the entity's own home, entity or workspace (or is a
+    filesystem root or a shared temp directory): such a ``d`` cannot be a jewel, so the caller refuses to
+    build the floor (fail-closed) rather than build one that silently hides the entity from itself. One
+    test for every jewel directory the operator's configuration places: the anneal stores a trust file
+    lists and the levain home."""
+    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
+    return (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
+            or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
+            or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
+
+
+# The operator-state directories levain itself creates under the levain home, named ONLY for the fallback
+# in :func:`_levain_home_jewels` (a levain home that overlaps the entity). Everywhere else the whole home
+# is denied, so a directory missing here is still covered there. A test ties this tuple to every reader
+# of ``$LEVAIN_HOME`` in the package, so a new one fails until it is named here.
+LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent")
+
+
+def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
+    """The floor's subtrees for the levain home, ``$LEVAIN_HOME`` else ``~/.levain``, made absolute as its
+    readers make it (``levain.autonomic.db.default_store_dir``, ``levain.consent.queue.default_queue_dir``:
+    an empty ``$LEVAIN_HOME`` is unset, a relative one is taken against the cwd now).
+
+    Normally the WHOLE home, at every spelling (:func:`_spellings`: a link at ``~/.levain`` must not leave
+    the queue reachable by a name the floor does not hold). When the home cannot be hidden whole because it
+    overlaps the entity (an install that lives AT ``~/.levain`` and is run as an entity, or a
+    ``$LEVAIN_HOME`` of ``$HOME``), the floor falls back to :data:`LEVAIN_HOME_STATE_DIRS` by name, which
+    is the shape before the whole-home deny plus the consent queue: that layout keeps the old class edge (a new directory
+    must add itself to the tuple). Refuses (fail-closed) only a home that cannot be resolved, or a named
+    directory whose denial would hide the entity's own home, entity or workspace."""
+    raw = os.environ.get("LEVAIN_HOME")
+    try:
+        base = Path(raw).expanduser() if raw else home / ".levain"
+        base = Path(os.path.abspath(base))
+        whole = _spellings(base)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfinementError(
+            f"$LEVAIN_HOME={raw!r} cannot be resolved ({exc}) — refusing to build the floor (fail-closed)."
+        ) from exc
+    if not any(_unhideable(d, home, entity_dir, workspace) for d in whole):
+        return base, whole
+    out: list[Path] = []
+    for name in LEVAIN_HOME_STATE_DIRS:
+        for d in _spellings(base / name):
+            if (str(d) == d.anchor or len(d.parts) <= 2
+                    or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))):
+                raise ConfinementError(
+                    f"the levain directory {d} cannot be hidden from the entity without hiding its own "
+                    "home, entity or workspace. Refusing to build the floor (fail-closed). Point "
+                    "$LEVAIN_HOME at a directory of its own, outside the entity and its workspace."
+                )
+            out.append(d)
+    return base, out
+
+
+def _consent_authority_jewels(home_base: Path, home: Path, entity_dir: Path, workspace: Path) -> list[Path]:
+    """The cockpit data roots the consent queue's adapter settings name (``cockpit_data_root`` in
+    ``<levain home>/consent/claude_code.json`` and ``codex.json``), read with the adapters' own
+    ``load_settings`` so the floor and the hook resolve the same directory. The authority log and its
+    anchor live there, together: a same-uid writer that replaces both enrols its own genesis key and
+    signs answers and grants the hook allows (measured 2026-10-16), so the whole root is denied read and
+    write. The settings themselves are under the denied levain home, so the entity cannot repoint them.
+    A missing or malformed settings file names nothing, and the hook then trusts nothing either. A root
+    whose denial would hide the entity's own home, entity or workspace refuses the floor (fail-closed)."""
+    from levain.consent.adapters import claude_code, codex   # lazy: keeps this module's import light
+
+    out: list[Path] = []
+    for adapter in (claude_code, codex):
+        root = adapter.load_settings(home_base / "consent").cockpit_data_root
+        if not root:
+            continue
+        for d in _spellings(Path(root)):
+            if (str(d) == d.anchor or len(d.parts) <= 2
+                    or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))):
+                raise ConfinementError(
+                    f"the cockpit data root {d} (named in the consent queue's {adapter.SETTINGS_NAME}) cannot "
+                    "be hidden from the entity without hiding its own home, entity or workspace. Refusing to "
+                    "build the floor (fail-closed)."
+                )
+            out.append(d)
+    return out
 
 
 def _mountpoint_creatable(d: Path) -> bool:
@@ -1229,10 +1309,17 @@ def build_policy(
         read the operator's own memory;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
-      - the autonomic engine's store directory ``<levain home>/autonomic`` (``$LEVAIN_HOME``, else
-        ``~/.levain``; subtree, read and write) — the binding registry and run journal that decide
-        what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
-      - the cockpit's signing keys ``<levain home>/keys`` (subtree, read and write; :data:`COCKPIT_KEY_DIR`);
+      - the WHOLE levain home (``$LEVAIN_HOME``, else ``~/.levain``; one subtree, read and write): it holds
+        the operator's authority, never the entity's — the autonomic store that decides what fires
+        (:data:`AUTONOMIC_STORE_DIR`), the cockpit's signing keys (:data:`COCKPIT_KEY_DIR`), the consent
+        queue and its ``claude_code.json`` (which names the cockpit root answers are checked against).
+        Denied whole, not by name, because naming each directory missed the consent queue when it
+        shipped; a new directory is covered the day it exists. A levain home that overlaps the entity
+        (an install living at ``~/.levain``) falls back to naming :data:`LEVAIN_HOME_STATE_DIRS`
+        (:func:`_levain_home_jewels`);
+      - every cockpit data root the consent settings in that home name (subtree, read and write;
+        :func:`_consent_authority_jewels`): the authority log and anchor answers and grants verify
+        against live there, outside the levain home;
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
         r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
@@ -1323,9 +1410,13 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
-    levain_home = Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser()
-    subtrees.append((levain_home / AUTONOMIC_STORE_DIR).resolve())
-    subtrees.append((levain_home / COCKPIT_KEY_DIR).resolve())
+    # The whole levain home, one subtree, so an operator-state directory under it is covered without
+    # naming itself; the by-name fallback for a home that overlaps the entity is in the helper.
+    levain_base, levain_home_jewels = _levain_home_jewels(home, ed, ws)
+    subtrees.extend(levain_home_jewels)
+    # The cockpit authority the consent settings in that home name: its log and anchor sit outside it.
+    authority_jewels = _consent_authority_jewels(levain_base, home, ed, ws)
+    subtrees.extend(authority_jewels)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1541,7 +1632,7 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
-    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor")}
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor"), *levain_home_jewels, *authority_jewels}
     for jewel in _dedup(subtrees + files):
         if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
