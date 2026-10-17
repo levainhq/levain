@@ -940,7 +940,8 @@ def _banner_for(
                 agent_note = ("bash is not available in this session" if not session.bash_ok
                               else "levain started none for this session")
             socket_lines = unix_socket_lines(load_confinement_config(session.entity_dir),
-                                             ssh_agent=agent, ssh_agent_note=agent_note)
+                                             ssh_agent=agent, ssh_agent_note=agent_note,
+                                             grants=getattr(session, "grants", None))
         except Exception as exc:  # noqa: BLE001 — the spawn refuses bash on the same error, and says so
             socket_lines = [f"unix sockets: not determinable ({exc})"]
     _print_banner(
