@@ -235,7 +235,8 @@ CONSENT_GRANTABLE_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
         "Read", "Grep", "LS", "NotebookRead",
         "Glob",         # policy.GLOB_TOOLS: its pattern, refused when it can reach outside its root
         "WebFetch",     # names no path: matched on its working directory alone (policy module docstring)
-        # names no path: matched on the working directory alone. Measured in a PermissionRequest
+        # names no path: matched on the working directory alone, so a grant answers every send from the workspace,
+        # one that resumes a subagent with any message included. Measured in a PermissionRequest
         # (project_memory/1016-land/Q9_OWNCHILD_RUN); CHANGELOG [0.11.x] governed messaging documents a standing
         # grant on it as the way a governed session stops stalling
         "SendMessage",
