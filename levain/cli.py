@@ -1962,16 +1962,19 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
         "away", help="Show or set away mode: whether the consent hook holds a request for a signed answer.",
         description="Away mode off (the default): the hook answers only by a standing grant and otherwise leaves "
                     "the agent's own dialog to ask you at once, so a signed answer has nothing to land on. On: the "
-                    "hook holds each request it cannot answer by a grant for up to --hold seconds while you answer "
-                    "it with `levain consent answer` or your phone, then leaves it to the agent's dialog. Changes "
-                    "only away_mode and away_hold_seconds in <queue dir>/claude_code.json and codex.json; grants "
-                    "nothing (every answer still verifies as a signature). Takes effect at the next request.")
+                    "hook holds each request no grant answers for up to --hold seconds so you can answer it with "
+                    "`levain consent answer` or your phone. Claude Code shows its own dialog during the hold too "
+                    "(an allow from the hook dismisses it); Codex shows no dialog until the hold ends, so for Codex "
+                    "away means away. `on` refuses when no enrolled key in the install's cockpit could sign an "
+                    "answer. Changes only away_mode and away_hold_seconds in <queue dir>/claude_code.json and "
+                    "codex.json; grants nothing (every answer still verifies as a signature). Takes effect at the "
+                    "next request.")
     away.add_argument("action", nargs="?", choices=("show", "on", "off"), default="show")
     away.add_argument("--agent", choices=("claude_code", "codex", "all"), default="all",
                       help="Which agent's settings (default: every agent that has a settings file).")
     away.add_argument("--hold", type=float, default=None,
-                      help="Seconds to hold a request in away mode, more than 0 and at most 900 (default: the "
-                           "file's hold, else 300).")
+                      help="Seconds to hold a request in away mode, more than 0 and at most 840, the longest the "
+                           "hook waits (default: the file's hold, else 300 for Claude Code and 120 for Codex).")
     away.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                       help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     away.set_defaults(func=_cmd_consent_away)
@@ -1989,29 +1992,30 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     rc, seen = 0, 0
     for agent in agents:
         try:
-            if args.action == "show" or args.agent == "all":
-                data = away.read(qdir, agent)
-                if data is None:
-                    if args.agent != "all":
-                        print(f"{agent}: no settings file in {qdir} (`levain init` with the consent hook on "
-                              "writes it)", file=sys.stderr)
-                        rc = 1
-                    continue
+            if away.read(qdir, agent) is None:
+                msg = f"{agent}: no settings file in {qdir} (`levain init` with the consent hook on writes it)"
+                if args.agent == "all":
+                    print(f"{agent}: skipped, no settings file")
+                else:
+                    print(msg, file=sys.stderr)
+                    rc = 1
+                continue
             if args.action != "show":
-                data = away.set_away(qdir, agent, args.action == "on", args.hold)
+                away.set_away(qdir, agent, args.action == "on", args.hold)
+            got = away.settings(qdir, agent)  # what the hook reads, not the raw file
             seen += 1
         except (OSError, ValueError, QueueStoreError) as e:
             print(f"levain consent away: {agent}: {e}", file=sys.stderr)
             rc = 1
             continue
-        state = "ON" if data.get("away_mode") is True else "off"
-        hold = data.get("away_hold_seconds")
-        line = f"{agent}: away mode {state}"
-        if data.get("away_mode") is True:
-            line += f", holds up to {hold:g}s for a signed answer" if isinstance(hold, (int, float)) else ""
-        root = data.get("cockpit_data_root")
-        line += f"; answers verify against {root}" if isinstance(root, str) and root else \
-            "; WARN: names no cockpit_data_root, so no grant or signed answer can verify"
+        if got.away_mode:
+            line = f"{agent}: away mode ON, holds up to {min(got.away_hold_seconds, away.MAX_HOLD):g}s"
+            line += " (Claude Code's own dialog shows meanwhile)" if agent == "claude_code" else \
+                " (Codex shows no dialog until the hold ends)"
+        else:
+            line = f"{agent}: away mode off"
+        reason = away.why_unanswerable(got)
+        line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
         print(line)
     if seen == 0 and rc == 0:
         print(f"levain consent away: no consent settings in {qdir}; `levain init` with the consent hook on writes "
