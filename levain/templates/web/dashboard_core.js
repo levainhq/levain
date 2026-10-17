@@ -1334,11 +1334,13 @@
           const label = () => { tog.textContent = trayHeldShown ? "hide" : "show"; tog.setAttribute("aria-expanded", trayHeldShown ? "true" : "false"); };
           label();
           // one state, every mounted Tray (the board's and the focus modal's) redraws on a change
-          heldMounts.add({ tog, sync: () => { label(); redraw(); } });
+          const mine = { tog, sync: () => { label(); redraw(); } };
+          heldMounts.add(mine);
           // drop the mounts a re-render replaced; after this task, so a Tray built but not yet attached stays
           setTimeout(() => { for (const m of [...heldMounts]) if (!m.tog.isConnected) heldMounts.delete(m); }, 0);
           tog.addEventListener("click", () => {
             trayHeldShown = !trayHeldShown; saveHeldShown();
+            heldMounts.add(mine);   // a Tray attached after the prune ran still redraws itself
             for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
           });
           line.appendChild(tog);
