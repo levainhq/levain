@@ -249,6 +249,7 @@
     if (!board) return;
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
+    const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
     board.replaceChildren();
 
     const entityEl = document.getElementById("entity");
@@ -352,8 +353,10 @@
       board.appendChild(renderErrors(view));
     }
     finalizePanels(board);  // wrap content + bound the long modules (scroll within, no reflow)
+    restoreKeptRows(board, kept);   // before the measure, which leaves an expanded row's toggle as "less"
     measureClauses(board);  // reveal per-item expand toggles on clauses that overflow the clamp
     applyFilter();
+    restoreKeptScroll(board, kept);
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
@@ -1068,6 +1071,57 @@
     return p;
   }
 
+  // Open or close a row's full text, and keep its toggle's state words in step with it.
+  function setExpanded(row, open) {
+    row.classList.toggle("row-expanded", open);
+    const toggle = row.querySelector(":scope > .clause-toggle");
+    if (toggle) {
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      // flip the accessible name with the state — else a screen reader announces "expand
+      // full text … expanded" (contradictory) [codex + kimi + complement L3 converged].
+      toggle.setAttribute("aria-label", open ? "collapse full text" : "expand full text");
+      toggle.textContent = open ? "⌃" : "⌄";
+    }
+    return open;
+  }
+  // What the reader holds open while a panel is drawn again (the board rebuilds on a stream event, a refresh or a
+  // returning tab; a typed panel repaints its body in place): the rows they expanded and how far each panel's body is
+  // scrolled. Rows are known by their id (data-row-key, or data-keep-key for a typed panel's row), never by position,
+  // inside the panel that holds them (data-ck-panel); a row that is gone simply stays closed. RE-RUNNABLE.
+  const keptScope = (n) => {
+    const ck = n.closest ? n.closest("[data-ck-panel]") : null;
+    if (ck) return ck.dataset.ckPanel || "";
+    const pn = n.closest ? n.closest(".panel") : null;
+    const h = pn ? pn.querySelector("h2") : null;
+    return h ? "t:" + h.textContent : "";
+  };
+  const keptKey = (row) => row.dataset.rowKey || row.dataset.keepKey || "";
+  const scrollersOf = (root) => {
+    const out = root.matches && root.matches(".pbody, .modal-body") ? [root] : [];
+    return out.concat(Array.from(root.querySelectorAll(".pbody, .modal-body")));
+  };
+  function captureKept(root) {
+    const kept = { open: new Set(), scroll: new Map() };
+    if (!root || !root.querySelectorAll) return kept;
+    for (const row of root.querySelectorAll(".row.row-expanded")) {
+      const k = keptKey(row);
+      if (k) kept.open.add(JSON.stringify([keptScope(row), k]));
+    }
+    for (const sc of scrollersOf(root)) if (sc.scrollTop > 0) kept.scroll.set(keptScope(sc), sc.scrollTop);
+    return kept;
+  }
+  function restoreKeptRows(root, kept) {
+    if (!kept || !root || !root.querySelectorAll || !kept.open.size) return;
+    for (const row of root.querySelectorAll(".row")) {
+      const k = keptKey(row);
+      if (k && kept.open.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, true);
+    }
+  }
+  function restoreKeptScroll(root, kept) {
+    if (!kept || !root || !kept.scroll.size) return;
+    for (const sc of scrollersOf(root)) { const t = kept.scroll.get(keptScope(sc)); if (t) sc.scrollTop = t; }
+  }
+
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
   // FULL canonical text goes into the DOM via textContent (the wire no longer truncates),
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
@@ -1090,12 +1144,7 @@
     toggle.setAttribute("aria-label", "expand full text");
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();  // don't trip a row/modal handler
-      const open = row.classList.toggle("row-expanded");
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-      // flip the accessible name with the state — else a screen reader announces "expand
-      // full text … expanded" (contradictory) [codex + kimi + complement L3 converged].
-      toggle.setAttribute("aria-label", open ? "collapse full text" : "expand full text");
-      toggle.textContent = open ? "⌃" : "⌄";
+      const open = setExpanded(row, !row.classList.contains("row-expanded"));
       // expanding changes the panel's content height → refresh its overflow scent
       const body = row.closest(".pbody, .modal-body");
       if (body && body.classList.contains("pbody")) measureOverflow(body);
@@ -3307,6 +3356,7 @@
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
+      if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
       if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
@@ -3588,6 +3638,7 @@
     // preserve scroll across a refresh-rebuild (a verb fired inside the modal) so a
     // tombstone/compost doesn't yank a long list back to the top.
     const prevBody = overlay.querySelector(".modal-body");
+    const modalKept = captureKept(prevBody);   // a rebuild of the same open modal keeps the rows read in it expanded
     const prevScroll = prevBody ? prevBody.scrollTop : 0;
     modalRestoreScroll = prevScroll;  // re-applied once async modal-episode rows land (reMeasure)
 
@@ -3631,6 +3682,7 @@
     const hadModalFocus = overlay.contains(document.activeElement);
     overlay.replaceChildren(box);
     pruneModalKinds();  // the typed panels the old modal body held end with it
+    restoreKeptRows(box, modalKept);
     measureClauses(box);  // reveal per-item expand toggles inside the focus modal too
     mbody.scrollTop = prevScroll;
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
@@ -3810,5 +3862,5 @@
     finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
   }
 
-  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, captureKept, restoreKeptRows, restoreKeptScroll, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
