@@ -420,7 +420,19 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str =
             if time.monotonic() > deadline:
                 raise AgentError(f"ssh-agent made no socket at {sock} within {_START_WAIT:g}s")
             time.sleep(0.02)
-        got = peer_pid(str(sock))
+        # ssh-agent binds the socket before it listens on it, so a connect in between is refused while
+        # the path exists: retried while the agent runs, until the same deadline.
+        while True:
+            try:
+                got = peer_pid(str(sock))
+                break
+            except AgentError:
+                if proc.poll() is not None:
+                    raise AgentError(f"ssh-agent exited with status {proc.returncode} before it "
+                                     "answered on its socket") from None
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.02)
         if got != proc.pid:
             raise AgentError(f"the process answering on {sock} is pid {got}, not the agent levain started "
                              f"(pid {proc.pid})")
