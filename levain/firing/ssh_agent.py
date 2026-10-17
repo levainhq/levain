@@ -73,8 +73,9 @@ class AgentError(RuntimeError):
 
 
 class AgentTimeout(AgentError):
-    """A connect to a socket did not complete in time (Linux blocks a connect to a full backlog): who
-    listens is unknown, which is not the same answer as nobody listening."""
+    """A connect to a socket was not accepted: it did not complete in time, or the kernel said the
+    listener's backlog is full (EAGAIN, measured on Linux 7.0 and 7.2 for a timed connect). Who listens
+    is unknown, which is not the same answer as nobody listening."""
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,8 @@ def peer_pid(sock: str, *, timeout: float = 5.0) -> int:
             raise AgentError(f"this platform ({platform.system()}) has no peer-pid read levain knows")
     except TimeoutError:
         raise AgentTimeout(f"could not read the peer of {sock} (no connect within {timeout:g} s)") from None
+    except BlockingIOError:
+        raise AgentTimeout(f"could not read the peer of {sock} (its listener's backlog is full)") from None
     except OSError as exc:
         raise AgentError(f"could not read the peer of {sock} ({exc.strerror or exc})") from None
     finally:

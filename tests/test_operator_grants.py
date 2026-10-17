@@ -893,6 +893,13 @@ def test_a_peer_read_that_times_out_is_its_own_answer(monkeypatch):
     with pytest.raises(ssh_agent.AgentTimeout):
         ssh_agent.peer_pid("/nowhere/s", timeout=1.0)
 
+    class _Full(_Slow):   # what Linux returns for a full backlog (measured on 7.0 and 7.2): EAGAIN, at once
+        def connect(self, p): raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(ssh_agent.socket, "socket", _Full)
+    with pytest.raises(ssh_agent.AgentTimeout):
+        ssh_agent.peer_pid("/nowhere/s", timeout=1.0)
+
 
 def test_a_grant_whose_listener_cannot_be_classified_is_refused(monkeypatch):
     monkeypatch.setattr(conf, "_listener_comm", lambda p: conf._LISTENER_UNKNOWN)
