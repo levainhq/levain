@@ -28,11 +28,14 @@ from typing import Any
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.record import ExternalGateRequest
 
-__all__ = ["ConsentEntry", "ConsentListing", "PENDING_CAP", "RECENT", "RECENT_CAP", "UNSHOWN", "audit_line",
-           "consent_targets", "entry_body", "filed_input", "find_entry", "read_listing"]
+__all__ = ["ConsentEntry", "ConsentListing", "HISTORY", "HISTORY_CAP", "PENDING_CAP", "RECENT", "RECENT_CAP",
+           "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_history",
+           "read_listing"]
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
 RECENT_CAP = 50
+HISTORY = timedelta(days=14)        # how far back the standing-rule proposals read decided requests
+HISTORY_CAP = 500                   # decided rows read for them, newest first
 PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
 UNSHOWN = object()
 TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
@@ -159,8 +162,16 @@ def _grant_id_of(answer: Any) -> str | None:
     return gid if isinstance(gid, str) else None
 
 
-def read_listing(directory: Path | str | None = None, *, now: datetime) -> ConsentListing:
+def read_history(directory: Path | str | None = None, *, now: datetime) -> ConsentListing:
+    """The decided requests of the last :data:`HISTORY` (newest :data:`HISTORY_CAP`), as :func:`read_listing` reads
+    them with a longer look-back: what the page's standing-rule proposals count. Same read-only rules."""
+    return read_listing(directory, now=now, span=HISTORY, cap=HISTORY_CAP)
+
+
+def read_listing(directory: Path | str | None = None, *, now: datetime, span: timedelta = RECENT,
+                 cap: int = RECENT_CAP) -> ConsentListing:
     """The queue in ``directory`` (default :func:`~levain.consent.queue.default_queue_dir`) as of ``now``.
+    ``span`` and ``cap`` bound the terminal requests read (the last day and :data:`RECENT_CAP` by default).
     No directory or no file is an empty listing and nothing is created. A store that cannot be trusted (another
     format, a directory others can reach) raises :class:`~levain.consent.queue.QueueStoreError`; a database
     that cannot be read raises ``sqlite3.Error``: the caller's note, never a dark panel."""
@@ -175,7 +186,7 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
     if not path.is_file():
         return ConsentListing()
     stamp = utc_stamp(now)
-    horizon = utc_stamp(now - RECENT)
+    horizon = utc_stamp(now - span)
     cols = ", ".join(_REQUEST_FIELDS) + ", state, decided_at, answer, signer_fp, via"
     # a short busy wait: the page's read worker never stalls on a writer holding the database
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
@@ -195,10 +206,10 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         rows = rows[:PENDING_CAP]
         rows += conn.execute(
             f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
-            "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, RECENT_CAP)).fetchall()
+            "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, cap)).fetchall()
         rows += conn.execute(
             f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
-            "ORDER BY decided_at DESC LIMIT ?", (horizon, RECENT_CAP)).fetchall()
+            "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
         # a store opened only by a levain before dialog outcomes has no such table: no outcomes
         outcomes: dict[str, str] = {}
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dialog_outcomes'").fetchone():
@@ -242,4 +253,4 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at, outcomes.get(request.id)))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
-    return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped, overflow)
+    return ConsentListing(tuple(pending), tuple(recent[:cap]), skipped, overflow)

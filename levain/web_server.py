@@ -135,6 +135,7 @@ _COCKPIT_VERB_PATH = "/cockpit/verb"
 _CONSENT_BODY_PREFIX = "/cockpit/consent/"
 _CONSENT_BODY_SUFFIX = ".json"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
+PROPOSALS_ID = "proposals"       # GET /cockpit/consent/proposals.json: the standing-rule proposals, same token gate
 # One agent session's transcript (Q8): GET /cockpit/session/<stem>.json. It names the session id and full cwd and
 # carries the operator's prompts, so it rides the consent body's gate: a surface token on EVERY bind, loopback included.
 _SESSION_LOG_PREFIX = "/cockpit/session/"
@@ -847,9 +848,16 @@ class _Handler(GuardedHandler):
             try:
                 from levain.consent.listing import entry_body, find_entry
 
-                entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
-                if entry is not None:
-                    status, payload = 200, entry_body(entry)
+                if request_id == PROPOSALS_ID:      # the standing-rule cards: not a request, the id no request carries
+                    from levain.cockpit.proposals import propose
+                    from levain.consent.listing import read_history
+
+                    status, payload = 200, {"proposals": [p.as_dict() for p in
+                                                          propose(read_history(now=datetime.now(timezone.utc)))]}
+                else:
+                    entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
+                    if entry is not None:
+                        status, payload = 200, entry_body(entry)
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
                 status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             finally:
