@@ -487,21 +487,35 @@ class ConsentQueue:
 
     # --- what the agent's own dialog did (unsigned) -----------------------------------------------------------
     def record_ran(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any,
-                   event: str) -> tuple[str, str] | None:
-        """The agent ran ``tool_name`` with ``tool_input`` in this session (its PostToolUse): the oldest request
-        of this agent and session for that tool and that exact input (its digest) that levain did not decide
-        (pending, withdrawn or expired) and that has no outcome yet gets ``ran``, or ``ran_unasked`` when the
-        tool ran within :data:`UNASKED_WITHIN` of levain leaving it; a pending one is also withdrawn. Returns (request id, outcome), or ``None``
-        when no such request is open: a call levain never filed (a session approval Claude Code no longer asks
-        about) is never given one."""
+                   event: str, tool_use_id: str | None = None) -> tuple[str, str] | None:
+        """The agent ran ``tool_name`` with ``tool_input`` in this session (its PostToolUse): the request of this
+        agent and session for that tool and that exact input (its digest) that levain did not decide (pending,
+        withdrawn or expired) and that has no outcome yet gets ``ran``, or ``ran_unasked`` when the tool ran
+        within :data:`UNASKED_WITHIN` of levain leaving it; a pending one is also withdrawn. Which request: the
+        one whose own tool-use id is ``tool_use_id`` when both carry one (a request carrying another id is a
+        different call and is never taken); else the NEWEST, a still-pending one first: the call that ran is the
+        latest retry, and an earlier identical request that was declined must not be recorded as run. Returns
+        (request id, outcome), or ``None`` when no such request is open: a call levain never filed (a session
+        approval Claude Code no longer asks about) is never given one."""
         digest = tool_input_digest({} if tool_input is None else tool_input)
+        use_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
         with self._write() as conn:
             stamp = utc_stamp(_now_utc(self._clock))
-            row = conn.execute(
-                "SELECT id, state, decided_at FROM requests r WHERE agent = ? AND agent_session_id = ? "
-                "AND tool_name = ? AND tool_input_digest = ? AND state IN ('pending','withdrawn','expired') "
-                "AND NOT EXISTS (SELECT 1 FROM dialog_outcomes o WHERE o.request_id = r.id) "
-                "ORDER BY received_at, rowid LIMIT 1", (agent, agent_session_id, tool_name, digest)).fetchone()
+            where = ("FROM requests r WHERE agent = ? AND agent_session_id = ? "
+                     "AND tool_name = ? AND tool_input_digest = ? AND state IN ('pending','withdrawn','expired') "
+                     "AND NOT EXISTS (SELECT 1 FROM dialog_outcomes o WHERE o.request_id = r.id)")
+            args: tuple[Any, ...] = (agent, agent_session_id, tool_name, digest)
+            row = None
+            if use_id is not None:
+                row = conn.execute("SELECT id, state, decided_at " + where + " AND event_id = ? "
+                                   "ORDER BY received_at DESC, rowid DESC LIMIT 1", args + ("hook:" + use_id,)).fetchone()
+            if row is None:
+                # a request that carries another call's id is not this call's; one with none (a PermissionRequest
+                # Claude Code and Codex send without it) could be
+                extra = " AND event_id NOT LIKE 'hook:%'" if use_id is not None else ""
+                row = conn.execute("SELECT id, state, decided_at " + where + extra +
+                                   " ORDER BY (state = 'pending') DESC, received_at DESC, rowid DESC LIMIT 1",
+                                   args).fetchone()
             if row is None:
                 return None
             outcome = "ran"

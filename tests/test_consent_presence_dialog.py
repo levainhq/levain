@@ -93,3 +93,51 @@ def test_codex_through_the_installed_hook_scripts(tmp_path):
                                                                "*** End Patch\n"})
     run("user_prompt_submit.py", {"hook_event_name": "UserPromptSubmit", "session_id": "t", "prompt": "ok"})
     assert q.dialog_outcome(asked.id)[0] == "ran" and q.dialog_outcome(denied.id)[0] == "did_not_run"
+
+
+def test_an_identical_retry_is_the_call_that_ran_not_the_declined_one(tmp_path):
+    # run_h2 R1 (reproduced at the hook seam before the fix: the OLDEST identical request got ran_unasked and the
+    # approved retry did_not_run): a first request declined in the dialog and left, then the same call retried
+    # and approved. The PostToolUse is the retry's.
+    q = _queue(tmp_path)
+    write = {"file_path": "/w/r.txt", "content": "hi"}
+    declined = _left(q, "claude_code", "s", "Write", write)
+    time.sleep(0.01)
+    approved = _left(q, "claude_code", "s", "Write", write)
+    got = observe("claude_code", "PostToolUse", {"session_id": "s", "tool_name": "Write", "tool_input": write,
+                                                 "tool_use_id": "toolu_B"}, q.directory)
+    assert got is not None and got[0] == approved.id
+    observe("claude_code", "Stop", {"session_id": "s"}, q.directory)
+    assert q.dialog_outcome(approved.id)[0] in ("ran", "ran_unasked")
+    assert q.dialog_outcome(declined.id)[0] == "did_not_run"
+
+
+def test_a_still_pending_request_is_taken_before_a_newer_left_one(tmp_path):
+    q = _queue(tmp_path)
+    write = {"file_path": "/w/p.txt", "content": "hi"}
+    held = _left(q, "claude_code", "s", "Write", write, withdraw=False)
+    time.sleep(0.01)
+    _left(q, "claude_code", "s", "Write", write)
+    assert observe("claude_code", "PostToolUse", {"session_id": "s", "tool_name": "Write", "tool_input": write},
+                   q.directory)[0] == held.id
+
+
+def test_tool_use_ids_match_when_both_sides_carry_one(tmp_path):
+    # a request filed with the id Claude Code sent matches the PostToolUse of that id, whichever is newer; a
+    # request carrying another call's id is never taken; one carrying none stays eligible
+    from datetime import timedelta
+    q = _queue(tmp_path)
+    write = {"file_path": "/w/i.txt", "content": "hi"}
+
+    def filed(event_id):
+        r = q.file(agent="claude_code", agent_session_id="s", tool_name="Write", tool_input=write, cwd="/w",
+                   hold=timedelta(seconds=60), event_id=event_id)
+        assert q.withdraw(r.id)
+        time.sleep(0.01)
+        return r
+    first, second, bare = filed("toolu_1"), filed("toolu_2"), filed(None)
+    post = {"session_id": "s", "tool_name": "Write", "tool_input": write}
+    assert observe("claude_code", "PostToolUse", {**post, "tool_use_id": "toolu_1"}, q.directory)[0] == first.id
+    assert observe("claude_code", "PostToolUse", {**post, "tool_use_id": "toolu_9"}, q.directory)[0] == bare.id
+    assert observe("claude_code", "PostToolUse", {**post, "tool_use_id": "toolu_9"}, q.directory) is None
+    assert observe("claude_code", "PostToolUse", post, q.directory)[0] == second.id

@@ -63,7 +63,8 @@ def observe(agent: str, event: str, payload: Any, queue_dir: Path | None = None)
             if not isinstance(name, str) or not name:
                 return None
             return queue.record_ran(agent=agent, agent_session_id=session, tool_name=name,
-                                    tool_input=payload.get("tool_input"), event=event)
+                                    tool_input=payload.get("tool_input"), event=event,
+                                    tool_use_id=payload.get("tool_use_id"))
         return queue.close_unrun(agent=agent, agent_session_id=session, event=event)
     except Exception:  # noqa: BLE001 - a hook never fails the agent over a record
         return None

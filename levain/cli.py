@@ -2052,7 +2052,7 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
             line = f"{agent}: away mode off"
         line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
         line += f"; set by {why}"
-        if source == "word" and not got.legacy:
+        if source == "word" and not (got.legacy and not on):  # a legacy off's reason already names the command
             line += "; `levain consent away auto` hands it back to input idle"
         elif source == "idle" and not on:
             line += f"; on after {got.away_idle_seconds:g}s of no keyboard, mouse or trackpad input"
