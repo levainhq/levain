@@ -7,7 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Changed
-- The phone consent page (`levain consent phone`) now matches the cockpit's look (palette, type, card shapes, buttons; light and dark by the phone's setting); nothing it shows or signs changed.
+- The phone consent page (`levain consent phone`) now matches the cockpit's look (palette, type, card shapes, buttons; light and dark by the phone's setting); nothing it shows or signs changed. Known edges, phone page look: the waiting card's accent top line stays on a card already answered until you refresh (the page's script draws it, outside a look-only change); in light mode allow and deny differ mainly by hue, so the words "allow" and "deny" are always spelled out.
 
 ## [0.11.2] — 2026-10-16
 

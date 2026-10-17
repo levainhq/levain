@@ -2,19 +2,25 @@
 
 Driven in headless Chrome against the served phone port at a phone's width (390): the request text as filed is fully
 in the DOM, no CSS clips it (no ellipsis, no line clamp, no height cap, no scroll box), nothing scrolls sideways, and
-every tap target is at least 44px. The page is read in both colour schemes the cockpit-matched sheet defines."""
+every tap target is at least 44px. Request data (agent, tool, where, display) is shown as filed: no case transform, no
+clipping. The page is read in both colour schemes (the phone's setting, emulated) and the card must differ between them."""
 
 from __future__ import annotations
 
 import json
+import shutil
 import urllib.request
 from datetime import timedelta
 from pathlib import Path
+
+import pytest
 
 from levain.authority import anchor_path
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_phone_server import _TOK, _serving, world  # noqa: F401  (world is a fixture)
+
+pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")  # as test_phone_server
 
 LONG = "x" * 40 + "/very/long/path/with/no/spaces/" * 6 + "\nline two of the request " + "word " * 80
 
@@ -54,3 +60,44 @@ def test_request_text_is_whole_and_unclipped_at_390(world, tmp_path: Path) -> No
     assert got["whiteSpace"] == "pre-wrap"
     assert not got["sideways"], "the page scrolls sideways at 390"
     assert got["small"] == 0, "a tap target is under 44px"
+
+
+# request data: what is filed must be what is drawn, byte for byte (innerText applies text-transform, so it catches a
+# CSS uppercase that textContent would not)
+DATA_PROBE = """(() => {
+  const card = document.querySelector('article.req'); const wheres = [...card.querySelectorAll('.where')];
+  const pick = (n) => { const cs = getComputedStyle(n);
+    return { text: n.innerText, transform: cs.textTransform, textOverflow: cs.textOverflow, clamp: cs.webkitLineClamp,
+             clipped: n.scrollWidth > n.clientWidth + 1 || n.scrollHeight > n.clientHeight + 1,
+             overflow: cs.overflowX + '/' + cs.overflowY }; };
+  return { meta: pick(card.querySelector('.req-head .meta')), tool: pick(card.querySelector('.tool')),
+           display: pick(card.querySelector('.display')), where: wheres.map(pick),
+           card: getComputedStyle(card).backgroundColor, page: getComputedStyle(document.body).backgroundColor };
+})()"""
+
+
+@needs_browser
+def test_request_data_is_shown_as_filed_in_both_colour_schemes(world, tmp_path: Path) -> None:
+    rid = _file_long(world)
+    with _serving(world["qdir"]) as (url, _httpd):
+        req = urllib.request.Request(url + "/consent.json", headers={"X-Levain-Phone-Token": _TOK})
+        row = next(r for r in json.loads(urllib.request.urlopen(req, timeout=20).read())["pending"] if r["id"] == rid)
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"until": "document.querySelector('article.req .display') && 1"},
+            {"scheme": "light"}, {"eval": DATA_PROBE},
+            {"scheme": "dark"}, {"eval": DATA_PROBE},
+        ])
+    light, dark = out["values"][-2], out["values"][-1]
+    assert row["agent"] == "claude_code" and row["tool"] == "Write" and row["cwd"] == "/w"
+    for scheme, got in (("light", light), ("dark", dark)):
+        for name, want in (("meta", row["agent"]), ("tool", row["tool"]), ("display", row["display"])):
+            assert got[name]["transform"] == "none", (scheme, name, got[name])
+            assert got[name]["text"] == want, (scheme, name, "shown differently from the server's value", got[name]["text"], want)
+            assert not got[name]["clipped"] and got[name]["textOverflow"] == "clip" and got[name]["clamp"] in ("none", ""), (scheme, name, got[name])
+        assert got["where"], (scheme, "the request's where lines are missing")
+        assert [w["text"] for w in got["where"]][0] == "in " + row["cwd"], (scheme, got["where"])
+        for w in got["where"]:
+            assert w["transform"] == "none" and not w["clipped"], (scheme, w)
+    assert light["card"] != dark["card"], "the card drew the same in both colour schemes: the dark block is missing"
+    assert light["page"] != dark["page"]

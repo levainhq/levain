@@ -44,12 +44,20 @@
     --allow: oklch(0.78 0.14 155); --deny: oklch(0.70 0.17 25); --on-fill: oklch(0.14 0.03 265);
   }
 }
+/* Safari 16.0 and 16.1 have passkeys but not color-mix(): there every token above is invalid and cards and buttons
+   lose their fill and border. Plain hex of the same derivations (computed in oklch), light and dark. */
+@supports not (color: color-mix(in oklch, red, blue)) {
+  :root { --card: #edeff4; --card-2: #e2e5ea; --hair: #d3d6dc; --hair-2: #b6bac2; --label: #464c59; --meta: #575d6a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --card: #0c121f; --card-2: #131926; --hair: #1b212e; --hair-2: #2d3340; --label: #969ba4; --meta: #828791; }
+  }
+}
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--base); color: var(--text); }
 body { font: 400 15px/1.45 var(--sans); -webkit-font-smoothing: antialiased;
        padding: max(12px, env(safe-area-inset-top)) 16px max(32px, env(safe-area-inset-bottom)); max-width: 40rem;
        margin: 0 auto; overflow-x: hidden; }
-:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; border-radius: var(--r-sm); }
+:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 12px;
        padding-block: var(--sp-4); border-bottom: 1px solid var(--hair); }
 h1 { margin: 0; font: 700 16px/1 var(--round); letter-spacing: -.03em; display: flex; align-items: center; gap: var(--sp-3); }
@@ -67,7 +75,7 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .tier { font: 600 11px/1 var(--mono); letter-spacing: var(--track-caps); border: 1px solid var(--hair-2); color: var(--label);
         border-radius: var(--r-sm); padding: 3px 6px; }
 .tier.t3 { color: var(--warn); border-color: var(--warn); }
-.req-head .meta { font: 600 11px/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; }
+.req-head .meta { font: 600 11px/1 var(--round); letter-spacing: var(--track-caps); }   /* the agent name is request data: shown as filed, never case-transformed */
 .display { font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--sp-4) 0;
            padding: var(--sp-4); border-radius: var(--r-md); background: var(--base); border: 1px solid var(--hair);
            overflow: visible; }   /* no max-height, no scroll box: the whole request is always in view */

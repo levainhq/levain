@@ -4,6 +4,7 @@
 //   {"until": "<expression>", "ms": <n>}     polled until truthy; collected, or {"timeout": ...}
 //   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
+//   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -67,6 +68,9 @@ for (const s of steps) {
   if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     await sleep(600);
+  } else if (s.scheme !== undefined) {
+    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s.scheme }] });
+    await sleep(300);
   } else if (s.posts !== undefined) {
     while (posts.length < s.posts && Date.now() < deadline) await sleep(100);
   } else if (s.until !== undefined) {
