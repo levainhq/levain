@@ -15,8 +15,10 @@ directory resolves inside it; every target path the request names (:func:`grant_
 any tool's :data:`MCP_PATH_FIELDS`, Claude Code's Read, Grep, LS and NotebookRead included) is inside it with no
 existing symlink on the way, and a file tool whose target cannot be read, a path field of another shape and a Glob
 pattern that can reach outside its root match nothing; an MCP tool is one of the read tools levain knows
-(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`) and its input is one that tool's schema accepts; and the grant
-has not expired. Which tools are file tools,
+(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`) and its input is one that tool's schema accepts, or one a
+consent-mcp grant declares (:func:`levain.authority.consent_mcp_declaration`) and its input carries only declared
+fields, each value of its kind, every declared ``path`` value and ``paths`` item joining the targets checked (beside
+the named fields, never instead); and the grant has not expired. Which tools are file tools,
 and how their targets are read, is per agent (:data:`AGENT_FILE_TOOLS`, :func:`register_targets`): Claude Code's are
 built in; Codex's ``apply_patch`` has its targets read by the Codex adapter's extractor, registered when that adapter
 is imported, and with no extractor registered it matches nothing. A tool naming no path (WebFetch, an MCP tool
@@ -35,7 +37,8 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import consent_grant, consent_mcp_input_fits, consent_root_problem, consent_tool_problem
+from levain.authority import (consent_grant, consent_grant_tool_problem, consent_mcp_declaration, consent_mcp_input_fits,
+                              consent_root_problem)
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
 
@@ -282,6 +285,36 @@ def _resolved(target: Any, cwd: str) -> str | None:
         return None
 
 
+def _declared_targets(declared: Mapping[str, str], tool_input: Any) -> list[Any] | None:
+    """The target paths of an input to a tool a consent-mcp grant declares (field -> kind): every ``path`` value and
+    each item of every ``paths`` value. ``None`` (matches nothing) unless the input is an object whose every field is
+    declared and whose every value fits its kind: ``path`` and ``str`` a string, ``paths`` a non-empty list of
+    strings, ``strs`` a list of strings, ``int`` a JSON integer, ``bool`` a JSON boolean. A declared field the input
+    leaves out is not required."""
+    if not isinstance(tool_input, Mapping):
+        return None
+    out: list[Any] = []
+    for name, value in tool_input.items():
+        kind = declared.get(name) if isinstance(name, str) else None
+        if kind in ("path", "str"):
+            ok = isinstance(value, str)
+        elif kind in ("paths", "strs"):
+            ok = isinstance(value, list) and all(isinstance(v, str) for v in value) and (kind == "strs" or bool(value))
+        elif kind == "int":
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        elif kind == "bool":
+            ok = isinstance(value, bool)
+        else:
+            ok = False
+        if not ok:
+            return None
+        if kind == "path":
+            out.append(value)
+        elif kind == "paths":
+            out += value
+    return out
+
+
 def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, tool_input: Any, posture: Any,
                   now: datetime) -> str | None:
     """Why ``grant`` does not answer ``request`` at ``now`` for ``tool_input`` under ``posture``; ``None`` when
@@ -296,9 +329,15 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     tools = grant.get("tools")
     if not isinstance(tools, (list, tuple)) or request.tool_name not in tools:
         return "the grant does not name this tool"
-    if consent_tool_problem(request.agent, request.tool_name) is not None:   # one signed before the append rule
+    if consent_grant_tool_problem(grant, request.tool_name) is not None:   # one signed before the append rule
         return "a grant never answers this tool (a shell, an MCP tool that may write, or a tool levain does not know)"
-    if request.tool_name.startswith("mcp__") and not consent_mcp_input_fits(request.tool_name, tool_input):
+    declared = consent_mcp_declaration(grant, request.tool_name)
+    declared_paths: list[Any] | None = None
+    if declared is not None:
+        declared_paths = _declared_targets(declared, tool_input)
+        if declared_paths is None:
+            return "the input is not one the grant declares for this tool"
+    elif request.tool_name.startswith("mcp__") and not consent_mcp_input_fits(request.tool_name, tool_input):
         return "the input is not one the read tool levain knows takes"  # another server's read_file, say
     postures = grant.get("postures")
     if not isinstance(posture, str) or not isinstance(postures, (list, tuple)) or posture not in postures:
@@ -326,6 +365,8 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     if not _within(cwd, root):
         return "the working directory is outside the grant's workspace"
     paths = _request_targets(request.agent, request.tool_name, tool_input)
+    if declared_paths:      # the declared ones beside the named fields read for every tool, never instead
+        paths = (paths or []) + declared_paths
     if paths is not None:
         for target in paths:
             where = _resolved(target, request.cwd)

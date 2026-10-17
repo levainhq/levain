@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 import secrets
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import CONSENT_GRANT_KIND, consent_grant, consent_workspace_problem, inert_grant
+from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, consent_grant, consent_grant_tool_problem,
+                              consent_workspace_problem, inert_grant)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -36,11 +37,22 @@ class ConsentGrant:
     expires_at: str
     seq: int | None
     link_hash: str | None
+    kind: str = CONSENT_GRANT_KIND
+    # a consent-mcp grant's declarations: tool -> field -> kind (empty for a consent grant)
+    mcp_fields: dict[str, dict[str, str]] = field(default_factory=dict, hash=False)
 
     @classmethod
     def of(cls, grant: Mapping[str, Any], link: tuple[int, str] | None) -> ConsentGrant:
+        declared = grant.get("mcp_fields") if grant.get("kind") == CONSENT_MCP_GRANT_KIND else None
         return cls(grant["id"], grant["agent"], tuple(grant["tools"]), grant["workspace"], tuple(grant["postures"]),
-                   grant["expires_at"], None if link is None else link[0], None if link is None else link[1])
+                   grant["expires_at"], None if link is None else link[0], None if link is None else link[1],
+                   str(grant["kind"]), {str(t): {str(k): str(v) for k, v in f.items()}
+                                        for t, f in (declared or {}).items()})
+
+    def tool_problem(self, tool: str) -> str | None:
+        """Why this grant answers nothing for ``tool`` (:func:`levain.authority.consent_grant_tool_problem`)."""
+        return consent_grant_tool_problem({"kind": self.kind, "agent": self.agent, "mcp_fields": self.mcp_fields},
+                                          tool)
 
 
 def _workspace(path: Path | str) -> str:
@@ -59,12 +71,16 @@ def create_grant(data_root: Path | str, *, agent: str, tools: Iterable[str], wor
                  postures: Iterable[str], expires: timedelta | datetime, signer_fp: str, sign: Signer,
                  clock: Callable[[], datetime], grant_id: str | None = None,
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                 marker_directory: Path | None = None) -> tuple[ConsentGrant, str | None]:
+                 marker_directory: Path | None = None,
+                 mcp_fields: Mapping[str, Mapping[str, str]] | None = None) -> tuple[ConsentGrant, str | None]:
     """Sign a ``create_grant`` link for a consent grant (``expires``: a duration from now, or an aware time).
-    The log's own rules judge it before anything is signed: exact tool names, no shell tool, the agent's
-    posture names, a workspace that is not ``/`` or the home directory, a life of at most 30 days, a
-    laptop-presence signer. Returns ``(grant, warning)``; ``warning`` says the link committed but its anchor
-    did not advance."""
+    ``mcp_fields`` declares, for MCP tools among ``tools``, their input fields and each one's kind
+    (:data:`levain.authority.CONSENT_MCP_FIELD_KINDS`): with a declaration the grant is of the ``consent-mcp`` kind,
+    without one of the ``consent`` kind, exactly as before.
+    The log's own rules judge it before anything is signed: exact tool names, no shell tool, no MCP tool off the
+    filesystem server's read tools that the grant does not declare, the agent's posture names, a workspace that is
+    not ``/`` or the home directory, a life of at most 30 days, a laptop-presence signer. Returns
+    ``(grant, warning)``; ``warning`` says the link committed but its anchor did not advance."""
     now = _now(clock)
     if isinstance(expires, timedelta):
         if expires <= timedelta(0):
@@ -75,9 +91,16 @@ def create_grant(data_root: Path | str, *, agent: str, tools: Iterable[str], wor
     else:
         raise KeyError_("expires is a duration or an aware time")
     gid = grant_id if grant_id is not None else "cg-" + secrets.token_hex(6)
-    grant = {"id": gid, "kind": CONSENT_GRANT_KIND, "agent": agent, "tools": sorted(set(tools)),
+    tools = sorted(set(tools))
+    grant = {"id": gid, "kind": CONSENT_GRANT_KIND, "agent": agent, "tools": tools,
              "workspace": _workspace(workspace), "postures": sorted(set(postures)),
              "expires_at": utc_stamp(expires_at)}
+    if mcp_fields:
+        stray = sorted(t for t in mcp_fields if t not in tools)
+        if stray:
+            raise KeyError_(f"fields are declared for {stray[0][:200]!r}, which the grant does not name (--tool)")
+        grant["kind"] = CONSENT_MCP_GRANT_KIND
+        grant["mcp_fields"] = {t: dict(f) for t, f in mcp_fields.items()}
     db = _journal(data_root, marker_directory=marker_directory)
     _signing_authority(_capture(db, now, ssh_keygen))     # refused before anything is signed
     new = _append(db, {"op": "create_grant", "grant": grant}, signer_fp=signer_fp, sign=sign, clock=clock,

@@ -1922,15 +1922,22 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
             "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
             "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
             "directory alone. The log refuses a shell tool, a tool levain does not know for AGENT, an MCP tool "
-            "other than the filesystem server's read tools (read_text_file, list_directory...), a workspace of / "
-            "or your home directory, and a life over 30 days, before anything is signed."
+            "other than the filesystem server's read tools (read_text_file, list_directory...) whose fields the "
+            "grant does not declare, a workspace of / or your home directory, and a life over 30 days, before "
+            "anything is signed. MCP does not say which of a tool's fields are paths, so for any other MCP tool "
+            "you declare every field it may take (--path-field, --mcp-field; the grant is then of the consent-mcp "
+            "kind, which levain 0.11.4 and older cannot read): a request with any other field, or a value of "
+            "another kind, goes to you, and every path and paths field must resolve inside WORKSPACE. A field you "
+            "declare str is never read as a path: declare as path every field the server reads one from. A "
+            "declaration on a listed read tool replaces levain's own schema for it."
         ),
     )
     cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
                            help="An exact tool name, one levain knows for that agent (Claude Code: Edit, Write, "
                                 "MultiEdit, NotebookEdit, Read, Grep, Glob, LS, NotebookRead, WebFetch, SendMessage, "
-                                "an MCP read tool; Codex: apply_patch, an MCP read tool); repeatable. No globs; never a "
+                                "an MCP read tool; Codex: apply_patch, an MCP read tool; either: an MCP tool "
+                                "whose fields you declare); repeatable. No globs; never a "
                                 "shell tool (Bash, PowerShell, Codex's write_stdin).")
     cs_create.add_argument("--workspace", type=Path, required=True,
                            help="The project directory the grant covers (resolved through symlinks).")
@@ -1939,6 +1946,11 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
                                 "auto, dontAsk, bypassPermissions; Codex: default); repeatable.")
     cs_create.add_argument("--expires", required=True,
                            help="A duration (30m, 12h, 7d; at most 30d) or a UTC time (2026-10-20T12:00:00Z).")
+    cs_create.add_argument("--path-field", dest="path_fields", action="append", default=[], metavar="TOOL:FIELD",
+                           help="Declare FIELD of the MCP tool TOOL (one of --tool) a target path; repeatable.")
+    cs_create.add_argument("--mcp-field", dest="mcp_fields", action="append", default=[], metavar="TOOL:FIELD=KIND",
+                           help="Declare FIELD of the MCP tool TOOL (one of --tool) of KIND: path, paths (a list of "
+                                "paths), str, strs (a list of strings), int or bool; repeatable.")
     cs_create.add_argument("--id", dest="grant_id", default=None, help="The grant's id (default: cg-<random>).")
     cs_create.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                            help="An enrolled laptop-presence key that signs the grant (its private key file, or "
@@ -2267,21 +2279,58 @@ def _grant_expiry(text: str) -> object:
     return when
 
 
+def _grant_mcp_fields(path_fields: list[str], mcp_fields: list[str]) -> dict[str, dict[str, str]]:
+    """``--path-field TOOL:FIELD`` and ``--mcp-field TOOL:FIELD=KIND`` as tool -> field -> kind (split at the last
+    ``:``, then a field from its kind at the first ``=``); a field declared twice with two kinds is refused. The log
+    judges the names and kinds (``levain.authority._validate_mcp_fields``)."""
+    out: dict[str, dict[str, str]] = {}
+    for spec, kind in [(f, "path") for f in path_fields] + [(f, None) for f in mcp_fields]:
+        tool, sep, name = spec.rpartition(":")
+        if kind is None:
+            name, eq, kind = name.partition("=")
+            if not eq:
+                raise ValueError(f"--mcp-field {spec!r} is not TOOL:FIELD=KIND")
+        if not sep or not tool or not name:
+            raise ValueError(f"{spec!r} is not TOOL:FIELD")
+        if out.setdefault(tool, {}).setdefault(name, kind) != kind:
+            raise ValueError(f"{tool}:{name} is declared both {out[tool][name]} and {kind}")
+    return out
+
+
+def _grant_fields_text(declared: dict[str, dict[str, str]]) -> str:
+    return "; ".join(f"{t} " + ",".join(f"{f}={k}" for f, k in sorted(fields.items()))
+                     for t, fields in sorted(declared.items()))
+
+
 def _cmd_consent_grant_create(args: argparse.Namespace) -> int:
+    from levain.authority import consent_mcp_tool_problem
     from levain.cockpit.keys import ssh_signer
     from levain.consent.grants import create_grant
 
+    declared: dict[str, dict[str, str]] | None = None     # None until the declarations parse
     try:
         expires = _grant_expiry(args.expires)
+        declared = _grant_mcp_fields(args.path_fields, args.mcp_fields)
+        stray = sorted(set(declared) - set(args.tools))
+        if stray:
+            raise ValueError(f"fields are declared for {stray[0]!r}, which is not among --tool")
         signer_fp, sign = ssh_signer(args.signing_key)
         grant, warning = create_grant(_cockpit_root(args), agent=args.agent, tools=args.tools,
                                       workspace=args.workspace, postures=args.postures, expires=expires,
-                                      signer_fp=signer_fp, sign=sign, clock=_utc_now, grant_id=args.grant_id)
+                                      signer_fp=signer_fp, sign=sign, clock=_utc_now, grant_id=args.grant_id,
+                                      mcp_fields=declared or None)
     except (ValueError, *_cockpit_refusals()) as exc:
         print(f"grant refused: {exc}", file=sys.stderr)
+        undeclared = [] if declared is None else [t for t in args.tools if t not in declared
+                                                  and consent_mcp_tool_problem(t) is not None]
+        if undeclared:
+            print(f"  to grant {undeclared[0]}, declare every field it takes: --path-field {undeclared[0]}:FIELD "
+                  f"for a path, --mcp-field {undeclared[0]}:FIELD=KIND for any other", file=sys.stderr)
         return 1
     print(f"granted: {grant.id} at seq {grant.seq}: {grant.agent} {', '.join(grant.tools)} in {grant.workspace} "
           f"under {', '.join(grant.postures)}, until {grant.expires_at}")
+    if grant.mcp_fields:
+        print(f"  declared fields ({grant.kind}): {_grant_fields_text(grant.mcp_fields)}")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
@@ -2306,7 +2355,6 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
-    from levain.authority import consent_tool_problem
     from levain.consent.grants import grant_listing
 
     try:
@@ -2320,12 +2368,14 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     stamp = utc_stamp(now)
     for g in grants:
         state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
-        refused = [t for t in g.tools if consent_tool_problem(g.agent, t) is not None]
+        refused = [t for t in g.tools if g.tool_problem(t) is not None]
         if refused:
             state += f" (answers nothing for {','.join(map(str, refused))}: a tool a grant may not name)"
         print(f"{g.id}  {g.agent}  {','.join(map(str, g.tools))}  {g.workspace}  postures {','.join(map(str, g.postures))}  "
               f"{state}  "
               f"(seq {g.seq})")
+        if g.mcp_fields:
+            print(f"  declared fields ({g.kind}): {_grant_fields_text(g.mcp_fields)}")
     for gid, kind, expires_at, seq in inert:
         state = "expired" if expires_at <= stamp else f"until {expires_at}"
         print(f"{gid!r}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
