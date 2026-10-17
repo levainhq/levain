@@ -1921,16 +1921,17 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
             "of the named tools, under one of the named permission modes, whose working directory and every "
             "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
             "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
-            "directory alone. The log refuses a shell tool, an MCP tool other than the filesystem server's read "
-            "tools (read_text_file, list_directory...), a workspace of / or your home directory, and a life "
-            "over 30 days, before anything is signed."
+            "directory alone. The log refuses a shell tool, a tool levain does not know for AGENT, an MCP tool "
+            "other than the filesystem server's read tools (read_text_file, list_directory...), a workspace of / "
+            "or your home directory, and a life over 30 days, before anything is signed."
         ),
     )
     cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
-                           help="An exact tool name (Edit, Write, WebFetch, mcp__server__tool; Codex: "
-                                "apply_patch); repeatable. No globs; never a shell tool (Bash, PowerShell, "
-                                "Codex's write_stdin).")
+                           help="An exact tool name, one levain knows for that agent (Claude Code: Edit, Write, "
+                                "MultiEdit, NotebookEdit, Read, Grep, Glob, LS, NotebookRead, WebFetch, an MCP "
+                                "read tool; Codex: apply_patch, an MCP read tool); repeatable. No globs; never a "
+                                "shell tool (Bash, PowerShell, Codex's write_stdin).")
     cs_create.add_argument("--workspace", type=Path, required=True,
                            help="The project directory the grant covers (resolved through symlinks).")
     cs_create.add_argument("--posture", dest="postures", action="append", required=True, metavar="MODE",
@@ -2305,7 +2306,7 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
-    from levain.authority import consent_mcp_tool_problem
+    from levain.authority import consent_tool_problem
     from levain.consent.grants import list_grants
 
     try:
@@ -2319,8 +2320,9 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     stamp = utc_stamp(now)
     for g in grants:
         state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
-        if any(consent_mcp_tool_problem(t) is not None for t in g.tools):
-            state += " (answers nothing: an MCP tool that may write)"
+        refused = [t for t in g.tools if consent_tool_problem(g.agent, t) is not None]
+        if refused:
+            state += f" (answers nothing for {','.join(refused)}: a tool a grant may not name)"
         print(f"{g.id}  {g.agent}  {','.join(g.tools)}  {g.workspace}  postures {','.join(g.postures)}  {state}  "
               f"(seq {g.seq})")
     return 0

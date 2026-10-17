@@ -884,7 +884,7 @@ def test_a_grant_on_an_mcp_tool_that_may_write_answers_nothing(tmp_path, monkeyp
         _granted_mcp_hook(tmp_path / "a", "mcp__fs__write_file")
     (tmp_path / "b").mkdir()
     with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
-        m.setattr(auth, "_consent_mcp_check", lambda grants: None)
+        m.setattr(auth, "_consent_tool_check", lambda grants, after="": None)
         ws, run = _granted_mcp_hook(tmp_path / "b", "mcp__fs__write_file")
     assert run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))) == ""
     assert run(event("mcp__fs__write_file", {"filepath": str(Path.home() / ".zshrc"), "content": "x"},
@@ -899,6 +899,47 @@ def test_a_grant_on_a_known_read_tool_still_answers_inside_its_workspace(tmp_pat
     assert auth.consent_mcp_tool_problem("mcp__my_fs__list_directory") is None
     for name in ("mcp__fs__read_text_file_and_write", "fs__write_file", "MCP__fs__read_file", "mcp__a__b__read_file"):
         assert auth.consent_mcp_tool_problem(name) is not None, name  # an MCP tool spelled otherwise fails closed
+
+
+def test_a_grant_on_a_tool_levain_does_not_know_answers_nothing(tmp_path, monkeypatch, capsys):
+    """Reproduced 2026-10-17 on seat/1017-4-C 1b24c31 with the real CLI: ``consent grant create --agent claude_code
+    --tool Task`` was accepted, and a Task grant answered a Task request whose prompt was ``rm -rf ~`` (a subagent
+    runs any prompt, so no workspace bound holds). A grant may now name only a tool levain knows for its agent: the
+    log refuses the grant, one signed before the rule answers nothing, and ``grant list`` says so."""
+    from levain.cli import main as cli_main
+
+    (tmp_path / "a").mkdir()
+    with pytest.raises(auth.AuthorityError, match="'Task' is not a tool levain knows for claude_code"):
+        _granted_mcp_hook(tmp_path / "a", "Task")
+    (tmp_path / "b").mkdir()
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
+        m.setattr(auth, "_consent_tool_check", lambda grants, after="": None)
+        ws, run = _granted_mcp_hook(tmp_path / "b", "Task")
+    task = {"description": "x", "prompt": "rm -rf ~", "subagent_type": "general-purpose"}
+    assert run(event("Task", task, cwd=str(ws))) == ""
+    CockpitDB(tmp_path / "b" / "cockpit").set_install_class("reported")
+    capsys.readouterr()
+    assert cli_main(["consent", "grant", "list", "--data-root", str(tmp_path / "b" / "cockpit")]) == 0
+    assert "(answers nothing for Task: a tool a grant may not name)" in capsys.readouterr().out
+    (tmp_path / "c").mkdir()
+    ws, run = _granted_mcp_hook(tmp_path / "c", "Read")      # the control: a tool levain knows still answers
+    assert json.loads(run(event("Read", {"file_path": str(ws / "a.py")}, cwd=str(ws))))[
+        "hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+
+
+def test_consent_tool_problem_allows_only_the_tools_levain_knows_for_each_agent():
+    for agent, tools in auth.CONSENT_GRANTABLE_TOOLS.items():
+        for tool in tools:
+            assert auth.consent_tool_problem(agent, tool) is None, (agent, tool)
+        assert not {t.lower() for t in tools} & auth.CONSENT_SHELL_TOOLS
+        assert auth.consent_tool_problem(agent, "mcp__fs__read_text_file") is None
+        assert "not know to be read-only" in auth.consent_tool_problem(agent, "mcp__fs__write_file")
+        assert "shell tool" in auth.consent_tool_problem(agent, "Bash")
+    for agent, tool in (("claude_code", "Task"), ("claude_code", "Agent"), ("claude_code", "SendMessage"),
+                        ("claude_code", "WebSearch"), ("claude_code", "write"), ("claude_code", "apply_patch"),
+                        ("codex", "Edit"), ("codex", "SomeNewTool"), ("other", "Read"), (None, "Read"),
+                        ("claude_code", 7)):
+        assert auth.consent_tool_problem(agent, tool) is not None, (agent, tool)
 
 
 @pytest.mark.parametrize("inp", [{"filepath": "/etc/hosts"}, {"relative_path": "../../etc/hosts"},
