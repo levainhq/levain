@@ -654,6 +654,37 @@ def _readable_key_problem(key: Path, rec: dict[str, Any]) -> str | None:
     return None
 
 
+def _append_known_hosts(d: Path, block: str) -> None:
+    fd = os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(block)
+
+
+def _take_back_known_hosts(d: Path, block: str) -> None:
+    """Remove the last copy of ``block`` from the session's known_hosts. Only that block: confined ssh may
+    have appended its own lines to this file since, and those stay."""
+    if not block:
+        return
+    f = d / KNOWN_HOSTS_NAME
+    fd = os.open(f, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+        text = fh.read()
+        at = text.rfind(block)
+        if at < 0:
+            return
+        fh.seek(0)
+        fh.write(text[:at] + text[at + len(block):])
+        fh.truncate()
+
+
+def _take_back(d: Path, rec: dict[str, Any], prior: list[Any], block: str) -> None:
+    """Undo an add whose ssh-add did not succeed: the record's keys as they were (a key an earlier add
+    recorded keeps its entry) and the known_hosts lines this add wrote."""
+    rec["keys"] = prior
+    write_record(d, rec)
+    _take_back_known_hosts(d, block)
+
+
 def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, session: str | None = None,
             waive_destinations: bool = False, system: str | None = None) -> str:
     """``levain ssh-add``: add ``key`` to a running session's scoped agent, limited to ``hosts`` (checked
@@ -720,30 +751,44 @@ def _add_key(key: Path, hosts: list[str], *, lifetime: int, session: str | None,
         for dest in hosts:
             argv += ["-h", dest]
     argv.append(str(key))
-    done = subprocess.run(argv, env=_tool_env(sock), check=False)   # stdin and the terminal stay: a passphrase prompt
-    if done.returncode != 0:
-        raise AgentError(f"ssh-add exited with status {done.returncode}; nothing was recorded")
+    lines: list[str] = []
     if hosts:
         # The checked host keys of these hosts into the session's known_hosts, so confined ssh knows them.
-        lines = []
         for dest in hosts:
             for h in _hop_hosts(dest):
                 found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True, env=_tool_env(),
                                        text=True, stdin=subprocess.DEVNULL, timeout=30, check=False)
                 lines += [ln for ln in found.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
-        fd = os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write("".join(f"{ln}\n" for ln in lines))
-    # Read, change and write under a lock on the session directory: two `levain ssh-add` at once would
-    # otherwise drop one key's record (L1 #8).
+    block = "".join(f"{ln}\n" for ln in lines)
+    # The known_hosts lines and the record entry are written BEFORE ssh-add, and taken back if it fails:
+    # the other order left a key in the agent that the record did not show whenever a write failed after
+    # ssh-add succeeded. All of it runs under a lock on the session directory, so two `levain ssh-add` at
+    # once neither drop one key's record (L1 #8) nor take back each other's lines.
     dfd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         fcntl.flock(dfd, fcntl.LOCK_EX)
+        if block:
+            _append_known_hosts(d, block)
         rec = read_record(d) or rec
-        rec["keys"] = [k for k in rec["keys"] if not (isinstance(k, dict) and k.get("fingerprint") == fp)]
+        prior = list(rec["keys"])
+        rec["keys"] = [k for k in prior if not (isinstance(k, dict) and k.get("fingerprint") == fp)]
         rec["keys"].append({"fingerprint": fp, "hosts": list(hosts), "lifetime": lifetime,
                             "added_at": int(time.time()), "waived": bool(waive_destinations)})
-        write_record(d, rec)
+        try:
+            write_record(d, rec)
+        except BaseException:
+            _take_back_known_hosts(d, block)
+            raise
+        try:
+            # stdin and the terminal stay: a passphrase prompt
+            done = subprocess.run(argv, env=_tool_env(sock), check=False)
+            failed = done.returncode != 0
+        except BaseException:
+            _take_back(d, rec, prior, block)
+            raise
+        if failed:
+            _take_back(d, rec, prior, block)
+            raise AgentError(f"ssh-add exited with status {done.returncode}; nothing was recorded")
     finally:
         os.close(dfd)
     limit = (f"for {', '.join(hosts)}" if hosts else
