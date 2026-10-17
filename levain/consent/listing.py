@@ -175,7 +175,8 @@ def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude
     """The standing-rule proposals' evidence, computed in the database per key (``GROUP BY agent, tool_name, cwd``)
     over the allowed and denied requests of the last :data:`HISTORY`: no row cap is involved, so no number of newer
     rows of other keys can crowd out a key's allows or its denial. Only keys with at least ``min_hand`` hand-allows
-    come back, most first then most recent, at most :data:`EVIDENCE_KEYS` of them (a bound on keys, not on rows).
+    come back, most first then most recent, every one of them (:func:`levain.cockpit.proposals.propose` caps the cards); the
+    per-key latest-decision lookup runs only for keys past ``min_hand`` signed allows with no denial.
     Same read-only rules as :func:`read_listing`; a request's seal is not re-checked (the count is an aggregate)."""
     conn = _open_ro(directory)
     if conn is None:
