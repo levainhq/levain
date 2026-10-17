@@ -2,7 +2,8 @@
 
 Codex runs this hook when it is about to ask for approval, and shows NO dialog while the hook runs (measured, Q0
 item 6 and Q3): the TUI says "Running hook" and the approval dialog appears only after the hook returns. So a hold
-delays the dialog, and away mode stays opt-in with a default hold of 0 s. The hook:
+delays the dialog, and the hook holds only while the operator is away (their word, or input idle) and stops
+holding when they come back. The hook:
 
 1. reads the event (``tool_name``, ``tool_input``, ``session_id``, ``cwd``, ``permission_mode``) and files one
    request on the queue. A Codex ``PermissionRequest`` carries no per-event id (only ``turn_id``, which one turn
@@ -11,7 +12,9 @@ delays the dialog, and away mode stays opt-in with a default hold of 0 s. The ho
    the event's ``permission_mode``), except for a request that targets agent config or hooks
    (:func:`targets_agent_config`), which is never eligible. A standing consent grant can answer there; its targets
    are read by :func:`policy_targets`, registered with the policy when this module is imported;
-3. when away mode is on waits up to the hold for a signed answer the core verifies, and withdraws the request if
+3. when away mode is on (:func:`levain.consent.auto_away.away_state`: the operator's explicit word, else input
+   idle on macOS, else off) waits up to the hold for a signed answer the core verifies, re-reading away mode while
+   it waits so an operator who comes back gets Codex's dialog within about a second, and withdraws the request if
    none came;
 4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
    exception, prints nothing and exits 0: Codex's own approval dialog appears and the human answers it.
@@ -31,6 +34,8 @@ Codex fires project hooks only in an INTERACTIVE session whose process cwd is th
 Settings live in ``<levain home>/consent/codex.json`` (:data:`SETTINGS_NAME`), the Claude Code adapter's shape::
 
     {"cockpit_data_root": "/absolute/cockpit/data/root", "away_mode": false, "away_hold_seconds": 0}
+
+plus ``away_word`` and ``away_idle_seconds`` once ``levain consent away`` has written them.
 
 :func:`install` writes the hook into ONE workspace's ``.codex/``. Levain never writes Codex's trust: Codex shows
 "Hooks need review" at the next start and the user trusts the hook there; :func:`trust_status` reports what Codex
@@ -60,13 +65,14 @@ from levain.consent import policy as consent_policy
 # _absolute_root is re-exported: the confinement floor reads it as `adapter._absolute_root` for either adapter
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
-    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
-    read_settings_file,
+    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
+    hold_for_answer, hook_command, read_settings_file,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
+from levain.consent.auto_away import away_state
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
 
@@ -199,10 +205,12 @@ def hook_output(decision: Decision) -> dict[str, Any]:
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
            policy: consent_policy.Policy | None = None, home: Path | None = None, codex_dir: Path | None = None,
-           clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+           clock: Callable[[], float] = time.monotonic, idle: Callable[[], float | None] | None = None,
+           still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed); the caller (:func:`main`) turns that into no decision. ``max_hold`` is a
-    total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. ``policy`` is only ever reached
+    total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold and ``idle`` / ``still_away``
+    are the Claude Code adapter's (:func:`levain.consent.adapters.claude_code.decide`). ``policy`` is only ever reached
     through :func:`levain.consent.policy.guarded_policy`, never for a request filed at ``AGENT_CONFIG_TIER``."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
@@ -223,7 +231,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
                                         protected=protected)
-    hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0
+    hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER)
@@ -234,10 +242,14 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
             got = _verified(consent_policy.guarded_policy(request, queue, posture=posture, tool_input=tool_input,
                                                           policy=policy), request)
         wait = min(hold, max(0.0, deadline - clock()))
+        back = None
         if got is None and wait > 0:
-            got = _verified(queue.await_decision(request.id, wait, tool_input=tool_input, posture=posture), request)
+            got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
+                                        still_away=still_away)
         if got is None:
-            if not queue.withdraw(request.id, note="the hook stopped waiting; Codex's approval dialog stands"):
+            note = f"the operator is back ({back}); Codex's approval dialog stands" if back else \
+                "the hook stopped waiting; Codex's approval dialog stands"
+            if not queue.withdraw(request.id, note=note):
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
         settled = True
         return hook_output(got) if got is not None else None
@@ -270,7 +282,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
-        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold)
+        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
+                     still_away=lambda: away_state(load_settings(queue_dir)))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

@@ -1526,9 +1526,16 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
                                "answer can reach it", hint, warn=True))
     qdir = _consent_queue_dir()
     settings = mod.load_settings(qdir)
-    if not settings.away_mode:
+    if settings.explicit_off:
         out.append(CheckResult(f"{label} away mode", True,
-                               f"off: an unanswered request goes straight to {label}'s own dialog"))
+                               f"off by your word: an unanswered request goes straight to {label}'s own dialog "
+                               "(`levain consent away auto` hands it back to input idle)"))
+    elif not settings.away_mode:
+        out.append(CheckResult(f"{label} away mode", True,
+                               f"follows input idle: after {settings.away_idle_seconds:g}s of no keyboard, mouse "
+                               f"or trackpad input (macOS; no idle source elsewhere) a request is held for a "
+                               f"signed answer until you are back, otherwise it goes straight to {label}'s own "
+                               "dialog"))
     else:
         hold = int(min(settings.away_hold_seconds, max(0.0, DEFAULT_MAX_HOLD - CLEANUP_RESERVE)))
         if adapter == "claude-code":
