@@ -951,7 +951,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "hands", "grants", "ssh_agent", "_lock", "_refusal", "_on_refuse")
+    __slots__ = ("_policy", "bound", "hands", "grants", "ssh_agent", "_lock", "_refusal", "_on_refuse")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -965,6 +965,11 @@ class _SharedFloor:
         # chat's reach check use this snapshot, never a later read of the file (codex L3 b1b r1). With
         # gpg's extra socket in it, gnupg's default programs are write-denied for both hands from here on.
         self.grants: GrantSnapshot = snapshot_operator_grants(hands)
+        # The floor as the session's binding resolved it, before anything here strengthens it: what the
+        # session reads back to check these hands were built from its floor. The enforced policy can only
+        # be this one or stronger (the gpg program denies below, and every later merge, only add denies),
+        # so comparing the enforced one with the binding's would refuse a valid configuration.
+        self.bound = policy
         if any(g.gpg_extra for g in self.grants.grants):
             policy = with_gpg_program_denies(policy)
         self._policy = policy

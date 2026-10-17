@@ -768,3 +768,31 @@ def test_a_binding_written_with_the_legacy_runtime_sockets_field_resumes_without
     old["floor"]["something_else"] = []
     with pytest.raises(BindingError, match="exactly the crown-jewels policy fields"):
         ConversationBinding.from_params(old)
+
+
+def test_a_gpg_grant_with_a_helper_this_user_can_write_still_starts_a_session(grants, tmp_path, monkeypatch):
+    """B1 L3 r1 B-M4 (codex MED): with gpg's extra socket granted, the conversation floor write-denies a
+    default gnupg program this user can change (a ~/.local/bin pinentry), and the session's read-back
+    then compared that stronger floor with the binding's and refused a valid configuration."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from levain.session import EntitySession
+
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    pinentry = home / ".local" / "bin" / "pinentry"
+    pinentry.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
+    monkeypatch.setattr(conf, "grants_apply", lambda system=None: True)
+    monkeypatch.setattr(conf, "_gpg_components", lambda: [pinentry])
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h"})
+    grants([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg", "why": "signing"}])
+    ent = tmp_path / "e"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="interactive")
+    try:
+        editor = s.conversation.agent.tools_map["file_editor"].executor
+        assert pinentry.resolve() in editor._policy.deny_write_files   # the stronger floor is the one enforced
+    finally:
+        s.close()
