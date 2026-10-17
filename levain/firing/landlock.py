@@ -358,7 +358,9 @@ if __name__ == "__main__":
         refuse("the unix-socket confinement stub was started wrongly: %s" % e)
     try:
         hygiene(opts["carry-stdin"])
-    except OSError as e:
+    except Exception as e:
+        # Any exception, not OSError alone: is_socketpair re-raises whatever wrapping the fd raised, and an
+        # escaped one would print a traceback where the stub owes a refusal by name.
         refuse("could not make the command's stdin, stdout and stderr safe to hand it (%s)" % e)
     if os.uname().sysname == "Linux":
         problem = confine(opts)
