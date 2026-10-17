@@ -257,7 +257,7 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
     # the first two body fetches answer 200 with an unreadable body; a freed slot lets the third (details) through
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && n++ < 2"
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 2"
             " ? Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }) : real(u, o); return 1; })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -282,7 +282,7 @@ def test_a_details_retry_after_a_failed_read_reuses_its_slot(tmp_path, monkeypat
     q.withdraw(gone.id)
     _root, src, _ids = _install(tmp_path)
     # the first body fetch answers 500, so "details" shows an error and re-enables; the retry reads the body
-    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && n++ < 1"
+    stub = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => String(u).includes('/cockpit/consent/') && !String(u).includes('/proposals.json') && n++ < 1"
             " ? Promise.resolve({ ok: false, status: 500 }) : real(u, o); return 1; })()")
     row = "[...document.querySelectorAll('#levain-modal .consent-row')].find(x => x.querySelector('.consent-audit'))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
