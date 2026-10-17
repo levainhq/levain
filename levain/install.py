@@ -2418,7 +2418,7 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
     staged = install.joinpath(*PENDING_REL, ".claude", "settings.json")
     emit("  running `levain update` to apply it")
     try:
-        rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit)
+        rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
     except BaseException:
         _restore_messaging_record(install, previous)
         emit("FAIL: `levain update` errored; the previous messaging choice is restored.")
@@ -2432,9 +2432,7 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
         return rc
     _restore_messaging_record(install, previous)
     if rc == 0:
-        emit(f"FAIL: `levain update` did not apply {choice} (an update never loosens a control the workspace's "
-             f"settings already carry); the previous messaging choice is restored. To loosen, run "
-             f"`levain init --force --messaging {choice}`.")
+        emit(f"FAIL: `levain update` did not apply {choice}; the previous messaging choice is restored.")
         return 1
     emit("FAIL: `levain update` did not finish; the previous messaging choice is restored.")
     return rc
@@ -2757,7 +2755,7 @@ PENDING_REL = (".levain", "pending")
 
 def refresh_adapter(
     install: Path, *, apply: bool, emit: Callable[[str], None] = print,
-    carrier: bool = True,
+    carrier: bool = True, messaging: str | None = None,
 ) -> AdapterRefresh:
     """:func:`_refresh_adapter` plus the re-pin: when it applied, levain's own hook rewrite is
     re-pinned as the last act (one pin writer, ``host_guard.repin_after_levain_write``), unless the
@@ -2769,7 +2767,7 @@ def refresh_adapter(
         root = install.resolve()
         if effective_adapter(root) in ("claude-code", "codex"):
             pin_before = host_guard.agent_pin_status(root)
-    out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier)
+    out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier, messaging=messaging)
     if pin_before is not None:
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
     if apply:
@@ -2804,7 +2802,7 @@ def _codex_runs_this_consent_hook(root: Path) -> bool:
 
 def _refresh_adapter(
     install: Path, *, apply: bool, emit: Callable[[str], None] = print,
-    carrier: bool = True,
+    carrier: bool = True, messaging: str | None = None,
 ) -> AdapterRefresh:
     """Bring the install's activation tree and adapter files up to what THIS levain
     renders, after ``pip install -U levain`` (gap #19: until now only ``levain init
@@ -2878,12 +2876,12 @@ def _refresh_adapter(
             expected = _expected_activation(activation_roots, anneal_path)
             files = _adapter_local_files(adapter, install, adapter_root, python_path,
                                          import_entries(roster, load_mode),
-                                         on_demand_entries(roster, load_mode))
+                                         on_demand_entries(roster, load_mode), messaging=messaging)
             # The same files rendered with a sentinel interpreter: the leaves that differ
             # are the ones levain substitutes per machine (see _levain_render_variant).
             variants = {t.name: x for t, x in _adapter_local_files(
                 adapter, install, adapter_root, _VARIABLE, import_entries(roster, load_mode),
-                on_demand_entries(roster, load_mode)).items()}
+                on_demand_entries(roster, load_mode), messaging=messaging).items()}
             # `expected` is composed from the LIVE pack sources, so a path a pack changed since
             # it was recorded would be installed in the same run the pack reconcile lists it for
             # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,

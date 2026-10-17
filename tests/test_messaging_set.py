@@ -117,13 +117,18 @@ def test_a_held_settings_file_keeps_the_record_and_says_so(env, capsys):
     assert "crossSessionInbound" not in json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
 
 
-def test_loosening_is_not_applied_by_update_and_is_refused_with_the_record_restored(env, capsys):
-    ent = _init(env, capsys, "a", messaging="governed")
-    before = (ent / SETTINGS).read_bytes()
-    assert _set(ent, "unmanaged") == 1
-    assert "never loosens" in capsys.readouterr().out
-    assert _config(ent)["messaging"] == "governed"
-    assert (ent / SETTINGS).read_bytes() == before
+def test_set_loosens_to_a_fresh_init_and_a_plain_update_leaves_it(env, capsys):
+    ent = _init(env, capsys, "a")
+    fresh = _init(env, capsys, "b", messaging="unmanaged")
+    assert _set(ent, "governed") == 0
+    assert _set(ent, "unmanaged") == 0
+    assert "never loosens" not in capsys.readouterr().out
+    assert _config(ent)["messaging"] == "unmanaged"
+    got, want = (ent / SETTINGS).read_bytes(), (fresh / SETTINGS).read_bytes()
+    assert got.replace(str(ent).encode(), b"X") == want.replace(str(fresh).encode(), b"X")
+    # a plain update (no explicit choice) changes nothing
+    assert cli.main(["update", "--path", str(ent), "--no-pip"]) == 0
+    assert (ent / SETTINGS).read_bytes() == got
 
 
 def test_show_reads_recorded_default_and_file(env, capsys):
