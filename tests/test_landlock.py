@@ -416,11 +416,23 @@ def test_the_canary_answers_and_is_removed(tmp_path):
     try:
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(5)
-        for _ in range(40):   # more than the backlog: each is accepted and closed
-            s = socket.socket(socket.AF_UNIX)
-            s.settimeout(5)
-            s.connect(c.path)
-            s.close()
+        # More than the backlog: each is accepted and closed. A connect that outruns the accept thread
+        # fails at once with EAGAIN on Linux (it does not wait), so a full backlog is retried for a few
+        # seconds. Production connects once and treats a failure as the answer, so only the test retries.
+        for _ in range(40):
+            deadline = time.monotonic() + 5
+            while True:
+                s = socket.socket(socket.AF_UNIX)
+                s.settimeout(5)
+                try:
+                    s.connect(c.path)
+                    break
+                except (ConnectionRefusedError, BlockingIOError):
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.05)
+                finally:
+                    s.close()
         assert c.bind_ops() == ["--bind", c.path, c.path]
     finally:
         c.stop()
