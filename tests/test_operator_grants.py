@@ -657,8 +657,9 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
     monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))
     mac = conf.unix_socket_lines(None, system="Darwin")
     assert mac[0] == conf.MACOS_SOCKET_TIER_LINE
-    assert any(line.startswith("waiver (operator grant) gpg:") for line in mac)
-    assert any(line.startswith("waiver (operator grant) podman:") for line in mac)
+    assert any(line.startswith("refused on macOS (operator grant) gpg:") for line in mac)
+    assert not any(line.startswith("waiver (operator grant)") for line in mac)
+    assert any(line.startswith("refused on macOS (operator grant) podman:") for line in mac)
     assert "default grant: /private/var/run/mDNSResponder (name resolution)" in mac
     # macOS reads the same operator authority file and fails closed on malformed content.
     grants("{broken")

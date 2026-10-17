@@ -67,6 +67,11 @@ _SUN_PATH_MAX = 103   # macOS sun_path is 104 bytes with its NUL; Linux's 108 is
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _START_WAIT = 5.0
 _STOP_WAIT = 3.0
+# Fixed policy oracle: never derived from HOME, LEVAIN_HOME, cwd, or entity-controlled state.
+# The path must already exist: on Darwin sandbox_check reports a write to any nonexistent pathname
+# as denied even outside a sandbox.  This root-owned system directory is stable and not a useful
+# write target; every Levain macOS profile additionally denies the literal directory itself.
+MACOS_CONFINEMENT_SENTINEL = "/private/var/empty"
 
 
 class AgentError(RuntimeError):
@@ -407,7 +412,9 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str =
     _private_dir(root, exclusive=False)
     sid = secrets.token_hex(6)
     d = root / sid
-    sock = d / SOCKET_NAME
+    # `run_root()` is resolved and this preserves that canonical spelling for Seatbelt's
+    # path-literal socket capability (notably macOS /tmp -> /private/tmp).
+    sock = (d / SOCKET_NAME).resolve()
     if len(os.fsencode(str(sock))) > _SUN_PATH_MAX:
         raise AgentError(f"the agent's socket path {sock} is longer than a unix socket path may be "
                          f"({_SUN_PATH_MAX} bytes); set LEVAIN_HOME to a shorter directory")
@@ -586,15 +593,15 @@ def _no_new_privs() -> bool | None:
 def confinement_refusal(system: str | None = None) -> str | None:
     """Why this process must not add keys, from a test of its own context, never the environment: on
     Linux every levain confinement runs with ``no_new_privs`` (bwrap and the Landlock stub set it), so a
-    process that has it, or cannot tell, is refused. On macOS, ask Seatbelt whether this process may
-    write levain's hidden run root: levain's profile denies it, while the operator's shell may write it."""
+    process that has it, or cannot tell, is refused. On macOS, ask Seatbelt about a fixed sentinel every
+    Levain profile denies, independent of entity-controlled environment variables."""
     system = system or platform.system()
     if system == "Darwin":
         confined = _macos_confinement_state()
         if confined is None:
             return "this process cannot ask Seatbelt whether it is inside a levain confinement"
         if confined:
-            return ("this process is denied access to levain's protected run root, as every levain macOS "
+            return ("this process is denied access to levain's confinement sentinel, as every levain macOS "
                     "confinement is; run `levain ssh-add` from your own shell")
         return None
     if system != "Linux":
@@ -610,7 +617,7 @@ def confinement_refusal(system: str | None = None) -> str | None:
 
 
 def _macos_confinement_state() -> bool | None:
-    """Whether this process's Seatbelt policy denies a write to levain's protected run root.
+    """Whether this process's Seatbelt policy denies Levain's fixed sentinel path.
 
     ``sandbox_check`` only queries the policy already on this process; it does not apply a profile.
     ``SANDBOX_FILTER_PATH`` is 1 in Darwin's sandbox API.  None is fail-closed uncertainty.
@@ -627,11 +634,13 @@ def _macos_confinement_state() -> bool | None:
             ctypes.c_int(os.getpid()),
             ctypes.c_char_p(b"file-write-data"),
             ctypes.c_int(1),
-            ctypes.c_char_p(os.fsencode(run_root())),
+            ctypes.c_char_p(os.fsencode(MACOS_CONFINEMENT_SENTINEL)),
         )
     except (AttributeError, OSError, TypeError, ValueError):
         return None
-    return result != 0
+    if result < 0:
+        return None
+    return result > 0
 
 
 def _manifest_problem(f: Path) -> str | None:
