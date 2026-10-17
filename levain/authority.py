@@ -50,7 +50,7 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_mcp_tool_problem", "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -157,26 +157,55 @@ CONSENT_AGENTS = ("claude_code", "codex")
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1, measured in Q0 item 6 and Q3).
 # Compared case-insensitively.
 CONSENT_SHELL_TOOLS = frozenset({"bash"})
-# The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``, each with the input fields
-# its schema declares: the reference filesystem server's tools that declare ``readOnlyHint: true``
-# (github.com/modelcontextprotocol/servers, src/filesystem/server.ts, read 2026-10-17). MCP declares no path fields
-# and its annotations are untrusted (spec 2025-06-18, server/tools), so a grant's workspace bound reads only the
-# fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``): a grant on a tool that writes could answer a write
-# anywhere, and one on another server's ``read_file`` taking its path in another field a read anywhere. Until a grant
-# can declare its tool's path fields, an MCP tool off this list is refused at append and answers nothing at
-# decision, and a request on one on it whose input carries a field not listed here matches no grant: it goes to you.
-CONSENT_MCP_READ_ONLY_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
-    "read_file": frozenset({"path", "head", "tail"}),
-    "read_text_file": frozenset({"path", "head", "tail"}),
-    "read_media_file": frozenset({"path"}),
-    "read_multiple_files": frozenset({"paths"}),
-    "list_directory": frozenset({"path"}),
-    "list_directory_with_sizes": frozenset({"path", "sortBy"}),
-    "directory_tree": frozenset({"path", "excludePatterns"}),
-    "search_files": frozenset({"path", "pattern", "excludePatterns"}),
-    "get_file_info": frozenset({"path"}),
-    "list_allowed_directories": frozenset(),
+# The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``, each with the input its
+# schema declares (field -> kind, and the fields it requires): the reference filesystem server's tools that declare
+# ``readOnlyHint: true`` (github.com/modelcontextprotocol/servers, src/filesystem/server.ts, read 2026-10-17). MCP
+# declares no path fields and its annotations are untrusted (spec 2025-06-18, server/tools), so a grant's workspace
+# bound reads only the fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``): a grant on a tool that writes
+# could answer a write anywhere, and one on another server's ``read_file`` taking its path in another field a read
+# anywhere. Until a grant can declare its tool's path fields, an MCP tool off this list is refused at append and
+# answers nothing at decision, and a request on a listed tool whose input is not one that tool's schema accepts
+# matches no grant: it goes to you. Kinds: "str", "int" (a JSON integer), "strs" (a list of strings), and a
+# frozenset of the allowed string values.
+_PATH, _COUNT, _STRS = "str", "int", "strs"
+CONSENT_MCP_READ_ONLY_TOOLS: Mapping[str, tuple[Mapping[str, Any], frozenset[str]]] = MappingProxyType({
+    "read_file": ({"path": _PATH, "head": _COUNT, "tail": _COUNT}, frozenset({"path"})),
+    "read_text_file": ({"path": _PATH, "head": _COUNT, "tail": _COUNT}, frozenset({"path"})),
+    "read_media_file": ({"path": _PATH}, frozenset({"path"})),
+    "read_multiple_files": ({"paths": _STRS}, frozenset({"paths"})),
+    "list_directory": ({"path": _PATH}, frozenset({"path"})),
+    "list_directory_with_sizes": ({"path": _PATH, "sortBy": frozenset({"name", "size"})}, frozenset({"path"})),
+    "directory_tree": ({"path": _PATH, "excludePatterns": _STRS}, frozenset({"path"})),
+    "search_files": ({"path": _PATH, "pattern": _PATH, "excludePatterns": _STRS}, frozenset({"path", "pattern"})),
+    "get_file_info": ({"path": _PATH}, frozenset({"path"})),
+    "list_allowed_directories": ({}, frozenset()),
 })
+
+
+def consent_mcp_input_fits(tool: str, tool_input: Any) -> bool:
+    """Whether ``tool_input`` is an input the schema of ``tool``'s entry in :data:`CONSENT_MCP_READ_ONLY_TOOLS`
+    accepts: an object with every required field, no other field, and each value of its field's kind. ``False``
+    for a tool not on the list."""
+    entry = CONSENT_MCP_READ_ONLY_TOOLS.get(tool[len("mcp__"):].partition("__")[2]) \
+        if isinstance(tool, str) and tool.startswith("mcp__") else None
+    if entry is None or not isinstance(tool_input, Mapping):
+        return False
+    fields, required = entry
+    if not required <= set(tool_input) or not set(tool_input) <= set(fields):
+        return False
+    for name, value in tool_input.items():
+        kind = fields[name]
+        if kind == _PATH:
+            ok = isinstance(value, str)
+        elif kind == _COUNT:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        elif kind == _STRS:
+            ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+        else:
+            ok = isinstance(value, str) and value in kind
+        if not ok:
+            return False
+    return True
 # The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
 # permission modes (Q0 measured ``default``); Codex: the value its event carries (Q0 item 6, Q3: ``default``).
 CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({

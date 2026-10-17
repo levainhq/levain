@@ -14,8 +14,8 @@ directory resolves inside it; every target path the request names (:func:`grant_
 any tool's :data:`MCP_PATH_FIELDS`, Claude Code's Read, Grep, LS and NotebookRead included) is inside it with no
 existing symlink on the way, and a file tool whose target cannot be read, a path field of another shape and a Glob
 pattern that can reach outside its root match nothing; an MCP tool is one of the read tools levain knows
-(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`) and its input carries only the fields that tool takes; and the
-grant has not expired. Which tools are file tools,
+(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`) and its input is one that tool's schema accepts; and the grant
+has not expired. Which tools are file tools,
 and how their targets are read, is per agent (:data:`AGENT_FILE_TOOLS`, :func:`register_targets`): Claude Code's are
 built in; Codex's ``apply_patch`` has its targets read by the Codex adapter's extractor, registered when that adapter
 is imported, and with no extractor registered it matches nothing. A tool naming no path (WebFetch, an MCP tool
@@ -34,7 +34,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_READ_ONLY_TOOLS, CONSENT_SHELL_TOOLS,
+from levain.authority import (CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_mcp_input_fits,
                               consent_mcp_tool_problem, consent_root_problem)
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
@@ -299,10 +299,8 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
         return "the grant does not name this tool"
     if consent_mcp_tool_problem(request.tool_name) is not None:
         return "an MCP tool that may write is never answered by a grant"   # one signed before the append rule
-    if request.tool_name.startswith("mcp__"):
-        known = CONSENT_MCP_READ_ONLY_TOOLS[request.tool_name[len("mcp__"):].partition("__")[2]]
-        if not isinstance(tool_input, Mapping) or not set(tool_input) <= known:
-            return "the input has a field the read tool levain knows does not take"  # another server's read_file
+    if request.tool_name.startswith("mcp__") and not consent_mcp_input_fits(request.tool_name, tool_input):
+        return "the input is not one the read tool levain knows takes"  # another server's read_file, say
     postures = grant.get("postures")
     if not isinstance(posture, str) or not isinstance(postures, (list, tuple)) or posture not in postures:
         return "the grant does not cover this posture"

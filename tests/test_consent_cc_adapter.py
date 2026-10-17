@@ -882,10 +882,10 @@ def test_a_grant_on_an_mcp_tool_that_may_write_answers_nothing(tmp_path, monkeyp
     (tmp_path / "a").mkdir()
     with pytest.raises(auth.AuthorityError, match="not know to be read-only"):
         _granted_mcp_hook(tmp_path / "a", "mcp__fs__write_file")
-    monkeypatch.setattr(auth, "_consent_mcp_check", lambda grants: None)
     (tmp_path / "b").mkdir()
-    ws, run = _granted_mcp_hook(tmp_path / "b", "mcp__fs__write_file")
-    monkeypatch.undo()
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
+        m.setattr(auth, "_consent_mcp_check", lambda grants: None)
+        ws, run = _granted_mcp_hook(tmp_path / "b", "mcp__fs__write_file")
     assert run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))) == ""
     assert run(event("mcp__fs__write_file", {"filepath": str(Path.home() / ".zshrc"), "content": "x"},
                      cwd=str(ws))) == ""
@@ -902,7 +902,9 @@ def test_a_grant_on_a_known_read_tool_still_answers_inside_its_workspace(tmp_pat
 
 
 @pytest.mark.parametrize("inp", [{"filepath": "/etc/hosts"}, {"relative_path": "../../etc/hosts"},
-                                 {"path": "src/a.py", "root": "/"}, ["src/a.py"]])
+                                 {"path": "src/a.py", "root": "/"}, ["src/a.py"],
+                                 {"head": "/etc/hosts"}, {"path": "src/a.py", "head": "/etc/hosts"},  # L3 r1 codex
+                                 {"path": "src/a.py", "head": True}])
 def test_another_servers_read_tool_with_a_field_the_reference_tool_does_not_take_matches_no_grant(tmp_path, inp):
     """L1 + L2 on 1ae0546: the read list is by tool name, so another server's ``read_file`` taking its path in
     ``filepath`` (or Serena's ``relative_path``) was matched on the working directory alone and read anywhere. A
@@ -911,6 +913,15 @@ def test_another_servers_read_tool_with_a_field_the_reference_tool_does_not_take
     assert run(event("mcp__fs__read_file", inp, cwd=str(ws))) == ""
     out = json.loads(run(event("mcp__fs__read_file", {"path": "src/a.py", "head": 5}, cwd=str(ws))))
     assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+
+
+def test_the_directory_holding_the_authority_database_is_tagged(tmp_path):
+    """L3 r1 codex MED: a protected FILE (cockpit.db) is a root, so its directory with the name in another field
+    was not tagged."""
+    root = tmp_path / "trust"
+    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)))
+    for inp in ({"directory": str(root), "filename": "cockpit.db"}, {"path": str(root / "cockpit.db")}):
+        assert cc.targets_agent_config("mcp__fs__w", inp, str(tmp_path), home=tmp_path / "h", protected=protected)
 
 
 @pytest.mark.parametrize("config_file", [

@@ -171,14 +171,16 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
     :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
-    derived from those checks, never spelled twice), or its file name is ``.claude.json`` wherever it sits (a
+    derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
+    authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
     server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
     ``user_configs`` are the caller's, computed once. Over-matching only sends the request to the human."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
+    parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
-        if p.name.lower() == USER_CONFIG_NAME:
+        if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
             if _tags_path(p / probe, roots, sites, user_configs):
