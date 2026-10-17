@@ -881,3 +881,33 @@ def test_an_mcp_input_past_the_bound_is_tagged():
         deep = [deep]
     assert cc.targets_agent_config("mcp__fs__w", {"v": deep}, "/work/proj", home=HOME)
     assert not cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 4000}, "/work/proj", home=HOME)
+
+
+@pytest.mark.parametrize("inp", [
+    {"filepath": "./" * 2100 + ".claude/settings.json", "content": "x"},  # a server's resolve() collapses the run
+    {"directory": "~/.claude", "filename": "settings.json"},  # the directory and the name in two fields
+    {"dir": "~", "name": ".claude.json"}, {"dir": "/work/proj", "name": ".claude-plugin"},
+    {"name": ".claude.json"},  # a server rooted at ~ joins it there
+    {"uri": "file:///home/u/.claude/hooks/h.sh"}, {"uri": "file:///home/u/.claude.json"},
+    {"filepath": "%2Eclaude/settings.json"}, {"dir": "/work/proj/.codex", "name": "config.toml"},
+    {"filepath": " .claude/settings.json\n"}, {"f": "/work/proj/" + "/" * 5000 + ".claude/settings.json"},
+])
+def test_an_mcp_path_built_or_spelled_another_way_is_tagged(inp):
+    """L2 probes on 450913a, each untagged there: what a server opens is not always one string as written."""
+    assert cc.targets_agent_config("mcp__x__write_file", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_ordinary_mcp_inputs_stay_untagged():
+    for inp in ({"dir": "/work/proj/src", "name": "a.py", "content": "~ home"}, {"url": "https://example.com/a"},
+                {"query": "claude settings", "limit": 5}, {"content": "./" * 3000}):
+        assert not cc.targets_agent_config("mcp__x__w", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_the_scan_has_a_bound_and_tags_past_it():
+    """L1 on 450913a: 4000 strings of ~4 KiB cost 33-49 s of lstat. Past the total the request goes to the human."""
+    t0 = time.monotonic()
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["a/" * 2040] * 4000}, "/work/proj", home=Path("/home/u"))
+    assert time.monotonic() - t0 < 5
+    # 4095 values + the key "v" = 4096 strings, the most read; one more is past the bound
+    assert not cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4095}, "/work/proj", home=Path("/home/u"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4096}, "/work/proj", home=Path("/home/u"))

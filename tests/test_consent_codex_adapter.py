@@ -150,3 +150,11 @@ def test_a_codex_mcp_write_naming_agent_config_in_any_field_is_tagged(tmp_path):
         assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir), inp
     assert not cx.targets_agent_config("mcp__fs__write", {"filepath": "src/a.py"}, str(tmp_path), home=home,
                                        codex_dir=codex_dir)
+
+
+def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
+    home = tmp_path / "home"
+    for inp in ({"dir": "~/.claude", "name": "settings.json"}, {"dir": str(tmp_path / ".codex"), "name": "hooks.json"},
+                {"name": ".claude.json"}):
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home,
+                                       codex_dir=tmp_path / "ch"), inp

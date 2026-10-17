@@ -170,15 +170,15 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         if targets is None:
             return True
     elif tool_name.startswith("mcp__") and isinstance(tool_input, Mapping):
-        targets = []
-        for field in MCP_PATH_FIELDS:
-            if field in tool_input:
-                value = tool_input[field]
-                targets += value if isinstance(value, list) else [value]
-        extra = consent_policy.mcp_config_candidates(tool_input)
-        if extra is None:
+        # the Claude Code check reads the whole MCP input once (named fields, every-string candidates, config
+        # directories); what is left per path is CODEX_HOME and any .codex/
+        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):
             return True
-        targets += extra
+        targets = consent_policy.mcp_config_candidates(tool_input) or []
+        try:
+            return any(_in_codex_config(t, cwd, home, codex_dir) for t in targets)
+        except (OSError, ValueError):
+            return True
     else:
         return False
     for target in targets:

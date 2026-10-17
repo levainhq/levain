@@ -143,6 +143,29 @@ CONFIG_FILE_NAMES = frozenset({".mcp.json"})
 USER_CONFIG_NAME = ".claude.json"
 
 
+# A directory whose files are agent config: an MCP server given it in one field and a file name in another writes
+# config with neither string naming it whole (:func:`names_config_dir`).
+CONFIG_DIR_NAMES = frozenset({".claude", ".codex", ".claude-plugin"})
+
+
+def names_config_dir(target: str, cwd: str, home: Path) -> bool:
+    """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
+    when ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) IS a directory agent config lives
+    in (a ``.claude``, ``.codex`` or ``.claude-plugin`` directory, or the home directory, where ``.claude.json``
+    is), or its file name is ``.claude.json`` wherever it sits (a server that joins a relative name to a root of
+    its own, home among them). Over-matching only sends the request to the human."""
+    raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
+    if not raw.is_absolute():
+        raw = Path(cwd) / raw
+    homes = {os.path.normpath(home).lower(), os.path.realpath(home).lower()}
+    for p in (os.path.normpath(raw), os.path.realpath(raw)):
+        low = p.lower()
+        name = os.path.basename(low)
+        if name in CONFIG_DIR_NAMES or name == USER_CONFIG_NAME or low in homes:
+            return True
+    return False
+
+
 def _is_config_path(path: Path) -> bool:
     parts = [p.lower() for p in path.parts]
     if parts and parts[-1] in CONFIG_FILE_NAMES:
@@ -252,16 +275,19 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
     other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
-    field of any name), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
+    field of any name), each also tagged when it names a config directory or ``.claude.json``
+    (:func:`names_config_dir`), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
     missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
     targets = _targets(tool_name, tool_input)
     if targets is None:
         return False
+    extra: list[str] = []
     if tool_name.startswith("mcp__"):
-        extra = mcp_config_candidates(tool_input)
-        if extra is None:
+        got = mcp_config_candidates(tool_input)
+        if got is None:
             return True
+        extra = got
         targets = [*targets, *extra]
     home = home if home is not None else Path.home()
     try:
@@ -289,7 +315,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             return True
         if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
             return True
-    return False
+    try:
+        return any(names_config_dir(target, cwd, Path(home)) for target in extra)
+    except (OSError, ValueError):
+        return True
 
 
 # --- the decision ------------------------------------------------------------------------------------------
