@@ -226,6 +226,7 @@
           // the transcript button's key: the row id is "session:<stem>" (the stem is a hash, not the session id)
           if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
         }
+        if (typeof r.id === "string" && r.id) line.key = r.id;
         if (grouped) line.grp = grp;
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
@@ -1606,10 +1607,14 @@
     for (const s of live) {
       s.data = data;
       s.fault = "";
+      // a body repainted in place keeps the rows the reader expanded and its scroll position
+      const keptHost = s.body.closest ? s.body.closest(".pbody, .modal-body") : null;
+      const kept = core.captureKept ? core.captureKept(keptHost || s.body) : null;
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
       paint(s);
+      if (kept) { core.restoreKeptRows(s.body, kept); core.restoreKeptScroll(keptHost || s.body, kept); }
       const sr = data.search || {};
       if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
       // the host's finalisation, on the node already there: the clause toggles and the overflow cue follow the new rows
