@@ -1126,14 +1126,18 @@ def snapshot_operator_grants(hands: "HandsIdentity | None" = None, *,
 
 def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None,
                       ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
-                      ssh_agent_note: str | None = None) -> list[str]:
+                      ssh_agent_note: str | None = None,
+                      grants: GrantSnapshot | None = None) -> list[str]:
     """The unix-socket lines ``levain run`` and ``levain doctor`` print, from one place (one table): the
     tier claim (:func:`levain.firing.landlock.tier_line` of levain's own read), every operator grant as a
     named waiver (none read for a hands user's entity, nor where grants are not applied: one line says
     so), every default grant, the ssh agent (:func:`levain.firing.ssh_agent.status_lines`: ``run`` passes
     its session's ``ssh_agent`` or the ``ssh_agent_note`` saying why it has none; ``doctor`` passes
     neither and gets every running session's), and the entity's legacy ``runtime_sockets`` key as
-    ignored. A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
+    ignored. A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does.
+    ``grants``: a conversation's :class:`GrantSnapshot`, which ``run`` passes so its banner lists the
+    grants that conversation's shell gets, not the file as it reads now; ``doctor`` has no conversation
+    and reads the file."""
     system = system or platform.system()
     abi, reason = _landlock.host_read(system)
     if system != "Linux" and reason is None:
@@ -1146,7 +1150,7 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
         # this host is not validated against this host's gpg; codex L3 b1b r2).
         lines.append(GRANTS_NOT_APPLIED_LINE)
     else:
-        for g in load_operator_grants():
+        for g in (grants.get() if grants is not None else load_operator_grants()):
             extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
             lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
     for d in DEFAULT_GRANT_LINES.get(system, ()):
