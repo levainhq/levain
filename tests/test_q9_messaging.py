@@ -276,7 +276,7 @@ def test_doctor_warns_naming_each_ungoverned_direction(env):
     assert r.ok and r.warn
     assert "inbound NOT governed: accept" in r.detail and "outbound NOT governed" in r.detail
     assert "--settings" in r.detail  # names what it cannot see
-    assert "a new `levain init --messaging governed` writes both" in r.hint and "--force" not in r.hint
+    assert "`levain messaging set governed` writes both" in r.hint and "--force" not in r.hint
 
 
 def test_doctor_messaging_line_is_claude_code_only(env):

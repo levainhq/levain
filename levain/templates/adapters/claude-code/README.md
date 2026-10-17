@@ -117,7 +117,9 @@ Claude Code lets a session message your other sessions. The renderer writes the
 messaging keys into `.claude/settings.json` (`settings.template.json` carries none
 of them); `levain init --messaging isolate|governed|off|unmanaged` picks the
 posture, and the choice is kept in `.levain/config.json` so `levain update` and
-`init --force` keep it. `isolate` is the default:
+`init --force` keep it. To change it later, `levain messaging set MODE` runs the
+update for you and records the choice only once the settings carry it; `levain messaging`
+shows it. `isolate` is the default:
 
 - **`isolate` (default)** writes only `"isolatePeerMachines": true`: Claude Code
   asks for your approval before a message leaves for a session beyond this

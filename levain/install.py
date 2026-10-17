@@ -2164,7 +2164,7 @@ def _check_messaging(install: Path, chosen: str, messaging: str | None) -> None:
     if config_path.is_file():
         try:
             doc = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             raise InitError(".levain/config.json is unreadable, so the messaging choice cannot be "
                             f"recorded ({e}); fix it, then re-run.") from e
         if not isinstance(doc, dict):
@@ -2183,7 +2183,7 @@ def recorded_messaging(install: Path) -> str | None:
         return None
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return "governed"
     if not isinstance(config, dict):
         return "governed"
@@ -2236,7 +2236,7 @@ def _write_consent_hook_choice(install: Path, choice: str, emit: Callable[[str],
     if os.path.lexists(config_path):
         try:
             existing = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             raise InitError(".levain/config.json is unreadable, so the consent hook choice cannot be "
                             f"recorded ({e}); fix it, then re-run.") from e
         if not isinstance(existing, dict):
@@ -2288,7 +2288,8 @@ def _apply_messaging(settings_text: str, choice: str, keep_from: Path | None = N
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:
+def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], None],
+                            changed: dict | None = None) -> None:
     """Record ``choice`` in ``.levain/config.json``, merged beside the adapter marker and brand keys (the file
     for install choices that are not interview answers, so `levain update` reads it and `--force` keeps it).
     Raises InitError when it cannot be recorded: an opt-out that does not persist would be undone by the
@@ -2300,68 +2301,76 @@ def _write_messaging_choice(install: Path, choice: str, emit: Callable[[str], No
     if config_path.is_file():
         try:
             existing = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             raise InitError(".levain/config.json is unreadable, so the messaging choice cannot be "
                             f"recorded ({e}); fix it, then re-run.") from e
         if not isinstance(existing, dict):
             raise InitError(".levain/config.json is not a JSON object, so the messaging choice cannot be "
                             "recorded; fix it, then re-run.")
-    if existing.get("messaging") == choice:
+    if existing.get("messaging") == choice and changed is None:
         return
+    new = {**existing, "messaging": choice}
+    if changed is not None:
+        new["messaging_changed"] = changed  # the audit stamp of `messaging set`, written with the record
     try:
-        _atomic_write_text(config_path, json.dumps({**existing, "messaging": choice}, indent=2,
-                                                   ensure_ascii=False) + "\n")
+        _atomic_write_text(config_path, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         raise InitError(f"could not record the messaging choice in .levain/config.json ({e}).") from e
     emit(f"  messaging:  {choice} → .levain/config.json")
 
 
-def _restore_messaging_record(install: Path, previous: str | None) -> None:
-    """Put ``messaging`` in ``.levain/config.json`` back to ``previous`` (``None``: remove the key), leaving every
-    other key as it is now. Used only by a verb that recorded a choice and must undo it."""
+_MESSAGING_STRICTNESS = ("off", "governed", "isolate", "unmanaged")  # strictest first
+
+
+def messaging_change(install: Path) -> dict | None:
+    """The ``messaging_changed`` stamp `messaging set` leaves in ``.levain/config.json``
+    (``{"from", "to", "at"}``), or ``None`` when there is none or it is not that shape."""
     from levain.dashboard import LEVAIN_CONFIG_REL
 
-    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
     try:
-        doc = json.loads(config_path.read_text(encoding="utf-8"))
-        if not isinstance(doc, dict):
-            return
-        if previous is None:
-            doc.pop("messaging", None)
-        else:
-            doc["messaging"] = previous
-        _atomic_write_text(config_path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
-    except (OSError, ValueError):
-        pass
+        doc = json.loads(install.joinpath(*LEVAIN_CONFIG_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    got = doc.get("messaging_changed") if isinstance(doc, dict) else None
+    if (isinstance(got, dict) and got.get("from") in MESSAGING_CHOICES and got.get("to") in MESSAGING_CHOICES
+            and isinstance(got.get("at"), str)):
+        return got
+    return None
 
 
-def _workspace_carries(install: Path, choice: str) -> bool | None:
-    """Whether the workspace's ``.claude/settings.json`` carries the controls ``choice`` maps to (the keys
-    ``_MESSAGING_KNOBS`` names, read through ``host_guard.messaging_facts``). ``None``: the file cannot be read."""
+def _workspace_facts(install: Path) -> dict | None:
+    """The messaging facts of the workspace's ``.claude/settings.json`` only (``host_guard.messaging_facts``;
+    ``{}`` when the file is absent or sets none). ``None``: the file cannot be read."""
     from levain.host_guard import messaging_facts
 
     path = install / ".claude" / "settings.json"
     if not os.path.lexists(path):
-        facts: dict = {}
-    else:
-        try:
-            facts = messaging_facts(json.loads(path.read_text(encoding="utf-8"))) or {}
-        except (OSError, ValueError, RecursionError):
-            return None
-    ask, deny = facts.get("ask", ()), facts.get("deny", ())
-    inbound = facts.get("crossSessionInbound")
-    if choice == "isolate":
-        return facts.get("isolatePeerMachines") is True
-    if choice == "governed":
-        return inbound == "hold" and "SendMessage" in ask
-    if choice == "off":
-        return inbound == "refuse" and "SendMessage" in deny and "ListAgents" in deny
-    return not facts
+        return {}
+    try:
+        return messaging_facts(json.loads(path.read_text(encoding="utf-8"))) or {}
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def _workspace_carries(install: Path, choice: str) -> bool | None:
+    """Whether the workspace's ``.claude/settings.json`` carries EXACTLY the controls ``choice`` maps to (the facts
+    the renderer writes for it, compared whole: the keys ``_MESSAGING_KNOBS`` names). ``None``: unreadable."""
+    from levain.consent.adapters.claude_code import merge_messaging
+    from levain.host_guard import messaging_facts
+
+    facts = _workspace_facts(install)
+    if facts is None:
+        return None
+    inbound, outbound = _MESSAGING_KNOBS[choice]
+    expected: dict = {}
+    merge_messaging(expected, inbound=inbound, outbound=outbound)
+    return facts == (messaging_facts(expected) or {})
 
 
 def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
-    """`levain messaging` / `messaging show`: the effective choice, whether it is recorded or the default, and
-    whether the workspace's settings carry its controls. Read-only."""
+    """`levain messaging` / `messaging show`: the effective choice, whether it is recorded, inferred or the default,
+    and whether the workspace's settings carry its controls. Read-only; reads only the workspace
+    .claude/settings.json (`levain doctor` reads every layer)."""
     install = Path(str(path)).expanduser().resolve()
     chosen = effective_adapter(install)
     if chosen is None:
@@ -2371,9 +2380,17 @@ def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
         emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
         return 1
     recorded = recorded_messaging(install)
-    effective = persisted_messaging(install)
-    source = "recorded in .levain/config.json" if recorded is not None else "the default, nothing recorded"
+    facts = _workspace_facts(install)
+    if recorded is not None:
+        effective, source = recorded, "recorded in .levain/config.json"
+    elif facts and (facts.get("crossSessionInbound") in ("hold", "refuse") or facts.get("ask") or facts.get("deny")):
+        effective, source = "governed", "inferred from .claude/settings.json; no record"
+    else:
+        effective, source = DEFAULT_MESSAGING, "the default; no record"
     emit(f"messaging: {effective} ({source})")
+    change = messaging_change(install)
+    if change is not None:
+        emit(f"  last changed by `messaging set`: {change['from']} -> {change['to']} at {change['at']}")
     carries = _workspace_carries(install, effective)
     if carries is None:
         emit("  .claude/settings.json: cannot be read, so whether it carries these controls cannot be told.")
@@ -2382,60 +2399,76 @@ def run_messaging_show(path: Path, emit: Callable[[str], None] = print) -> int:
     else:
         emit(f"  .claude/settings.json: does not carry the {effective} controls "
              f"(`levain update` renders them from the record; `levain doctor` says more).")
+    emit("  (this reads the workspace .claude/settings.json only; `levain doctor` reads every settings layer.)")
     return 0
+
+
+def _pending_snapshot(path: Path) -> tuple[bytes, int] | None:
+    try:
+        return path.read_bytes(), path.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: bool = False,
                       emit: Callable[[str], None] = print) -> int:
-    """`levain messaging set MODE`: validate, record ``choice`` through :func:`_write_messaging_choice`, then run
-    `levain update` for the install (the one renderer, receipt and pin path). An update that errors restores the
-    previous record; one that holds settings.json for review keeps the record. Exit code = update's."""
+    """`levain messaging set MODE`: under ONE hold of the install lock, validate, run `levain update` for the install
+    with ``choice`` explicit (the one renderer, receipt and pin path), and only then, if the workspace
+    settings carry exactly that choice's controls and the update finished, record it (with a ``messaging_changed``
+    stamp). Nothing is recorded otherwise, and nothing is rolled back: a plain update never loosens a carried
+    control and re-renders the recorded choice, so a run cut short fails safe. Exit code = update's."""
+    from datetime import datetime, timezone
+
     from levain.update import run_update
 
     install = Path(str(path)).expanduser().resolve()
-    chosen = effective_adapter(install)
-    if chosen is None:
+    adapter = effective_adapter(install)
+    if adapter is None:
         emit(f"FAIL: {install} is not a levain install (run `levain init` first, or pass --path).")
         return 1
-    if chosen != "claude-code":
-        emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=chosen))
+    if adapter != "claude-code":
+        emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
         return 1
     try:
-        _check_messaging(install, chosen, choice)
+        _check_messaging(install, adapter, choice)
     except InitError as e:
         emit(f"FAIL: {e}")
         return 1
-    previous = recorded_messaging(install)
+    staged = install.joinpath(*PENDING_REL, ".claude", "settings.json")
     try:
-        with install_lock(install, create=False):
-            _write_messaging_choice(install, choice, emit)
+        with install_lock(install, create=False):  # reentrant: run_update's own acquire is then a no-op
+            previous = persisted_messaging(install)
+            before = _pending_snapshot(staged)
+            emit("  running `levain update` to apply it")
+            rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
+            carries = _workspace_carries(install, choice)
+            if carries and rc == 0:
+                change = None
+                if previous != choice:
+                    change = {"from": previous, "to": choice,
+                              "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                _write_messaging_choice(install, choice, emit, changed=change)
+                if (change is not None and
+                        _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous)):
+                    emit(f"LOOSENED {previous} -> {choice}")
+                return 0
+            if _pending_snapshot(staged) not in (None, before):
+                emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json was held for review "
+                     f"(you edited it). The staged copy is at {staged}; merge it (until then the old controls stay in "
+                     f"force), then run `levain messaging set {choice}` again.")
+            elif carries:
+                emit(f"messaging: {choice} is NOT recorded: `levain update` did not finish (exit {rc}); its output "
+                     f"above says why. Fix that, then run `levain messaging set {choice}` again.")
+            else:
+                emit(f"messaging: {choice} is NOT applied and NOT recorded: .claude/settings.json does not carry its "
+                     "controls; `levain update`'s output above names the cause.")
+            return rc if rc else 1
     except InstallLockError as e:
         emit(f"FAIL: {e.message}")
         return 1
     except InitError as e:
         emit(f"FAIL: {e}")
         return 1
-    staged = install.joinpath(*PENDING_REL, ".claude", "settings.json")
-    emit("  running `levain update` to apply it")
-    try:
-        rc = run_update(install, yes=yes, no_pip=no_pip, emit=emit, _messaging=choice)
-    except BaseException:
-        _restore_messaging_record(install, previous)
-        emit("FAIL: `levain update` errored; the previous messaging choice is restored.")
-        raise
-    carries = _workspace_carries(install, choice)
-    if carries:
-        return rc
-    if os.path.lexists(staged):
-        emit(f"messaging: {choice} is recorded, but .claude/settings.json was held for review (you edited it). "
-             f"Merge the staged copy at {staged} to apply it.")
-        return rc
-    _restore_messaging_record(install, previous)
-    if rc == 0:
-        emit(f"FAIL: `levain update` did not apply {choice}; the previous messaging choice is restored.")
-        return 1
-    emit("FAIL: `levain update` did not finish; the previous messaging choice is restored.")
-    return rc
 
 
 def parse_memory_load(specs: Sequence[str]) -> tuple[str | None, dict[str, str]]:
