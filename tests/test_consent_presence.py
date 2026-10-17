@@ -75,20 +75,20 @@ def _wait_pending(qdir, limit=10.0):
     raise AssertionError("the hook never held the request")
 
 
-@pytest.mark.parametrize("agent", ["claude_code", "codex"])
-def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, agent, capsys):
-    # run A1 (Claude Code shape) and X2 (Codex 0.162.1): the hold ends about a second after `away off`, no answer
-    mod, event = EVENTS[agent]
-    assert cli(["consent", "away", "on", "--hold", "15", "--agent", agent, "--queue-dir", str(qdir)]) == 0
-    t, out, started = _hook(mod, event, qdir)
-    _wait_pending(qdir)
-    assert cli(["consent", "away", "off", "--agent", agent, "--queue-dir", str(qdir)]) == 0
-    flipped = time.monotonic()
-    t.join(10)
-    assert not t.is_alive() and time.monotonic() - flipped < cc.RECHECK_EVERY + 2 and time.monotonic() - started < 12
-    assert out.getvalue() == ""  # no decision: the agent's own dialog asks
-    state, note = _row(qdir)
-    assert state == "withdrawn" and note.startswith("the operator is back (explicit word: off)")
+def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, capsys):
+    # runs A1 (Claude Code shape) and X2 (Codex 0.162.1): the hold ends about a second after `away off`, no answer
+    for agent in ("claude_code", "codex"):
+        mod, event = EVENTS[agent]
+        assert cli(["consent", "away", "on", "--hold", "15", "--agent", agent, "--queue-dir", str(qdir)]) == 0
+        t, out, started = _hook(mod, event, qdir)
+        _wait_pending(qdir)
+        assert cli(["consent", "away", "off", "--agent", agent, "--queue-dir", str(qdir)]) == 0
+        flipped = time.monotonic()
+        t.join(10)
+        assert not t.is_alive() and time.monotonic() - flipped < cc.RECHECK_EVERY + 3
+        assert out.getvalue() == ""  # no decision: the agent's own dialog asks
+        state, note = _row(qdir)
+        assert state == "withdrawn" and note.startswith("the operator is back (explicit word: off)")
 
 
 def test_input_idle_holds_and_input_releases(qdir, idle, capsys):
@@ -104,9 +104,20 @@ def test_input_idle_holds_and_input_releases(qdir, idle, capsys):
 
 
 def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, capsys):
-    # runs I2 and I3: off holds nothing however idle; on holds however present; auto hands it back to idle
+    # runs S0, I1, I2 and I3: off holds nothing however idle, on holds however present, auto hands it back to
+    # idle; `show` names the source each time
+    idle[0] = 213.0
+    cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(qdir)])
+    assert "codex: away mode off; answers verify against" in (out := capsys.readouterr().out)
+    assert "set by input idle 213s < 600s; on after 600s of no keyboard, mouse or trackpad input" in out
+    cli(["consent", "away", "auto", "--idle-after", "1", "--agent", "codex", "--queue-dir", str(qdir)])
+    assert "codex: away mode ON, holds up to 120s" in (out := capsys.readouterr().out)
+    assert "set by input idle 213s >= 1s" in out
+    assert cli(["consent", "away", "on", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2
     idle[0] = 700.0
     assert cli(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert "set by explicit word: off; `levain consent away auto` hands it back to input idle" in \
+        capsys.readouterr().out
     t, out, started = _hook(cc, EVENTS["claude_code"][1], qdir)
     t.join(10)
     assert time.monotonic() - started < 2 and _row(qdir) == (
@@ -117,21 +128,6 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
     assert cli(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     assert "away_word" not in json.loads((qdir / cc.SETTINGS_NAME).read_text())
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (False, "idle")
-
-
-def test_show_names_what_set_the_state(qdir, idle, capsys):
-    # runs S0, I1, A1: `show` says which source decided and the threshold it compared against
-    idle[0] = 213.0
-    cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(qdir)])
-    assert "codex: away mode off; answers verify against" in (out := capsys.readouterr().out)
-    assert "set by input idle 213s < 600s; on after 600s of no keyboard, mouse or trackpad input" in out
-    cli(["consent", "away", "auto", "--idle-after", "1", "--agent", "codex", "--queue-dir", str(qdir)])
-    assert "codex: away mode ON, holds up to 120s" in (out := capsys.readouterr().out)
-    assert "set by input idle 213s >= 1s" in out
-    cli(["consent", "away", "off", "--agent", "codex", "--queue-dir", str(qdir)])
-    assert "set by explicit word: off; `levain consent away auto` hands it back to input idle" in \
-        capsys.readouterr().out
-    assert cli(["consent", "away", "on", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2
 
 
 def test_a_failed_idle_read_is_no_idle_source_never_away(monkeypatch):

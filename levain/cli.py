@@ -2197,18 +2197,30 @@ def _time_left(expires_at: str, now: datetime) -> str:
 
 
 def _cmd_consent_pending(args: argparse.Namespace) -> int:
+    import sqlite3
+
     from levain.cockpit.consent import ConsentError
+    from levain.consent.dialog import LABELS
+    from levain.consent.listing import read_listing
     from levain.consent.queue import QueueStoreError
 
     try:
-        pending = _reading_queue(_consent_queue_dir(args)).pending()
+        qdir = _consent_queue_dir(args)
+        pending = _reading_queue(qdir).pending()
         if not pending:
             print("no pending consent requests")
         now = _utc_now()
         for r in pending:
             print(_term_safe(f"{r.id}  {r.agent}  {r.tool_name}  cwd {r.cwd}  targets {_consent_targets(r)}  "
                              f"{r.tier}  filed {r.received_at}  {_time_left(r.expires_at, now)}"))
-    except (OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
+        # what the agent's own dialog did with the requests levain left to it: unsigned, never an answer
+        left = [e for e in read_listing(qdir, now=now).recent if e.state in ("withdrawn", "expired")]
+        if left:
+            print("left to the agent's own dialog (last 24 h, UNSIGNED: not answers levain verified):")
+            for e in left:
+                print(_term_safe(f"  {e.request.id}  {e.request.agent}  {e.request.tool_name}  "
+                                 f"{e.decided_at}  {LABELS.get(e.dialog, LABELS[None])}"))
+    except (OSError, QueueStoreError, ConsentError, sqlite3.Error, *_cockpit_refusals()) as exc:
         print(f"pending: {_term_safe(exc)}", file=sys.stderr)
         return 1
     return 0

@@ -20,6 +20,9 @@ Wired to Claude Code's UserPromptSubmit event. Injects, at recency position
 The three are independent: a broken directives file drops (1) but must not also
 drop (2)/(3), so `sections` is built additively.
 
+First, whether or not anything else here fires: the consent requests levain left to the agent's own
+dialog in this session that did not run are recorded, unsigned, as not run (`levain.consent.dialog`).
+
 FAIL-OPEN — structural: main()'s entire body is wrapped in a catch-all and the
 process always exits 0. A hook must never crash or write stderr noise into the
 operator's session. The _levain_hook import is guarded too, since it runs
@@ -82,6 +85,8 @@ def _wrap_state_compat(hook_mod, timeout=None):
 def main() -> int:
     try:
         payload = hook.read_stdin()
+        if hasattr(hook, "consent_observe"):  # an older helper beside a newer script: no record, the hook runs
+            hook.consent_observe("claude_code", "UserPromptSubmit", payload)
 
         if not hook.should_fire():
             return 0

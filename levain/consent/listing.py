@@ -74,13 +74,16 @@ def consent_targets(request: object) -> str:
 @dataclass(frozen=True)
 class ConsentEntry:
     """One request as the page shows it. ``state`` is the DISPLAY state (a pending past its expiry reads
-    ``expired``); ``decided_at`` is the decision's time, or the expiry for one that expired unswept."""
+    ``expired``); ``decided_at`` is the decision's time, or the expiry for one that expired unswept. ``dialog``
+    is the UNSIGNED outcome recorded for a request levain left to the agent's own dialog (``ran``,
+    ``ran_unasked``, ``did_not_run``; :data:`levain.consent.queue.DIALOG_OUTCOMES`), ``None`` for none yet."""
     request: ExternalGateRequest
     state: str
     via: str | None
     signer_fp: str | None
     grant_id: str | None
     decided_at: str | None
+    dialog: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,10 +105,12 @@ def audit_line(entry: ConsentEntry) -> str:
         return f"allowed by signed answer, key {entry.signer_fp or '(unknown)'}"
     if entry.state == "denied":
         return f"denied by signed answer, key {entry.signer_fp or '(unknown)'}"
+    from levain.consent.dialog import LABELS
+
     if entry.state == "expired":
-        return "expired: no answer, the agent's own dialog stood"
+        return f"expired: no answer, the agent's own dialog stood; {LABELS.get(entry.dialog, LABELS[None])}"
     if entry.state == "withdrawn":
-        return "withdrawn"
+        return f"withdrawn to the agent's own dialog; {LABELS.get(entry.dialog, LABELS[None])}"
     return entry.state
 
 
@@ -194,6 +199,15 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
         rows += conn.execute(
             f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
             "ORDER BY decided_at DESC LIMIT ?", (horizon, RECENT_CAP)).fetchall()
+        # a store opened only by a levain before dialog outcomes has no such table: no outcomes
+        outcomes: dict[str, str] = {}
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dialog_outcomes'").fetchone():
+            ids = [r[0] for r in rows]
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                outcomes.update(conn.execute(
+                    f"SELECT request_id, outcome FROM dialog_outcomes WHERE request_id IN "
+                    f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -221,10 +235,11 @@ def read_listing(directory: Path | str | None = None, *, now: datetime) -> Conse
             if request.expires_at > stamp:
                 pending.append(ConsentEntry(request, "pending", None, None, None, None))
             elif request.expires_at >= horizon:    # nobody swept it: it reads as expired, at its expiry
-                recent.append(ConsentEntry(request, "expired", None, None, None, request.expires_at))
+                recent.append(ConsentEntry(request, "expired", None, None, None, request.expires_at,
+                                           outcomes.get(request.id)))
         elif decided_at is not None and decided_at >= horizon:
             gid = _grant_id_of(answer) if via == "grant" else None
-            recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at))
+            recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at, outcomes.get(request.id)))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
     return ConsentListing(tuple(pending), tuple(recent[:RECENT_CAP]), skipped, overflow)
