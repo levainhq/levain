@@ -72,6 +72,11 @@ class AgentError(RuntimeError):
     """The scoped agent cannot be started, found or used; the text says why, for the operator."""
 
 
+class AgentTimeout(AgentError):
+    """A connect to a socket did not complete in time (Linux blocks a connect to a full backlog): who
+    listens is unknown, which is not the same answer as nobody listening."""
+
+
 @dataclass(frozen=True)
 class ScopedAgent:
     """One session's agent: its id (the directory name under ``<levain home>/run``), its socket on the
@@ -183,6 +188,8 @@ def peer_pid(sock: str, *, timeout: float = 5.0) -> int:
             pid = struct.unpack("i", s.getsockopt(0, 2, struct.calcsize("i")))[0]
         else:
             raise AgentError(f"this platform ({platform.system()}) has no peer-pid read levain knows")
+    except TimeoutError:
+        raise AgentTimeout(f"could not read the peer of {sock} (no connect within {timeout:g} s)") from None
     except OSError as exc:
         raise AgentError(f"could not read the peer of {sock} ({exc.strerror or exc})") from None
     finally:

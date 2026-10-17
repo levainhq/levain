@@ -803,9 +803,15 @@ def _same_socket(a: str, b: str) -> bool:
     return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
+# What :func:`_listener_comm` returns when a listener exists but did not answer in time.
+_LISTENER_UNKNOWN = "\x00unknown"
+
+
 def _listener_comm(p: str) -> str | None:
     """Linux: the ``comm`` of the process listening on ``p``, read by connecting without sending a byte
-    (``SO_PEERCRED``), or None (nobody answers, another pid namespace, not Linux)."""
+    (``SO_PEERCRED``); None when nobody answers, the peer is in another pid namespace, or not Linux;
+    :data:`_LISTENER_UNKNOWN` when the connect did not complete in time, so the caller cannot tell an
+    agent from anything else."""
     if not sys.platform.startswith("linux"):
         return None
     try:
@@ -814,6 +820,8 @@ def _listener_comm(p: str) -> str | None:
         pid = _ssh_agent.peer_pid(p, timeout=1.0)
         with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as fh:
             return fh.read().strip()
+    except _ssh_agent.AgentTimeout:
+        return _LISTENER_UNKNOWN
     except (_ssh_agent.AgentError, OSError):
         return None
 
@@ -833,6 +841,11 @@ def _ssh_agent_refusal(p: str) -> str | None:
     if any(_same_socket(s, p) for s in _gpg_ssh_sockets()):
         return _SSH_AGENT_GRANT.format("gpg-agent's ssh socket")
     comm = _listener_comm(p)
+    if comm == _LISTENER_UNKNOWN:
+        # Fail closed (L3 r2 codex): a listener that does not accept in time could be an agent whose
+        # backlog is full now and drains later, so the grant is refused rather than read as "not one".
+        return ("did not accept a connection within 1 s, so levain cannot tell whether an ssh agent "
+                "listens on it; try again once it answers")
     if comm == "gpg-agent" and p in _gpg_extra_sockets():   # the literal path, as the gpg grant rule
         return None
     if comm is not None and comm in _AGENT_LISTENERS:

@@ -850,7 +850,7 @@ def test_the_grant_check_waits_one_second_on_a_listener_that_does_not_accept(mon
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux blocks a connect to a full backlog")
-def test_a_listener_whose_backlog_is_full_costs_the_grant_check_about_a_second(tmp_path):
+def test_a_listener_whose_backlog_is_full_costs_the_grant_check_about_a_second_and_is_refused(tmp_path):
     import time
 
     d = tempfile.mkdtemp(dir="/tmp")
@@ -869,12 +869,36 @@ def test_a_listener_whose_backlog_is_full_costs_the_grant_check_about_a_second(t
             except (BlockingIOError, OSError):
                 break
         t = time.monotonic()
-        assert conf._listener_comm(p) is None
+        assert conf._listener_comm(p) == conf._LISTENER_UNKNOWN
         assert time.monotonic() - t < 3
+        assert "cannot tell whether an ssh agent" in (conf._ssh_agent_refusal(p) or "")
     finally:
         for c in held:
             c.close()
         ls.close()
+
+
+def test_a_peer_read_that_times_out_is_its_own_answer(monkeypatch):
+    """A connect that does not complete in time says nothing about who listens (L3 r2 codex): it is
+    AgentTimeout, not the AgentError of nobody answering, so the grant check can refuse on it."""
+    from levain.firing import ssh_agent
+
+    class _Slow:
+        def __init__(self, *a, **k): pass
+        def settimeout(self, t): pass
+        def connect(self, p): raise TimeoutError("timed out")
+        def close(self): pass
+
+    monkeypatch.setattr(ssh_agent.socket, "socket", _Slow)
+    with pytest.raises(ssh_agent.AgentTimeout):
+        ssh_agent.peer_pid("/nowhere/s", timeout=1.0)
+
+
+def test_a_grant_whose_listener_cannot_be_classified_is_refused(monkeypatch):
+    monkeypatch.setattr(conf, "_listener_comm", lambda p: conf._LISTENER_UNKNOWN)
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: ())
+    assert "cannot tell whether an ssh agent" in (conf._ssh_agent_refusal("/run/user/1/x.sock") or "")
 
 
 def test_doctor_reports_unix_sockets_only_for_an_entity_levain_run_runs(grants, tmp_path, capsys, monkeypatch):
