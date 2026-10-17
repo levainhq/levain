@@ -157,32 +157,39 @@ CONFIG_FILE_NAMES = frozenset({".mcp.json"})
 USER_CONFIG_NAME = ".claude.json"
 
 
-# A directory whose files are agent config: an MCP server given it in one field and a file name in another writes
-# config with neither string naming it whole (:func:`names_config_dir`).
-CONFIG_DIR_NAMES = frozenset({".claude", ".codex", ".claude-plugin"})
+# The names a file inside a directory is probed under, so that a directory is agent config exactly when a file the
+# checks below tag could sit directly in it (:func:`names_config_dir`): one name each directory-keyed check keys on.
+# A name that is config in ANY directory (``.mcp.json``) is not probed, or every directory would be: the file-name
+# field naming it is itself a candidate, tagged on its own.
+_DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NAME, "x.pth", "sitecustomize.py",
+               "levain")
 
 
-def _home_spellings(home: Path) -> frozenset[str]:
-    return frozenset({os.path.normpath(home).lower(), os.path.realpath(home).lower()})
-
-
-def names_config_dir(target: str, cwd: str, home: Path, homes: frozenset[str] | None = None) -> bool:
+def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
+                     user_configs: frozenset[str]) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
-    when ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) IS a directory agent config lives
-    in (a ``.claude``, ``.codex`` or ``.claude-plugin`` directory, or the home directory, where ``.claude.json``
-    is), or its file name is ``.claude.json`` wherever it sits (a server that joins a relative name to a root of
-    its own, home among them). Over-matching only sends the request to the human. ``homes``: ``home``'s spellings,
-    computed once by a caller checking many targets."""
+    when a server given ``target`` as a directory and a file name in another field could write agent config:
+    ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
+    :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
+    derived from those checks, never spelled twice), or its file name is ``.claude.json`` wherever it sits (a
+    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
+    ``user_configs`` are the caller's, computed once. Over-matching only sends the request to the human."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
-    homes = homes if homes is not None else _home_spellings(home)
-    for p in (os.path.normpath(raw), os.path.realpath(raw)):
-        low = p.lower()
-        name = os.path.basename(low)
-        if name in CONFIG_DIR_NAMES or name == USER_CONFIG_NAME or low in homes:
+    for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
+        if p.name.lower() == USER_CONFIG_NAME:
             return True
+        for probe in _DIR_PROBES:
+            if _tags_path(p / probe, roots, sites, user_configs):
+                return True
     return False
+
+
+def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str]) -> bool:
+    """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
+    return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
+            or _redirects_the_import(path, sites))
 
 
 def _is_config_path(path: Path) -> bool:
@@ -315,7 +322,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
         user_config = Path(home) / USER_CONFIG_NAME
-        user_configs = {os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()}
+        user_configs = frozenset({os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()})
     except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
@@ -329,15 +336,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots):
-            return True
-        if str(written).lower() in user_configs or str(resolved).lower() in user_configs:
-            return True
-        if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
+        if _tags_path(written, roots, sites, user_configs) or _tags_path(resolved, roots, sites, user_configs):
             return True
     try:
-        homes = _home_spellings(Path(home)) if extra else frozenset()
-        return any(names_config_dir(target, cwd, Path(home), homes) for target in extra)
+        return any(names_config_dir(target, cwd, Path(home), roots, sites, user_configs) for target in extra)
     except (OSError, ValueError):
         return True
 

@@ -44,12 +44,13 @@ from typing import Any
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
 __all__ = [
-    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
+    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
+    "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "FIDO_ATTESTED", "FORMAT", "PASSKEY", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_mcp_tool_problem", "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -156,6 +157,17 @@ CONSENT_AGENTS = ("claude_code", "codex")
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1, measured in Q0 item 6 and Q3).
 # Compared case-insensitively.
 CONSENT_SHELL_TOOLS = frozenset({"bash"})
+# The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``: the reference filesystem
+# server's tools that declare ``readOnlyHint: true`` (github.com/modelcontextprotocol/servers, src/filesystem/server.ts,
+# read 2026-10-17). MCP declares no path fields and its annotations are untrusted (spec 2025-06-18, server/tools), so
+# a grant's workspace bound reads only the fields levain knows (``levain.consent.policy.MCP_PATH_FIELDS``) and a grant
+# on a tool that writes could answer a write anywhere. Until a grant can declare its tool's path fields, an MCP tool
+# off this list is refused at append and answers nothing at decision: it goes to you. A server is the operator's own
+# install, so a tool named here that writes is that server's lie, not a request's.
+CONSENT_MCP_READ_ONLY_TOOLS = frozenset({
+    "read_file", "read_text_file", "read_media_file", "read_multiple_files", "list_directory",
+    "list_directory_with_sizes", "directory_tree", "search_files", "get_file_info", "list_allowed_directories",
+})
 # The posture names each agent's PermissionRequest event carries (``permission_mode``). Claude Code: its documented
 # permission modes (Q0 measured ``default``); Codex: the value its event carries (Q0 item 6, Q3: ``default``).
 CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({
@@ -1168,6 +1180,30 @@ def consent_root_problem(workspace: str) -> str | None:
     return None
 
 
+def consent_mcp_tool_problem(tool: str) -> str | None:
+    """Why a consent grant may not name ``tool``, when it is an MCP tool (``mcp__<server>__<tool>``, the server name
+    ending at its first ``__``) whose own name is not in :data:`CONSENT_MCP_READ_ONLY_TOOLS`; ``None`` otherwise."""
+    if not isinstance(tool, str) or not tool.startswith("mcp__"):
+        return None
+    if tool[len("mcp__"):].partition("__")[2] in CONSENT_MCP_READ_ONLY_TOOLS:
+        return None
+    return (f"{tool[:200]!r} is an MCP tool levain does not know to be read-only: MCP does not say which of a "
+            "tool's fields are paths, so a grant could not keep its writes inside the workspace; its requests go "
+            "to you (a grant may name the filesystem server's read tools, such as mcp__<server>__read_text_file)")
+
+
+def _consent_mcp_check(grants: list[Any]) -> None:
+    """At append, no consent grant a link brings in or extends names an MCP tool that may write."""
+    for grant in grants:
+        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+            continue
+        tools = grant.get("tools")
+        for tool in tools if isinstance(tools, (list, tuple)) else ():
+            problem = consent_mcp_tool_problem(tool)
+            if problem is not None:
+                raise AuthorityError(problem)
+
+
 def _consent_home_check(grants: list[Any]) -> None:
     """At append, every consent grant's workspace is an existing directory whose realpath is exactly the signed
     string (no symlink anywhere on it, so what was signed is what the criteria resolve), and not a refused root."""
@@ -1195,17 +1231,21 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     workspace under it), judged for every consent grant a create or a loosen brings in or changes."""
     if rec["op"] == "create_grant":
         _consent_home_check([rec["grant"]])
+        _consent_mcp_check([rec["grant"]])
     elif rec["op"] == "loosen":
         policy = rec["policy"]
         grants = policy.get("grants", {}) if isinstance(policy, Mapping) else {}
         old = state.policy.grants
-        _consent_home_check([g for gid, g in grants.items()
-                             if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))])
+        changed = [g for gid, g in grants.items()
+                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+        _consent_home_check(changed)
+        _consent_mcp_check(changed)
     if rec["op"] != "renew":
         return
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
+    _consent_mcp_check([grant])     # a grant signed before the rule is not extended past it
     signed = _parse_stamp(rec["signed_at"], "signed_at")
     if abs(now - signed) > _RENEW_SKEW:
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")

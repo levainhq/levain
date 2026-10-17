@@ -867,11 +867,58 @@ def _granted_mcp_hook(tmp_path, tool):
 def test_a_grant_never_answers_an_mcp_write_to_agent_config_named_in_any_field(tmp_path, inp):
     """Ruling 3b item 1: an MCP tool whose server names its path in a field levain does not know (``filepath``,
     ``file``, nested) still edits agent config. Reproduced 2026-10-17 on main c0664a9: a grant on the tool allowed
-    a write to the workspace's ``.claude/settings.json`` through ``filepath``."""
-    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__write_file")
-    assert json.loads(run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))))[
-        "hookSpecificOutput"]["decision"] == {"behavior": "allow"}  # the grant answers an ordinary write
-    assert run(event("mcp__fs__write_file", inp, cwd=str(ws))) == ""
+    a write to the workspace's ``.claude/settings.json`` through ``filepath``. A grant may now name only a read
+    tool (the next test), so the tagging is held on one: a request it tags is agent config, never a grant's."""
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_text_file")
+    assert json.loads(run(event("mcp__fs__read_text_file", {"path": "src/a.py"}, cwd=str(ws))))[
+        "hookSpecificOutput"]["decision"] == {"behavior": "allow"}  # the grant answers an ordinary read
+    assert run(event("mcp__fs__read_text_file", inp, cwd=str(ws))) == ""
+
+
+def test_a_grant_on_an_mcp_tool_that_may_write_answers_nothing(tmp_path, monkeypatch):
+    """Phill 10-17 (c): MCP declares no path fields, so a grant's workspace bound cannot hold a writing tool (a
+    ``filepath`` grant answered writes anywhere, CHANGELOG 0.11.0 known edge). The log refuses such a grant, and one
+    signed before the rule (made here by switching the append check off) answers nothing and renews nothing."""
+    (tmp_path / "a").mkdir()
+    with pytest.raises(auth.AuthorityError, match="not know to be read-only"):
+        _granted_mcp_hook(tmp_path / "a", "mcp__fs__write_file")
+    monkeypatch.setattr(auth, "_consent_mcp_check", lambda grants: None)
+    (tmp_path / "b").mkdir()
+    ws, run = _granted_mcp_hook(tmp_path / "b", "mcp__fs__write_file")
+    monkeypatch.undo()
+    assert run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))) == ""
+    assert run(event("mcp__fs__write_file", {"filepath": str(Path.home() / ".zshrc"), "content": "x"},
+                     cwd=str(ws))) == ""
+
+
+def test_a_grant_on_a_known_read_tool_still_answers_inside_its_workspace(tmp_path):
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_text_file")
+    out = json.loads(run(event("mcp__fs__read_text_file", {"path": str(ws / "src" / "a.py")}, cwd=str(ws))))
+    assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert run(event("mcp__fs__read_text_file", {"path": "/etc/hosts"}, cwd=str(ws))) == ""  # outside: no answer
+    assert auth.consent_mcp_tool_problem("mcp__my_fs__list_directory") is None
+    assert auth.consent_mcp_tool_problem("mcp__fs__read_text_file_and_write") is not None
+
+
+@pytest.mark.parametrize("where", ["activation-hooks", "activation-hooks-relative", "site-dir"])
+def test_a_directory_field_holding_the_hook_or_a_site_dir_is_tagged(tmp_path, where):
+    """Diogenes 10-17 MEDIUM, reproduced on main 24a8d26 (both adapters False): a server given the directory in one
+    field and the file name in another writes the consent hook (a levain install's activation/hooks/) or a ``.pth``
+    in a site directory, which runs at every interpreter start. The directory is tagged when a file the path
+    checks tag could sit in it, derived from those checks rather than a second list of names."""
+    import sysconfig
+
+    from levain.consent.adapters import codex as cx
+    proj = Path(os.path.realpath(tmp_path)) / "proj"
+    (proj / "activation" / "hooks").mkdir(parents=True)
+    inp = {"activation-hooks": {"directory": str(proj / "activation" / "hooks"), "filename": "consent_claude_code.py"},
+           "activation-hooks-relative": {"directory": "activation/hooks", "filename": "consent_claude_code.py"},
+           "site-dir": {"directory": sysconfig.get_path("purelib"), "filename": "zz.pth"}}[where]
+    assert cc.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h")
+    assert cx.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h",
+                                   codex_dir=tmp_path / "h" / ".codex")
+    assert not cc.targets_agent_config("mcp__fs__write_file", {"directory": str(proj / "src"), "filename": "a.py"},
+                                       str(proj), home=tmp_path / "h")
 
 
 def test_an_mcp_input_past_the_bound_is_tagged():

@@ -1921,7 +1921,8 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
             "of the named tools, under one of the named permission modes, whose working directory and every "
             "file it targets resolve inside WORKSPACE, is allowed without asking until the grant expires. A "
             "tool with no file target (WebFetch, an MCP tool without path arguments) is matched on its working "
-            "directory alone. The log refuses a shell tool, a workspace of / or your home directory, and a life "
+            "directory alone. The log refuses a shell tool, an MCP tool other than the filesystem server's read "
+            "tools (read_text_file, list_directory...), a workspace of / or your home directory, and a life "
             "over 30 days, before anything is signed."
         ),
     )

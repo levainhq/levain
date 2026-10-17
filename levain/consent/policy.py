@@ -13,7 +13,8 @@ is the signed string, checked at append too) and not ``/``, this machine's home 
 directory resolves inside it; every target path the request names (:func:`grant_targets`: a file tool's target and
 any tool's :data:`MCP_PATH_FIELDS`, Claude Code's Read, Grep, LS and NotebookRead included) is inside it with no
 existing symlink on the way, and a file tool whose target cannot be read, a path field of another shape and a Glob
-pattern that can reach outside its root match nothing; and the grant has not expired. Which tools are file tools,
+pattern that can reach outside its root match nothing; an MCP tool is one of the read tools levain knows
+(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`); and the grant has not expired. Which tools are file tools,
 and how their targets are read, is per agent (:data:`AGENT_FILE_TOOLS`, :func:`register_targets`): Claude Code's are
 built in; Codex's ``apply_patch`` has its targets read by the Codex adapter's extractor, registered when that adapter
 is imported, and with no extractor registered it matches nothing. A tool naming no path (WebFetch, an MCP tool
@@ -32,7 +33,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_root_problem
+from levain.authority import CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_mcp_tool_problem, consent_root_problem
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
 
@@ -294,6 +295,8 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     if request.tool_name.lower() in CONSENT_SHELL_TOOLS or not isinstance(tools, (list, tuple)) \
             or request.tool_name not in tools:
         return "the grant does not name this tool"
+    if consent_mcp_tool_problem(request.tool_name) is not None:
+        return "an MCP tool that may write is never answered by a grant"   # one signed before the append rule
     postures = grant.get("postures")
     if not isinstance(posture, str) or not isinstance(postures, (list, tuple)) or posture not in postures:
         return "the grant does not cover this posture"
