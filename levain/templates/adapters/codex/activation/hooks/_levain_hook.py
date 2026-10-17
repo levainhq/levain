@@ -1279,8 +1279,8 @@ def emit(additional_context: str, event_name: str) -> bool:
     is the hook event ("SessionStart" / "UserPromptSubmit"), emitted as
     `hookEventName` per the documented schema (omitting it relies on
     undocumented permissiveness — not safe for a distributable artifact).
-    Stop event is excluded: its output schema does not accept
-    `hookSpecificOutput` (see module docstring).
+    Stop does not use this function: its output schema does not accept
+    `hookSpecificOutput` (see module docstring); `stop.py` prints nothing.
 
     Codex uses the same hook output shape as Claude Code at v1; this is the
     primary harness-coupled seam — a future non-Codex adapter that diverges

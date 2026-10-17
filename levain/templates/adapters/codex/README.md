@@ -380,7 +380,8 @@ hooks will read different stores, and the hooks may not fire at all.
   This means: even if Codex platform hook reliability is fixed upstream,
   a Stop hook emitting `hookSpecificOutput.additionalContext` would be
   parsed as invalid output, not injected as context. The adapter therefore
-  excludes Stop entirely — Layer D folds into SessionStart start-catch
+  injects nothing from Stop: `stop.py` is wired only to record the turn's final
+  reply in the session transcript and prints nothing — Layer D folds into SessionStart start-catch
   (`source ∈ {"startup", "clear"}`) + UserPromptSubmit ambient nudge
   (episodes-since-wrap ≥ threshold), same shape as the Claude Code
   adapter. Verifying whether `decision: block` + `reason` or
@@ -457,8 +458,8 @@ expect **three** swap points:
    Codex 0.133 emits `startup` / `resume` / `clear` / `compact`
    (matching Claude Code); the matcher covers all four. Re-verify the
    target harness's equivalents.
-3. **Hook events wired** — Codex excludes Stop due to output schema
-   constraint; Claude Code uses SessionStart + UserPromptSubmit by the
+3. **Hook events wired** — Codex wires Stop for the transcript only (it injects
+   nothing there, because of the output schema constraint); Claude Code uses SessionStart + UserPromptSubmit by the
    same architectural logic (Stop fires after the model stops). A
    different harness may wire different events; the wiring is in
    `hooks.json.template` (per Codex) or `settings.template.json` (per
