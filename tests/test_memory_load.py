@@ -67,7 +67,7 @@ def test_the_wrap_procedure_is_its_own_seed_file_and_memory_md_points_at_it():
                  "**Wrap once.**", "**One store per entity"):
         assert part in workflow and part not in memory
     assert workflow.count("the *why*, the package carries the authoritative contract") == 1
-    assert "one `Store` per thread" in workflow and "`flock`" in workflow   # anneal 1.0's rule, with its platform condition
+    assert "one `Store` per thread" in workflow and "`flock`" in workflow and "one writer at a time" in workflow   # anneal 1.0's rule, with its platform condition
 
 
 # --- the resolver --------------------------------------------------------------------------------------------
