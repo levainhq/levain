@@ -39,7 +39,7 @@ def input_idle_seconds() -> float | None:
     if sys.platform != "darwin":
         return None
     try:
-        out = subprocess.run(_IOREG, capture_output=True, timeout=IDLE_READ_TIMEOUT, check=False,
+        out = subprocess.run(_IOREG, capture_output=True, timeout=IDLE_READ_TIMEOUT, check=False, env={},
                              stdin=subprocess.DEVNULL).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
