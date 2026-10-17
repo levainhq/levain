@@ -1929,8 +1929,8 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
     cs_create.add_argument("--agent", required=True, choices=("claude_code", "codex"))
     cs_create.add_argument("--tool", dest="tools", action="append", required=True, metavar="TOOL",
                            help="An exact tool name, one levain knows for that agent (Claude Code: Edit, Write, "
-                                "MultiEdit, NotebookEdit, Read, Grep, Glob, LS, NotebookRead, WebFetch, an MCP "
-                                "read tool; Codex: apply_patch, an MCP read tool); repeatable. No globs; never a "
+                                "MultiEdit, NotebookEdit, Read, Grep, Glob, LS, NotebookRead, WebFetch, SendMessage, "
+                                "an MCP read tool; Codex: apply_patch, an MCP read tool); repeatable. No globs; never a "
                                 "shell tool (Bash, PowerShell, Codex's write_stdin).")
     cs_create.add_argument("--workspace", type=Path, required=True,
                            help="The project directory the grant covers (resolved through symlinks).")
@@ -2322,7 +2322,7 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
         refused = [t for t in g.tools if consent_tool_problem(g.agent, t) is not None]
         if refused:
-            state += f" (answers nothing for {','.join(refused)}: a tool a grant may not name)"
+            state += f" (answers nothing for {','.join(map(str, refused))}: a tool a grant may not name)"
         print(f"{g.id}  {g.agent}  {','.join(g.tools)}  {g.workspace}  postures {','.join(g.postures)}  {state}  "
               f"(seq {g.seq})")
     return 0
