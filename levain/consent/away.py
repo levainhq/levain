@@ -22,7 +22,11 @@ from typing import Any
 
 from levain.authority import anchor_path
 from levain.consent.adapters import claude_code, codex
-from levain.consent.adapters.claude_code import CLEANUP_RESERVE, DEFAULT_MAX_HOLD, _refuse_symlink
+from levain.consent.adapters.claude_code import (
+    CLEANUP_RESERVE,
+    DEFAULT_MAX_HOLD,
+    _refuse_symlink,
+)
 from levain.consent.queue import ConsentQueue, authority_source
 
 __all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "read", "set_away", "settings", "why_unanswerable"]
@@ -106,8 +110,10 @@ def set_away(qdir: Path, agent: str, on: bool, hold: float | None = None) -> dic
     old_hold = data.get("away_hold_seconds")
     if on:
         if hold is None:
-            ok = isinstance(old_hold, (int, float)) and not isinstance(old_hold, bool) and math.isfinite(old_hold)
-            hold = float(old_hold) if ok and 0 < old_hold <= MAX_HOLD else DEFAULT_HOLDS[agent]
+            hold = DEFAULT_HOLDS[agent]
+            if isinstance(old_hold, (int, float)) and not isinstance(old_hold, bool) and math.isfinite(old_hold) \
+                    and 0 < old_hold <= MAX_HOLD:
+                hold = float(old_hold)
         reason = why_unanswerable(settings(qdir, agent))
         if reason:
             raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")

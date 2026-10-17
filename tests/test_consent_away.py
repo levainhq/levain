@@ -5,16 +5,15 @@ import json
 import os
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import levain.authority as auth
 from levain.authority import ReplayCache
-from levain.cockpit.firejournal import CockpitDB
-
 from levain.cli import main
+from levain.cockpit.firejournal import CockpitDB
 from levain.consent import away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
@@ -38,7 +37,7 @@ def _cockpit(tmp_path: Path, enrol: bool = True) -> Path:
                              sign=lambda m: subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(key), "-n",
                                                             auth.NAMESPACE], input=m, capture_output=True,
                                                            check=True).stdout.decode(),
-                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+                             clock=lambda: datetime.now(UTC), cache=ReplayCache(), anchor=None)
         conn.close()
     return Path(os.path.realpath(root))
 
