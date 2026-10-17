@@ -327,8 +327,9 @@ _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 # The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows (``_gnupg_homes``,
 # and on Linux each GNUPGHOME view of ``_runtime_view``, which binds them back read-only): the gpg
 # analogue of the ssh ``config`` vector above. The operator's gpg-agent, scdaemon and dirmngr run
-# OUTSIDE the floor, read these files, and start programs they name (``pinentry-program``,
-# ``scdaemon-program``), so bash writing one would choose a program the host runs unconfined.
+# OUTSIDE the floor, read these files, and start programs they name (``_GPG_AGENT_PROGRAMS``:
+# ``pinentry-program``, ``scdaemon-program``, ``tpm2daemon-program``), so bash writing one would choose
+# a program the host runs unconfined.
 # ``gpg.conf``, ``dirmngr.conf`` and ``common.conf`` carry lower-severity options and are denied with
 # them: an entity has no reason to write any of them. UNCONDITIONAL, like ``_SSH_WRITE_DENIED``.
 _GNUPG_CONF_WRITE_DENIED = (
@@ -1941,7 +1942,7 @@ def build_policy(
             deny_write_files_l.extend(_spellings(home / conf))
     # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
     deny_write_files_l.extend(_dirmngr_home_conf_spellings())
-    # The programs the operator's gpg-agent.conf names (pinentry, scdaemon), resolved, with their ancestors
+    # The programs the operator's gpg-agent.conf names (_GPG_AGENT_PROGRAMS), resolved, with their ancestors
     # through ``all_jewels``: a confined process may make the agent run the operator's own programs (a
     # sign through a granted extra socket can), never a binary it wrote (:func:`_gpg_program_spellings`).
     # gnupg's defaults join a conversation's floor only when its grants hold gpg's extra socket
@@ -5608,11 +5609,22 @@ def _creatable_by_me(p: Path) -> bool:
     return a.is_dir() and os.access(a, os.W_OK)
 
 
-_GPG_PROGRAM_OPTIONS = ("pinentry-program", "scdaemon-program")
+# Every gpg-agent option that names a program the agent executes, with the gpgconf component that is
+# its default when the option is absent: ONE table read by both :func:`_gpg_program_spellings` (the
+# options in gpg-agent.conf) and :func:`_gpg_components` (the defaults). The set is gpg-agent's own
+# option table (``agent/gpg-agent.c``: oPinentryProgram, oScdaemonProgram, oTpm2daemonProgram; the
+# same three ``gpg-agent --dump-options`` lists ending in ``-program``). A program missing here is one
+# a confined hand could plant and the unconfined agent would start.
+_GPG_AGENT_PROGRAMS: dict[str, str] = {
+    "pinentry-program": "pinentry",
+    "scdaemon-program": "scdaemon",
+    "tpm2daemon-program": "tpm2daemon",
+}
 
 
 def _gpg_components() -> list[Path]:
-    """The pinentry and scdaemon gnupg starts when its configuration names none: ``gpgconf
+    """The programs gpg-agent starts when its configuration names none (each component of
+    :data:`_GPG_AGENT_PROGRAMS`: pinentry, scdaemon, tpm2daemon): ``gpgconf
     --list-components``, never a login shell's lookup (a shell's startup files are the entity's to write).
     Empty when gpgconf is missing or fails."""
     from levain.launch import child_env
@@ -5629,7 +5641,7 @@ def _gpg_components() -> list[Path]:
     out: list[Path] = []
     for line in done.stdout.splitlines() if done.returncode == 0 else []:
         fields = line.split(":")
-        if len(fields) >= 3 and fields[0] in ("pinentry", "scdaemon"):
+        if len(fields) >= 3 and fields[0] in _GPG_AGENT_PROGRAMS.values():
             value = urllib.parse.unquote(fields[2])   # gpgconf percent-escapes its values
             if value.startswith("/"):
                 out.append(Path(value))
@@ -5638,7 +5650,7 @@ def _gpg_components() -> list[Path]:
 
 def _gpg_program_spellings(*, components: bool = False) -> list[Path]:
     """The programs the operator's gpg-agent starts, as write-denied jewel spellings (:func:`_spellings`:
-    the name as written and its resolved target): each ``pinentry-program`` and ``scdaemon-program``
+    the name as written and its resolved target): each program option (:data:`_GPG_AGENT_PROGRAMS`)
     line of ``gpg-agent.conf`` in every home :func:`_gnupg_homes` names, and with ``components`` gnupg's
     defaults (:func:`_gpg_components`, asked only when a gpg extra socket is granted:
     :func:`with_gpg_program_denies`). The agent runs them unconfined, and a sign through a granted extra
@@ -5653,7 +5665,7 @@ def _gpg_program_spellings(*, components: bool = False) -> list[Path]:
             continue
         for line in text.splitlines():
             parts = line.strip().split(None, 1)
-            if len(parts) == 2 and parts[0] in _GPG_PROGRAM_OPTIONS:
+            if len(parts) == 2 and parts[0] in _GPG_AGENT_PROGRAMS:
                 value = os.path.expanduser(parts[1].strip().strip('"'))
                 if os.path.isabs(value):
                     programs.append(Path(value))
@@ -5674,7 +5686,7 @@ def _gpg_program_spellings(*, components: bool = False) -> list[Path]:
 
 
 def with_gpg_program_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
-    """``policy`` with gnupg's default pinentry and scdaemon (and the conf-named ones) write-denied, with
+    """``policy`` with gpg-agent's default programs (and the conf-named ones) write-denied, with
     their ancestors: for a conversation whose grant snapshot holds a gpg extra socket, from its start,
     so neither hand can plant a program that agent then runs."""
     progs = [p for p in _gpg_program_spellings(components=True) if p not in policy.deny_write_files]

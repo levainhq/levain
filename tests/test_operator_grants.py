@@ -495,6 +495,23 @@ def test_the_programs_gpg_agent_starts_are_write_denied_with_their_ancestors(tmp
     assert (home / "tools") in with_gpg.deny_write_dirs
 
 
+def test_a_tpm2daemon_program_under_home_is_write_denied_to_confined_bash(tmp_path, monkeypatch):
+    """Every gpg-agent option naming a program it executes is covered, tpm2daemon-program included
+    (gpg-agent.c's option table: pinentry-, scdaemon-, tpm2daemon-program): a wrapper the conf names
+    under $HOME is write-denied in the floor bash runs under, with its directory."""
+    home = tmp_path / "home"
+    (home / ".gnupg").mkdir(parents=True)
+    (home / "bin").mkdir()
+    (home / "bin" / "tpm2-wrap").write_text("#!/bin/sh\n")
+    (home / ".gnupg" / "gpg-agent.conf").write_text("tpm2daemon-program ~/bin/tpm2-wrap\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    policy = build_policy(_entity(tmp_path))
+    assert (home.resolve() / "bin" / "tpm2-wrap") in policy.deny_write_files
+    assert (home / "bin") in policy.deny_write_dirs
+    assert conf.crown_jewel_reason(policy, home / "bin" / "tpm2-wrap") is not None
+
+
 def test_gpgconfs_components_are_asked_only_when_a_gpg_extra_socket_is_granted(grants, tmp_path, monkeypatch):
     """The conversation's floor asks gpgconf for gnupg's default programs only when its grant snapshot
     holds gpg's extra socket (build_policy never asks)."""
@@ -587,10 +604,12 @@ def test_gpgconfs_components_give_the_default_pinentry_and_scdaemon(monkeypatch)
     seen = []
     monkeypatch.setattr(conf.shutil, "which", lambda name: "/usr/bin/gpgconf")
     out = ("gpg:OpenPGP:/usr/bin/gpg\ngpg-agent:Private Keys:/usr/bin/gpg-agent\n"
-           "scdaemon:Smartcards:/usr/lib/gnupg/scdaemon\npinentry:Passphrase Entry:/opt/x%3ay/pinentry\n")
+           "scdaemon:Smartcards:/usr/lib/gnupg/scdaemon\npinentry:Passphrase Entry:/opt/x%3ay/pinentry\n"
+           "tpm2daemon:TPM:/usr/lib/gnupg/tpm2daemon\n")
     monkeypatch.setattr(conf.subprocess, "run", lambda argv, **kw: seen.append(argv) or SimpleNamespace(
         returncode=0, stdout=out))
-    assert _REAL_GPG_COMPONENTS() == [Path("/usr/lib/gnupg/scdaemon"), Path("/opt/x:y/pinentry")]
+    assert _REAL_GPG_COMPONENTS() == [Path("/usr/lib/gnupg/scdaemon"), Path("/opt/x:y/pinentry"),
+                                      Path("/usr/lib/gnupg/tpm2daemon")]
     assert seen == [["/usr/bin/gpgconf", "--list-components"]]
 
 
