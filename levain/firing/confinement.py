@@ -809,7 +809,9 @@ def _listener_comm(p: str) -> str | None:
     if not sys.platform.startswith("linux"):
         return None
     try:
-        pid = _ssh_agent.peer_pid(p)
+        # A short connect timeout: this runs for every granted socket at each check, and a listener that
+        # does not accept (Linux blocks a connect to a full backlog) must not hold the spawn or doctor.
+        pid = _ssh_agent.peer_pid(p, timeout=1.0)
         with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as fh:
             return fh.read().strip()
     except (_ssh_agent.AgentError, OSError):

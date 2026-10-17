@@ -832,3 +832,46 @@ def test_doctor_fails_the_unix_sockets_row_when_its_code_cannot_be_imported(tmp_
     monkeypatch.setitem(sys.modules, "levain.firing.confinement", None)   # import raises ImportError
     (r,) = doctor._check_unix_sockets(_entity(tmp_path))
     assert not r.ok and "not determinable" in r.detail
+
+
+def test_the_grant_check_waits_one_second_on_a_listener_that_does_not_accept(monkeypatch):
+    """B1 L3 r1 B-C2 (complement LOW4): the listener read at a grant's check blocked for the peer read's
+    5 s per granted socket on a hung listener; it connects with a 1 s timeout."""
+    seen = []
+
+    def peer(sock, *, timeout=5.0):
+        seen.append(timeout)
+        raise conf._ssh_agent.AgentError("timed out")
+
+    monkeypatch.setattr(conf._ssh_agent, "peer_pid", peer)
+    monkeypatch.setattr(conf.sys, "platform", "linux")
+    assert conf._listener_comm("/run/user/1/hung.sock") is None
+    assert seen == [1.0]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux blocks a connect to a full backlog")
+def test_a_listener_whose_backlog_is_full_costs_the_grant_check_about_a_second(tmp_path):
+    import time
+
+    d = tempfile.mkdtemp(dir="/tmp")
+    p = os.path.join(d, "s")
+    ls = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    ls.bind(p)
+    ls.listen(0)
+    held = []
+    try:
+        for _ in range(512):
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.setblocking(False)
+            held.append(c)
+            try:
+                c.connect(p)
+            except (BlockingIOError, OSError):
+                break
+        t = time.monotonic()
+        assert conf._listener_comm(p) is None
+        assert time.monotonic() - t < 3
+    finally:
+        for c in held:
+            c.close()
+        ls.close()
