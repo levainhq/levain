@@ -112,54 +112,74 @@ def test_the_install_lock_is_held_across_the_whole_verb_and_run_update_is_reentr
     assert _config(ent)["messaging"] == "governed"
 
 
-# only "raise" remains: a nonzero rc no longer decides recording (the "rc" case moved to the held-file and
-# pin-failure tests below), but an exception still propagates and records nothing
-@pytest.mark.parametrize("fail", ["raise"])
-def test_a_forced_update_error_records_nothing_and_a_plain_update_repairs_toward_the_record(
-        env, capsys, monkeypatch, fail):
+def test_an_exception_after_the_settings_write_applies_the_same_commit_gate_then_reraises(
+        env, capsys, monkeypatch):
     from levain import update as upd
 
     real = upd.run_update
 
     def after_write(*a, **k):
-        real(*a, **k)  # settings.json IS written
-        if fail == "raise":
-            raise RuntimeError("boom")
-        return 1
+        real(*a, **k)  # settings.json IS written and pinned
+        raise RuntimeError("boom")
 
-    # looser new file: recorded governed, set unmanaged, update errors after writing the loose file
     ent = _init(env, capsys, "a", messaging="governed")
-    before_cfg = _config(ent)
     monkeypatch.setattr(upd, "run_update", after_write)
-    if fail == "raise":
-        with pytest.raises(RuntimeError):
-            _set(ent, "unmanaged")
-    else:
-        assert _set(ent, "unmanaged") == 1
+    with pytest.raises(RuntimeError):
+        _set(ent, "unmanaged")
+    out = capsys.readouterr().out
     cfg = _config(ent)
-    assert cfg == before_cfg and "messaging_changed" not in cfg
-    loose = json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
-    assert "crossSessionInbound" not in loose  # the loose file is on disk
-    assert "restored" not in capsys.readouterr().out
-    monkeypatch.setattr(upd, "run_update", real)
-    assert cli.main(["update", "--path", str(ent), "--no-pip"]) == 0
-    capsys.readouterr()
-    fresh = _init(env, capsys, "f", messaging="governed")
-    assert ((ent / SETTINGS).read_bytes().replace(str(ent).encode(), b"X")
-            == (fresh / SETTINGS).read_bytes().replace(str(fresh).encode(), b"X"))  # re-tightened
-    # tighter new file: recorded isolate, set governed, update errors: the tighter file is kept
-    ent2 = _init(env, capsys, "b")
+    # the file carries unmanaged and the pin covers it: the record follows, with its stamp
+    assert "crossSessionInbound" not in json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
+    assert cfg["messaging"] == "unmanaged" and cfg["messaging_changed"]["from"] == "governed"
+    assert "LOOSENED governed -> unmanaged" in out
+    # a failed pin write: the gate refuses, nothing is recorded, the exception still propagates
+    ent2 = _init(env, capsys, "b", messaging="governed")
     cfg2 = _config(ent2)
-    monkeypatch.setattr(upd, "run_update", after_write)
-    if fail == "raise":
-        with pytest.raises(RuntimeError):
-            _set(ent2, "governed")
-    else:
-        assert _set(ent2, "governed") == 1
+    monkeypatch.setattr(hg, "repin_after_levain_write", lambda *a, **k: False)
+    with pytest.raises(RuntimeError):
+        _set(ent2, "unmanaged")
     assert _config(ent2) == cfg2
-    monkeypatch.setattr(upd, "run_update", real)
-    assert cli.main(["update", "--path", str(ent2), "--no-pip"]) == 0
-    assert json.loads((ent2 / SETTINGS).read_text(encoding="utf-8"))["crossSessionInbound"] == "hold"
+
+
+def test_an_exception_after_a_tightening_write_records_it_too(env, capsys, monkeypatch):
+    from levain import update as upd
+
+    real = upd.run_update
+
+    def after_write(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("boom")
+
+    ent = _init(env, capsys, "c")
+    monkeypatch.setattr(upd, "run_update", after_write)
+    with pytest.raises(RuntimeError):
+        _set(ent, "governed")
+    assert _config(ent)["messaging"] == "governed"
+
+
+def test_validation_runs_under_the_install_lock(env, capsys):
+    import threading
+
+    from levain.install import install_lock
+
+    ent = _init(env, capsys, "a")
+    (ent / ".levain" / "config.json").write_text("[1]", encoding="utf-8")  # a refusal that is not the lock's
+    release, held = threading.Event(), threading.Event()
+
+    def holder():
+        with install_lock(ent, create=False):
+            held.set()
+            release.wait(10)
+    t = threading.Thread(target=holder)
+    t.start()
+    held.wait(10)
+    try:
+        assert _set(ent, "governed") == 1
+        out = capsys.readouterr().out
+    finally:
+        release.set()
+        t.join()
+    assert "another levain process" in out and "not a JSON object" not in out
 
 
 def test_a_stale_pending_file_from_before_is_not_reported_as_held(env, capsys, monkeypatch):
@@ -282,3 +302,62 @@ def test_a_pin_write_that_fails_after_the_settings_file_is_written_records_nothi
     out = capsys.readouterr().out
     assert "crossSessionInbound" not in json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
     assert _config(ent) == cfg0 and "NOT recorded" in out and "LOOSENED" not in out
+
+
+def _drop_record(ent: Path) -> None:
+    cfg = _config(ent)
+    cfg.pop("messaging", None)
+    (ent / ".levain" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def test_show_with_no_record_infers_only_from_an_exact_match_else_custom(env, capsys):
+    ent = _init(env, capsys, "d", messaging="governed")
+    _drop_record(ent)
+    doc = json.loads((ent / SETTINGS).read_text(encoding="utf-8"))
+    for k in ("crossSessionInbound", "isolatePeerMachines"):
+        doc.pop(k, None)
+    doc["permissions"] = {"deny": ["SendMessage"]}  # a deny-only file matches no choice
+    (ent / SETTINGS).write_text(json.dumps(doc), encoding="utf-8")
+    assert cli.main(["messaging", "--path", str(ent)]) == 0
+    out = capsys.readouterr().out
+    assert "messaging: custom (no record" in out and "match no choice" in out and "inferred" not in out
+    off = _init(env, capsys, "o", messaging="off")
+    _drop_record(off)
+    assert cli.main(["messaging", "--path", str(off)]) == 0
+    out = capsys.readouterr().out
+    assert "messaging: off (inferred from .claude/settings.json; no record)" in out
+
+
+def test_a_changed_choice_drops_the_old_stamp_and_a_same_choice_rewrite_keeps_it(env, capsys):
+    ent = _init(env, capsys, "a")
+    assert _set(ent, "governed") == 0
+    assert "messaging_changed" in _config(ent)
+    capsys.readouterr()
+    assert run_init(ent, "claude-code", force=True, answers_file=_answers(env, capsys), messaging="unmanaged") == 0
+    assert "messaging_changed" not in _config(ent)  # fails on a63871b: the governed stamp survived
+    capsys.readouterr()
+    assert _set(ent, "governed") == 0
+    stamp = _config(ent)["messaging_changed"]
+    from levain.install import _write_messaging_choice
+    _write_messaging_choice(ent, "governed", lambda m: None)
+    assert _config(ent)["messaging_changed"] == stamp
+
+
+def test_an_unrecorded_governed_install_moving_to_isolate_stamps_and_prints_loosened(env, capsys):
+    ent = _init(env, capsys, "a", messaging="governed")
+    _drop_record(ent)
+    assert _set(ent, "isolate") == 0
+    out = capsys.readouterr().out
+    ch = _config(ent)["messaging_changed"]
+    assert ch["from"] == "governed" and ch["to"] == "isolate"
+    assert "LOOSENED governed -> isolate" in out
+
+
+def test_no_pin_names_the_fix(env, capsys):
+    ent = _init(env, capsys, "a")
+    (ent / ".levain" / "agent_hook_pins.json").unlink()
+    cfg0 = _config(ent)
+    assert _set(ent, "governed") != 0
+    out = capsys.readouterr().out
+    assert _config(ent).get("messaging") == cfg0.get("messaging")
+    assert "--repin-hooks" in out
