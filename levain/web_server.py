@@ -161,16 +161,23 @@ def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
 
 
+class _ConsentReader:
+    """The consent queue's listing reader for the decisions panel (Q6a): ``reader(now)`` over one queue directory,
+    read-only; no queue directory means no rows and no note. ``directory`` is explicit (None is the default queue) and
+    is what the rows and the proposals route both read; an object offering a reader without the attribute gets no
+    proposals from the route, never the default queue's."""
+
+    def __init__(self, directory: Any = None) -> None:
+        self.directory = directory
+
+    def __call__(self, now: datetime) -> Any:
+        from levain.consent.listing import read_listing
+
+        return read_listing(self.directory, now=now)
+
+
 def _consent_reader() -> Any:
-    """The consent queue's listing reader for the decisions panel (Q6a): ``fn(now)`` over the default queue
-    directory, read-only; no queue directory means no rows and no note."""
-    from levain.consent.listing import read_listing
-
-    def reader(now: datetime) -> Any:
-        return read_listing(now=now)
-
-    reader.directory = None     # type: ignore[attr-defined]   # the default queue; the proposals route reads the same one
-    return reader
+    return _ConsentReader()
 
 
 def broker_install_class(httpd: Any) -> str:
@@ -853,12 +860,17 @@ class _Handler(GuardedHandler):
                 from levain.consent.listing import entry_body, find_entry
 
                 if request_id == PROPOSALS_ID:      # the standing-rule cards: not a request, the id no request carries
-                    from levain.cockpit.proposals import propose
-                    from levain.consent.listing import read_history
+                    from levain.cockpit.proposals import MIN_HAND_ALLOWS, propose
+                    from levain.consent.listing import read_evidence
+                    from levain.consent.policy import AGENT_CONFIG_TIER
 
-                    status, payload = 200, {"proposals": [p.as_dict() for p in
-                                                          propose(read_history(getattr(self.server.consent_reader, "directory", None),
-                                                                      now=datetime.now(timezone.utc)))]}
+                    reader = self.server.consent_reader
+                    if not hasattr(reader, "directory"):     # a reader that names no queue: nothing, never the default one
+                        status, payload = 200, {"proposals": []}
+                    else:
+                        found = read_evidence(reader.directory, now=datetime.now(timezone.utc),
+                                              exclude_tier=AGENT_CONFIG_TIER, min_hand=MIN_HAND_ALLOWS)
+                        status, payload = 200, {"proposals": [p.as_dict() for p in propose(found)]}
                 else:
                     entry = find_entry(self.server.consent_reader(datetime.now(timezone.utc)), request_id)
                     if entry is not None:

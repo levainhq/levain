@@ -4,7 +4,7 @@ When the operator has answered the same request by hand, ``allow``, again and ag
 working directory), the page offers the one command that would make that a standing grant. The page never signs:
 a proposal is text, the ``levain consent grant create`` line the operator runs in a terminal with their own signing
 key. Nothing here reads the authority log or signs anything; the evidence is the consent queue's decided requests
-over the last :data:`levain.consent.listing.HISTORY`, read-only.
+over the last :data:`levain.consent.listing.HISTORY`, counted per key in the database, read-only.
 
 What is never proposed is whatever the log would refuse at append, taken from the log's own constants and checks
 (:mod:`levain.authority`), never listed again here: a shell tool, an MCP tool off the read-only list, a request at
@@ -15,15 +15,13 @@ Stdlib only (plus the record and listing helpers).
 from __future__ import annotations
 
 import shlex
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 from levain.authority import (CONSENT_AGENTS, CONSENT_POSTURES, CONSENT_SHELL_TOOLS, _CONSENT_TOOL,
                               consent_mcp_tool_problem, consent_root_problem, consent_workspace_problem)
-from levain.consent.listing import ConsentEntry, ConsentListing
-from levain.consent.policy import AGENT_CONFIG_TIER
+from levain.consent.listing import KeyEvidence
 
 __all__ = ["MIN_HAND_ALLOWS", "PROPOSED_LIFE", "PROPOSED_POSTURE", "PROPOSAL_CAP", "Proposal", "propose"]
 
@@ -81,31 +79,22 @@ def _duration(life: timedelta) -> str:
     return f"{days}d" if days and not rest else f"{int(life.total_seconds() // 3600)}h"
 
 
-def propose(history: ConsentListing) -> list[Proposal]:
-    """The proposals ``history`` (a :func:`~levain.consent.listing.read_history`) supports, most hand answers first,
-    then most recent, at most :data:`PROPOSAL_CAP`. A key (agent, tool, workspace) is proposed when it has
-    :data:`MIN_HAND_ALLOWS` hand-answered allows below the agent-config tier, no denial in the window, and its latest
-    decided request was not answered by a standing grant (one is already doing the work)."""
-    by_key: dict[tuple[str, str, str], list[ConsentEntry]] = defaultdict(list)
-    for e in history.recent:
-        if e.state in ("allowed", "denied"):
-            by_key[(e.request.agent, e.request.tool_name, e.request.cwd)].append(e)
+def propose(evidence: list[KeyEvidence]) -> list[Proposal]:
+    """The proposals ``evidence`` (a :func:`~levain.consent.listing.read_evidence`, taken with ``min_hand`` of
+    :data:`MIN_HAND_ALLOWS`) supports, most hand answers first, then most recent, at most :data:`PROPOSAL_CAP`. A key
+    (agent, tool, workspace) is proposed when it has :data:`MIN_HAND_ALLOWS` hand-answered allows below the
+    agent-config tier, no denial in the window, and its latest decided request was not answered by a standing grant
+    (one is already doing the work)."""
     out: list[Proposal] = []
-    for (agent, tool, cwd), entries in by_key.items():
-        if not _proposable(agent, tool, cwd):
-            continue
-        entries.sort(key=lambda e: (e.decided_at or "", e.request.id))    # a tie in the stamp: the later id
-        if any(e.state == "denied" for e in entries) or entries[-1].via == "grant":
-            continue
-        hand = [e for e in entries if e.state == "allowed" and e.via == "signature" and e.request.tier != AGENT_CONFIG_TIER]
-        if len(hand) < MIN_HAND_ALLOWS:
+    for k in evidence:
+        if k.hand_allows < MIN_HAND_ALLOWS or k.denied or k.latest_via_grant or not _proposable(k.agent, k.tool, k.cwd):
             continue
         expires = _duration(PROPOSED_LIFE)
-        command = " ".join(["levain consent grant create", "--agent", agent, "--tool", shlex.quote(tool),
-                            "--workspace", shlex.quote(cwd), "--posture", PROPOSED_POSTURE,
+        command = " ".join(["levain consent grant create", "--agent", k.agent, "--tool", shlex.quote(k.tool),
+                            "--workspace", shlex.quote(k.cwd), "--posture", PROPOSED_POSTURE,
                             "--expires", expires, "--signing-key <key>"])
-        out.append(Proposal(agent, tool, cwd, len(hand), hand[-1].decided_at or "", expires, PROPOSED_POSTURE, command,
-                            f"covers {tool} prompts under the {PROPOSED_POSTURE} permission mode inside {cwd}; "
+        out.append(Proposal(k.agent, k.tool, k.cwd, k.hand_allows, k.last_hand_at, expires, PROPOSED_POSTURE, command,
+                            f"covers {k.tool} prompts under the {PROPOSED_POSTURE} permission mode inside {k.cwd}; "
                             "other modes need their own --posture"))
     out.sort(key=lambda p: (p.count, p.last_at), reverse=True)
     return out[:PROPOSAL_CAP]
