@@ -927,7 +927,7 @@ def _check_unix_sockets(install: Path) -> list[CheckResult]:
     try:
         from levain.firing.confinement import ConfinementError, load_confinement_config, unix_socket_lines
     except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
-        return [CheckResult("unix sockets", True, f"not determinable ({exc})")]
+        return [CheckResult("unix sockets", False, f"not determinable ({exc})")]
     try:
         cfg = load_confinement_config(install)
     except Exception:  # noqa: BLE001 — _check_confinement already FAILs a broken config
