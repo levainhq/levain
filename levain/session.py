@@ -716,6 +716,9 @@ class EntitySession:
     :meth:`close` stops it."""
     ssh_agent_note: str | None = None
     """Why this session has no scoped ssh agent, when its bash could have had one; the banner says so."""
+    grants: Any = field(default=None, repr=False, compare=False)
+    """The conversation's operator grant snapshot (:class:`~levain.firing.confinement.GrantSnapshot`),
+    read once when its hands were built, or None without hands; the banner lists these."""
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -847,6 +850,7 @@ class EntitySession:
         hands_lock_fd: int | None = None
         hands_session_fd: int | None = None
         scoped_agent: Any = None
+        grant_snapshot: Any = None
         ssh_agent_note: str | None = None
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
@@ -984,6 +988,8 @@ class EntitySession:
                         "the conversation's hands did not report the floor this session resolved "
                         "— refusing to start (fail-closed)."
                     )
+                # The grants this conversation's shell gets, as its floor read them: the banner lists these.
+                grant_snapshot = tools_map["file_editor"].executor._floor.grants
             # The banner prints the floor the hands enforce: the binding's resolved value.
             deny_standard_creds = (
                 conv_binding.deny_standard_creds
@@ -1069,6 +1075,7 @@ class EntitySession:
             hands_uid=hands_id.uid if (with_tools and hands_id is not None) else None,
             ssh_agent=scoped_agent,
             ssh_agent_note=ssh_agent_note,
+            grants=grant_snapshot,
         )
 
     # -- the one operation ---------------------------------------------------

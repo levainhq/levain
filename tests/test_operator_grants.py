@@ -796,3 +796,29 @@ def test_a_gpg_grant_with_a_helper_this_user_can_write_still_starts_a_session(gr
         assert pinentry.resolve() in editor._policy.deny_write_files   # the stronger floor is the one enforced
     finally:
         s.close()
+
+
+def test_the_run_banner_lists_the_grants_the_conversation_took_not_the_file_now(grants, tmp_path, capsys, monkeypatch):
+    """B1 L3 r1 B-M5 (codex MED): the banner re-read grants.json, so a file edited after the session
+    started listed grants this conversation's shell never got. It renders the conversation's snapshot."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from levain.run import _banner_for
+    from levain.session import EntitySession
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
+    monkeypatch.setattr(conf, "grants_apply", lambda system=None: True)
+    monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))   # no syscall
+    grants([{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])
+    ent = tmp_path / "e"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="interactive")
+    try:
+        grants([{"path": "/run/user/1/docker.sock", "name": "docker", "why": "later"}])
+        _banner_for(s)
+        out = capsys.readouterr().out
+        assert "waiver (operator grant) podman" in out and "waiver (operator grant) docker" not in out, out
+    finally:
+        s.close()
