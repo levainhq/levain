@@ -560,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_canary_parser(cs_sub)
     _add_consent_grant_parser(cs_sub, _ck_common)
     _add_consent_answer_parser(cs_sub)
+    _add_consent_away_parser(cs_sub)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1953,6 +1954,70 @@ def _add_consent_grant_parser(cs_sub: argparse._SubParsersAction, common: object
     cs_list = cs_grant_sub.add_parser("list", help="List the consent grants the authority log holds.")
     common(cs_list)
     cs_list.set_defaults(func=_cmd_consent_grant_list)
+
+
+def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
+    """``levain consent away [show|on|off]`` under the ``consent`` subparsers ``cs_sub``."""
+    away = cs_sub.add_parser(
+        "away", help="Show or set away mode: whether the consent hook holds a request for a signed answer.",
+        description="Away mode off (the default): the hook answers only by a standing grant and otherwise leaves "
+                    "the agent's own dialog to ask you at once, so a signed answer has nothing to land on. On: the "
+                    "hook holds each request it cannot answer by a grant for up to --hold seconds while you answer "
+                    "it with `levain consent answer` or your phone, then leaves it to the agent's dialog. Changes "
+                    "only away_mode and away_hold_seconds in <queue dir>/claude_code.json and codex.json; grants "
+                    "nothing (every answer still verifies as a signature). Takes effect at the next request.")
+    away.add_argument("action", nargs="?", choices=("show", "on", "off"), default="show")
+    away.add_argument("--agent", choices=("claude_code", "codex", "all"), default="all",
+                      help="Which agent's settings (default: every agent that has a settings file).")
+    away.add_argument("--hold", type=float, default=None,
+                      help="Seconds to hold a request in away mode, more than 0 and at most 900 (default: the "
+                           "file's hold, else 300).")
+    away.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                      help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+    away.set_defaults(func=_cmd_consent_away)
+
+
+def _cmd_consent_away(args: argparse.Namespace) -> int:
+    from levain.consent import away
+    from levain.consent.queue import QueueStoreError, default_queue_dir
+
+    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+    agents = list(away.AGENTS) if args.agent == "all" else [args.agent]
+    if args.action == "show" and args.hold is not None:
+        print("levain consent away: --hold goes with `on` or `off`", file=sys.stderr)
+        return 2
+    rc, seen = 0, 0
+    for agent in agents:
+        try:
+            if args.action == "show" or args.agent == "all":
+                data = away.read(qdir, agent)
+                if data is None:
+                    if args.agent != "all":
+                        print(f"{agent}: no settings file in {qdir} (`levain init` with the consent hook on "
+                              "writes it)", file=sys.stderr)
+                        rc = 1
+                    continue
+            if args.action != "show":
+                data = away.set_away(qdir, agent, args.action == "on", args.hold)
+            seen += 1
+        except (OSError, ValueError, QueueStoreError) as e:
+            print(f"levain consent away: {agent}: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        state = "ON" if data.get("away_mode") is True else "off"
+        hold = data.get("away_hold_seconds")
+        line = f"{agent}: away mode {state}"
+        if data.get("away_mode") is True:
+            line += f", holds up to {hold:g}s for a signed answer" if isinstance(hold, (int, float)) else ""
+        root = data.get("cockpit_data_root")
+        line += f"; answers verify against {root}" if isinstance(root, str) and root else \
+            "; WARN: names no cockpit_data_root, so no grant or signed answer can verify"
+        print(line)
+    if seen == 0 and rc == 0:
+        print(f"levain consent away: no consent settings in {qdir}; `levain init` with the consent hook on writes "
+              "them", file=sys.stderr)
+        return 1
+    return rc
 
 
 def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
