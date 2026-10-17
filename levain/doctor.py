@@ -2159,6 +2159,20 @@ def _check_cc_sandbox(install: Path) -> list[CheckResult]:
 
 
 def _check_cc_messaging(install: Path) -> list[CheckResult]:
+    """The messaging row, with the audit tail `levain messaging set` leaves ("(changed from X <at>)")."""
+    import dataclasses
+
+    from levain.install import messaging_change
+
+    rows = _check_cc_messaging_posture(install)
+    change = messaging_change(install)
+    if change is not None and rows:
+        rows[0] = dataclasses.replace(
+            rows[0], detail=f"{rows[0].detail} (changed from {change['from']} {change['at']})")
+    return rows
+
+
+def _check_cc_messaging_posture(install: Path) -> list[CheckResult]:
     """Q9: Claude Code's cross-session messaging for this workspace, read with the vendor's precedence
     (:func:`levain.host_guard.cc_messaging_posture`), as the settings files say it. Governed = inbound `hold`/`refuse`
     and outbound `ask`/`deny` on `SendMessage`. Ungoverned under the install's recorded `isolate` (the default) or
@@ -2194,7 +2208,7 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
     if chosen == "off" and not (p.inbound == "refuse" and p.outbound == "deny" and p.list_denied):
         return [CheckResult("Claude Code messaging", True, f"this install's recorded choice is `off`, and the files "
                             f"say less: {detail}",
-                            "Re-run `levain init --path <install> --force --messaging off`, or record the posture "
+                            "Run `levain messaging set off`, or record the posture "
                             "you want; doctor never edits your settings.", warn=True)]
     if p.inbound in ("hold", "refuse") and p.outbound in ("ask", "deny"):
         return [CheckResult("Claude Code messaging", True, detail)]
@@ -2210,11 +2224,11 @@ def _check_cc_messaging(install: Path) -> list[CheckResult]:
                             f"not governed, by this install's messaging choice `{chosen}`: {gaps}. Claude Code never "
                             "counts a message from another session as your consent, so it cannot answer a permission "
                             "prompt; a delivered message can still lead Claude to act with the permissions the "
-                            "session already has. To govern messaging, a new `levain init --messaging governed` "
+                            "session already has. To govern messaging, `levain messaging set governed` "
                             f"writes the hold and the ask. {inbound}; {outbound} {seen}")]
     return [CheckResult("Claude Code messaging", True, detail,
                         'Set `crossSessionInbound: "hold"` and `permissions.ask: ["SendMessage"]` in the '
-                        "workspace's .claude/settings.json (a new `levain init --messaging governed` writes both; "
+                        "workspace's .claude/settings.json (`levain messaging set governed` writes both; "
                         "doctor never edits your settings), or accept this as your own trust decision.", warn=True)]
 
 
