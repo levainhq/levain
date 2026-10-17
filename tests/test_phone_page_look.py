@@ -90,13 +90,15 @@ def test_request_data_is_shown_as_filed_in_both_colour_schemes(world, tmp_path: 
         ])
     light, dark = out["values"][-2], out["values"][-1]
     assert row["agent"] == "claude_code" and row["tool"] == "Write" and row["cwd"] == "/w"
+    assert row.get("targets"), "the fixture request must touch a path, or the second where line is never drawn"
     for scheme, got in (("light", light), ("dark", dark)):
         for name, want in (("meta", row["agent"]), ("tool", row["tool"]), ("display", row["display"])):
             assert got[name]["transform"] == "none", (scheme, name, got[name])
             assert got[name]["text"] == want, (scheme, name, "shown differently from the server's value", got[name]["text"], want)
             assert not got[name]["clipped"] and got[name]["textOverflow"] == "clip" and got[name]["clamp"] in ("none", ""), (scheme, name, got[name])
         assert got["where"], (scheme, "the request's where lines are missing")
-        assert [w["text"] for w in got["where"]][0] == "in " + row["cwd"], (scheme, got["where"])
+        want_where = ["in " + row["cwd"]] + (["touches " + str(row["targets"])] if row.get("targets") else [])
+        assert [w["text"] for w in got["where"]] == want_where, (scheme, got["where"], want_where)
         for w in got["where"]:
             assert w["transform"] == "none" and not w["clipped"], (scheme, w)
     assert light["card"] != dark["card"], "the card drew the same in both colour schemes: the dark block is missing"
