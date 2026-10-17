@@ -1168,6 +1168,9 @@ body.ke .ck-card.w.w-open:focus-visible { outline: 1px solid var(--line-hot); ou
 /* the focus view's group headings (a list drawn as a count): the kernel's own groups, in its own order */
 .ext-grouphead { margin: var(--sp-5) 0 var(--sp-2); color: var(--label); font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; }
 .ext-grouphead:first-child { margin-top: 0; }
+/* the proposals' heading is first inside its slot, not in the list: it keeps the gap every other heading has, unless the slot itself leads */
+.proposal-slot > .ext-grouphead:first-child { margin-top: var(--sp-5); }
+.proposal-slot:first-child > .ext-grouphead:first-child { margin-top: 0; }
 
 /* ZONES: a fixed 3-column grid, a row as tall as its tallest card, spans as grid-column spans */
 body.ke #board.ke { display: block; padding-block: 0; }

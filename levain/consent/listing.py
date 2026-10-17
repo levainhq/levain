@@ -28,14 +28,14 @@ from typing import Any
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.record import ExternalGateRequest
 
-__all__ = ["ConsentEntry", "ConsentListing", "HISTORY", "HISTORY_CAP", "PENDING_CAP", "RECENT", "RECENT_CAP",
-           "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_history",
+__all__ = ["ConsentEntry", "ConsentListing", "EVIDENCE_KEYS", "HISTORY", "KeyEvidence", "PENDING_CAP", "RECENT", "RECENT_CAP",
+           "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_evidence",
            "read_listing"]
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
 RECENT_CAP = 50
 HISTORY = timedelta(days=14)        # how far back the standing-rule proposals read decided requests
-HISTORY_CAP = 500                   # decided rows read for them, newest first
+EVIDENCE_KEYS = 200                 # keys the proposals' evidence returns (a bound on keys, never on the rows counted)
 PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
 UNSHOWN = object()
 TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
@@ -162,68 +162,105 @@ def _grant_id_of(answer: Any) -> str | None:
     return gid if isinstance(gid, str) else None
 
 
-def read_history(directory: Path | str | None = None, *, now: datetime) -> ConsentListing:
-    """The answered requests (``allowed`` and ``denied``, nothing else) of the last :data:`HISTORY`, as
-    :func:`read_listing` reads them with a longer look-back: what the page's standing-rule proposals count. Same
-    read-only rules. The bound: the newest :data:`HISTORY_CAP` allowed-or-denied rows, plus, read apart, the newest
-    :data:`HISTORY_CAP` denials, so a busy queue (or a flood of allows) can never crowd out the denial that must
-    withdraw a card; at most twice the cap is read, and none of it is cut afterwards."""
-    return read_listing(directory, now=now, span=HISTORY, cap=HISTORY_CAP, decided_only=True)
+@dataclass(frozen=True)
+class KeyEvidence:
+    """What the decided requests of one (agent, tool, working directory) say over the last :data:`HISTORY`: how many
+    were allowed by hand (a signed answer, below the agent-config tier), when the latest of those was, whether any
+    was denied, and whether the latest decision of all was a standing grant's."""
+    agent: str
+    tool: str
+    cwd: str
+    hand_allows: int
+    last_hand_at: str
+    denied: bool
+    latest_via_grant: bool
 
 
-def read_listing(directory: Path | str | None = None, *, now: datetime, span: timedelta = RECENT,
-                 cap: int = RECENT_CAP, decided_only: bool = False) -> ConsentListing:
-    """The queue in ``directory`` (default :func:`~levain.consent.queue.default_queue_dir`) as of ``now``.
-    ``span`` and ``cap`` bound the terminal requests read (the last day and :data:`RECENT_CAP` by default).
-    No directory or no file is an empty listing and nothing is created. A store that cannot be trusted (another
-    format, a directory others can reach) raises :class:`~levain.consent.queue.QueueStoreError`; a database
-    that cannot be read raises ``sqlite3.Error``: the caller's note, never a dark panel. ``decided_only`` reads no
-    pending or expired request and only ``allowed`` / ``denied`` rows (see :func:`read_history` for its bound)."""
-    from levain.consent.queue import DB_NAME, STORE_FORMAT, QueueStoreError, default_queue_dir
+def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude_tier: str,
+                  min_hand: int = 1) -> list[KeyEvidence]:
+    """The standing-rule proposals' evidence, computed in the database per key (``GROUP BY agent, tool_name, cwd``)
+    over the allowed and denied requests of the last :data:`HISTORY`: no row cap is involved, so no number of newer
+    rows of other keys can crowd out a key's allows or its denial. Only keys with at least ``min_hand`` hand-allows
+    come back, most first then most recent, at most :data:`EVIDENCE_KEYS` of them (a bound on keys, not on rows).
+    Same read-only rules as :func:`read_listing`; a request's seal is not re-checked (the count is an aggregate)."""
+    conn = _open_ro(directory)
+    if conn is None:
+        return []
+    horizon = utc_stamp(now - HISTORY)
+    try:
+        conn.execute("BEGIN")
+        _check_format(conn)
+        rows = conn.execute(
+            "SELECT agent, tool_name, cwd, "
+            "SUM(CASE WHEN state = 'allowed' AND via = 'signature' AND tier != ?1 THEN 1 ELSE 0 END) AS hand, "
+            "MAX(CASE WHEN state = 'allowed' AND via = 'signature' AND tier != ?1 THEN decided_at END), "
+            "MAX(CASE WHEN state = 'denied' THEN 1 ELSE 0 END), "
+            "(SELECT r2.via FROM requests r2 WHERE r2.agent = r.agent AND r2.tool_name = r.tool_name AND r2.cwd = r.cwd "
+            "AND r2.state IN ('allowed', 'denied') AND r2.decided_at >= ?2 ORDER BY r2.decided_at DESC, r2.id DESC LIMIT 1) "
+            "FROM requests r WHERE state IN ('allowed', 'denied') AND decided_at >= ?2 "
+            "GROUP BY agent, tool_name, cwd HAVING hand >= ?3 "
+            "ORDER BY hand DESC, MAX(decided_at) DESC LIMIT ?4", (exclude_tier, horizon, min_hand, EVIDENCE_KEYS)).fetchall()
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return [KeyEvidence(a, t, c, int(n), last or "", bool(d), v == "grant") for a, t, c, n, last, d, v in rows]
+
+
+def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:
+    """A read-only connection to the queue in ``directory``, or None when there is no queue (nothing is created)."""
+    from levain.consent.queue import DB_NAME, default_queue_dir
 
     base = Path(directory) if directory is not None else default_queue_dir()
     path = base / DB_NAME
     try:
         _check_directory(base)
     except FileNotFoundError:
-        return ConsentListing()
+        return None
     if not path.is_file():
+        return None
+    # a short busy wait: the page's read worker never stalls on a writer holding the database
+    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
+
+
+def _check_format(conn: sqlite3.Connection) -> None:
+    from levain.consent.queue import STORE_FORMAT, QueueStoreError
+
+    fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+    if fmt is None or fmt[0] != STORE_FORMAT:
+        raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
+
+
+def read_listing(directory: Path | str | None = None, *, now: datetime, span: timedelta = RECENT,
+                 cap: int = RECENT_CAP) -> ConsentListing:
+    """The queue in ``directory`` (default :func:`~levain.consent.queue.default_queue_dir`) as of ``now``.
+    ``span`` and ``cap`` bound the terminal requests read (the last day and :data:`RECENT_CAP` by default).
+    No directory or no file is an empty listing and nothing is created. A store that cannot be trusted (another
+    format, a directory others can reach) raises :class:`~levain.consent.queue.QueueStoreError`; a database
+    that cannot be read raises ``sqlite3.Error``: the caller's note, never a dark panel."""
+    conn = _open_ro(directory)
+    if conn is None:
         return ConsentListing()
     stamp = utc_stamp(now)
     horizon = utc_stamp(now - span)
     cols = ", ".join(_REQUEST_FIELDS) + ", state, decided_at, answer, signer_fp, via"
-    # a short busy wait: the page's read worker never stalls on a writer holding the database
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
     try:
         conn.execute("BEGIN")
-        fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-        if fmt is None or fmt[0] != STORE_FORMAT:
-            raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
+        _check_format(conn)
         # every read is bounded and indexed (requests_pending, requests_decided): the queue's whole history is
         # never scanned. The live pending come soonest-expiring first, one past the cap, so overflow is known
         # without counting every row; the unswept expired ones (which would crowd the live ones out of that
         # order) are read apart, newest expiry first, within the recent cap
-        if decided_only:
-            rows = conn.execute(
-                f"SELECT {cols} FROM requests WHERE state IN ('allowed', 'denied') AND decided_at >= ? "
-                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
-            seen = {r[0] for r in rows}      # the denials, apart: never crowded out by newer allows
-            rows += [r for r in conn.execute(
-                f"SELECT {cols} FROM requests WHERE state = 'denied' AND decided_at >= ? "
-                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall() if r[0] not in seen]
-            overflow = False
-        else:
-            rows = conn.execute(
-                f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at > ? "
-                "ORDER BY expires_at ASC, rowid ASC LIMIT ?", (stamp, PENDING_CAP + 1)).fetchall()
-            overflow = len(rows) > PENDING_CAP
-            rows = rows[:PENDING_CAP]
-            rows += conn.execute(
-                f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
-                "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, cap)).fetchall()
-            rows += conn.execute(
-                f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
-                "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
+        rows = conn.execute(
+            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at > ? "
+            "ORDER BY expires_at ASC, rowid ASC LIMIT ?", (stamp, PENDING_CAP + 1)).fetchall()
+        overflow = len(rows) > PENDING_CAP
+        rows = rows[:PENDING_CAP]
+        rows += conn.execute(
+            f"SELECT {cols} FROM requests WHERE state = 'pending' AND expires_at <= ? AND expires_at >= ? "
+            "ORDER BY expires_at DESC LIMIT ?", (stamp, horizon, cap)).fetchall()
+        rows += conn.execute(
+            f"SELECT {cols} FROM requests WHERE state != 'pending' AND decided_at >= ? "
+            "ORDER BY decided_at DESC LIMIT ?", (horizon, cap)).fetchall()
         # a store opened only by a levain before dialog outcomes has no such table: no outcomes
         outcomes: dict[str, str] = {}
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dialog_outcomes'").fetchone():
@@ -267,4 +304,4 @@ def read_listing(directory: Path | str | None = None, *, now: datetime, span: ti
             recent.append(ConsentEntry(request, state, via, signer_fp, gid, decided_at, outcomes.get(request.id)))
     pending.sort(key=lambda e: (e.request.received_at, e.request.id))
     recent.sort(key=lambda e: (e.decided_at or "", e.request.id), reverse=True)
-    return ConsentListing(tuple(pending), tuple(recent if decided_only else recent[:cap]), skipped, overflow)
+    return ConsentListing(tuple(pending), tuple(recent[:cap]), skipped, overflow)

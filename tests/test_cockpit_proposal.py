@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from levain.cockpit.proposals import MIN_HAND_ALLOWS, PROPOSAL_CAP, PROPOSED_LIFE, propose
-from levain.consent.listing import read_history, read_listing
+from levain.consent.listing import KeyEvidence, read_evidence, read_listing
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import ConsentQueue, authority_source
 
@@ -32,14 +32,14 @@ class Seed:
 
     def __init__(self, base: Path) -> None:
         self.dir = base / "consent"
-        self.dir.mkdir(mode=0o700)
+        self.dir.mkdir(mode=0o700, parents=True)
         self.clock = [NOW - timedelta(days=5)]
         self.q = ConsentQueue(self.dir, authority=authority_source(self.dir, anchor=None), clock=lambda: self.clock[0])
         self.n = 0
 
     def decide(self, state: str = "allowed", *, via: str | None = "signature", agent: str = "claude_code",
                tool: str = "Edit", cwd: str = WS, tier: str = "T2", tool_input: dict | None = None,
-               ago: timedelta = timedelta(hours=1)) -> None:
+               ago: timedelta = timedelta(hours=1)) -> str:
         self.n += 1
         self.clock[0] = NOW - ago
         r = self.q.file(agent=agent, agent_session_id=f"s{self.n}", tool_name=tool,
@@ -51,9 +51,13 @@ class Seed:
                          (state, _stamp(NOW - ago + timedelta(seconds=20)), via, "SHA256:testkey", r.id))
         finally:
             conn.close()
+        return r.id
+
+    def evidence(self):
+        return read_evidence(self.dir, now=NOW, exclude_tier=AGENT_CONFIG_TIER, min_hand=MIN_HAND_ALLOWS)
 
     def propose(self):
-        return propose(read_history(self.dir, now=NOW))
+        return propose(self.evidence())
 
 
 @pytest.fixture
@@ -181,7 +185,7 @@ def _route(monkeypatch, seed, *, token: bool) -> tuple[int, dict]:
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     h = ws._Handler.__new__(ws._Handler)
     sent: list = []
-    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=lambda now: read_listing(seed.dir, now=now))
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=ws._ConsentReader(seed.dir))
     h._off_box_token_valid = lambda: token
     h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
     h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
@@ -249,31 +253,34 @@ def test_a_page_without_its_token_draws_no_card(tmp_path, monkeypatch):
 
 # ---- L3 r1 fixes (head triage 1017+4) -------------------------------------------------------------------------
 
-def test_f2_a_busy_queue_does_not_crowd_out_the_denial_or_the_allows(seed, monkeypatch):
-    import levain.consent.listing as listing
+def test_g2_more_than_500_newer_allows_of_other_keys_do_not_hide_a_card(seed):
+    for i in range(3):
+        seed.decide(ago=timedelta(days=9, hours=i))
+    for i in range(520):
+        seed.decide(cwd=f"/work/o{i % 7}", tool="Write", ago=timedelta(hours=1 + i % 50))
+    assert WS in [p.workspace for p in seed.propose()]
 
-    monkeypatch.setattr(listing, "HISTORY_CAP", 8)
+
+def test_g2_more_than_500_newer_denials_of_other_keys_do_not_hide_the_keys_denial(seed):
     seed.decide("denied", ago=timedelta(days=12))
+    for i in range(520):
+        seed.decide("denied", cwd=f"/work/o{i % 7}", tool="Write", ago=timedelta(days=2, minutes=i))
     for i in range(3):
-        seed.decide(ago=timedelta(days=10, hours=i), cwd="/work/other")
-    for i in range(8):                      # newer terminal rows that are not decisions: they must not crowd anything out
-        seed.decide("withdrawn", via=None, cwd="/work/noise", ago=timedelta(hours=1 + i))
-    for i in range(3):                      # three newer allows of the denied key and cap-many newer allows of another
-        seed.decide(ago=timedelta(days=1, hours=i))
-    assert [p.workspace for p in seed.propose()] == ["/work/other"]    # WS carries a denial: withdrawn, not dropped
-    kept = {(e.state) for e in read_history(seed.dir, now=NOW).recent}
-    assert kept <= {"allowed", "denied"}
+        seed.decide(ago=timedelta(minutes=10 + i))
+    assert WS not in [p.workspace for p in seed.propose()]      # the older denial still withdraws the card
 
 
-def test_f2_the_allows_survive_a_cap_filled_with_newer_allows_of_other_keys(seed, monkeypatch):
+def test_g2_withdrawn_rows_are_not_evidence_and_the_key_count_is_bounded(seed, monkeypatch):
     import levain.consent.listing as listing
 
-    monkeypatch.setattr(listing, "HISTORY_CAP", 4)
-    for i in range(3):
-        seed.decide(ago=timedelta(days=9, hours=i), cwd="/work/old")
     for i in range(6):
         seed.decide("withdrawn", via=None, ago=timedelta(hours=1 + i))
-    assert [p.workspace for p in seed.propose()] == ["/work/old"]
+    assert seed.evidence() == []
+    monkeypatch.setattr(listing, "EVIDENCE_KEYS", 2)
+    for k in range(4):
+        for _ in range(3 + k):
+            seed.decide(cwd=f"/work/p{k}")
+    assert [e.cwd for e in seed.evidence()] == ["/work/p3", "/work/p2"]       # keys bounded, most answered first
 
 
 def test_f3_an_mcp_tool_with_an_empty_server_is_never_proposed(seed):
@@ -282,30 +289,37 @@ def test_f3_an_mcp_tool_with_an_empty_server_is_never_proposed(seed):
     assert seed.propose() == []
 
 
-def test_f4_a_tie_in_decided_at_picks_the_later_row(seed):
-    import dataclasses
-
-    from levain.consent.listing import ConsentEntry, ConsentListing
-
-    for _ in range(4):
-        seed.decide()
-    base = [e for e in read_history(seed.dir, now=NOW).recent]
-    at = base[0].decided_at
-
-    def listing(grant_id: str, hand_id_base: str) -> ConsentListing:
-        rows = [ConsentEntry(dataclasses.replace(e.request, id=f"{hand_id_base}{i}"), "allowed", "signature", "fp", None, at)
-                for i, e in enumerate(base[:3])]
-        rows.append(ConsentEntry(dataclasses.replace(base[3].request, id=grant_id), "allowed", "grant", None, "g1", at))
-        return ConsentListing(recent=tuple(rows[::-1]))     # the input order must not decide
-
-    assert propose(listing("zzz", "a")) == []               # the grant row is the later: it is already answering
-    assert len(propose(listing("000", "a"))) == 1           # the hand row is the later: still proposed
+def test_f4_a_tie_in_decided_at_picks_the_later_id(seed, tmp_path):
+    tie = timedelta(hours=3)                                              # one stamp for every row: only the id decides
+    hand = [seed.decide(ago=tie) for _ in range(3)]
+    grant = seed.decide(via="grant", ago=tie)
+    while grant < max(hand):                                              # ids are random: file grants until one is the later
+        grant = seed.decide(via="grant", ago=tie)
+    assert seed.propose() == []                                           # the later row is a grant: it is already answering
+    other = Seed(tmp_path / "two")
+    grant = other.decide(via="grant", ago=tie)
+    hand = [other.decide(ago=tie) for _ in range(3)]
+    while max(hand) < grant:
+        hand.append(other.decide(ago=tie))
+    assert len(other.propose()) == 1                                      # the later row is a hand allow: still proposed
 
 
-def test_f5_the_route_reads_the_directory_the_server_was_given(seed, monkeypatch, tmp_path):
+def _serve_route(seed, reader):
     import threading
     from types import SimpleNamespace
 
+    import levain.web_server as ws
+
+    h = ws._Handler.__new__(ws._Handler)
+    sent: list = []
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=reader)
+    h._off_box_token_valid = lambda: True
+    h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
+    h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
+    return sent[0]
+
+
+def test_g3_the_route_reads_the_directory_the_reader_names(seed, monkeypatch, tmp_path):
     import levain.web_server as ws
 
     for _ in range(3):
@@ -313,16 +327,17 @@ def test_f5_the_route_reads_the_directory_the_server_was_given(seed, monkeypatch
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.setenv("LEVAIN_HOME", str(elsewhere))           # the default queue is a different (empty) one
-    reader = (lambda now: read_listing(seed.dir, now=now))
-    reader.directory = seed.dir
-    h = ws._Handler.__new__(ws._Handler)
-    sent: list = []
-    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=reader)
-    h._off_box_token_valid = lambda: True
-    h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
-    h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
-    assert sent[0][0] == 200 and [p["tool"] for p in sent[0][1]["proposals"]] == ["Edit"]
-    assert ws._consent_reader().directory is None               # the default reader: the default queue
+    status, body = _serve_route(seed, ws._ConsentReader(seed.dir))
+    assert status == 200 and [p["tool"] for p in body["proposals"]] == ["Edit"]
+    assert ws._consent_reader().directory is None               # the default reader: the default queue, named explicitly
+
+
+def test_g3_a_reader_without_a_directory_yields_no_cards_never_the_default_queue(seed, monkeypatch):
+    for _ in range(3):
+        seed.decide()
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))      # the default queue IS the seeded one
+    status, body = _serve_route(seed, lambda now: read_listing(seed.dir, now=now))
+    assert status == 200 and body == {"proposals": []}
 
 
 @needs_browser
@@ -386,3 +401,30 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
             {"eval": heads},
         ])
     assert out["values"][-1] == ["agents waiting on you", "standing rule proposals", "resolved"]
+
+
+@needs_browser
+def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monkeypatch):
+    seed = Seed(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    for i in range(3):
+        seed.decide(ago=timedelta(hours=2 + i))
+    seed.clock[0] = datetime.now(timezone.utc)
+    seed.q.file(agent="claude_code", agent_session_id="live", tool_name="Edit", tool_input={"file_path": "/w/a"},
+                cwd="/w", hold=timedelta(minutes=30), event_id="live")
+    _root, src, _ids = _install(tmp_path)
+    box = "document.querySelector('#levain-modal input[type=search], #levain-modal input.ext-search, #levain-modal input[type=text]')"
+    typed = ("(() => { const b = " + box + "; b.value = '%s'; b.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    pause = "new Promise(r => setTimeout(() => r(1), 700))"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": f"{TILE}.click(); 1"},
+            {"until": f"{_CARDS}.length === 1"},
+            {"eval": typed % "zzz-nothing-matches"}, {"eval": pause},
+            {"eval": typed % ""}, {"eval": pause},
+            {"eval": f"{_CARDS}.length"},
+            {"eval": "(() => { const m = [...document.querySelectorAll('#levain-modal button')].find(b => /show all/i.test(b.textContent)); if (m) m.click(); return 1; })()"},
+            {"eval": pause},
+            {"eval": f"{_CARDS}.length"},
+        ])
+    assert out["values"][-4] == 1 and out["values"][-1] == 1
