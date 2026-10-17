@@ -935,11 +935,26 @@ def test_consent_tool_problem_allows_only_the_tools_levain_knows_for_each_agent(
         assert auth.consent_tool_problem(agent, "mcp__fs__read_text_file") is None
         assert "not know to be read-only" in auth.consent_tool_problem(agent, "mcp__fs__write_file")
         assert "shell tool" in auth.consent_tool_problem(agent, "Bash")
-    for agent, tool in (("claude_code", "Task"), ("claude_code", "Agent"), ("claude_code", "SendMessage"),
+    for agent, tool in (("claude_code", "Task"), ("claude_code", "Agent"),
                         ("claude_code", "WebSearch"), ("claude_code", "write"), ("claude_code", "apply_patch"),
                         ("codex", "Edit"), ("codex", "SomeNewTool"), ("other", "Read"), (None, "Read"),
                         ("claude_code", 7)):
         assert auth.consent_tool_problem(agent, tool) is not None, (agent, tool)
+
+
+def test_a_sendmessage_grant_is_accepted_and_answers_a_send(tmp_path):
+    """Reproduced 2026-10-17 on seat/1017-4-C 05ca239 (L3 r2 codex MED): the allowlist refused ``SendMessage``, so the
+    standing grant CHANGELOG [0.11.x] (governed messaging) names as the way to stop governed sessions stalling could
+    not be created. The tool is matched on the working directory alone (no target path)."""
+    ws, run = _granted_mcp_hook(tmp_path, "SendMessage")
+    out = json.loads(run(event("SendMessage", {"to": "main", "message": "hi"}, cwd=str(ws))))
+    assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert run(event("SendMessage", {"to": "main", "message": "hi"}, cwd="/")) == ""   # outside the workspace
+
+
+def test_the_tool_refusal_for_an_unknown_agent_names_no_empty_list():
+    msg = auth.consent_tool_problem("gemini", "Read")
+    assert "gemini is not a consent agent" in msg and "( ," not in msg
 
 
 @pytest.mark.parametrize("inp", [{"filepath": "/etc/hosts"}, {"relative_path": "../../etc/hosts"},

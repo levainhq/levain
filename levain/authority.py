@@ -222,7 +222,9 @@ CONSENT_POSTURES: Mapping[str, frozenset[str]] = MappingProxyType({
 })
 # The built-in tools a consent grant may name, per agent (:func:`consent_tool_problem`): each one either reached
 # levain's hook in a measured PermissionRequest or has its targets read by ``levain.consent.policy``, and is not a
-# shell. A name off the list (Claude Code's Task or Agent, which spawns a model with any prompt; a tool an agent
+# shell. The file and search tools have their target paths checked against the workspace; WebFetch and SendMessage
+# name no path and are matched on the working directory alone.
+# A name off the list (Claude Code's Task or Agent, which spawns a model with any prompt; a tool an agent
 # adds in its next release) is refused at append and answers nothing at decision: its requests go to you.
 CONSENT_GRANTABLE_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
     "claude_code": frozenset({
@@ -233,6 +235,10 @@ CONSENT_GRANTABLE_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
         "Read", "Grep", "LS", "NotebookRead",
         "Glob",         # policy.GLOB_TOOLS: its pattern, refused when it can reach outside its root
         "WebFetch",     # names no path: matched on its working directory alone (policy module docstring)
+        # names no path: matched on the working directory alone. Measured in a PermissionRequest
+        # (project_memory/1016-land/Q9_OWNCHILD_RUN); CHANGELOG [0.11.x] governed messaging documents a standing
+        # grant on it as the way a governed session stops stalling
+        "SendMessage",
     }),
     # policy.AGENT_FILE_TOOLS, targets read by the Codex adapter's patch reader; measured in a PermissionRequest
     # (1015-consent Q3_RUN/fix1 and Q5_RUN canary_codex_record.jsonl, 1017-shellnames r1)
@@ -1274,8 +1280,10 @@ def consent_tool_problem(agent: str, tool: str) -> str | None:
     known = CONSENT_GRANTABLE_TOOLS.get(agent) if isinstance(agent, str) else None
     if known is not None and tool in known:
         return None
+    if known is None:
+        return f"{tool[:200]!r}: {str(agent)[:40]} is not a consent agent; its requests go to you"
     return (f"{tool[:200]!r} is not a tool levain knows for {str(agent)[:40]}: a grant may name only a tool whose "
-            f"request levain bounds to the workspace ({', '.join(sorted(known or ()))}, or an MCP read tool); its "
+            f"request levain bounds to the workspace ({', '.join(sorted(known))}, or an MCP read tool); its "
             "requests go to you")
 
 
