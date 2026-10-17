@@ -50,8 +50,8 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
-    "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
+    "consent_grant", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
 
@@ -691,10 +691,31 @@ def _validate_consent_grant(grant: Mapping[str, Any], what: str, at: datetime | 
     return _thaw(grant)
 
 
+def _validate_inert_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A grant of a kind this levain does not know (one a newer levain wrote), held INERT: only its envelope is read
+    (``id`` a non-empty string, ``kind`` a :data:`_GRANT_KIND_NAME`, ``expires_at`` a stamp at most 30 days past its
+    link's time, every leaf finite JSON). It answers nothing (:func:`consent_grant` is false for it), and a change
+    to it classifies as nothing narrower than a renew (:func:`_inert_grant_change`)."""
+    if not isinstance(grant["kind"], str) or not _GRANT_KIND_NAME.fullmatch(grant["kind"]):
+        raise AuthorityError(f"{what}.kind must be a grant kind name ({_GRANT_KIND_NAME.pattern})")
+    if not isinstance(grant.get("id"), str) or not grant["id"]:
+        raise AuthorityError(f"{what}.id must be a non-empty string")
+    expires = _parse_stamp(grant.get("expires_at"), f"{what}.expires_at")
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
+    return _thaw(grant)
+
+
 def _validate_grant(grant: Any, what: str, *, at: datetime | None = None) -> dict[str, Any]:
-    if isinstance(grant, Mapping) and "kind" in grant:
-        return _validate_consent_grant(grant, what, at)
-    if not isinstance(grant, Mapping) or set(grant) != _GRANT_FIELDS:
+    if not isinstance(grant, Mapping):
+        raise AuthorityError(f"{what} must carry exactly {', '.join(sorted(_GRANT_FIELDS))}")
+    return _grant_kind(grant).validate(grant, what, at)
+
+
+def _validate_egress_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    if set(grant) != _GRANT_FIELDS:
         raise AuthorityError(f"{what} must carry exactly {', '.join(sorted(_GRANT_FIELDS))}")
     for name in ("id", "entity", "remote_url", "deploy_key_sha256"):
         if not isinstance(grant[name], str) or not grant[name]:
@@ -768,8 +789,8 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
         grant = _validate_grant(rec["grant"], "grant", at=at)
         if grant["id"] in data["grants"]:
             raise AuthorityError(f"grant {grant['id']!r} already exists")
-        if grant.get("kind") == CONSENT_GRANT_KIND and _parse_stamp(grant["expires_at"], "expires_at") <= at:
-            raise AuthorityError("a consent grant must expire after the link that creates it")
+        if _grant_kind(grant) is not _EGRESS_KIND and _parse_stamp(grant["expires_at"], "expires_at") <= at:
+            raise AuthorityError(f"a {str(grant['kind'])[:40]} grant must expire after the link that creates it")
         data["grants"][grant["id"]] = grant
     elif op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
@@ -807,8 +828,10 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     if o.get("kind") != n.get("kind"):
         return "loose"
     o_exp, n_exp = _parse_stamp(o["expires_at"], "expires_at"), _parse_stamp(n["expires_at"], "expires_at")
-    if n.get("kind") == CONSENT_GRANT_KIND:
-        return _consent_grant_change(o, n, o_exp, n_exp)
+    return _grant_kind(n).change(o, n, o_exp, n_exp)
+
+
+def _egress_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
     rest = [k for k in _GRANT_FIELDS if k not in ("refspecs", "verbs", "expires_at")]
     if any(o[k] != n[k] for k in rest):
         return "loose"
@@ -839,6 +862,67 @@ def _consent_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dat
         and isinstance(n["workspace"], str) and isinstance(o["workspace"], str) \
         and _path_within(n["workspace"], o["workspace"])
     return "tight" if narrower and n_exp <= o_exp else "loose"
+
+
+def _inert_grant_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A change to a grant of a kind this levain does not know: ``renew`` when only its expiry moved later, else
+    ``loose`` (never ``tight``: what would be narrower is the newer levain's to say)."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    return "renew" if rest(o) == rest(n) and n_exp > o_exp else "loose"
+
+
+def _refuse_unknown_kind(grants: list[Any]) -> None:
+    """At append: this levain writes no grant of a kind it does not know (it holds one a newer levain wrote, inert)."""
+    for grant in grants:
+        kind = grant.get("kind") if isinstance(grant, Mapping) else None
+        raise AuthorityError(f"this levain does not know the grant kind {str(kind)[:40]!r}: a grant of it is "
+                             "replayed, renewed and revoked here, never created or otherwise changed; use the "
+                             "levain that wrote it")
+
+
+@dataclass(frozen=True)
+class _GrantKind:
+    """How one grant kind is read, compared and appended. ``consent``: the consent queue answers from a grant of it
+    (:func:`consent_grant`). ``append_checks`` judge each grant of the kind a create or a loosen brings in or changes;
+    ``renew_checks`` the grant a renew extends."""
+    validate: Callable[[Mapping[str, Any], str, datetime | None], dict[str, Any]]
+    change: Callable[[Mapping[str, Any], Mapping[str, Any], datetime, datetime], str]
+    append_checks: tuple[Callable[[list[Any]], None], ...] = ()
+    renew_checks: tuple[Callable[[list[Any]], None], ...] = ()
+    consent: bool = False
+
+
+# Every kind this levain knows, by the grant's ``kind`` (``None``: an egress grant, which carries none); any other
+# kind is :data:`_INERT_KIND`. Every per-kind rule dispatches through here, so no check keyed on one kind's name can
+# skip another kind (the consent checks are wrapped in lambdas because they are defined further down).
+_GRANT_KIND_NAME = re.compile(r"[a-z][a-z0-9.-]{0,31}")
+_EGRESS_KIND = _GrantKind(validate=_validate_egress_grant, change=_egress_grant_change)
+_INERT_KIND = _GrantKind(validate=_validate_inert_grant, change=_inert_grant_change,
+                         append_checks=(_refuse_unknown_kind,))
+_GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
+    None: _EGRESS_KIND,
+    CONSENT_GRANT_KIND: _GrantKind(validate=_validate_consent_grant, change=_consent_grant_change,
+                                   append_checks=(lambda g: _consent_home_check(g), lambda g: _consent_mcp_check(g)),
+                                   renew_checks=(lambda g: _consent_mcp_check(g),), consent=True),
+})
+
+
+def _grant_kind(grant: Mapping[str, Any]) -> _GrantKind:
+    if "kind" not in grant:
+        return _EGRESS_KIND
+    kind = grant["kind"]
+    return _GRANT_KINDS.get(kind, _INERT_KIND) if isinstance(kind, str) else _INERT_KIND
+
+
+def consent_grant(grant: Any) -> bool:
+    """Whether the consent queue answers from ``grant``: a grant of a consent kind this levain knows. A grant of a
+    kind it does not know is held inert and answers nothing."""
+    return isinstance(grant, Mapping) and _grant_kind(grant).consent
+
+
+def inert_grant(grant: Any) -> bool:
+    """Whether ``grant`` is of a kind this levain does not know (held inert: replayed, revocable, answers nothing)."""
+    return isinstance(grant, Mapping) and _grant_kind(grant) is _INERT_KIND
 
 
 def classify(old: StandingPolicy, new: StandingPolicy) -> str:
@@ -1022,7 +1106,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         if isinstance(exc, (ReplayError, VerifierUnavailable)):
             raise
         raise ReplayError(seq, str(exc)) from None
-    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError) as exc:
+    except (TypeError, ValueError, KeyError, UnicodeError, OverflowError, RecursionError) as exc:
         # a field of a shape no rule above anticipated: still a refusal at this seq, never an escape
         raise ReplayError(seq, f"a malformed field ({type(exc).__name__})") from None
 
@@ -1232,9 +1316,10 @@ def consent_mcp_tool_problem(tool: str) -> str | None:
 
 
 def _consent_mcp_check(grants: list[Any]) -> None:
-    """At append, no consent grant a link brings in or extends names an MCP tool that may write."""
+    """At append, no consent grant a link brings in or extends names an MCP tool that may write (run on the grants
+    of a consent kind, :data:`_GRANT_KINDS`)."""
     for grant in grants:
-        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+        if not isinstance(grant, Mapping):
             continue
         tools = grant.get("tools")
         for tool in tools if isinstance(tools, (list, tuple)) else ():
@@ -1245,9 +1330,10 @@ def _consent_mcp_check(grants: list[Any]) -> None:
 
 def _consent_home_check(grants: list[Any]) -> None:
     """At append, every consent grant's workspace is an existing directory whose realpath is exactly the signed
-    string (no symlink anywhere on it, so what was signed is what the criteria resolve), and not a refused root."""
+    string (no symlink anywhere on it, so what was signed is what the criteria resolve), and not a refused root
+    (run on the grants of a consent kind, :data:`_GRANT_KINDS`)."""
     for grant in grants:
-        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+        if not isinstance(grant, Mapping):
             continue
         ws = grant.get("workspace")
         if not isinstance(ws, str):
@@ -1264,27 +1350,33 @@ def _consent_home_check(grants: list[Any]) -> None:
             raise AuthorityError(problem)
 
 
+def _grant_append_checks(grants: list[Any]) -> None:
+    for grant in grants:
+        if isinstance(grant, Mapping):
+            for check in _grant_kind(grant).append_checks:
+                check([grant])
+
+
 def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
     """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6), or its home
     directory: a consent grant's workspace is never the home directory or above it (that grants every
-    workspace under it), judged for every consent grant a create or a loosen brings in or changes."""
+    workspace under it), judged for every consent grant a create or a loosen brings in or changes; and every
+    other per-kind append rule (:data:`_GRANT_KINDS`), a kind this levain does not know refused."""
     if rec["op"] == "create_grant":
-        _consent_home_check([rec["grant"]])
-        _consent_mcp_check([rec["grant"]])
+        _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":
         policy = rec["policy"]
         grants = policy.get("grants", {}) if isinstance(policy, Mapping) else {}
         old = state.policy.grants
-        changed = [g for gid, g in grants.items()
-                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
-        _consent_home_check(changed)
-        _consent_mcp_check(changed)
+        _grant_append_checks([g for gid, g in grants.items()
+                              if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))])
     if rec["op"] != "renew":
         return
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
-    _consent_mcp_check([grant])     # a grant signed before the rule is not extended past it
+    for check in _grant_kind(grant).renew_checks:
+        check([grant])              # a consent grant signed before the MCP rule is not extended past it
     signed = _parse_stamp(rec["signed_at"], "signed_at")
     if abs(now - signed) > _RENEW_SKEW:
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")

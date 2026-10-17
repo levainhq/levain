@@ -38,6 +38,7 @@ from levain.authority import (CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_m
                               consent_mcp_tool_problem, consent_root_problem)
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
+from levain.authority import consent_grant
 
 if TYPE_CHECKING:
     from levain.consent.queue import ConsentQueue, Decision
@@ -287,8 +288,8 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     """Why ``grant`` does not answer ``request`` at ``now`` for ``tool_input`` under ``posture``; ``None`` when
     every criterion holds (module docstring). ``tool_input`` must be the input the request's digest was computed
     from: anything else is refused here, so what was checked is what is answered."""
-    if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
-        return "not a consent grant"
+    if not consent_grant(grant):
+        return "not a consent grant"   # an egress grant, or one of a kind this levain does not know
     if request.tier == AGENT_CONFIG_TIER:
         return "agent config is never answered by a grant"
     if grant.get("agent") != request.agent:

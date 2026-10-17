@@ -17,12 +17,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import CONSENT_GRANT_KIND, consent_workspace_problem
+from levain.authority import CONSENT_GRANT_KIND, consent_grant, consent_workspace_problem, inert_grant
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
 
-__all__ = ["ConsentGrant", "create_grant", "list_grants", "revoke_grant"]
+__all__ = ["ConsentGrant", "create_grant", "list_grants", "list_inert_grants", "revoke_grant"]
 
 
 @dataclass(frozen=True)
@@ -88,13 +88,13 @@ def create_grant(data_root: Path | str, *, agent: str, tools: Iterable[str], wor
 def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: Signer,
                  clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                  marker_directory: Path | None = None) -> tuple[int, str | None]:
-    """Sign a ``revoke_grant`` link removing the consent grant ``grant_id`` (any enrolled key may). From the
-    next decision on it answers nothing, and an answer it already gave is no longer delivered. Returns
-    ``(seq, warning)``."""
+    """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, or one of a kind this levain does not
+    know (:func:`list_inert_grants`); any enrolled key may. From the next decision on it answers nothing, and an
+    answer it already gave is no longer delivered. Returns ``(seq, warning)``."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
     grant = state.policy.grants.get(grant_id)
-    if grant is None or grant.get("kind") != CONSENT_GRANT_KIND:
+    if not consent_grant(grant) and not inert_grant(grant):
         raise KeyError_(f"no consent grant {grant_id!r}")
     new = _append(db, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, sign=sign, clock=clock,
                   ssh_keygen=ssh_keygen)
@@ -107,4 +107,18 @@ def list_grants(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str 
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
     return [ConsentGrant.of(g, state.grant_link(gid)) for gid, g in sorted(state.policy.grants.items())
-            if g.get("kind") == CONSENT_GRANT_KIND]
+            if consent_grant(g)]
+
+
+def list_inert_grants(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                      marker_directory: Path | None = None) -> list[tuple[str, str, str, int | None]]:
+    """``(id, kind, expires_at, link seq)`` of every grant the replay holds of a kind this levain does not know
+    (one a newer levain wrote): held inert, it answers nothing here, and ``revoke_grant`` removes it."""
+    db = _journal(data_root, marker_directory=marker_directory)
+    state = _signing_authority(_capture(db, now, ssh_keygen))
+    out = []
+    for gid, g in sorted(state.policy.grants.items()):
+        if inert_grant(g):
+            link = state.grant_link(gid)
+            out.append((gid, str(g["kind"]), str(g["expires_at"]), None if link is None else link[0]))
+    return out
