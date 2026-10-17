@@ -158,7 +158,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     """True when a Codex ``apply_patch`` or an MCP tool targets an agent's config or hooks: every path the Claude
     Code adapter tags (:func:`levain.consent.adapters.claude_code.targets_agent_config`: Claude Code's config,
     ``.codex/hooks.json`` and ``config.toml``, the levain package, the adapter's own queue and authority), plus
-    anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). A patch whose headers name no file
+    anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). An MCP tool's targets are its
+    :data:`MCP_PATH_FIELDS` and every other string in its input (:func:`levain.consent.policy.mcp_config_candidates`). A patch whose headers name no file
     is tagged, as is a non-string MCP path. Shell requests (:data:`SHELL_TOOLS`) and every other tool are never
     tagged: a command is not parsed (ruling 1)."""
     home = home if home is not None else Path.home()
@@ -174,6 +175,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             if field in tool_input:
                 value = tool_input[field]
                 targets += value if isinstance(value, list) else [value]
+        extra = consent_policy.mcp_config_candidates(tool_input)
+        if extra is None:
+            return True
+        targets += extra
     else:
         return False
     for target in targets:

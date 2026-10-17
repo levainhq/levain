@@ -52,6 +52,7 @@ from levain.consent.policy import FILE_TOOLS as FILE_TOOLS
 from levain.consent.policy import MCP_PATH_FIELDS as MCP_PATH_FIELDS
 from levain.consent.policy import PolicyNotEligible as PolicyNotEligible
 from levain.consent.policy import guarded_policy as guarded_policy
+from levain.consent.policy import mcp_config_candidates
 from levain.consent.policy import targets as _targets
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
@@ -249,13 +250,19 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
-    tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and nothing
-    else. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
+    tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
+    other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
+    field of any name), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
     missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
     targets = _targets(tool_name, tool_input)
     if targets is None:
         return False
+    if tool_name.startswith("mcp__"):
+        extra = mcp_config_candidates(tool_input)
+        if extra is None:
+            return True
+        targets = [*targets, *extra]
     home = home if home is not None else Path.home()
     try:
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}

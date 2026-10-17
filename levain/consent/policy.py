@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 __all__ = ["AGENT_CONFIG_TIER", "AGENT_FILE_TOOLS", "FILE_TOOLS", "GLOB_TOOLS", "MCP_PATH_FIELDS", "Policy",
            "PolicyNotEligible", "Targets", "decide", "grant_refusal", "grant_targets", "guarded_policy",
-           "register_targets", "targets"]
+           "mcp_config_candidates", "register_targets", "targets"]
 
 # The tier an agent_config request is filed at: an allow then needs a key class covering T3.
 AGENT_CONFIG_TIER = "T3"
@@ -84,6 +84,42 @@ def targets(tool_name: str, tool_input: Any) -> list[Any] | None:
         if field in tool_input:
             value = tool_input[field]
             out += value if isinstance(value, list) else [value]
+    return out
+
+
+# The bound on reading an MCP tool's input for agent config (:func:`mcp_config_candidates`): a string longer than the
+# longest path an OS opens (Linux PATH_MAX) names no file; past the string count or the depth, the input is tagged.
+_CANDIDATE_MAX_LEN = 4096
+_CANDIDATE_MAX_COUNT = 4096
+_CANDIDATE_MAX_DEPTH = 64
+
+
+def mcp_config_candidates(tool_input: Any) -> list[str] | None:
+    """Every string in an MCP tool's input that could name a file, for agent-config tagging only (ruling 3b item 1):
+    an MCP server can take its path in a field of any name (``filepath``, ``file``, a key of a path-to-content map,
+    an item of a nested list), so tagging reads every string key and value at any depth, not only
+    :data:`MCP_PATH_FIELDS`. A string is cut at its first NUL (a C server stops there) and kept when what is left is
+    non-empty and at most :data:`_CANDIDATE_MAX_LEN` long. ``None`` (the caller tags the request) when the input
+    holds more than :data:`_CANDIDATE_MAX_COUNT` strings or nests deeper than :data:`_CANDIDATE_MAX_DEPTH`.
+    Over-matching only sends a request to the human; a grant's own criteria still read the named fields alone
+    (:func:`grant_targets`)."""
+    out: list[str] = []
+    seen = 0
+    stack: list[tuple[Any, int]] = [(tool_input, 0)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, str):
+            seen += 1
+            if seen > _CANDIDATE_MAX_COUNT:
+                return None
+            head = value.split("\x00", 1)[0]
+            if head and len(head) <= _CANDIDATE_MAX_LEN:
+                out.append(head)
+        elif isinstance(value, (Mapping, list, tuple)):
+            if depth >= _CANDIDATE_MAX_DEPTH:
+                return None
+            items = [x for kv in value.items() for x in kv] if isinstance(value, Mapping) else list(value)
+            stack.extend((x, depth + 1) for x in items)
     return out
 
 

@@ -613,10 +613,13 @@ def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
 @pytest.mark.parametrize("inp,tagged", [
     ({"path": ".mcp.json", "content": "{}"}, True), ({"file_path": "~/.claude/settings.json"}, True),
     ({"paths": ["src/a.py", ".claude/agents/x.md"]}, True), ({"destination": ".claude/hooks/h.sh"}, True),
-    ({"path": "src/a.py", "content": "x"}, False), ({"query": ".mcp.json"}, False), ({}, False),
+    ({"path": "src/a.py", "content": "x"}, False), ({"query": ".mcp.json"}, True), ({}, False),
+    ({"query": "where is .claude/settings.json read", "n": 3}, False), ({"content": "x" * 5000 + "/.mcp.json"}, False),
+    ({"file": ".claude/hooks/h.sh\x00.txt"}, True), ({"files": {"~/.codex/hooks.json": "{}"}}, True),
 ])
-def test_an_mcp_tool_is_tagged_by_its_named_path_fields(inp, tagged):
-    """MCP tools that write files: only what tool_input names as a path field is read, no parsing."""
+def test_an_mcp_tool_is_tagged_by_any_string_that_names_agent_config(inp, tagged):
+    """MCP tools that write files: a server can name its path in any field, so every string key and value is read
+    as a path (no parsing: a string is a path or it is not); over-matching sends the request to the human."""
     assert cc.targets_agent_config("mcp__fs__write_file", inp, "/work/proj", home=HOME) is tagged
 
 
@@ -822,3 +825,59 @@ def test_an_old_form_levain_entry_is_recognised_and_replaced(tmp_path, agent):
                     allow_untested_agent_version=True)
     commands = [h["command"] for g in json.loads(config.read_text())["hooks"]["PermissionRequest"] for h in g["hooks"]]
     assert sorted(commands) == sorted(lookalikes + [f"/new/bin/python3 -EP {script}"])
+
+
+def _granted_mcp_hook(tmp_path, tool):
+    """A real cockpit with one consent grant on ``tool`` over ``proj``; returns (workspace, run(event) -> stdout)."""
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    ws.mkdir()
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    for op in ({"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key, "class": "laptop-presence",
+                "custody": "passphrase"},
+               {"op": "create_grant", "grant": {"id": "g1", "kind": "consent", "agent": "claude_code",
+                                                "tools": [tool], "workspace": str(ws), "postures": ["default"],
+                                                "expires_at": utc_stamp(datetime.now(timezone.utc)
+                                                                        + timedelta(days=1))}}):
+        auth.sign_and_append(conn, op, signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    qdir = tmp_path / "home" / "consent"
+    qdir.mkdir(parents=True, mode=0o700)
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+
+    def run(e):
+        out = io.StringIO()
+        assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
+        return out.getvalue()
+    return ws, run
+
+
+@pytest.mark.parametrize("inp", [
+    {"filepath": ".claude/settings.json", "content": "{}"},
+    {"target": {"file": "~/.claude/hooks/h.sh"}, "content": "x"},
+    {"edits": [{"file": ".claude/settings.local.json"}]},
+    {"file": ".codex/config.toml"},
+    {"filename": "/abs/.mcp.json"},
+])
+def test_a_grant_never_answers_an_mcp_write_to_agent_config_named_in_any_field(tmp_path, inp):
+    """Ruling 3b item 1: an MCP tool whose server names its path in a field levain does not know (``filepath``,
+    ``file``, nested) still edits agent config. Reproduced 2026-10-17 on main c0664a9: a grant on the tool allowed
+    a write to the workspace's ``.claude/settings.json`` through ``filepath``."""
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__write_file")
+    assert json.loads(run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))))[
+        "hookSpecificOutput"]["decision"] == {"behavior": "allow"}  # the grant answers an ordinary write
+    assert run(event("mcp__fs__write_file", inp, cwd=str(ws))) == ""
+
+
+def test_an_mcp_input_past_the_bound_is_tagged():
+    assert cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 5000}, "/work/proj", home=HOME)
+    deep: object = "x"
+    for _ in range(70):
+        deep = [deep]
+    assert cc.targets_agent_config("mcp__fs__w", {"v": deep}, "/work/proj", home=HOME)
+    assert not cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 4000}, "/work/proj", home=HOME)
