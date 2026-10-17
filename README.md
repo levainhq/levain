@@ -22,7 +22,7 @@ If you run coding agents for real, you hit the permission prompt fast. The usual
 
 **Babysit every prompt.** Every file write, every shell command, every tool call waits on you to click yes. One agent, that's annoying. I run 10 to 15 at a time, and the prompt is the first thing that broke: agents sat frozen for an hour at a dialog nobody was looking at.
 
-**Skip permissions.** It scales, and now the agent acts with your full authority and nothing records what it decided on your behalf.
+**Skip permissions.** It scales, and now the agent acts with your full authority and nothing checks what it does on your behalf before it does it.
 
 **Let a classifier decide, or write your own rules.** Claude Code's auto mode hands each call to a second model that judges whether it's safe. For a lot of developers that's as much friction as babysitting, sometimes more, because its refusals land on work you already meant to allow. Well-tuned custom permission rules get the friction exactly where you want it. But the prompts that are left still only reach you at the terminal, or on your phone if you turn on Remote Control, which routes your session through Anthropic's servers to the Claude app, something plenty of people and companies won't allow. And however good the rules are, Claude Code can log each decision and whether a rule, a hook or you made it, but nothing signs that record, so it can't prove who approved what.
 
