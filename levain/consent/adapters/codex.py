@@ -55,9 +55,11 @@ from typing import IO, Any
 
 from levain.authority import anchor_path
 from levain.consent import policy as consent_policy
-from levain.consent.adapters.claude_code import (
+# _absolute_root is re-exported: the confinement floor reads it as `adapter._absolute_root` for either adapter
+from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
-    _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command, read_settings_file,
+    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
+    read_settings_file,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
