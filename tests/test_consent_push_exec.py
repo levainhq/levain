@@ -1,0 +1,435 @@
+"""levain.consent.push: the effect half of the push grant. Every execute case here was first RUN by hand
+(the lane's run report). Local bare remotes only (file:// under tmp_path); HOME is
+a scratch directory, so no test reads the operator's git config."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from levain.consent import push
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    home = root / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for k in list(os.environ):
+        if k.startswith("GIT_"):
+            monkeypatch.delenv(k)
+    w = _World(root)
+    w.setup()
+    return w
+
+
+class _World:
+    def __init__(self, root: Path):
+        self.root = root
+        self.home = root / "home"
+        self.ws = root / "ws"
+        self.proj = self.ws / "proj"
+        self.remote = root / "remote.git"
+        self.evil = root / "evil.git"
+        self.marks = root / "marks"
+        self.lhome = root / "levain-home"
+        self.url = f"file://{self.remote}"
+        self.evil_url = f"file://{self.evil}"
+        self.grant = {"id": "pg-t", "kind": "push", "workspace": str(self.ws), "remote_url": self.url,
+                      "branches": ["claude/*"]}
+        self.receipts: list[dict] = []
+
+    def git(self, *args, check=True, **kw):
+        r = subprocess.run(["git", *map(str, args)], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=60, **kw)
+        if check and r.returncode:
+            raise AssertionError(f"git {args}: {r.stderr}")
+        return r
+
+    def setup(self):
+        for d in (self.ws, self.marks, self.lhome):
+            d.mkdir()
+        self.git("init", "-q", "--bare", self.remote)
+        self.git("init", "-q", "--bare", self.evil)
+        self.git("init", "-q", "-b", "main", self.proj)
+        self.commit("one")
+        self.git("-C", self.proj, "checkout", "-q", "-b", "claude/x")
+        self.commit("two")
+
+    def commit(self, msg, *extra):
+        self.git("-C", self.proj, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c",
+                 "user.name=t", "-c", "user.email=t@x", "commit", "-q", "--allow-empty", *extra, "-m", msg)
+        return self.tip()
+
+    def tip(self, ref="HEAD"):
+        return self.git("-C", self.proj, "rev-parse", ref).stdout.strip()
+
+    def remote_sha(self, ref, repo=None):
+        r = self.git(f"--git-dir={repo or self.remote}", "rev-parse", "--verify", "--quiet", ref, check=False)
+        return r.stdout.strip() or None
+
+    def refusal(self, *, path, remote, branch):
+        if not path.startswith(str(self.ws) + "/"):
+            return f"{path} is outside the workspace"
+        if remote != self.grant["remote_url"]:
+            return f"no grant covers remote {remote}"
+        if not push.branch_matches(self.grant["branches"], branch):
+            return f"no grant covers branch {branch}"
+        return (self.grant["id"], 5)
+
+    def run(self, branch="claude/x", *, repo=None, remote=None, refusal=None):
+        return push.execute(self.grant, repo_path=repo or self.proj, remote=remote or self.url, branch=branch,
+                            levain_home=self.lhome, refusal=refusal or self.refusal, receipt=self.receipts.append)
+
+    def marker(self, name):
+        p = self.marks / f"bin-{name}"
+        p.write_text(f"#!/bin/sh\necho \"$0\" >> {self.marks}/{name}.fired\nexit 0\n")
+        p.chmod(0o755)
+        return str(p)
+
+    def fired(self):
+        return sorted(p.name for p in self.marks.glob("*.fired"))
+
+
+# --- canonical_remote -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url,canon", [
+    ("file:///srv/r.git", "file:///srv/r.git"),
+    ("file:///srv/r.git/", "file:///srv/r.git"),
+    ("FILE:///srv/R.git", "file:///srv/R.git"),
+    ("SSH://git@GitHub.com:22/org/repo.git", "ssh://git@github.com/org/repo.git"),
+    ("ssh://host:2222/x", "ssh://host:2222/x"),
+    ("git@GitHub.com:org/repo.git", "git@github.com:org/repo.git"),
+    ("host:/abs/r.git", "ssh://host/abs/r.git"),
+    ("HTTPS://Example.COM:443/a/b.git", "https://example.com/a/b.git"),
+    ("https://u@h.example/a", "https://u@h.example/a"),
+    ("https://h:8443/a/", "https://h:8443/a"),
+])
+def test_canonical_remote_accepts(url, canon):
+    assert push.canonical_remote(url) == canon
+    assert push.canonical_remote(canon) == canon
+
+
+@pytest.mark.parametrize("url,why", [
+    ("ext::x", "transport"), ("fd::3", "transport"), ("ext::sh -c x", "whitespace"),
+    ("http://h/x", "scheme"), ("git://h/x", "scheme"), ("relative/path", "relative"), ("/abs/path", "relative"),
+    ("file://host/x", "names no host"), ("file://relative", "names no host"), ("https://u:pw@h/x", "password"),
+    ("https://h/x?y", "query"), ("https://h/x#y", "fragment"), ("https://h/a%2e", "%-escape"),
+    ("https://h/a/../b", "segment"), ("https://h//b", "segment"), ("ssh://-oProxyCommand=x/y", "host"),
+    ("ssh://h:0022/x", "port"), ("ssh://h:99999/x", "port"), ("https://h", "no path"), ("h:-x", "begins with '-'"),
+    ("[::1]:x", "bracket"), ("ssh://hôst/x", "non-ASCII"), ("", "non-empty"),
+])
+def test_canonical_remote_refuses_naming_why(url, why):
+    with pytest.raises(ValueError, match=why):
+        push.canonical_remote(url)
+
+
+# --- branches ---------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rule", ["claude/*", "feature-x", "main", "a/b/*"])
+def test_branch_rules_accepted(rule):
+    assert push.branch_problem(rule) is None
+
+
+@pytest.mark.parametrize("rule", ["*", "claude/**", "*/x", "a*/", "a*", "bad..name", "-x", "@{-1}", "HEAD",
+                                  "x.lock", "claude/", "", "a b"])
+def test_branch_rules_refused(rule):
+    assert push.branch_problem(rule)
+
+
+def test_branch_matches():
+    rules = ["claude/*", "feature-x"]
+    assert push.branch_matches(rules, "claude/x")
+    assert push.branch_matches(rules, "claude/a/b")
+    assert push.branch_matches(rules, "feature-x")
+    for b in ("claude", "claude/", "claudex/y", "main", "feature-x/y", "claude/*", "claude/..x"):
+        assert not push.branch_matches(rules, b), b
+
+
+# --- execute (RUN cases a-g) ------------------------------------------------------------------------------------
+
+def test_a_granted_push_lands_with_the_right_sha(world):
+    tip = world.tip()
+    res = world.run()
+    assert (res.ok, res.status, res.old_sha, res.new_sha) == (True, "new", push.ZERO_SHA, tip)
+    assert world.remote_sha("refs/heads/claude/x") == tip
+    nxt = world.commit("three")
+    res = world.run()
+    assert (res.status, res.old_sha, res.new_sha) == ("fast-forward", tip, nxt)
+    assert world.remote_sha("refs/heads/claude/x") == nxt
+    assert [r["grant_id"] for r in world.receipts] == ["pg-t", "pg-t"]
+    assert world.receipts[0]["grant_seq"] == 5 and world.receipts[0]["repo"] == str(world.proj)
+    res = world.run()
+    assert (res.ok, res.status) == (True, "up-to-date")
+
+
+def test_a_refusal_stops_before_any_effect(world):
+    with pytest.raises(push.PushRefused, match="no grant covers branch main"):
+        world.run("main")
+    assert world.remote_sha("refs/heads/main") is None
+    with pytest.raises(push.PushRefused, match="is now pg-other"):
+        world.run(refusal=lambda **kw: ("pg-other", 9))
+    with pytest.raises(push.PushRefused, match="returned no grant"):
+        world.run(refusal=lambda **kw: None)
+    with pytest.raises(push.PushRefused, match="returned no grant"):
+        world.run(refusal=lambda **kw: ("pg-t", True))
+    assert world.remote_sha("refs/heads/claude/x") is None
+    assert world.receipts == []
+
+
+def test_refusal_sees_the_canonical_remote_and_realpath(world):
+    seen = {}
+
+    def refusal(**kw):
+        seen.update(kw)
+        return "no"
+    with pytest.raises(push.PushRefused):
+        world.run(remote=world.url + "/", refusal=refusal)
+    assert seen == {"path": str(world.proj), "remote": world.url, "branch": "claude/x"}
+
+
+def test_bad_request_shape_never_reaches_the_check(world):
+    called = []
+
+    def refusal(**kw):
+        called.append(kw)
+        return ("pg-t", 1)
+    for kw in ({"remote": "ext::x"}, {"branch": "claude/*"}, {"branch": "bad..x"}):
+        with pytest.raises(push.PushRefused):
+            world.run(refusal=refusal, **kw)
+    assert called == []
+
+
+def test_b_non_fast_forward_is_rejected_not_forced(world):
+    world.run()
+    before = world.remote_sha("refs/heads/claude/x")
+    world.commit("two, amended", "--amend")
+    res = world.run()
+    assert (res.ok, res.status, res.exit) == (False, "rejected", 1)
+    assert "non-fast-forward" in res.detail
+    assert world.remote_sha("refs/heads/claude/x") == before
+    assert world.receipts[-1]["status"] == "rejected"
+
+
+def _hostile(world, repo, hooks_path=True):
+    hp = world.marks / "hookspath"
+    hp.mkdir(exist_ok=True)
+    for h in ("pre-push", "reference-transaction", "post-update", "pre-receive", "update", "post-receive",
+              "push-to-checkout", "fsmonitor-watchman"):
+        for d, tag in ((hp, "hookspath"), (Path(repo) / ".git" / "hooks", "githooks")):
+            s = d / h
+            s.write_text(f"#!/bin/sh\necho x >> {world.marks}/{tag}-{h}.fired\nexit 0\n")
+            s.chmod(0o755)
+    cfg = {"core.fsmonitor": world.marker("fsmonitor"), "uploadpack.packObjectsHook": world.marker("pack"),
+           "core.sshCommand": world.marker("ssh"), "remote.origin.url": world.url,
+           "remote.origin.receivepack": world.marker("receivepack"),
+           "remote.origin.uploadpack": world.marker("uploadpack"), f"url.{world.evil_url}.insteadOf": world.url,
+           f"url.{world.evil_url}.pushInsteadOf": world.url, "credential.helper": world.marker("cred"),
+           "gpg.program": world.marker("gpg"), "push.gpgSign": "true",
+           "core.alternateRefsCommand": world.marker("altrefs")}
+    if hooks_path:
+        cfg["core.hooksPath"] = str(hp)
+    for k, v in cfg.items():
+        world.git("-C", repo, "config", k, v)
+
+
+@pytest.mark.parametrize("hooks_path", [True, False])
+def test_c_nothing_the_agent_wrote_in_its_repo_executes(world, hooks_path):
+    _hostile(world, world.proj, hooks_path=hooks_path)
+    tip = world.commit("hostile")
+    res = world.run()
+    assert res.ok and world.remote_sha("refs/heads/claude/x") == tip
+    assert world.fired() == []
+    assert world.git(f"--git-dir={world.evil}", "for-each-ref").stdout == ""
+    # the probe can fail: the same config does run programs under plain git
+    world.git("-C", world.proj, "status", check=False)
+    world.git("-C", world.proj, "-c", "push.gpgSign=false", "push", world.evil_url, "HEAD:refs/heads/ctl",
+              check=False)
+    fired = world.fired()
+    assert "fsmonitor.fired" in fired
+    assert ("hookspath-pre-push.fired" if hooks_path else "githooks-pre-push.fired") in fired
+
+
+def test_c_pack_objects_hook_runs_only_from_protected_config(world):
+    """The design's UNVERIFIED claim: upload-pack honours uploadpack.packObjectsHook from protected (global)
+    config and never from the repo's. Repo-level: execute runs nothing; global-level: a plain fetch runs it."""
+    world.git("-C", world.proj, "config", "uploadpack.packObjectsHook", world.marker("repo-pack"))
+    world.run()
+    assert world.fired() == []
+    (world.home / ".gitconfig").write_text(f"[uploadpack]\n\tpackObjectsHook = {world.marker('global-pack')}\n")
+    ctl = world.root / "ctl.git"
+    world.git("init", "-q", "--bare", ctl)
+    world.git(f"--git-dir={ctl}", "fetch", "-q", world.proj, "refs/heads/claude/x:refs/c", check=False)
+    assert world.fired() == ["global-pack.fired"]
+
+
+def test_d_callers_git_env_has_no_effect(world, monkeypatch):
+    tip = world.tip()
+    (world.root / "evil-global").write_text(f"[url \"{world.evil_url}\"]\n\tinsteadOf = {world.url}\n")
+    env = {"GIT_DIR": str(world.evil), "GIT_WORK_TREE": "/", "GIT_CONFIG_COUNT": "1",
+           "GIT_CONFIG_KEY_0": f"url.{world.evil_url}.pushInsteadOf", "GIT_CONFIG_VALUE_0": world.url,
+           "GIT_SSH_COMMAND": world.marker("gitssh"), "GIT_CONFIG_GLOBAL": str(world.root / "evil-global"),
+           "GIT_EXEC_PATH": str(world.marks), "GIT_TERMINAL_PROMPT": "1"}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert push.git_env()["GIT_TERMINAL_PROMPT"] == "0"
+    assert not [k for k in push.git_env() if k.startswith("GIT_") and k != "GIT_TERMINAL_PROMPT"]
+    res = world.run()
+    assert res.ok and world.remote_sha("refs/heads/claude/x") == tip
+    assert world.git(f"--git-dir={world.evil}", "for-each-ref", env={"PATH": os.environ["PATH"]}).stdout == ""
+    assert world.fired() == []
+
+
+def test_git_env_keeps_home_and_ssh_auth_sock(world, monkeypatch):
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    env = push.git_env()
+    assert env["HOME"] == str(world.home) and env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+
+
+@pytest.mark.parametrize("key,value", [("insteadOf", "{url}"), ("pushInsteadOf", "{url}"),
+                                       ("insteadOf", "file://{root}/"), ("insteadOf", "FILE://{root}/")])
+def test_e_an_insteadof_rewrite_of_the_pin_refuses(world, key, value):
+    v = value.format(url=world.url, root=world.root)
+    (world.home / ".gitconfig").write_text(f"[url \"{world.evil_url}\"]\n\t{key} = {v}\n")
+    with pytest.raises(push.PushRefused, match="rewrites the pinned remote"):
+        world.run()
+    assert world.remote_sha("refs/heads/claude/x") is None
+    assert world.git(f"--git-dir={world.evil}", "for-each-ref").stdout == ""
+    assert world.receipts == []
+
+
+def test_e_an_unrelated_insteadof_does_not_refuse(world):
+    (world.home / ".gitconfig").write_text("[url \"ssh://git@github.com/\"]\n\tinsteadOf = https://github.com/\n")
+    assert world.run().ok
+
+
+def test_f_symlinks_gitfiles_and_odd_paths_refused(world):
+    link = world.ws / "link"
+    link.symlink_to(world.proj)
+    with pytest.raises(push.PushRefused, match="symlink"):
+        world.run(repo=link)
+    lroot = world.root / "lroot"
+    lroot.symlink_to(world.root)
+    with pytest.raises(push.PushRefused, match="symlink"):
+        world.run(repo=lroot / "ws" / "proj")
+    wt = world.ws / "wt"
+    world.git("-C", world.proj, "worktree", "add", "-q", "-b", "claude/wt", wt)
+    with pytest.raises(push.PushRefused, match="gitfile"):
+        world.run("claude/wt", repo=wt)
+    with pytest.raises(push.PushRefused, match="absolute"):
+        world.run(repo="ws/proj")
+    with pytest.raises(push.PushRefused, match="No such file"):
+        world.run(repo=world.ws / "nope")
+    gl = world.ws / "gl"
+    gl.mkdir()
+    (gl / ".git").symlink_to(world.proj / ".git")
+    with pytest.raises(push.PushRefused, match="not a directory"):
+        world.run(repo=gl)
+    assert world.remote_sha("refs/heads/claude/wt") is None
+
+
+def test_f_missing_branch_and_missing_home(world):
+    with pytest.raises(push.PushRefused, match="could not read branch claude/none"):
+        world.run("claude/none")
+    with pytest.raises(push.PushRefused, match="levain home"):
+        push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x",
+                     levain_home=world.root / "absent", refusal=world.refusal, receipt=world.receipts.append)
+
+
+def test_g_concurrent_executes_on_one_repo_serialise(world):
+    world.git("-C", world.proj, "branch", "claude/g1")
+    world.git("-C", world.proj, "branch", "claude/g2")
+    spans, lock = [], threading.Lock()
+
+    def slow(**kw):
+        t0 = time.monotonic()
+        time.sleep(0.5)
+        with lock:
+            spans.append((t0, time.monotonic()))
+        return world.refusal(**kw)
+    results = []
+    threads = [threading.Thread(target=lambda b=b: results.append(world.run(b, refusal=slow)))
+               for b in ("claude/g1", "claude/g2")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert len(results) == 2 and all(r.ok for r in results)
+    (a0, a1), (b0, b1) = sorted(spans)
+    assert b0 >= a1
+    assert world.remote_sha("refs/heads/claude/g1") and world.remote_sha("refs/heads/claude/g2")
+
+
+# --- the mirror, the journal, the argv -------------------------------------------------------------------------
+
+def test_journal_has_intent_before_and_outcome_after(world):
+    tip = world.tip()
+    world.run()
+    key = push.repo_key(str(world.proj))
+    lines = [json.loads(x) for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert [x["state"] for x in lines] == ["intent", "done"]
+    assert lines[0]["new_sha"] == tip and lines[0]["grant_id"] == "pg-t" and lines[0]["grant_seq"] == 5
+    assert lines[1]["status"] == "new"
+
+
+def test_receipt_failure_leaves_the_journal(world):
+    def boom(rec):
+        raise OSError("disk full")
+    with pytest.raises(OSError):
+        push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
+                     refusal=world.refusal, receipt=boom)
+    key = push.repo_key(str(world.proj))
+    states = [json.loads(x)["state"] for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert states == ["intent", "done"]
+    assert world.remote_sha("refs/heads/claude/x") == world.tip()
+
+
+def test_mirror_is_private_and_its_config_rewritten_every_use(world):
+    world.run()
+    m = world.lhome / "push" / "mirrors" / "pg-t" / f"{push.repo_key(str(world.proj))}.git"
+    for d in (world.lhome / "push", m.parent, m):
+        assert (d.stat().st_mode & 0o777) == 0o700
+    assert (m / "config").read_text() == push.MIRROR_CONFIG
+    assert not (m / "hooks").exists()
+    # a tamper between pushes does not survive: a pushInsteadOf and a hook planted in the mirror
+    (m / "config").write_text(push.MIRROR_CONFIG + f"[url \"{world.evil_url}\"]\n\tpushInsteadOf = {world.url}\n")
+    (m / "hooks").mkdir()
+    (m / "hooks" / "reference-transaction").write_text(f"#!/bin/sh\necho x >> {world.marks}/mirror.fired\n")
+    (m / "hooks" / "reference-transaction").chmod(0o755)
+    nxt = world.commit("three")
+    assert world.run().ok
+    assert world.remote_sha("refs/heads/claude/x") == nxt
+    assert world.fired() == [] and (m / "config").read_text() == push.MIRROR_CONFIG
+
+
+def test_mirror_keyed_by_repo_so_two_repos_under_one_grant_do_not_share_a_ref(world):
+    other = world.ws / "other"
+    world.git("init", "-q", "-b", "claude/y", other)
+    world.git("-C", other, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "--allow-empty", "-m", "o")
+    world.run()
+    world.run("claude/y", repo=other)
+    mirrors = sorted(p.name for p in (world.lhome / "push" / "mirrors" / "pg-t").iterdir())
+    assert len(mirrors) == 2
+
+
+def test_grant_id_must_be_plain(world):
+    world.grant["id"] = "../x"
+    with pytest.raises(push.PushRefused, match="plain id"):
+        world.run(refusal=lambda **kw: ("../x", 1))
+
+
+def test_push_argv_is_the_only_shape():
+    argv = push.push_argv(Path("/m.git"), "file:///r.git", "claude/x")
+    assert argv[-5:] == ["push", "--no-verify", "--porcelain", "file:///r.git", "refs/levain/src:refs/heads/claude/x"]
+    flat = " ".join(argv)
+    for bad in ("--force", "+refs", "--delete", "--mirror", "--all", "--tags", "--follow-tags"):
+        assert bad not in flat
+    cs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+    assert cs == list(push.PUSH_CONFIG)
