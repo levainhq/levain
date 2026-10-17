@@ -696,3 +696,14 @@ def test_a_stdin_socket_that_cannot_be_inspected_is_a_named_refusal():
     assert r.returncode == 126 and b"ran" not in r.stdout
     assert b"could not make the command's stdin, stdout and stderr safe" in r.stderr and b"cannot wrap" in r.stderr
     assert b"Traceback" not in r.stderr
+
+
+def test_any_exception_while_making_stdio_safe_refuses_the_command_never_a_traceback():
+    """B1 L3 r1 B-G1 (glm LOW): the stub caught OSError only around its fd hygiene, and is_socketpair
+    re-raises whatever wrapping the socket raised, so any other exception printed a traceback with
+    exit 1. The stub refuses (exit 126) on any exception there. Run with hygiene made to raise."""
+    prog = L._STUB_DEFS + "\ndef hygiene(carry_stdin):\n    raise ValueError('not a socket it can wrap')\n" + L._STUB_MAIN
+    p = subprocess.run([sys.executable, "-I", "-S", "-c", prog, "--expect-tier", "T0", "--", "/bin/echo", "ran"],
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode == 126 and "Traceback" not in p.stderr and "ran" not in p.stdout, (p.returncode, p.stderr)
+    assert "refusing to start the command" in p.stderr
