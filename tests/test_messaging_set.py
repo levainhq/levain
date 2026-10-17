@@ -361,3 +361,20 @@ def test_no_pin_names_the_fix(env, capsys):
     out = capsys.readouterr().out
     assert _config(ent).get("messaging") == cfg0.get("messaging")
     assert "--repin-hooks" in out
+
+
+
+def test_custom_controls_replaced_by_a_choice_stamp_from_custom(env, capsys, monkeypatch):
+    # A hand-made custom file is held for review by update (the adapter receipt records levain's bytes), so the
+    # gate is driven directly: when it does record over controls that matched no choice, it says so.
+    import levain.host_guard as hg
+    from levain.install import _commit_messaging_if_applied
+
+    ent = _init(env, capsys, "c", messaging="governed")
+    _drop_record(ent)
+    monkeypatch.setattr(hg, "workspace_settings_pin_matches", lambda install: True)
+    msgs: list[str] = []
+    assert _commit_messaging_if_applied(ent, "governed", "custom", msgs.append)
+    ch = _config(ent)["messaging_changed"]
+    assert ch["from"] == "custom" and ch["to"] == "governed"
+    assert "REPLACED custom messaging controls -> governed" in msgs and not any("LOOSENED" in m for m in msgs)
