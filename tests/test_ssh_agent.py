@@ -697,3 +697,23 @@ def test_a_failed_ssh_add_takes_back_its_record_entry_and_known_hosts_lines(keye
         ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
     assert kh.read_text() == ""
     assert ssh_agent.read_record(agent.dir)["keys"] == [before]
+
+
+# --- B1 r1 B-C1: a socket that exists before the agent listens on it is retried, not a failed start ----
+
+@needs_openssh
+def test_a_refused_first_connect_to_a_just_made_socket_is_retried(home, monkeypatch):
+    """complement MED: ssh-agent binds its socket before it listens, so under load the first connect can
+    be refused while the path exists. The start retries the peer read until its deadline."""
+    real = ssh_agent.peer_pid
+    calls = []
+
+    def refused_twice(sock):
+        calls.append(sock)
+        if len(calls) <= 2:
+            raise ssh_agent.AgentError(f"could not read the peer of {sock} (Connection refused)")
+        return real(sock)
+
+    monkeypatch.setattr(ssh_agent, "peer_pid", refused_twice)
+    a = ssh_agent.start(entity="e1")
+    assert len(calls) == 3 and real(a.socket) == a.pid
