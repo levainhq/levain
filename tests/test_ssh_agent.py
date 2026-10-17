@@ -663,3 +663,37 @@ def test_an_owner_pid_held_by_another_process_does_not_keep_its_agent(home):
     finally:
         other.kill()
         other.wait()
+
+
+# --- B1 r1 B-M3: the record and known_hosts are written before ssh-add, and taken back if it fails ----
+
+def test_a_known_hosts_that_cannot_be_written_adds_no_key(keyed):
+    """codex MED: ssh-add ran first, so a failed known_hosts write left the key in the agent while the
+    command reported a failure. Now the write comes first: it fails, nothing reaches the agent."""
+    agent, key, _manifest = keyed
+    os.chmod(agent.dir / "known_hosts", 0o400)
+    with pytest.raises(ssh_agent.AgentError):
+        ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
+    assert "no identities" in _listed(agent)
+    assert ssh_agent.read_record(agent.dir)["keys"] == []
+
+
+def test_a_failed_ssh_add_takes_back_its_record_entry_and_known_hosts_lines(keyed, monkeypatch):
+    """complement LOW3: when ssh-add fails, the record entry and the known_hosts lines written for it
+    go, and a key recorded by an earlier add keeps its entry."""
+    agent, key, _manifest = keyed
+    kh = agent.dir / "known_hosts"
+    ssh_agent.add_key(key, [], waive_destinations=True, lifetime=600, system="Linux")
+    [before] = ssh_agent.read_record(agent.dir)["keys"]
+    real = subprocess.run
+
+    def failing_ssh_add(argv, *a, **kw):
+        if argv[0] == "ssh-add":
+            return subprocess.CompletedProcess(argv, 1)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(ssh_agent.subprocess, "run", failing_ssh_add)
+    with pytest.raises(ssh_agent.AgentError, match="ssh-add exited with status 1"):
+        ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
+    assert kh.read_text() == ""
+    assert ssh_agent.read_record(agent.dir)["keys"] == [before]
