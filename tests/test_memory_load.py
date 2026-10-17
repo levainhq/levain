@@ -64,7 +64,7 @@ def test_the_wrap_procedure_is_its_own_seed_file_and_memory_md_points_at_it():
         assert rule in memory and rule not in workflow
     # the procedure moved whole
     for part in ("**Pair with staleness:**", "Pre-compose pattern recall", "Contradiction-scan",
-                 "**Wrap once.**", "**Single-process invariant"):
+                 "**Wrap once.**", "**One store per entity"):
         assert part in workflow and part not in memory
     assert workflow.count("the *why*, the package carries the authoritative contract") == 1
 
