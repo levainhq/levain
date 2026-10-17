@@ -13,7 +13,9 @@ is the signed string, checked at append too) and not ``/``, this machine's home 
 directory resolves inside it; every target path the request names (:func:`grant_targets`: a file tool's target and
 any tool's :data:`MCP_PATH_FIELDS`, Claude Code's Read, Grep, LS and NotebookRead included) is inside it with no
 existing symlink on the way, and a file tool whose target cannot be read, a path field of another shape and a Glob
-pattern that can reach outside its root match nothing; and the grant has not expired. Which tools are file tools,
+pattern that can reach outside its root match nothing; an MCP tool is one of the read tools levain knows
+(:data:`levain.authority.CONSENT_MCP_READ_ONLY_TOOLS`) and its input is one that tool's schema accepts; and the grant
+has not expired. Which tools are file tools,
 and how their targets are read, is per agent (:data:`AGENT_FILE_TOOLS`, :func:`register_targets`): Claude Code's are
 built in; Codex's ``apply_patch`` has its targets read by the Codex adapter's extractor, registered when that adapter
 is imported, and with no extractor registered it matches nothing. A tool naming no path (WebFetch, an MCP tool
@@ -32,7 +34,8 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from levain.authority import CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_root_problem
+from levain.authority import (CONSENT_GRANT_KIND, CONSENT_SHELL_TOOLS, consent_mcp_input_fits,
+                              consent_mcp_tool_problem, consent_root_problem)
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.consent.record import tool_input_digest
 
@@ -42,7 +45,7 @@ if TYPE_CHECKING:
 
 __all__ = ["AGENT_CONFIG_TIER", "AGENT_FILE_TOOLS", "FILE_TOOLS", "GLOB_TOOLS", "MCP_PATH_FIELDS", "Policy",
            "PolicyNotEligible", "Targets", "decide", "grant_refusal", "grant_targets", "guarded_policy",
-           "register_targets", "targets"]
+           "mcp_config_candidates", "register_targets", "targets"]
 
 # The tier an agent_config request is filed at: an allow then needs a key class covering T3.
 AGENT_CONFIG_TIER = "T3"
@@ -84,6 +87,126 @@ def targets(tool_name: str, tool_input: Any) -> list[Any] | None:
         if field in tool_input:
             value = tool_input[field]
             out += value if isinstance(value, list) else [value]
+    return out
+
+
+# The bound on reading an MCP tool's input for agent config (:func:`mcp_config_candidates`): a spelling longer than
+# the longest path an OS opens (Linux PATH_MAX), once normalised, names no file; past the string count or the depth,
+# the input is tagged.
+_CANDIDATE_MAX_LEN = 4096
+_CANDIDATE_MAX_COUNT = 4096
+_CANDIDATE_MAX_DEPTH = 64
+# the characters of every kept spelling together: each is resolved through the filesystem, one lstat per component
+_CANDIDATE_MAX_TOTAL = 256 * 1024
+
+
+# a string longer than this is normalised (linear) before it is decoded; decoding reads at most
+# _CANDIDATE_RAW_MAX characters across one input
+_CANDIDATE_DECODE_MAX = 64 * 1024
+_CANDIDATE_RAW_MAX = 4 * 1024 * 1024
+# the most spellings one string yields, and the most JSON nodes (strings, containers, scalars) one input holds
+_SPELLINGS_PER_STRING = 16
+_CANDIDATE_MAX_NODES = 4 * _CANDIDATE_MAX_COUNT
+
+
+def _decoded(form: str) -> list[str]:
+    """One decoding step of ``form``: trimmed, percent-decoded, and as a ``file:`` URI's path (its authority,
+    query and fragment dropped, the path percent-decoded, as Node's ``fileURLToPath`` and Python's ``url2pathname``
+    read it)."""
+    from urllib.parse import unquote, urlsplit
+
+    out = [form.strip()]
+    if "%" in form:
+        out.append(unquote(form))
+    lead = form.lstrip()
+    if lead[:5].lower() == "file:":
+        try:
+            out.append(unquote(urlsplit(lead).path))
+        except ValueError:
+            out.append(lead[5:])
+    return out
+
+
+def _spellings(value: str) -> list[str] | None:
+    """The paths one input string can reach a server as: cut at its first NUL (a C server stops there); a string over
+    :data:`_CANDIDATE_DECODE_MAX` first trimmed and normalised, and ``None`` if what is left is still that long and
+    holds an encoded dot or slash or a ``file:`` scheme; then, to a fixed point, trimmed, percent-decoded and read
+    as a ``file:`` URI (:func:`_decoded`); each as given and lexically normalised (a server's
+    ``path.resolve`` / ``abspath`` / ``filepath.Clean`` collapses ``./``, ``..`` and slash runs before it opens).
+    Only the non-empty ones at most :data:`_CANDIDATE_MAX_LEN` long are kept. ``None`` past
+    :data:`_SPELLINGS_PER_STRING` forms (the caller tags the request)."""
+    head = value.split("\x00", 1)[0]
+    if len(head) > _CANDIDATE_DECODE_MAX:
+        # collapse first (linear), then decode what that leaves when it is short; a long string a server could
+        # still decode into a shorter path (an encoded dot or slash, a file: URI) goes to the human
+        short = os.path.normpath(head.strip())
+        if len(short) > _CANDIDATE_DECODE_MAX:
+            low = short.lower()
+            if "%2e" in low or "%2f" in low or "%5c" in low or "file:" in low[:16]:
+                return None
+            return [short] if len(short) <= _CANDIDATE_MAX_LEN else []
+        head = short
+    forms = [head]
+    todo = [head]
+    while todo:
+        form = todo.pop()
+        for nxt in (_decoded(form) if len(form) <= _CANDIDATE_DECODE_MAX else [form.strip()]):
+            nxt = nxt.split("\x00", 1)[0]
+            if nxt not in forms:
+                if len(forms) >= _SPELLINGS_PER_STRING:
+                    return None
+                forms.append(nxt)
+                todo.append(nxt)
+    out: list[str] = []
+    for form in forms:
+        for spelled in (form, os.path.normpath(form) if form else form):
+            if spelled and len(spelled) <= _CANDIDATE_MAX_LEN and spelled not in out:
+                out.append(spelled)
+    return out
+
+
+def mcp_config_candidates(tool_input: Any) -> list[str] | None:
+    """Every string in an MCP tool's input that could name a file, for agent-config tagging only (ruling 3b item 1):
+    an MCP server can take its path in a field of any name (``filepath``, ``file``, a key of a path-to-content map,
+    an item of a nested list), so tagging reads every string key and value at any depth, not only
+    :data:`MCP_PATH_FIELDS`, in each of its :func:`_spellings`; the input need not be an object. ``None`` (the
+    caller tags the request), decided as the walk goes, when the input holds more than :data:`_CANDIDATE_MAX_COUNT`
+    strings or :data:`_CANDIDATE_MAX_NODES` nodes, more than :data:`_CANDIDATE_RAW_MAX` characters to decode, nests deeper than :data:`_CANDIDATE_MAX_DEPTH`, a string has too
+    many spellings, or the kept spellings total more than :data:`_CANDIDATE_MAX_TOTAL` characters. Over-matching
+    only sends a request to the human; a grant's own criteria still read the named fields alone
+    (:func:`grant_targets`). This is best effort by construction: MCP declares no path fields (a tool's
+    annotations are untrusted, access control is the server's), so a path a server builds from what no string holds
+    whole (a root it was configured with, an encoding other than these) is not seen, a known edge in the
+    CHANGELOG."""
+    out: list[str] = []
+    strings = nodes = total = raw = 0
+    stack: list[tuple[Any, int]] = [(tool_input, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _CANDIDATE_MAX_NODES:
+            return None
+        if isinstance(value, str):
+            strings += 1
+            raw += min(len(value), _CANDIDATE_DECODE_MAX)
+            got = _spellings(value) if strings <= _CANDIDATE_MAX_COUNT and raw <= _CANDIDATE_RAW_MAX else None
+            if got is None:
+                return None
+            total += sum(map(len, got))
+            if total > _CANDIDATE_MAX_TOTAL:
+                return None
+            out += got
+        elif isinstance(value, (Mapping, list, tuple)):
+            if depth >= _CANDIDATE_MAX_DEPTH or len(value) > _CANDIDATE_MAX_NODES:
+                return None
+            for item in (value.items() if isinstance(value, Mapping) else value):
+                if isinstance(value, Mapping):
+                    stack.append((item[0], depth + 1))
+                    stack.append((item[1], depth + 1))
+                else:
+                    stack.append((item, depth + 1))
+            if len(stack) > _CANDIDATE_MAX_NODES:
+                return None
     return out
 
 
@@ -174,6 +297,10 @@ def grant_refusal(grant: Mapping[str, Any], request: ExternalGateRequest, *, too
     if request.tool_name.lower() in CONSENT_SHELL_TOOLS or not isinstance(tools, (list, tuple)) \
             or request.tool_name not in tools:
         return "the grant does not name this tool"
+    if consent_mcp_tool_problem(request.tool_name) is not None:
+        return "an MCP tool that may write is never answered by a grant"   # one signed before the append rule
+    if request.tool_name.startswith("mcp__") and not consent_mcp_input_fits(request.tool_name, tool_input):
+        return "the input is not one the read tool levain knows takes"  # another server's read_file, say
     postures = grant.get("postures")
     if not isinstance(posture, str) or not isinstance(postures, (list, tuple)) or posture not in postures:
         return "the grant does not cover this posture"

@@ -613,10 +613,13 @@ def test_a_plugin_dirs_hooks_are_tagged_only_beside_a_plugin_manifest(tmp_path):
 @pytest.mark.parametrize("inp,tagged", [
     ({"path": ".mcp.json", "content": "{}"}, True), ({"file_path": "~/.claude/settings.json"}, True),
     ({"paths": ["src/a.py", ".claude/agents/x.md"]}, True), ({"destination": ".claude/hooks/h.sh"}, True),
-    ({"path": "src/a.py", "content": "x"}, False), ({"query": ".mcp.json"}, False), ({}, False),
+    ({"path": "src/a.py", "content": "x"}, False), ({"query": ".mcp.json"}, True), ({}, False),
+    ({"query": "where is .claude/settings.json read", "n": 3}, False), ({"content": "x" * 5000 + "/.mcp.json"}, False),
+    ({"file": ".claude/hooks/h.sh\x00.txt"}, True), ({"files": {"~/.codex/hooks.json": "{}"}}, True),
 ])
-def test_an_mcp_tool_is_tagged_by_its_named_path_fields(inp, tagged):
-    """MCP tools that write files: only what tool_input names as a path field is read, no parsing."""
+def test_an_mcp_tool_is_tagged_by_any_string_that_names_agent_config(inp, tagged):
+    """MCP tools that write files: a server can name its path in any field, so every string key and value is read
+    as a path (no parsing: a string is a path or it is not); over-matching sends the request to the human."""
     assert cc.targets_agent_config("mcp__fs__write_file", inp, "/work/proj", home=HOME) is tagged
 
 
@@ -822,3 +825,207 @@ def test_an_old_form_levain_entry_is_recognised_and_replaced(tmp_path, agent):
                     allow_untested_agent_version=True)
     commands = [h["command"] for g in json.loads(config.read_text())["hooks"]["PermissionRequest"] for h in g["hooks"]]
     assert sorted(commands) == sorted(lookalikes + [f"/new/bin/python3 -EP {script}"])
+
+
+def _granted_mcp_hook(tmp_path, tool):
+    """A real cockpit with one consent grant on ``tool`` over ``proj``; returns (workspace, run(event) -> stdout)."""
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    ws = Path(os.path.realpath(tmp_path / "proj"))
+    ws.mkdir()
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    for op in ({"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key, "class": "laptop-presence",
+                "custody": "passphrase"},
+               {"op": "create_grant", "grant": {"id": "g1", "kind": "consent", "agent": "claude_code",
+                                                "tools": [tool], "workspace": str(ws), "postures": ["default"],
+                                                "expires_at": utc_stamp(datetime.now(timezone.utc)
+                                                                        + timedelta(days=1))}}):
+        auth.sign_and_append(conn, op, signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                             clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    qdir = tmp_path / "home" / "consent"
+    qdir.mkdir(parents=True, mode=0o700)
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+
+    def run(e):
+        out = io.StringIO()
+        assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
+        return out.getvalue()
+    return ws, run
+
+
+@pytest.mark.parametrize("inp", [
+    {"filepath": ".claude/settings.json", "content": "{}"},
+    {"target": {"file": "~/.claude/hooks/h.sh"}, "content": "x"},
+    {"edits": [{"file": ".claude/settings.local.json"}]},
+    {"file": ".codex/config.toml"},
+    {"filename": "/abs/.mcp.json"},
+])
+def test_a_grant_never_answers_an_mcp_write_to_agent_config_named_in_any_field(tmp_path, inp):
+    """Ruling 3b item 1: an MCP tool whose server names its path in a field levain does not know (``filepath``,
+    ``file``, nested) still edits agent config. Reproduced 2026-10-17 on main c0664a9: a grant on the tool allowed
+    a write to the workspace's ``.claude/settings.json`` through ``filepath``. A grant may now name only a read
+    tool (the next test), so the tagging is held on one: a request it tags is agent config, never a grant's."""
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_text_file")
+    assert json.loads(run(event("mcp__fs__read_text_file", {"path": "src/a.py"}, cwd=str(ws))))[
+        "hookSpecificOutput"]["decision"] == {"behavior": "allow"}  # the grant answers an ordinary read
+    assert run(event("mcp__fs__read_text_file", inp, cwd=str(ws))) == ""
+
+
+def test_a_grant_on_an_mcp_tool_that_may_write_answers_nothing(tmp_path, monkeypatch):
+    """Phill 10-17 (c): MCP declares no path fields, so a grant's workspace bound cannot hold a writing tool (a
+    ``filepath`` grant answered writes anywhere, CHANGELOG 0.11.0 known edge). The log refuses such a grant, and one
+    signed before the rule (made here by switching the append check off) answers nothing and renews nothing."""
+    (tmp_path / "a").mkdir()
+    with pytest.raises(auth.AuthorityError, match="not know to be read-only"):
+        _granted_mcp_hook(tmp_path / "a", "mcp__fs__write_file")
+    (tmp_path / "b").mkdir()
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would revert conftest's isolation too
+        m.setattr(auth, "_consent_mcp_check", lambda grants: None)
+        ws, run = _granted_mcp_hook(tmp_path / "b", "mcp__fs__write_file")
+    assert run(event("mcp__fs__write_file", {"path": "src/a.py", "content": "x"}, cwd=str(ws))) == ""
+    assert run(event("mcp__fs__write_file", {"filepath": str(Path.home() / ".zshrc"), "content": "x"},
+                     cwd=str(ws))) == ""
+
+
+def test_a_grant_on_a_known_read_tool_still_answers_inside_its_workspace(tmp_path):
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_text_file")
+    out = json.loads(run(event("mcp__fs__read_text_file", {"path": str(ws / "src" / "a.py")}, cwd=str(ws))))
+    assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert run(event("mcp__fs__read_text_file", {"path": "/etc/hosts"}, cwd=str(ws))) == ""  # outside: no answer
+    assert auth.consent_mcp_tool_problem("mcp__my_fs__list_directory") is None
+    for name in ("mcp__fs__read_text_file_and_write", "fs__write_file", "MCP__fs__read_file", "mcp__a__b__read_file"):
+        assert auth.consent_mcp_tool_problem(name) is not None, name  # an MCP tool spelled otherwise fails closed
+
+
+@pytest.mark.parametrize("inp", [{"filepath": "/etc/hosts"}, {"relative_path": "../../etc/hosts"},
+                                 {"path": "src/a.py", "root": "/"}, ["src/a.py"],
+                                 {"head": "/etc/hosts"}, {"path": "src/a.py", "head": "/etc/hosts"},  # L3 r1 codex
+                                 {"path": "src/a.py", "head": True}])
+def test_another_servers_read_tool_with_a_field_the_reference_tool_does_not_take_matches_no_grant(tmp_path, inp):
+    """L1 + L2 on 1ae0546: the read list is by tool name, so another server's ``read_file`` taking its path in
+    ``filepath`` (or Serena's ``relative_path``) was matched on the working directory alone and read anywhere. A
+    request now matches only when its input carries just the fields the reference tool's schema declares."""
+    ws, run = _granted_mcp_hook(tmp_path, "mcp__fs__read_file")
+    assert run(event("mcp__fs__read_file", inp, cwd=str(ws))) == ""
+    out = json.loads(run(event("mcp__fs__read_file", {"path": "src/a.py", "head": 5}, cwd=str(ws))))
+    assert out["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+
+
+def test_the_directory_holding_the_authority_database_is_tagged(tmp_path):
+    """L3 r1 codex MED: a protected FILE (cockpit.db) is a root, so its directory with the name in another field
+    was not tagged."""
+    root = tmp_path / "trust"
+    protected = cc.protected_paths(tmp_path / "q", cc.AdapterSettings(cockpit_data_root=str(root)))
+    for inp in ({"directory": str(root), "filename": "cockpit.db"}, {"path": str(root / "cockpit.db")}):
+        assert cc.targets_agent_config("mcp__fs__w", inp, str(tmp_path), home=tmp_path / "h", protected=protected)
+
+
+@pytest.mark.parametrize("config_file", [
+    ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/h.sh", ".claude/agents/a.md",
+    ".claude/skills/s/SKILL.md", ".claude/commands/c.md", ".claude/plugins/p/hooks/h.json", ".codex/hooks.json",
+    ".codex/config.toml", "activation/hooks/consent_claude_code.py", "p/.claude-plugin/plugin.json",
+])
+def test_the_directory_holding_each_config_file_is_tagged(config_file):
+    """L1 on 1ae0546 (the class of the finding it closes): the probes are a list too, so tie them to the file
+    checks: wherever a file is tagged, a server given its directory and its name in two fields is tagged."""
+    cwd, home = "/work/proj", Path("/home/u")
+    assert cc.targets_agent_config("Write", {"file_path": f"{cwd}/{config_file}"}, cwd, home=home)
+    parent, name = os.path.split(config_file)
+    assert cc.targets_agent_config("mcp__fs__w", {"directory": f"{cwd}/{parent}", "n": "zz-" + name}, cwd, home=home)
+
+
+@pytest.mark.parametrize("where", ["activation-hooks", "activation-hooks-relative", "site-dir"])
+def test_a_directory_field_holding_the_hook_or_a_site_dir_is_tagged(tmp_path, where):
+    """Diogenes 10-17 MEDIUM, reproduced on main 24a8d26 (both adapters False): a server given the directory in one
+    field and the file name in another writes the consent hook (a levain install's activation/hooks/) or a ``.pth``
+    in a site directory, which runs at every interpreter start. The directory is tagged when a file the path
+    checks tag could sit in it, derived from those checks rather than a second list of names."""
+    import sysconfig
+
+    from levain.consent.adapters import codex as cx
+    proj = Path(os.path.realpath(tmp_path)) / "proj"
+    (proj / "activation" / "hooks").mkdir(parents=True)
+    inp = {"activation-hooks": {"directory": str(proj / "activation" / "hooks"), "filename": "consent_claude_code.py"},
+           "activation-hooks-relative": {"directory": "activation/hooks", "filename": "consent_claude_code.py"},
+           "site-dir": {"directory": sysconfig.get_path("purelib"), "filename": "zz.pth"}}[where]
+    assert cc.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h")
+    assert cx.targets_agent_config("mcp__fs__write_file", inp, str(proj), home=tmp_path / "h",
+                                   codex_dir=tmp_path / "h" / ".codex")
+    assert not cc.targets_agent_config("mcp__fs__write_file", {"directory": str(proj / "src"), "filename": "a.py"},
+                                       str(proj), home=tmp_path / "h")
+
+
+def test_an_mcp_input_past_the_bound_is_tagged():
+    assert cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 5000}, "/work/proj", home=HOME)
+    deep: object = "x"
+    for _ in range(70):
+        deep = [deep]
+    assert cc.targets_agent_config("mcp__fs__w", {"v": deep}, "/work/proj", home=HOME)
+    assert not cc.targets_agent_config("mcp__fs__w", {"lines": ["a"] * 4000}, "/work/proj", home=HOME)
+
+
+@pytest.mark.parametrize("inp", [
+    {"filepath": "./" * 2100 + ".claude/settings.json", "content": "x"},  # a server's resolve() collapses the run
+    {"directory": "~/.claude", "filename": "settings.json"},  # the directory and the name in two fields
+    {"dir": "~", "name": ".claude.json"}, {"dir": "/work/proj", "name": ".claude-plugin"},
+    {"name": ".claude.json"},  # a server rooted at ~ joins it there
+    {"uri": "file:///home/u/.claude/hooks/h.sh"}, {"uri": "file:///home/u/.claude.json"},
+    {"filepath": "%2Eclaude/settings.json"}, {"dir": "/work/proj/.codex", "name": "config.toml"},
+    {"filepath": " .claude/settings.json\n"}, {"f": "/work/proj/" + "/" * 5000 + ".claude/settings.json"},
+])
+def test_an_mcp_path_built_or_spelled_another_way_is_tagged(inp):
+    """L2 probes on 450913a, each untagged there: what a server opens is not always one string as written."""
+    assert cc.targets_agent_config("mcp__x__write_file", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_ordinary_mcp_inputs_stay_untagged():
+    for inp in ({"dir": "/work/proj/src", "name": "a.py", "content": "~ home"}, {"url": "https://example.com/a"},
+                {"query": "claude settings", "limit": 5}, {"content": "./" * 3000}):
+        assert not cc.targets_agent_config("mcp__x__w", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_the_scan_has_a_bound_and_tags_past_it():
+    """L1 on 450913a: 4000 strings of ~4 KiB cost 33-49 s of lstat. Past the total the request goes to the human."""
+    t0 = time.monotonic()
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["a/" * 2040] * 4000}, "/work/proj", home=Path("/home/u"))
+    assert time.monotonic() - t0 < 5
+    # 4095 values + the key "v" = 4096 strings, the most read; one more is past the bound
+    assert not cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4095}, "/work/proj", home=Path("/home/u"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["ab"] * 4096}, "/work/proj", home=Path("/home/u"))
+
+
+@pytest.mark.parametrize("inp", [
+    {"uri": "file:///work/proj/.claude/settings.json?raw=1"},  # L3 r1 codex: a query fileURLToPath drops
+    {"uri": " file:///work/proj/%2Eclaude/settings.json "},  # trim, then file:, then decode, composed
+    {"uri": "file://localhost/home/u/.claude.json#x"}, {"f": "%20.claude/settings.json%0A"},
+    ["~/.claude/settings.json"], "~/.claude/hooks/h.sh",  # an input that is not an object (L3 r1 glm)
+])
+def test_l3_r1_spellings_are_tagged(inp):
+    assert cc.targets_agent_config("mcp__x__write", inp, "/work/proj", home=Path("/home/u")), inp
+
+
+def test_the_budget_stops_the_walk_early():
+    """L3 r1 codex MED: 4095 percent-encoded file: strings of ~3.5 KiB built ~53 MiB before the total was checked."""
+    t0 = time.monotonic()
+    assert cc.targets_agent_config("mcp__x__w", {"v": ["file:///" + "%61" * 1200] * 4095}, "/w", home=Path("/h"))
+    assert cc.targets_agent_config("mcp__x__w", {"v": [0] * 20000}, "/w", home=Path("/h"))
+    assert time.monotonic() - t0 < 2
+
+
+@pytest.mark.parametrize("value", [
+    "file:///work/proj/" + "a/../" * 14000 + ".claude/settings.json?raw=1",  # L3 r2 codex HIGH
+    "/" * 70000 + "%2Eclaude/settings.json", "file://" + "/" * 70000 + "/%2Eclaude/settings.json",  # complement MED
+    "a/%2E%2E/" * 9000 + ".claude/settings.json",
+])
+def test_a_long_string_is_collapsed_then_decoded(value):
+    assert cc.targets_agent_config("mcp__x__write", {"filepath": value}, "/work/proj", home=Path("/home/u"))
+
+
+def test_long_content_is_not_tagged():
+    body = "def f(x):\n    return x / 2  # 50% of it\n" * 3000
+    assert not cc.targets_agent_config("mcp__x__write", {"path": "src/a.py", "content": body}, "/work/proj",
+                                       home=Path("/home/u"))

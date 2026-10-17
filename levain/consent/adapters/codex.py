@@ -55,9 +55,11 @@ from typing import IO, Any
 
 from levain.authority import anchor_path
 from levain.consent import policy as consent_policy
-from levain.consent.adapters.claude_code import (
-    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings,
+# _absolute_root is re-exported: the confinement floor reads it as `adapter._absolute_root` for either adapter
+from levain.consent.adapters.claude_code import (  # noqa: F401
+    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
+    read_settings_file,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
@@ -87,17 +89,7 @@ TRUST_TIMEOUT = 30.0
 def load_settings(queue_dir: Path) -> AdapterSettings:
     """The adapter's settings from ``queue_dir/codex.json``; defaults (away off, no authority) when the file is
     missing or any field is malformed."""
-    try:
-        data = json.loads((queue_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return AdapterSettings()
-    if not isinstance(data, dict):
-        return AdapterSettings()
-    hold = data.get("away_hold_seconds", 0)
-    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
-        hold = 0.0
-    return AdapterSettings(away_mode=data.get("away_mode") is True, away_hold_seconds=float(hold),
-                           cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
+    return read_settings_file(queue_dir / SETTINGS_NAME)
 
 
 def codex_home(environ: Mapping[str, str] | None = None) -> Path:
@@ -158,7 +150,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     """True when a Codex ``apply_patch`` or an MCP tool targets an agent's config or hooks: every path the Claude
     Code adapter tags (:func:`levain.consent.adapters.claude_code.targets_agent_config`: Claude Code's config,
     ``.codex/hooks.json`` and ``config.toml``, the levain package, the adapter's own queue and authority), plus
-    anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). A patch whose headers name no file
+    anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). An MCP tool's targets are its
+    :data:`MCP_PATH_FIELDS` and every other string in its input (:func:`levain.consent.policy.mcp_config_candidates`). A patch whose headers name no file
     is tagged, as is a non-string MCP path. Shell requests (:data:`SHELL_TOOLS`) and every other tool are never
     tagged: a command is not parsed (ruling 1)."""
     home = home if home is not None else Path.home()
@@ -168,12 +161,16 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         targets: list[Any] | None = patch_targets(command)
         if targets is None:
             return True
-    elif tool_name.startswith("mcp__") and isinstance(tool_input, Mapping):
-        targets = []
-        for field in MCP_PATH_FIELDS:
-            if field in tool_input:
-                value = tool_input[field]
-                targets += value if isinstance(value, list) else [value]
+    elif tool_name.startswith("mcp__"):
+        # the Claude Code check reads the whole MCP input once (named fields, every-string candidates, config
+        # directories); what is left per path is CODEX_HOME and any .codex/
+        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):
+            return True
+        targets = consent_policy.mcp_config_candidates(tool_input) or []
+        try:
+            return any(_in_codex_config(t, cwd, home, codex_dir) for t in targets)
+        except (OSError, ValueError):
+            return True
     else:
         return False
     for target in targets:

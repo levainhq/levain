@@ -50,7 +50,7 @@
   },
   {
    "namespace": "levain-consent-answer",
-   "status": "reserved",
+   "status": "shipped",
    "owner": "levain/consent/record.py"
   }
  ],

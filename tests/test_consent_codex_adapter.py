@@ -140,3 +140,27 @@ def test_real_core_grant_answers_an_apply_patch_inside_its_workspace_only(tmp_pa
     # r2 item 1 (codex r2 #1): an inside header does not cover an outside path field carried beside it
     assert run({**patch("a.txt"), "path": str(tmp_path / "outside.txt")}) == ""
     assert run({**patch("a.txt"), "file_path": str(tmp_path / "outside.txt")}) == ""
+
+
+def test_a_codex_mcp_write_naming_agent_config_in_any_field_is_tagged(tmp_path):
+    """Ruling 3b item 1 for Codex: an MCP server's own field name (``filepath``) still reaches config."""
+    home, codex_dir = tmp_path / "home", tmp_path / "codexhome"
+    for inp in ({"filepath": ".codex/config.toml"}, {"target": {"file": str(codex_dir / "x")}},
+                {"filepath": ".claude/settings.json"}):
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home, codex_dir=codex_dir), inp
+    assert not cx.targets_agent_config("mcp__fs__write", {"filepath": "src/a.py"}, str(tmp_path), home=home,
+                                       codex_dir=codex_dir)
+
+
+def test_a_codex_mcp_write_naming_a_config_directory_is_tagged(tmp_path):
+    home = tmp_path / "home"
+    for inp in ({"dir": "~/.claude", "name": "settings.json"}, {"dir": str(tmp_path / ".codex"), "name": "hooks.json"},
+                {"name": ".claude.json"}):
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=home,
+                                       codex_dir=tmp_path / "ch"), inp
+
+
+def test_a_codex_mcp_input_that_is_not_an_object_is_still_read(tmp_path):
+    for inp in ([".codex/config.toml"], [{"file": ".codex/config.toml"}], "file:///x/.codex/hooks.json?a=1"):
+        assert cx.targets_agent_config("mcp__fs__write", inp, str(tmp_path), home=tmp_path / "h",
+                                       codex_dir=tmp_path / "ch"), inp

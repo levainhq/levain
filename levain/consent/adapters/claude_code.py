@@ -52,6 +52,7 @@ from levain.consent.policy import FILE_TOOLS as FILE_TOOLS
 from levain.consent.policy import MCP_PATH_FIELDS as MCP_PATH_FIELDS
 from levain.consent.policy import PolicyNotEligible as PolicyNotEligible
 from levain.consent.policy import guarded_policy as guarded_policy
+from levain.consent.policy import mcp_config_candidates
 from levain.consent.policy import targets as _targets
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
@@ -90,17 +91,31 @@ class AdapterSettings:
 def load_settings(queue_dir: Path) -> AdapterSettings:
     """The adapter's settings from ``queue_dir/claude_code.json``; defaults (away off, no authority) when the
     file is missing or any field is malformed."""
+    return read_settings_file(queue_dir / SETTINGS_NAME)
+
+
+def read_settings_file(path: Path) -> AdapterSettings:
+    """:func:`settings_from` the JSON in ``path``; defaults when it is missing, does not parse or nests too deep.
+    The Codex adapter reads its own file through this too."""
     try:
-        data = json.loads((queue_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
         return AdapterSettings()
+    return settings_from(data)
+
+
+def settings_from(data: Any) -> AdapterSettings:
+    """The settings a parsed settings file means, as both adapters' hooks and ``levain consent away`` read it:
+    away mode only when ``away_mode`` is ``true``, a hold only when it is a finite number >= 0 (an integer too
+    large for a float is malformed), a cockpit root only when absolute (:func:`_absolute_root`)."""
     if not isinstance(data, dict):
         return AdapterSettings()
-    away = data.get("away_mode") is True
     hold = data.get("away_hold_seconds", 0)
-    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
-        hold = 0.0
-    return AdapterSettings(away_mode=away, away_hold_seconds=float(hold),
+    try:
+        ok = not isinstance(hold, bool) and isinstance(hold, (int, float)) and math.isfinite(float(hold)) and hold >= 0
+    except OverflowError:
+        ok = False
+    return AdapterSettings(away_mode=data.get("away_mode") is True, away_hold_seconds=float(hold) if ok else 0.0,
                            cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
 
 
@@ -140,6 +155,43 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 # its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
 USER_CONFIG_NAME = ".claude.json"
+
+
+# The names a file inside a directory is probed under, so that a directory is agent config exactly when a file the
+# checks below tag could sit directly in it (:func:`names_config_dir`): one name each directory-keyed check keys on.
+# A name that is config in ANY directory (``.mcp.json``) is not probed, or every directory would be: the file-name
+# field naming it is itself a candidate, tagged on its own.
+_DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NAME, "x.pth", "sitecustomize.py",
+               "levain")
+
+
+def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
+                     user_configs: frozenset[str]) -> bool:
+    """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
+    when a server given ``target`` as a directory and a file name in another field could write agent config:
+    ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
+    :func:`targets_agent_config` tag (each of :data:`_DIR_PROBES` directly inside it, so the directory list is
+    derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
+    authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
+    server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
+    ``user_configs`` are the caller's, computed once. Over-matching only sends the request to the human."""
+    raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
+    if not raw.is_absolute():
+        raw = Path(cwd) / raw
+    parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
+    for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
+        if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
+            return True
+        for probe in _DIR_PROBES:
+            if _tags_path(p / probe, roots, sites, user_configs):
+                return True
+    return False
+
+
+def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str]) -> bool:
+    """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
+    return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
+            or _redirects_the_import(path, sites))
 
 
 def _is_config_path(path: Path) -> bool:
@@ -249,20 +301,30 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
-    tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and nothing
-    else. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
+    tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
+    other string in its input (:func:`levain.consent.policy.mcp_config_candidates`: a server can name its path in a
+    field of any name), each also tagged when it names a config directory or ``.claude.json``
+    (:func:`names_config_dir`), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
     missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
     targets = _targets(tool_name, tool_input)
-    if targets is None:
+    if targets is None and not tool_name.startswith("mcp__"):
         return False
+    targets = targets or []
+    extra: list[str] = []
+    if tool_name.startswith("mcp__"):
+        got = mcp_config_candidates(tool_input)
+        if got is None:
+            return True
+        extra = got
+        targets = [*targets, *extra]
     home = home if home is not None else Path.home()
     try:
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
         user_config = Path(home) / USER_CONFIG_NAME
-        user_configs = {os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()}
+        user_configs = frozenset({os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()})
     except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
@@ -276,13 +338,12 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots):
+        if _tags_path(written, roots, sites, user_configs) or _tags_path(resolved, roots, sites, user_configs):
             return True
-        if str(written).lower() in user_configs or str(resolved).lower() in user_configs:
-            return True
-        if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
-            return True
-    return False
+    try:
+        return any(names_config_dir(target, cwd, Path(home), roots, sites, user_configs) for target in extra)
+    except (OSError, ValueError):
+        return True
 
 
 # --- the decision ------------------------------------------------------------------------------------------

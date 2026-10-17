@@ -189,7 +189,7 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
 
 ### F11. SSHSIG namespace registry
 - Exact strings, never prefixes. Shipped: `git`, `levain-authority`, `levain-authority-reset`, `levain-confirm`,
-  `levain-cockpit`. Used by `levain consent answer` for a consent-queue answer: `levain-consent-answer` (`levain/consent/record.py`; the registry still lists it as reserved). Reserved: `levain-team-entry` (F9), `levain-manifest`, `levain-consent`; the family
+  `levain-cockpit`. Used by `levain consent answer` for a consent-queue answer: `levain-consent-answer` (`levain/consent/record.py`). Reserved: `levain-team-entry` (F9), `levain-manifest`, `levain-consent`; the family
   `levain-team-<kind>` for P1's envelope kinds, where no kind may be `entry`.
 - Code: `levain/contracts/namespaces.py`. Golden: `frozen/namespaces.json`. `tests/test_contracts_namespaces.py`
   walks the package's AST: every constant after `"-n"` in an `ssh-keygen -Y` argument list, every `namespace=`
