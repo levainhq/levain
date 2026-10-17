@@ -444,7 +444,7 @@ def test_live_confined_shell_cannot_read_or_rewrite_the_consent_settings(home):
     with select_provider().spawn_shell(build_policy(entity)) as sh:
         ok = sh.run(f"touch '{entity}/workspace/control' 2>&1", timeout=20)
         assert ok.exit_code == 0, ok.output
-        for cmd in (f"cat '{settings}'", f"ls '{queue}'",
+        for cmd in (f"cat '{settings}'", f"ls '{settings}'",
                     f"printf '{{}}' > '{settings}'", f"touch '{home}/.levain/new-dir-file'"):
             r = sh.run(cmd + " 2>&1", timeout=20)
             assert r.exit_code != 0, f"{cmd!r} succeeded: {r.output!r}"
