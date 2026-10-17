@@ -16,6 +16,15 @@ one of four things ends it:
     nothing and the agent's native dialog stands;
   - ``withdrawn``: the requester gave up (the human answered the native dialog, the hook stopped holding).
 
+What became of a request levain left to the agent's own dialog (withdrawn, expired, or answered in that dialog
+while the hook still held it) is recorded apart, UNSIGNED, in ``dialog_outcomes`` (:meth:`ConsentQueue.record_ran`,
+:meth:`ConsentQueue.close_unrun`, written by the agent's PostToolUse / Stop / UserPromptSubmit hooks): ``ran``
+(the tool ran: a yes in the agent's dialog), ``ran_unasked`` (it ran within :data:`UNASKED_WITHIN` of levain
+leaving it to the agent, too soon for a person: the agent's own standing approval) or ``did_not_run`` (a later
+turn began or the turn ended without it running: a no, or abandoned; which is not known). An outcome never
+touches the request's state, answer or signature, and is never authority: it is the record of a decision levain
+did not make.
+
 The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
 delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`) re-reads the
 stored answer and signature, checks the answer binds this queue, this request and the row's decision, and
@@ -83,6 +92,12 @@ _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_inp
            "tier", "received_at", "expires_at")
 _STATE_OF = {"allow": "allowed", "deny": "denied"}
 _ACCESS_BY_OTHERS = 0o077
+# what became of a request left to the agent's own dialog (unsigned; never a decision)
+DIALOG_OUTCOMES: tuple[str, ...] = ("ran", "ran_unasked", "did_not_run")
+# a tool that ran this soon after levain left its request to the agent was not answered by a person: Codex 0.162.1
+# runs a call it holds a session approval for 0.1 s after levain withdraws the request, and a person's yes in its
+# dialog came 12-13 s after [judged by levain seat lane H, 2026-10-17, against those two measured runs]
+UNASKED_WITHIN = timedelta(seconds=0.5)
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -115,6 +130,15 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'receipts are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS receipts_kept BEFORE DELETE ON receipts "
     "BEGIN SELECT RAISE(ABORT, 'receipts are append-only'); END",
+    # one unsigned outcome per request left to the agent's dialog, written once (a table a store made before it
+    # gains on its next open; the format is unchanged, so an older levain reading the store ignores it)
+    "CREATE TABLE IF NOT EXISTS dialog_outcomes (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
+    "outcome TEXT NOT NULL CHECK (outcome IN ('ran','ran_unasked','did_not_run')), closed_at TEXT NOT NULL, "
+    "event TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS dialog_outcomes_frozen BEFORE UPDATE ON dialog_outcomes "
+    "BEGIN SELECT RAISE(ABORT, 'a dialog outcome is written once'); END",
+    "CREATE TRIGGER IF NOT EXISTS dialog_outcomes_kept BEFORE DELETE ON dialog_outcomes "
+    "BEGIN SELECT RAISE(ABORT, 'dialog outcomes are never deleted'); END",
 )
 
 
@@ -460,6 +484,66 @@ class ConsentQueue:
                 if request is not None and self._transition(conn, request, "expired", stamp=stamp):
                     done += 1
         return done
+
+    # --- what the agent's own dialog did (unsigned) -----------------------------------------------------------
+    def record_ran(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any,
+                   event: str) -> tuple[str, str] | None:
+        """The agent ran ``tool_name`` with ``tool_input`` in this session (its PostToolUse): the oldest request
+        of this agent and session for that tool and that exact input (its digest) that levain did not decide
+        (pending, withdrawn or expired) and that has no outcome yet gets ``ran``, or ``ran_unasked`` when the
+        tool ran within :data:`UNASKED_WITHIN` of levain leaving it; a pending one is also withdrawn. Returns (request id, outcome), or ``None``
+        when no such request is open: a call levain never filed (a session approval Claude Code no longer asks
+        about) is never given one."""
+        digest = tool_input_digest({} if tool_input is None else tool_input)
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            row = conn.execute(
+                "SELECT id, state, decided_at FROM requests r WHERE agent = ? AND agent_session_id = ? "
+                "AND tool_name = ? AND tool_input_digest = ? AND state IN ('pending','withdrawn','expired') "
+                "AND NOT EXISTS (SELECT 1 FROM dialog_outcomes o WHERE o.request_id = r.id) "
+                "ORDER BY received_at, rowid LIMIT 1", (agent, agent_session_id, tool_name, digest)).fetchone()
+            if row is None:
+                return None
+            outcome = "ran"
+            if row[1] != "pending" and row[2] is not None:
+                try:
+                    if parse_stamp(stamp) - parse_stamp(row[2]) < UNASKED_WITHIN:
+                        outcome = "ran_unasked"
+                except ConsentError:
+                    pass
+            conn.execute("INSERT INTO dialog_outcomes (request_id, outcome, closed_at, event) VALUES (?, ?, ?, ?)",
+                         (row[0], outcome, stamp, event))
+            if row[1] == "pending":
+                # answered in the agent's dialog while the hook still held it (Claude Code shows its dialog during
+                # a hold): nothing is left to sign, so it stops being answerable
+                request = self._request_of(self._row(conn, row[0]) or {})
+                if request is not None:
+                    self._transition(conn, request, "withdrawn", stamp=stamp,
+                                     note="the agent ran it: answered in the agent's own dialog")
+        return row[0], outcome
+
+    def close_unrun(self, *, agent: str, agent_session_id: str, event: str) -> list[str]:
+        """The session's turn ended or a later one began (its Stop / UserPromptSubmit): every request of this
+        agent and session that levain left to the agent's dialog (withdrawn or expired, or pending past its
+        expiry) and that has no outcome gets ``did_not_run``. A request still held is left open. Returns their
+        ids."""
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM requests r WHERE agent = ? AND agent_session_id = ? "
+                "AND (state IN ('withdrawn','expired') OR (state = 'pending' AND expires_at <= ?)) "
+                "AND NOT EXISTS (SELECT 1 FROM dialog_outcomes o WHERE o.request_id = r.id) "
+                "ORDER BY received_at, rowid", (agent, agent_session_id, stamp)).fetchall()]
+            conn.executemany("INSERT INTO dialog_outcomes (request_id, outcome, closed_at, event) VALUES (?, ?, ?, ?)",
+                             [(i, "did_not_run", stamp, event) for i in ids])
+        return ids
+
+    def dialog_outcome(self, request_id: str) -> tuple[str, str] | None:
+        """(outcome, closed_at) recorded for ``request_id``, or ``None`` (none yet, or levain decided it)."""
+        with self._read() as conn:
+            row = conn.execute("SELECT outcome, closed_at FROM dialog_outcomes WHERE request_id = ?",
+                               (request_id,)).fetchone()
+        return None if row is None else (row[0], row[1])
 
     def withdraw(self, request_id: str, *, note: str = "") -> bool:
         """The requester stops waiting (the human answered the native dialog; the hook gave up). Needs no

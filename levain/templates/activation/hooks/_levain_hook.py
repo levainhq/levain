@@ -1267,6 +1267,18 @@ def temporal() -> str:
     return datetime.now().astimezone().strftime("%I:%M %p %Z — %A %B %d, %Y")
 
 
+
+def consent_observe(agent: str, event: str, payload) -> None:
+    """Record, unsigned, what this ``event`` says about consent requests levain left to the agent's own dialog
+    (``levain.consent.dialog.observe``: a tool run closes its request as run; a turn boundary closes the rest as
+    not run). Runs whether or not the hook would emit anything. Never raises."""
+    try:
+        from levain.consent.dialog import observe
+        observe(agent, event, payload)
+    except Exception:
+        pass
+
+
 def read_stdin() -> dict:
     """Consume and parse the hook's stdin JSON payload.
 
