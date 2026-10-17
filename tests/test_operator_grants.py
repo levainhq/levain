@@ -69,8 +69,8 @@ def test_the_grant_directory_is_hidden_from_every_confined_process(tmp_path, mon
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
     policy = build_policy(_entity(tmp_path))
     gdir = (tmp_path / "lh" / conf.GRANTS_DIR).resolve()
-    assert gdir in policy.deny_read_write
-    assert gdir.parent in policy.deny_write_dirs   # its ancestors cannot be renamed
+    assert gdir.parent in policy.deny_read_write   # inside the levain home, which the floor hides whole
+    assert gdir.parent.parent in policy.deny_write_dirs   # its ancestors cannot be renamed
     assert conf.crown_jewel_reason(policy, gdir / conf.GRANTS_FILE) is not None   # the file editor refuses it
 
 
