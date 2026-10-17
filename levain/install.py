@@ -2403,7 +2403,9 @@ def _commit_messaging_if_applied(install: Path, choice: str, previous: str, emit
         change = {"from": previous, "to": choice,
                   "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     _write_messaging_choice(install, choice, emit, changed=change)
-    if change is not None and _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous):
+    if change is not None and previous == "custom":
+        emit(f"REPLACED custom messaging controls -> {choice}")
+    elif change is not None and _MESSAGING_STRICTNESS.index(choice) > _MESSAGING_STRICTNESS.index(previous):
         emit(f"LOOSENED {previous} -> {choice}")
     return True
 
@@ -2474,7 +2476,7 @@ def run_messaging_set(path: Path, choice: str, *, yes: bool = False, no_pip: boo
                 emit(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
                 return 1
             _check_messaging(install, adapter, choice)
-            previous = _effective_messaging(install)[0] or persisted_messaging(install)
+            previous = _effective_messaging(install)[0] or "custom"  # controls that match no choice
             before = _pending_snapshot(staged)
             emit("  running `levain update` to apply it")
             try:
