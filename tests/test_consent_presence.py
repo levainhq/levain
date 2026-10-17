@@ -15,7 +15,7 @@ import time
 import pytest
 
 from levain.cli import main as cli
-from levain.consent import auto_away
+from levain.consent import auto_away, away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from levain.consent.auto_away import input_idle_seconds as real_idle_read
@@ -136,6 +136,13 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
     assert "codex: away mode off;" in (out := capsys.readouterr().out)
     assert "set by explicit word: off (set before auto-away existed); `levain consent away auto` lets input idle " \
            "decide" in out
+    (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": True,
+                                                       "away_hold_seconds": 90.0}, indent=2) + "\n")
+    cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(legacy)])
+    # run_h2 R3: a legacy ON is told the way back to input idle too
+    assert "`levain consent away auto` hands it back to input idle" in capsys.readouterr().out
+    (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": False,
+                                                       "away_hold_seconds": 90.0}, indent=2) + "\n")
     cli(["consent", "away", "auto", "--agent", "codex", "--queue-dir", str(legacy)])
     assert "away mode ON, holds up to 90s" in capsys.readouterr().out  # the 0.11.4 hold is kept, not defaulted
     assert json.loads((legacy / cx.SETTINGS_NAME).read_text())["away_hold_seconds"] == 90.0
@@ -161,7 +168,9 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
     assert cli(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "auto"
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (False, "idle")
-    assert cli(["consent", "away", "auto", "--idle-after", str(10 ** 400), "--queue-dir", str(qdir)]) == 1
+    # run_h2: an integer too large for a float is refused by set_away itself (the CLI's float parse never gets there)
+    with pytest.raises(ValueError, match="--idle-after"):
+        away.set_away(qdir, "claude_code", None, None, 10 ** 400)
 
 
 def test_a_failed_idle_read_is_no_idle_source_never_away(monkeypatch):
