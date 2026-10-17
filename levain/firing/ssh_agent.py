@@ -167,12 +167,13 @@ def openssh_problem() -> str | None:
 
 # --- the socket's peer ----------------------------------------------------------------------------
 
-def peer_pid(sock: str) -> int:
+def peer_pid(sock: str, *, timeout: float = 5.0) -> int:
     """The pid of the process listening on ``sock``, as the kernel reports it for a connection to it:
-    ``SO_PEERCRED`` on Linux, ``LOCAL_PEERPID`` on macOS. :class:`AgentError` when it cannot be read."""
+    ``SO_PEERCRED`` on Linux, ``LOCAL_PEERPID`` on macOS. :class:`AgentError` when it cannot be read,
+    the connect taking longer than ``timeout`` seconds included."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(5)
+        s.settimeout(timeout)
         s.connect(sock)
         if hasattr(socket, "SO_PEERCRED"):
             pid, _uid, _gid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
