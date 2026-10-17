@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **Security: a confined `levain run` entity could read and rewrite the consent queue, and forge the cockpit authority it is checked against.** The confinement floor hid `<levain home>/autonomic` and `<levain home>/keys` by name; the consent queue directory (`~/.levain/consent`, or under `$LEVAIN_HOME`), added later, was not among them, and neither was the cockpit data root its settings name (`<install>/.levain/cockpit`, which holds the authority log and its anchor). An entity's shell could read every Claude Code and Codex consent request, rewrite `claude_code.json` or `codex.json`, or replace that cockpit's authority log and anchor together with its own key, after which the consent hook allowed requests by the entity's grants and answers (measured). The floor now denies the whole levain home, read and write, as one subtree, so a directory levain adds there later is covered from the start, and it denies every cockpit data root the consent settings name. Upgrade if you run entities with `levain run` on a machine whose Claude Code or Codex installs use the consent hook.
+- Known edges, the floor and the levain home: (1) when the levain home holds the entity itself (an install that lives at `~/.levain` and is run as an entity) or its workspace, or `$LEVAIN_HOME` is your home directory, the home cannot be hidden whole without hiding the entity, so the floor hides its `autonomic`, `keys` and `consent` directories by name instead; a directory a later release adds there is covered in that layout only once that release names it. (2) The cockpit roots are read when the floor is built: one a `levain init` names while an entity's session is running is denied from that entity's next session. (3) A queue or key directory you place outside the levain home (`--queue-dir`, `levain cockpit key create --dir`) is not on the floor; the defaults are. (4) A Claude Code or Codex session itself is not confined by levain and runs as you, so it can write these files whatever the floor says, as before.
+
 ## [0.11.2] — 2026-10-16
 
 ### Added
