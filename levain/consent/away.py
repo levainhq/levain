@@ -107,8 +107,9 @@ def _valid_hold(value: Any) -> float | None:
 
 
 def settings(qdir: Path, agent: str) -> Any:
-    """``agent``'s settings as its hook reads them (the adapter's own ``load_settings``)."""
-    return (claude_code if agent == "claude_code" else codex).load_settings(qdir)
+    """``agent``'s settings as its hook reads them (the adapters' own :func:`claude_code.settings_from`), from a
+    bounded read of the file (:func:`read`); defaults when there is none."""
+    return claude_code.settings_from(read(qdir, agent))
 
 
 def why_unanswerable(adapter_settings: Any) -> str | None:
@@ -148,8 +149,7 @@ def set_away(qdir: Path, agent: str, on: bool, hold: float | None = None) -> dic
         if hold is None:
             hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
         # the snapshot being written is the one checked (L3 r1: a re-read could validate another file's root)
-        reason = why_unanswerable(claude_code.AdapterSettings(
-            cockpit_data_root=claude_code._absolute_root(data.get("cockpit_data_root"))))
+        reason = why_unanswerable(claude_code.settings_from(data))
         if reason:
             raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
         data["away_mode"] = True

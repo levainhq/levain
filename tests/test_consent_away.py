@@ -188,3 +188,18 @@ def test_a_file_changed_mid_write_is_not_overwritten(qdir, monkeypatch):
     monkeypatch.setattr(away, "why_unanswerable", swap)
     assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text()) == {"cockpit_data_root": "/newer", "x": 2}
+
+
+@pytest.mark.parametrize("action", ["show", "off"])
+def test_a_huge_integer_hold_reads_as_malformed_everywhere(qdir, cockpit, action, capsys):
+    """L3 r2 (complement + codex): show/off reached the adapters' math.isfinite on a 400-digit int (OverflowError)."""
+    (qdir / cc.SETTINGS_NAME).write_text(f'{{"cockpit_data_root": "{cockpit}", "away_mode": true, '
+                                         f'"away_hold_seconds": {"9" * 400}}}')
+    assert cc.load_settings(qdir).away_hold_seconds == 0.0  # the hook's own reader: malformed -> 0
+    assert main(["consent", "away", action, "--queue-dir", str(qdir)]) == 0
+    assert "codex: away mode off" in capsys.readouterr().out  # --agent all went on past claude_code
+
+
+def test_both_hooks_and_the_verb_share_one_reader(qdir):
+    (qdir / cx.SETTINGS_NAME).write_text("[" * 20000 + "]" * 20000)
+    assert cx.load_settings(qdir) == cc.AdapterSettings()  # deep nesting -> defaults, no RecursionError

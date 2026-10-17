@@ -91,17 +91,31 @@ class AdapterSettings:
 def load_settings(queue_dir: Path) -> AdapterSettings:
     """The adapter's settings from ``queue_dir/claude_code.json``; defaults (away off, no authority) when the
     file is missing or any field is malformed."""
+    return read_settings_file(queue_dir / SETTINGS_NAME)
+
+
+def read_settings_file(path: Path) -> AdapterSettings:
+    """:func:`settings_from` the JSON in ``path``; defaults when it is missing, does not parse or nests too deep.
+    The Codex adapter reads its own file through this too."""
     try:
-        data = json.loads((queue_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
         return AdapterSettings()
+    return settings_from(data)
+
+
+def settings_from(data: Any) -> AdapterSettings:
+    """The settings a parsed settings file means, as both adapters' hooks and ``levain consent away`` read it:
+    away mode only when ``away_mode`` is ``true``, a hold only when it is a finite number >= 0 (an integer too
+    large for a float is malformed), a cockpit root only when absolute (:func:`_absolute_root`)."""
     if not isinstance(data, dict):
         return AdapterSettings()
-    away = data.get("away_mode") is True
     hold = data.get("away_hold_seconds", 0)
-    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
-        hold = 0.0
-    return AdapterSettings(away_mode=away, away_hold_seconds=float(hold),
+    try:
+        ok = not isinstance(hold, bool) and isinstance(hold, (int, float)) and math.isfinite(float(hold)) and hold >= 0
+    except OverflowError:
+        ok = False
+    return AdapterSettings(away_mode=data.get("away_mode") is True, away_hold_seconds=float(hold) if ok else 0.0,
                            cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
 
 

@@ -56,8 +56,8 @@ from typing import IO, Any
 from levain.authority import anchor_path
 from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (
-    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MCP_PATH_FIELDS, MIN_FILE_HOLD, AdapterSettings,
-    _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command,
+    CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
+    _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, hook_command, read_settings_file,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
@@ -87,17 +87,7 @@ TRUST_TIMEOUT = 30.0
 def load_settings(queue_dir: Path) -> AdapterSettings:
     """The adapter's settings from ``queue_dir/codex.json``; defaults (away off, no authority) when the file is
     missing or any field is malformed."""
-    try:
-        data = json.loads((queue_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return AdapterSettings()
-    if not isinstance(data, dict):
-        return AdapterSettings()
-    hold = data.get("away_hold_seconds", 0)
-    if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
-        hold = 0.0
-    return AdapterSettings(away_mode=data.get("away_mode") is True, away_hold_seconds=float(hold),
-                           cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
+    return read_settings_file(queue_dir / SETTINGS_NAME)
 
 
 def codex_home(environ: Mapping[str, str] | None = None) -> Path:
