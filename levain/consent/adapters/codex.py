@@ -16,12 +16,14 @@ delays the dialog, and away mode stays opt-in with a default hold of 0 s. The ho
 4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
    exception, prints nothing and exits 0: Codex's own approval dialog appears and the human answers it.
 
-Measured on codex-cli 0.162.1: the approvals that reach this event are a shell escalation (``tool_name`` ``Bash``,
-the command in ``tool_input.command``, Codex's model-written reason in ``tool_input.description``) and an
+Measured on codex-cli 0.162.1, the approvals that reach this event include a shell escalation (``tool_name``
+``Bash``, the command in ``tool_input.command``, Codex's model-written reason in ``tool_input.description``), input
+sent to a terminal launched outside the sandbox (``tool_name`` ``write_stdin``, the text in ``tool_input.chars``), an
 ``apply_patch`` outside what the sandbox may write, the workspace's ``.codex/`` included (``tool_name``
-``apply_patch``, the patch text in ``tool_input.command``). A shell command is never parsed (ruling 1). A patch's
-own file headers are read to tag agent config (a patch naming no file is tagged) and to match a grant's workspace
-(an unreadable patch matches no grant).
+``apply_patch``, the patch text in ``tool_input.command``), and an MCP tool call (``mcp__<server>__<tool>``;
+1017-shellnames). A shell command or its input is never parsed (ruling 1). A patch's own file headers are read to
+tag agent config (a patch naming no file is tagged) and to match a grant's workspace (an unreadable patch matches no
+grant).
 
 Codex fires project hooks only in an INTERACTIVE session whose process cwd is the project: ``codex exec`` never asks
 (its approval policy is ``never``) and ``codex -C <dir>`` does not load ``<dir>/.codex/hooks.json`` (Q0 item 6).

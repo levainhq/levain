@@ -154,9 +154,17 @@ CONSENT_GRANT_KIND = "consent"
 _CONSENT_GRANT_FIELDS = frozenset({"id", "kind", "agent", "tools", "workspace", "postures", "expires_at"})
 CONSENT_AGENTS = ("claude_code", "codex")
 # Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Both agents
-# name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1, measured in Q0 item 6 and Q3).
-# Compared case-insensitively.
-CONSENT_SHELL_TOOLS = frozenset({"bash"})
+# name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1's exec_command, measured in Q0 item
+# 6, Q3 and 1017-shellnames). Codex 0.162.1 names the input it sends to a running terminal ``write_stdin`` (its
+# ``chars`` field, to a terminal launched outside the sandbox: 1017-shellnames, where a grant naming it answered
+# ``touch`` typed into /bin/sh). Claude Code's PowerShell tool (named so in the 2.1.302 binary, not run here) and
+# the other shell names levain's PostToolUse hooks know (shell, exec_command, shell_command, local_shell) are too.
+# A grant naming any of them is refused at append (:func:`_consent_shell_check`) and answers nothing at decision
+# (``levain.consent.policy.grant_refusal``). The replay holds only Bash (:data:`_REPLAY_SHELL_TOOLS`), so a log
+# that already holds a grant on another of them still replays. Compared case-insensitively.
+CONSENT_SHELL_TOOLS = frozenset({"bash", "powershell", "write_stdin", "shell", "exec_command", "shell_command",
+                                 "local_shell"})
+_REPLAY_SHELL_TOOLS = frozenset({"bash"})
 # The MCP tools a consent grant may name, by the tool's own name after ``mcp__<server>__``, each with the input its
 # schema declares (field -> kind, and the fields it requires): the reference filesystem server's tools that declare
 # ``readOnlyHint: true`` (github.com/modelcontextprotocol/servers, src/filesystem/server.ts, read 2026-10-17). MCP
@@ -677,10 +685,9 @@ def _validate_consent_grant(grant: Mapping[str, Any], what: str, at: datetime | 
                 f" (for {agent}: {', '.join(sorted(CONSENT_POSTURES[agent]))})"))
         if list(items) != sorted(set(items)):
             raise AuthorityError(f"{what}.{name} must be sorted and unique")
-    shell = [t for t in grant["tools"] if t.lower() in CONSENT_SHELL_TOOLS]
+    shell = [t for t in grant["tools"] if t.lower() in _REPLAY_SHELL_TOOLS]
     if shell:
-        raise AuthorityError(f"{what} names the shell tool {shell[0]!r}: a shell command is never parsed, so a "
-                             "grant for it would allow every command; shell requests go to you")
+        raise AuthorityError(_shell_refusal(what, shell[0]))
     problem = consent_workspace_problem(grant["workspace"])
     if problem is not None:
         raise AuthorityError(f"{what}: {problem}")
@@ -1243,6 +1250,22 @@ def _consent_mcp_check(grants: list[Any]) -> None:
                 raise AuthorityError(problem)
 
 
+def _shell_refusal(what: str, tool: str) -> str:
+    return (f"{what} names the shell tool {tool[:200]!r}: a shell command is never parsed, so a grant for it would "
+            "allow every command; shell requests go to you")
+
+
+def _consent_shell_check(grants: list[Any]) -> None:
+    """At append, no consent grant a link brings in or extends names a shell tool (:data:`CONSENT_SHELL_TOOLS`)."""
+    for grant in grants:
+        if not isinstance(grant, Mapping) or grant.get("kind") != CONSENT_GRANT_KIND:
+            continue
+        tools = grant.get("tools")
+        for tool in tools if isinstance(tools, (list, tuple)) else ():
+            if isinstance(tool, str) and tool.lower() in CONSENT_SHELL_TOOLS:
+                raise AuthorityError(_shell_refusal("grant", tool))
+
+
 def _consent_home_check(grants: list[Any]) -> None:
     """At append, every consent grant's workspace is an existing directory whose realpath is exactly the signed
     string (no symlink anywhere on it, so what was signed is what the criteria resolve), and not a refused root."""
@@ -1271,6 +1294,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     if rec["op"] == "create_grant":
         _consent_home_check([rec["grant"]])
         _consent_mcp_check([rec["grant"]])
+        _consent_shell_check([rec["grant"]])
     elif rec["op"] == "loosen":
         policy = rec["policy"]
         grants = policy.get("grants", {}) if isinstance(policy, Mapping) else {}
@@ -1279,12 +1303,14 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
                    if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
         _consent_home_check(changed)
         _consent_mcp_check(changed)
+        _consent_shell_check(changed)
     if rec["op"] != "renew":
         return
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
     _consent_mcp_check([grant])     # a grant signed before the rule is not extended past it
+    _consent_shell_check([grant])   # nor one signed before the wider shell set
     signed = _parse_stamp(rec["signed_at"], "signed_at")
     if abs(now - signed) > _RENEW_SKEW:
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")
