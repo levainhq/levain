@@ -790,16 +790,8 @@ _SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key t
 _AGENT_LISTENERS = ("ssh-agent", "gnome-keyring-d", "gpg-agent")
 
 
-def _process_start(pid: int) -> str | None:
-    """Linux: when ``pid`` started (``/proc/<pid>/stat`` field 22, clock ticks since boot, read after
-    the last ``)`` because comm may hold one), so a reused pid is told from the process it was; None
-    when it cannot be read (no such process, not Linux)."""
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
-            data = fh.read()
-        return data[data.rindex(")") + 1:].split()[19]
-    except (OSError, ValueError, IndexError):
-        return None
+# Linux: when a pid started (/proc/<pid>/stat field 22), one reader for the floor and the agent's sweep.
+_process_start = _ssh_agent.process_start
 
 
 def _same_socket(a: str, b: str) -> bool:
