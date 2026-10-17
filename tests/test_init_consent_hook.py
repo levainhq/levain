@@ -253,7 +253,7 @@ def test_doctor_rows_on_a_fresh_install(make_install):
     rows = doctor._check_claude_code(cc)
     assert not _row(rows, "Claude Code consent hook").warn
     away = _row(rows, "Claude Code away mode")
-    assert not away.warn and away.detail.startswith("off:"), away
+    assert not away.warn and away.detail.startswith("follows input idle:"), away
     auth = _row(rows, "Claude Code consent authority")
     assert not auth.warn and "no cockpit.db there yet" in auth.detail, auth
     (Path(os.path.realpath(cc / ".levain" / "cockpit"))).mkdir(parents=True, exist_ok=True)
