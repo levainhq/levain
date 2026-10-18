@@ -26,7 +26,7 @@ reasons; anything else a caller or a newer agent version adds is dropped, never 
 Known edges (one line each): the input digest is unsalted, so a SHORT input is recoverable by dictionary; a Codex
 policy that changes mid-turn is read from the turn's FIRST ``turn_context``; ``counts`` counts the pre and the post
 row of one call separately; ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is
-not refused by a trigger.
+not refused by a trigger; a ledger.db made by fedba7b1 (before the ``outcome`` column) is refused, delete it.
 """
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ _COLUMNS = ("id", "agent", "agent_session_id", "tool_use_id", "received_at", "to
 # the only free text the ledger keeps about a stamp: levain's own reasons, from this list
 _REASONS = frozenset({"transcript_missing", "transcript_unreadable", "rollout_missing", "rollout_unreadable",
                       "result_not_written", "result_without_decision", "no_tool_use_id", "no_source", "no_turn_id",
-                      "turn_not_written", "turn_policy_unreadable"})
+                      "turn_not_written", "turn_policy_unreadable", "result_oversized"})
 _DETAIL_STR_KEYS = ("decision", "source", "reasonType", "approval_policy", "approvals_reviewer")
 _DETAIL_TYPE_KEYS = ("sandbox_policy", "permission_profile")
 _MAX_DETAIL_STR = 64
@@ -87,7 +87,7 @@ def clean_detail(detail: Mapping[str, Any] | None) -> dict[str, Any] | None:
         kind = value.get("type") if isinstance(value, Mapping) else value
         if isinstance(kind, str) and len(kind) <= _MAX_DETAIL_STR:
             out[key] = {"type": kind}
-    if detail.get("reason") in _REASONS:
+    if isinstance(detail.get("reason"), str) and detail["reason"] in _REASONS:
         out["reason"] = detail["reason"]
     skipped = detail.get("skipped_lines")
     if isinstance(skipped, Mapping):
@@ -276,6 +276,9 @@ class Ledger:
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
             if row is not None and row[0] != STORE_FORMAT:
                 raise LedgerStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
+            if "calls" in tables and "outcome" not in {r[1] for r in conn.execute("PRAGMA table_info(calls)")}:
+                raise LedgerStoreError(f"store format {STORE_FORMAT!r} calls table lacks the `outcome` column "
+                                       "(a pre-outcome ledger.db): delete the file")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -448,7 +451,8 @@ def _claude_resolution(call: Call, scans: Mapping[str, _stamps.ClaudeScan]) -> _
     if state == "no_decision":
         return _final("unknown", {"reason": "result_without_decision", **skipped}, "unknown")
     # the transcript may not exist yet, may be briefly unreadable, may not have the result yet: wait, don't conclude
-    cause = {"missing_file": "transcript_missing", "unreadable": "transcript_unreadable"}.get(state, "result_not_written")
+    cause = {"missing_file": "transcript_missing", "unreadable": "transcript_unreadable",
+             "result_oversized": "result_oversized"}.get(state, "result_not_written")
     return _wait(cause, skipped)
 
 
@@ -469,7 +473,8 @@ def _codex_resolution(call: Call, policies: Mapping[str, Mapping[str, Any] | Non
         policy = turns.get(call.turn_id)
     if policy is None:
         return _wait("turn_not_written")
-    return _final(_stamps.codex_stamp(policy), policy, "unknown")
+    stamp = _stamps.codex_stamp(policy)
+    return _final(stamp, policy, "unknown" if stamp in ("pending", "unknown") else "accepted")
 
 
 def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hours=1),

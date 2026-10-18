@@ -1602,8 +1602,8 @@ def _cmd_consent_ledger(args: argparse.Namespace) -> int:
         if args.ledger_cmd == "reconcile":
             if args.give_up_after != "never" and not re.fullmatch(r"[0-9]{1,9}[dhm]", args.give_up_after, re.ASCII):
                 raise ValueError(f"--give-up-after {args.give_up_after!r} is not an age such as 90m, 1h, 2d, or `never`")
-            gua = None if args.give_up_after == "never" else (
-                datetime.now(timezone.utc) - parse_when(args.give_up_after))
+            now = datetime.now(timezone.utc)
+            gua = None if args.give_up_after == "never" else now - parse_when(args.give_up_after, now=now)
             result = reconcile(ledger, give_up_after=gua, codex_last_turn=args.codex_last_turn)
             print(json.dumps(result, sort_keys=True) if args.as_json else
                   f"filled {result['filled']} ({result['unknown']} unknown), still pending {result['still_pending']}"

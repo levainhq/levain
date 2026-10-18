@@ -618,3 +618,53 @@ def test_cli_rejects_a_giant_age_and_an_absolute_give_up(tmp_path, capsys):
     assert levain_main(["consent", "ledger", "reconcile", "--give-up-after", "2026-10-17", *q]) == 1
     assert levain_main(["consent", "ledger", "reconcile", "--give-up-after", "999999999999999999d", *q]) == 1
     assert "levain consent ledger:" in capsys.readouterr().err
+
+
+# --- B3 round-2 fixes ---------------------------------------------------------------------------------------
+def test_pre_outcome_ledger_is_refused_with_a_clear_error(tmp_path):
+    d = tmp_path / "consent"
+    d.mkdir(mode=0o700)
+    conn = sqlite3.connect(d / "ledger.db")
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO meta VALUES ('format', ?)", (STORE_FORMAT,))
+    conn.execute("CREATE TABLE calls (id TEXT PRIMARY KEY, agent TEXT)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LedgerStoreError, match="outcome"):
+        Ledger(d, clock=lambda: NOW).counts()
+
+
+def test_oversized_line_holding_the_id_is_result_oversized_never_allow(tmp_path, monkeypatch):
+    t = tmp_path / "t.jsonl"
+    big = b'{"type":"user","pad":"' + b"x" * (3 << 20) + b'","tool_use_id":"toolu_BIG"}\n'
+    t.write_bytes(big)
+    scan = stamps.claude_scan(t, ["toolu_BIG", "toolu_OTHER"], max_line_bytes=1 << 20)
+    assert scan.states["toolu_BIG"] == ("result_oversized", None)
+    assert scan.states["toolu_OTHER"] == ("no_result", None)
+    ledger = _ledger(tmp_path)
+    row = _cc_row(ledger, "toolu_BIG", t, at=NOW - timedelta(hours=2))
+    import functools
+    monkeypatch.setattr(stamps, "claude_scan", functools.partial(stamps.claude_scan, max_line_bytes=1 << 20))
+    assert reconcile(ledger, give_up_after=timedelta(hours=1))["unknown"] == 1
+    got = ledger.get(row)
+    assert got.stamp == "unknown"
+    assert got.stamp_detail["reason"] == "result_oversized"
+
+
+def test_reconciled_codex_sandbox_and_bypass_are_accepted_like_record_call(tmp_path):
+    ledger = _ledger(tmp_path)
+    for tag in ("readonly", "bypass"):
+        pre = json.loads(_lines(f"codex_{tag}_hooks.jsonl")[0])
+        ledger.record_call(
+            agent="codex", agent_session_id=pre["session_id"], tool_name=pre["tool_name"], tool_input=pre["tool_input"],
+            cwd=pre["cwd"], phase="pre", tool_use_id=pre["tool_use_id"], source_path=str(FIX / f"codex_{tag}_rollout.jsonl"),
+            turn_id=pre["turn_id"], permission_mode=pre["permission_mode"])
+    reconcile(ledger)
+    assert {(a, s, o) for a, s, o, _ in ledger.counts()} == {("codex", "sandbox", "accepted"),
+                                                              ("codex", "bypass", "accepted")}
+
+
+def test_clean_detail_drops_an_unhashable_reason():
+    from levain.consent.ledger import clean_detail
+    assert clean_detail({"reason": ["no_source"], "gave_up": True}) == {"gave_up": True}
+    assert clean_detail({"reason": {"a": 1}}) is None
