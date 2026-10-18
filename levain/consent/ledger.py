@@ -11,16 +11,24 @@ when the hook fires, so a row may be filed ``pending`` and stamped once, later (
 UPDATE and every DELETE statement, and another refuses an INSERT of an id that exists (so ``INSERT OR REPLACE`` cannot
 rewrite a row by id). The file itself is only as safe as its 0600 mode and the uid: the triggers guard the statements
 levain writes, not an owner who drops them. Levain's own authority (grant, answer, ruling) is stamped at filing, with the queue
-request id that answered the call.
+request id that answered the call. A stamp other than levain's is the agent's own record of itself: the transcript,
+the rollout and the hook scripts are writable by the agent's uid, so such a stamp is its account, not proof.
 
-A GAP is a window on this ledger (:meth:`Ledger.window`): the rows of one session from the undecided time to the
-ruling. The weekly unseen digest (:meth:`Ledger.digest`) is the rows a standing grant or a late ruling answered.
-:meth:`Ledger.counts` counts by agent and stamp (row D reads spent-vs-authorized from the same rows). All three read
-ONE row per call: a call with a ``pre`` row (levain answered it at the gate) is that row, its post row giving only
-the outcome.
+A GAP is a window on this ledger (:meth:`Ledger.window`): the rows of one session and its subagents from the
+undecided time to the ruling. It lists calls that ran or that the gate denied; a call the agent's own rules or sandbox
+refused before it ran fires no hook and has no row. The weekly unseen digest (:meth:`Ledger.digest`) is the rows a
+standing grant or a late ruling answered. :meth:`Ledger.counts` counts by agent, stamp and outcome (row D counts
+spent-vs-authorized from the same rows, outcome ``accepted`` only). All three read ONE row per call: a call with a
+``pre`` row (levain answered it at the gate) is that row. The STAMP says who authorised the call; its OUTCOME there
+comes from the post row of the same call (same tool and input digest): ``accepted`` when one exists, even still
+pending, since a post event means the call ran; ``refused`` when it says refused; ``unknown`` when there is none. So
+this view can show an authorised call that did not run (another hook, a settings rule or the sandbox stopped it after
+levain's allow): the write-time CHECK binds stored rows, not this reading of them.
 
-The hooks write through :func:`hook_record`, :func:`hook_fill` and :func:`gate_row`, which never raise: a ledger that
-cannot be written is a missing record, never a changed answer or a blocked agent.
+The hooks write through :func:`hook_record`, :func:`hook_fill` and :func:`gate_row`, which catch every ``Exception``
+(an interrupt still ends the hook): a ledger that cannot be written is a missing record, never a changed answer or a
+blocked agent. They wait at most :data:`HOOK_BUSY_SECONDS` for the store's lock, and a fill stops at its budget
+(:data:`HOOK_FILL_BUDGET`): what it leaves pending is stamped by the next hook, Stop or ``reconcile``.
 
 OUTCOME beside STAMP: what the authority did (``accepted`` / ``refused`` / ``unknown``). A refusal authorised nothing,
 so a refused row's stamp is only ever ``unknown`` or ``pending`` (a CHECK, not a convention), and ``counts`` splits by
@@ -29,10 +37,11 @@ a Codex turn's ``approval_policy``/``approvals_reviewer``/sandbox ``type``/profi
 reasons; anything else a caller or a newer agent version adds is dropped, never stored.
 
 Known edges (one line each): the input digest is unsalted, so a SHORT input is recoverable by dictionary; a Codex
-policy that changes mid-turn is read from the turn's FIRST ``turn_context``; a call whose pre row levain stamped and
-whose post row says ``refused`` reads as that stamp with outcome ``refused`` (unreached: a refused call fires no post
-event); ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is
-not refused by a trigger; a ledger.db made by fedba7b1 (before the ``outcome`` column) is refused, delete it.
+policy that changes mid-turn is read from the turn's FIRST ``turn_context``; a call levain allowed that something
+after it refused (the Codex sandbox, which fires no PostToolUseFailure) reads as levain's stamp with outcome
+``unknown``; rows are placed by when the hook fired, which for a post row is the call's END, so a call still running at
+the ruling is not in its window; each hook fill scans its transcript from the start (under the cap), as reconcile
+does; ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is not refused by a trigger; a ledger.db made by fedba7b1 (before the ``outcome`` column) is refused, delete it.
 A transcript longer than the scan cap ends ``unknown`` with reason ``result_not_written`` for the calls past the cap; an id
 merely quoted inside a skipped oversized line marks its row ``result_oversized`` (still ``unknown``, never allow).
 """
@@ -43,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -57,7 +67,8 @@ from levain.consent import stamps as _stamps
 from levain.consent.queue import QueueStoreError, default_queue_dir
 from levain.consent.record import AGENTS, tool_input_digest
 
-__all__ = ["DB_NAME", "DIGEST_STAMPS", "PHASES", "STORE_FORMAT", "Call", "Ledger", "LedgerStoreError",
+__all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "PHASES", "STORE_FORMAT",
+           "SUBAGENT_MARK", "WINDOW_SCOPE", "Call", "Ledger", "LedgerStoreError",
            "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile"]
 
 DB_NAME = "ledger.db"
@@ -77,6 +88,15 @@ _REASONS = frozenset({"transcript_missing", "transcript_unreadable", "rollout_mi
 _DETAIL_STR_KEYS = ("decision", "source", "reasonType", "approval_policy", "approvals_reviewer")
 _DETAIL_TYPE_KEYS = ("sandbox_policy", "permission_profile")
 _MAX_DETAIL_STR = 64
+# a hook waits at most this long for the store's lock: its answer, or its host's timeout, never waits on the record
+HOOK_BUSY_SECONDS = 2.0
+# the most a hook spends stamping pending rows; the rest are left for the next hook, Stop or reconcile
+HOOK_FILL_BUDGET = 3.0
+# a Claude Code subagent's rows file under its session's key plus this and the subagent's id
+SUBAGENT_MARK = "#agent:"
+# what a window lists, printed under one: a row exists only for a call some hook saw
+WINDOW_SCOPE = ("calls that ran or that the gate denied; calls the agent's own rules or sandbox refused are not "
+                "listed")
 
 
 def clean_detail(detail: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -163,13 +183,15 @@ _SCHEMA: tuple[str, ...] = (
 
 # ONE CALL, ONE AUTHORITY: a call levain answered at its gate has a ``pre`` row (levain's own stamp) and, once it ran,
 # a ``post`` / ``post_failure`` row (the agent's record, which can only say "a hook allowed it"). The readers that
-# count or list calls read this instead of ``calls``: the post row of a call with a pre row is dropped, and gives
-# the pre row only its outcome (when it says one). Raw rows (``get``, ``pending``) still read ``calls``.
+# count or list calls read this instead of ``calls``: the post row of the SAME call (same tool and input digest, so an
+# input another hook rewrote is not covered by the ruling for the original) is dropped and gives the pre row its
+# outcome; with no post row the outcome is ``unknown``. Raw rows (``get``, ``pending``) still read ``calls``.
 _POST_PHASES = "('post', 'post_failure')"
-_SAME_CALL = "p.agent = c.agent AND p.agent_session_id = c.agent_session_id AND p.tool_use_id = c.tool_use_id"
-_POST_OUTCOME = (f"CASE WHEN c.phase = 'pre' THEN COALESCE((SELECT p.outcome FROM calls p WHERE {_SAME_CALL} "
-                 f"AND p.phase IN {_POST_PHASES} AND p.outcome <> 'unknown' ORDER BY p.rowid LIMIT 1), c.outcome) "
-                 "ELSE c.outcome END AS outcome")
+_SAME_CALL = ("p.agent = c.agent AND p.agent_session_id = c.agent_session_id AND p.tool_use_id = c.tool_use_id "
+              "AND p.tool_name = c.tool_name AND p.tool_input_digest = c.tool_input_digest")
+_POST_OUTCOME = (f"CASE WHEN c.phase = 'pre' THEN COALESCE((SELECT CASE WHEN p.outcome = 'refused' THEN 'refused' "
+                 f"ELSE 'accepted' END FROM calls p WHERE {_SAME_CALL} AND p.phase IN {_POST_PHASES} "
+                 "ORDER BY p.rowid LIMIT 1), 'unknown') ELSE c.outcome END AS outcome")
 _PER_CALL = (
     "(SELECT " + ", ".join(_POST_OUTCOME if col == "outcome" else f"c.{col} AS {col}" for col in _COLUMNS)
     + f", c.rowid AS rowid FROM calls c WHERE NOT (c.phase IN {_POST_PHASES} AND c.tool_use_id IS NOT NULL "
@@ -253,11 +275,14 @@ class Ledger:
     Every operation opens its own connection, so one object is safe across threads and processes."""
 
     def __init__(self, directory: Path | str | None = None, *,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 busy_seconds: float | None = None) -> None:
         self.directory = Path(directory) if directory is not None else default_queue_dir()
         self.path = self.directory / DB_NAME
         self._clock = clock
         self._ready = False
+        # how long a statement waits for another writer's lock (None: the durable store's own default)
+        self._busy_ms = None if busy_seconds is None else max(0, int(busy_seconds * 1000))
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -280,6 +305,8 @@ class Ledger:
             self._check_directory()
         conn = open_durable(self.path)
         try:
+            if self._busy_ms is not None:
+                conn.execute(f"PRAGMA busy_timeout = {self._busy_ms}")
             if not self._ready:
                 os.chmod(self.path, 0o600)
                 self._ensure_schema(conn)
@@ -412,9 +439,11 @@ class Ledger:
                                 "ORDER BY received_at, rowid", args).fetchall()
         return [Call._of(r) for r in rows]
 
-    def pending_for(self, agent: str, agent_session_id: str) -> list[Call]:
-        """The session's rows still waiting for their stamp, oldest first."""
-        return self._select("agent = ? AND agent_session_id = ? AND stamp = 'pending'", (agent, agent_session_id))
+    def pending_for(self, agent: str, agent_session_id: str, *, subagents: bool = False) -> list[Call]:
+        """The session's rows still waiting for their stamp, oldest first; with ``subagents``, its subagents' rows
+        too (keys ``<session>#agent:<id>``)."""
+        where, args = _session_clause(agent_session_id, subagents)
+        return self._select(f"agent = ? AND {where} AND stamp = 'pending'", (agent, *args))
 
     def pending(self) -> list[Call]:
         """Every row still waiting for its stamp, oldest first."""
@@ -422,12 +451,15 @@ class Ledger:
 
     def window(self, agent: str, agent_session_id: str, since: str | datetime, until: str | datetime | None = None
                ) -> list[Call]:
-        """The session's rows with ``since <= received_at <= until`` (``until`` None = now): a gap is the window
-        from its undecided time to its ruling."""
+        """The rows of the session's family with ``since <= received_at <= until`` (``until`` None = now): a gap is
+        the window from its undecided time to its ruling. The family is the root session and all its subagents
+        (``<root>#agent:<id>``), whichever of them ``agent_session_id`` names; each row's own key says which it is.
+        Only calls that ran or that the gate denied have rows (the module docstring)."""
         now = self._now()
         lo, hi = _need(since, now), _stamp_of(until, now, now=now)
-        return self._select("agent = ? AND agent_session_id = ? AND received_at >= ? AND received_at <= ?",
-                            (agent, agent_session_id, lo, hi), per_call=True)
+        where, args = _session_clause(agent_session_id.split(SUBAGENT_MARK, 1)[0], True)
+        return self._select(f"agent = ? AND {where} AND received_at >= ? AND received_at <= ?",
+                            (agent, *args, lo, hi), per_call=True)
 
     def digest(self, since: str | datetime, until: str | datetime | None = None) -> list[Call]:
         """The unseen digest: rows in the window a standing grant or a late ruling answered (a signed answer was
@@ -450,6 +482,15 @@ class Ledger:
                                 "AND received_at <= ? GROUP BY agent, stamp, outcome ORDER BY agent, stamp, outcome",
                                 (lo, hi)).fetchall()
         return [(a, s, o, n) for a, s, o, n in rows]
+
+
+def _session_clause(session: str, subagents: bool) -> tuple[str, tuple[Any, ...]]:
+    """SQL for rows of ``session``, and with ``subagents`` of every ``<session>#agent:<id>`` key (a prefix test,
+    not GLOB or LIKE, so no character of a session id is a pattern)."""
+    if not subagents:
+        return "agent_session_id = ?", (session,)
+    prefix = session + SUBAGENT_MARK
+    return "(agent_session_id = ? OR substr(agent_session_id, 1, ?) = ?)", (session, len(prefix), prefix)
 
 
 # a resolution is ("final", stamp, detail, outcome) or ("wait", cause, detail): leave the row pending for now
@@ -504,25 +545,29 @@ def _codex_resolution(call: Call, policies: Mapping[str, Mapping[str, Any] | Non
 
 
 def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hours=1),
-              agent: str | None = None, agent_session_id: str | None = None,
-              codex_last_turn: bool = False) -> dict[str, int]:
-    """For every pending row (of ``agent`` and/or ``agent_session_id`` when given, each applied on its own),
+              agent: str | None = None, agent_session_id: str | None = None, subagents: bool = False,
+              codex_last_turn: bool = False, deadline: float | None = None) -> dict[str, int]:
+    """For every pending row (of ``agent`` and/or ``agent_session_id`` when given, each applied on its own; with
+    ``subagents``, the session's subagents' rows too),
     re-read its stamp source and fill it. A source that is not there yet (no file yet, a transient read error, the
     result or the turn not written) leaves the row pending; only a source that can never answer (no path, no
     ``tool_use_id``) or answers with no decision stamps it ``unknown`` at once (never allow/deny). A row still
     undecided after ``give_up_after`` (None: never) is stamped ``unknown`` with the real cause as its reason. Each
     transcript is scanned ONCE per pass for all its pending rows. A Codex row with no ``turn_id`` is never given
-    "the last turn's" policy; ``codex_last_turn=True`` (a test/CLI option) allows exactly that.
+    "the last turn's" policy; ``codex_last_turn=True`` (a test/CLI option) allows exactly that. Past ``deadline``
+    (a :func:`time.monotonic` value) no further row is stamped: those count as still pending.
 
     Returns ``{"filled", "unknown", "still_pending", "already_stamped"}``: ``unknown`` is a subset of ``filled``;
     ``already_stamped`` counts rows another process stamped between the read and the write."""
     out = {"filled": 0, "unknown": 0, "still_pending": 0, "already_stamped": 0}
     now = ledger._now()
     if agent is not None and agent_session_id is not None:
-        rows = ledger.pending_for(agent, agent_session_id)
+        rows = ledger.pending_for(agent, agent_session_id, subagents=subagents)
     else:
+        family = agent_session_id + SUBAGENT_MARK if agent_session_id is not None and subagents else None
         rows = [c for c in ledger.pending() if (agent is None or c.agent == agent)
-                and (agent_session_id is None or c.agent_session_id == agent_session_id)]
+                and (agent_session_id is None or c.agent_session_id == agent_session_id
+                     or (family is not None and c.agent_session_id.startswith(family)))]
     by_path: dict[str, list[str]] = {}
     for c in rows:
         if c.agent == "claude_code" and c.source_path and c.tool_use_id:
@@ -534,6 +579,9 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
                 and (c.turn_id is not None or codex_last_turn) and os.path.isfile(c.source_path):
             policies[c.source_path] = _stamps.codex_turn_policies(c.source_path)
     for c in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            out["still_pending"] += 1
+            continue
         if c.agent == "claude_code":
             res = _claude_resolution(c, scans)
         else:
@@ -556,8 +604,7 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
 
 
 # --- the hooks' writers ------------------------------------------------------------------------------------------
-# Called from inside the agents' hooks. Each one returns None on any Exception (an interrupt still ends the hook), so
-# a ledger that cannot be written is one stderr line, never a changed answer or a blocked agent.
+# Called from inside the agents' hooks (the module docstring: Exception caught, the lock wait and the fill bounded).
 
 _TOOL_PHASES = {"PostToolUse": "post", "PostToolUseFailure": "post_failure"}
 
@@ -572,7 +619,7 @@ def _session_key(agent: str, payload: Mapping[str, Any]) -> str | None:
     session = _text(payload.get("session_id"))
     agent_id = _text(payload.get("agent_id"))
     if session is not None and agent == "claude_code" and agent_id is not None:
-        return f"{session}#agent:{agent_id}"
+        return f"{session}{SUBAGENT_MARK}{agent_id}"
     return session
 
 
@@ -587,13 +634,31 @@ def _hook_ledger(queue_dir: Path | str | None) -> Ledger | None:
     """The ledger in the consent directory, only when that directory already exists: a hook never creates
     levain's home."""
     directory = Path(queue_dir) if queue_dir is not None else default_queue_dir()
-    return Ledger(directory) if directory.is_dir() else None
+    return Ledger(directory, busy_seconds=HOOK_BUSY_SECONDS) if directory.is_dir() else None
+
+
+_AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}", re.ASCII)
+
+
+def _source_path(agent: str, payload: Mapping[str, Any]) -> str | None:
+    """Where the call's stamp is read. A Claude Code subagent's hook events carry its PARENT's ``transcript_path``
+    while its own tool results go to ``<parent transcript minus .jsonl>/subagents/agent-<agent_id>.jsonl`` (measured
+    on Claude Code 2.1.302, B3h fix r1), so a subagent row reads that file; a path already under ``subagents/`` is
+    kept as given."""
+    path = _text(payload.get("transcript_path"))
+    agent_id = _text(payload.get("agent_id"))
+    if path is None or agent != "claude_code" or agent_id is None or not _AGENT_ID.fullmatch(agent_id):
+        return path
+    given = Path(path)
+    if given.parent.name == "subagents" or given.suffix != ".jsonl":
+        return path
+    return str(given.with_suffix("") / "subagents" / f"agent-{agent_id}.jsonl")
 
 
 def _common(agent: str, payload: Mapping[str, Any], session: str, tool_name: str, tool_input: Any,
             cwd: str) -> dict[str, Any]:
     return {"agent": agent, "agent_session_id": session, "tool_name": tool_name, "tool_input": tool_input, "cwd": cwd,
-            "tool_use_id": _text(payload.get("tool_use_id")), "source_path": _text(payload.get("transcript_path")),
+            "tool_use_id": _text(payload.get("tool_use_id")), "source_path": _source_path(agent, payload),
             # a Codex row reads its turn's policy; Claude Code has no turns in its record
             "turn_id": _text(payload.get("turn_id")) if agent == "codex" else None,
             "permission_mode": _text(payload.get("permission_mode"))}
@@ -621,11 +686,13 @@ def hook_record(agent: str, payload: Any, *, queue_dir: Path | str | None = None
         return None
 
 
-def hook_fill(agent: str, payload: Any, *, queue_dir: Path | str | None = None) -> dict[str, int] | None:
+def hook_fill(agent: str, payload: Any, *, queue_dir: Path | str | None = None,
+              budget: float = HOOK_FILL_BUDGET) -> dict[str, int] | None:
     """Stamp this session's pending rows from the agent's own record (:func:`reconcile` scoped to the payload's
-    session; each transcript or rollout is read once, under the readers' byte caps). A row whose source still says
-    nothing stays pending until :func:`reconcile`'s default give-up age, then ``unknown``, never allow or deny.
-    None when there is no ledger yet, no session, or on any failure."""
+    session; each transcript or rollout is read once, under the readers' byte caps), for at most ``budget`` seconds.
+    A ``Stop`` stamps the session's subagents' rows too: no later hook of a subagent may come. A row whose source
+    still says nothing stays pending until :func:`reconcile`'s default give-up age, then ``unknown``, never allow or
+    deny. None when there is no ledger yet, no session, or on any failure."""
     try:
         if agent not in AGENTS or not isinstance(payload, Mapping):
             return None
@@ -633,7 +700,9 @@ def hook_fill(agent: str, payload: Any, *, queue_dir: Path | str | None = None) 
         ledger = _hook_ledger(queue_dir)
         if session is None or ledger is None or not ledger.path.is_file():
             return None
-        return reconcile(ledger, agent=agent, agent_session_id=session)
+        family = payload.get("hook_event_name") == "Stop" and SUBAGENT_MARK not in session
+        return reconcile(ledger, agent=agent, agent_session_id=session, subagents=family,
+                         deadline=time.monotonic() + budget)
     except Exception as exc:  # noqa: BLE001 - the ledger is a record, never a gate
         _hook_failed("rows not stamped", exc)
         return None
@@ -649,7 +718,7 @@ def gate_row(agent: str, queue_dir: Path | str, event: Mapping[str, Any], sessio
     receipts still record every decision."""
     try:
         common = _common(agent, event, session, tool_name, tool_input, cwd)
-        ledger = Ledger(queue_dir)
+        ledger = Ledger(queue_dir, busy_seconds=HOOK_BUSY_SECONDS)
         if decision is not None and getattr(decision, "decision", None) == "allow":
             via = getattr(decision, "via", None)
             return ledger.record_call(**common, phase="pre", stamp=via if via in ("grant", "ruling") else "answer",

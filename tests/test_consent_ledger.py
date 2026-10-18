@@ -370,7 +370,7 @@ def test_reconcile_codex_rows_from_the_rollout(tmp_path):
         pre = json.loads(_lines(f"codex_{tag}_hooks.jsonl")[0])
         rows[tag] = ledger.record_call(
             agent="codex", agent_session_id=pre["session_id"], tool_name=pre["tool_name"], tool_input=pre["tool_input"],
-            cwd=pre["cwd"], phase="pre", tool_use_id=pre["tool_use_id"], source_path=str(FIX / f"codex_{tag}_rollout.jsonl"),
+            cwd=pre["cwd"], phase="post", tool_use_id=pre["tool_use_id"], source_path=str(FIX / f"codex_{tag}_rollout.jsonl"),
             turn_id=pre["turn_id"], permission_mode=pre["permission_mode"])
     gone = ledger.record_call(agent="codex", agent_session_id="g", tool_name="Bash", tool_input={}, cwd="/w",
                               phase="pre", tool_use_id="gone", source_path=str(tmp_path / "no-rollout.jsonl"),
@@ -669,7 +669,7 @@ def test_reconciled_codex_sandbox_and_bypass_are_accepted_like_record_call(tmp_p
         pre = json.loads(_lines(f"codex_{tag}_hooks.jsonl")[0])
         ledger.record_call(
             agent="codex", agent_session_id=pre["session_id"], tool_name=pre["tool_name"], tool_input=pre["tool_input"],
-            cwd=pre["cwd"], phase="pre", tool_use_id=pre["tool_use_id"], source_path=str(FIX / f"codex_{tag}_rollout.jsonl"),
+            cwd=pre["cwd"], phase="post", tool_use_id=pre["tool_use_id"], source_path=str(FIX / f"codex_{tag}_rollout.jsonl"),
             turn_id=pre["turn_id"], permission_mode=pre["permission_mode"])
     reconcile(ledger)
     assert {(a, s, o) for a, s, o, _ in ledger.counts()} == {("codex", "sandbox", "accepted"),
@@ -711,3 +711,54 @@ def test_a_ruled_call_reads_as_its_ruling_not_the_mode_the_transcript_names(tmp_
     assert (one.phase, one.stamp, one.outcome, one.request_id) == ("pre", "ruling", "accepted", "pend-1")
     assert [c.stamp for c in ledger.digest("1h")] == ["ruling"]
     assert ledger.counts() == [("claude_code", "ruling", "accepted", 1)]
+
+
+from tests.test_consent_queue import authority, clock, keys, queue  # noqa: E402,F401 - the shared queue fixtures
+
+
+def test_a_locked_ledger_changes_neither_the_gate_answer_nor_its_time(queue, keys, authority, clock, tmp_path,
+                                                                     monkeypatch):
+    """Reproduced in B3h fix r1 (10-18): with ledger.db's write lock held by another process, the gate's ruled allow
+    waited the store's 30 s busy timeout on its ledger row before the answer was written, inside a hook whose kill
+    at its timeout is a block. The same answer now prints, byte for byte, within the hook-path busy budget."""
+    import io
+    import shutil
+    import time
+
+    from levain.consent import ConsentQueue
+    from levain.consent.adapters import claude_code as cc
+    from tests.test_consent_queue_v4 import ruled, undecided
+
+    edit = {"file_path": "/work/proj/.claude/settings.json", "old_string": "a", "new_string": "b"}
+    request, _ = undecided(queue, tool_input=edit)
+    queue.answer_late(request.id, *ruled(queue, request.id, keys["laptop"]))
+    qa = Path(queue.directory)
+    qb = tmp_path / "locked" / "consent"
+    shutil.copytree(qa, qb)
+    tx = tmp_path / "t.jsonl"
+    tx.write_text("")
+    event = {"hook_event_name": "PreToolUse", "session_id": "sess-1", "tool_use_id": "toolu_lock",
+             "transcript_path": str(tx), "cwd": "/work/proj", "permission_mode": "bypassPermissions",
+             "tool_name": "Edit", "tool_input": edit}
+
+    def answer(qdir: Path) -> tuple[str, float]:
+        monkeypatch.setattr(cc, "_queue_for", lambda d, s: ConsentQueue(qdir, authority=authority, clock=clock))
+        out, t0 = io.StringIO(), time.monotonic()
+        assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
+        return out.getvalue(), time.monotonic() - t0
+
+    working, _ = answer(qa)
+    assert '"permissionDecision": "allow"' in working
+    assert [(c.phase, c.stamp) for c in Ledger(qa).pending()] == []
+    assert Ledger(qa).counts() == [("claude_code", "ruling", "unknown", 1)]   # not seen to run: no post row yet
+    Ledger(qb).counts()                                                      # the store exists, then is locked
+    lock = sqlite3.connect(qb / "ledger.db", isolation_level=None)
+    lock.execute("BEGIN IMMEDIATE")
+    try:
+        locked, took = answer(qb)
+    finally:
+        lock.execute("ROLLBACK")
+        lock.close()
+    assert locked == working
+    assert took < 10, took
+    assert Ledger(qb).counts() == []                                          # the record is missing, never the answer

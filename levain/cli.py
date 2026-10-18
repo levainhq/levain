@@ -1592,7 +1592,7 @@ def _cmd_consent_ledger(args: argparse.Namespace) -> int:
     import sqlite3
     from dataclasses import asdict
 
-    from levain.consent.ledger import Ledger, parse_when, reconcile
+    from levain.consent.ledger import SUBAGENT_MARK, WINDOW_SCOPE, Ledger, parse_when, reconcile
     from levain.consent.queue import QueueStoreError
 
     qdir = Path(os.path.abspath(args.queue_dir.expanduser())) if args.queue_dir is not None else None
@@ -1627,10 +1627,13 @@ def _cmd_consent_ledger(args: argparse.Namespace) -> int:
         print(json.dumps([asdict(c) for c in calls]))
     else:
         for c in calls:
-            print(f"{c.received_at}  {c.agent:11} {c.stamp:16} {c.phase:14} {c.tool_name}  {c.tool_input_digest[:20]}  "
-                  f"{c.agent_session_id[:8]}")
+            root, mark, sub = c.agent_session_id.partition(SUBAGENT_MARK)
+            print(f"{c.received_at}  {c.agent:11} {c.stamp:16} {c.outcome:9} {c.phase:14} {c.tool_name}  "
+                  f"{c.tool_input_digest[:20]}  {root[:8]}" + (f"  subagent {sub}" if mark else ""))
         if not calls:
             print("no rows")
+        if args.ledger_cmd == "window":
+            print(WINDOW_SCOPE)
     return 0
 
 
@@ -2469,21 +2472,25 @@ def _rule_target(qdir: Path, gap_text: str, session: str | None, agent: str | No
 
 def _print_gap_window(qdir: Path, gapped: object, ruled_at: str) -> None:
     """The ledger rows of the gap's session from its undecided time to the ruling (DESIGN §3.6, the record side)."""
-    from levain.consent.ledger import DB_NAME, Ledger, reconcile
+    from levain.consent.ledger import DB_NAME, SUBAGENT_MARK, WINDOW_SCOPE, Ledger, reconcile
 
     if not (qdir / DB_NAME).is_file():
         print("  gap window: no ledger in this queue directory (no rows recorded)")
         return
     ledger = Ledger(qdir)
+    root = gapped.request.agent_session_id.split(SUBAGENT_MARK, 1)[0]
     try:
-        reconcile(ledger, give_up_after=None, agent_session_id=gapped.request.agent_session_id)
+        reconcile(ledger, give_up_after=None, agent_session_id=root, subagents=True)
     except Exception as exc:  # noqa: BLE001 - a stamp left pending is shown as pending, never hidden
         print(f"  (stamps not reconciled: {_term_safe(exc)})")
     rows = ledger.window(gapped.request.agent, gapped.request.agent_session_id, gapped.undecided_at, ruled_at)
-    print(f"  gap window {gapped.undecided_at} .. {ruled_at}: {len(rows)} ledger row(s) in this session")
+    print(f"  gap window {gapped.undecided_at} .. {ruled_at}: {len(rows)} ledger row(s) in this session and its "
+          "subagents")
     for c in rows:
+        sub = c.agent_session_id.partition(SUBAGENT_MARK)[2]
         print(_term_safe(f"    {c.received_at}  {c.phase:14} {c.stamp:16} {c.outcome:9} {c.tool_name}  "
-                         f"{c.tool_input_digest[:20]}"))
+                         f"{c.tool_input_digest[:20]}" + (f"  subagent {sub}" if sub else "")))
+    print(f"  ({WINDOW_SCOPE})")
 
 
 def _print_delivery(d: object) -> None:

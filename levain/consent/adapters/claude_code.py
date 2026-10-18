@@ -635,6 +635,9 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 GATE_EVENT = "PreToolUse"
 # Claude Code's ``timeout`` for the gate entry is D + this margin (interpreter start, the undecided mark)
 GATE_TIMEOUT_MARGIN = 30
+# a PreToolUse that took longer than this held (or waited on a store): it leaves its ledger fill to the next hook,
+# Stop or reconcile, so the fill never eats into the margin
+GATE_FILL_WITHIN = 5.0
 # how long after the gate's allow the dialog's PermissionRequest may take it: that hook follows in under a second
 # (an interpreter start + a replay); this bounds how long a later identical call can ride the old allow
 GATE_ALLOW_REUSE = timedelta(seconds=5)
@@ -915,9 +918,10 @@ def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_n
 
 
 def _ledger_fill(event: Any, queue_dir: Path | None) -> None:
-    """Stamp this session's pending ledger rows from its transcript (:func:`levain.consent.ledger.hook_fill`): the
-    prior call's ``permissionDecision`` is on disk by this PreToolUse (runs3-cc). Runs after the gate's answer is
-    written; nothing it does reaches that answer."""
+    """Stamp this session's pending ledger rows from its transcript (:func:`levain.consent.ledger.hook_fill`, bounded
+    by its lock wait and fill budget): the prior call's ``permissionDecision`` is on disk by this PreToolUse
+    (runs3-cc). Runs after the gate's answer is written, so unlike the ledger's own writers it also swallows an
+    interrupt: :func:`main`'s failure path would print a second answer after the first."""
     try:
         from levain.consent.ledger import hook_fill
 
@@ -1056,6 +1060,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     event: Any = None
     queue_dir: Path | None = None
     settings = AdapterSettings()
+    started = time.monotonic()
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-claude-code")
         parser.add_argument("--queue-dir", default=None)
@@ -1072,7 +1077,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
-        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT \
+                and time.monotonic() - started <= GATE_FILL_WITHIN:
             _ledger_fill(event, queue_dir)
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:

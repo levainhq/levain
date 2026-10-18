@@ -1574,6 +1574,80 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
     return out
 
 
+def _newest_stamp(db: Path, sql: str, args: tuple[Any, ...]) -> str | None:
+    """One ``MAX(...)`` read from a consent store opened read-only (never created, never migrated); None when the
+    file is absent, unreadable or empty."""
+    import sqlite3
+
+    if not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = conn.execute(sql, args).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    return row[0] if row and isinstance(row[0], str) else None
+
+
+def _check_consent_ledger(install: Path, hooks: Any, adapter: str) -> list[CheckResult]:
+    """The authority ledger's writer (Q15): whether this install's PostToolUse hook files ledger rows (its scripts
+    call ``consent_ledger``), and the age of the agent's newest row. A silent ledger is not a healthy one: WARN when
+    a request the consent hooks answered (allowed, denied or left undecided) was filed after every ledger row of that
+    agent, since the gate files a row for each call it answers and a call that ran files one too (a dialog request
+    a signed deny answered has no row, so it warns until that session's next call). Advisory only."""
+    from levain.consent.ledger import DB_NAME
+    from levain.consent.queue import DB_NAME as QUEUE_DB
+    from levain.install import CONSENT_AGENTS, _consent_queue_dir
+
+    label = "Claude Code" if adapter == "claude-code" else "Codex"
+    name = f"{label} consent ledger"
+    agent = CONSENT_AGENTS[adapter]
+    scripts = install / "activation" / "hooks"
+
+    def calls_it(script: str) -> bool:
+        try:
+            return "consent_ledger" in (scripts / script).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    if not (_hooks_wired_anywhere(hooks, "PostToolUse", install, "post_tool_use.py")
+            and calls_it("post_tool_use.py") and calls_it("_levain_hook.py")):
+        return [CheckResult(name, True, "writer not wired: this install's PostToolUse hook files no ledger rows, so "
+                            "`levain consent ledger` shows no calls", "Run `levain update` to rewrite the hooks.",
+                            warn=True)]
+    qdir = _consent_queue_dir()
+    last_row = _newest_stamp(qdir / DB_NAME, "SELECT MAX(received_at) FROM calls WHERE agent = ?", (agent,))
+    last_answer = _newest_stamp(qdir / QUEUE_DB, "SELECT MAX(received_at) FROM requests WHERE agent = ? AND state IN "
+                                "('allowed', 'denied', 'undecided')", (agent,))
+    seen = f"last row {_age(last_row)}" if last_row else "no row yet"
+    if last_answer is not None and (last_row is None or last_row < last_answer):
+        return [CheckResult(name, True, f"writer wired (hooks reference it), {seen}, but a request filed "
+                            f"{_age(last_answer)} and answered has no row after it: the writer is failing",
+                            "Each failed write prints one `levain ledger:` line on the hook's stderr; "
+                            f"check {qdir} is a 0700 directory you own.", warn=True)]
+    return [CheckResult(name, True, f"writer wired (hooks reference it), {seen}")]
+
+
+def _age(stamp: str) -> str:
+    """``3m ago`` / ``2h ago`` / ``4d ago`` for a UTC stamp; the stamp itself when it does not parse."""
+    from datetime import datetime, timezone
+
+    from levain.consent.ledger import parse_when
+
+    try:
+        secs = (datetime.now(timezone.utc) - parse_when(stamp)).total_seconds()
+    except ValueError:
+        return stamp
+    if secs < 120:
+        return f"{max(0, int(secs))}s ago"
+    if secs < 7200:
+        return f"{int(secs // 60)}m ago"
+    return f"{int(secs // 3600)}h ago" if secs < 172800 else f"{int(secs // 86400)}d ago"
+
+
 _MIRROR_OFF = {"off", "0", "false", "no"}
 
 
@@ -2811,6 +2885,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             results.extend(_check_transcript_hooks(
                 install, hooks, ("Stop", "PostToolUse", "PostToolUseFailure"), "Claude Code"))
             results.extend(_check_consent_wiring(install, hooks, "claude-code"))
+            results.extend(_check_consent_ledger(install, hooks, "claude-code"))
 
             allow = settings.get("permissions", {}).get("allow", [])
             # Match the exact server name or `server__tool` form — not any
@@ -3046,6 +3121,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
             if _hook_command_targets(ss, install, "session_start.py"):
                 results.extend(_check_transcript_hooks(install, hh, ("Stop", "PostToolUse"), "Codex"))
                 results.extend(_check_consent_wiring(install, hh, "codex"))
+                results.extend(_check_consent_ledger(install, hh, "codex"))
                 results.extend(_check_codex_gate_trust(install, hooks_path, codex_home))
 
     if not config_path.is_file():
