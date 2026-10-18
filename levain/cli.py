@@ -563,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_grant_parser(cs_sub, _ck_common)
     _add_consent_answer_parser(cs_sub)
     _add_consent_away_parser(cs_sub)
+    _add_push_parser(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -2220,6 +2221,13 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                           help=f"The loopback port (default {_phone_port_default()}).")
     cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
     cs_phone.set_defaults(func=_cmd_consent_phone)
+
+
+def _add_push_parser(subparsers: argparse._SubParsersAction) -> None:
+    """``levain push``: the gated push (``levain.consent.push_gate``)."""
+    from levain.consent.push_gate import add_parser
+
+    add_parser(subparsers)
 
 
 def _phone_port_default() -> int:

@@ -876,3 +876,18 @@ def test_d11_the_object_store_walk_is_capped(world, monkeypatch):
     with pytest.raises(push.PushRefused, match="more than 3 entries"):
         world.run()
     assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []
+
+
+def test_expect_sha_refuses_a_branch_moved_after_the_allow(world):
+    # seen red (B6 RUN prep, 10-18): with no expected commit, a branch moved between the operator's allow and the
+    # lock pushed the commit nobody was shown
+    allowed = world.tip()
+
+    def moved_then_judged(**kw):
+        world.commit("moved after the allow")
+        return world.refusal(**kw)
+
+    with pytest.raises(push.PushRefused, match="not " + allowed + ", the commit that was allowed"):
+        push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
+                     refusal=moved_then_judged, receipt=world.receipts.append, expect_sha=allowed)
+    assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []

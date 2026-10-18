@@ -652,7 +652,7 @@ def _record(home: Path, key: str, result: PushResult, real: str,
 
 def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str, branch: str,
             levain_home: str | os.PathLike, refusal: Refusal,
-            receipt: Callable[[dict[str, Any]], Any]) -> PushResult:
+            receipt: Callable[[dict[str, Any]], Any], expect_sha: str | None = None) -> PushResult:
     """Push ``branch`` of the repository at ``repo_path`` to ``remote`` under a grant (§3 steps 1-4).
 
     ``grant`` is the grant the caller found before the lock; its ``id`` names the mirror. Under the per-repo lock
@@ -661,7 +661,8 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     ``grant["id"]`` (a different covering grant refuses: the caller asks again). ``receipt`` is called with the
     receipt record after git ran (also when git rejected the ref); an intent line is journalled under
     ``<levain_home>/push/`` before the push and an outcome line after it, so a receipt write that fails after
-    the effect leaves a record.
+    the effect leaves a record. With ``expect_sha``, the branch tip fetched under the lock must be that commit, or
+    the push is refused (an answer that allowed one commit never pushes another).
 
     Raises :class:`PushRefused` for anything refused before the push (an ``OSError`` writing the intent line
     also aborts before it); git is resolved and the push argv built before the intent line, so no
@@ -717,6 +718,9 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         new = rp.stdout.strip()
         if rp.returncode or not _SHA.match(new):
             raise PushRefused(f"branch {branch} of {real} is not a commit")
+        if expect_sha is not None and new != expect_sha:
+            raise PushRefused(f"branch {branch} of {real} is at {new} now, not {expect_sha}, the commit that was "
+                              "allowed")
         # the private ref names the verified commit itself (a branch naming a tag object would push the tag)
         u = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "update-ref", "--no-deref",
                   SRC_REF, new])
