@@ -559,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     cs_sub = cs_p.add_subparsers(dest="consent_cmd", required=True)
     _add_consent_canary_parser(cs_sub)
+    _add_consent_ledger_parser(cs_sub)
     _add_consent_grant_parser(cs_sub, _ck_common)
     _add_consent_answer_parser(cs_sub)
     _add_consent_away_parser(cs_sub)
@@ -1538,6 +1539,93 @@ def _cmd_consent_canary(args: argparse.Namespace) -> int:
     from levain.consent.canary import cli_canary
 
     return cli_canary(args.agent, args.workspace)
+
+
+def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
+    """`levain consent ledger counts|digest|window|reconcile` (Q15): the authority ledger, read-mostly."""
+    ledger_p = consent_sub.add_parser(
+        "ledger", help="The authority ledger: which tool calls ran, and on whose authority.",
+        description=(
+            "One row per tool call an agent made, with an authority stamp (grant, answer, ruling, own_rules, "
+            "classifier, bypass, dialog_unsigned, hook, sandbox, unknown, pending). Digests only: no command "
+            "text or file content is stored. `counts` counts by agent and stamp; `digest` lists the rows a "
+            "standing grant or a late ruling answered (the unseen digest); `window` lists one session's rows "
+            "between two times (a gap is the window from its undecided time to its ruling); `reconcile` re-reads "
+            "the agent's own record for every pending row and stamps it."))
+    sub = ledger_p.add_subparsers(dest="ledger_cmd", required=True)
+
+    def common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                       help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+        p.add_argument("--json", dest="as_json", action="store_true", help="Print JSON.")
+
+    def span(p: argparse.ArgumentParser, *, since_required: bool) -> None:
+        p.add_argument("--since", required=since_required, default=None,
+                       help="Start: an ISO time, a date, or an age such as 7d, 36h, 90m.")
+        p.add_argument("--until", default=None, help="End (default: now), same forms.")
+
+    counts_p = sub.add_parser("counts", help="Count rows by agent and stamp.")
+    span(counts_p, since_required=False)
+    common(counts_p)
+    digest_p = sub.add_parser("digest", help="List the rows a grant or a late ruling answered.")
+    span(digest_p, since_required=True)
+    common(digest_p)
+    window_p = sub.add_parser("window", help="List one session's rows between two times.")
+    window_p.add_argument("--agent", required=True, choices=("claude_code", "codex"))
+    window_p.add_argument("--session", required=True, help="The agent's session id.")
+    span(window_p, since_required=True)
+    common(window_p)
+    recon_p = sub.add_parser("reconcile", help="Re-read the agent's record for every pending row and stamp it.")
+    recon_p.add_argument("--give-up-after", dest="give_up_after", default="1h",
+                         help="Stamp a row `unknown` when its source still has no answer this long after the call "
+                              "(e.g. 1h, 2d; `never` keeps it pending). Default 1h.")
+    common(recon_p)
+    for p in (counts_p, digest_p, window_p, recon_p):
+        p.set_defaults(func=_cmd_consent_ledger)
+
+
+def _cmd_consent_ledger(args: argparse.Namespace) -> int:
+    import json
+    import sqlite3
+    from dataclasses import asdict
+
+    from levain.consent.ledger import Ledger, parse_when, reconcile
+    from levain.consent.queue import QueueStoreError
+
+    qdir = Path(os.path.abspath(args.queue_dir.expanduser())) if args.queue_dir is not None else None
+    try:
+        ledger = Ledger(qdir)
+        if args.ledger_cmd == "reconcile":
+            now = datetime.now(timezone.utc)
+            gua = None if args.give_up_after == "never" else now - parse_when(args.give_up_after, now=now)
+            result = reconcile(ledger, give_up_after=gua)
+            print(json.dumps(result, sort_keys=True) if args.as_json else
+                  f"filled {result['filled']} ({result['unknown']} unknown), still pending {result['still_pending']}")
+            return 0
+        if args.ledger_cmd == "counts":
+            rows = ledger.counts(args.since, args.until)
+            if args.as_json:
+                print(json.dumps([{"agent": a, "stamp": s, "rows": n} for a, s, n in rows]))
+            else:
+                for a, s, n in rows:
+                    print(f"{a:12} {s:16} {n}")
+                if not rows:
+                    print("no rows")
+            return 0
+        calls = (ledger.digest(args.since, args.until) if args.ledger_cmd == "digest"
+                 else ledger.window(args.agent, args.session, args.since, args.until))
+    except (OSError, ValueError, QueueStoreError, sqlite3.Error) as e:
+        print(f"levain consent ledger: {e}", file=sys.stderr)
+        return 1
+    if args.as_json:
+        print(json.dumps([asdict(c) for c in calls]))
+    else:
+        for c in calls:
+            print(f"{c.received_at}  {c.agent:11} {c.stamp:16} {c.phase:14} {c.tool_name}  {c.tool_input_digest[:20]}  "
+                  f"{c.agent_session_id[:8]}")
+        if not calls:
+            print("no rows")
+    return 0
 
 
 def _cmd_verify_hooks(args: argparse.Namespace) -> int:

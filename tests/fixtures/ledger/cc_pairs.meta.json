@@ -1,0 +1,110 @@
+[
+ {
+  "case": "R3-bypass-proj",
+  "tool_use_id": "toolu_01F2geW2akQAt3C6Hxw6xo22",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "mode"
+  },
+  "session": "5c3efa41-2a8f-42dd-8ed3-44c4063192f4"
+ },
+ {
+  "case": "R3-bypass-proj",
+  "tool_use_id": "toolu_01NmBLE7uHbx7SaaFu52VdQP",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "mode"
+  },
+  "session": "5c3efa41-2a8f-42dd-8ed3-44c4063192f4"
+ },
+ {
+  "case": "R3-denied-proj",
+  "tool_use_id": "toolu_019ZUCE4HjWKn74DJCHrWEnh",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "reject",
+   "source": "hook",
+   "reasonType": "hook"
+  },
+  "session": "7a49e5e7-9da7-4367-a3ad-64db574af2d6"
+ },
+ {
+  "case": "R3-denied-proj",
+  "tool_use_id": "toolu_014BdruYwYw2piyzZpySkDoT",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "mode"
+  },
+  "session": "7a49e5e7-9da7-4367-a3ad-64db574af2d6"
+ },
+ {
+  "case": "R3-allowrule2-proj",
+  "tool_use_id": "toolu_01Eh5vpXJLSJFyDzPSW5DxAZ",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "reject",
+   "source": "config"
+  },
+  "session": "0c9a5009-0739-44df-8f25-249841355e9f"
+ },
+ {
+  "case": "R3-allowrule2-proj",
+  "tool_use_id": "toolu_01HwLbuJ9S5WaMNkm1r1qNin",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "reject",
+   "source": "config"
+  },
+  "session": "0c9a5009-0739-44df-8f25-249841355e9f"
+ },
+ {
+  "case": "R3TX-cases-BG1-proj",
+  "tool_use_id": "toolu_01SJRz7WJJRM1r1ocsT4iTx5",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "classifier"
+  },
+  "session": "ed41e7c4-ef44-4ed0-ac32-50cb676146f3"
+ },
+ {
+  "case": "R3TX-cases-BG1-proj",
+  "tool_use_id": "toolu_01Q6ZpHJogNwzueLrquoPRE9",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "classifier"
+  },
+  "session": "ed41e7c4-ef44-4ed0-ac32-50cb676146f3"
+ },
+ {
+  "case": "R3-allowrule-proj",
+  "tool_use_id": "toolu_01FCticDu8yqdSDE9m173CzE",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "subcommandResults"
+  },
+  "session": "94612160-52cb-48c1-b4ec-49716bcc8295"
+ },
+ {
+  "case": "R3-allowrule-proj",
+  "tool_use_id": "toolu_014RxNxe3Bm8xrBmTX2sC3MP",
+  "tool": "Bash",
+  "permissionDecision": {
+   "decision": "accept",
+   "source": "config",
+   "reasonType": "subcommandResults"
+  },
+  "session": "94612160-52cb-48c1-b4ec-49716bcc8295"
+ }
+]
