@@ -49,6 +49,12 @@ Known edges (one line each, not built against):
   another host than the one he was shown; levain refuses git's URL rewrites but does not read ssh's config.
 - with no session in the environment the session is :data:`NO_SESSION`, so gap numbers and ruled allows are shared
   by every such caller (a ruled allow still matches only the identical push).
+- the newest gap is chosen by gap number: a deny applied later to an older gap is missed and the operator is
+  simply asked again.
+- a signal landing between ``queue.file`` returning and the cleanup ``try`` leaves the request to its expiry.
+- a signal or crash between git returning and the record being written reports exit 4, outcome unknown.
+- a ruled allow taken before ``_filed_for`` refuses it is spent.
+- withdraw reports "answered or ended" also when the store errored.
 - the push receipt is a line in ``<levain home>/push/receipts.jsonl`` beside the executor's journal, not a row in
   the queue's receipts.
 
@@ -180,8 +186,12 @@ def _push_hold(qdir: Path, adapter: Any) -> float:
         got = json.loads((qdir / adapter.SETTINGS_NAME).read_text(encoding="utf-8")).get("push_hold_seconds")
     except (OSError, ValueError, RecursionError, AttributeError):
         got = None
-    ok = isinstance(got, (int, float)) and not isinstance(got, bool) and math.isfinite(got) and got > 0
-    return min(float(got) if ok else PUSH_HOLD, claude_code.GATE_HOLD_CEILING)
+    try:                                     # an integer past float range raises on both calls
+        ok = isinstance(got, (int, float)) and not isinstance(got, bool) and math.isfinite(got) and got > 0
+        hold = float(got) if ok else PUSH_HOLD
+    except OverflowError:
+        hold = PUSH_HOLD
+    return min(hold, claude_code.GATE_HOLD_CEILING)
 
 
 def _receipt(home: Path, extra: dict[str, Any]):
@@ -191,7 +201,7 @@ def _receipt(home: Path, extra: dict[str, Any]):
     return write
 
 
-def _filed_for(queue: ConsentQueue, got: Decision, call: dict[str, str]) -> bool:
+def _filed_for(queue: ConsentQueue, got: Decision | Ruling, call: dict[str, str]) -> bool:
     """The decision decides a ``levain_push`` request at :data:`PUSH_TIER` whose display reads back as exactly
     ``call`` and whose digest is ``call``'s: what the operator was shown is what would be pushed."""
     found = queue.get(got.request_id)
@@ -203,7 +213,8 @@ def _filed_for(queue: ConsentQueue, got: Decision, call: dict[str, str]) -> bool
 
 
 def _late_deny(queue: ConsentQueue, agent: str, session: str, call: dict[str, str]) -> int | None:
-    """The gap number when the newest gap this session gave this exact push is a verified DENY ruling."""
+    """The gap number when the newest gap this session gave this exact push is a verified DENY ruling that is
+    filed for exactly this call (the same check an allow passes)."""
     digest, newest, n = tool_input_digest(call), None, 1
     while (g := queue.request_by_gap(agent, session, n)) is not None:
         if (g.request.tool_name, g.request.tool_input_digest, g.request.cwd) == (PUSH_TOOL, digest, call["repo"]):
@@ -212,7 +223,9 @@ def _late_deny(queue: ConsentQueue, agent: str, session: str, call: dict[str, st
     if newest is None or newest.state != "denied":
         return None
     ruled = queue.decision(newest.request.id)
-    return newest.gap if isinstance(ruled, Ruling) and ruled.ruling == "deny" else None
+    if isinstance(ruled, Ruling) and ruled.ruling == "deny" and _filed_for(queue, ruled, call):
+        return newest.gap
+    return None
 
 
 def _withdraw(queue: ConsentQueue, request_id: str, note: str) -> bool:
