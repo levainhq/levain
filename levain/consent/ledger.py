@@ -2,7 +2,7 @@
 
 A store ``<levain home>/consent/ledger.db`` beside ``queue.db`` (same directory checks, WAL through
 :func:`levain.autonomic.durable_sqlite.open_durable`, format :data:`STORE_FORMAT`). A row is written by the hooks
-(PreToolUse of a call the gate itself denied, PostToolUse, PostToolUseFailure) and carries the call's identity, a
+(the gate's PreToolUse of a call it answered, PostToolUse, PostToolUseFailure) and carries the call's identity, a
 DIGEST of its tool input (never the input, the command text or any file content), and the authority STAMP.
 
 The stamp is read back from the agent's own record (:mod:`levain.consent.stamps`), which is often not written yet
@@ -15,7 +15,12 @@ request id that answered the call.
 
 A GAP is a window on this ledger (:meth:`Ledger.window`): the rows of one session from the undecided time to the
 ruling. The weekly unseen digest (:meth:`Ledger.digest`) is the rows a standing grant or a late ruling answered.
-:meth:`Ledger.counts` counts by agent and stamp (row D reads spent-vs-authorized from the same rows).
+:meth:`Ledger.counts` counts by agent and stamp (row D reads spent-vs-authorized from the same rows). All three read
+ONE row per call: a call with a ``pre`` row (levain answered it at the gate) is that row, its post row giving only
+the outcome.
+
+The hooks write through :func:`hook_record`, :func:`hook_fill` and :func:`gate_row`, which never raise: a ledger that
+cannot be written is a missing record, never a changed answer or a blocked agent.
 
 OUTCOME beside STAMP: what the authority did (``accepted`` / ``refused`` / ``unknown``). A refusal authorised nothing,
 so a refused row's stamp is only ever ``unknown`` or ``pending`` (a CHECK, not a convention), and ``counts`` splits by
@@ -24,8 +29,9 @@ a Codex turn's ``approval_policy``/``approvals_reviewer``/sandbox ``type``/profi
 reasons; anything else a caller or a newer agent version adds is dropped, never stored.
 
 Known edges (one line each): the input digest is unsalted, so a SHORT input is recoverable by dictionary; a Codex
-policy that changes mid-turn is read from the turn's FIRST ``turn_context``; ``counts`` counts the pre and the post
-row of one call separately; ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is
+policy that changes mid-turn is read from the turn's FIRST ``turn_context``; a call whose pre row levain stamped and
+whose post row says ``refused`` reads as that stamp with outcome ``refused`` (unreached: a refused call fires no post
+event); ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is
 not refused by a trigger; a ledger.db made by fedba7b1 (before the ``outcome`` column) is refused, delete it.
 A transcript longer than the scan cap ends ``unknown`` with reason ``result_not_written`` for the calls past the cap; an id
 merely quoted inside a skipped oversized line marks its row ``result_oversized`` (still ``unknown``, never allow).
@@ -36,6 +42,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -51,7 +58,7 @@ from levain.consent.queue import QueueStoreError, default_queue_dir
 from levain.consent.record import AGENTS, tool_input_digest
 
 __all__ = ["DB_NAME", "DIGEST_STAMPS", "PHASES", "STORE_FORMAT", "Call", "Ledger", "LedgerStoreError",
-           "clean_detail", "parse_when", "reconcile"]
+           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile"]
 
 DB_NAME = "ledger.db"
 STORE_FORMAT = "levain-authority-ledger/1"
@@ -152,6 +159,21 @@ _SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS calls_no_replace BEFORE INSERT ON calls "
     "WHEN EXISTS (SELECT 1 FROM calls WHERE id = NEW.id) "
     "BEGIN SELECT RAISE(ABORT, 'a ledger row id is never reused'); END",
+)
+
+# ONE CALL, ONE AUTHORITY: a call levain answered at its gate has a ``pre`` row (levain's own stamp) and, once it ran,
+# a ``post`` / ``post_failure`` row (the agent's record, which can only say "a hook allowed it"). The readers that
+# count or list calls read this instead of ``calls``: the post row of a call with a pre row is dropped, and gives
+# the pre row only its outcome (when it says one). Raw rows (``get``, ``pending``) still read ``calls``.
+_POST_PHASES = "('post', 'post_failure')"
+_SAME_CALL = "p.agent = c.agent AND p.agent_session_id = c.agent_session_id AND p.tool_use_id = c.tool_use_id"
+_POST_OUTCOME = (f"CASE WHEN c.phase = 'pre' THEN COALESCE((SELECT p.outcome FROM calls p WHERE {_SAME_CALL} "
+                 f"AND p.phase IN {_POST_PHASES} AND p.outcome <> 'unknown' ORDER BY p.rowid LIMIT 1), c.outcome) "
+                 "ELSE c.outcome END AS outcome")
+_PER_CALL = (
+    "(SELECT " + ", ".join(_POST_OUTCOME if col == "outcome" else f"c.{col} AS {col}" for col in _COLUMNS)
+    + f", c.rowid AS rowid FROM calls c WHERE NOT (c.phase IN {_POST_PHASES} AND c.tool_use_id IS NOT NULL "
+    f"AND EXISTS (SELECT 1 FROM calls p WHERE {_SAME_CALL} AND p.phase = 'pre'))) AS per_call"
 )
 
 
@@ -383,9 +405,10 @@ class Ledger:
             row = conn.execute(f"SELECT {','.join(_COLUMNS)} FROM calls WHERE id = ?", (call_id,)).fetchone()
         return Call._of(row) if row else None
 
-    def _select(self, where: str, args: tuple[Any, ...]) -> list[Call]:
+    def _select(self, where: str, args: tuple[Any, ...], *, per_call: bool = False) -> list[Call]:
+        source = _PER_CALL if per_call else "calls"
         with self._read() as conn:
-            rows = conn.execute(f"SELECT {','.join(_COLUMNS)} FROM calls WHERE {where} "
+            rows = conn.execute(f"SELECT {','.join(_COLUMNS)} FROM {source} WHERE {where} "
                                 "ORDER BY received_at, rowid", args).fetchall()
         return [Call._of(r) for r in rows]
 
@@ -404,7 +427,7 @@ class Ledger:
         now = self._now()
         lo, hi = _need(since, now), _stamp_of(until, now, now=now)
         return self._select("agent = ? AND agent_session_id = ? AND received_at >= ? AND received_at <= ?",
-                            (agent, agent_session_id, lo, hi))
+                            (agent, agent_session_id, lo, hi), per_call=True)
 
     def digest(self, since: str | datetime, until: str | datetime | None = None) -> list[Call]:
         """The unseen digest: rows in the window a standing grant or a late ruling answered (a signed answer was
@@ -412,17 +435,18 @@ class Ledger:
         now = self._now()
         lo, hi = _need(since, now), _stamp_of(until, now, now=now)
         marks = ",".join("?" * len(DIGEST_STAMPS))
-        return self._select(f"received_at >= ? AND received_at <= ? AND stamp IN ({marks})", (lo, hi, *DIGEST_STAMPS))
+        return self._select(f"received_at >= ? AND received_at <= ? AND stamp IN ({marks})", (lo, hi, *DIGEST_STAMPS),
+                            per_call=True)
 
     def counts(self, since: str | datetime | None = None, until: str | datetime | None = None
                ) -> list[tuple[str, str, str, int]]:
-        """``(agent, stamp, outcome, rows)`` over the window, sorted. No ``since`` counts from the start. A call's
-        pre and post rows are counted separately."""
+        """``(agent, stamp, outcome, calls)`` over the window, sorted, one per call (``window``'s rule). No
+        ``since`` counts from the start."""
         now = self._now()
         lo = _stamp_of(since, now=now) if since is not None else ""
         hi = _stamp_of(until, now, now=now)
         with self._read() as conn:
-            rows = conn.execute("SELECT agent, stamp, outcome, COUNT(*) FROM calls WHERE received_at >= ? "
+            rows = conn.execute(f"SELECT agent, stamp, outcome, COUNT(*) FROM {_PER_CALL} WHERE received_at >= ? "
                                 "AND received_at <= ? GROUP BY agent, stamp, outcome ORDER BY agent, stamp, outcome",
                                 (lo, hi)).fetchall()
         return [(a, s, o, n) for a, s, o, n in rows]
@@ -494,8 +518,11 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
     ``already_stamped`` counts rows another process stamped between the read and the write."""
     out = {"filled": 0, "unknown": 0, "still_pending": 0, "already_stamped": 0}
     now = ledger._now()
-    rows = [c for c in ledger.pending() if (agent is None or c.agent == agent)
-            and (agent_session_id is None or c.agent_session_id == agent_session_id)]
+    if agent is not None and agent_session_id is not None:
+        rows = ledger.pending_for(agent, agent_session_id)
+    else:
+        rows = [c for c in ledger.pending() if (agent is None or c.agent == agent)
+                and (agent_session_id is None or c.agent_session_id == agent_session_id)]
     by_path: dict[str, list[str]] = {}
     for c in rows:
         if c.agent == "claude_code" and c.source_path and c.tool_use_id:
@@ -526,3 +553,113 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
         else:
             out["already_stamped"] += 1
     return out
+
+
+# --- the hooks' writers ------------------------------------------------------------------------------------------
+# Called from inside the agents' hooks. Each one returns None on any Exception (an interrupt still ends the hook), so
+# a ledger that cannot be written is one stderr line, never a changed answer or a blocked agent.
+
+_TOOL_PHASES = {"PostToolUse": "post", "PostToolUseFailure": "post_failure"}
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _session_key(agent: str, payload: Mapping[str, Any]) -> str | None:
+    """The session a row files under: the gate's own key, so a call's pre and post rows meet. Claude Code appends
+    ``#agent:<agent_id>`` for a subagent (its adapter's rule); the Codex gate keys by ``session_id`` alone."""
+    session = _text(payload.get("session_id"))
+    agent_id = _text(payload.get("agent_id"))
+    if session is not None and agent == "claude_code" and agent_id is not None:
+        return f"{session}#agent:{agent_id}"
+    return session
+
+
+def _hook_failed(what: str, exc: BaseException) -> None:
+    try:
+        print(f"levain ledger: {what} ({type(exc).__name__}: {exc})"[:300], file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _hook_ledger(queue_dir: Path | str | None) -> Ledger | None:
+    """The ledger in the consent directory, only when that directory already exists: a hook never creates
+    levain's home."""
+    directory = Path(queue_dir) if queue_dir is not None else default_queue_dir()
+    return Ledger(directory) if directory.is_dir() else None
+
+
+def _common(agent: str, payload: Mapping[str, Any], session: str, tool_name: str, tool_input: Any,
+            cwd: str) -> dict[str, Any]:
+    return {"agent": agent, "agent_session_id": session, "tool_name": tool_name, "tool_input": tool_input, "cwd": cwd,
+            "tool_use_id": _text(payload.get("tool_use_id")), "source_path": _text(payload.get("transcript_path")),
+            # a Codex row reads its turn's policy; Claude Code has no turns in its record
+            "turn_id": _text(payload.get("turn_id")) if agent == "codex" else None,
+            "permission_mode": _text(payload.get("permission_mode"))}
+
+
+def hook_record(agent: str, payload: Any, *, queue_dir: Path | str | None = None) -> str | None:
+    """File the call a ``PostToolUse`` / ``PostToolUseFailure`` payload reports, ``pending`` (phase ``post`` /
+    ``post_failure``), and return its row id. Its stamp is read later from the agent's record (:func:`hook_fill`).
+    None when the payload is not such an event, lacks a session, tool or cwd, when the consent directory does not
+    exist, or on any failure."""
+    try:
+        if agent not in AGENTS or not isinstance(payload, Mapping):
+            return None
+        phase = _TOOL_PHASES.get(payload.get("hook_event_name"))  # type: ignore[arg-type]
+        session, name, cwd = _session_key(agent, payload), _text(payload.get("tool_name")), _text(payload.get("cwd"))
+        if phase is None or session is None or name is None or cwd is None:
+            return None
+        ledger = _hook_ledger(queue_dir)
+        if ledger is None:
+            return None
+        return ledger.record_call(**_common(agent, payload, session, name, payload.get("tool_input"), cwd),
+                                  phase=phase)
+    except Exception as exc:  # noqa: BLE001 - the ledger is a record, never a gate
+        _hook_failed("row not written", exc)
+        return None
+
+
+def hook_fill(agent: str, payload: Any, *, queue_dir: Path | str | None = None) -> dict[str, int] | None:
+    """Stamp this session's pending rows from the agent's own record (:func:`reconcile` scoped to the payload's
+    session; each transcript or rollout is read once, under the readers' byte caps). A row whose source still says
+    nothing stays pending until :func:`reconcile`'s default give-up age, then ``unknown``, never allow or deny.
+    None when there is no ledger yet, no session, or on any failure."""
+    try:
+        if agent not in AGENTS or not isinstance(payload, Mapping):
+            return None
+        session = _session_key(agent, payload)
+        ledger = _hook_ledger(queue_dir)
+        if session is None or ledger is None or not ledger.path.is_file():
+            return None
+        return reconcile(ledger, agent=agent, agent_session_id=session)
+    except Exception as exc:  # noqa: BLE001 - the ledger is a record, never a gate
+        _hook_failed("rows not stamped", exc)
+        return None
+
+
+def gate_row(agent: str, queue_dir: Path | str, event: Mapping[str, Any], session: str, tool_name: str,
+             tool_input: Any, cwd: str, *, decision: Any = None, refused: str | None = None,
+             request_id: str | None = None) -> str | None:
+    """File a gated call's row at decision time, from the gate's own answer: a verified allow is phase ``pre``,
+    stamped with its authority (``answer`` / ``grant`` / ``ruling``, the answering request); anything the gate
+    denied is ``denied_by_gate`` (stamp ``unknown``, outcome ``refused``), its ``decision`` saying how (``deny``,
+    ``undecided``, ``halted``, ``failed``). ``session`` is the gate's own key. None on any failure: the queue's
+    receipts still record every decision."""
+    try:
+        common = _common(agent, event, session, tool_name, tool_input, cwd)
+        ledger = Ledger(queue_dir)
+        if decision is not None and getattr(decision, "decision", None) == "allow":
+            via = getattr(decision, "via", None)
+            return ledger.record_call(**common, phase="pre", stamp=via if via in ("grant", "ruling") else "answer",
+                                      request_id=getattr(decision, "request_id", None),
+                                      stamp_detail={"decision": "allow", "source": "levain_gate"})
+        how = "deny" if decision is not None else (refused or "deny")
+        return ledger.record_call(**common, phase="denied_by_gate", stamp="unknown", outcome="refused",
+                                  request_id=getattr(decision, "request_id", None) if decision is not None
+                                  else request_id,
+                                  stamp_detail={"decision": how, "source": "levain_gate"})
+    except Exception as exc:  # noqa: BLE001 - the ledger is a record, never the gate
+        _hook_failed("gate row not written", exc)
+        return None

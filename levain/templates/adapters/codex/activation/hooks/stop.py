@@ -6,7 +6,8 @@ transcript log, a DISPLAY for the cockpit and never an authority. It does NOT to
 registry: the registry's `last_event` allows only SessionStart | UserPromptSubmit.
 
 First, whether or not anything else here fires: the consent requests levain left to the agent's own
-dialog in this session that did not run are recorded, unsigned, as not run (`levain.consent.dialog`).
+dialog in this session that did not run are recorded, unsigned, as not run (`levain.consent.dialog`), and the
+session's pending authority-ledger rows are stamped from the agent's own record (`levain.consent.ledger`).
 
 Prints NOTHING and exits 0 always: Codex's Stop output schema rejects `hookSpecificOutput.additionalContext`. FAIL-OPEN — the hook import is guarded and main()
 swallows everything.
@@ -29,6 +30,8 @@ def main() -> int:
         payload = hook.read_stdin()
         if hasattr(hook, "consent_observe"):  # an older helper beside a newer script: no record, the hook runs
             hook.consent_observe("codex", "Stop", payload)
+        if hasattr(hook, "consent_ledger"):
+            hook.consent_ledger("codex", payload, fill=True)
         if not hook.should_fire():
             return 0
         message = payload.get("last_assistant_message")

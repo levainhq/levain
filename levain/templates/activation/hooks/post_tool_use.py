@@ -10,7 +10,9 @@ tool's `file_path` (a notebook tool's `notebook_path`). `tool_response` is NEVER
 shape differs per agent and it can carry anything. A DISPLAY for the cockpit, never an authority.
 
 First, whether or not anything else here fires: a consent request levain filed for this same call and
-left to the agent's own dialog is recorded, unsigned, as run (`levain.consent.dialog`).
+left to the agent's own dialog is recorded, unsigned, as run (`levain.consent.dialog`), and the call is filed in
+the authority ledger, its stamp pending: the transcript's `permissionDecision` is not on disk yet at this event, so the
+consent gate's next PreToolUse (or Stop) stamps it (`levain.consent.ledger`).
 
 Prints NOTHING and exits 0 always. FAIL-OPEN — the hook import is guarded and main() swallows
 everything.
@@ -57,6 +59,8 @@ def main() -> int:
         payload = hook.read_stdin()
         if hasattr(hook, "consent_observe"):  # an older helper beside a newer script: no record, the hook runs
             hook.consent_observe("claude_code", "PostToolUse", payload)
+        if hasattr(hook, "consent_ledger"):
+            hook.consent_ledger("claude_code", payload, record=True)
         if not hook.should_fire():
             return 0
         name = payload.get("tool_name")

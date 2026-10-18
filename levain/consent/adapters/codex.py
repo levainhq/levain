@@ -391,37 +391,16 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
 def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
                  *, decision: Decision | None = None, refused: str | None = None,
                  request_id: str | None = None) -> None:
-    """File the gated call's ledger row at decision time: a verified allow is stamped with its authority
-    (``answer`` / ``grant`` / ``ruling``, phase ``pre``, the answering request), anything the gate denied is a
-    ``denied_by_gate`` row (stamp ``unknown``, outcome ``refused``) whose ``decision`` says how (``deny``,
-    ``undecided``, ``halted``, ``failed``). A ledger that cannot be written never changes the gate's answer: the
-    queue's receipts still record every decision."""
-    from levain.consent.ledger import Ledger
-
-    tool_use_id = event.get("tool_use_id")
-    turn_id, source, mode = event.get("turn_id"), event.get("transcript_path"), event.get("permission_mode")
-    common: dict[str, Any] = {
-        "agent": AGENT, "agent_session_id": session, "tool_name": tool_name, "tool_input": tool_input, "cwd": cwd,
-        "tool_use_id": tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
-        "source_path": source if isinstance(source, str) and source else None,
-        "turn_id": turn_id if isinstance(turn_id, str) and turn_id else None,
-        "permission_mode": mode if isinstance(mode, str) and mode else None}
+    """File the gated call's ledger row at decision time (:func:`levain.consent.ledger.gate_row`: a verified allow
+    is a ``pre`` row with levain's stamp, anything denied a ``denied_by_gate`` row). A ledger that cannot be written
+    never changes the gate's answer: the queue's receipts still record every decision."""
     try:
-        ledger = Ledger(queue_dir)
-        if decision is not None and decision.decision == "allow":
-            stamp = decision.via if decision.via in ("grant", "ruling") else "answer"
-            ledger.record_call(**common, phase="pre", stamp=stamp, request_id=decision.request_id,
-                               stamp_detail={"decision": "allow", "source": "levain_gate"})
-        else:
-            how = "deny" if decision is not None else (refused or "deny")
-            ledger.record_call(**common, phase="denied_by_gate", stamp="unknown", outcome="refused",
-                               request_id=decision.request_id if decision is not None else request_id,
-                               stamp_detail={"decision": how, "source": "levain_gate"})
-    except Exception as exc:  # noqa: BLE001 - the ledger is a record, never the gate
-        try:
-            print(f"levain consent gate: ledger row not written ({type(exc).__name__}: {exc})"[:300], file=sys.stderr)
-        except Exception:
-            pass
+        from levain.consent.ledger import gate_row
+
+        gate_row(AGENT, queue_dir, event, session, tool_name, tool_input, cwd, decision=decision, refused=refused,
+                 request_id=request_id)
+    except Exception:  # noqa: BLE001 - the ledger is a record, never the gate
+        pass
 
 
 def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:

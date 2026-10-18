@@ -900,6 +900,32 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     return out
 
 
+def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
+                 *, decision: Decision | None = None, refused: str | None = None,
+                 request_id: str | None = None) -> None:
+    """File the gated call's ledger row at decision time (:func:`levain.consent.ledger.gate_row`). A call the gate
+    denied fires no PostToolUse (runs3-cc), so this row is its only one. Never changes the gate's answer."""
+    try:
+        from levain.consent.ledger import gate_row
+
+        gate_row(AGENT, queue_dir, event, session, tool_name, tool_input, cwd, decision=decision, refused=refused,
+                 request_id=request_id)
+    except Exception:  # noqa: BLE001 - the ledger is a record, never the gate
+        pass
+
+
+def _ledger_fill(event: Any, queue_dir: Path | None) -> None:
+    """Stamp this session's pending ledger rows from its transcript (:func:`levain.consent.ledger.hook_fill`): the
+    prior call's ``permissionDecision`` is on disk by this PreToolUse (runs3-cc). Runs after the gate's answer is
+    written; nothing it does reaches that answer."""
+    try:
+        from levain.consent.ledger import hook_fill
+
+        hook_fill(AGENT, event, queue_dir=queue_dir)
+    except BaseException:  # noqa: BLE001 - the answer is already written; a record never fails the hook
+        pass
+
+
 def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
                tool_input: Any, cwd: str, session: str, *, home: Path | None,
                sleep: Callable[[float], None],
@@ -907,6 +933,13 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     from datetime import datetime, timezone
 
     from levain.cockpit.consent import parse_stamp
+
+    qdir = Path(queue.directory)
+    note = lambda **kw: _ledger_note(qdir, event, session, tool_name, tool_input, cwd, **kw)  # noqa: E731
+
+    def deliver(decision: Decision) -> dict[str, Any]:
+        note(decision=decision)
+        return gate_output(decision)
 
     tier = gate_class(tool_name, tool_input, cwd, home=home,
                       protected=protected_paths(Path(queue.directory), settings))
@@ -922,7 +955,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
-            return gate_output(ruled)
+            return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
             return None
         if posture == "default" and not effective_away(settings)[0]:
@@ -934,6 +967,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
                              resume=resume_meta_of(event))
     except Exception as exc:
+        note(refused="failed")
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
     try:
@@ -949,12 +983,12 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                     return None
                 # not pending any more: an answer may have landed between the wait and the withdraw
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
-                return gate_output(got) if got is not None else None
+                return deliver(got) if got is not None else None
         else:
             got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
                                                  posture=posture), request)
         if got is not None:
-            return gate_output(got)
+            return deliver(got)
         # the hold ends at expires_at (the library's deadline); mark_undecided applies at or after it
         left = (parse_stamp(request.expires_at) - datetime.now(timezone.utc)).total_seconds()
         still = queue.get(request.id)
@@ -967,13 +1001,16 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         marked = queue.mark_undecided(request.id, halt=tier == "irreversible", tool_input=tool_input,
                                       posture=posture)
         if isinstance(marked.decision, Decision) and _verified(marked.decision, request) is not None:
-            return gate_output(marked.decision)  # an answer verified in the last moments of the hold
+            return deliver(marked.decision)  # an answer verified in the last moments of the hold
         if marked.state == "undecided" and marked.gap is not None:
+            note(refused="undecided", request_id=request.id)
             return undecided_output(tier, what, marked.gap)
+        note(refused="deny", request_id=request.id)
         why = marked.reason or "no verified decision"
         return _pre("deny", f"levain: the action was NOT taken: {what} ({why}). Do not retry it and do "
                     "not achieve it another way.", **_stop(tier, what, why))
     except Exception as exc:
+        note(refused="failed", request_id=request.id)
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
 
@@ -991,6 +1028,10 @@ def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[
         tier, what = "irreversible", "this call"
     if tier is None:
         return None
+    session = _session_of(event) if isinstance(event, Mapping) else None
+    if session is not None:
+        _ledger_note(queue_dir, event, session, str(event.get("tool_name")), event.get("tool_input") or {},
+                     str(event.get("cwd") or ""), refused="failed")
     return _pre("deny", f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it "
                 "and do not achieve it another way.", **_stop(tier, what, "the gate could not run."))
 
@@ -1031,6 +1072,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+            _ledger_fill(event, queue_dir)
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
             try:

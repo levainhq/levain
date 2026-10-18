@@ -1279,6 +1279,20 @@ def consent_observe(agent: str, event: str, payload) -> None:
         pass
 
 
+def consent_ledger(agent: str, payload, *, record: bool = False, fill: bool = False) -> None:
+    """The authority ledger's hook half (``levain.consent.ledger``): ``record`` files this tool event's call,
+    ``fill`` stamps the session's pending calls from the agent's own record. Runs whether or not the hook would emit
+    anything. Never raises: the ledger is a record, never a gate."""
+    try:
+        from levain.consent import ledger
+        if record:
+            ledger.hook_record(agent, payload)
+        if fill:
+            ledger.hook_fill(agent, payload)
+    except Exception:
+        pass
+
+
 def read_stdin() -> dict:
     """Consume and parse the hook's stdin JSON payload.
 

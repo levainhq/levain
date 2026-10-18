@@ -680,3 +680,34 @@ def test_clean_detail_drops_an_unhashable_reason():
     from levain.consent.ledger import clean_detail
     assert clean_detail({"reason": ["no_source"], "gave_up": True}) == {"gave_up": True}
     assert clean_detail({"reason": {"a": 1}}) is None
+
+
+def test_a_ruled_call_reads_as_its_ruling_not_the_mode_the_transcript_names(tmp_path):
+    """Reproduced in the B3h run (10-18, b3h/RUN.txt): a gated Edit ruled allow ran in a bypass session, and the
+    transcript's decision for it was {accept, config, mode}: its post row stamps ``bypass``. The gate's pre row says
+    ``ruling``; window, digest and counts read the call once, as its ruling."""
+    from types import SimpleNamespace
+
+    from levain.consent.ledger import gate_row, hook_fill, hook_record
+
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    tx = tmp_path / "s.jsonl"
+    tx.write_text(json.dumps({"type": "user", "permissionDecision": {"decision": "accept", "source": "config",
+                                                                      "reasonType": "mode"},
+                              "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_ruled"}]}}) + "\n")
+    edit = {"file_path": "/w/.claude/settings.json", "old_string": "{", "new_string": "{\"env\": {},"}
+    event = {"session_id": "s1", "tool_use_id": "toolu_ruled", "transcript_path": str(tx),
+             "permission_mode": "bypassPermissions", "tool_name": "Edit", "tool_input": edit, "cwd": "/w"}
+    ruling = SimpleNamespace(decision="allow", via="ruling", request_id="pend-1")
+    assert gate_row("claude_code", qdir, {**event, "hook_event_name": "PreToolUse"}, "s1", "Edit", edit, "/w",
+                    decision=ruling)
+    assert hook_record("claude_code", {**event, "hook_event_name": "PostToolUse"}, queue_dir=qdir)
+    assert hook_fill("claude_code", {**event, "hook_event_name": "Stop"}, queue_dir=qdir)["filled"] == 1
+    ledger = Ledger(qdir)
+    raw = sqlite3.connect(ledger.path).execute("SELECT phase, stamp FROM calls ORDER BY rowid").fetchall()
+    assert raw == [("pre", "ruling"), ("post", "bypass")]          # both rows kept, as filed
+    (one,) = ledger.window("claude_code", "s1", "1h")
+    assert (one.phase, one.stamp, one.outcome, one.request_id) == ("pre", "ruling", "accepted", "pend-1")
+    assert [c.stamp for c in ledger.digest("1h")] == ["ruling"]
+    assert ledger.counts() == [("claude_code", "ruling", "accepted", 1)]
