@@ -8,7 +8,7 @@
    "source": "config",
    "reasonType": "mode"
   },
-  "session": "5c3efa41-2a8f-42dd-8ed3-44c4063192f4"
+  "session": "00000000-0000-4000-8000-000000000004"
  },
  {
   "case": "R3-bypass-proj",
@@ -19,7 +19,7 @@
    "source": "config",
    "reasonType": "mode"
   },
-  "session": "5c3efa41-2a8f-42dd-8ed3-44c4063192f4"
+  "session": "00000000-0000-4000-8000-000000000004"
  },
  {
   "case": "R3-denied-proj",
@@ -30,7 +30,7 @@
    "source": "hook",
    "reasonType": "hook"
   },
-  "session": "7a49e5e7-9da7-4367-a3ad-64db574af2d6"
+  "session": "00000000-0000-4000-8000-000000000014"
  },
  {
   "case": "R3-denied-proj",
@@ -41,7 +41,7 @@
    "source": "config",
    "reasonType": "mode"
   },
-  "session": "7a49e5e7-9da7-4367-a3ad-64db574af2d6"
+  "session": "00000000-0000-4000-8000-000000000014"
  },
  {
   "case": "R3-allowrule2-proj",
@@ -51,7 +51,7 @@
    "decision": "reject",
    "source": "config"
   },
-  "session": "0c9a5009-0739-44df-8f25-249841355e9f"
+  "session": "00000000-0000-4000-8000-000000000024"
  },
  {
   "case": "R3-allowrule2-proj",
@@ -61,7 +61,7 @@
    "decision": "reject",
    "source": "config"
   },
-  "session": "0c9a5009-0739-44df-8f25-249841355e9f"
+  "session": "00000000-0000-4000-8000-000000000024"
  },
  {
   "case": "R3TX-cases-BG1-proj",
@@ -72,7 +72,7 @@
    "source": "config",
    "reasonType": "classifier"
   },
-  "session": "ed41e7c4-ef44-4ed0-ac32-50cb676146f3"
+  "session": "00000000-0000-4000-8000-000000000035"
  },
  {
   "case": "R3TX-cases-BG1-proj",
@@ -83,7 +83,7 @@
    "source": "config",
    "reasonType": "classifier"
   },
-  "session": "ed41e7c4-ef44-4ed0-ac32-50cb676146f3"
+  "session": "00000000-0000-4000-8000-000000000035"
  },
  {
   "case": "R3-allowrule-proj",
@@ -94,7 +94,7 @@
    "source": "config",
    "reasonType": "subcommandResults"
   },
-  "session": "94612160-52cb-48c1-b4ec-49716bcc8295"
+  "session": "00000000-0000-4000-8000-000000000046"
  },
  {
   "case": "R3-allowrule-proj",
@@ -105,6 +105,6 @@
    "source": "config",
    "reasonType": "subcommandResults"
   },
-  "session": "94612160-52cb-48c1-b4ec-49716bcc8295"
+  "session": "00000000-0000-4000-8000-000000000046"
  }
 ]
