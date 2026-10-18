@@ -741,6 +741,26 @@ def test_a_ruling_applied_during_verification_is_selected_again(queue, keys, mon
     assert fired and queue.decision(a.id).taken is False
 
 
+def test_a_halt_retry_on_an_undecided_row_with_no_gap_raises(queue):
+    """L3 r1 complement LOW: a halt is never skipped silently."""
+    request = ask(queue)
+    _raw(queue, ("UPDATE requests SET state = 'undecided' WHERE id = ?", (request.id,)))   # a raw move: no gap
+    with pytest.raises(QueueStoreError, match="no gap number"):
+        queue.mark_undecided(request.id, halt=True)
+    got = queue.mark_undecided(request.id)
+    assert (got.state, got.gap) == ("undecided", None)
+
+
+def test_an_unreadable_other_ruling_on_the_call_fails_the_take_closed(queue, keys):
+    """L3 r1 complement LOW: an earlier-applied ruling whose record a raw writer broke voids the take."""
+    a, _ = undecided(queue)
+    b, _ = undecided(queue)
+    _rule(queue, a, keys["phone"], "deny")
+    _rule(queue, b, keys["phone"])
+    _raw(queue, ("DROP TRIGGER requests_frozen", ()), ("UPDATE requests SET answer = 'x' WHERE id = ?", (a.id,)))
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+
+
 def test_only_the_take_delivers_a_ruled_allow(queue, keys):
     """L2 M2: decision() and mark_undecided() give a ruling as information (a Ruling, never a Decision), so the
     adapters' delivery check refuses it before and after the take."""

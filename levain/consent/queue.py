@@ -898,6 +898,9 @@ class ConsentQueue:
             if state == "undecided":
                 got = self._gap_of(conn, request_id)
                 if got is None:
+                    if halt:                         # never skip a halt silently
+                        raise QueueStoreError(f"request {request_id} is undecided but has no gap number: "
+                                              "its session cannot be halted on it")
                     return Marked("undecided", None, "the request is undecided but has no gap number")
                 if halt:
                     self._insert_halt(conn, request, got[0], stamp)
@@ -1091,10 +1094,10 @@ class ConsentQueue:
             return f"the ruling names gap {payload['gap']!r}, not this request's gap #{gap[0]}"
         signed_at = payload["signed_at"]
         try:
-            parse_stamp(signed_at)
+            early = parse_stamp(signed_at) < parse_stamp(gap[1])
         except ConsentError:
             return "the ruling's signed_at is not a timestamp"
-        if signed_at < gap[1]:
+        if early:
             return "the ruling was signed before the request went undecided"
         if payload["decision"] not in DECISIONS:
             return f"decision {payload['decision']!r} is not one of {DECISIONS}"
@@ -1321,11 +1324,13 @@ class ConsentQueue:
         signed = parse_stamp(got.signed_at)
         for other in rows[1:]:
             rec = self._stored_record(other)
+            if rec is None:
+                return None                          # another ruling on the call cannot be read: fail closed
             try:
-                if rec is not None and parse_stamp(rec.get("signed_at")) > signed:
+                if parse_stamp(rec.get("signed_at")) > signed:
                     return None                      # applied earlier yet signed later: fail closed
             except (ConsentError, TypeError):
-                continue
+                return None
         return got, latest["ruling_seq"]
 
     def claim_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
