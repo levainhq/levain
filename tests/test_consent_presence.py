@@ -74,8 +74,11 @@ def _row(qdir):
 def _wait_pending(qdir, limit=10.0):
     end = time.monotonic() + limit
     while time.monotonic() < end:
-        if (qdir / "queue.db").exists() and (_row(qdir) or (None,))[0] == "pending":
-            return
+        try:
+            if (qdir / "queue.db").exists() and (_row(qdir) or (None,))[0] == "pending":
+                return
+        except sqlite3.OperationalError:
+            pass                                # the file exists before the hook has created its tables
         time.sleep(0.05)
     raise AssertionError("the hook never held the request")
 
