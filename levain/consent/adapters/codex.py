@@ -83,7 +83,7 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
-    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from,
+    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from, with_away_mark,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
@@ -658,7 +658,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         parser.add_argument("--max-hold", type=float, default=DEFAULT_MAX_HOLD)
         args = parser.parse_args(argv)
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
-        settings = load_settings(queue_dir)
+        settings = with_away_mark(load_settings(queue_dir), queue_dir, AGENT)
         event = json.loads(stdin.read())
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
             out = gate(event, _queue_for(queue_dir, settings), settings)

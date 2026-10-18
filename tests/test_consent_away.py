@@ -1,6 +1,7 @@
 """`levain consent away`: away mode set through the CLI is what the adapters' own load_settings reads."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -69,9 +70,47 @@ def test_on_then_off_is_what_both_adapters_read(qdir, capsys):
         assert s.away_mode is True and s.away_hold_seconds == 120.0
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["other"] == 1  # other keys kept
     assert oct((qdir / cc.SETTINGS_NAME).stat().st_mode & 0o777) == "0o600"
-    assert "claude_code: away mode ON, holds up to 120s" in capsys.readouterr().out
-    assert main(["consent", "away", "off", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
+    assert "claude_code: away mode ON (signed to leave), holds up to 120s" in capsys.readouterr().out
+    assert main(["consent", "away", "off", "--agent", "codex", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 0
     assert cx.load_settings(qdir).away_mode is False and cc.load_settings(qdir).away_mode is True
+
+
+def _key(qdir: Path) -> Path:
+    """The laptop key the queue's cockpit enrolled (:func:`_cockpit`)."""
+    return Path(json.loads((qdir / cc.SETTINGS_NAME).read_text())["cockpit_data_root"]).parent / "laptop"
+
+
+def test_off_without_a_signature_leaves_an_away_on_standing(qdir, capsys):
+    """AWAY-SIGN run (i), reproduced on the code before it: `away off` after `away on`, unsigned, exited 0 and
+    turned away mode off. It is refused now, and away stays on for the hook; a signed off leaves it."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    assert "leaving it takes a signature" in capsys.readouterr().err
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "on"   # the word was not written
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 0
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is False
+
+
+def test_a_hand_rewritten_off_does_not_end_a_marked_away_for_the_hook(qdir, tmp_path):
+    """AWAY-SIGN run (ii), reproduced on the code before it: after `away on`, the settings file rewritten by hand
+    to away_word off let a gated PreToolUse pass unheld. The hook reads the away mark in the store and holds."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cc.SETTINGS_NAME
+    data = json.loads(path.read_text())
+    data.update(away_word="off", away_mode=False, away_hold_seconds=0, gate_hold_seconds=0.5)
+    path.write_text(json.dumps(data))
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "S-ii", "cwd": str(ws), "permission_mode": "default",
+             "tool_name": "Edit", "tool_use_id": "tu-ii",
+             "tool_input": {"file_path": str(ws / ".claude" / "settings.json"), "old_string": "a", "new_string": "b"}}
+    out = io.StringIO()
+    assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
+    assert "UNDECIDED" in out.getvalue()                       # held to D and marked undecided, never passed
+    assert cc.still_away_from(path, cc.load_settings(qdir))()[0] is True
 
 
 def test_on_without_hold_uses_the_default_and_show_writes_nothing(qdir, capsys):

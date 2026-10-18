@@ -27,9 +27,11 @@ from typing import Any
 from levain.autonomic.pending import seal_pending_id
 from levain.cockpit.consent import ConsentError, encode, parse_stamp, record_sha256, value_sha256
 
-__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE",
+__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "AWAY_LEAVE_FORMAT", "AWAY_NAMESPACE", "DECISIONS",
+           "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE",
            "RULING_FORMAT", "RULING_NAMESPACE", "ExternalGateRequest", "answer_message", "answer_payload",
-           "grant_answer_payload", "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
+           "away_leave_message", "away_leave_payload", "grant_answer_payload", "redact_display", "ruling_message",
+           "ruling_payload", "tool_input_digest"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
@@ -43,6 +45,11 @@ ANSWER_NAMESPACE = "levain-consent-answer"
 # ruling and a ruling never verifies as an answer
 RULING_FORMAT = "levain-consent-ruling/1"
 RULING_NAMESPACE = "levain-consent-ruling"
+# leaving an away mode the operator set with `levain consent away on` (its away mark): signed, since leaving it
+# lowers what the hook holds back to the operator's own presence; its own format and its own SSHSIG namespace, so a
+# leave verifies as nothing else and no answer or ruling verifies as a leave
+AWAY_LEAVE_FORMAT = "levain-consent-away-leave/1"
+AWAY_NAMESPACE = "levain-consent-away"
 # what the queue stores when a standing consent grant answered (Q4): never signed per request; the grant's own
 # link in the authority log is the signature, re-verified at every delivery
 GRANT_ANSWER_FORMAT = "levain-consent-grant-answer/1"
@@ -237,4 +244,19 @@ def ruling_payload(*, queue_id: str, request: ExternalGateRequest, gap: int, dec
 
 def ruling_message(payload: dict[str, Any]) -> bytes:
     """The exact bytes a ruling signs, in :data:`RULING_NAMESPACE`: the payload's JCS encoding."""
+    return encode(payload)
+
+
+def away_leave_payload(*, queue_id: str, mark_id: str, agent: str, signer_fp: str, signed_at: str) -> dict[str, str]:
+    """The record a leave of away mode signs: this queue, the away mark it ends (set by ``levain consent away on``
+    for ``agent``), the key, and when it was made (``signed_at``, a :func:`~levain.cockpit.consent.utc_stamp`)."""
+    if agent not in AGENTS:
+        raise ConsentError(f"agent must be one of {AGENTS}: {agent!r}")
+    parse_stamp(signed_at)
+    return {"format": AWAY_LEAVE_FORMAT, "queue_id": _need("queue_id", queue_id),
+            "mark_id": _need("mark_id", mark_id), "agent": agent, "decision": "leave", "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
+
+
+def away_leave_message(payload: dict[str, str]) -> bytes:
+    """The exact bytes a leave signs, in :data:`AWAY_NAMESPACE`: the payload's JCS encoding."""
     return encode(payload)

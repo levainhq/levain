@@ -1,7 +1,8 @@
 """levain.consent.auto_away — whether the operator is away, as the consent hooks and ``levain consent away`` read it.
 
 Away is decided in this order, strongest first: the operator's explicit word (``levain consent away on`` or
-``off``, kept in the agent's settings file until ``levain consent away auto`` clears it), then input idle (no
+``off``, kept in the agent's settings file until ``levain consent away auto`` clears it; an ``on`` is also an away
+mark in the consent queue store, which only a signed ``off`` or ``auto`` leaves), then input idle (no
 keyboard, mouse or trackpad input for ``away_idle_seconds``, default :data:`IDLE_THRESHOLD`), then off. Input idle
 is read only on macOS, from ``ioreg``'s ``HIDIdleTime`` (HID-level, so a mouse move counts as being there, and input
 typed into a pty by another process does not); every other platform has no idle source here, so only the explicit
@@ -52,6 +53,8 @@ def away_state(settings: Any, idle: Callable[[], float | None] | None = None) ->
     ``idle`` (input idle decided) or ``none`` (no idle source; off). ``idle`` (default :func:`input_idle_seconds`)
     is read only when no explicit word stands."""
     if settings.away_mode:
+        if getattr(settings, "away_marked", False):
+            return True, "word", "explicit word: on (leaving needs a signed `levain consent away off`)"
         return True, "word", "explicit word: on"
     if settings.explicit_off:
         if getattr(settings, "legacy", False):
