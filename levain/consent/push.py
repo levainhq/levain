@@ -90,7 +90,7 @@ from typing import Any
 from levain.launch import child_env
 
 __all__ = ["GIT_CANDIDATES", "MAX_OBJECT_ENTRIES", "MIRROR_CONFIG", "PUSH_CONFIG", "TRUSTED_PATH", "PushOutcomeUnknown",
-           "PushRecordIncomplete", "PushRefused", "PushResult", "branch_matches", "branch_problem",
+           "PushRecordIncomplete", "PushRefused", "PushResult", "append_line", "branch_matches", "branch_problem",
            "canonical_remote", "execute", "git_bin", "git_env", "push_argv", "push_protocol", "repo_key"]
 
 # The git levain runs, by absolute path; the first that passes :func:`git_bin`'s ownership test is used.
@@ -587,9 +587,14 @@ def _rewrites(mirror: Path, remote: str) -> list[str]:
 
 
 def _journal(levain_home: Path, key: str, record: dict[str, Any]) -> None:
-    """Append ``record`` as one line, whole (a short write is continued; a write that makes no progress
-    raises), fsync it, and on the journal's first creation fsync its directory too."""
-    path = levain_home / "push" / f"{key}.journal.jsonl"
+    """Append ``record`` to the repository's push journal (:func:`append_line`)."""
+    append_line(levain_home / "push" / f"{key}.journal.jsonl", record)
+
+
+def append_line(path: Path, record: dict[str, Any]) -> None:
+    """Append ``record`` to ``path`` as one JSON line, whole (a short write is continued; a write that makes no
+    progress raises), fsync it, and on the file's first creation fsync its directory too. The file is created
+    0600 and never through a link."""
     flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
     try:
         fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
@@ -602,7 +607,7 @@ def _journal(levain_home: Path, key: str, record: dict[str, Any]) -> None:
         while data:
             n = os.write(fd, data)
             if n <= 0:
-                raise OSError(f"journal write to {path} made no progress")
+                raise OSError(f"the write to {path} made no progress")
             data = data[n:]
         os.fsync(fd)
     finally:
@@ -664,13 +669,17 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     the effect leaves a record. With ``expect_sha``, the branch tip fetched under the lock must be that commit, or
     the push is refused (an answer that allowed one commit never pushes another).
 
-    Raises :class:`PushRefused` for anything refused before the push (an ``OSError`` writing the intent line
-    also aborts before it); git is resolved and the push argv built before the intent line, so no
-    :class:`PushRefused` is raised after it. A rejection by git (non-fast-forward, a protected branch) is a :class:`PushResult`
-    with ``ok`` False: reported, never forced. Once the push has started every path writes the ``done`` line and
-    calls ``receipt``, each attempted whatever the other did: a push that did not report (timeout, git could not
-    run, any other exception once the intent line is written) raises :class:`PushOutcomeUnknown` with status ``"unknown"``; a push that reported but whose done line
-    or receipt failed raises :class:`PushRecordIncomplete` carrying the result."""
+    Raises :class:`PushRefused` for anything levain refuses before the push; an ``OSError`` or
+    ``subprocess.SubprocessError`` (a git that timed out or could not run, the lock or the intent line that
+    could not be written) before the intent line propagates as itself, and nothing was pushed. git is resolved
+    and the push argv built before the intent line, so no :class:`PushRefused` is raised after it. A rejection
+    by git (non-fast-forward, a protected branch) is a :class:`PushResult` with ``ok`` False: reported, never
+    forced. Once the push has started every path writes the ``done`` line and calls ``receipt``, each attempted
+    whatever the other did: a push that did not report (timeout, git could not run, any other exception once
+    the intent line is written) raises :class:`PushOutcomeUnknown` with status ``"unknown"`` (a
+    ``KeyboardInterrupt`` or ``SystemExit`` there is recorded the same way, then re-raised as itself); a push
+    that reported but whose done line or receipt failed raises :class:`PushRecordIncomplete` carrying the
+    result."""
     try:
         canon = canonical_remote(remote)
     except ValueError as exc:
@@ -739,11 +748,13 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         # from here on the remote may change: every path reaches the receipt
         try:
             p = _git(argv, protocols=proto, git=gb)
-        except Exception as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
+        except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
             result = PushResult(ok=False, status="unknown", grant_id=gid, grant_seq=seq, remote=canon,
                                 branch=branch, old_sha=None, new_sha=new, exit=-1,
                                 detail=f"git push did not report: {type(exc).__name__}: {exc}"[:400])
             errs = _record(home, key, result, real, receipt)
+            if not isinstance(exc, Exception):
+                raise                        # KeyboardInterrupt / SystemExit: recorded as unknown, then re-raised
             raise PushOutcomeUnknown(f"the push of {branch} to {canon} may or may not have landed ({result.detail})"
                                      + (f"; record errors: {'; '.join(errs)}" if errs else ""),
                                      result, errs) from exc
