@@ -2303,7 +2303,7 @@ def _grant_fields_text(declared: dict[str, dict[str, str]]) -> str:
 
 
 def _cmd_consent_grant_create(args: argparse.Namespace) -> int:
-    from levain.authority import consent_mcp_tool_problem
+    from levain.authority import _CONSENT_MCP_TOOL, _consent_shell_name, consent_mcp_tool_problem
     from levain.cockpit.keys import ssh_signer
     from levain.consent.grants import create_grant
 
@@ -2321,7 +2321,9 @@ def _cmd_consent_grant_create(args: argparse.Namespace) -> int:
                                       mcp_fields=declared or None)
     except (ValueError, *_cockpit_refusals()) as exc:
         print(f"grant refused: {exc}", file=sys.stderr)
+        # the declare hint is a remedy only for a well-formed MCP name that is not a shell: no declaration grants those
         undeclared = [] if declared is None else [t for t in args.tools if t not in declared
+                                                  and _CONSENT_MCP_TOOL.fullmatch(t) and not _consent_shell_name(t)
                                                   and consent_mcp_tool_problem(t) is not None]
         if undeclared:
             print(f"  to grant {undeclared[0]}, declare every field it takes: --path-field {undeclared[0]}:FIELD "
