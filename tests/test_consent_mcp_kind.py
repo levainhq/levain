@@ -177,6 +177,17 @@ def test_create_refuses_an_undeclared_write_tool_and_a_bad_declaration(scratch, 
     assert "refused" not in scratch.state().policy.grants
 
 
+def test_a_refused_shell_or_malformed_mcp_name_is_not_told_to_declare_fields(scratch, capsys):
+    """A declaration can never make a shell, or a name that is not mcp__<server>__<tool>, grantable, so the refusal
+    names no --path-field/--mcp-field remedy for it (L3 r2 codex LOW: following that advice still fails)."""
+    for tool in ("mcp__shell__exec_command", "mcp__terminal__Write_Stdin", "mcp__x__bash", "mcp____x"):
+        assert scratch.create(tool=tool, gid="refused") == 1, tool
+        err = capsys.readouterr().err
+        assert "grant refused:" in err, tool
+        assert "declare every field" not in err, (tool, err)
+    assert "refused" not in scratch.state().policy.grants
+
+
 def test_list_prints_the_declarations(declared, capsys):
     assert main(["consent", "grant", "list", "--data-root", str(declared.root)]) == 0
     out = capsys.readouterr().out
