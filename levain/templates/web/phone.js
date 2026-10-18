@@ -72,7 +72,7 @@
     const card = el("article", "req");
     const head = el("div", "req-head");
     head.append(el("span", "tool", r.tool || "(tool)"), el("span", "tier" + (r.tier === "T3" ? " t3" : ""), r.tier || ""),
-                el("span", "meta", (r.agent || "") + (ruling ? " \u00b7 undecided, gap #" + r.gap : "")));
+                el("span", "meta", (r.agent || "") + (ruling ? " \u00b7 undecided, gap " + (r.gap_label || "#" + r.gap) : "")));
     card.append(head, el("pre", "display", typeof r.display === "string" ? r.display : ""));
     if (r.cwd) card.appendChild(el("div", "where", "in " + r.cwd));
     if (r.targets) card.appendChild(el("div", "where", "touches " + r.targets));
@@ -84,8 +84,10 @@
     if (!signers.length) { if (!notes.has(r.id)) say(r.signer_note || "no passkey is enrolled for this name"); card.appendChild(note); return card; }
     const actions = el("div", "actions");
     // a passkey is a display-phone key: it denies any request and allows up to T2 (the server refuses the rest)
-    const decisions = r.tier === "T3" ? ["deny"] : ["allow", "deny"];
-    if (r.tier === "T3" && !notes.has(r.id)) say(ruling ? "a late allow of a T3 request is the laptop's (levain consent rule there)"
+    // a ruling over a display cut at its limit: only a deny is signed for it (the server refuses an allow)
+    const decisions = r.tier === "T3" || (ruling && r.cut) ? ["deny"] : ["allow", "deny"];
+    if (ruling && r.cut && !notes.has(r.id)) say("too long to show whole here: only a deny can be signed for it");
+    else if (r.tier === "T3" && !notes.has(r.id)) say(ruling ? "a late allow of a T3 request is the laptop's (levain consent rule there)"
                                                         : "allowing a T3 request is the laptop's (levain consent answer there)");
     for (const decision of decisions) {
       const b = el("button", decision, (ruling ? "rule " : "") + decision + " with passkey");
@@ -135,8 +137,10 @@
           if (!a.ok) return say("not answered: " + why(a), "bad");
           const done = (ruling ? "ruled " : "") + (a.body.decision === "allow" ? "allowed" : "denied");
           last = done + " " + (r.tool || "");
-          const where = a.body.delivery && a.body.delivery.reason ? " · " + a.body.delivery.reason : "";
-          say(done + " · signed by " + a.body.signer_fp + where, "ok");
+          const d = a.body.delivery || {};
+          const where = d.reason ? " · delivery " + (d.route || "") + ": " + d.reason : "";
+          // the ruling stands either way; a delivery that failed or had nothing to deliver is shown as a failure
+          say(done + " · signed by " + a.body.signer_fp + where, d.route === "failed" || d.route === "none" ? "bad" : "ok");
         },
               (e) => {
                 // asked for one credential and the OS had none it would use: forget it here, so the next tap is not

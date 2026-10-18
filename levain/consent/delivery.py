@@ -1,9 +1,14 @@
 """levain.consent.delivery — a late ruling delivered back to the session it rules on (DESIGN §3.6, seat ruling R-i).
 
 A ruling (:meth:`~levain.consent.queue.ConsentQueue.answer_late`) changes the queue; this module gets its text to the
-agent. The text reaches a session ONCE, through :meth:`~levain.consent.queue.ConsentQueue.claim_rulings_for`, whichever
-path claims it first: the session's own next hook or a resume started here. Where it
-goes is read from the session's state at the moment of delivery, never assumed:
+agent. The text reaches a session ONCE: through the session's own next hook
+(:meth:`~levain.consent.queue.ConsentQueue.claim_rulings_for`), or through a resume started here, which leases the text
+(:meth:`~levain.consent.queue.ConsentQueue.lease_rulings_for`) and counts it delivered only once the resume is
+confirmed: still running, or exited 0, :data:`RESUME_SETTLE` seconds after it started. A resume that could not start
+or exited non-zero within that time is recorded ``failed`` and the text stays deliverable (by the session's next hook,
+or ``levain consent deliver``); one this process never settled (it died in between) stays ``unconfirmed``, never
+counted delivered and never retried, since it may have run. Where the text goes is read from the session's state at
+the moment of delivery, never assumed:
 
   - Claude Code, from ``claude agents --json`` run under the session's own config directory (a listed ``sessionId``
     is live, with ``status`` busy or idle and ``kind`` background or interactive; a running ``claude -p`` is listed
@@ -13,24 +18,30 @@ goes is read from the session's state at the moment of delivery, never assumed:
       * listed, idle, background: ``claude stop`` then ``claude --bg --resume`` under the same id, ONLY once the run
         owed for it shows the stop keeps the id and the conversation and forks nothing (:data:`STOP_THEN_RESUME_RUN`);
         until then, its next hook;
-      * not listed, and the process recorded at filing gone: ended. It is resumed with the text as its prompt, in the
-        directory it was started in and its permission mode (recorded at filing,
-        :meth:`~levain.consent.queue.ConsentQueue.resume_meta`): ``claude -p --resume`` when it was a ``-p`` run, else
-        ``claude --bg --resume``.
+      * not listed, and the process recorded at filing gone (no process of that pid, or one that started at another
+        time): ended. It is resumed with the text as its prompt, in the directory it was started in and its
+        permission mode (recorded at filing, :meth:`~levain.consent.queue.ConsentQueue.resume_meta`):
+        ``claude -p --resume=<id>`` when it was a ``-p`` run, else ``claude --bg --resume=<id>``.
   - Codex has no listing: a session whose ``codex exec`` process (its pid recorded at filing) is gone is ended and
     resumed with ``codex exec resume``; one whose process still runs, or with no pid recorded, gets its next hook.
 
 A session is never resumed while it may be running (a resume of a running session starts a copy: two agents on one
-tree): a listing that fails, a recorded process still alive (any program: a reused pid only delays the delivery), or no
-resume record all leave the text to the next hook. The text is claimed BEFORE the resume starts, so the resumed
-session's own hooks find nothing to deliver a second time.
+tree): a listing that fails, no process recorded, a recorded process still alive, or no resume record all leave the
+text to the next hook. Nor is it resumed on inputs that cannot be trusted to bring back the session that was filed
+(:func:`resume_refusal`): a session id that is not a UUID, a start directory that is not an existing absolute one,
+no transcript for that config directory, directory and id, no levain gate in the settings the resume would load, a
+permission mode that is not a known one, or an original command line that carried a flag the resume cannot restore
+(its settings, MCP config, tool lists, added directories, system prompt): resumed without it, the session would run
+with fewer constraints than it was started with.
 
 Known edges (stated, not built against):
   - a session resumed by someone else between the listing and the launch (about a second) gets a copy.
   - a ruling left to a busy session's next hook waits if that session then ends with no further tool call;
     :func:`deliver_undelivered` (``levain consent deliver``) later finds it ended and resumes it.
-  - a resumed Claude Code session works in the directory it was started in; a ruled allow is taken only by a call made
-    in the working directory the request was filed in.
+  - a resume that starts, runs past :data:`RESUME_SETTLE` and then fails (a credential refused late) counts as
+    delivered; one that did its work and still exited non-zero inside it is retried, and its text arrives twice.
+  - the transcript is looked up at the directory name Claude Code derives from the start directory (every character
+    outside ``A-Za-z0-9`` as ``-``); a start directory long enough that Claude Code shortens that name is not resumed.
   - a ruling on a subagent's call is claimed under the subagent's session: a resume delivers it to the parent session;
     the parent's own hooks do not.
   - Codex's permission mode is not restored (its hook's ``permission_mode`` is not its sandbox): a resume runs under
@@ -40,18 +51,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from levain.consent.queue import ConsentQueue, Ruling
+from levain.consent.queue import ConsentQueue, Ruling, gap_label
 
-__all__ = ["STOP_THEN_RESUME_RUN", "Delivery", "base_session", "claude_listing", "deliver", "deliver_undelivered",
-           "plan", "process_running"]
+__all__ = ["QUOTED_NOTE", "RESUME_SETTLE", "STOP_THEN_RESUME_RUN", "Delivery", "agent_notify", "base_session",
+           "claude_listing", "deliver", "deliver_undelivered", "gate_refusal", "option_names", "plan",
+           "process_identity", "process_running", "resume_refusal", "session_ok", "unrestored_flags"]
 
 #: The stop-then-resume path for an IDLE background Claude Code session (R-i). Off until the run owed in B7 shows
 #: ``claude stop`` keeps the session id and its conversation and ``claude --bg --resume`` then continues it with no
@@ -61,24 +75,41 @@ STOP_THEN_RESUME_RUN = False
 LISTING_TIMEOUT = 30.0
 # how long a stopped session may stay listed before the stop is judged not to have cleared it
 STOP_SETTLE = 20.0
+#: how long a started resume is watched before it counts as delivered: one that exits non-zero inside it (an unknown
+#: session, a refused credential, a bad argument) failed and its text stays deliverable
+RESUME_SETTLE = 10.0
 _CLAUDE = "claude_code"
 _CODEX = "codex"
-# the permission modes a resumed Claude Code session is started in (anything else recorded is left to its default)
+# the permission modes a resumed Claude Code session is started in
 _MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions", "auto", "dontAsk"})
+# the flags of an original Claude Code command line that a resume does not carry over: resumed without them, the
+# session would run with fewer constraints than it was started with (each also as ``--flag=value``)
+_UNRESTORED = ("--settings", "--mcp-config", "--strict-mcp-config", "--add-dir", "--allowedTools", "--allowed-tools",
+               "--disallowedTools", "--disallowed-tools", "--tools", "--append-system-prompt",
+               "--append-system-prompt-file", "--system-prompt", "--system-prompt-file", "--agents", "--plugin-dir")
+# the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
+_BYPASS_FLAG = "--dangerously-skip-permissions"
+# a session id: Claude Code's and Codex's are UUIDs; a subagent's key adds ``#agent:<id>``
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # the agent's own credentials, which a resumed session needs as its original had them; the allowlisted child
 # environment drops every credential-shaped name, so these are carried by name
 _AGENT_AUTH = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
                "OPENAI_API_KEY", "CODEX_API_KEY")
 _CONFIG_VAR = {_CLAUDE: "CLAUDE_CONFIG_DIR", _CODEX: "CODEX_HOME"}
+# what follows the §3.6 lines in a resume's prompt: the action in them is quoted from the agent's own filing
+QUOTED_NOTE = ("(Each «…» above is the action quoted as the agent filed it in its request, not the operator's "
+               "words.)")
 
 
 @dataclass(frozen=True)
 class Delivery:
     """What became of one ruling's delivery. ``route``: ``hook`` (left to the session's next hook, ``reason`` says
-    why), ``resumed`` (a resume started, ``argv`` in ``cwd``), ``failed`` (the text was claimed but the resume did
-    not start: ``reason``), ``delivered`` (already claimed, by a hook or an earlier delivery), ``none`` (nothing to
-    deliver: not a ruling that verifies). ``rulings`` names every request whose text a resume carried (a session's
-    undelivered rulings travel together)."""
+    why), ``resumed`` (a resume started and was confirmed, ``argv`` in ``cwd``), ``failed`` (the resume did not
+    start or exited at once: ``reason``; the text stays deliverable), ``unconfirmed`` (a resume was started for it
+    and never settled: it may have run, so it is not retried), ``delivered`` (already delivered, by a hook or an
+    earlier resume), ``none`` (nothing to deliver: not a ruling that verifies). ``rulings`` names every request whose
+    text a resume carried (a session's undelivered rulings travel together)."""
     request_id: str
     agent: str
     session: str
@@ -94,6 +125,14 @@ class Delivery:
 def base_session(session: str) -> str:
     """The resumable session of a hook's session key (a subagent's key is ``<session>#agent:<id>``)."""
     return session.partition("#agent:")[0]
+
+
+def session_ok(session: Any) -> bool:
+    """True when ``session`` is a session key a resume may name: a UUID, optionally ``#agent:<id>``."""
+    if not isinstance(session, str):
+        return False
+    base, sep, agent_id = session.partition("#agent:")
+    return _UUID.fullmatch(base) is not None and (not sep or _AGENT_ID.fullmatch(agent_id) is not None)
 
 
 def _env(agent: str, meta: Mapping[str, Any]) -> dict[str, str]:
@@ -140,9 +179,26 @@ def claude_listing(meta: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
     return out
 
 
-def process_running(pid: Any) -> bool | None:
-    """True when a process ``pid`` exists (whatever program it is now), False when none does, ``None`` when that
-    cannot be told."""
+def process_identity(pid: Any) -> tuple[str, str] | None:
+    """The OS's start time and command line of process ``pid`` (``ps -o lstart= -o args=``), or ``None`` when none
+    can be read. The start time tells a pid's process from a later one that reused the pid."""
+    if type(pid) is not int or pid < 1:
+        return None
+    try:
+        got = subprocess.run(["ps", "-ww", "-o", "lstart=", "-o", "args=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5, stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin",
+                                                                                  "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = got.stdout.strip() if got.returncode == 0 else ""
+    m = re.fullmatch(r"(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)", line, re.S)
+    return None if m is None else (" ".join(m.group(1).split()), m.group(2))
+
+
+def process_running(pid: Any, started: Any = None) -> bool | None:
+    """True when process ``pid`` exists (whatever program it is now), False when none does, or when ``started`` (its
+    start time recorded at filing, :func:`process_identity`) is given and the process there now started at another
+    time; ``None`` when that cannot be told."""
     if type(pid) is not int or pid < 1:
         return None
     try:
@@ -150,20 +206,119 @@ def process_running(pid: Any) -> bool | None:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        pass
     except OSError:
         return None
+    if isinstance(started, str) and started:
+        now = process_identity(pid)
+        if now is not None and now[0] != " ".join(started.split()):
+            return False                                 # the pid was reused: the recorded process is gone
     return True
+
+
+def _transcript(meta: Mapping[str, Any], session: str) -> Path:
+    """Where Claude Code keeps the session's transcript: ``<config>/projects/<start dir, every character outside
+    A-Za-z0-9 as ->/<id>.jsonl``."""
+    config = meta.get("config_dir") if isinstance(meta.get("config_dir"), str) else None
+    base = Path(config) if config else Path.home() / ".claude"
+    return base / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(meta["cwd"])) / f"{session}.jsonl"
+
+
+def _settings(path: Path) -> dict[str, Any]:
+    try:
+        got = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
+    """Why a Claude Code session resumed in ``cwd`` under ``config_dir`` would not run levain's gate, or ``None``:
+    the gate entry (``<python> -EP -m levain.hookrun <...>/consent_claude_code.py``, an existing script) must be in
+    the project's or the user's settings, and no settings file the resume loads may set ``disableAllHooks``."""
+    import shlex
+
+    from levain.consent.adapters.claude_code import GATE_EVENT, HOOK_FLAGS, HOOKRUN
+    from levain.install import CONSENT_HOOK_SCRIPTS
+
+    user = Path(config_dir) if config_dir else Path.home() / ".claude"
+    project = Path(cwd) / ".claude"
+    files = {f: _settings(f) for f in (project / "settings.json", project / "settings.local.json",
+                                        user / "settings.json")}
+    off = [str(f) for f, doc in files.items() if doc.get("disableAllHooks") is True]
+    if off:
+        return f"{off[0]} turns every hook off"
+    for f in (project / "settings.json", user / "settings.json"):
+        hooks = files[f].get("hooks")
+        groups = hooks.get(GATE_EVENT) if isinstance(hooks, dict) else None
+        for group in groups if isinstance(groups, list) else ():
+            for h in (group.get("hooks") if isinstance(group, dict) else None) or ():
+                try:
+                    tokens = shlex.split(h["command"]) if isinstance(h, dict) and isinstance(h.get("command"),
+                                                                                            str) else []
+                except ValueError:
+                    continue
+                if (len(tokens) == 5 and tokens[1:4] == [HOOK_FLAGS, *HOOKRUN]
+                        and os.path.basename(tokens[4]) == CONSENT_HOOK_SCRIPTS["claude-code"]
+                        and os.path.isfile(tokens[4])):
+                    return None
+    return "no levain gate is installed in the settings it would load"
+
+
+def option_names(argv_text: str) -> str:
+    """The option names of a command line as ``ps`` shows it (each token starting with ``-``, cut at ``=``), never
+    their values or the prompt: what :func:`unrestored_flags` reads, and all that is recorded of the command line
+    (a value on it can be a secret). The executable stands first, so a record is never empty."""
+    tokens = argv_text.split()
+    return " ".join([*tokens[:1], *(t.partition("=")[0] for t in tokens[1:] if t.startswith("-"))])
+
+
+def unrestored_flags(flags: str, mode: str | None) -> list[str]:
+    """The flags of an original command line (:func:`option_names`) that a resume would not carry over."""
+    out = []
+    for token in flags.split():
+        name = token.partition("=")[0]
+        if name in _UNRESTORED or (name.startswith("--dangerously-")
+                                   and not (name == _BYPASS_FLAG and mode == "bypassPermissions")):
+            out.append(name)
+    return list(dict.fromkeys(out))
+
+
+def resume_refusal(agent: str, session: str, meta: Mapping[str, Any]) -> str | None:
+    """Why the ended session ``session`` (its resumable id) is not resumed on what was recorded at filing, or
+    ``None`` (see the module docstring)."""
+    if not session_ok(session):
+        return "its session id is not a UUID"
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        return f"its start directory {cwd!r} is not an existing absolute directory"
+    if agent != _CLAUDE:
+        return None
+    if not _transcript(meta, session).is_file():
+        return "no transcript of it is where Claude Code keeps it for that config directory and start directory"
+    mode = meta.get("permission_mode")
+    if mode not in _MODES:
+        return f"its permission mode {mode!r} is not one a resume can set"
+    flags = meta.get("claude_flags")
+    if not isinstance(flags, str) or not flags:
+        return "its original command line was not recorded, so what a resume would drop cannot be told"
+    dropped = unrestored_flags(flags, mode)
+    if dropped:
+        return f"it was started with {', '.join(dropped)}, which a resume does not carry over"
+    config = meta.get("config_dir") if isinstance(meta.get("config_dir"), str) else None
+    return gate_refusal(cwd, config)
 
 
 def _resume_argv(agent: str, session: str, meta: Mapping[str, Any], env: Mapping[str, str]) -> list[str] | None:
     """The resume command for an ended session, without its prompt (appended last), or ``None`` when the agent's
-    command is not found."""
+    command is not found or the session id is not one (checked again here: it is an argument)."""
+    if not session_ok(session) or "#" in session:
+        return None
     if agent == _CLAUDE:
         exe = _exe("claude", env)
         if exe is None:
             return None
-        argv = [exe, "-p" if meta.get("invocation") == "-p" else "--bg", "--resume", session]
+        argv = [exe, "-p" if meta.get("invocation") == "-p" else "--bg", f"--resume={session}"]
         mode = meta.get("permission_mode")
         if mode in _MODES:
             argv += ["--permission-mode", mode]
@@ -179,9 +334,9 @@ def _verified_ruling(queue: ConsentQueue, request_id: str) -> Ruling | None:
 
 def plan(queue: ConsentQueue, request_id: str, *,
          listing: Callable[[Mapping[str, Any]], dict[str, dict[str, Any]] | None] = claude_listing,
-         running: Callable[[Any], bool | None] = process_running) -> Delivery:
+         running: Callable[..., bool | None] = process_running) -> Delivery:
     """Where the ruling on ``request_id`` would go now, with no side effect (see the module docstring). A ``resumed``
-    plan carries the resume command without its prompt; :func:`deliver` claims the texts and starts it."""
+    plan carries the resume command without its prompt; :func:`deliver` leases the texts and starts it."""
     got = queue.get(request_id)
     if got is None:
         return Delivery(request_id, "", "", "none", "no sealed request of that id")
@@ -191,9 +346,12 @@ def plan(queue: ConsentQueue, request_id: str, *,
     if ruling is None:
         return Delivery(request_id, agent, session, "none", f"the request is {got[1]}, with no ruling that verifies")
     out = Delivery(request_id, agent, session, "hook", "", gap=ruling.gap, ruling=ruling.ruling)
-    when = queue.ruling_delivered(request_id)
-    if when is not None:
+    state, when = queue.delivery_state(request_id)
+    if state == "delivered":
         return replace(out, route="delivered", reason=f"its text reached the session at {when}")
+    if state == "unconfirmed":
+        return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
+                                                        "it may have run, so it is not started again")
     meta = queue.resume_meta(request_id) or {}
     target = base_session(session)
     if agent == _CLAUDE:
@@ -214,19 +372,24 @@ def plan(queue: ConsentQueue, request_id: str, *,
             if status == "idle":
                 return replace(out, reason="the session is open in a terminal; the ruling lands at its next step")
             return replace(out, reason=f"the session is live ({status!r}); the ruling rides its next step")
-        pid_key = "claude_pid"
+        pid_key, started = "claude_pid", meta.get("claude_started")
     elif agent == _CODEX:
-        pid_key = "codex_pid"
+        pid_key, started = "codex_pid", None
     else:
         return replace(out, route="none", reason=f"no delivery for agent {agent!r}")
     if not isinstance(meta.get("cwd"), str) or not meta.get("invocation"):
         return replace(out, reason="no resume record was kept for this session; the ruling lands at its next step")
     pid = meta.get(pid_key)
-    if agent == _CODEX and pid is None:
-        return replace(out, reason="no codex process was recorded, so it cannot be told ended; the ruling lands at "
+    if pid is None:
+        return replace(out, reason="no process was recorded for it, so it cannot be told ended; the ruling lands at "
                                    "its next step")
-    if pid is not None and running(pid) is not False:
-        return replace(out, reason=f"its process {pid} is still running; the ruling lands at its next step")
+    if running(pid, started) is not False:
+        return replace(out, reason=f"its process {pid} (started {started or 'at a time not recorded'}) may still "
+                                   "run; the ruling lands at its next step")
+    why = resume_refusal(agent, target, meta)
+    if why is not None:
+        return replace(out, reason=f"the session has ended but is not resumed: {why}; resume it by hand and the "
+                                   "ruling lands at its next step")
     argv = _resume_argv(agent, target, meta, _env(agent, meta))
     if argv is None:
         return replace(out, reason=f"no {'claude' if agent == _CLAUDE else 'codex'} command to resume it with")
@@ -235,15 +398,23 @@ def plan(queue: ConsentQueue, request_id: str, *,
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:
-    """Start ``argv`` detached in ``cwd``, its output to ``log``; ``None`` when it started, else why not."""
+    """Start ``argv`` detached in ``cwd``, its output to ``log``, and watch it :data:`RESUME_SETTLE` seconds: ``None``
+    when it is still running then or exited 0 (confirmed), else why it failed. A child still running is reaped by a
+    daemon thread, so a long-lived caller keeps no zombie."""
+    settle = RESUME_SETTLE
     try:
         log.parent.mkdir(mode=0o700, exist_ok=True)
         with open(log, "ab") as fh:
-            subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=fh,
-                             stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+            proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=fh,
+                                    stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     except OSError as exc:
         return f"{type(exc).__name__}: {exc}"
-    return None
+    try:
+        code = proc.wait(timeout=settle)
+    except subprocess.TimeoutExpired:
+        threading.Thread(target=proc.wait, name="levain-resume-reaper", daemon=True).start()
+        return None
+    return None if code == 0 else f"it exited {code} within {settle:g} s (its output: {log})"
 
 
 def _stop(session: str, meta: Mapping[str, Any],
@@ -271,12 +442,14 @@ def _stop(session: str, meta: Mapping[str, Any],
 
 def deliver(queue: ConsentQueue, request_id: str, *,
             listing: Callable[[Mapping[str, Any]], dict[str, dict[str, Any]] | None] = claude_listing,
-            running: Callable[[Any], bool | None] = process_running,
+            running: Callable[..., bool | None] = process_running,
             launch: Callable[[list[str], str, Mapping[str, str], Path], str | None] = _launch,
             notify: Callable[[str], Any] | None = None) -> Delivery:
-    """Deliver the ruling on ``request_id`` (:func:`plan`): for an ended session, claim the session's undelivered
-    ruling texts, start the resume with them as its prompt and record it (:meth:`ConsentQueue.record_resume`); for
-    any other, leave it to the session's next hook and, with ``notify``, ping where it waits."""
+    """Deliver the ruling on ``request_id`` (:func:`plan`): for an ended session, lease the session's undelivered
+    ruling texts (:meth:`ConsentQueue.lease_rulings_for`), start the resume with them as its prompt and settle the
+    lease by its outcome (:meth:`ConsentQueue.settle_resume`); for any other, leave it to the session's next hook.
+    With ``notify``, the operator is pinged when the ruling waits, failed or is unconfirmed (a ping never fails the
+    delivery)."""
     from levain.consent.adapters.claude_code import ruling_line
 
     got = plan(queue, request_id, listing=listing, running=running)
@@ -289,34 +462,70 @@ def deliver(queue: ConsentQueue, request_id: str, *,
                                                     "lands at its next step")
         else:
             got = plan(queue, request_id, listing=listing, running=running)
-    if got.route != "resumed":
-        if got.route == "hook" and notify is not None:
-            notify(f"levain: ruling on gap #{got.gap} ({(got.ruling or '').upper()}) waits: {got.reason}.")
-        return got
-    if not os.path.isdir(got.cwd or ""):
-        return replace(got, route="hook", argv=(), reason=f"the session's start directory {got.cwd} is gone; the "
+    if got.route == "resumed" and not os.path.isdir(got.cwd or ""):
+        got = replace(got, route="hook", argv=(), reason=f"the session's start directory {got.cwd} is gone; the "
                                                          "ruling lands at its next step")
-    claimed = queue.claim_rulings_for(got.agent, got.session)
-    if not claimed:
-        return replace(got, route="delivered", argv=(), reason="its text was claimed by another path first")
-    lines = [line for line in (ruling_line(queue, r) for r in claimed) if line]
-    argv = [*got.argv, "\n".join(lines)]
-    ids = tuple(r.request_id for r in claimed)
-    env = _env(got.agent, meta)
-    why = launch(argv, got.cwd or "", env, Path(queue.directory) / "resumes" / f"{ids[0]}.log")
-    queue.record_resume(list(ids), agent_session_id=got.session, argv=argv, cwd=got.cwd or "",
-                        outcome="started" if why is None else "failed", detail=why)
-    if why is not None:
-        return replace(got, route="failed", argv=tuple(argv), rulings=ids,
-                       reason=f"the ruling was claimed but the resume did not start ({why})")
-    return replace(got, argv=tuple(argv), rulings=ids)
+    if got.route == "resumed":
+        leased = queue.lease_rulings_for(got.agent, got.session)
+        if not leased:
+            state, when = queue.delivery_state(request_id)
+            if state == "delivered":
+                got = replace(got, route="delivered", argv=(), reason=f"its text reached the session at {when}")
+            elif state == "unconfirmed":
+                got = replace(got, route="unconfirmed", argv=(), reason="another resume holds it, not yet confirmed")
+            else:
+                got = replace(got, route="hook", argv=(), reason="its ruling could not be verified now, so nothing "
+                                                                 "was started; the ruling lands at its next step")
+        else:
+            lines = [line for line in (ruling_line(queue, r, quote=True) for r in leased) if line]
+            argv = [*got.argv, "\n".join([*lines, QUOTED_NOTE])]
+            ids = tuple(r.request_id for r in leased)
+            why = launch(argv, got.cwd or "", _env(got.agent, meta), Path(queue.directory) / "resumes" / f"{ids[0]}.log")
+            queue.settle_resume(list(ids), agent_session_id=got.session, argv=argv, cwd=got.cwd or "",
+                                outcome="started" if why is None else "failed", detail=why)
+            if why is None:
+                return replace(got, argv=tuple(argv), rulings=ids)
+            got = replace(got, route="failed", argv=tuple(argv), rulings=ids,
+                          reason=f"the resume did not start ({why}); the ruling stays deliverable: the session's next "
+                                 "step, or `levain consent deliver`")
+    if notify is not None and got.route in ("hook", "failed", "unconfirmed"):
+        word = {"hook": "waits", "failed": "was not delivered", "unconfirmed": "is unconfirmed"}[got.route]
+        try:
+            notify(f"levain: ruling on gap {gap_label(got.gap or 0, got.session)} ({(got.ruling or '').upper()}) "
+                   f"{word}: {got.reason}.")
+        except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the delivery
+            pass
+    return got
 
 
 def deliver_undelivered(queue: ConsentQueue, **kw: Any) -> list[Delivery]:
-    """:func:`deliver` every ruling whose text has not reached its session (``levain consent deliver``, for a ruling
-    left to a next hook that never came)."""
+    """:func:`deliver` every ruling whose text is not known to have reached its session (``levain consent
+    deliver``, for a ruling left to a next hook that never came, or a resume that failed); one ruling's unexpected
+    error is reported as its ``failed`` delivery and never stops the rest."""
     out = []
     for gapped in queue.undelivered_rulings():
-        if queue.ruling_delivered(gapped.request.id) is None:   # a resume above may have carried it
-            out.append(deliver(queue, gapped.request.id, **kw))
+        rid = gapped.request.id
+        if queue.ruling_delivered(rid) is not None:   # a resume above may have carried it
+            continue
+        try:
+            out.append(deliver(queue, rid, **kw))
+        except Exception as exc:  # noqa: BLE001 - the next ruling is still delivered
+            out.append(Delivery(rid, gapped.request.agent, gapped.request.agent_session_id, "failed",
+                                f"delivery raised {type(exc).__name__}: {exc}", gap=gapped.gap))
     return out
+
+
+def agent_notify(queue_dir: Path, agent: str) -> Callable[[str], Any] | None:
+    """The ping for a ruling's delivery under the request's own agent's settings (its notify command and phone URL),
+    or ``None`` when that agent has none configured."""
+    from levain.consent.adapters import claude_code, codex
+
+    adapter = {_CLAUDE: claude_code, _CODEX: codex}.get(agent)
+    try:
+        settings = adapter.load_settings(queue_dir) if adapter is not None else None
+    except Exception:  # noqa: BLE001 - a ping is optional
+        return None
+    if settings is None or not getattr(settings, "notify_argv", None):
+        return None
+    send = getattr(adapter, "notify", claude_code.notify)   # Codex shares Claude Code's notify seam
+    return lambda text: send(settings, text, cwd=queue_dir)

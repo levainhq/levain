@@ -61,7 +61,7 @@ from levain.consent.policy import guarded_policy as guarded_policy
 from levain.consent.policy import mcp_config_candidates
 from levain.consent.policy import targets as _targets
 from levain.consent.auto_away import IDLE_THRESHOLD, WORDS, away_state, hold_seconds
-from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
+from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir, gap_label
 from levain.consent.record import ExternalGateRequest
 
 AGENT = "claude_code"
@@ -564,7 +564,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
-                         event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None)
+                         event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+                         resume=resume_meta_of(event))
     settled = False
     try:
         got: Decision | None = None
@@ -750,7 +751,8 @@ def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
             continue
         gap = queue.gap(reping.request_id)
         what = _what(got[0].tool_name, None, got[0].display)
-        head = f"levain: asking again, gap #{gap}" if gap is not None else "levain: asking again"
+        head = (f"levain: asking again, gap {gap_label(gap, got[0].agent_session_id)}" if gap is not None
+                else "levain: asking again")
         sent += notify(settings, f"{head}: {what} (request {reping.request_id}).", cwd=queue.directory)
     return sent
 
@@ -793,23 +795,32 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
     return "\n".join(lines) or None
 
 
-def ruling_line(queue: ConsentQueue, ruling: Any) -> str | None:
+def ruling_line(queue: ConsentQueue, ruling: Any, *, quote: bool = False) -> str | None:
     """DESIGN §3.6's text for one claimed ruling (the hook's additionalContext, a resume's prompt), or ``None`` for an
-    unknown ruling value (which skips that ruling only, never the rest)."""
+    unknown ruling value (which skips that ruling only, never the rest). With ``quote`` (a resume's prompt, where the
+    text arrives as the user's turn) the action is set in «…», which the prompt then names as the agent's own filing."""
     text = RULING_TEXT.get(ruling.ruling)
     if text is None:
         return None
     got = queue.get(ruling.request_id)
     what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
-    return text.format(n=ruling.gap, x=what)
+    return text.format(n=ruling.gap, x=f"«{what}»" if quote else what)
 
 
-def resume_record(event: Mapping[str, Any]) -> dict[str, Any]:
-    """What a later resume of this hook's session needs (:meth:`ConsentQueue.file`'s ``resume``), from the hook's
-    payload and the environment Claude Code gives its hooks: ``-p`` when the entrypoint is an SDK one (``sdk-cli``
-    under ``claude -p``, measured 2.1.302), else ``interactive`` (a ``--bg`` session is not told apart here; an ended
-    one of either kind resumes as ``--bg``); the session's start directory
-    (``CLAUDE_PROJECT_DIR``, where its transcript is found), its config directory and its process."""
+def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What a later resume of this hook's session needs (:meth:`ConsentQueue.file`'s ``resume``), or ``None`` when its
+    session id is not a UUID (it would be an argument of the resume, :func:`levain.consent.delivery.session_ok`).
+    From the hook's payload, the environment Claude Code gives its hooks and the OS: ``-p`` when the entrypoint is an
+    SDK one (``sdk-cli`` under ``claude -p``, measured 2.1.302), else ``interactive`` (a ``--bg`` session is not told
+    apart here; an ended one of either kind resumes as ``--bg``); the session's start directory
+    (``CLAUDE_PROJECT_DIR``, where its transcript is found), its config directory, its process (``CLAUDE_PID``) and
+    that process's start time and the option names of its command line as ``ps`` reports them
+    (:func:`levain.consent.delivery.process_identity`: the start time tells it from a later process that reused the
+    pid; the option names say what a resume would drop; values and the prompt are never recorded)."""
+    from levain.consent.delivery import option_names, process_identity, session_ok
+
+    if not session_ok(event.get("session_id")):
+        return None
     entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
     project = os.environ.get("CLAUDE_PROJECT_DIR", "")
     cwd = project if os.path.isabs(project) else event.get("cwd")
@@ -819,11 +830,15 @@ def resume_record(event: Mapping[str, Any]) -> dict[str, Any]:
         pid: int | None = int(os.environ.get("CLAUDE_PID", ""))
     except ValueError:
         pid = None
+    pid = pid if pid is not None and pid > 0 else None
+    seen = process_identity(pid) if pid is not None else None
     return {"invocation": "-p" if entry.startswith("sdk") else "interactive",
             "permission_mode": mode if isinstance(mode, str) and mode else None,
             "cwd": cwd if isinstance(cwd, str) and cwd else None,
             "config_dir": config if os.path.isabs(config) else None,
-            "claude_pid": pid if pid is not None and pid > 0 else None}
+            "claude_pid": pid,
+            "claude_started": seen[0] if seen and seen[0] else None,
+            "claude_flags": option_names(seen[1]) if seen and seen[1] else None}
 
 
 def _session_of(event: Mapping[str, Any]) -> str | None:
@@ -908,7 +923,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
-                             resume=resume_record(event))
+                             resume=resume_meta_of(event))
     except Exception as exc:
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))

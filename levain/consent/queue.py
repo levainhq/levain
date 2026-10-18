@@ -21,8 +21,9 @@ one of these ends it or moves it on:
     (:meth:`ConsentQueue.answer_late`), a record binding this queue, the request, its digest, its gap number,
     the decision and when it was signed, in :data:`~levain.consent.record.RULING_NAMESPACE` (never an answer's
     namespace, so neither verifies as the other), checked against the authority log exactly as an answer is,
-    and signed no later than the queue's clock (read under the lock) plus :data:`RULING_SKEW`. Only the LATEST ruling on an identical call (agent, session, tool,
-    input digest and working directory) counts: a ruled allow pre-authorises that one call once
+    and signed no later than the queue's clock (read under the lock) plus :data:`RULING_SKEW`. Only the LATEST ruling on an identical call (agent, session, tool and
+    input digest; the working directory is shown, never keyed, since a resumed session starts in its project
+    directory while the call may have been made from below it) counts: a ruled allow pre-authorises that one call once
     (:meth:`ConsentQueue.take_ruled_allow`, the ONLY delivery of a ruled allow), for :data:`RULED_ALLOW_LAPSE`
     from when the queue applied it; a later ruling on the identical call voids every earlier one not yet taken, so
     a later deny takes the allow back and two allows give one run. :meth:`ConsentQueue.decision`,
@@ -114,7 +115,8 @@ from levain.consent.record import (
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue", "Decision",
-           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "authority_source", "default_queue_dir"]
+           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "authority_source", "default_queue_dir",
+           "gap_label", "session_handle"]
 
 DB_NAME = "queue.db"
 STORE_FORMAT = "levain-consent-queue/4"
@@ -143,7 +145,8 @@ RULING_SKEW = timedelta(minutes=2)
 SNOOZE_MAX_MINUTES = 7 * 24 * 60
 # how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
 INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
-_RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid"})
+_RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid",
+                          "claude_started", "claude_flags"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _ROW_COLUMNS = _FIELDS + ("state", "decided_at", "answer", "signature", "signer_fp", "note", "via")
@@ -224,7 +227,8 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'a gap number is given once'); END",
     "CREATE TRIGGER IF NOT EXISTS gaps_kept BEFORE DELETE ON gaps "
     "BEGIN SELECT RAISE(ABORT, 'gap numbers are never deleted'); END",
-    # the take's lookup: the ruled requests of one identical call (agent, session, tool, input digest, cwd)
+    # the take's lookup: the ruled requests of one identical call (agent, session, tool, input digest; the trailing
+    # cwd column is from when cwd was keyed)
     "CREATE INDEX IF NOT EXISTS requests_ruled ON requests (agent, agent_session_id, tool_name, tool_input_digest, "
     "cwd) WHERE via = 'ruling'",
     # a ruling's text delivered to its session (both allow and deny): once
@@ -277,15 +281,20 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS halt_releases_kept BEFORE DELETE ON halt_releases "
     "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
-    # a resume levain started to deliver a ruling to its ended session, once per ruling, written after the ruling's
-    # delivery was claimed (unsigned: what was run and whether it started, never authority)
-    "CREATE TABLE IF NOT EXISTS ruling_resumes (request_id TEXT PRIMARY KEY REFERENCES ruling_deliveries(request_id), "
-    "agent_session_id TEXT NOT NULL, argv TEXT NOT NULL, cwd TEXT NOT NULL, "
-    "outcome TEXT NOT NULL CHECK (outcome IN ('started','failed')), detail TEXT, created_at TEXT NOT NULL)",
-    "CREATE TRIGGER IF NOT EXISTS ruling_resumes_frozen BEFORE UPDATE ON ruling_resumes "
-    "BEGIN SELECT RAISE(ABORT, 'a ruling resume is written once'); END",
-    "CREATE TRIGGER IF NOT EXISTS ruling_resumes_kept BEFORE DELETE ON ruling_resumes "
-    "BEGIN SELECT RAISE(ABORT, 'ruling resumes are never deleted'); END",
+    # what became of a ruling's text after its delivery was claimed for a RESUME (unsigned: never authority), one
+    # row per step, the latest one counting: ``launching`` (claimed for a resume about to start; left alone it is
+    # UNCONFIRMED: it may have run), ``started`` (the resume was confirmed: delivered), ``failed`` (it did not start
+    # or exited at once: deliverable again), ``hook`` (a failed one delivered by the session's next hook). A claim
+    # with no row here was delivered by a hook.
+    "CREATE TABLE IF NOT EXISTS ruling_resume_steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL "
+    "REFERENCES ruling_deliveries(request_id), agent_session_id TEXT NOT NULL, "
+    "outcome TEXT NOT NULL CHECK (outcome IN ('launching','started','failed','hook')), argv TEXT, cwd TEXT, "
+    "detail TEXT, created_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS ruling_resume_steps_request ON ruling_resume_steps (request_id, seq)",
+    "CREATE TRIGGER IF NOT EXISTS ruling_resume_steps_frozen BEFORE UPDATE ON ruling_resume_steps "
+    "BEGIN SELECT RAISE(ABORT, 'ruling resume steps are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS ruling_resume_steps_kept BEFORE DELETE ON ruling_resume_steps "
+    "BEGIN SELECT RAISE(ABORT, 'ruling resume steps are never deleted'); END",
 )
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
@@ -397,6 +406,19 @@ class Gapped:
     gap: int
     state: str
     undecided_at: str
+
+
+def session_handle(agent_session_id: str) -> str:
+    """A short handle for an agent session in what the operator reads and types: the first 6 characters of its id,
+    and for a subagent's key (``<session>#agent:<id>``) ``+`` the first 6 of the subagent's id."""
+    base, sep, sub = agent_session_id.partition("#agent:")
+    return base[:6] + (f"+{sub[:6]}" if sep else "")
+
+
+def gap_label(gap: int, agent_session_id: str) -> str:
+    """A gap as the operator names it (``levain consent rule 3@a1b2c3``): ``#<gap>@<session handle>``. Gap numbers
+    start at 1 in every session, so a bare number names one gap only while no other session has it."""
+    return f"#{gap}@{session_handle(agent_session_id)}"
 
 
 def class_covers(key_class: str, tier: str) -> bool:
@@ -569,7 +591,7 @@ class ConsentQueue:
             raise ConsentError(f"resume must be a mapping of {sorted(_RESUME_KEYS)} naming the invocation")
         if resume["invocation"] not in INVOCATIONS:
             raise ConsentError(f"resume invocation must be one of {INVOCATIONS}: {resume['invocation']!r}")
-        for k in ("permission_mode", "cwd", "config_dir"):
+        for k in ("permission_mode", "cwd", "config_dir", "claude_started", "claude_flags"):
             if k in resume and resume[k] is not None and not (isinstance(resume[k], str) and resume[k]):
                 raise ConsentError(f"resume {k} must be a non-empty string or None")
         for k in ("codex_pid", "claude_pid"):
@@ -588,7 +610,8 @@ class ConsentQueue:
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
         session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
-        ``codex_pid`` / ``claude_pid`` the agent's process, ``cwd`` the directory the session was started in,
+        ``codex_pid`` / ``claude_pid`` the agent's process, ``claude_started`` / ``claude_flags`` that process's
+        start time and the option names on its command line (never their values) as the OS reported them, ``cwd`` the directory the session was started in,
         ``config_dir`` the agent's config directory, ``None`` for its default), written with the request in its transaction and
         read back by :meth:`resume_meta`; unsigned, never authority."""
         meta = self._resume_record(resume)
@@ -722,6 +745,16 @@ class ConsentQueue:
             where, args = where + " AND g.agent = ?", args + (agent,)
         if agent_session_id is not None:
             where, args = where + " AND g.agent_session_id = ?", args + (agent_session_id,)
+        return self._gapped(where, args)
+
+    def gapped(self, agent: str | None = None, *, since: datetime | None = None) -> list[Gapped]:
+        """Every request that was given a gap number (undecided or ruled; sealed rows only), oldest gap first; of one
+        agent when named, and with ``since`` only those still undecided or that went undecided at or after it."""
+        where, args = "1 = 1", ()
+        if agent is not None:
+            where, args = where + " AND g.agent = ?", args + (agent,)
+        if since is not None:
+            where, args = where + " AND (r.state = 'undecided' OR g.created_at >= ?)", args + (utc_stamp(since),)
         return self._gapped(where, args)
 
     def request_by_gap(self, agent: str, agent_session_id: str, gap: int) -> Gapped | None:
@@ -1292,8 +1325,9 @@ class ConsentQueue:
     def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *, cwd: str,
                          event: str | None = None) -> Decision | None:
         """The ONE delivery of a ruled allow: the :class:`Decision` that pre-authorises this call, taken once.
-        The identical call is this agent, session, ``tool_name``, exact input (its digest) and ``cwd`` (the sealed
-        working directory). Of its ruled requests only the LATEST ruling counts (the highest application sequence,
+        The identical call is this agent, session, ``tool_name`` and exact input (its digest). ``cwd`` is not part
+        of it: a resumed session starts in its project directory, and a call filed from below it would otherwise
+        never take its ruling (the request's working directory is shown with the ruling, not matched). Of its ruled requests only the LATEST ruling counts (the highest application sequence,
         the seq of its ruling receipt; never a clock, which ties within a stamp and can step backwards): it
         must be an allow, not yet taken, re-verified against a fresh replay, applied less than
         :data:`RULED_ALLOW_LAPSE` ago and less than that after it was signed, and no other ruling on the call may
@@ -1303,10 +1337,11 @@ class ConsentQueue:
         state and seq are unchanged and nothing newer was applied, and records the take (selection runs once more
         when it moved, else ``None``); a second take returns ``None``. A cheap read-only check runs first: a call with no
         untaken ruled allow costs no replay and no write lock."""
+        del cwd                                      # shown with the ruling, never keyed (see above)
         digest = tool_input_digest(tool_input)
-        key = (agent, agent_session_id, tool_name, digest, cwd)
+        key = (agent, agent_session_id, tool_name, digest)
         where = ("FROM requests r WHERE agent = ? AND agent_session_id = ? AND tool_name = ? "
-                 "AND tool_input_digest = ? AND cwd = ? AND via = 'ruling'")
+                 "AND tool_input_digest = ? AND via = 'ruling'")
         with self._read() as conn:
             if conn.execute("SELECT 1 " + where + " AND state = 'allowed' AND NOT EXISTS "
                             "(SELECT 1 FROM ruled_takes t WHERE t.request_id = r.id) LIMIT 1", key).fetchone() is None:
@@ -1347,8 +1382,8 @@ class ConsentQueue:
         own hook that follows it: Claude Code still shows its dialog after a hook's allow on a path it protects
         (measured 2.1.302: a gate-allowed Edit of ``.claude/settings.json`` in acceptEdits went on to
         ``PermissionRequest``, ``decision_reason_type: safetyCheck``), and that event carries no ``tool_use_id``, so
-        it cannot name the gate's request by event id. The call is matched as :meth:`take_ruled_allow` matches it
-        (agent, session, ``tool_name``, exact input digest, ``cwd``); the request must be the NEWEST gate filing
+        it cannot name the gate's request by event id. The call is matched on agent, session, ``tool_name``, exact
+        input digest and ``cwd``; the request must be the NEWEST gate filing
         (``hook:`` event id) on that call, allowed by a signed answer or a grant, decided less than ``within`` ago,
         never taken, and re-verify now (:meth:`decision`, with ``tool_input`` and ``posture``); the age is checked again
         inside the write transaction that records the take. The take is recorded
@@ -1425,16 +1460,36 @@ class ConsentQueue:
                 return None
         return got, latest["ruling_seq"]
 
+    # the latest resume step of a ruled request ``r`` (NULL when it is unclaimed or a hook claimed it)
+    _LAST_STEP = "(SELECT e.outcome FROM ruling_resume_steps e WHERE e.request_id = r.id ORDER BY e.seq DESC LIMIT 1)"
+    # a ruling whose text has not reached its session: never claimed, or claimed for a resume that failed
+    _DELIVERABLE = ("(NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) OR "
+                    + _LAST_STEP + " = 'failed')")
+
     def claim_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
-        """This session's rulings (allow and deny) whose text has not been delivered to it yet, oldest applied
-        first (by application sequence, the seq of the ruling's receipt), each re-verified against a fresh replay
-        outside the write lock, then re-checked unchanged and marked delivered under one short write lock: a
-        ruling's text reaches its session once. A ruling that no longer verifies is neither returned nor marked. What the
-        agent is told is the caller's; a returned allow still runs only through :meth:`take_ruled_allow`."""
+        """This session's rulings (allow and deny) whose text has not reached it yet (never claimed, or claimed for
+        a resume that failed: :meth:`settle_resume`), oldest applied first (by application sequence, the seq of the
+        ruling's receipt), each re-verified against a fresh replay outside the write lock, then re-checked unchanged
+        and marked delivered under one short write lock: a ruling's text reaches its session once. A ruling that no
+        longer verifies is neither returned nor marked, and one a resume holds (:meth:`lease_rulings_for`) is not
+        returned. What the agent is told is the caller's; a returned allow still runs only through
+        :meth:`take_ruled_allow`."""
+        return self._claim(agent, agent_session_id, step=None)
+
+    def lease_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
+        """As :meth:`claim_rulings_for`, for a RESUME that carries the texts as its prompt: each is claimed with a
+        ``launching`` step, so the resumed session's own hooks find nothing to deliver again, and is delivered only
+        when :meth:`settle_resume` confirms the resume (``started``); a ``failed`` one is deliverable again, by the
+        session's next hook or another resume. A ``launching`` step nobody settles (the deliverer died between the
+        claim and the settle) stays UNCONFIRMED (:meth:`delivery_state`): never counted delivered, never retried,
+        since the resume may have run."""
+        return self._claim(agent, agent_session_id, step="launching")
+
+    def _claim(self, agent: str, agent_session_id: str, *, step: str | None) -> list[Ruling]:
+        key = (agent, agent_session_id)
         with self._read() as conn:
             if conn.execute("SELECT 1 FROM requests r WHERE agent = ? AND agent_session_id = ? AND via = 'ruling' "
-                            "AND NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) LIMIT 1",
-                            (agent, agent_session_id)).fetchone() is None:
+                            "AND " + self._DELIVERABLE + " LIMIT 1", key).fetchone() is None:
                 return []
         authority = self._fresh_authority()
         if authority is None:
@@ -1443,8 +1498,7 @@ class ConsentQueue:
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
             cur = conn.execute(f"SELECT {self._RULED_COLS}, {self._RULING_SEQ} FROM requests r WHERE agent = ? "
                                "AND agent_session_id = ? AND via = 'ruling' AND state IN ('allowed','denied') "
-                               "AND NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) "
-                               "ORDER BY ruling_seq IS NULL, ruling_seq", (agent, agent_session_id))
+                               "AND " + self._DELIVERABLE + " ORDER BY ruling_seq IS NULL, ruling_seq", key)
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, raw)) for raw in cur.fetchall()]
             gaps = {row["id"]: self._gap_of(conn, row["id"]) for row in rows}
@@ -1467,50 +1521,85 @@ class ConsentQueue:
                                    (got.request_id,)).fetchone()
                 if now is None or now[0] != row["state"] or now[1] != row["ruling_seq"]:
                     continue
-                if conn.execute("INSERT OR IGNORE INTO ruling_deliveries (request_id, agent, agent_session_id, "
-                                "delivered_at) VALUES (?, ?, ?, ?)",
-                                (got.request_id, agent, agent_session_id, stamp)).rowcount != 1:
-                    continue                         # another claimer delivered it first
+                if conn.execute("SELECT 1 FROM ruling_deliveries WHERE request_id = ?",
+                                (got.request_id,)).fetchone() is None:
+                    if conn.execute("INSERT OR IGNORE INTO ruling_deliveries (request_id, agent, agent_session_id, "
+                                    "delivered_at) VALUES (?, ?, ?, ?)",
+                                    (got.request_id, agent, agent_session_id, stamp)).rowcount != 1:
+                        continue                     # another claimer delivered it first
+                    if step is not None:
+                        self._insert_step(conn, got.request_id, agent_session_id, step, stamp)
+                else:
+                    last = self._last_step(conn, got.request_id)
+                    if last is None or last[0] != "failed":
+                        continue                     # delivered meanwhile, or a resume holds it
+                    self._insert_step(conn, got.request_id, agent_session_id, step or "hook", stamp)
                 taken = conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?",
                                      (got.request_id,)).fetchone() is not None
                 out.append(got if got.taken == taken else replace(got, taken=taken))
         return out
 
-    def ruling_delivered(self, request_id: str) -> str | None:
-        """When the request's ruling text was claimed for its session (:meth:`claim_rulings_for`), or ``None``."""
-        with self._read() as conn:
-            row = conn.execute("SELECT delivered_at FROM ruling_deliveries WHERE request_id = ?",
-                               (request_id,)).fetchone()
-        return None if row is None else row[0]
+    @staticmethod
+    def _last_step(conn: sqlite3.Connection, request_id: str) -> tuple[str, str] | None:
+        return conn.execute("SELECT outcome, created_at FROM ruling_resume_steps WHERE request_id = ? "
+                            "ORDER BY seq DESC LIMIT 1", (request_id,)).fetchone()
 
-    def undelivered_rulings(self) -> list[Gapped]:
-        """The ruled requests whose text has not been claimed for their session yet, oldest gap first (sealed rows
-        only; not re-verified here: delivery re-verifies when it claims)."""
-        return self._gapped("r.via = 'ruling' AND r.state IN ('allowed','denied') AND NOT EXISTS "
-                            "(SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id)", ())
+    @staticmethod
+    def _insert_step(conn: sqlite3.Connection, request_id: str, agent_session_id: str, outcome: str, stamp: str,
+                     argv: list[str] | None = None, cwd: str | None = None, detail: str | None = None) -> None:
+        conn.execute("INSERT INTO ruling_resume_steps (request_id, agent_session_id, outcome, argv, cwd, detail, "
+                     "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (request_id, agent_session_id, outcome,
+                      None if argv is None else json.dumps(argv, ensure_ascii=False), cwd, detail, stamp))
 
-    def record_resume(self, request_ids: list[str], *, agent_session_id: str, argv: list[str], cwd: str,
-                      outcome: str, detail: str | None = None) -> None:
-        """Record the resume levain started (or failed to start) to deliver these rulings, whose delivery was
-        already claimed: one row per ruling, written once. Unsigned."""
+    def settle_resume(self, request_ids: list[str], *, agent_session_id: str, outcome: str, argv: list[str],
+                      cwd: str, detail: str | None = None) -> None:
+        """Record what became of the resume that leased these rulings (:meth:`lease_rulings_for`): ``started``
+        (confirmed: the texts are delivered) or ``failed`` (deliverable again), with what was run. Only a ruling
+        whose latest step is still ``launching`` is settled. Unsigned."""
         if outcome not in ("started", "failed"):
             raise ConsentError(f"outcome must be started or failed: {outcome!r}")
         with self._write() as conn:
             stamp = utc_stamp(_now_utc(self._clock))
-            conn.executemany("INSERT OR IGNORE INTO ruling_resumes (request_id, agent_session_id, argv, cwd, outcome, "
-                             "detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                             [(rid, agent_session_id, json.dumps(argv, ensure_ascii=False), cwd, outcome, detail, stamp)
-                              for rid in request_ids])
+            for rid in request_ids:
+                last = self._last_step(conn, rid)
+                if last is not None and last[0] == "launching":
+                    self._insert_step(conn, rid, agent_session_id, outcome, stamp, argv, cwd, detail)
 
-    def resume_record(self, request_id: str) -> dict[str, Any] | None:
-        """The resume recorded for this request's ruling (:meth:`record_resume`), or ``None``."""
+    def delivery_state(self, request_id: str) -> tuple[str, str | None]:
+        """Where the request's ruling text is, with when it got there: ``undelivered`` (never claimed),
+        ``delivered`` (claimed by a hook, or by a resume that was confirmed), ``failed`` (its resume failed:
+        deliverable again) or ``unconfirmed`` (claimed for a resume that was never settled: it may have run)."""
         with self._read() as conn:
-            row = conn.execute("SELECT agent_session_id, argv, cwd, outcome, detail, created_at FROM ruling_resumes "
-                               "WHERE request_id = ?", (request_id,)).fetchone()
-        if row is None:
-            return None
-        return {"agent_session_id": row[0], "argv": json.loads(row[1]), "cwd": row[2], "outcome": row[3],
-                "detail": row[4], "created_at": row[5]}
+            claimed = conn.execute("SELECT delivered_at FROM ruling_deliveries WHERE request_id = ?",
+                                   (request_id,)).fetchone()
+            last = None if claimed is None else self._last_step(conn, request_id)
+        if claimed is None:
+            return "undelivered", None
+        if last is None:
+            return "delivered", claimed[0]
+        return {"launching": "unconfirmed", "started": "delivered", "hook": "delivered"}.get(last[0], "failed"), last[1]
+
+    def ruling_delivered(self, request_id: str) -> str | None:
+        """When the request's ruling text reached its session (:meth:`delivery_state` ``delivered``), or ``None``."""
+        state, when = self.delivery_state(request_id)
+        return when if state == "delivered" else None
+
+    def undelivered_rulings(self) -> list[Gapped]:
+        """The ruled requests whose text is not known to have reached their session (undelivered, failed or
+        unconfirmed: :meth:`delivery_state`), oldest gap first (sealed rows only; not re-verified here: delivery
+        re-verifies when it claims)."""
+        return self._gapped("r.via = 'ruling' AND r.state IN ('allowed','denied') AND (" + self._DELIVERABLE +
+                            " OR " + self._LAST_STEP + " = 'launching')", ())
+
+    def resume_steps(self, request_id: str) -> list[dict[str, Any]]:
+        """Every resume step recorded for this request's ruling (:meth:`lease_rulings_for`,
+        :meth:`settle_resume`), oldest first."""
+        with self._read() as conn:
+            rows = conn.execute("SELECT outcome, argv, cwd, detail, created_at, agent_session_id FROM "
+                                "ruling_resume_steps WHERE request_id = ? ORDER BY seq", (request_id,)).fetchall()
+        return [{"outcome": r[0], "argv": None if r[1] is None else json.loads(r[1]), "cwd": r[2], "detail": r[3],
+                 "created_at": r[4], "agent_session_id": r[5]} for r in rows]
 
     # --- standing grants (Q4) --------------------------------------------------------------------------
     def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,

@@ -11,7 +11,7 @@ it serves exactly five things:
     ``levain consent answer``;
   - ``POST /consent/<request_id>/rule-challenge`` and ``.../rule``: the same for a late RULING on an undecided
     request (``levain consent rule``), signed in the ruling namespace, never an answer's; once it verifies, the
-    ruling is delivered to its session (:mod:`levain.consent.delivery`);
+    ruling is delivered to its session (:mod:`levain.consent.delivery`), on its own thread;
   - ``POST /passkey/key-line``: a new passkey's OpenSSH public key and the laptop commands that enrol it (a passkey
     never enrols itself: enrolment is signed by a laptop-presence key).
 
@@ -59,6 +59,11 @@ _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _KEY_LINE = "/passkey/key-line"
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
+# how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
+# listing and a resume's settle each take seconds to tens of seconds); past this the page says it is still running
+_DELIVERY_WAIT = 45.0
+# the key a ruling's result carries its delivery's waiter under (taken off before the result is sent)
+_AWAIT = "_await_delivery"
 
 
 class PhoneError(Exception):
@@ -155,7 +160,7 @@ class _PhoneHandler(GuardedHandler):
             return
         # an answer carries a signature the person just made with Face ID: it waits a moment for a slot rather than
         # throw that ceremony away; everything else answers busy at once
-        waits = consent is not None and consent[1] == "answer"
+        waits = consent is not None and consent[1] in ("answer", "rule")
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -164,13 +169,19 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.answer_step(consent[0], consent[1], req)
             else:
                 result = self.server.key_line(req)
-            self._json(result)
         except PhoneError as exc:
             self._json({"error": exc.error, "message": exc.message, **exc.extra}, exc.status)
+            return
         except Exception as exc:  # noqa: BLE001 - every failure is an answer the page can show
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500)
+            return
         finally:
             self.server.request_gate.release()
+        # a ruling's delivery runs on its own thread: wait for it here, the request slot already released
+        waiter = result.pop(_AWAIT, None) if isinstance(result, dict) else None
+        if waiter is not None:
+            result["delivery"] = waiter(_DELIVERY_WAIT)
+        self._json(result)
 
 
 class _PhoneServer(ThreadingHTTPServer):
@@ -229,8 +240,10 @@ class _PhoneServer(ThreadingHTTPServer):
         return keys, ""
 
     def listing(self) -> dict[str, Any]:
-        """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``."""
-        from levain.consent.listing import entry_body, read_listing
+        """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``; and
+        each undecided one with its gap, its ``gap_label`` and whether its display was ``cut``."""
+        from levain.consent.listing import UNSHOWN, entry_body, filed_input, read_listing
+        from levain.consent.queue import gap_label
 
         listing = read_listing(self.queue_dir, now=datetime.now(timezone.utc))
         memo: dict[Path, list[str] | str] = {}
@@ -247,6 +260,9 @@ class _PhoneServer(ThreadingHTTPServer):
             body.pop("answer_allow", None)
             body.pop("answer_deny", None)
             body["gap"] = entry.gap
+            body["gap_label"] = gap_label(entry.gap, entry.request.agent_session_id)
+            # a display cut at its limit: only a deny is signed for it (the page offers no allow)
+            body["cut"] = filed_input(entry.request) is UNSHOWN
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             undecided.append(body)
         return {"rp_id": self.rp_id, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
@@ -342,7 +358,10 @@ class _PhoneServer(ThreadingHTTPServer):
             if state != "undecided":
                 raise PhoneError(409, "conflict", f"request {request_id} is {state}, not undecided: a ruling answers "
                                                   "only an undecided request")
-            refuse_cut_display(request, "from a phone")
+            decision = req["decision"] if action == "rule-challenge" else (
+                req["payload"].get("decision") if isinstance(req["payload"], dict) else None)
+            if decision != "deny":
+                refuse_cut_display(request, "from a phone")   # a deny is signed even over a cut display
             source = self._source(answer_root(self.queue_dir, request))
             keys = {k.fingerprint: k for k in passkey_keys(source(), self.rp_id)}
             queue = ConsentQueue(self.queue_dir, authority=source)
@@ -373,17 +392,37 @@ class _PhoneServer(ThreadingHTTPServer):
             raise PhoneError(422, "answer_refused", str(exc)) from None
         except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
             raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
-        out = {"request_id": ruled.request_id, "decision": ruled.ruling, "signer_fp": ruled.signer_fp,
-               "decided_at": ruled.decided_at, "gap": ruled.gap}
-        try:
-            from levain.consent.delivery import deliver
+        return {"request_id": ruled.request_id, "decision": ruled.ruling, "signer_fp": ruled.signer_fp,
+                "decided_at": ruled.decided_at, "gap": ruled.gap,
+                "delivery": {"route": "pending", "reason": "delivery is running"},
+                _AWAIT: self._deliver_later(queue, ruled.request_id, request.agent)}
 
-            d = deliver(queue, ruled.request_id)
-            out["delivery"] = {"route": d.route, "reason": d.reason}
-        except Exception as exc:  # noqa: BLE001 - the ruling stands; its session's next hook delivers it
-            out["delivery"] = {"route": "hook", "reason": f"delivery failed ({type(exc).__name__}); the ruling "
-                                                          "lands at the session's next step"}
-        return out
+    def _deliver_later(self, queue: Any, request_id: str, agent: str) -> Any:
+        """Start the ruling's delivery on its own thread; returns ``wait(timeout)`` -> its route and reason, or that it
+        is still running. A delivery that raises is reported ``failed``; the ruling stands either way."""
+        from levain.consent.delivery import agent_notify, deliver
+
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                d = deliver(queue, request_id, notify=agent_notify(self.queue_dir, agent))
+                box["d"] = {"route": d.route, "reason": d.reason}
+            except Exception as exc:  # noqa: BLE001 - the ruling stands; `levain consent deliver` retries it
+                box["d"] = {"route": "failed", "reason": f"delivery raised {type(exc).__name__}; the ruling stands: "
+                                                         "`levain consent deliver` delivers it"}
+            finally:
+                done.set()
+
+        threading.Thread(target=run, name="levain-ruling-delivery", daemon=True).start()
+
+        def wait(timeout: float) -> dict[str, Any]:
+            if done.wait(timeout):
+                return box["d"]
+            return {"route": "pending", "reason": "delivery is still running; the ping says where it lands"}
+
+        return wait
 
     def key_line(self, req: Any) -> dict[str, Any]:
         """``POST /passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url) -> its OpenSSH

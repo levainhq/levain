@@ -384,9 +384,9 @@ def test_a_ruled_allow_is_taken_once(queue, keys):
     assert queue.take_ruled_allow(*args, {"command": "touch /tmp/other"}, cwd=CWD) is None     # another digest
     assert queue.take_ruled_allow("claude_code", "sess-2", "Edit", x, cwd=CWD) is None
     assert queue.take_ruled_allow("claude_code", "sess-1", "Write", x, cwd=CWD) is None
-    assert queue.take_ruled_allow(*args, x, cwd="/elsewhere") is None                         # another cwd
     assert queue.decision(request.id).taken is False
-    got = queue.take_ruled_allow(*args, x, cwd=CWD, event="hook:tu-1")
+    # the working directory is shown, never keyed: a resumed session starts in its project directory
+    got = queue.take_ruled_allow(*args, x, cwd="/elsewhere", event="hook:tu-1")
     assert isinstance(got, Decision)
     assert (got.request_id, got.decision, got.via, got.gap) == (request.id, "allow", "ruling", gap)
     assert queue.take_ruled_allow(*args, x, cwd=CWD) is None          # consumed
@@ -645,7 +645,7 @@ def test_a_later_deny_voids_an_earlier_untaken_allow(queue, keys, clock):
     assert queue.decision(a.id).ruling == "allow" and queue.decision(a.id).taken is False   # the row is unchanged
 
 
-def test_a_deny_on_another_cwd_is_another_call(queue, keys, clock):
+def test_a_deny_from_another_cwd_is_the_same_call(queue, keys, clock):
     a, _ = undecided(queue)
     other = queue.file(agent="claude_code", agent_session_id="sess-1", tool_name="Edit", tool_input=X,
                        cwd="/other/proj", hold=timedelta(minutes=5))
@@ -653,8 +653,9 @@ def test_a_deny_on_another_cwd_is_another_call(queue, keys, clock):
     _rule(queue, a, keys["phone"])
     clock.now = NOW + timedelta(minutes=5)
     _rule(queue, other, keys["phone"], "deny")
-    assert queue.take_ruled_allow(*TAKE, cwd="/other/proj") is None      # the deny is the latest there
-    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == a.id      # the allow is the latest here
+    # the working directory is shown, never keyed: the later deny voids the allow from either directory
+    assert queue.take_ruled_allow(*TAKE, cwd="/other/proj") is None
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
 
 
 def test_a_later_allow_after_a_run_is_a_new_run(queue, keys, clock):
