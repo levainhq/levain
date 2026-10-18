@@ -27,6 +27,8 @@ Known edges (one line each): the input digest is unsalted, so a SHORT input is r
 policy that changes mid-turn is read from the turn's FIRST ``turn_context``; ``counts`` counts the pre and the post
 row of one call separately; ``INSERT OR REPLACE`` by the (agent, session, tool_use_id, phase) tuple, not the id, is
 not refused by a trigger; a ledger.db made by fedba7b1 (before the ``outcome`` column) is refused, delete it.
+A transcript longer than the scan cap ends ``unknown`` with reason ``result_not_written`` for the calls past the cap; an id
+merely quoted inside a skipped oversized line marks its row ``result_oversized`` (still ``unknown``, never allow).
 """
 from __future__ import annotations
 
@@ -516,6 +518,8 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
                 out["still_pending"] += 1
                 continue
         _, stamp, detail, outcome = res
+        if c.outcome == "refused":                  # filed refused: reconcile may fill the stamp (unknown), never the outcome
+            stamp, outcome = "unknown", "refused"
         if ledger.fill_stamp(c.id, stamp, detail, outcome):
             out["filled"] += 1
             out["unknown"] += stamp == "unknown"

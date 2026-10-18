@@ -1579,9 +1579,6 @@ def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
     recon_p.add_argument("--give-up-after", dest="give_up_after", default="1h",
                          help="Stamp a row `unknown` when its source still has no answer this long after the call "
                               "(an age such as 90m, 1h, 2d; `never` keeps it pending). Default 1h.")
-    recon_p.add_argument("--codex-last-turn", dest="codex_last_turn", action="store_true",
-                         help="For a Codex row with no turn id, use the rollout's LAST turn policy (it may not be the "
-                              "call's own; a test option). Default: such a row stays pending, then `unknown`.")
     common(recon_p)
     for p in (counts_p, digest_p, window_p, recon_p):
         p.set_defaults(func=_cmd_consent_ledger)
@@ -1604,7 +1601,7 @@ def _cmd_consent_ledger(args: argparse.Namespace) -> int:
                 raise ValueError(f"--give-up-after {args.give_up_after!r} is not an age such as 90m, 1h, 2d, or `never`")
             now = datetime.now(timezone.utc)
             gua = None if args.give_up_after == "never" else now - parse_when(args.give_up_after, now=now)
-            result = reconcile(ledger, give_up_after=gua, codex_last_turn=args.codex_last_turn)
+            result = reconcile(ledger, give_up_after=gua)
             print(json.dumps(result, sort_keys=True) if args.as_json else
                   f"filled {result['filled']} ({result['unknown']} unknown), still pending {result['still_pending']}"
                   + (f", already stamped elsewhere {result['already_stamped']}" if result["already_stamped"] else ""))
