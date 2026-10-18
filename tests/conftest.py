@@ -21,30 +21,43 @@ LIVE_SEATBELT_REASON = (
 )
 
 
-def _spawns_seatbelt_driver(args) -> bool:
-    """True iff a spawn's argv names the Seatbelt driver (the hands path puts it after sudo/env, so any element)."""
+# Read once, when this module loads: a test's own setenv/monkeypatch cannot open the guard for the run.
+LIVE_SEATBELT_OPT_IN = os.environ.get(LIVE_SEATBELT_ENV) == "1"
+_DRIVER = "sandbox" + "-exec"
+_PROFILE_FLAGS = ("-p", "-f")
+
+
+def _spawns_seatbelt_driver(args, executable=None) -> bool:
+    """True iff a spawn applies a profile: the driver (by basename) followed by its profile flag, anywhere in argv
+    (the hands path puts it after sudo/env), or the driver as ``executable=``. A command that only names the
+    driver as an operand (``which``, ``codesign -v``) is not one."""
     if isinstance(args, (str, bytes, os.PathLike)):
         args = [args]
     try:
-        return any(os.path.basename(os.fsdecode(a)) == "sandbox-exec" for a in args)
+        names = [os.path.basename(os.fsdecode(a)) for a in args]
+        if executable is not None and os.path.basename(os.fsdecode(executable)) == _DRIVER:
+            return True
     except TypeError:
         return False
+    return any(n == _DRIVER and i + 1 < len(names) and names[i + 1] in _PROFILE_FLAGS for i, n in enumerate(names))
 
 
 @pytest.fixture(autouse=True, scope="session")
 def _no_live_seatbelt_profile_unless_opted_in():
-    """TEST ONLY: the one place that keeps a broad pytest run from applying a live Seatbelt profile to the host.
+    """TEST ONLY: keeps a broad pytest run from applying a live Seatbelt profile to the host through this process.
 
-    Every real launch of the driver goes through ``subprocess.Popen`` (``subprocess.run`` included), so the
-    guard sits there rather than on each test: a test that would apply a profile is SKIPPED at the spawn (with
-    the reason above) unless ``LEVAIN_LIVE_SEATBELT=1``, and a NEW live test cannot apply one by forgetting a
-    marker. Nothing is spawned when it skips. Text-rendering tests never spawn the driver and keep running; a
-    test that replaces ``subprocess.Popen`` with a fake never reaches this. The guard in product code
-    (``seatbelt_guard``) stays the floor beneath it."""
+    The product launches the driver through ``subprocess.Popen`` (``subprocess.run`` included), so the guard sits
+    there rather than on each test: such a test is SKIPPED at the spawn (with the reason above) unless
+    ``LEVAIN_LIVE_SEATBELT=1`` was set when the run started, and a NEW live test cannot apply one by forgetting a
+    marker. Nothing is spawned when it skips. Known edges, closed as constructions no test here writes: a child
+    process's own spawn, ``os.exec*``/``posix_spawn``, a shell string, and a spawn on a worker thread (the skip ends
+    that thread, not the test). Beneath all of them the product refuses a kernel-mask rule before every launch
+    (``levain.firing.seatbelt_guard``)."""
     real_init = subprocess.Popen.__init__
 
     def guarded(self, args, *a, **kw):
-        if os.environ.get(LIVE_SEATBELT_ENV) != "1" and _spawns_seatbelt_driver(args):
+        args = list(args) if not isinstance(args, (str, bytes, os.PathLike)) else args   # an iterator is read once
+        if not LIVE_SEATBELT_OPT_IN and _spawns_seatbelt_driver(args, kw.get("executable")):
             pytest.skip(LIVE_SEATBELT_REASON)
         return real_init(self, args, *a, **kw)
 
@@ -52,7 +65,8 @@ def _no_live_seatbelt_profile_unless_opted_in():
     try:
         yield
     finally:
-        subprocess.Popen.__init__ = real_init
+        if subprocess.Popen.__init__ is guarded:   # never clobber a replacement someone else left in place
+            subprocess.Popen.__init__ = real_init
 
 
 @pytest.fixture(autouse=True)
