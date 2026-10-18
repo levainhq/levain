@@ -501,6 +501,18 @@ def test_reconcile_stamps_a_refusal_unknown_with_outcome_refused(tmp_path):
     assert done.stamp_detail == {"decision": "reject", "source": "hook", "reasonType": "hook"}
 
 
+def test_reconcile_keeps_a_row_filed_refused_as_refused(tmp_path):
+    ledger = _ledger(tmp_path)
+    ids = [h["tool_use_id"] for h in sum(BY_CASE.values(), []) if h.get("tool_use_id")]
+    rows = [ledger.record_call(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={}, cwd="/w",
+                               phase="pre", tool_use_id=t, source_path=str(FIX / "cc_pairs.jsonl"),
+                               outcome="refused") for t in ids]
+    reconcile(ledger)
+    done = [ledger.get(r) for r in rows]
+    assert done and all(d.outcome == "refused" and d.stamp in ("unknown", "pending") for d in done)
+    assert any(d.stamp == "unknown" for d in done)
+
+
 def test_stamp_detail_is_whitelisted_and_no_free_text_reaches_the_db(tmp_path):
     ledger = _ledger(tmp_path)
     bait = "FREE-TEXT-LEAK-MARKER"
