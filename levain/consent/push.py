@@ -52,6 +52,11 @@ Known edges (one line each, not built against):
   hash, so a swapped store can supply only objects of exactly those hashes. The residue is an approved commit
   that references objects the agent could not read itself, which needs the agent to know their hashes. The
   alternates / ``commondir`` / symlink refusals stay as defence in depth.
+- a promisor the agent plants after the check with a ``file://`` URL (and its own ``uploadpack`` command) is
+  allowed by the workspace fetch's ``file`` protocol. It fires only on a git that lazy-fetches inside
+  upload-pack despite ``GIT_NO_LAZY_FETCH``, i.e. one without git's May 2024 security releases (CVE-2024-32004,
+  fixed in 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1, 2.45.1 and distribution backports); no version floor is
+  enforced, because a backported distribution git reports the older number.
 - a HARD link the agent makes inside its object store to an object file outside it is not detected (a hard
   link is indistinguishable from the file); the agent must be able to name that file to make one.
 - a credential helper or ``core.sshCommand`` in the operator's own config named by a bare command that lives
