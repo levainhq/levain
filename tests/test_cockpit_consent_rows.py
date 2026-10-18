@@ -357,3 +357,25 @@ def test_a_reopened_decisions_modal_starts_unfiltered_even_with_a_saved_query(tm
             {"eval": rows},
         ])["values"]
     assert out[-5] == 1 and out[-1] == 3, out
+
+
+@needs_browser
+def test_an_undecided_row_is_drawn_waiting_not_answered(tmp_path, monkeypatch):
+    """An undecided request (the hold ended with no answer; it waits on a ruling) is not dimmed as answered and its
+    time reads "undecided", never "decided"."""
+    q = _home_queue(tmp_path, monkeypatch)
+    late = q.file(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
+                  hold=timedelta(minutes=5), event_id="u1")
+    q.mark_undecided(late.id)
+    _root, src, _ids = _install(tmp_path)
+    row = "document.querySelector('#levain-modal .consent-row')"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{TILE} && /1/.test({TILE}.innerText)"},
+            {"eval": f"{TILE}.click(); 1"},
+            {"until": row},
+            {"eval": f"[{row}.className, {row}.querySelector('.consent-head').textContent]"},
+        ])["values"]
+    cls, text = out[-1]
+    assert "ext-accent" in cls and "ext-dim" not in cls, out
+    assert "undecided" in text and "decided " not in text.replace("undecided ", ""), out

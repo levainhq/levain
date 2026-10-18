@@ -3228,7 +3228,9 @@
   function consentRow(o) {
     const c = o.consent;
     const pending = c.state === "pending";
-    const row = el("div", "row consent-row" + (pending ? " ext-accent" : " ext-dim"));
+    // undecided: the hold ended with no answer and the call did not run; it waits on a ruling, so it is not drawn as answered
+    const undecided = c.state === "undecided";
+    const row = el("div", "row consent-row" + (pending || undecided ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-consent-row", "");
     const head = el("div", "consent-head");
     head.appendChild(el("span", "consent-agent", c.agent || "agent"));
@@ -3241,7 +3243,10 @@
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
     } else head.appendChild(el("span", "consent-audit", c.state));
     if (c.age) head.appendChild(el("span", "ext-meta", "filed " + c.age));
-    if (!pending && c.decidedAge) head.appendChild(el("span", "ext-meta", (c.state === "expired" ? "expired " : "decided ") + c.decidedAge));
+    if (!pending && c.decidedAge) {
+      const when = c.state === "expired" ? "expired " : undecided ? "undecided " : "decided ";
+      head.appendChild(el("span", "ext-meta", when + c.decidedAge + (undecided ? ", waits on a ruling" : "")));
+    }
     row.appendChild(head);
     if (!pending) {
       // a decided request fetches nothing on draw; "details" fetches its body (the audit line) through the same queue
