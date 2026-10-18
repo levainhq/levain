@@ -1104,3 +1104,21 @@ def test_a_late_ruling_names_the_action_not_its_stored_display(queue, keys):
     queue.answer_late(request.id, *ruled(queue, request.id, keys["laptop"]))
     assert ruling_context(queue, "sess-1") == RULING_TEXT["allow"].format(n=gap, x=f"Edit of {path}")
     assert ruling_context(queue, "sess-1") is None
+
+
+def test_a_d_raised_after_install_still_ends_before_the_installed_timeout(tmp_path, monkeypatch):
+    """L1-4, reproduced: the gate entry's timeout was frozen at install as D + 30 while the hook re-reads D at every
+    run, so D raised from 300 to 840 after install held 840 s under a 330 s timeout (Claude Code kills the hook
+    mid-hold: pending request, no UNDECIDED text, no gap). The entry now carries the ceiling's timeout, and the hold
+    the hook runs for any D the settings file can say ends at least the margin before it."""
+    from levain.install import consent_gate_handler
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
+    qdir = tmp_path / "consent"
+    qdir.mkdir()
+    (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"gate_hold_seconds": 300}))
+    installed = consent_gate_handler("/usr/bin/python3", tmp_path / "install")[1]["timeout"]
+    for raised in (840, 841, 10_000):
+        (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"gate_hold_seconds": raised}))
+        hold = min(cc.load_settings(qdir).gate_hold_seconds, cc.GATE_HOLD_CEILING)
+        assert hold + cc.GATE_TIMEOUT_MARGIN <= installed, (raised, hold, installed)

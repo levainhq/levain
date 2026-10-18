@@ -2031,15 +2031,15 @@ def consent_hook_handler(python_path: str, install: Path, adapter: str) -> tuple
 def consent_gate_handler(python_path: str, install: Path) -> tuple[str, dict[str, Any], Path]:
     """(command, handler, script) of Claude Code's PreToolUse gate entry (Q14 B2): the same command and script as
     :func:`consent_hook_handler` (the script routes by event), ``"onFailure": "block"`` (a crashed or timed-out gate
-    blocks the call, never lets it run; measured runs2 RUN C) and ``timeout`` = the gate's hold D + 30 s, D read
-    from the consent settings the hook reads (``gate_hold_seconds``, default 300 s): a D changed there takes effect
-    in the timeout at the next `levain update`."""
-    from levain.consent.adapters.claude_code import gate_timeout, load_settings
+    blocks the call, never lets it run; measured runs2 RUN C) and ``timeout`` = the adapter's
+    :data:`GATE_TIMEOUT`: the hold ceiling (840 s) + 30 s, never the D set now. The hook re-reads D
+    (``gate_hold_seconds``) at every run and clamps it to the ceiling, so a D raised after this render still ends
+    before Claude Code's timeout; a timeout frozen at the old D would kill the hook mid-hold. It also keeps the render
+    independent of the machine's consent settings file."""
+    from levain.consent.adapters.claude_code import GATE_TIMEOUT
 
     command, _handler, script = consent_hook_handler(python_path, install, "claude-code")
-    hold = load_settings(_consent_queue_dir()).gate_hold_seconds
-    return command, {"type": "command", "command": command, "timeout": gate_timeout(hold),
-                     "onFailure": "block"}, script
+    return command, {"type": "command", "command": command, "timeout": GATE_TIMEOUT, "onFailure": "block"}, script
 
 
 def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str) -> str:

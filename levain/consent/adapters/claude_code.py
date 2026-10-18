@@ -38,6 +38,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import site
 import sys
@@ -605,7 +606,12 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 #
 # Every PreToolUse also carries this session's late rulings, not yet delivered, as ``additionalContext`` (DESIGN
 # §3.6; :meth:`ConsentQueue.claim_rulings_for`), and, when a notify command is configured, the snoozed re-pings that
-# are due (R-e). The entry is installed with ``"onFailure": "block"`` and ``timeout`` = :func:`gate_timeout` of D.
+# are due (R-e). The entry is installed with ``"onFailure": "block"`` and ``timeout`` = :data:`GATE_TIMEOUT`, the
+# timeout of the CEILING, never of the D set at install: D is re-read from the settings file at every run, so a D
+# raised after install would otherwise outlive a timeout frozen at the old one (Claude Code would kill the hook
+# mid-hold: the request left pending, no UNDECIDED text, no gap). The hold is clamped to the ceiling here too, so it
+# always ends :data:`GATE_TIMEOUT_MARGIN` before the timeout. The cost: a gate that hangs (not one that holds) keeps
+# the call blocked up to that timeout, not D + the margin.
 
 GATE_EVENT = "PreToolUse"
 # Claude Code's ``timeout`` for the gate entry is D + this margin (interpreter start, the undecided mark)
@@ -615,6 +621,8 @@ GATE_TIMEOUT_MARGIN = 30
 DIALOG_MODES = frozenset({"default", "plan"})
 # how often the hold re-reads the request
 GATE_POLL = 0.25
+# the longest the hold sleeps between its wait and the undecided mark
+GATE_SLEEP_CAP = 6.0
 # DESIGN §3.3, verbatim (U-REV with its bundling clause): the reversible tier; the agent may work around the gap
 U_REV = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
          "This is not a rejection of your approach; it is open as gap #{n} and the operator will rule on it later. "
@@ -638,11 +646,18 @@ RULING_TEXT = {
 }
 # the longest a description of the action runs in a reason, a ping or a ruling
 WHAT_MAX = 300
+# C0 controls and DEL, each shown as "?" in a description (a newline or an escape sequence never reaches a ping)
+_CONTROL = re.compile("[\x00-\x1f\x7f]")
 
 
 def gate_timeout(hold: float) -> int:
-    """Claude Code's ``timeout`` for the gate entry: ``ceil(hold)`` + :data:`GATE_TIMEOUT_MARGIN`."""
+    """Claude Code's ``timeout`` for a gate entry whose hold is at most ``hold``: ``ceil(hold)`` +
+    :data:`GATE_TIMEOUT_MARGIN`."""
     return int(math.ceil(hold)) + GATE_TIMEOUT_MARGIN
+
+
+# the timeout levain installs the gate entry with: that of the ceiling, the longest hold the hook ever runs
+GATE_TIMEOUT = gate_timeout(GATE_HOLD_CEILING)
 
 
 def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
@@ -671,14 +686,25 @@ def _what(tool_name: str, tool_input: Any, display: str | None = None) -> str:
         text = f"{tool_name} of {', '.join(paths)}"
     else:
         text = display if display is not None else redact_display(tool_name, tool_input)
-    return text if len(text) <= WHAT_MAX else text[:WHAT_MAX - 1] + "…"
+    text = _CONTROL.sub("?", text)  # never a control character into a ping, a reason or a ruling
+    if len(text) <= WHAT_MAX:
+        return text
+    # cut in the MIDDLE: a path's decisive end (``…/.claude/settings.json``) is its tail, and a long benign prefix
+    # must not push it out of what the operator reads
+    head = WHAT_MAX // 3
+    return text[:head] + "…" + text[-(WHAT_MAX - head - 1):]
 
 
-def notify(settings: AdapterSettings, message: str) -> bool:
-    """Ping the operator (R-f): start ``notify_argv`` + ``[message]``, detached, never waited on. True when it
-    started; False when none is configured or it could not start. A failed ping never fails the gate."""
+def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = None) -> bool:
+    """Ping the operator (R-f): start ``notify_argv`` + ``[message]``, detached, never waited on, in ``cwd`` (the
+    queue directory from the gate; the home directory when none is given), never the project the agent works in.
+    The command is an absolute path or a bare name found on the child's ``PATH`` as an absolute path; a relative
+    path (``bin/ping``) is refused, since it would resolve against a directory the agent can write. True when it
+    started; False when none is configured, the command is refused, or it could not start. A failed ping never
+    fails the gate."""
     if not settings.notify_argv:
         return False
+    import shutil
     import subprocess
 
     from levain.launch import child_env
@@ -686,8 +712,15 @@ def notify(settings: AdapterSettings, message: str) -> bool:
     text = message if settings.phone_url is None else f"{message} {settings.phone_url}"
     try:
         # child_env: the allowlisted environment, never the agent session's whole one (its tokens among it)
-        subprocess.Popen([*settings.notify_argv, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, env=child_env())
+        env = child_env()
+        command = settings.notify_argv[0]
+        if "/" not in command:
+            command = shutil.which(command, path=env.get("PATH", os.defpath)) or ""
+        if not os.path.isabs(command):
+            return False  # a relative path, or a bare name not found (or found only through a relative PATH entry)
+        subprocess.Popen([command, *settings.notify_argv[1:], text], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         close_fds=True, env=env, cwd=str(cwd) if cwd is not None else str(Path.home()))
     except Exception:
         return False
     return True
@@ -707,7 +740,7 @@ def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
         gap = queue.gap(reping.request_id)
         what = _what(got[0].tool_name, None, got[0].display)
         head = f"levain: asking again, gap #{gap}" if gap is not None else "levain: asking again"
-        sent += notify(settings, f"{head}: {what} (request {reping.request_id}).")
+        sent += notify(settings, f"{head}: {what} (request {reping.request_id}).", cwd=queue.directory)
     return sent
 
 
@@ -764,7 +797,8 @@ def _session_of(event: Mapping[str, Any]) -> str | None:
 def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
          sleep: Callable[[float], None] = time.sleep) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    A gated call (:func:`gate_class`) gets a ruled allow (taken once), else, outside :data:`DIALOG_MODES` and when
+    A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent),
+    else a ruled allow (taken once), else, outside :data:`DIALOG_MODES` and when
     something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
     pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
     (:func:`undecided_output`). Anything that fails after the call is known gated is a deny (with the hard stop for
@@ -811,20 +845,23 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
+    if posture == "plan":
+        return None  # plan runs nothing: no decision, and a ruled allow is not spent on a call that will not run
     try:
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return gate_output(ruled)
         if posture in DIALOG_MODES or nothing_can_decide(settings):
             return None
-        hold = settings.gate_hold_seconds
+        hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id)
     except Exception as exc:
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
     try:
-        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).")
+        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
+               cwd=queue.directory)
         got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
                                              posture=posture), request)
         if got is not None:
@@ -832,15 +869,18 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         # the hold ends at expires_at (the library's deadline); mark_undecided applies at or after it
         left = (parse_stamp(request.expires_at) - datetime.now(timezone.utc)).total_seconds()
         if left > 0:
-            sleep(left + 0.05)
+            # capped: ``left`` is wall-clock, and a clock stepped back must not carry the hold past the timeout
+            # (a mark refused for being early is the deny below, never an allow)
+            sleep(min(left + 0.05, GATE_SLEEP_CAP))
         marked = queue.mark_undecided(request.id, halt=tier == "irreversible", tool_input=tool_input,
                                       posture=posture)
         if isinstance(marked.decision, Decision) and _verified(marked.decision, request) is not None:
             return gate_output(marked.decision)  # an answer verified in the last moments of the hold
         if marked.state == "undecided" and marked.gap is not None:
             return undecided_output(tier, what, marked.gap)
-        return _pre("deny", f"levain: the action was NOT taken: {what} ({marked.reason}). Do not retry it and do "
-                    "not achieve it another way.", **_stop(tier, what, marked.reason))
+        why = marked.reason or "no verified decision"
+        return _pre("deny", f"levain: the action was NOT taken: {what} ({why}). Do not retry it and do "
+                    "not achieve it another way.", **_stop(tier, what, why))
     except Exception as exc:
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
