@@ -577,96 +577,119 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
 
 
 _PERSISTENCE_AGENT_NAMES = (".claude", ".codex")
+_PERSISTENCE_AGENT_MAX_SYMLINK_HOPS = 40
 
 
 def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
     tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]
 ]:
-    """Return ``(roots, directory_targets, file_targets, protected_hops)`` for the
-    whole-directory Claude/Codex persistence floor.
+    """Return the one resolved set for the whole-directory Claude/Codex floor.
 
-    ``roots`` are lexical names below HOME/workspace (including existing case variants).
-    The target sets cover every existing symlink reached below such a root. ``protected_hops``
-    pins both the spelling of each link target and the fully resolved chain so an intermediate
-    link cannot be swapped after policy construction. Any existing link that cannot be resolved,
-    or a link cycle in a protected tree, refuses the floor by name.
+    The four members are ``(lexical_roots, final_directories, final_files, literal_pins)``.
+    Every symlink anywhere below an existing root is resolved component-by-component, including
+    symlinks encountered in a link's target. Final targets receive the write deny; every link
+    dentry and every ancestor of a link or final target receives only a literal relocation pin.
+    Directory identities bound recursive traversal, while link identities detect a chain loop.
     """
     roots: list[Path] = []
     directory_targets: list[Path] = []
     file_targets: list[Path] = []
-    target_spellings: list[Path] = []
+    links: list[Path] = []
+    final_targets: list[Path] = []
+    directories_to_walk: list[Path] = []
+    workspace_real = Path(os.path.realpath(workspace))
 
-    def fail(path: Path, exc: BaseException) -> NoReturn:
-        raise ConfinementError(
-            f"the protected persistence path {path} cannot be resolved ({exc}) — "
+    def refuse(path: Path, problem: str, exc: BaseException | None = None) -> NoReturn:
+        error = ConfinementError(
+            f"the protected persistence path {path} has {problem} — "
             "refusing to build the floor (fail-closed)"
-        ) from exc
+        )
+        if exc is None:
+            raise error
+        raise error from exc
 
-    def resolve_existing(path: Path) -> Path:
-        try:
-            return path.resolve(strict=True)
-        except (OSError, RuntimeError, ValueError) as exc:
-            fail(path, exc)
+    def resolve_chain(path: Path) -> tuple[Path, list[Path]]:
+        """Resolve an existing path and expose every symlink dentry traversed."""
+        absolute = Path(os.path.abspath(path))
+        pending = list(absolute.parts[1:])
+        current = Path(absolute.anchor)
+        chain: list[Path] = []
+        seen_links: set[tuple[int, int]] = set()
+        followed = 0
+        while pending:
+            component = pending.pop(0)
+            candidate = current / component
+            try:
+                st = os.lstat(candidate)
+            except (OSError, ValueError) as exc:
+                refuse(candidate, f"an unresolvable symlink hop ({exc})", exc)
+            if not stat.S_ISLNK(st.st_mode):
+                current = candidate
+                continue
+            followed += 1
+            if followed > _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS:
+                refuse(path, f"a symlink chain past {_PERSISTENCE_AGENT_MAX_SYMLINK_HOPS} hops")
+            identity = (st.st_dev, st.st_ino)
+            if identity in seen_links:
+                refuse(candidate, "a symlink loop")
+            seen_links.add(identity)
+            chain.append(candidate)
+            try:
+                value = Path(os.readlink(candidate))
+            except OSError as exc:
+                refuse(candidate, f"an unresolvable symlink hop ({exc})", exc)
+            target = value if value.is_absolute() else candidate.parent / value
+            target = Path(os.path.abspath(target))
+            pending = list(target.parts[1:]) + pending
+            current = Path(target.anchor)
+        return current, chain
 
-    def remember_link_target(link: Path, *, required: bool) -> Path | None:
+    def classify(source: Path) -> None:
+        target, chain = resolve_chain(source)
+        links.extend(chain)
+        final_targets.append(target)
         try:
-            value = os.readlink(link)
-        except OSError as exc:
-            fail(link, exc)
-        target = Path(value)
-        if not target.is_absolute():
-            target = link.parent / target
-        target = Path(os.path.abspath(target))
-        target_spellings.append(target)
-        try:
-            return link.resolve(strict=True)
-        except (FileNotFoundError, NotADirectoryError, RuntimeError) as exc:
-            # A broken/looping child link has no reachable data target. The whole-root regex still
-            # denies unlinking or replacing that lexical link. Roots and their resolution hops are
-            # different: the floor depends on their targets, so those always fail closed.
-            if not required:
-                return None
-            fail(link, exc)
+            st = os.lstat(target)
         except (OSError, ValueError) as exc:
-            fail(link, exc)
+            refuse(source, f"an unresolvable final target ({exc})", exc)
+        if stat.S_ISDIR(st.st_mode):
+            target_canon = _canon(str(target))
+            workspace_canon = _canon(str(workspace_real))
+            if (workspace_canon == target_canon
+                    or workspace_canon.startswith(target_canon.rstrip(os.sep) + os.sep)):
+                refuse(source, f"a final target {target} that is or contains the workspace {workspace}")
+            directory_targets.append(target)
+            directories_to_walk.append(target)
+        else:
+            file_targets.append(target)
 
-    def scan_root(path: Path) -> None:
-        """Capture direct child links, including the ruled `.claude/settings.json` shape.
-
-        Ordinary directories need no recursive policy expansion: the root's ``subpath`` deny and
-        inode walk cover them. A direct symlinked directory becomes another whole protected target.
-        """
-        real = resolve_existing(path)
-        try:
-            st = os.stat(real)
-        except OSError as exc:
-            fail(path, exc)
-        if not stat.S_ISDIR(st.st_mode):
-            file_targets.append(real)
-            return
-        directory_targets.append(real)
-        try:
-            entries = list(os.scandir(real))
-        except OSError as exc:
-            fail(real, exc)
-        for entry in entries:
-            child = Path(entry.path)
+    def scan_protected_directories() -> None:
+        visited: set[tuple[int, int]] = set()
+        while directories_to_walk:
+            directory = directories_to_walk.pop(0)
             try:
-                is_link = entry.is_symlink()
+                st = os.stat(directory)
             except OSError as exc:
-                fail(child, exc)
-            if not is_link:
+                refuse(directory, f"an unresolvable directory target ({exc})", exc)
+            identity = (st.st_dev, st.st_ino)
+            if identity in visited:
                 continue
-            target = remember_link_target(child, required=False)
-            if target is None:
-                continue
+            visited.add(identity)
             try:
-                if target.is_dir():
-                    directory_targets.append(target)
-                else:
-                    file_targets.append(target)
+                with os.scandir(directory) as scanned:
+                    entries = sorted(scanned, key=lambda entry: entry.name)
             except OSError as exc:
-                fail(child, exc)
+                refuse(directory, f"a protected directory that cannot be walked ({exc})", exc)
+            for entry in entries:
+                child = Path(entry.path)
+                try:
+                    child_st = os.lstat(child)
+                except OSError as exc:
+                    refuse(child, f"an entry that cannot be inspected ({exc})", exc)
+                if stat.S_ISLNK(child_st.st_mode):
+                    classify(child)
+                elif stat.S_ISDIR(child_st.st_mode):
+                    directories_to_walk.append(child)
 
     for anchor in (home, workspace):
         candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
@@ -679,38 +702,25 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
         except (FileNotFoundError, NotADirectoryError):
             pass
         except OSError as exc:
-            fail(anchor, exc)
+            refuse(anchor, f"an anchor that cannot be scanned ({exc})", exc)
 
         for raw in _dedup_paths(candidates):
-            # Validate even the lower-case requested spelling: Path.resolve catches a loop while
-            # still allowing an absent name, which must remain denied for future creation.
-            _required_spellings(raw, "whole Claude/Codex agent directory")
             try:
                 roots.extend((raw, raw.parent.resolve() / raw.name))
             except (OSError, RuntimeError, ValueError) as exc:
-                fail(raw, exc)
+                refuse(raw, f"an unresolvable parent ({exc})", exc)
             if not os.path.lexists(raw):
                 continue
-            if raw.is_symlink():
-                resolved = remember_link_target(raw, required=True)
-                assert resolved is not None
-            else:
-                resolved = resolve_existing(raw)
-            try:
-                if resolved.is_dir():
-                    directory_targets.append(resolved)
-                    scan_root(resolved)
-                else:
-                    file_targets.append(resolved)
-            except OSError as exc:
-                fail(raw, exc)
+            classify(raw)
+
+    scan_protected_directories()
 
     root_t = _dedup_paths(roots)
-    dir_t = _dedup_paths(directory_targets)
-    file_t = _dedup_paths(file_targets)
-    protected = [*root_t, *dir_t, *file_t, *target_spellings]
-    hops = _dedup_paths([*protected, *_write_deny_ancestors(protected)])
-    return root_t, dir_t, file_t, hops
+    dir_t = tuple(sorted(_dedup_paths(directory_targets), key=str))
+    file_t = tuple(sorted(_dedup_paths(file_targets), key=str))
+    pin_sources = [*links, *final_targets]
+    pins = tuple(sorted(_dedup_paths([*links, *_write_deny_ancestors(pin_sources)]), key=str))
+    return root_t, dir_t, file_t, pins
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
@@ -1549,9 +1559,9 @@ class CrownJewelsPolicy:
     persistence_write_subtrees: tuple[Path, ...] = ()  # bin/LaunchAgents/git config trees
     persistence_write_files: tuple[Path, ...] = ()  # shell/git startup files
     persistence_agent_roots: tuple[Path, ...] = ()  # lexical .claude/.codex roots (whole-dir deny)
-    persistence_agent_dirs: tuple[Path, ...] = ()  # resolved protected directory targets
-    persistence_agent_files: tuple[Path, ...] = ()  # resolved symlinked-file targets below them
-    persistence_agent_hops: tuple[Path, ...] = ()  # exact resolution-chain nodes: no swapping
+    persistence_agent_dirs: tuple[Path, ...] = ()  # final directory targets: whole-tree write deny
+    persistence_agent_files: tuple[Path, ...] = ()  # final file targets: exact write deny
+    persistence_agent_pins: tuple[Path, ...] = ()  # link hops/ancestors: replace/unlink only
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -2421,7 +2431,7 @@ def build_policy(
         for p in _required_spellings(root, label)
     ])
     (persistence_agent_roots, persistence_agent_dirs, persistence_agent_files,
-     persistence_agent_hops) = _persistence_agent_paths(home, ws)
+     persistence_agent_pins) = _persistence_agent_paths(home, ws)
 
     # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, the entity's
     # own store files, AND the config file (all relocate the same way). Including ``deny_write_files_t``
@@ -2436,9 +2446,7 @@ def build_policy(
     all_jewels = (
         list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t)
         + list(own_memory_files_t) + list(persistence_write_subtrees)
-        + list(persistence_write_files) + list(persistence_agent_roots)
-        + list(persistence_agent_dirs) + list(persistence_agent_files)
-        + list(persistence_agent_hops) + [config_file]
+        + list(persistence_write_files) + [config_file]
     )
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
@@ -2505,7 +2513,7 @@ def build_policy(
         persistence_agent_roots=persistence_agent_roots,
         persistence_agent_dirs=persistence_agent_dirs,
         persistence_agent_files=persistence_agent_files,
-        persistence_agent_hops=persistence_agent_hops,
+        persistence_agent_pins=persistence_agent_pins,
     )
 
 
@@ -2805,6 +2813,26 @@ def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
     return None
 
 
+def persistence_agent_pin_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
+    """Return a reason when replacing/unlinking ``path`` would move a resolved-set pin.
+
+    Pins are intentionally not crown-jewel subtrees: ordinary children of a pinned directory — in
+    particular the workspace — remain writable. Callers use this only for an operation that replaces
+    or unlinks the exact named entry.
+    """
+    try:
+        expanded = Path(path).expanduser()
+        lexical = Path(os.path.abspath(expanded))
+        resolved = expanded.resolve()
+    except (ValueError, OSError, RuntimeError) as exc:
+        return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
+    for pin in policy.persistence_agent_pins:
+        if (_canon(str(lexical)) == _canon(str(pin))
+                or _canon(str(resolved)) == _canon(str(pin))):
+            return f"{lexical} is a pinned agent-directory symlink hop or ancestor"
+    return None
+
+
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
     """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
 
@@ -2863,18 +2891,15 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
                 or _canon(str(p.parent)) == _canon(str(home))):
             return f"{lexical} is an immediate operator-home entry and is write-protected"
     for root in policy.persistence_agent_roots:
-        if _ci_within(lexical, root):
+        if _ci_within(lexical, root) or _ci_within(p, root):
             return f"{lexical} is under the whole write-protected agent directory {root}"
     for root in policy.persistence_agent_dirs:
-        if _ci_within(p, root):
+        if _ci_within(lexical, root) or _ci_within(p, root):
             return f"{p} is under the resolved write-protected agent directory {root}"
     for target in policy.persistence_agent_files:
-        if _canon(str(p)) == _canon(str(target)):
+        if (_canon(str(lexical)) == _canon(str(target))
+                or _canon(str(p)) == _canon(str(target))):
             return f"{p} is a resolved file target below a write-protected agent directory"
-    for hop in policy.persistence_agent_hops:
-        if (_canon(str(lexical)) == _canon(str(hop))
-                or _canon(str(p)) == _canon(str(hop))):
-            return f"{lexical} is a protected agent-directory resolution hop"
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
@@ -4817,10 +4842,18 @@ def _macos_persistence_lines(policy: CrownJewelsPolicy) -> list[str]:
     for root in policy.persistence_agent_dirs:
         lines.append(f'    (literal "{_sbpl_string(str(root))}")')
         lines.append(f'    (subpath "{_sbpl_string(str(root))}")')
-    for path in (*policy.persistence_write_files, *policy.persistence_agent_files,
-                 *policy.persistence_agent_hops):
+    for path in (*policy.persistence_write_files, *policy.persistence_agent_files):
         lines.append(f'    (literal "{_sbpl_string(str(path))}")')
     lines += [")", ""]
+    if policy.persistence_agent_pins:
+        lines += [
+            ";; Resolved-set pins — exact entries cannot be created/replaced/unlinked; children",
+            ";; remain writable (not file-write* and never a subtree deny).",
+            "(deny file-write-create file-write-unlink",
+        ]
+        for path in policy.persistence_agent_pins:
+            lines.append(f'    (literal "{_sbpl_string(str(path))}")')
+        lines += [")", ""]
     return lines
 
 
@@ -5695,7 +5728,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
                     for b in (Path(rd) / "bus", Path(rd) / "systemd" / "private")]
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
              *policy.sqlite_sidecars, *policy.persistence_write_files,
-             *policy.persistence_agent_files, *policy.persistence_agent_hops, *sockets]
+             *policy.persistence_agent_files, *sockets]
     if policy.config_file is not None:
         named.append(policy.config_file)
     for f in named:
@@ -8357,7 +8390,7 @@ _HANDS_POLICY_NARROWED = ("deny_read_write", "deny_files", "deny_write_dirs", "d
                           "ssh_dir", "config_file", "persistence_home_dirs",
                           "persistence_write_subtrees", "persistence_write_files",
                           "persistence_agent_roots", "persistence_agent_dirs",
-                          "persistence_agent_files", "persistence_agent_hops")
+                          "persistence_agent_files", "persistence_agent_pins")
 _HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs", "cred_dir_sources",
                       "trusted_roots")
 

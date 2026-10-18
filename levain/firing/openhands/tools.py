@@ -110,6 +110,7 @@ from levain.firing.confinement import (
     _accepts_kw,
     _jewel_inodes,
     crown_jewel_reason,
+    persistence_agent_pin_reason,
     linked_jewel_reason,
     opened_file_path,
     opened_file_reason,
@@ -532,7 +533,8 @@ def _floored_move_impl(policy: CrownJewelsPolicy, src, dst) -> str:
     pfd, walked = _judged_dir(os.path.dirname(dst))
     try:
         target = os.path.join(walked, name)
-        reason = crown_jewel_reason(policy, target)
+        reason = (crown_jewel_reason(policy, target)
+                  or persistence_agent_pin_reason(policy, target))
         if reason is None:
             try:
                 st = os.stat(name, dir_fd=pfd, follow_symlinks=False)

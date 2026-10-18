@@ -89,7 +89,7 @@ def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monke
         assert f'(subpath "{path}")' in text
     for path in policy.persistence_agent_dirs:
         assert f'(subpath "{path}")' in text
-    for path in policy.persistence_agent_hops:
+    for path in policy.persistence_agent_pins:
         assert f'(literal "{path}")' in text
 
 
@@ -164,12 +164,179 @@ def test_swappable_intermediate_agent_symlink_is_pinned(tmp_path, monkeypatch) -
     policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
     text = conf.SeatbeltProvider().render_profile(policy)
 
-    for hop in (workspace / ".codex", workspace / "sub", dir_a, real):
-        assert hop in policy.persistence_agent_hops
+    for hop in (workspace / ".codex", workspace / "sub", workspace, dir_a):
+        assert hop in policy.persistence_agent_pins
         assert f'(literal "{hop}")' in text
-        assert conf.crown_jewel_reason(policy, hop) is not None
+        assert conf.persistence_agent_pin_reason(policy, hop) is not None
     assert f'(subpath "{real}")' in text
     assert conf.crown_jewel_reason(policy, real / "config.toml") is not None
+
+
+def test_depth_n_symlink_target_and_full_multi_hop_chain_are_pinned(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    hooks = workspace / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    payload = workspace / "payload.sh"
+    payload.write_text("SAFE")
+    (hooks / "run.sh").symlink_to(Path("../..") / "payload.sh")
+
+    target = workspace / "target"
+    target.write_text("SAFE")
+    (workspace / "a").symlink_to("b")
+    (workspace / "b").symlink_to("target")
+    (workspace / ".claude" / "x").symlink_to(Path("..") / "a")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    assert payload in policy.persistence_agent_files
+    assert target in policy.persistence_agent_files
+    for link in (hooks / "run.sh", workspace / ".claude" / "x", workspace / "a", workspace / "b"):
+        assert link in policy.persistence_agent_pins
+        assert conf.persistence_agent_pin_reason(policy, link) is not None
+        assert f'(literal "{link}")' in text
+    assert conf.crown_jewel_reason(policy, payload) is not None
+    assert conf.crown_jewel_reason(policy, target) is not None
+    assert conf.crown_jewel_reason(policy, workspace / "payload-sibling.txt") is None
+
+
+def test_agent_pins_do_not_turn_the_workspace_into_a_write_denied_subtree(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (workspace / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    ordinary = workspace / "ordinary.txt"
+
+    assert workspace in policy.persistence_agent_pins
+    assert workspace not in policy.deny_write_dirs
+    assert conf.persistence_agent_pin_reason(policy, workspace) is not None
+    assert conf.persistence_agent_pin_reason(policy, ordinary) is None
+    assert conf.crown_jewel_reason(policy, workspace) is None
+    assert conf.crown_jewel_reason(policy, ordinary) is None
+    text = conf.SeatbeltProvider().render_profile(policy)
+    full_write_section, pin_section = text.split(";; Resolved-set pins", maxsplit=1)
+    assert f'(literal "{workspace}")' not in full_write_section
+    assert "(deny file-write-create file-write-unlink" in pin_section
+    assert f'(literal "{workspace}")' in pin_section
+    ordinary.write_text("editor-control")
+    assert ordinary.read_text() == "editor-control"
+
+
+def test_nested_link_loop_refuses_with_named_reason(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (workspace / ".claude").mkdir(parents=True)
+    (workspace / ".claude" / "x").symlink_to(Path("..") / "a")
+    (workspace / "a").symlink_to("b")
+    (workspace / "b").symlink_to("a")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    with pytest.raises(conf.ConfinementError, match="symlink loop"):
+        conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+
+def test_chain_past_40_hops_refuses_with_named_reason(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (workspace / ".claude").mkdir(parents=True)
+    (workspace / ".claude" / "x").symlink_to(Path("..") / "hop0")
+    for index in range(40):
+        (workspace / f"hop{index}").symlink_to(f"hop{index + 1}")
+    (workspace / "hop40").write_text("target")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    with pytest.raises(conf.ConfinementError, match="symlink chain past 40 hops"):
+        conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+
+def test_final_target_that_contains_workspace_refuses(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "container" / "workspace"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    (home / ".claude").symlink_to(tmp_path / "container", target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    with pytest.raises(conf.ConfinementError, match="is or contains the workspace"):
+        conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+
+def test_operator_style_home_links_outside_home_spawn_and_deny_only_targets(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    target_dir = tmp_path / "elsewhere" / "global"
+    target_dir.mkdir(parents=True)
+    target = target_dir / "CLAUDE.md"
+    target.write_text("operator")
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").symlink_to(target)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    conf._refuse_multiply_linked_jewels(policy)
+
+    assert target in policy.persistence_agent_files
+    assert conf.crown_jewel_reason(policy, target) is not None
+    assert conf.crown_jewel_reason(policy, target_dir / "sibling.md") is None
+
+
+def test_editor_checks_lexical_and_canonical_agent_paths(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "target.md"
+    target.write_text("protected")
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude" / "linked.md").symlink_to(target)
+    outside_alias = tmp_path / "outside-alias"
+    outside_alias.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+    assert conf.crown_jewel_reason(policy, alias / ".CLAUDE" / "settings.json") is not None
+    assert conf.crown_jewel_reason(policy, outside_alias / "target.md") is not None
+
+
+def test_depth_n_symlink_target_is_in_the_pre_spawn_inode_set(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    hooks = workspace / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    payload = workspace / "payload.sh"
+    payload.write_text("protected")
+    (hooks / "run.sh").symlink_to(Path("../..") / "payload.sh")
+    os.link(payload, workspace / "payload-alias")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+
+    with pytest.raises(conf.ConfinementError, match="crown jewel with 2 names"):
+        conf._refuse_multiply_linked_jewels(policy)
 
 
 def test_broken_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
@@ -180,7 +347,7 @@ def test_broken_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(home))
     entity = tmp_path / "entity"
     (entity / ".levain").mkdir(parents=True)
-    with pytest.raises(conf.ConfinementError, match=r"protected persistence path .*\.claude.*cannot be resolved"):
+    with pytest.raises(conf.ConfinementError, match=r"protected persistence path .*missing.*unresolvable"):
         conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
 
 
@@ -192,7 +359,7 @@ def test_looping_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(home))
     entity = tmp_path / "entity"
     (entity / ".levain").mkdir(parents=True)
-    with pytest.raises(conf.ConfinementError, match="protected persistence path.*cannot be resolved"):
+    with pytest.raises(conf.ConfinementError, match="protected persistence path.*symlink loop"):
         conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
 
 
