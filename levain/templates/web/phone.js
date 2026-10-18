@@ -49,8 +49,12 @@
     rpId = data.rp_id || rpId;
     const list = $("requests");
     const rows = Array.isArray(data.pending) ? data.pending : [];
-    $("status").textContent = (rows.length ? rows.length + " waiting on you" : "nothing is waiting on you") + (last ? " \u00b7 last: " + last : "");
-    list.replaceChildren(...rows.map(row));
+    // undecided: the hold ended with no answer and the call did not run; the agent was told gap #N is open and
+    // waits on a late ruling, signed here in the ruling namespace (never an answer's)
+    const gaps = Array.isArray(data.undecided) ? data.undecided : [];
+    const waiting = rows.length + gaps.length;
+    $("status").textContent = (waiting ? waiting + " waiting on you" : "nothing is waiting on you") + (last ? " \u00b7 last: " + last : "");
+    list.replaceChildren(...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
     const ours = enrolled.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -64,11 +68,11 @@
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
   }
 
-  function row(r) {
+  function row(r, ruling) {
     const card = el("article", "req");
     const head = el("div", "req-head");
     head.append(el("span", "tool", r.tool || "(tool)"), el("span", "tier" + (r.tier === "T3" ? " t3" : ""), r.tier || ""),
-                el("span", "meta", r.agent || ""));
+                el("span", "meta", (r.agent || "") + (ruling ? " \u00b7 undecided, gap #" + r.gap : "")));
     card.append(head, el("pre", "display", typeof r.display === "string" ? r.display : ""));
     if (r.cwd) card.appendChild(el("div", "where", "in " + r.cwd));
     if (r.targets) card.appendChild(el("div", "where", "touches " + r.targets));
@@ -81,24 +85,25 @@
     const actions = el("div", "actions");
     // a passkey is a display-phone key: it denies any request and allows up to T2 (the server refuses the rest)
     const decisions = r.tier === "T3" ? ["deny"] : ["allow", "deny"];
-    if (r.tier === "T3" && !notes.has(r.id)) say("allowing a T3 request is the laptop's (levain consent answer there)");
+    if (r.tier === "T3" && !notes.has(r.id)) say(ruling ? "a late allow of a T3 request is the laptop's (levain consent rule there)"
+                                                        : "allowing a T3 request is the laptop's (levain consent answer there)");
     for (const decision of decisions) {
-      const b = el("button", decision, decision + " with passkey");
+      const b = el("button", decision, (ruling ? "rule " : "") + decision + " with passkey");
       b.type = "button";
       b.disabled = !usable;
-      b.addEventListener("click", () => start(r, decision, signers, say, actions));
+      b.addEventListener("click", () => start(r, decision, signers, say, actions, ruling));
       actions.appendChild(b);
     }
     card.append(actions, note);
     return card;
   }
 
-  function start(r, decision, signers, say, actions) {
+  function start(r, decision, signers, say, actions, ruling) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
     // exactly one passkey this browser made is enrolled: use it, and ask the OS for that credential
-    if (known.length === 1) return answer(r, decision, known[0], local[known[0]], say);
-    if (!known.length && signers.length === 1) return answer(r, decision, signers[0], null, say);
+    if (known.length === 1) return answer(r, decision, known[0], local[known[0]], say, ruling);
+    if (!known.length && signers.length === 1) return answer(r, decision, signers[0], null, say, ruling);
     // otherwise the person picks: among this browser's own when it made several (a deleted one is forgotten when
     // the OS refuses it), else among every enrolled one (the OS then offers every passkey for this name, and a
     // pick of another device's key is refused at verify)
@@ -108,29 +113,30 @@
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => answer(r, decision, fp, known.length ? local[fp] : null, say));
+      p.addEventListener("click", () => answer(r, decision, fp, known.length ? local[fp] : null, say, ruling));
       actions.appendChild(p);
     }
   }
 
-  function answer(r, decision, fp, rawId, say) {
+  function answer(r, decision, fp, rawId, say, ruling) {
     if (busy) return;
     busy++;
     const base = "/consent/" + encodeURIComponent(r.id) + "/";
-    say("asking for the answer to sign…");
-    call("POST", base + "challenge", { decision: decision, signer_fp: fp }).then((c) => {
+    say("asking for the " + (ruling ? "ruling" : "answer") + " to sign…");
+    call("POST", base + (ruling ? "rule-challenge" : "challenge"), { decision: decision, signer_fp: fp }).then((c) => {
       if (!c.ok) return say(why(c), "bad");
       say("confirm with your passkey to " + decision + "…");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
       if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
-      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + "answer", {
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + (ruling ? "rule" : "answer"), {
         payload: c.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
         client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }))
         .then((a) => {
           if (!a.ok) return say("not answered: " + why(a), "bad");
-          const done = a.body.decision === "allow" ? "allowed" : "denied";
+          const done = (ruling ? "ruled " : "") + (a.body.decision === "allow" ? "allowed" : "denied");
           last = done + " " + (r.tool || "");
-          say(done + " · signed by " + a.body.signer_fp, "ok");
+          const where = a.body.delivery && a.body.delivery.reason ? " · " + a.body.delivery.reason : "";
+          say(done + " · signed by " + a.body.signer_fp + where, "ok");
         },
               (e) => {
                 // asked for one credential and the OS had none it would use: forget it here, so the next tap is not

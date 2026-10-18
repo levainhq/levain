@@ -563,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_grant_parser(cs_sub, _ck_common)
     _add_consent_answer_parser(cs_sub)
     _add_consent_away_parser(cs_sub)
+    _add_consent_rule_parser(cs_sub)
 
     run_p = subparsers.add_parser(
         "run",
@@ -2384,6 +2385,207 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
     print(_term_safe(f"{'allowed' if decision.decision == 'allow' else 'denied'}: {decision.request_id} by "
                      f"{decision.signer_fp} at {decision.decided_at}"))
     return 0
+
+
+def _add_consent_rule_parser(cs_sub: argparse._SubParsersAction) -> None:
+    """``levain consent rule`` (a late ruling on an undecided request, R-a) and ``levain consent deliver`` under the
+    ``consent`` subparsers ``cs_sub``."""
+    queue_help = "The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent)."
+    rule = cs_sub.add_parser(
+        "rule", help="Sign a late ruling (allow or deny) on an undecided request, by its gap number.",
+        description="A request whose hold ended with no answer is UNDECIDED and numbered per agent session (gap "
+                    "#N); the agent was told it is open. This signs your ruling on it with --signing-key, in the "
+                    "ruling namespace (never an answer's), and hands it to the queue, which verifies it against a "
+                    "fresh replay of the authority log. The ruling is then delivered: a session still running gets it "
+                    "at its next step; an ended one is resumed with it as its prompt, in the directory and permission "
+                    "mode it was started in. The ledger rows of the gap's window are printed beside it. With no "
+                    "gap, lists the undecided requests.")
+    rule.add_argument("gap", nargs="?", default=None, help="The gap number (3 or #3).")
+    rule.add_argument("decision", nargs="?", choices=("allow", "deny"), default=None)
+    rule.add_argument("--session", default=None,
+                      help="The agent session the gap belongs to (its id, or a unique start of it); needed only when "
+                           "two sessions have a gap of that number.")
+    rule.add_argument("--agent", default=None, choices=("claude_code", "codex"), help="The agent, likewise.")
+    rule.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
+                      help="An enrolled key that signs the ruling (as for `levain consent answer`). An allow of an "
+                           "agent-config edit needs a laptop-presence key.")
+    rule.add_argument("--no-deliver", dest="deliver", action="store_false",
+                      help="Record the ruling only; `levain consent deliver` delivers it later.")
+    rule.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
+    rule.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                      help="The cockpit data root whose authority log verifies the ruling (as for `levain consent "
+                           "answer`).")
+    rule.add_argument("--path", type=Path, default=None,
+                      help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
+    rule.set_defaults(func=_cmd_consent_rule)
+    dlv = cs_sub.add_parser(
+        "deliver", help="Deliver every late ruling whose text has not reached its session yet.",
+        description="For a ruling left to a session's next step that never came (the session ended first): a session "
+                    "that has ended is resumed with the ruling as its prompt; one still running keeps waiting. Safe "
+                    "to run from cron or launchd: a ruling's text reaches its session once.")
+    dlv.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
+    dlv.set_defaults(func=_cmd_consent_deliver)
+
+
+def _rule_target(qdir: Path, gap_text: str, session: str | None, agent: str | None) -> object:
+    """The one undecided request with gap number ``gap_text`` (of ``session`` / ``agent`` when named), or raise
+    ``AnswerRefused`` naming the candidates."""
+    from levain.consent.queue import AnswerRefused
+
+    text = gap_text.strip().lstrip("#")
+    if not text.isdigit():
+        raise AnswerRefused(f"{gap_text!r} is not a gap number")
+    gap = int(text)
+    found = [g for g in _reading_queue(qdir).undecided_for(agent) if g.gap == gap
+             and (session is None or g.request.agent_session_id.startswith(session))]
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise AnswerRefused(f"no undecided request has gap #{gap}" + (f" in session {session}" if session else "")
+                            + "; `levain consent rule` with no gap lists them")
+    names = "; ".join(f"{g.request.agent} session {g.request.agent_session_id}" for g in found)
+    raise AnswerRefused(f"gap #{gap} names {len(found)} undecided requests ({names}); pass --session")
+
+
+def _print_gap_window(qdir: Path, gapped: object, ruled_at: str) -> None:
+    """The ledger rows of the gap's session from its undecided time to the ruling (DESIGN §3.6, the record side)."""
+    from levain.consent.ledger import DB_NAME, Ledger, reconcile
+
+    if not (qdir / DB_NAME).is_file():
+        print("  gap window: no ledger in this queue directory (no rows recorded)")
+        return
+    ledger = Ledger(qdir)
+    try:
+        reconcile(ledger, give_up_after=None, agent_session_id=gapped.request.agent_session_id)
+    except Exception as exc:  # noqa: BLE001 - a stamp left pending is shown as pending, never hidden
+        print(f"  (stamps not reconciled: {_term_safe(exc)})")
+    rows = ledger.window(gapped.request.agent, gapped.request.agent_session_id, gapped.undecided_at, ruled_at)
+    print(f"  gap window {gapped.undecided_at} .. {ruled_at}: {len(rows)} ledger row(s) in this session")
+    for c in rows:
+        print(_term_safe(f"    {c.received_at}  {c.phase:14} {c.stamp:16} {c.outcome:9} {c.tool_name}  "
+                         f"{c.tool_input_digest[:20]}"))
+
+
+def _print_delivery(d: object) -> None:
+    print(_term_safe(f"  delivery: {d.route}: {d.reason}"))
+    if d.argv:
+        import shlex
+
+        shown = [*d.argv[:-1], d.argv[-1] if len(d.argv[-1]) <= 60 else d.argv[-1][:57] + "..."]
+        print(_term_safe(f"  resume: (cd {shlex.quote(d.cwd or '')} && {shlex.join(shown)})"))
+
+
+def _delivery_queue(qdir: Path, request: object) -> object:
+    """The queue whose authority source is the cockpit the request's hook verifies against (delivery re-verifies
+    each ruling it claims)."""
+    from levain.authority import anchor_path
+    from levain.consent.answering import answer_root
+    from levain.consent.queue import ConsentQueue, authority_source
+
+    root = answer_root(qdir, request)
+    return ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+
+
+def _ruling_notify(qdir: Path, agent: str) -> object:
+    """The ping for a ruling left to a session's next step (the adapter's notify seam), or ``None``."""
+    from levain.consent.adapters import claude_code, codex
+
+    adapter = {"claude_code": claude_code, "codex": codex}.get(agent)
+    try:
+        settings = adapter.load_settings(qdir) if adapter is not None else None
+    except Exception:  # noqa: BLE001 - a ping is optional
+        return None
+    if settings is None or not getattr(settings, "notify_argv", None):
+        return None
+    return lambda text: claude_code.notify(settings, text, cwd=qdir)
+
+
+def _cmd_consent_rule(args: argparse.Namespace) -> int:
+    from levain.authority import anchor_path
+    from levain.cockpit.consent import ConsentError
+    from levain.cockpit.keys import ssh_signer
+    from levain.consent.answering import refuse_cut_display
+    from levain.consent.delivery import deliver
+    from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source
+    from levain.consent.record import RULING_NAMESPACE, ruling_message
+
+    try:
+        qdir = _consent_queue_dir(args)
+        if args.gap is None:
+            rows = _reading_queue(qdir).undecided_for(args.agent)
+            for g in rows:
+                r = g.request
+                print(_term_safe(f"gap #{g.gap}  {r.agent}  session {r.agent_session_id}  {r.tool_name}  "
+                                 f"targets {_consent_targets(r)}  {r.tier}  undecided since {g.undecided_at}"))
+            if not rows:
+                print("no undecided requests")
+            return 0
+        if args.decision is None or args.signing_key is None:
+            raise AnswerRefused("a ruling needs allow|deny and --signing-key")
+        gapped = _rule_target(qdir, args.gap, args.session, args.agent)
+        request = gapped.request
+        refuse_cut_display(request, "from the terminal")
+        root = _answer_root(args, qdir, request)
+        queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+        signer_fp, sign = ssh_signer(args.signing_key, namespace=RULING_NAMESPACE)
+        payload = queue.ruling_payload(request.id, args.decision, signer_fp)
+        print(_term_safe(f"ruling on gap #{gapped.gap}: {args.decision.upper()} ({request.id})"))
+        for label, value in (("agent", f"{request.agent} (session {request.agent_session_id})"),
+                             ("tool", request.tool_name),
+                             ("input as filed", request.display[len(request.tool_name) + 1:]),
+                             ("cwd", request.cwd), ("tier", request.tier),
+                             ("undecided since", gapped.undecided_at),
+                             ("request digest", payload["request_digest"]), ("signer", signer_fp)):
+            print(f"  {label:<15} {_term_safe(value)}")
+        sys.stdout.flush()
+        ruling = queue.answer_late(request.id, payload, sign(ruling_message(payload)))
+    except KeyboardInterrupt:
+        print("ruling cancelled", file=sys.stderr)
+        return 1
+    except (AnswerRefused, OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
+        print(f"ruling refused: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    print(_term_safe(f"ruled {ruling.ruling}: gap #{ruling.gap} ({ruling.request_id}) by {ruling.signer_fp} at "
+                     f"{ruling.decided_at}"))
+    try:
+        _print_gap_window(qdir, gapped, ruling.decided_at)
+    except Exception as exc:  # noqa: BLE001 - the ruling stands; the window is a report
+        print(f"  gap window: not read ({_term_safe(exc)})")
+    if not args.deliver:
+        print("  delivery: not attempted (--no-deliver); `levain consent deliver` delivers it")
+        return 0
+    try:
+        _print_delivery(deliver(queue, ruling.request_id, notify=_ruling_notify(qdir, request.agent)))
+    except Exception as exc:  # noqa: BLE001 - the ruling stands; its next hook or `consent deliver` delivers it
+        print(f"  delivery: failed ({_term_safe(type(exc).__name__)}: {_term_safe(exc)}); the ruling stands and "
+              "lands at the session's next step, or `levain consent deliver`")
+        return 1
+    return 0
+
+
+def _cmd_consent_deliver(args: argparse.Namespace) -> int:
+    from levain.cockpit.consent import ConsentError
+    from levain.consent.delivery import deliver
+    from levain.consent.queue import AnswerRefused, QueueStoreError
+
+    try:
+        qdir = _consent_queue_dir(args)
+        waiting = _reading_queue(qdir).undelivered_rulings()
+        if not waiting:
+            print("no ruling waits for delivery")
+        failed = 0
+        for g in waiting:
+            queue = _delivery_queue(qdir, g.request)
+            if queue.ruling_delivered(g.request.id) is not None:
+                continue                      # an earlier resume in this run carried it
+            print(_term_safe(f"gap #{g.gap} ({g.request.agent} session {g.request.agent_session_id})"))
+            d = deliver(queue, g.request.id, notify=_ruling_notify(qdir, g.request.agent))
+            _print_delivery(d)
+            failed += d.route == "failed"
+    except (AnswerRefused, OSError, QueueStoreError, ConsentError, *_cockpit_refusals()) as exc:
+        print(f"deliver: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    return 1 if failed else 0
 
 
 def _grant_expiry(text: str) -> object:

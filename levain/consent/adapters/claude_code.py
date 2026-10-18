@@ -789,15 +789,41 @@ def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
 def ruling_context(queue: ConsentQueue, session: str) -> str | None:
     """This session's late rulings not yet delivered, as DESIGN §3.6's text, one per line (claimed: each reaches
     the session once), or ``None``. The ruled allow itself still runs only through ``take_ruled_allow``."""
-    lines = []
-    for ruling in queue.claim_rulings_for(AGENT, session):
-        got = queue.get(ruling.request_id)
-        what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
-        text = RULING_TEXT.get(ruling.ruling)
-        if text is None:
-            continue  # an unknown ruling value skips that ruling only, never the rest
-        lines.append(text.format(n=ruling.gap, x=what))
+    lines = [line for line in (ruling_line(queue, r) for r in queue.claim_rulings_for(AGENT, session)) if line]
     return "\n".join(lines) or None
+
+
+def ruling_line(queue: ConsentQueue, ruling: Any) -> str | None:
+    """DESIGN §3.6's text for one claimed ruling (the hook's additionalContext, a resume's prompt), or ``None`` for an
+    unknown ruling value (which skips that ruling only, never the rest)."""
+    text = RULING_TEXT.get(ruling.ruling)
+    if text is None:
+        return None
+    got = queue.get(ruling.request_id)
+    what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
+    return text.format(n=ruling.gap, x=what)
+
+
+def resume_record(event: Mapping[str, Any]) -> dict[str, Any]:
+    """What a later resume of this hook's session needs (:meth:`ConsentQueue.file`'s ``resume``), from the hook's
+    payload and the environment Claude Code gives its hooks: ``-p`` when the entrypoint is an SDK one (``sdk-cli``
+    under ``claude -p``, measured 2.1.302), else ``interactive`` (a ``--bg`` session is not told apart here; an ended
+    one of either kind resumes as ``--bg``); the session's start directory
+    (``CLAUDE_PROJECT_DIR``, where its transcript is found), its config directory and its process."""
+    entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    project = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    cwd = project if os.path.isabs(project) else event.get("cwd")
+    mode = event.get("permission_mode")
+    config = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    try:
+        pid: int | None = int(os.environ.get("CLAUDE_PID", ""))
+    except ValueError:
+        pid = None
+    return {"invocation": "-p" if entry.startswith("sdk") else "interactive",
+            "permission_mode": mode if isinstance(mode, str) and mode else None,
+            "cwd": cwd if isinstance(cwd, str) and cwd else None,
+            "config_dir": config if os.path.isabs(config) else None,
+            "claude_pid": pid if pid is not None and pid > 0 else None}
 
 
 def _session_of(event: Mapping[str, Any]) -> str | None:
@@ -881,7 +907,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
-                             cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id)
+                             cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
+                             resume=resume_record(event))
     except Exception as exc:
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))

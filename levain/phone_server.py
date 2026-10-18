@@ -1,7 +1,7 @@
 """levain.phone_server — the phone port: answer consent requests with a passkey from a phone (Q6b).
 
 ``levain consent phone`` runs this. It is its OWN loopback listener, separate from the cockpit (``levain serve``), and
-it serves exactly four things:
+it serves exactly five things:
 
   - a static page (``/``, ``/phone.js``, ``/phone.css``) that carries no data;
   - ``GET /consent.json``: the pending consent requests and, for each, the passkey keys enrolled to answer it on
@@ -9,6 +9,9 @@ it serves exactly four things:
   - ``POST /consent/<request_id>/challenge`` and ``.../answer``: the answer record to sign and its WebAuthn
     challenge, then the passkey's assertion, which the consent queue verifies with the same ssh-keygen check as
     ``levain consent answer``;
+  - ``POST /consent/<request_id>/rule-challenge`` and ``.../rule``: the same for a late RULING on an undecided
+    request (``levain consent rule``), signed in the ruling namespace, never an answer's; once it verifies, the
+    ruling is delivered to its session (:mod:`levain.consent.delivery`);
   - ``POST /passkey/key-line``: a new passkey's OpenSSH public key and the laptop commands that enrol it (a passkey
     never enrols itself: enrolment is signed by a laptop-presence key).
 
@@ -52,7 +55,7 @@ _STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
            "/phone.css": ("phone.css", "text/css; charset=utf-8")}
 _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
-_ACTIONS = ("challenge", "answer")
+_ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _KEY_LINE = "/passkey/key-line"
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
@@ -238,7 +241,16 @@ class _PhoneServer(ThreadingHTTPServer):
             body.pop("answer_deny", None)
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             rows.append(body)
-        return {"rp_id": self.rp_id, "pending": rows, "overflow": listing.overflow, "enrolled": self._enrolled(memo)}
+        undecided = []
+        for entry in listing.undecided:
+            body = entry_body(entry)
+            body.pop("answer_allow", None)
+            body.pop("answer_deny", None)
+            body["gap"] = entry.gap
+            body["signers"], body["signer_note"] = self._signers(entry.request, memo)
+            undecided.append(body)
+        return {"rp_id": self.rp_id, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
+                "enrolled": self._enrolled(memo)}
 
     def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
         """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol
@@ -253,7 +265,10 @@ class _PhoneServer(ThreadingHTTPServer):
 
     def answer_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
         """``challenge`` ({decision, signer_fp}) -> the answer record and its WebAuthn challenge; ``answer``
-        ({payload, authenticator_data, client_data_json, signature}, base64url) -> the queue's verdict."""
+        ({payload, authenticator_data, client_data_json, signature}, base64url) -> the queue's verdict. The
+        ``rule-`` pair does the same for a late ruling on an undecided request (:meth:`rule_step`)."""
+        if action in ("rule-challenge", "rule"):
+            return self.rule_step(request_id, action, req)
         from levain.authority import AuthorityError, VerifierUnavailable
         from levain.cockpit.consent import ConsentError
         from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
@@ -303,6 +318,72 @@ class _PhoneServer(ThreadingHTTPServer):
             raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
         return {"request_id": decided.request_id, "decision": decided.decision, "signer_fp": decided.signer_fp,
                 "decided_at": decided.decided_at}
+
+    def rule_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``rule-challenge`` ({decision, signer_fp}) -> the ruling record and its WebAuthn challenge, in the ruling
+        namespace; ``rule`` ({payload, authenticator_data, client_data_json, signature}) -> the queue's verdict on the
+        ruling (:meth:`ConsentQueue.answer_late`: only an undecided request takes one), then its delivery."""
+        from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
+        from levain.consent.passkey import PasskeyError, b64url_decode, challenge, to_sshsig
+        from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source, class_covers
+        from levain.consent.record import DECISIONS, RULING_NAMESPACE, ruling_message
+
+        need = {"rule-challenge": {"decision", "signer_fp"},
+                "rule": {"payload", "authenticator_data", "client_data_json", "signature"}}[action]
+        if not isinstance(req, dict) or set(req) != need:
+            raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
+        try:
+            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)).get(request_id)
+            if got is None:
+                raise PhoneError(404, "not_found", "no such consent request")
+            request, state = got
+            if state != "undecided":
+                raise PhoneError(409, "conflict", f"request {request_id} is {state}, not undecided: a ruling answers "
+                                                  "only an undecided request")
+            refuse_cut_display(request, "from a phone")
+            source = self._source(answer_root(self.queue_dir, request))
+            keys = {k.fingerprint: k for k in passkey_keys(source(), self.rp_id)}
+            queue = ConsentQueue(self.queue_dir, authority=source)
+            if action == "rule-challenge":
+                decision, fp = req["decision"], req["signer_fp"]
+                if decision not in DECISIONS:
+                    raise PhoneError(400, "bad_request", f"decision must be one of {list(DECISIONS)}")
+                if not isinstance(fp, str) or fp not in keys:
+                    raise PhoneError(422, "no_passkey", f"{str(fp)[:80]} is not an active passkey enrolled for "
+                                                        f"{self.rp_id}")
+                if decision == "allow" and not class_covers(keys[fp].key_class, request.tier):
+                    raise PhoneError(422, "answer_refused", f"a {keys[fp].key_class} passkey cannot allow a "
+                                                            f"{request.tier} request: rule it from the laptop")
+                payload = queue.ruling_payload(request_id, decision, fp)
+                return {"payload": payload, "rp_id": self.rp_id,
+                        "challenge": _b64u(challenge(ruling_message(payload), RULING_NAMESPACE))}
+            payload = req["payload"]
+            fp = payload.get("signer_fp") if isinstance(payload, dict) else None
+            key = keys.get(fp) if isinstance(fp, str) else None
+            if key is None:
+                raise PhoneError(422, "no_passkey", f"the ruling's signer is not an active passkey enrolled for "
+                                                    f"{self.rp_id}")
+            signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
+                                  b64url_decode(req["client_data_json"], "client_data_json"),
+                                  b64url_decode(req["signature"], "signature"), namespace=RULING_NAMESPACE)
+            ruled = queue.answer_late(request_id, payload, signature)
+        except (AnswerRefused, PasskeyError, ConsentError) as exc:
+            raise PhoneError(422, "answer_refused", str(exc)) from None
+        except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
+        out = {"request_id": ruled.request_id, "decision": ruled.ruling, "signer_fp": ruled.signer_fp,
+               "decided_at": ruled.decided_at, "gap": ruled.gap}
+        try:
+            from levain.consent.delivery import deliver
+
+            d = deliver(queue, ruled.request_id)
+            out["delivery"] = {"route": d.route, "reason": d.reason}
+        except Exception as exc:  # noqa: BLE001 - the ruling stands; its session's next hook delivers it
+            out["delivery"] = {"route": "hook", "reason": f"delivery failed ({type(exc).__name__}); the ruling "
+                                                          "lands at the session's next step"}
+        return out
 
     def key_line(self, req: Any) -> dict[str, Any]:
         """``POST /passkey/key-line`` ({spki}: the new credential's ``getPublicKey()``, base64url) -> its OpenSSH

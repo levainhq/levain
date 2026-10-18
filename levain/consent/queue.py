@@ -59,8 +59,8 @@ exception, a deleted later deny, under known edges below).
 A terminal request never changes again: SQL triggers refuse any update of a terminal row, any move but
 ``pending`` to a terminal state or to ``undecided`` and ``undecided`` to ``allowed``/``denied`` by a ruling, any
 change of a request's fields, and any delete (a guard against a buggy writer; authority is the signature above).
-Gap numbers, takes of a ruled allow, deliveries of a ruling's text, resume metadata, snoozes and session
-halts (:meth:`ConsentQueue.halt`, released in the transaction of the ruling on the halting request) are
+Gap numbers, takes of a ruled allow, deliveries of a ruling's text, the resumes started to deliver one
+(:mod:`levain.consent.delivery`), resume metadata, snoozes and session halts (:meth:`ConsentQueue.halt`, released in the transaction of the ruling on the halting request) are
 append-only tables beside the request row, which they never change. Every transition writes its receipt
 (built by :mod:`levain.autonomic.receipt`) in the same transaction, so a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
 its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
@@ -143,7 +143,7 @@ RULING_SKEW = timedelta(minutes=2)
 SNOOZE_MAX_MINUTES = 7 * 24 * 60
 # how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
 INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
-_RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd"})
+_RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _ROW_COLUMNS = _FIELDS + ("state", "decided_at", "answer", "signature", "signer_fp", "note", "via")
@@ -277,6 +277,15 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS halt_releases_kept BEFORE DELETE ON halt_releases "
     "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
+    # a resume levain started to deliver a ruling to its ended session, once per ruling, written after the ruling's
+    # delivery was claimed (unsigned: what was run and whether it started, never authority)
+    "CREATE TABLE IF NOT EXISTS ruling_resumes (request_id TEXT PRIMARY KEY REFERENCES ruling_deliveries(request_id), "
+    "agent_session_id TEXT NOT NULL, argv TEXT NOT NULL, cwd TEXT NOT NULL, "
+    "outcome TEXT NOT NULL CHECK (outcome IN ('started','failed')), detail TEXT, created_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS ruling_resumes_frozen BEFORE UPDATE ON ruling_resumes "
+    "BEGIN SELECT RAISE(ABORT, 'a ruling resume is written once'); END",
+    "CREATE TRIGGER IF NOT EXISTS ruling_resumes_kept BEFORE DELETE ON ruling_resumes "
+    "BEGIN SELECT RAISE(ABORT, 'ruling resumes are never deleted'); END",
 )
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
@@ -560,12 +569,13 @@ class ConsentQueue:
             raise ConsentError(f"resume must be a mapping of {sorted(_RESUME_KEYS)} naming the invocation")
         if resume["invocation"] not in INVOCATIONS:
             raise ConsentError(f"resume invocation must be one of {INVOCATIONS}: {resume['invocation']!r}")
-        for k in ("permission_mode", "cwd"):
+        for k in ("permission_mode", "cwd", "config_dir"):
             if k in resume and resume[k] is not None and not (isinstance(resume[k], str) and resume[k]):
                 raise ConsentError(f"resume {k} must be a non-empty string or None")
-        pid = resume.get("codex_pid")
-        if pid is not None and (type(pid) is not int or pid < 1):
-            raise ConsentError("resume codex_pid must be a positive integer or None")
+        for k in ("codex_pid", "claude_pid"):
+            pid = resume.get(k)
+            if pid is not None and (type(pid) is not int or pid < 1):
+                raise ConsentError(f"resume {k} must be a positive integer or None")
         return json.dumps(dict(resume), sort_keys=True, ensure_ascii=False)
 
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
@@ -578,7 +588,8 @@ class ConsentQueue:
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
         session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
-        ``codex_pid``, ``cwd`` the original working directory), written with the request in its transaction and
+        ``codex_pid`` / ``claude_pid`` the agent's process, ``cwd`` the directory the session was started in,
+        ``config_dir`` the agent's config directory, ``None`` for its default), written with the request in its transaction and
         read back by :meth:`resume_meta`; unsigned, never authority."""
         meta = self._resume_record(resume)
         if tier not in _TIER_NEEDS:
@@ -1464,6 +1475,42 @@ class ConsentQueue:
                                      (got.request_id,)).fetchone() is not None
                 out.append(got if got.taken == taken else replace(got, taken=taken))
         return out
+
+    def ruling_delivered(self, request_id: str) -> str | None:
+        """When the request's ruling text was claimed for its session (:meth:`claim_rulings_for`), or ``None``."""
+        with self._read() as conn:
+            row = conn.execute("SELECT delivered_at FROM ruling_deliveries WHERE request_id = ?",
+                               (request_id,)).fetchone()
+        return None if row is None else row[0]
+
+    def undelivered_rulings(self) -> list[Gapped]:
+        """The ruled requests whose text has not been claimed for their session yet, oldest gap first (sealed rows
+        only; not re-verified here: delivery re-verifies when it claims)."""
+        return self._gapped("r.via = 'ruling' AND r.state IN ('allowed','denied') AND NOT EXISTS "
+                            "(SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id)", ())
+
+    def record_resume(self, request_ids: list[str], *, agent_session_id: str, argv: list[str], cwd: str,
+                      outcome: str, detail: str | None = None) -> None:
+        """Record the resume levain started (or failed to start) to deliver these rulings, whose delivery was
+        already claimed: one row per ruling, written once. Unsigned."""
+        if outcome not in ("started", "failed"):
+            raise ConsentError(f"outcome must be started or failed: {outcome!r}")
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            conn.executemany("INSERT OR IGNORE INTO ruling_resumes (request_id, agent_session_id, argv, cwd, outcome, "
+                             "detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             [(rid, agent_session_id, json.dumps(argv, ensure_ascii=False), cwd, outcome, detail, stamp)
+                              for rid in request_ids])
+
+    def resume_record(self, request_id: str) -> dict[str, Any] | None:
+        """The resume recorded for this request's ruling (:meth:`record_resume`), or ``None``."""
+        with self._read() as conn:
+            row = conn.execute("SELECT agent_session_id, argv, cwd, outcome, detail, created_at FROM ruling_resumes "
+                               "WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return {"agent_session_id": row[0], "argv": json.loads(row[1]), "cwd": row[2], "outcome": row[3],
+                "detail": row[4], "created_at": row[5]}
 
     # --- standing grants (Q4) --------------------------------------------------------------------------
     def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,
