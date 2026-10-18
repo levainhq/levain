@@ -2429,18 +2429,11 @@ def _add_consent_rule_parser(cs_sub: argparse._SubParsersAction) -> None:
     dlv.set_defaults(func=_cmd_consent_deliver)
 
 
-# how far back a ruled gap still makes a bare gap number ambiguous (an undecided one always does)
-_GAP_NAME_WINDOW_DAYS = 7
-
-
 def _rule_target(qdir: Path, gap_text: str, session: str | None, agent: str | None) -> object:
     """The one undecided request named by ``gap_text`` (``3``, ``#3``, ``3@a1b2c3``; of ``session`` / ``agent`` when
     named), or raise ``AnswerRefused`` naming the candidates. Gap numbers start at 1 in every session, so a bare
-    number is refused when that number names a gap in more than one session, ruled ones of the last
-    :data:`_GAP_NAME_WINDOW_DAYS` days included: a gap already ruled must never let the number fall through to another
-    session's gap."""
-    from datetime import datetime, timedelta, timezone
-
+    number is refused when that number names a gap in more than one session, ruled ones of any age included: a gap
+    already ruled must never let the number fall through to another session's gap."""
     from levain.consent.queue import AnswerRefused, gap_label, session_handle
 
     if session is not None and not session.strip():
@@ -2449,8 +2442,7 @@ def _rule_target(qdir: Path, gap_text: str, session: str | None, agent: str | No
     if not number.isdigit() or (at and not handle):
         raise AnswerRefused(f"{gap_text!r} is not a gap (3, #3 or 3@a1b2c3)")
     gap = int(number)
-    since = datetime.now(timezone.utc) - timedelta(days=_GAP_NAME_WINDOW_DAYS)
-    found = [g for g in _reading_queue(qdir).gapped(agent, since=since) if g.gap == gap
+    found = [g for g in _reading_queue(qdir).gapped(agent) if g.gap == gap
              and (not handle or session_handle(g.request.agent_session_id) == handle
                   or g.request.agent_session_id.startswith(handle))
              and (session is None or g.request.agent_session_id.startswith(session))]

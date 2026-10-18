@@ -234,11 +234,15 @@ def _settings(path: Path) -> dict[str, Any]:
 
 def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     """Why a Claude Code session resumed in ``cwd`` under ``config_dir`` would not run levain's gate, or ``None``:
-    the gate entry (``<python> -EP -m levain.hookrun <...>/consent_claude_code.py``, an existing script) must be in
-    the project's or the user's settings, and no settings file the resume loads may set ``disableAllHooks``."""
+    the project's or the user's settings must hold the gate entry in the exact shape ``install`` writes (a
+    ``PreToolUse`` group with matcher ``*`` whose handler is ``type`` command, the command
+    ``<python> -EP -m levain.hookrun <...>/consent_claude_code.py`` on an existing script, ``onFailure`` block and
+    ``timeout`` :data:`GATE_TIMEOUT`, no other field), and no settings file the resume loads may set
+    ``disableAllHooks``. A lookalike entry (another matcher, a non-blocking one) gates less than every call, so the
+    reason names the field that differs."""
     import shlex
 
-    from levain.consent.adapters.claude_code import GATE_EVENT, HOOK_FLAGS, HOOKRUN
+    from levain.consent.adapters.claude_code import GATE_EVENT, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN
     from levain.install import CONSENT_HOOK_SCRIPTS
 
     user = Path(config_dir) if config_dir else Path.home() / ".claude"
@@ -248,6 +252,8 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     off = [str(f) for f, doc in files.items() if doc.get("disableAllHooks") is True]
     if off:
         return f"{off[0]} turns every hook off"
+    want = {"type": "command", "onFailure": "block", "timeout": GATE_TIMEOUT}
+    lookalike = None
     for f in (project / "settings.json", user / "settings.json"):
         hooks = files[f].get("hooks")
         groups = hooks.get(GATE_EVENT) if isinstance(hooks, dict) else None
@@ -258,11 +264,17 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
                                                                                             str) else []
                 except ValueError:
                     continue
-                if (len(tokens) == 5 and tokens[1:4] == [HOOK_FLAGS, *HOOKRUN]
+                if not (len(tokens) == 5 and tokens[1:4] == [HOOK_FLAGS, *HOOKRUN]
                         and os.path.basename(tokens[4]) == CONSENT_HOOK_SCRIPTS["claude-code"]
                         and os.path.isfile(tokens[4])):
+                    continue
+                bad = ([] if group.get("matcher") == "*" else [f"matcher {group.get('matcher')!r}"]) + [
+                    f"{k} {h.get(k)!r}" for k, v in want.items() if h.get(k) != v or type(h.get(k)) is not type(v)]
+                bad += [f"extra field {k!r}" for k in h if k not in ("command", *want)]
+                if not bad:
                     return None
-    return "no levain gate is installed in the settings it would load"
+                lookalike = lookalike or f"the gate entry in {f} is not the one levain installs ({', '.join(bad)})"
+    return lookalike or "no levain gate is installed in the settings it would load"
 
 
 def option_names(argv_text: str) -> str:
@@ -399,15 +411,17 @@ def plan(queue: ConsentQueue, request_id: str, *,
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:
     """Start ``argv`` detached in ``cwd``, its output to ``log``, and watch it :data:`RESUME_SETTLE` seconds: ``None``
-    when it is still running then or exited 0 (confirmed), else why it failed. A child still running is reaped by a
-    daemon thread, so a long-lived caller keeps no zombie."""
+    when it is still running then or exited 0 (confirmed), else why it failed. Any exception before ``Popen``
+    returns (an argv with a NUL byte raises ``ValueError``) is a failure: no child is running. One raised after
+    that propagates, since a child may then be running. A child still running is reaped by a daemon thread, so a
+    long-lived caller keeps no zombie."""
     settle = RESUME_SETTLE
     try:
         log.parent.mkdir(mode=0o700, exist_ok=True)
         with open(log, "ab") as fh:
             proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=fh,
                                     stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 - Popen raised, so nothing was started: a retryable failure
         return f"{type(exc).__name__}: {exc}"
     try:
         code = proc.wait(timeout=settle)
@@ -477,10 +491,19 @@ def deliver(queue: ConsentQueue, request_id: str, *,
                 got = replace(got, route="hook", argv=(), reason="its ruling could not be verified now, so nothing "
                                                                  "was started; the ruling lands at its next step")
         else:
-            lines = [line for line in (ruling_line(queue, r, quote=True) for r in leased) if line]
-            argv = [*got.argv, "\n".join([*lines, QUOTED_NOTE])]
             ids = tuple(r.request_id for r in leased)
-            why = launch(argv, got.cwd or "", _env(got.agent, meta), Path(queue.directory) / "resumes" / f"{ids[0]}.log")
+            argv = list(got.argv)
+            try:
+                lines = [line for line in (ruling_line(queue, r, quote=True) for r in leased) if line]
+                argv = [*got.argv, "\n".join([*lines, QUOTED_NOTE])]
+                env = _env(got.agent, meta)
+                log = Path(queue.directory) / "resumes" / f"{ids[0]}.log"
+            except Exception as exc:  # noqa: BLE001 - nothing was started: the lease settles failed, so it is retried
+                why = f"the resume could not be prepared ({type(exc).__name__}: {exc})"
+            else:
+                # ``launch`` turns every exception before the child is spawned into a reason; one it raises
+                # leaves the lease unsettled, read as unconfirmed (a child may be running)
+                why = launch(argv, got.cwd or "", env, log)
             queue.settle_resume(list(ids), agent_session_id=got.session, argv=argv, cwd=got.cwd or "",
                                 outcome="started" if why is None else "failed", detail=why)
             if why is None:

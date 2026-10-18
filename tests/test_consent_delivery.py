@@ -7,12 +7,14 @@ so neither ``levain consent deliver`` nor the session's next hook could ever del
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
 from datetime import timedelta
 
 from levain.consent import delivery
+from levain.consent.adapters.claude_code import GATE_TIMEOUT
 from levain.consent.record import RULING_NAMESPACE, ruling_message
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
 
@@ -27,9 +29,10 @@ def _ended_session_ruled(queue, keys, tmp_path, decision):
     script.parent.mkdir(parents=True)
     script.write_text("")
     (cwd / ".claude").mkdir()
-    (cwd / ".claude" / "settings.json").write_text(
-        '{"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": '
-        f'"/usr/bin/python3 -EP -m levain.hookrun {script}"}}]}}]}}}}')
+    gate = {"type": "command", "command": f"/usr/bin/python3 -EP -m levain.hookrun {script}",
+            "timeout": GATE_TIMEOUT, "onFailure": "block"}      # the canonical gate entry
+    (cwd / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*",
+                                                                                          "hooks": [gate]}]}}))
     transcript = cfg / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{session}.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text("{}\n")
