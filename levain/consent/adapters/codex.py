@@ -53,7 +53,9 @@ Known edges of the PreToolUse gate (each measured or read, none built against):
 - a subagent's ``session_id`` as the root's is read from Codex's source, not measured beyond the latch run;
 - ``config/batchWrite``'s upsert merge of ``hooks.state`` is unmeasured beyond the keys levain writes;
 - a queue store that exists and cannot be read denies every Codex call on the machine (deliberate: a halt cannot
-  then be ruled out).
+  then be ruled out);
+- the gate's last halt read and its allow are two statements, so a sibling call's halt landing between them lets
+  that one allow through (the read is the last statement before the return, so the window is the return itself).
 """
 from __future__ import annotations
 
@@ -520,16 +522,25 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     qdir = Path(queue.directory)
     note = lambda **kw: _ledger_note(qdir, event, session, tool_name, tool_input, cwd, **kw)  # noqa: E731
 
+    def halt_wins(request_id: str | None) -> dict[str, Any] | None:
+        halted = queue.is_halted(AGENT, session)
+        if halted is None:
+            return None
+        note(refused="halted", request_id=request_id)
+        return _deny(HALT_TEXT.format(n=halted))
+
     def deliver(decision: Decision) -> dict[str, Any]:
         # an allow only while the session is still not halted: a sibling call's undecided deny may have halted it
-        # while this one waited (L3 r1 codex 4)
-        if decision.decision == "allow":
-            halted = queue.is_halted(AGENT, session)
-            if halted is not None:
-                note(refused="halted", request_id=decision.request_id)
-                return _deny(HALT_TEXT.format(n=halted))
+        # while this one waited (L3 r1 codex 4). Read before the ledger note, so the common case logs no allow,
+        # and again as the last statement before the return, so the window left is the return itself (r2 codex 4)
+        if decision.decision != "allow":
+            note(decision=decision)
+            return gate_output(decision)
+        out = halt_wins(decision.request_id)
+        if out is not None:
+            return out
         note(decision=decision)
-        return gate_output(decision)
+        return halt_wins(decision.request_id) or gate_output(decision)
 
     tier: str | None = "irreversible"           # until classified: a failure before that denies with the latch's tier
     what = "this call"
@@ -569,7 +580,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                                         still_away=still_away)
             if got is None and back:
                 if queue.withdraw(request.id, note=f"away mode ended ({back}); Codex's approval asks"):
-                    return None
+                    return halt_wins(request.id)  # Codex's approval asks only a session that is not halted
                 # not pending any more: an answer may have landed between the wait and the withdraw
                 got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
                 return deliver(got) if got is not None else None
@@ -1044,11 +1055,15 @@ def _gate_entries(doc: Any) -> list[tuple[int, int, Mapping[str, Any], Mapping[s
     return out
 
 
-def gate_entry_differences(group: Mapping[str, Any], handler: Mapping[str, Any], script: Path) -> list[str]:
+def gate_entry_differences(group: Mapping[str, Any], handler: Mapping[str, Any], script: Path,
+                           python: str | None = None) -> list[str]:
     """How a gate entry differs from levain's render (empty when it does not): matcher ``*``, a handler of exactly
     ``type`` command, ``timeout`` :data:`GATE_TIMEOUT` (no ``async``, ``statusMessage`` or other field) and the
-    command ``<interpreter> -EP -m levain.hookrun <script>``. A narrowed matcher, an async handler or a short timeout
-    keeps Codex's trust once re-trusted and still lets the call run (L3 r1 codex 3)."""
+    command ``<python> -EP -m levain.hookrun <script>``, where ``<python>`` is ``python`` (default: this levain's
+    own, ``sys.executable``), absolute and equal. A narrowed matcher, an async handler, a short
+    timeout or another interpreter keeps Codex's trust once re-trusted and still lets the call run (L3 r1 codex 3,
+    r2 codex 3)."""
+    python = os.path.abspath(python or sys.executable)
     out = []
     if group.get("matcher") != "*":
         out.append(f"matcher {group.get('matcher')!r} (levain's is '*')")
@@ -1065,6 +1080,8 @@ def gate_entry_differences(group: Mapping[str, Any], handler: Mapping[str, Any],
         tokens = []
     if len(tokens) != 5 or tokens[1:4] != [HOOK_FLAGS, *HOOKRUN] or tokens[4] != str(script):
         out.append("command (not levain's '<python> -EP -m levain.hookrun <script>')")
+    elif tokens[0] != python:
+        out.append(f"interpreter {tokens[0]!r} (levain's is {python!r})")
     return out
 
 
@@ -1172,11 +1189,12 @@ def untrusted_hooks(hooks_path: Path, expected_text: str, *, home: Path | None =
 
 
 def gate_trust(hooks_path: Path, script: Path, *, home: Path | None = None, codex_bin: str | None = None,
-               timeout: float = TRUST_TIMEOUT) -> TrustStatus:
+               timeout: float = TRUST_TIMEOUT, python: str | None = None) -> TrustStatus:
     """Whether Codex will run levain's PreToolUse gate in CODEX_HOME's ``hooks_path`` (the entry running
     ``script``), by Codex's own verdict: ``trusted`` only when the entry is exactly levain's render
-    (:func:`gate_entry_differences`), ``script`` is the package's own (:func:`gate_script_intact`) and Codex's
-    ``hooks/list`` reports it trusted, enabled and with ``currentHash`` equal to :func:`hook_trusted_hash`.
+    (:func:`gate_entry_differences`, its interpreter ``python``), ``script`` is the package's own
+    (:func:`gate_script_intact`) and Codex's ``hooks/list`` reports it trusted, enabled and with ``currentHash``
+    equal to :func:`hook_trusted_hash`.
     Otherwise ``absent`` (no gate entry runs ``script``), ``changed`` (the entry differs from levain's render,
     or Codex lists it modified), ``script_changed``, ``untrusted``, ``disabled``, ``formula_mismatch`` (Codex hashes
     the entry differently: this Codex is not the one the formula was measured on), ``unlisted``, ``unknown``, or,
@@ -1194,7 +1212,7 @@ def gate_trust(hooks_path: Path, script: Path, *, home: Path | None = None, code
     if found is None:
         return TrustStatus("absent", f"no levain PreToolUse gate in {hooks_path}")
     g, h, group, handler = found
-    diffs = gate_entry_differences(group, handler, script)
+    diffs = gate_entry_differences(group, handler, script, python)
     if diffs:
         return TrustStatus("changed", "the gate entry differs from levain's render: " + "; ".join(diffs))
     digest = hook_trusted_hash(GATE_EVENT, group, handler)

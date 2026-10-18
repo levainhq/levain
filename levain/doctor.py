@@ -2940,10 +2940,10 @@ def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -
     settings = codex.load_settings(_consent_queue_dir())
     if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
         return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list), but "
-                            "nothing can decide a gated call now: no active key whose class signs T3 and away is "
-                            "not on by your word, so agent config and hook edits run without a question",
-                            "Enrol a laptop-presence key in this install's cockpit, or `levain consent away on` "
-                            "to hold them.", warn=True)]
+                            "nothing can decide a gated call now: no active key whose class signs T3 (away mode "
+                            "alone does not count: no key could answer a held call), so agent config and hook "
+                            "edits run without a question",
+                            "Enrol a laptop-presence key in this install's cockpit.", warn=True)]
     return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list: trusted, "
                         "enabled, levain's hash)")]
 

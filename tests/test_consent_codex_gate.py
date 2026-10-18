@@ -69,15 +69,16 @@ def test_trusted_hash_is_codex_own_and_doctor_reads_trust(tmp_path):
     hooks = home / "hooks.json"
     hooks.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [handler]}]}}))
     no_codex = "/nonexistent/levain-test-codex"  # config.toml is read; Codex's own verdict cannot be
-    assert cx.gate_trust(hooks, script, home=home, codex_bin=no_codex).status == "untrusted"
+    assert cx.gate_trust(hooks, script, home=home, codex_bin=no_codex, python="/py").status == "untrusted"
     digest = cx.hook_trusted_hash("PreToolUse", {"matcher": "*"}, handler)
     (home / "config.toml").write_text(f'[hooks.state."{hooks}:pre_tool_use:0:0"]\ntrusted_hash = "{digest}"\n')
-    assert cx.gate_trust(hooks, script, home=home, codex_bin=no_codex).status == "unconfirmed"  # never GREEN
+    got = cx.gate_trust(hooks, script, home=home, codex_bin=no_codex, python="/py")
+    assert got.status == "unconfirmed"  # never GREEN
     script.write_text(script.read_text() + "\n")  # Codex hashes the command, so only levain sees this
-    assert cx.gate_trust(hooks, script, home=home, codex_bin=no_codex).status == "script_changed"
+    assert cx.gate_trust(hooks, script, home=home, codex_bin=no_codex, python="/py").status == "script_changed"
     script.write_bytes(cx.GATE_SCRIPT_SOURCE.read_bytes())
     for group in ({"matcher": "Bash"}, {"matcher": "*", "async": True}, {"matcher": "*", "timeout": 600}):
         h = {**handler, **{k: v for k, v in group.items() if k != "matcher"}}
         hooks.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": group["matcher"], "hooks": [h]}]}}))
-        got = cx.gate_trust(hooks, script, home=home, codex_bin=no_codex)
+        got = cx.gate_trust(hooks, script, home=home, codex_bin=no_codex, python="/py")
         assert got.status == "changed" and "differs from levain's render" in got.detail, (group, got)

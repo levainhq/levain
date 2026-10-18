@@ -4158,20 +4158,23 @@ def _trust_codex_hooks(codex_home: Path, hooks_text: str, emit: Callable[[str], 
     with no warning, so a hook left untrusted is said here, never failed on: `levain doctor` reports the gate RED
     until it is trusted. True when every hook is trusted (or, ``quiet``, when the file is not levain's render, so
     not this run's to trust); the callers list a False for review (a non-zero exit).
-    ``quiet`` (update): Codex is not asked when config.toml already trusts every hook as rendered, the gate's
-    script is the package's and the installed Codex is a tested version (another version may hash differently);
-    nothing is said on success or when the file is not levain's render (update stages such a file and says so
-    itself)."""
+    ``quiet`` (update): no trust is written when config.toml already trusts every hook as rendered, the installed
+    Codex is a tested version (another version may hash differently) and Codex's own ``hooks/list`` reports the
+    gate trusted (:func:`levain.consent.adapters.codex.gate_trust`: config.toml's hashes stay current while Codex
+    skips user hooks, managed-only; L3 r2 codex 1). A Codex that cannot be asked takes the trust write, which
+    asks it again and says so when it fails: never a silent success. Nothing is said on success or when the file
+    is not levain's render (update stages such a file and says so itself)."""
     from levain.consent.adapters.codex import (
-        _command_script, _gate_entries, gate_script_intact, untrusted_hooks, write_hook_trust,
+        _command_script, _gate_entries, gate_trust, untrusted_hooks, write_hook_trust,
     )
     from levain.consent.canary import TESTED_VERSIONS, agent_version
 
     hooks = codex_home / "hooks.json"
     if quiet and untrusted_hooks(hooks, hooks_text, home=codex_home) == [] \
-            and all(gate_script_intact(_command_script(handler))
-                    for _g, _h, _group, handler in _gate_entries(json.loads(hooks_text))) \
-            and agent_version("codex") in TESTED_VERSIONS["codex"]:
+            and agent_version("codex") in TESTED_VERSIONS["codex"] \
+            and all(script is not None and gate_trust(hooks, script, home=codex_home).status == "trusted"
+                    for script in (_command_script(handler)
+                                   for _g, _h, _group, handler in _gate_entries(json.loads(hooks_text)))):
         return True
     results, why = write_hook_trust(hooks, hooks_text, home=codex_home)
     if why is not None:

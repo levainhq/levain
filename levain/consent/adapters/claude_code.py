@@ -288,8 +288,9 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
-    a standing grant never does (L3 r1 codex 6)."""
-    if settings.away_mode:
+    a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
+    (L3 r1 codex 6, r2)."""
+    if settings.away_mode and tier != AGENT_CONFIG_TIER:
         return False
     root = settings.cockpit_data_root
     if not root or not (Path(root) / "cockpit.db").is_file():
