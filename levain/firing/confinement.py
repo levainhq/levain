@@ -589,7 +589,9 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
     Every symlink anywhere below an existing root is resolved component-by-component, including
     symlinks encountered in a link's target. Final targets receive the write deny; every link
     dentry and every ancestor of a link or final target receives only a literal relocation pin.
-    Directory identities bound recursive traversal, while link identities detect a chain loop.
+    Directory identities bound recursive traversal, while link identities plus the remaining
+    component suffix detect a chain loop. A dangling chain contributes its first missing component
+    as an exact write target instead of making the floor unavailable.
     """
     roots: list[Path] = []
     directory_targets: list[Path] = []
@@ -608,19 +610,31 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
             raise error
         raise error from exc
 
-    def resolve_chain(path: Path) -> tuple[Path, list[Path]]:
-        """Resolve an existing path and expose every symlink dentry traversed."""
+    def resolve_chain(path: Path) -> tuple[Path, list[Path], bool]:
+        """Resolve ``path`` in kernel order and expose every symlink dentry traversed.
+
+        The boolean says whether the returned target exists. For a dangling chain the target is the
+        first missing component: creating that exact entry is what would make the kernel advance
+        farther through the formerly broken link, so it is the literal the policy must deny.
+        """
         absolute = Path(os.path.abspath(path))
         pending = list(absolute.parts[1:])
         current = Path(absolute.anchor)
         chain: list[Path] = []
-        seen_links: set[tuple[int, int]] = set()
+        seen_links: set[tuple[int, int, tuple[str, ...]]] = set()
         followed = 0
         while pending:
             component = pending.pop(0)
+            if component in ("", "."):
+                continue
+            if component == "..":
+                current = current.parent
+                continue
             candidate = current / component
             try:
                 st = os.lstat(candidate)
+            except FileNotFoundError:
+                return candidate, chain, False
             except (OSError, ValueError) as exc:
                 refuse(candidate, f"an unresolvable symlink hop ({exc})", exc)
             if not stat.S_ISLNK(st.st_mode):
@@ -629,7 +643,7 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
             followed += 1
             if followed > _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS:
                 refuse(path, f"a symlink chain past {_PERSISTENCE_AGENT_MAX_SYMLINK_HOPS} hops")
-            identity = (st.st_dev, st.st_ino)
+            identity = (st.st_dev, st.st_ino, tuple(pending))
             if identity in seen_links:
                 refuse(candidate, "a symlink loop")
             seen_links.add(identity)
@@ -638,16 +652,25 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
                 value = Path(os.readlink(candidate))
             except OSError as exc:
                 refuse(candidate, f"an unresolvable symlink hop ({exc})", exc)
-            target = value if value.is_absolute() else candidate.parent / value
-            target = Path(os.path.abspath(target))
-            pending = list(target.parts[1:]) + pending
-            current = Path(target.anchor)
-        return current, chain
+            # Do not abspath the whole target: that would collapse ``jump/..`` before ``jump`` was
+            # followed. Consume raw components and apply ``..`` to the already-resolved current
+            # directory, exactly as pathname lookup does.
+            if value.is_absolute():
+                current = Path(value.anchor)
+                target_parts = list(value.parts[1:])
+            else:
+                current = candidate.parent
+                target_parts = list(value.parts)
+            pending = target_parts + pending
+        return current, chain, True
 
     def classify(source: Path) -> None:
-        target, chain = resolve_chain(source)
+        target, chain, exists = resolve_chain(source)
         links.extend(chain)
         final_targets.append(target)
+        if not exists:
+            file_targets.append(target)
+            return
         try:
             st = os.lstat(target)
         except (OSError, ValueError) as exc:
@@ -709,8 +732,12 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
                 roots.extend((raw, raw.parent.resolve() / raw.name))
             except (OSError, RuntimeError, ValueError) as exc:
                 refuse(raw, f"an unresolvable parent ({exc})", exc)
-            if not os.path.lexists(raw):
+            try:
+                os.lstat(raw)
+            except FileNotFoundError:
                 continue
+            except (OSError, ValueError) as exc:
+                refuse(raw, f"an entry whose existence cannot be inspected ({exc})", exc)
             classify(raw)
 
     scan_protected_directories()
@@ -718,8 +745,10 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
     root_t = _dedup_paths(roots)
     dir_t = tuple(sorted(_dedup_paths(directory_targets), key=str))
     file_t = tuple(sorted(_dedup_paths(file_targets), key=str))
-    pin_sources = [*links, *final_targets]
-    pins = tuple(sorted(_dedup_paths([*links, *_write_deny_ancestors(pin_sources)]), key=str))
+    # Roots are load-bearing even while absent: pinning their ancestors prevents moving HOME or the
+    # workspace aside, planting below the alternate name, and moving it back around the root regex.
+    pin_sources = [*root_t, *links, *final_targets]
+    pins = tuple(sorted(_dedup_paths([*root_t, *links, *_write_deny_ancestors(pin_sources)]), key=str))
     return root_t, dir_t, file_t, pins
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
@@ -2823,12 +2852,12 @@ def persistence_agent_pin_reason(policy: CrownJewelsPolicy, path: Path | str) ->
     try:
         expanded = Path(path).expanduser()
         lexical = Path(os.path.abspath(expanded))
-        resolved = expanded.resolve()
+        dentry = lexical.parent.resolve() / lexical.name
     except (ValueError, OSError, RuntimeError) as exc:
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
     for pin in policy.persistence_agent_pins:
         if (_canon(str(lexical)) == _canon(str(pin))
-                or _canon(str(resolved)) == _canon(str(pin))):
+                or _canon(str(dentry)) == _canon(str(pin))):
             return f"{lexical} is a pinned agent-directory symlink hop or ancestor"
     return None
 
