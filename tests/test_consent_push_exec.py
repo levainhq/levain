@@ -282,7 +282,8 @@ def test_d_callers_git_env_has_no_effect(world, monkeypatch):
         monkeypatch.setenv(k, v)
     assert push.git_env()["GIT_TERMINAL_PROMPT"] == "0"
     assert sorted(k for k in push.git_env() if k.startswith("GIT_")) == [
-        "GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT"]
+        "GIT_ALLOW_PROTOCOL", "GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT"]
+    assert push.git_env()["GIT_ALLOW_PROTOCOL"] == "" and push.git_env("file")["GIT_ALLOW_PROTOCOL"] == "file"
     res = world.run()
     assert res.ok and world.remote_sha("refs/heads/claude/x") == tip
     assert world.git(f"--git-dir={world.evil}", "for-each-ref", env={"PATH": os.environ["PATH"]}).stdout == ""
@@ -719,3 +720,159 @@ def test_toctou_a_different_real_repo_at_the_same_path_refuses(world):
     with pytest.raises(push.PushRefused, match="a different repository"):
         world.run(refusal=swap)
     assert world.remote_sha("refs/heads/claude/x") is None
+
+
+# --- round 3: transport bounded, the record after the intent line (L3 r2, DESIGN_r3) ---------------------------
+
+def _after_the_check(monkeypatch, plant):
+    """Run ``plant`` right after the under-lock topology check (the 2nd call), i.e. between the scan and the
+    fetch: the agent writes into its repo once levain has looked."""
+    real, calls = push._repo_topology, []
+
+    def hooked(path):
+        out = real(path)
+        calls.append(path)
+        if len(calls) == 2:
+            plant()
+        return out
+    monkeypatch.setattr(push, "_repo_topology", hooked)
+    return calls
+
+
+@pytest.mark.parametrize("how", ["ext", "ext-via-insteadof", "ssh-command", "fd"])
+def test_transport_planted_after_the_check_never_runs(world, monkeypatch, how):
+    """DESIGN_r3 item 1, RUN: after the check the agent makes its repo a partial clone whose promisor is an
+    ext::/fd::/ssh transport and deletes a blob the tip needs, so upload-pack must lazy-fetch it. A git that
+    lazy-fetches anyway (an older one that ignores GIT_NO_LAZY_FETCH; simulated by GIT_NO_LAZY_FETCH=0, which
+    re-enables it in upload-pack) must still refuse the transport: the marker stays absent."""
+    (world.proj / "f.txt").write_text("needed\n")
+    world.git("-C", world.proj, "add", "f.txt")
+    world.commit("blob")
+    blob = world.git("-C", world.proj, "rev-parse", "HEAD:f.txt").stdout.strip()
+    mark = world.marks / "transport.fired"
+    ssh = world.marker("lazy-ssh")
+    url = {"ext": f"ext::sh -c touch% {mark}", "ext-via-insteadof": "ssh://evil.invalid/x",
+           "ssh-command": "ssh://evil.invalid/x", "fd": "fd::7"}[how]
+
+    def plant():
+        g = ["-C", world.proj, "config"]
+        world.git(*g, "core.repositoryformatversion", "1")
+        world.git(*g, "extensions.partialclone", "evil")
+        world.git(*g, "remote.evil.promisor", "true")
+        world.git(*g, "remote.evil.url", url)
+        world.git(*g, "protocol.ext.allow", "always")
+        world.git(*g, "protocol.fd.allow", "always")
+        world.git(*g, "protocol.allow", "always")
+        if how == "ext-via-insteadof":
+            world.git(*g, f"url.ext::sh -c touch% {mark}% #.insteadOf", "ssh://evil.invalid/")
+        if how == "ssh-command":
+            world.git(*g, "core.sshCommand", ssh)
+        (world.proj / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+
+    real_env = push.git_env
+
+    def lazy_env(protocols=""):
+        env = real_env(protocols)
+        env["GIT_NO_LAZY_FETCH"] = "0"
+        return env
+    monkeypatch.setattr(push, "git_env", lazy_env)
+    calls = _after_the_check(monkeypatch, plant)
+    with pytest.raises(push.PushRefused, match="could not read branch"):
+        world.run()
+    assert len(calls) == 2
+    assert not mark.exists() and world.fired() == []
+    assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []
+
+
+def test_push_protocol_is_the_destinations_scheme_only():
+    assert push.push_protocol(push.canonical_remote("ssh://git@h/r")) == "ssh"
+    assert push.push_protocol(push.canonical_remote("git@h:r.git")) == "ssh"
+    assert push.push_protocol(push.canonical_remote("https://h/r")) == "https"
+    assert push.push_protocol(push.canonical_remote("file:///r.git")) == "file"
+
+
+def test_fetch_and_push_run_with_only_their_own_protocol(world, monkeypatch):
+    real, seen = push._git, []
+
+    def spy(argv, **kw):
+        sub = next((a for a in argv if a in ("fetch", "push")), None)
+        seen.append((sub, kw.get("protocols", "")))
+        return real(argv, **kw)
+    monkeypatch.setattr(push, "_git", spy)
+    assert world.run().ok
+    assert [x for x in seen if x[0]] == [("fetch", "file"), ("push", "file")]
+    assert {p for sub, p in seen if not sub} == {""}
+
+
+def test_d8_invalid_utf8_from_a_remote_hook_still_records(world):
+    """A destination hook prints bytes that are not UTF-8 after accepting the update. The push landed: the done
+    line and the receipt must both be written (round 2: UnicodeDecodeError escaped and wrote neither)."""
+    hook = world.remote / "hooks" / "post-receive"
+    hook.write_text("#!/bin/sh\nprintf 'bad \\377\\376 bytes\\n' >&2\nexit 0\n")
+    hook.chmod(0o755)
+    tip = world.tip()
+    res = world.run()
+    assert (res.ok, res.status) == (True, "new") and world.remote_sha("refs/heads/claude/x") == tip
+    assert [r["status"] for r in world.receipts] == ["new"]
+    key = push.repo_key(str(world.proj))
+    lines = [json.loads(x) for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert [(x["state"], x.get("status")) for x in lines] == [("intent", None), ("done", "new")]
+
+
+def test_d8_any_exception_after_the_intent_is_an_unknown_outcome(world, monkeypatch):
+    real = push._git
+
+    def boom(argv, **kw):
+        if "push" in argv:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return real(argv, **kw)
+    monkeypatch.setattr(push, "_git", boom)
+    with pytest.raises(push.PushOutcomeUnknown) as ei:
+        world.run()
+    assert ei.value.result.status == "unknown" and "UnicodeDecodeError" in ei.value.result.detail
+    assert [r["status"] for r in world.receipts] == ["unknown"]
+    key = push.repo_key(str(world.proj))
+    states = [json.loads(x)["state"] for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert states == ["intent", "done"]
+
+
+def test_d10_git_resolved_before_the_intent_line(world, monkeypatch):
+    """The push's git is resolved before the intent line, and the push itself does not resolve it again (a
+    refusal there would leave an intent with no done line)."""
+    order, real_gb, real_j = [], push.git_bin, push._journal
+
+    def gb():
+        order.append("git_bin")
+        return real_gb()
+
+    def j(home, key, record):
+        order.append(record["state"])
+        return real_j(home, key, record)
+    monkeypatch.setattr(push, "git_bin", gb)
+    monkeypatch.setattr(push, "_journal", j)
+    assert world.run().ok
+    i, d = order.index("intent"), order.index("done")
+    assert order[i - 1] == "git_bin" and "git_bin" not in order[i:d]
+
+
+def test_private_dir_fsyncs_the_parent_only_when_it_creates(world, monkeypatch):
+    real_fsync, synced = os.fsync, []
+
+    def spy(fd):
+        st = os.fstat(fd)
+        import stat as st_
+        if st_.S_ISDIR(st.st_mode):
+            synced.append(st.st_ino)
+        return real_fsync(fd)
+    monkeypatch.setattr(push.os, "fsync", spy)
+    push._private_dir(world.lhome / "push")
+    assert synced == [os.stat(world.lhome).st_ino]
+    push._private_dir(world.lhome / "push")
+    assert synced == [os.stat(world.lhome).st_ino]
+
+
+def test_d11_the_object_store_walk_is_capped(world, monkeypatch):
+    monkeypatch.setattr(push, "MAX_OBJECT_ENTRIES", 3)
+    with pytest.raises(push.PushRefused, match="more than 3 entries"):
+        world.run()
+    assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []

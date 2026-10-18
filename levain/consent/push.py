@@ -20,7 +20,7 @@ bare mirror (a fetch runs the source's ``upload-pack``, which runs no hook and h
 ``uploadpack.packObjectsHook`` only from protected config; measured on Apple git 2.50.1, case c of
 ``tests/test_consent_push_exec.py``), and the push runs from the mirror, whose config levain rewrites on every
 use. Every ``GIT_*`` variable of the caller is removed from git's environment (then ``GIT_TERMINAL_PROMPT=0``,
-``GIT_NO_LAZY_FETCH=1`` and ``GIT_NO_REPLACE_OBJECTS=1`` are set by levain), and so are the loader's
+``GIT_NO_LAZY_FETCH=1``, ``GIT_NO_REPLACE_OBJECTS=1`` and ``GIT_ALLOW_PROTOCOL`` are set by levain), and so are the loader's
 ``LD_*`` / ``DYLD_*`` search variables. ``git`` is never looked up on ``PATH``: it is :data:`GIT_CANDIDATES`
 (``/usr/bin/git``), refused unless it and its directory are root-owned and not group- or world-writable, and
 git's own children (``ssh``, a credential helper) see the fixed :data:`TRUSTED_PATH`.
@@ -31,14 +31,27 @@ clone (``extensions.partialclone``, a ``remote.<n>.promisor``, or an ``objects/p
 and not SHA-256 (refused by name: the mirror is SHA-1). That check runs twice: before the lock, and again under
 it immediately before the fetch, which must find the same directories (same realpath, device and inode).
 
+What git may DO while it reads the agent's repo is bounded by transport, not by another look at the directory:
+the fetch runs with ``GIT_ALLOW_PROTOCOL=file`` and the push with the destination's own scheme only (``ssh``,
+``https``, or ``file`` for a ``file://`` destination), inherited by every git child. A promisor remote, a lazy
+fetch, an ``ext::`` / ``fd::`` URL or an ``insteadOf`` the agent writes into its repo after the check is refused
+by git itself, on any git version (an older git that ignores ``GIT_NO_LAZY_FETCH`` included); every other git
+call runs with an empty allow-list. Measured on Apple git 2.50.1 by planting each after the under-lock check
+(``test_transport_planted_after_the_check_never_runs``).
+
 What it does NOT confine, stated: the operator's system and global git config apply (credential helpers live
 there, and an edit of ``~/.gitconfig`` is outside every workspace), except that a ``url.*.insteadOf`` /
 ``pushInsteadOf`` that would rewrite the pinned URL refuses the push.
 
 Known edges (one line each, not built against):
 
-- a swap of the repository or its ``.git`` between the under-lock check and git opening the directory is not
-  closed (git takes a path, not a descriptor); the window is one ``git fetch`` start.
+- object-store swaps: an agent still running can change its repository, ``.git``, object store, alternates or a
+  loose object after the under-lock check and before or while git reads it (git takes a path, not a
+  descriptor), and the static refusals above only see a store that holds still. Bounded, not closed: what is
+  pushed is fixed by the approved commit's hash, and the fetch verifies every object it receives against its
+  hash, so a swapped store can supply only objects of exactly those hashes. The residue is an approved commit
+  that references objects the agent could not read itself, which needs the agent to know their hashes. The
+  alternates / ``commondir`` / symlink refusals stay as defence in depth.
 - a HARD link the agent makes inside its object store to an object file outside it is not detected (a hard
   link is indistinguishable from the file); the agent must be able to name that file to make one.
 - a credential helper or ``core.sshCommand`` in the operator's own config named by a bare command that lives
@@ -47,6 +60,9 @@ Known edges (one line each, not built against):
 - on macOS ``/usr/bin/git`` is the ``xcrun`` shim: it picks the developer directory from ``xcode-select``
   (root's) and ``DEVELOPER_DIR`` (dropped from the environment by the allowlist), and keeps a per-user lookup
   cache (``xcrun_db``) in the user's temp directory, which levain does not inspect.
+
+The object-store walk is capped at :data:`MAX_OBJECT_ENTRIES` entries (refused above it), so the per-repo lock
+is held for a bounded scan.
 
 Stdlib only.
 """
@@ -68,14 +84,19 @@ from typing import Any
 
 from levain.launch import child_env
 
-__all__ = ["GIT_CANDIDATES", "MIRROR_CONFIG", "PUSH_CONFIG", "TRUSTED_PATH", "PushOutcomeUnknown",
+__all__ = ["GIT_CANDIDATES", "MAX_OBJECT_ENTRIES", "MIRROR_CONFIG", "PUSH_CONFIG", "TRUSTED_PATH", "PushOutcomeUnknown",
            "PushRecordIncomplete", "PushRefused", "PushResult", "branch_matches", "branch_problem",
-           "canonical_remote", "execute", "git_bin", "git_env", "push_argv", "repo_key"]
+           "canonical_remote", "execute", "git_bin", "git_env", "push_argv", "push_protocol", "repo_key"]
 
 # The git levain runs, by absolute path; the first that passes :func:`git_bin`'s ownership test is used.
 GIT_CANDIDATES: tuple[str, ...] = ("/usr/bin/git",)
 # git's children (ssh, credential helpers, the xcrun shim's lookups) search only these.
 TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+# The most entries (files and directories) the object-store walk visits before it refuses: the walk runs twice
+# per push, once under the per-repo lock, and a store the agent filled on purpose must not hold that lock
+# unbounded. A store this large is packed first (``git gc``).
+MAX_OBJECT_ENTRIES = 200_000
 
 # The config flags of every push (§3 step 3), plus core.abbrev=no so --porcelain reports full object names
 # (git abbreviates them to 7 by default, which a receipt cannot carry).
@@ -308,7 +329,19 @@ def branch_matches(patterns: Iterable[str], branch: str) -> bool:
 # execute
 
 
-def git_env() -> dict[str, str]:
+def push_protocol(canon: str) -> str:
+    """The one transport a push to the canonical remote ``canon`` may use: ``ssh`` (``ssh://`` and scp-form),
+    ``https`` or ``file``. Derived from :func:`canonical_remote`'s output, never from the request."""
+    m = _SCHEME.match(canon)
+    if not m:
+        return "ssh"   # scp-form is the only canonical spelling without a scheme
+    scheme = m.group(1)
+    if scheme not in ("ssh", "https", "file"):
+        raise PushRefused(f"no push transport for scheme {scheme}://")
+    return scheme
+
+
+def git_env(protocols: str = "") -> dict[str, str]:
     """git's environment for a granted push: :func:`levain.launch.child_env` (the allowlist; ``HOME`` and
     ``SSH_AUTH_SOCK`` are on it, so the user's own credentials work) with EVERY ``GIT_*`` name removed, so a
     caller's ``GIT_DIR``, ``GIT_CONFIG_COUNT``/``KEY_n``/``VALUE_n``, ``GIT_SSH_COMMAND`` and the rest mean
@@ -317,13 +350,17 @@ def git_env() -> dict[str, str]:
     must not supply git's ``ssh`` or a library). Then levain's own values: ``GIT_TERMINAL_PROMPT=0`` (a push from
     a server with no terminal must fail, never hang on a prompt), ``GIT_NO_LAZY_FETCH=1`` (a partial clone's
     upload-pack must never fetch a missing object through the agent's remote config; Apple git 2.50.1 was
-    measured to default to this inside upload-pack, an older git may not) and ``GIT_NO_REPLACE_OBJECTS=1``."""
+    measured to default to this inside upload-pack, an older git may not), ``GIT_NO_REPLACE_OBJECTS=1``, and
+    ``GIT_ALLOW_PROTOCOL=protocols`` (colon-separated; empty allows no transport at all). git's children inherit
+    it, and it overrides every ``protocol.*.allow`` in any config, so it bounds a lazy fetch upload-pack starts in
+    the agent's repo too."""
     env = {k: v for k, v in child_env().items()
            if not k.upper().startswith(("GIT_", "LD_", "DYLD_"))}
     env["PATH"] = TRUSTED_PATH
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_NO_LAZY_FETCH"] = "1"
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_ALLOW_PROTOCOL"] = protocols
     return env
 
 
@@ -365,9 +402,10 @@ def push_argv(mirror: Path, remote: str, branch: str) -> list[str]:
 
 
 def _walk_objects(objs: str) -> None:
-    """Refuse a symlink anywhere under the object store (a fan-out directory, a loose object, a pack), and a
-    ``.promisor`` pack file."""
+    """Refuse a symlink anywhere under the object store (a fan-out directory, a loose object, a pack), a
+    ``.promisor`` pack file, and a store of more than :data:`MAX_OBJECT_ENTRIES` entries."""
     stack = [objs]
+    seen = 0
     while stack:
         d = stack.pop()
         try:
@@ -375,6 +413,10 @@ def _walk_objects(objs: str) -> None:
                 entries = list(it)
         except OSError as exc:
             raise PushRefused(f"could not read the object store at {d}: {exc.strerror}") from None
+        seen += len(entries)
+        if seen > MAX_OBJECT_ENTRIES:
+            raise PushRefused(f"the object store at {objs} holds more than {MAX_OBJECT_ENTRIES} entries; levain "
+                              "caps its scan so the per-repo lock stays bounded (pack it first: git gc)")
         for e in entries:
             if e.is_symlink():
                 raise PushRefused(f"the object store holds a symlink ({e.path}); levain reads only objects the "
@@ -459,12 +501,23 @@ def _repo_realpath(repo_path: str | os.PathLike) -> str:
     return real
 
 
+def _fsync_dir(path: Path | str) -> None:
+    dfd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
 def _private_dir(path: Path) -> None:
-    """``path`` as a 0700 directory of this user, not a link."""
+    """``path`` as a 0700 directory of this user, not a link. When it creates the directory it fsyncs the parent,
+    so the new entry (and the journal under it) survives a crash."""
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
         pass
+    else:
+        _fsync_dir(path.parent)
     st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise PushRefused(f"{path} is not levain's own directory")
@@ -472,12 +525,15 @@ def _private_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def _git(argv: list[str], *, timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run ``argv`` (``argv[0]`` is ``"git"``) as :func:`git_bin`, in :func:`git_env`, from ``/``."""
+def _git(argv: list[str], *, timeout: int = 600, protocols: str = "",
+         git: str | None = None) -> subprocess.CompletedProcess:
+    """Run ``argv`` (``argv[0]`` is ``"git"``) as ``git`` (default :func:`git_bin`), in
+    :func:`git_env` with ``protocols`` the only transports allowed, from ``/``. Output is decoded as UTF-8 with
+    ``errors="replace"``: a remote hook's bytes never raise."""
     if argv[0] != "git":
         raise ValueError("levain runs only git here")
-    return subprocess.run([git_bin(), *argv[1:]], env=git_env(), cwd="/", stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([git or git_bin(), *argv[1:]], env=git_env(protocols), cwd="/", stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def _mirror(levain_home: Path, grant_id: str, key: str) -> Path:
@@ -547,11 +603,7 @@ def _journal(levain_home: Path, key: str, record: dict[str, Any]) -> None:
     finally:
         os.close(fd)
     if created:
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        _fsync_dir(path.parent)
 
 
 def _parse_porcelain(stdout: str, dst: str) -> tuple[str, str | None, str]:
@@ -607,10 +659,11 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     the effect leaves a record.
 
     Raises :class:`PushRefused` for anything refused before the push (an ``OSError`` writing the intent line
-    also aborts before it). A rejection by git (non-fast-forward, a protected branch) is a :class:`PushResult`
+    also aborts before it); git is resolved and the push argv built before the intent line, so no
+    :class:`PushRefused` is raised after it. A rejection by git (non-fast-forward, a protected branch) is a :class:`PushResult`
     with ``ok`` False: reported, never forced. Once the push has started every path writes the ``done`` line and
     calls ``receipt``, each attempted whatever the other did: a push that did not report (timeout, git could not
-    run) raises :class:`PushOutcomeUnknown` with status ``"unknown"``; a push that reported but whose done line
+    run, any other exception once the intent line is written) raises :class:`PushOutcomeUnknown` with status ``"unknown"``; a push that reported but whose done line
     or receipt failed raises :class:`PushRecordIncomplete` carrying the result."""
     try:
         canon = canonical_remote(remote)
@@ -652,7 +705,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
                               "store is at that path now)")
         f = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never",
                   "-c", "protocol.fd.allow=never", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-                  "--no-recurse-submodules", real, f"+refs/heads/{branch}:{SRC_REF}"])
+                  "--no-recurse-submodules", real, f"+refs/heads/{branch}:{SRC_REF}"], protocols="file")
         if f.returncode:
             raise PushRefused(f"could not read branch {branch} from {real}: {f.stderr.strip()[-400:]}")
         rp = _git(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "--quiet", f"{SRC_REF}^{{commit}}"])
@@ -668,12 +721,16 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         if hits := _rewrites(mirror, canon):
             raise PushRefused(f"the git config rewrites the pinned remote ({hits[0]}); a pin must mean the "
                               "destination")
+        # everything the push needs is resolved BEFORE the intent line: after it, nothing refuses
+        gb = git_bin()
+        argv = push_argv(mirror, canon, branch)
+        proto = push_protocol(canon)
         base = {"grant_id": gid, "grant_seq": seq, "remote": canon, "branch": branch, "repo": real, "new_sha": new}
         _journal(home, key, {"state": "intent", "at": time.time(), **base})
         # from here on the remote may change: every path reaches the receipt
         try:
-            p = _git(push_argv(mirror, canon, branch))
-        except (subprocess.TimeoutExpired, OSError) as exc:
+            p = _git(argv, protocols=proto, git=gb)
+        except Exception as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
             result = PushResult(ok=False, status="unknown", grant_id=gid, grant_seq=seq, remote=canon,
                                 branch=branch, old_sha=None, new_sha=new, exit=-1,
                                 detail=f"git push did not report: {type(exc).__name__}: {exc}"[:400])
