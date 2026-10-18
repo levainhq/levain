@@ -1505,6 +1505,8 @@
 
   function setQuery(s, q, now) {
     s.query = q;
+    s.carry = null;   // what a draw held belongs to the query it was drawn under
+    for (const o of states) if (o.pid === s.pid) o.carry = null;
     s.showAll = false;
     save(FILTER_KEY + s.pid, q);
     for (const o of states) if (o !== s && o.pid === s.pid && onPage(o)) { o.query = q; if (o.filterInput) o.filterInput.value = q; paintOrSearch(o, now); }
@@ -1554,17 +1556,20 @@
   }
   // A repaint of a body already on the page, handing back what the reader holds in it: the rows they opened and the
   // scroll, settled in the order the board uses. A panel filled during a board or modal draw also owes what that draw
-  // captured, since its rows arrive after the draw's own restore (the first answer takes it, once).
+  // captured, since its rows arrive after the draw's own restore. Only a body still holding no rows takes it (rows on
+  // the page mean the reader's own state is the live one), and it is spent once a repaint puts rows there.
   function repaintKeeping(s) {
     const core = root.LevainDashboard;
     const host = (s.body.closest ? s.body.closest(".pbody, .modal-body") : null) || s.body;
     const kept = core && core.captureKept ? core.captureKept(host) : null;
-    if (kept && s.carry && Date.now() - s.born < 15000) {
+    const hadRows = !!(s.body.querySelector && s.body.querySelector(".row"));
+    if (hadRows || (s.carry && Date.now() - s.born >= 15000)) s.carry = null;
+    if (kept && s.carry) {
       for (const k of s.carry.open) kept.open.add(k);
       for (const [k, v] of s.carry.scroll) if (!kept.scroll.has(k)) kept.scroll.set(k, v);
     }
-    s.carry = null;
     paint(s);
+    if (s.body.querySelector && s.body.querySelector(".row")) s.carry = null;
     if (core && core.settleKept) core.settleKept(host, kept);
     else if (core && core.measureClauses) core.measureClauses(host);   // a core without the keeper still re-measures its rows
   }
