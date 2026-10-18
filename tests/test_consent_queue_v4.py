@@ -689,6 +689,58 @@ def test_claim_rulings_for_delivers_in_application_order_within_one_second(queue
     assert [r.request_id for r in queue.claim_rulings_for("claude_code", "sess-1")] == [b.id, a.id]
 
 
+def _slow_verifier_leaves_the_lock_free(monkeypatch, q):
+    """A verifier stub that sleeps and, while it sleeps, takes the queue's write lock from another connection."""
+    import sqlite3
+    import time as _time
+    import levain.consent.queue as qmod
+    real, seen = qmod.verify_link_sig, []
+
+    def slow(*a, **kw):
+        _time.sleep(0.2)
+        other = sqlite3.connect(q.path, timeout=0.1)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            seen.append("free")
+        except sqlite3.OperationalError:
+            seen.append("locked")
+        finally:
+            other.close()
+        return real(*a, **kw)
+    monkeypatch.setattr(qmod, "verify_link_sig", slow)
+    return seen
+
+
+def test_no_signature_is_verified_under_the_write_lock(queue, keys, monkeypatch):
+    """L3 r1 codex MED: take_ruled_allow and claim_rulings_for verify outside BEGIN IMMEDIATE."""
+    a, _ = undecided(queue)
+    _rule(queue, a, keys["phone"])
+    seen = _slow_verifier_leaves_the_lock_free(monkeypatch, queue)
+    assert [r.request_id for r in queue.claim_rulings_for("claude_code", "sess-1")] == [a.id]
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == a.id
+    assert seen and set(seen) == {"free"}
+
+
+def test_a_ruling_applied_during_verification_is_selected_again(queue, keys, monkeypatch):
+    """A deny applied while the allow is being verified moves the selection: the take gives nothing."""
+    import levain.consent.queue as qmod
+    a, _ = undecided(queue)
+    b, _ = undecided(queue)
+    _rule(queue, a, keys["phone"])
+    deny = ruled(queue, b.id, keys["phone"], "deny")
+    real, fired = qmod.verify_link_sig, []
+
+    def racing(*args, **kw):
+        if not fired:
+            fired.append(1)
+            queue.answer_late(b.id, *deny)
+        return real(*args, **kw)
+    monkeypatch.setattr(qmod, "verify_link_sig", racing)
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+    assert fired and queue.decision(a.id).taken is False
+
+
 def test_only_the_take_delivers_a_ruled_allow(queue, keys):
     """L2 M2: decision() and mark_undecided() give a ruling as information (a Ruling, never a Decision), so the
     adapters' delivery check refuses it before and after the take."""

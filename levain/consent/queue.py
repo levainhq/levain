@@ -90,7 +90,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1254,8 +1254,10 @@ class ConsentQueue:
         must be an allow, not yet taken, re-verified against a fresh replay, applied less than
         :data:`RULED_ALLOW_LAPSE` ago and less than that after it was signed, and no other ruling on the call may
         carry a later signed ``signed_at`` (a tamper bound only: it can void, never revive). So a later
-        deny voids every earlier allow not yet taken, and two allows give one run. The take is recorded in the
-        same write transaction; a second take returns ``None``. A cheap read-only check runs first: a call with no
+        deny voids every earlier allow not yet taken, and two allows give one run. Selection and signature
+        verification run outside the write lock; a short write lock then re-checks that the chosen ruling's
+        state and seq are unchanged and nothing newer was applied, and records the take (selection runs once more
+        when it moved, else ``None``); a second take returns ``None``. A cheap read-only check runs first: a call with no
         untaken ruled allow costs no replay and no write lock."""
         digest = tool_input_digest(tool_input)
         key = (agent, agent_session_id, tool_name, digest, cwd)
@@ -1268,8 +1270,36 @@ class ConsentQueue:
         authority = self._fresh_authority()
         if authority is None:
             return None
-        with self._write() as conn:
-            now = _now_utc(self._clock)
+        for _attempt in range(2):                    # selection once more when a newer ruling landed meanwhile
+            picked = self._pick_ruled_allow(where, key, authority)
+            if picked is None:
+                return None
+            got, seq = picked
+            with self._write() as conn:              # short: no signature is verified under the write lock
+                now = _now_utc(self._clock)
+                row = conn.execute(f"SELECT r.state, {self._RULING_SEQ} FROM requests r WHERE r.id = ?",
+                                   (got.request_id,)).fetchone()
+                newest = conn.execute(f"SELECT MAX(ruling_seq) FROM (SELECT {self._RULING_SEQ} " + where +
+                                      " AND state IN ('allowed','denied'))", key).fetchone()[0]
+                if row is None or row[0] != "allowed" or row[1] != seq or newest != seq:
+                    continue                         # it moved between the read and the lock
+                if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (got.request_id,)).fetchone():
+                    return None
+                signed, decided = parse_stamp(got.signed_at), parse_stamp(got.decided_at)
+                if now >= decided + RULED_ALLOW_LAPSE or decided >= signed + RULED_ALLOW_LAPSE:
+                    return None
+                conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
+                             (got.request_id, utc_stamp(now), event))
+            return Decision(request_id=got.request_id, decision="allow", signer_fp=got.signer_fp,
+                            decided_at=got.decided_at, request_digest=got.request_digest, via="ruling", gap=got.gap)
+        return None
+
+    def _pick_ruled_allow(self, where: str, key: tuple[Any, ...], authority: AuthoritySnapshot
+                          ) -> tuple[Ruling, int] | None:
+        """Outside any write lock: the call's latest ruling (by application sequence) when it is an untaken allow
+        that re-verifies under ``authority`` and no earlier-applied ruling carries a later signed ``signed_at``;
+        with its ruling receipt's seq, which :meth:`take_ruled_allow` re-checks under its short write lock."""
+        with self._read() as conn:
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
             cur = conn.execute(f"SELECT {self._RULED_COLS}, {self._RULING_SEQ} " + where +
                                " AND state IN ('allowed','denied') ORDER BY ruling_seq DESC", key)
@@ -1280,34 +1310,29 @@ class ConsentQueue:
             latest = rows[0]
             if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (latest["id"],)).fetchone():
                 return None
-            request = self._request_of(latest)
-            payload = None if request is None else self._stored_record(latest)
-            if request is None or payload is None:
-                return None
-            got = self._verified_ruling(latest, request, queue_id, self._gap_of(conn, request.id), payload,
-                                        authority)
-            if got is None or got.ruling != "allow":
-                return None
-            signed, decided = parse_stamp(got.signed_at), parse_stamp(got.decided_at)
-            if now >= decided + RULED_ALLOW_LAPSE or decided >= signed + RULED_ALLOW_LAPSE:
-                return None
-            for other in rows[1:]:
-                rec = self._stored_record(other)
-                try:
-                    if rec is not None and parse_stamp(rec.get("signed_at")) > signed:
-                        return None                  # applied earlier yet signed later: fail closed
-                except (ConsentError, TypeError):
-                    continue
-            conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
-                         (request.id, utc_stamp(now), event))
-        return Decision(request_id=got.request_id, decision="allow", signer_fp=got.signer_fp,
-                        decided_at=got.decided_at, request_digest=got.request_digest, via="ruling", gap=got.gap)
+            gap = self._gap_of(conn, latest["id"])
+        request = self._request_of(latest)
+        payload = None if request is None else self._stored_record(latest)
+        if request is None or payload is None:
+            return None
+        got = self._verified_ruling(latest, request, queue_id, gap, payload, authority)
+        if got is None or got.ruling != "allow":
+            return None
+        signed = parse_stamp(got.signed_at)
+        for other in rows[1:]:
+            rec = self._stored_record(other)
+            try:
+                if rec is not None and parse_stamp(rec.get("signed_at")) > signed:
+                    return None                      # applied earlier yet signed later: fail closed
+            except (ConsentError, TypeError):
+                continue
+        return got, latest["ruling_seq"]
 
     def claim_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
         """This session's rulings (allow and deny) whose text has not been delivered to it yet, oldest applied
-        first (by application sequence, the seq of the ruling's receipt), each re-verified against a fresh replay,
-        marked delivered in the SAME write transaction: a ruling's
-        text reaches its session once. A ruling that no longer verifies is neither returned nor marked. What the
+        first (by application sequence, the seq of the ruling's receipt), each re-verified against a fresh replay
+        outside the write lock, then re-checked unchanged and marked delivered under one short write lock: a
+        ruling's text reaches its session once. A ruling that no longer verifies is neither returned nor marked. What the
         agent is told is the caller's; a returned allow still runs only through :meth:`take_ruled_allow`."""
         with self._read() as conn:
             if conn.execute("SELECT 1 FROM requests r WHERE agent = ? AND agent_session_id = ? AND via = 'ruling' "
@@ -1317,29 +1342,41 @@ class ConsentQueue:
         authority = self._fresh_authority()
         if authority is None:
             return []
-        out: list[Ruling] = []
-        with self._write() as conn:
-            stamp = utc_stamp(_now_utc(self._clock))
+        with self._read() as conn:                   # read and verify outside the write lock
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
             cur = conn.execute(f"SELECT {self._RULED_COLS}, {self._RULING_SEQ} FROM requests r WHERE agent = ? "
                                "AND agent_session_id = ? AND via = 'ruling' AND state IN ('allowed','denied') "
                                "AND NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) "
                                "ORDER BY ruling_seq IS NULL, ruling_seq", (agent, agent_session_id))
             names = [d[0] for d in cur.description]
-            for raw in cur.fetchall():
-                row = dict(zip(names, raw))
-                request = self._request_of(row)
-                payload = None if request is None else self._stored_record(row)
-                if request is None or payload is None:
+            rows = [dict(zip(names, raw)) for raw in cur.fetchall()]
+            gaps = {row["id"]: self._gap_of(conn, row["id"]) for row in rows}
+        verified: list[tuple[Ruling, dict[str, Any]]] = []
+        for row in rows:
+            request = self._request_of(row)
+            payload = None if request is None else self._stored_record(row)
+            if request is None or payload is None or type(row["ruling_seq"]) is not int:
+                continue
+            got = self._verified_ruling(row, request, queue_id, gaps[row["id"]], payload, authority)
+            if got is not None:
+                verified.append((got, row))
+        out: list[Ruling] = []
+        if not verified:
+            return out
+        with self._write() as conn:                  # short: re-check each, claim it, nothing verified here
+            stamp = utc_stamp(_now_utc(self._clock))
+            for got, row in verified:
+                now = conn.execute(f"SELECT r.state, {self._RULING_SEQ} FROM requests r WHERE r.id = ?",
+                                   (got.request_id,)).fetchone()
+                if now is None or now[0] != row["state"] or now[1] != row["ruling_seq"]:
                     continue
-                taken = conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (request.id,)).fetchone()
-                got = self._verified_ruling(row, request, queue_id, self._gap_of(conn, request.id), payload,
-                                            authority, taken=taken is not None)
-                if got is None:
-                    continue
-                conn.execute("INSERT INTO ruling_deliveries (request_id, agent, agent_session_id, delivered_at) "
-                             "VALUES (?, ?, ?, ?)", (request.id, agent, agent_session_id, stamp))
-                out.append(got)
+                if conn.execute("INSERT OR IGNORE INTO ruling_deliveries (request_id, agent, agent_session_id, "
+                                "delivered_at) VALUES (?, ?, ?, ?)",
+                                (got.request_id, agent, agent_session_id, stamp)).rowcount != 1:
+                    continue                         # another claimer delivered it first
+                taken = conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?",
+                                     (got.request_id,)).fetchone() is not None
+                out.append(got if got.taken == taken else replace(got, taken=taken))
         return out
 
     # --- standing grants (Q4) --------------------------------------------------------------------------
