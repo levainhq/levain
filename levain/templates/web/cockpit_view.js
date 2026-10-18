@@ -1388,6 +1388,7 @@
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
     s.searchable = rowKind && sr.on === true && !(ctx && ctx.widget);
     if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
+    s.carry = root.LevainDashboard && root.LevainDashboard.buildKept ? root.LevainDashboard.buildKept() : null;
     s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
     if (data.kind === "count-queue") {
       // the figure is data, not chrome: paint() keeps it current
@@ -1541,7 +1542,7 @@
   async function runStoreSearch(s) {
     const q = sendable(s.query);
     const seq = ++s.seq;
-    if (!q) { s.results = null; paint(s); return; }
+    if (!q) { s.results = null; repaintKeeping(s); return; }
     let out;
     try {
       const raw = await sharedSearch(s.pid, q);
@@ -1549,7 +1550,23 @@
     } catch (e) { out = { items: [], hays: [], label: "", error: e && e.message ? e.message : String(e) }; }
     if (seq !== s.seq || !onPage(s)) return;     // a newer query, or the panel is gone
     s.results = out;
+    repaintKeeping(s);
+  }
+  // A repaint of a body already on the page, handing back what the reader holds in it: the rows they opened and the
+  // scroll, settled in the order the board uses. A panel filled during a board or modal draw also owes what that draw
+  // captured, since its rows arrive after the draw's own restore (the first answer takes it, once).
+  function repaintKeeping(s) {
+    const core = root.LevainDashboard;
+    const host = (s.body.closest ? s.body.closest(".pbody, .modal-body") : null) || s.body;
+    const kept = core && core.captureKept ? core.captureKept(host) : null;
+    if (kept && s.carry && Date.now() - s.born < 15000) {
+      for (const k of s.carry.open) kept.open.add(k);
+      for (const [k, v] of s.carry.scroll) if (!kept.scroll.has(k)) kept.scroll.set(k, v);
+    }
+    s.carry = null;
     paint(s);
+    if (core && core.settleKept) core.settleKept(host, kept);
+    else if (core && core.measureClauses) core.measureClauses(host);   // a core without the keeper still re-measures its rows
   }
   function mapSearch(s, payload) {
     if (typeof payload.search_error === "string" && payload.search_error) return { items: [], hays: [], label: "", error: payload.search_error };
@@ -1607,22 +1624,12 @@
     for (const s of live) {
       s.data = data;
       s.fault = "";
-      // a body repainted in place keeps the rows the reader expanded and its scroll position
-      const keptHost = s.body.closest ? s.body.closest(".pbody, .modal-body") : null;
-      const kept = core.captureKept ? core.captureKept(keptHost || s.body) : null;
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
-      paint(s);
-      if (kept) { core.restoreKeptRows(s.body, kept); core.restoreKeptScroll(keptHost || s.body, kept); }
+      repaintKeeping(s);   // a body repainted in place keeps the rows the reader expanded and its scroll position
       const sr = data.search || {};
       if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
-      // the host's finalisation, on the node already there: the clause toggles and the overflow cue follow the new rows
-      const host = s.body.closest ? s.body.closest(".pbody, .modal-body") : null;
-      if (host) {
-        if (core.measureClauses) core.measureClauses(host);
-        if (core.measureOverflow && host.classList.contains("clamped")) core.measureOverflow(host);
-      }
     }
     if (core.adoptPanel) core.adoptPanel(pid, view);
     // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
