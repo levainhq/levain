@@ -553,6 +553,13 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if policy is None and nothing_can_decide(settings):
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
+    if agent_config:
+        # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
+        # dialog anyway on a path it protects: deliver that allow once, never a second question
+        took = queue.take_gate_allow(AGENT, session, tool_name, tool_input, cwd=cwd, within=GATE_ALLOW_REUSE,
+                                     posture=posture, event=EVENT)
+        if took is not None:
+            return hook_output(took)
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
@@ -593,7 +600,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # PermissionRequest fires only when Claude Code is about to show its dialog, so it never fires in bypass or auto
 # (DESIGN §2.2, measured). PreToolUse fires in every mode and can deny with a reason the agent reads (§2.3). So a
 # gated call (T3: agent config and hooks, :func:`targets_agent_config`) is held here, in every mode where no dialog
-# would ask (:data:`DIALOG_MODES` are left to the PermissionRequest hook above and the agent's own dialog):
+# would ask. ``default`` is held too: an allow rule (``Edit``) runs a T3 call that Claude Code does not itself
+# protect (a hook script) with no dialog and no PermissionRequest (measured 2.1.302, B2 fix lane M1). ``plan`` runs
+# nothing and gets no decision. When the gate allowed a call and Claude Code shows its own dialog anyway (a path it
+# protects, ``.claude/settings.json``), the PermissionRequest hook delivers that same allow once
+# (:meth:`ConsentQueue.take_gate_allow`), so the operator is asked once:
 #
 # 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
 # 2. else the request is filed with ``expires_at`` = now + D (the library owns the deadline, B1 fix 3), the operator
@@ -616,9 +627,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 GATE_EVENT = "PreToolUse"
 # Claude Code's ``timeout`` for the gate entry is D + this margin (interpreter start, the undecided mark)
 GATE_TIMEOUT_MARGIN = 30
-# The modes where Claude Code asks the human itself: the gate holds nothing there (PermissionRequest does). Any other
-# mode, a missing one included, is held.
-DIALOG_MODES = frozenset({"default", "plan"})
+# how long after the gate's allow the dialog's own PermissionRequest may take it (it follows in milliseconds)
+GATE_ALLOW_REUSE = timedelta(seconds=30)
 # how often the hold re-reads the request
 GATE_POLL = 0.25
 # the longest the hold sleeps between its wait and the undecided mark
@@ -798,7 +808,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
     A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent),
-    else a ruled allow (taken once), else, outside :data:`DIALOG_MODES` and when
+    else a ruled allow (taken once), else, in every other mode (``default`` included) and when
     something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
     pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
     (:func:`undecided_output`). Anything that fails after the call is known gated is a deny (with the hard stop for
@@ -851,7 +861,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return gate_output(ruled)
-        if posture in DIALOG_MODES or nothing_can_decide(settings):
+        if nothing_can_decide(settings):
             return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,

@@ -1330,6 +1330,49 @@ class ConsentQueue:
                             decided_at=got.decided_at, request_digest=got.request_digest, via="ruling", gap=got.gap)
         return None
 
+    def take_gate_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *, cwd: str,
+                        within: timedelta, posture: str | None = None, event: str | None = None) -> Decision | None:
+        """The allow a PreToolUse gate already delivered for this exact call, taken ONCE by the native dialog's
+        own hook that follows it: Claude Code still shows its dialog after a hook's allow on a path it protects
+        (measured 2.1.302: a gate-allowed Edit of ``.claude/settings.json`` in acceptEdits went on to
+        ``PermissionRequest``, ``decision_reason_type: safetyCheck``), and that event carries no ``tool_use_id``, so
+        it cannot name the gate's request by event id. The call is matched as :meth:`take_ruled_allow` matches it
+        (agent, session, ``tool_name``, exact input digest, ``cwd``); the request must be the NEWEST gate filing
+        (``hook:`` event id) on that call, allowed by a signed answer or a grant, decided less than ``within`` ago,
+        never taken, and re-verify now (:meth:`decision`, with ``tool_input`` and ``posture``). The take is recorded
+        in ``ruled_takes`` (an allow taken by the call it authorised, at most once), so one answer never approves a
+        second dialog. ``None`` for anything else: the dialog's hook then files its own request as before."""
+        digest = tool_input_digest({} if tool_input is None else tool_input)
+        key = (agent, agent_session_id, tool_name, digest, cwd)
+        where = ("FROM requests r WHERE agent = ? AND agent_session_id = ? AND tool_name = ? "
+                 "AND tool_input_digest = ? AND cwd = ? AND event_id LIKE 'hook:%'")
+        with self._read() as conn:
+            row = conn.execute("SELECT id, state, via, decided_at " + where +
+                               " ORDER BY received_at DESC, rowid DESC LIMIT 1", key).fetchone()
+            if row is None or row[1] != "allowed" or row[2] not in ("signature", "grant") or row[3] is None:
+                return None
+            if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (row[0],)).fetchone():
+                return None
+        try:
+            age = _now_utc(self._clock) - parse_stamp(row[3])
+        except ConsentError:
+            return None
+        if not timedelta(0) <= age < within:
+            return None
+        got = self.decision(row[0], tool_input=tool_input, posture=posture)
+        if not isinstance(got, Decision) or got.decision != "allow":
+            return None
+        with self._write() as conn:
+            if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (row[0],)).fetchone():
+                return None
+            newest = conn.execute("SELECT id, state " + where + " ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                                  key).fetchone()
+            if newest is None or newest[0] != row[0] or newest[1] != "allowed":
+                return None                          # it moved between the read and the lock
+            conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
+                         (row[0], utc_stamp(_now_utc(self._clock)), event))
+        return got
+
     def _pick_ruled_allow(self, where: str, key: tuple[Any, ...], authority: AuthoritySnapshot
                           ) -> tuple[Ruling, int] | None:
         """Outside any write lock: the call's latest ruling (by application sequence) when it is an untaken allow

@@ -84,6 +84,9 @@ class FakeQueue:
     def answer_by_grant(self, request_id, **kw):
         return None  # no standing grant: the default policy decides nothing
 
+    def take_gate_allow(self, *a, **kw):
+        return None  # no gate allow to reuse: the PermissionRequest path files its own request
+
 
 AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
 
@@ -1122,3 +1125,23 @@ def test_a_d_raised_after_install_still_ends_before_the_installed_timeout(tmp_pa
         (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"gate_hold_seconds": raised}))
         hold = min(cc.load_settings(qdir).gate_hold_seconds, cc.GATE_HOLD_CEILING)
         assert hold + cc.GATE_TIMEOUT_MARGIN <= installed, (raised, hold, installed)
+
+
+def test_the_dialog_after_a_gate_allow_takes_that_allow_once(queue, keys, monkeypatch):
+    """B2 fix lane M2, reproduced on Claude Code 2.1.302: a gate-allowed Edit of .claude/settings.json in
+    acceptEdits still reached Claude Code's own dialog (safetyCheck), whose PermissionRequest carries no
+    tool_use_id, so decide() filed a SECOND request and the operator's allow never ran the edit. That hook now
+    delivers the gate's allow for the same call, once; a second dialog for it is asked as before."""
+    from tests.test_consent_queue import signed
+
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
+    tool_input = {"file_path": "/work/proj/.claude/settings.json", "old_string": "a", "new_string": "b"}
+    gated = queue.file(agent=cc.AGENT, agent_session_id="sess-1", tool_name="Edit", tool_input=tool_input,
+                       cwd="/work/proj", hold=timedelta(minutes=5), tier=cc.AGENT_CONFIG_TIER, event_id="toolu_1")
+    queue.answer(gated.id, *signed(queue, gated, keys["laptop"]))
+    dialog = {"hook_event_name": "PermissionRequest", "tool_name": "Edit", "tool_input": tool_input,
+              "cwd": "/work/proj", "session_id": "sess-1", "permission_mode": "acceptEdits"}
+    first = cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert first == {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
+    assert cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert [r.id for r in queue.pending()] == []
