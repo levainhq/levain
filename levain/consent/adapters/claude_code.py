@@ -681,10 +681,13 @@ def notify(settings: AdapterSettings, message: str) -> bool:
         return False
     import subprocess
 
+    from levain.launch import child_env
+
     text = message if settings.phone_url is None else f"{message} {settings.phone_url}"
     try:
+        # child_env: the allowlisted environment, never the agent session's whole one (its tokens among it)
         subprocess.Popen([*settings.notify_argv, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, env=child_env())
     except Exception:
         return False
     return True
