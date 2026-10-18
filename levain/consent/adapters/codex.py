@@ -436,7 +436,7 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
     ppid = os.getppid()
     try:
         args = subprocess.run(["ps", "-o", "args=", "-p", str(ppid)], capture_output=True, text=True, timeout=2,
-                              stdin=subprocess.DEVNULL).stdout.split()
+                              stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout.split()
     except (OSError, subprocess.SubprocessError, ValueError):
         args = []
     if ppid > 1 and args and os.path.basename(args[0]) == "codex":
