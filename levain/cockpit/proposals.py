@@ -14,6 +14,7 @@ Stdlib only (plus the record and listing helpers).
 """
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass
 from datetime import timedelta
@@ -73,6 +74,8 @@ def _proposable(agent: str, tool: str, workspace: str) -> str | None:
         server, sep, name = tool[len("mcp__"):].partition("__")
         if not (server and sep and name):
             return None
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):   # a hook's cwd is absolute; nothing else is proposed
+        return None
     resolved, _ = consent_resolved_workspace(workspace)
     return resolved if resolved is not None and consent_root_problem(resolved) is None else None
 

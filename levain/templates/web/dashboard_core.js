@@ -3384,7 +3384,8 @@
   // Standing-rule proposals (rows 13/17): when the operator has allowed the same agent + tool + working directory by hand
   // three times, the Decisions view offers the one `levain consent grant create` line that would make it a grant. The page
   // never signs; the card is text and a copy button. Fetched from /cockpit/consent/proposals.json with the page's token
-  // through the consent queue above, and kept for 30 s so a modal repaint does not re-read it; every dashboard reload (render) drops it. No token, or a read that fails:
+  // through the consent queue above, and kept for 30 s so a modal repaint does not re-read it; every dashboard reload (render) and every fresh open of a
+  // panel drops it. No token, or a read that fails:
   // no card (a proposal is an offer, never a gate).
   const PROPOSAL_TTL_MS = 30000;
   let proposalRead = null, proposalAt = 0;
@@ -3694,6 +3695,7 @@
     modalKey = entryKey(entry);
     modalReturnFocus = triggerEl || null;
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
+    proposalRead = null;     // a fresh open reads the proposals again: a denial or a grant since withdraws its card
     buildModal(entry);
   }
 
