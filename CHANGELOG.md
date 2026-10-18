@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Away mode follows you on macOS.** Unless you have said otherwise, levain counts you away once your Mac has had no keyboard or mouse input for 10 minutes (`levain consent away auto --idle-after SECONDS` sets the time), and only while an enrolled key could sign an answer. `levain consent away on|off` still decides when you say it; `levain consent away auto` hands the choice back to the idle rule, and `levain consent away show` names what decided. A request held while you were away is released within about a second of your return (or of `away off`), and the agent's own dialog then asks you. On Linux levain reads no idle time: away is your word only. A settings file written by levain 0.11.4 or older keeps its mode (an `away off` stays off) until you run `levain consent away auto`; `levain init` now writes `auto`.
+- **What the agent's own dialog did with a request levain left to it is now on the record, unsigned.** No hook sees a dialog's answer, so levain reads what followed from its own hooks: the tool ran (`ran`); it ran within half a second of levain stepping aside, as with Codex's approve-for-this-session (`ran_unasked`); or the session moved on to its next prompt or stopped without it running (`did_not_run`: a no, or abandoned, which levain cannot tell apart). `levain consent pending` lists the last day's under an UNSIGNED heading. An outcome never changes a request's state, answer or signature. Known edges: when the tool call carries no tool-use id, an identical request filed for another call can take the outcome; a repeated PostToolUse for a call already closed can mark another identical request as `ran`.
+
 ## [0.11.5] — 2026-10-17
 
 ### Security
