@@ -10,7 +10,7 @@ Levain wraps Claude Code and Codex. It does three things at once, and they only 
 
 Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also ship, as is (see *Run a sovereign entity*).
 
-![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from the author's own long-running memory store.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-health-trace.png)
+![The cockpit's Health tile and Cognition trace panel: counts of memory links, wraps, graduated and demoted patterns, and a per-consolidation trace of episodes, graduations and links, all real numbers from the author's own long-running memory store.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-health-trace.png)
 
 *`levain serve` — memory health and a live consolidation trace, from the author's own long-running memory store. You don't have to trust the pitch above; this is what "you can see what's in it" actually looks like.*
 
@@ -180,6 +180,10 @@ A message that says "yes" is never authority. Only a signature from an enrolled 
 
 **The whole picture.** You say once what an agent may do, as a signed standing grant, and routine prompts for the file tools and other tools you name get answered without you (shell commands, edits of agent config, and any MCP tool other than a known read tool still come to you). With away mode on (`levain consent away on`), everything else waits for your signed decision for the hold you set (by default 5 minutes for Claude Code and 2 for Codex, at most 14), at the desk with `levain consent answer` or, with the phone page levain serves behind an https proxy you trust, on your phone; when the hold runs out, or with away mode off, the agent's own dialog asks you, as before (Codex shows none during the hold; Claude Code shows its own alongside, and a click there is the agent's answer, unsigned). Your answer is signed too, so an agent can't just type "yes" for you: a message is never an answer, only a signature from a key you enrolled, and a Touch ID key or a phone passkey needs your presence (a touch, a face or a PIN) for each one (*Answer an agent from your phone* says what the phone page cannot protect against). Every answer levain gives, yours or a grant's, lands in an audit trail. It's one queue, in your levain home, for Claude Code and Codex, not one per vendor.
 
+![The cockpit's Decisions view on a demo install: one write waiting for an answer, a standing-rule proposal ("allowed by hand 3×") with the single grant command to copy, and the resolved requests below.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-decisions.png)
+
+*The Decisions view in the cockpit. A request waiting on you shows the exact answer commands to copy. When you have allowed the same agent, tool and directory by hand three times, it offers the one `levain consent grant create` line that would make that a standing grant. It is text for you to run with your own key; the page never signs anything. A demo install with invented content.*
+
 What this does not do: levain does not confine a Claude Code or Codex session. The hooks and consent paths are installed in the agent's configuration, and an agent running as you shares your user account.
 
 ## Composing a domain — AgentPacks
@@ -221,6 +225,10 @@ levain team consolidate                                           # the owner, o
 - **Packs feed it.** `levain team pack-sync <pack>` seeds a pack's `judgment.toml` rules into the ledger as entries authored by the pack; a pack upgrade supersedes what changed and retires what it dropped, and a rule the team retired is not brought back by re-syncing the same text.
 
 Two places show the ledger. When your levain install lives inside the clone, `levain serve` draws a Team zone in the cockpit: Members, Waiting on you, Where agents were stopped, Held by nobody, In force, Joins pending and Sync. A writable cockpit (`levain serve --write`) adds two actions (*Fetch now*, and *accept* on a key or ownership waiting on this machine, which needs a `laptop-presence` signature, so the row names the laptop command, `levain team key confirm` or `levain team accept`). A clone with no levain install has `levain team view`, a read-only localhost page with four panes: what waits on you, where agents were stopped, what is held by nobody, and what is in force. `levain team status --path <file>` shows exactly what an agent would see there; `levain team doctor` checks identity, sync, the wired hooks and their interpreter. The hooks are wired into `.claude/settings.local.json` of every working tree of the clone (that file names your own interpreter, so it is git-excluded, never committed); after a new `git worktree add`, or a `git clean -fdx` that removed it, run `levain team install` again.
+
+![The cockpit's Team zone on a demo project: members, entries held by nobody, the decisions in force, and sync state.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-team.png)
+
+*The Team zone for a demo project with a local ledger and invented entries.*
 
 Team ledgers from levain 0.6.x (the unsigned `levain-ledger` branch) are not read by this version: the owner starts a new ledger with `levain team init --replace-legacy` and re-records the entries to keep, and `levain team retire-legacy` deletes the old remote branch.
 
@@ -339,11 +347,11 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 - **Conversations live in server memory.** A restart of `levain serve` ends every one.
 - **`--path` and `--chat` are independent.** `--path` picks whose memory the cockpit shows; `--chat` picks which entity the chat talks to. Nothing checks that they match, so the page can show one entity's memory while the chat talks to another. `--path` defaults to the current directory, so start `levain serve --chat ./ada` from your own install and the page shows your memory beside ada's chat. Point both at the same directory when you want them to agree.
 
-![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
+![The cockpit board on a demo install: the state line, the Decisions waiting and Health tiles, and the Tray, Open loops, Recent episodes and Keep panels.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
 
-*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a freshly-seeded demo install ("Ridge"), not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
+*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a demo install with invented content, not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
 
-![The State, Active Threads, Patterns, Decisions, and Context panels from the same demo install.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-state.png)
+![The cockpit's Neocortex panel on the same demo install, with its State, Active Threads and Decisions tabs.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-state.png)
 
 *The felt-memory side: what a wrap actually writes to your continuity file, rendered from outside the session. Same demo install as above.*
 
@@ -393,6 +401,10 @@ tailscale serve --bg --https=443 http://127.0.0.1:7428
 ```
 
 Any other https proxy works the same way with `--name <its https name>`. Open the printed phone link on the phone (it carries the phone port's own token, so send it to yourself privately). "make a passkey here" creates a passkey on the phone and shows two laptop commands that enrol it as a `display-phone` key; a passkey can never enrol itself. After that, a waiting request shows "allow with passkey" and "deny with passkey" (deny only for a T3 request: its allow is the laptop's). The phone signs the exact answer record; the phone port converts the passkey's signature to an OpenSSH one and the queue checks it with `ssh-keygen`, as for an answer signed in the terminal.
+
+![Two phone-width screens: the cockpit's Decisions view with the proposal card, and the phone consent page showing one waiting request and, before a passkey is enrolled, a button to make one.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-phone.png)
+
+*Left: the Decisions view at phone width. Right: the page `levain consent phone` serves, as it looks before a passkey is enrolled on that phone. Demo install, invented content.*
 
 What to know:
 
