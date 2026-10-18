@@ -863,6 +863,10 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             return gate_output(ruled)
         if nothing_can_decide(settings):
             return None
+        if posture == "default" and not effective_away(settings)[0]:
+            # an attended default-mode session: Claude Code's own dialog (or the operator's own allow rule) decides,
+            # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
+            return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id)
