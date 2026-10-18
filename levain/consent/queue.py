@@ -1339,7 +1339,8 @@ class ConsentQueue:
         it cannot name the gate's request by event id. The call is matched as :meth:`take_ruled_allow` matches it
         (agent, session, ``tool_name``, exact input digest, ``cwd``); the request must be the NEWEST gate filing
         (``hook:`` event id) on that call, allowed by a signed answer or a grant, decided less than ``within`` ago,
-        never taken, and re-verify now (:meth:`decision`, with ``tool_input`` and ``posture``). The take is recorded
+        never taken, and re-verify now (:meth:`decision`, with ``tool_input`` and ``posture``); the age is checked again
+        inside the write transaction that records the take. The take is recorded
         in ``ruled_takes`` (an allow taken by the call it authorised, at most once), so one answer never approves a
         second dialog. ``None`` for anything else: the dialog's hook then files its own request as before."""
         digest = tool_input_digest({} if tool_input is None else tool_input)
@@ -1365,12 +1366,16 @@ class ConsentQueue:
         with self._write() as conn:
             if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (row[0],)).fetchone():
                 return None
-            newest = conn.execute("SELECT id, state " + where + " ORDER BY received_at DESC, rowid DESC LIMIT 1",
-                                  key).fetchone()
-            if newest is None or newest[0] != row[0] or newest[1] != "allowed":
+            newest = conn.execute("SELECT id, state, decided_at " + where +
+                                  " ORDER BY received_at DESC, rowid DESC LIMIT 1", key).fetchone()
+            if newest is None or newest[0] != row[0] or newest[1] != "allowed" or newest[2] != row[3]:
                 return None                          # it moved between the read and the lock
+            # the age again, under the lock: the replay and the wait for the lock can outlast ``within``
+            now = _now_utc(self._clock)
+            if not timedelta(0) <= now - parse_stamp(newest[2]) < within:
+                return None
             conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
-                         (row[0], utc_stamp(_now_utc(self._clock)), event))
+                         (row[0], utc_stamp(now), event))
         return got
 
     def _pick_ruled_allow(self, where: str, key: tuple[Any, ...], authority: AuthoritySnapshot

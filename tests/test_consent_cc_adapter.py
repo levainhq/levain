@@ -1145,3 +1145,27 @@ def test_the_dialog_after_a_gate_allow_takes_that_allow_once(queue, keys, monkey
     assert first == {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
     assert cc.decide(dialog, queue, cc.AdapterSettings(), home=Path("/home/u")) is None
     assert [r.id for r in queue.pending()] == []
+
+
+def test_a_default_mode_gate_hold_ends_when_the_operator_comes_back(queue, monkeypatch):
+    """L3 r1 complement 1 = codex 2, reproduced on b0fec809: in default mode the gate read away once, at its start,
+    so an operator who came back a moment later (the word off) still waited out the whole hold, then got UNDECIDED
+    and a hard stop. The hold re-reads the settings file every RECHECK_EVERY, as the PermissionRequest hold does; when
+    away ends the request is withdrawn and Claude Code's own dialog asks."""
+    import threading
+
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
+    queue.pending()  # the queue makes its own directory, owner-only
+    settings_file = Path(queue.directory) / cc.SETTINGS_NAME
+    settings_file.write_text(json.dumps({"away_word": "on", "gate_hold_seconds": 3}))
+    settings = cc.load_settings(Path(queue.directory))
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/work/proj", "session_id": "sess-1",
+             "permission_mode": "default", "tool_use_id": "toolu_1",
+             "tool_input": {"file_path": "/work/proj/.claude/hooks/h.sh", "old_string": "a", "new_string": "b"}}
+    back = threading.Timer(0.3, lambda: settings_file.write_text(json.dumps({"away_word": "off"})))
+    back.start()
+    t0 = time.monotonic()
+    out = cc.gate(event, queue, settings, home=Path("/home/u"))
+    assert out is None
+    assert time.monotonic() - t0 < 2.5
+    assert queue.pending() == []

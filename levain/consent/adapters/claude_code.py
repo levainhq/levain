@@ -627,8 +627,9 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 GATE_EVENT = "PreToolUse"
 # Claude Code's ``timeout`` for the gate entry is D + this margin (interpreter start, the undecided mark)
 GATE_TIMEOUT_MARGIN = 30
-# how long after the gate's allow the dialog's own PermissionRequest may take it (it follows in milliseconds)
-GATE_ALLOW_REUSE = timedelta(seconds=30)
+# how long after the gate's allow the dialog's PermissionRequest may take it: that hook follows in under a second
+# (an interpreter start + a replay); this bounds how long a later identical call can ride the old allow
+GATE_ALLOW_REUSE = timedelta(seconds=5)
 # how often the hold re-reads the request
 GATE_POLL = 0.25
 # the longest the hold sleeps between its wait and the undecided mark
@@ -792,7 +793,10 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
     for ruling in queue.claim_rulings_for(AGENT, session):
         got = queue.get(ruling.request_id)
         what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
-        lines.append(RULING_TEXT[ruling.ruling].format(n=ruling.gap, x=what))
+        text = RULING_TEXT.get(ruling.ruling)
+        if text is None:
+            continue  # an unknown ruling value skips that ruling only, never the rest
+        lines.append(text.format(n=ruling.gap, x=what))
     return "\n".join(lines) or None
 
 
@@ -805,13 +809,17 @@ def _session_of(event: Mapping[str, Any]) -> str | None:
 
 
 def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
-         sleep: Callable[[float], None] = time.sleep) -> dict[str, Any] | None:
+         sleep: Callable[[float], None] = time.sleep,
+         still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
     A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent),
     else a ruled allow (taken once), else, in every other mode (``default`` included) and when
     something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
     pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
-    (:func:`undecided_output`). Anything that fails after the call is known gated is a deny (with the hard stop for
+    (:func:`undecided_output`). In ``default`` the hold runs only while the operator is away, and ``still_away``
+    (default :func:`still_away_from` the queue directory's settings file) is re-read every :data:`RECHECK_EVERY`
+    (:func:`hold_for_answer`): when away ends the request is withdrawn and Claude Code's dialog asks. Anything
+    that fails after the call is known gated is a deny (with the hard stop for
     the irreversible tier), never an allow: the request it filed stays pending until a read or sweep expires it.
     Late rulings for the session (:func:`ruling_context`) ride whatever is returned, as ``additionalContext``."""
     if getattr(queue, "directory", None) is None:
@@ -828,7 +836,10 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         send_repings(queue, settings)
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
-    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep)
+    if still_away is None:
+        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings)
+    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep,
+                     still_away=still_away)
     try:
         context = ruling_context(queue, session)
     except Exception:
@@ -841,7 +852,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
 
 def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
                tool_input: Any, cwd: str, session: str, *, home: Path | None,
-               sleep: Callable[[float], None]) -> dict[str, Any] | None:
+               sleep: Callable[[float], None],
+               still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     from datetime import datetime, timezone
 
     from levain.cockpit.consent import parse_stamp
@@ -876,15 +888,30 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
                cwd=queue.directory)
-        got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
-                                             posture=posture), request)
+        if posture == "default" and still_away is not None:
+            # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
+            # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)
+            got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
+                                        still_away=still_away)
+            if got is None and back:
+                if queue.withdraw(request.id, note=f"away mode ended ({back}); Claude Code's dialog asks"):
+                    return None
+                # not pending any more: an answer may have landed between the wait and the withdraw
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
+                return gate_output(got) if got is not None else None
+        else:
+            got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
+                                                 posture=posture), request)
         if got is not None:
             return gate_output(got)
         # the hold ends at expires_at (the library's deadline); mark_undecided applies at or after it
         left = (parse_stamp(request.expires_at) - datetime.now(timezone.utc)).total_seconds()
-        if left > 0:
-            # capped: ``left`` is wall-clock, and a clock stepped back must not carry the hold past the timeout
-            # (a mark refused for being early is the deny below, never an allow)
+        still = queue.get(request.id)
+        if left > 0 and still is not None and still[1] == "pending":
+            # only a request still pending at the end of its hold waits for the mark (one withdrawn, or whose
+            # answer no longer verifies, is marked at once: L3 r1 complement 6). Capped: ``left`` is wall-clock,
+            # and a clock stepped back must not carry the hold past the timeout (a mark refused for being early
+            # is the deny below, never an allow)
             sleep(min(left + 0.05, GATE_SLEEP_CAP))
         marked = queue.mark_undecided(request.id, halt=tier == "irreversible", tool_input=tool_input,
                                       posture=posture)
@@ -1011,7 +1038,8 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
     (:func:`merge_messaging`, never loosening) in the same write. Raises
     :class:`levain.consent.canary.UntestedAgentVersion` when the installed ``claude`` is not a tested version
     (:data:`levain.consent.canary.TESTED_VERSIONS`), unless ``allow_untested_agent_version``. Returns
-    (script, settings)."""
+    (script, settings). It installs the PermissionRequest hook only, never the PreToolUse gate (Q14 B2): the
+    gate is installed by ``levain init`` / ``levain update`` (:mod:`levain.install`); only the canary calls this."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
         raise ValueError("max_hold must be a finite number of seconds >= 0")
     merge_messaging({}, inbound=inbound, outbound=outbound)  # refuse an unknown choice before writing anything
