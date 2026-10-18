@@ -9,7 +9,6 @@ signing keys and refusals are the cockpit key commands' own (:mod:`levain.cockpi
 """
 from __future__ import annotations
 
-import os
 import secrets
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, consent_grant, consent_grant_tool_problem,
-                              consent_workspace_problem, inert_grant)
+                              consent_resolved_workspace, inert_grant)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -58,11 +57,8 @@ class ConsentGrant:
 def _workspace(path: Path | str) -> str:
     """``path`` resolved (``~`` expanded, symlinks followed), an existing directory: what the grant stores is
     exactly what the criteria compare against."""
-    resolved = os.path.realpath(Path(path).expanduser())
-    if not os.path.isdir(resolved):
-        raise KeyError_(f"the workspace {resolved} is not a directory")
-    problem = consent_workspace_problem(resolved)
-    if problem is not None:
+    resolved, problem = consent_resolved_workspace(path)
+    if resolved is None:
         raise KeyError_(problem)
     return resolved
 

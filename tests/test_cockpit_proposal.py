@@ -20,7 +20,6 @@ from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import ConsentQueue, authority_source
 
 NOW = datetime(2026, 10, 17, 12, 0, 0, tzinfo=timezone.utc)
-WS = "/work/proj"
 
 
 def _stamp(when: datetime) -> str:
@@ -36,11 +35,20 @@ class Seed:
         self.clock = [NOW - timedelta(days=5)]
         self.q = ConsentQueue(self.dir, authority=authority_source(self.dir, anchor=None), clock=lambda: self.clock[0])
         self.n = 0
+        self.root = base / "work"
+        self.ws = self.w("proj")
+
+    def w(self, name: str) -> str:
+        """A real directory under the test's own tree: the log refuses a workspace that does not exist."""
+        d = self.root / name
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
 
     def decide(self, state: str = "allowed", *, via: str | None = "signature", agent: str = "claude_code",
-               tool: str = "Edit", cwd: str = WS, tier: str = "T2", tool_input: dict | None = None,
+               tool: str = "Edit", cwd: str | None = None, tier: str = "T2", tool_input: dict | None = None,
                ago: timedelta = timedelta(hours=1)) -> str:
         self.n += 1
+        cwd = self.ws if cwd is None else cwd
         self.clock[0] = NOW - ago
         r = self.q.file(agent=agent, agent_session_id=f"s{self.n}", tool_name=tool,
                         tool_input=tool_input or {"file_path": f"{cwd}/f{self.n}.txt", "content": "x"}, cwd=cwd,
@@ -71,8 +79,8 @@ def test_three_hand_allows_make_a_card_with_the_exact_grant_line(seed):
     got = seed.propose()
     assert len(got) == 1
     p = got[0]
-    assert (p.agent, p.tool, p.workspace, p.count) == ("claude_code", "Edit", WS, MIN_HAND_ALLOWS)
-    assert p.command == ("levain consent grant create --agent claude_code --tool Edit --workspace /work/proj "
+    assert (p.agent, p.tool, p.workspace, p.count) == ("claude_code", "Edit", seed.ws, MIN_HAND_ALLOWS)
+    assert p.command == (f"levain consent grant create --agent claude_code --tool Edit --workspace {seed.ws} "
                          "--posture default --expires 7d --signing-key <key>")
     assert PROPOSED_LIFE <= timedelta(days=30) and p.expires == "7d"
 
@@ -88,7 +96,7 @@ def test_the_proposed_line_parses_with_the_real_cli_parser(seed, monkeypatch):
     assert argv[0] == "levain" and cli.main(argv[1:]) == 0
     ns = seen[0]
     assert (ns.agent, ns.tools, str(ns.workspace), ns.postures, ns.expires) == (
-        "codex", ["apply_patch"], WS, ["default"], "7d")
+        "codex", ["apply_patch"], seed.ws, ["default"], "7d")
 
 
 def test_below_the_threshold_no_card(seed):
@@ -105,10 +113,10 @@ def test_a_shell_tool_is_never_proposed(seed):
 
 def test_an_mcp_write_tool_is_never_proposed_but_a_read_only_one_is(seed):
     for _ in range(4):
-        seed.decide(tool="mcp__fs__write_file", tool_input={"path": f"{WS}/a", "content": "x"})
+        seed.decide(tool="mcp__fs__write_file", tool_input={"path": f"{seed.ws}/a", "content": "x"})
     assert seed.propose() == []
     for _ in range(3):
-        seed.decide(tool="mcp__fs__read_text_file", tool_input={"path": f"{WS}/a"})
+        seed.decide(tool="mcp__fs__read_text_file", tool_input={"path": f"{seed.ws}/a"})
     got = seed.propose()
     assert [p.tool for p in got] == ["mcp__fs__read_text_file"]
 
@@ -139,9 +147,9 @@ def test_a_standing_grant_already_answering_withdraws_the_card(seed):
 
 def test_keys_are_agent_tool_and_workspace(seed):
     for _ in range(2):
-        seed.decide(cwd="/work/a")
-        seed.decide(cwd="/work/b")
-        seed.decide(agent="codex", tool="Edit", cwd="/work/a")
+        seed.decide(cwd=seed.w("a"))
+        seed.decide(cwd=seed.w("b"))
+        seed.decide(agent="codex", tool="Edit", cwd=seed.w("a"))
     assert seed.propose() == []
 
 
@@ -155,8 +163,8 @@ def test_a_root_or_home_workspace_is_never_proposed(seed):
 
 def test_a_path_with_a_space_is_quoted(seed):
     for _ in range(3):
-        seed.decide(cwd="/work/my proj")
-    assert "--workspace '/work/my proj'" in seed.propose()[0].command
+        seed.decide(cwd=seed.w("my proj"))
+    assert f"--workspace {shlex.quote(seed.w('my proj'))}" in seed.propose()[0].command
 
 
 def test_history_reaches_past_the_listing_day_but_not_past_the_window(seed):
@@ -164,16 +172,16 @@ def test_history_reaches_past_the_listing_day_but_not_past_the_window(seed):
         seed.decide(ago=timedelta(days=10, hours=i))
     assert seed.propose() and read_listing(seed.dir, now=NOW).recent == ()
     for i in range(3):
-        seed.decide(cwd="/work/old", ago=timedelta(days=20, hours=i))
-    assert [p.workspace for p in seed.propose()] == [WS]
+        seed.decide(cwd=seed.w("old"), ago=timedelta(days=20, hours=i))
+    assert [p.workspace for p in seed.propose()] == [seed.ws]
 
 
 def test_cards_are_ordered_most_answered_first_and_capped(seed):
     for k in range(PROPOSAL_CAP + 2):
-        for _ in range(3 + (k == 7)):
-            seed.decide(cwd=f"/work/p{k}")
+        for _ in range(3 + (k == PROPOSAL_CAP + 1)):
+            seed.decide(cwd=seed.w(f"p{k}"))
     got = seed.propose()
-    assert len(got) == PROPOSAL_CAP and got[0].workspace == "/work/p7" and got[0].count == 4
+    assert len(got) == PROPOSAL_CAP and got[0].workspace == seed.w(f"p{PROPOSAL_CAP + 1}") and got[0].count == 4
 
 
 def _route(monkeypatch, seed, *, token: bool) -> tuple[int, dict]:
@@ -214,7 +222,7 @@ def test_the_page_draws_the_card_as_text_with_a_copy_button_and_signs_nothing(tm
     seed = Seed(tmp_path)
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     for i in range(3):
-        seed.decide(cwd="/work/<img src=x onerror=window.__pwned=1>", ago=timedelta(hours=2 + i))
+        seed.decide(cwd=seed.w("<img src=x onerror=window.__pwned=1>"), ago=timedelta(hours=2 + i))
     seed.clock[0] = datetime.now(timezone.utc)
     seed.q.file(agent="claude_code", agent_session_id="live", tool_name="Edit", tool_input={"file_path": "/w/a"},
                 cwd="/w", hold=timedelta(minutes=30), event_id="live")
@@ -257,17 +265,17 @@ def test_g2_more_than_500_newer_allows_of_other_keys_do_not_hide_a_card(seed):
     for i in range(3):
         seed.decide(ago=timedelta(days=9, hours=i))
     for i in range(520):
-        seed.decide(cwd=f"/work/o{i % 7}", tool="Write", ago=timedelta(hours=1 + i % 50))
-    assert WS in [p.workspace for p in seed.propose()]
+        seed.decide(cwd=seed.w(f"o{i % 300}"), tool="Write", ago=timedelta(hours=1 + i % 50))
+    assert seed.ws in [p.workspace for p in seed.propose()]
 
 
 def test_g2_more_than_500_newer_denials_of_other_keys_do_not_hide_the_keys_denial(seed):
     seed.decide("denied", ago=timedelta(days=12))
     for i in range(520):
-        seed.decide("denied", cwd=f"/work/o{i % 7}", tool="Write", ago=timedelta(days=2, minutes=i))
+        seed.decide("denied", cwd=seed.w(f"o{i % 300}"), tool="Write", ago=timedelta(days=2, minutes=i))
     for i in range(3):
         seed.decide(ago=timedelta(minutes=10 + i))
-    assert WS not in [p.workspace for p in seed.propose()]      # the older denial still withdraws the card
+    assert seed.ws not in [p.workspace for p in seed.propose()]      # the older denial still withdraws the card
 
 
 def test_g2_withdrawn_rows_are_not_evidence_and_keys_come_most_answered_first(seed):
@@ -276,23 +284,23 @@ def test_g2_withdrawn_rows_are_not_evidence_and_keys_come_most_answered_first(se
     assert seed.evidence() == []
     for k in range(4):
         for _ in range(3 + k):
-            seed.decide(cwd=f"/work/p{k}")
-    assert [e.cwd for e in seed.evidence()] == ["/work/p3", "/work/p2", "/work/p1", "/work/p0"]
+            seed.decide(cwd=seed.w(f"p{k}"))
+    assert [e.cwd for e in seed.evidence()] == [seed.w("p3"), seed.w("p2"), seed.w("p1"), seed.w("p0")]
 
 
 def test_k1_200_unproposable_keys_with_more_allows_do_not_crowd_out_a_valid_card(seed):
     for k in range(210):
         for _ in range(4):
-            seed.decide(cwd=f"/work/d{k}", ago=timedelta(hours=3))
-        seed.decide("denied", cwd=f"/work/d{k}", ago=timedelta(hours=2))
+            seed.decide(cwd=seed.w(f"d{k}"), ago=timedelta(hours=3))
+        seed.decide("denied", cwd=seed.w(f"d{k}"), ago=timedelta(hours=2))
     for _ in range(3):
         seed.decide(ago=timedelta(hours=1))
-    assert [p.workspace for p in seed.propose()] == [WS]
+    assert [p.workspace for p in seed.propose()] == [seed.ws]
 
 
 def test_f3_an_mcp_tool_with_an_empty_server_is_never_proposed(seed):
     for _ in range(3):
-        seed.decide(tool="mcp____read_text_file", tool_input={"path": f"{WS}/a"})
+        seed.decide(tool="mcp____read_text_file", tool_input={"path": f"{seed.ws}/a"})
     assert seed.propose() == []
 
 
@@ -417,7 +425,7 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
     for i in range(3):
         seed.decide(ago=timedelta(hours=2 + i))
     for i in range(11):                                  # more than ten resolved rows: the "show all" control exists
-        seed.decide(cwd=f"/work/x{i}", tool="Write", ago=timedelta(hours=1, minutes=i))
+        seed.decide(cwd=seed.w(f"x{i}"), tool="Write", ago=timedelta(hours=1, minutes=i))
     seed.clock[0] = datetime.now(timezone.utc)
     seed.q.file(agent="claude_code", agent_session_id="live", tool_name="Edit", tool_input={"file_path": "/w/a"},
                 cwd="/w", hold=timedelta(minutes=30), event_id="live")
@@ -443,7 +451,78 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
 def test_a_tool_off_the_logs_allowlist_is_never_proposed(seed):
     """0.11.5: the log refuses a grant naming a tool it does not bound to the workspace, so the card never offers one."""
     for _ in range(MIN_HAND_ALLOWS):
-        seed.decide(agent="claude_code", tool="Task", cwd="/work/a", tool_input={"prompt": "x"})
-        seed.decide(agent="codex", tool="write_stdin", cwd="/work/b", tool_input={"chars": "x"})
-        seed.decide(agent="claude_code", tool="Edit", cwd="/work/c")
+        seed.decide(agent="claude_code", tool="Task", cwd=seed.w("a"), tool_input={"prompt": "x"})
+        seed.decide(agent="codex", tool="write_stdin", cwd=seed.w("b"), tool_input={"chars": "x"})
+        seed.decide(agent="claude_code", tool="Edit", cwd=seed.w("c"))
     assert [(p.agent, p.tool) for p in seed.propose()] == [("claude_code", "Edit")]
+
+
+# ---- L3 int r1 (1017+21): nothing the log would refuse at `grant create` is proposed ----------------------------
+
+@pytest.mark.parametrize("tool", ["mcp___srv__read_file", "mcp__bad server__read_file",
+                                  "mcp__" + "s" * 130 + "__read_file"])
+def test_a_tool_name_the_log_refuses_the_shape_of_is_never_proposed(seed, tool):
+    for _ in range(3):
+        seed.decide(tool=tool, tool_input={"path": f"{seed.ws}/a"})
+    assert seed.propose() == []
+
+
+def test_a_deleted_workspace_is_never_proposed(seed):
+    gone = seed.w("gone")
+    for _ in range(3):
+        seed.decide(cwd=gone)
+    assert [p.workspace for p in seed.propose()] == [gone]
+    Path(gone).rmdir()
+    assert seed.propose() == []
+
+
+def test_a_workspace_that_resolves_to_home_is_never_proposed(seed):
+    link = Path(seed.root) / "homelink"
+    link.symlink_to(Path.home())
+    for _ in range(3):
+        seed.decide(cwd=str(link))
+    assert seed.propose() == []
+
+
+def test_a_symlinked_workspace_is_proposed_as_the_directory_it_resolves_to(seed):
+    link = Path(seed.root) / "alias"
+    link.symlink_to(seed.ws)
+    for _ in range(3):
+        seed.decide(cwd=str(link))
+    got = seed.propose()
+    assert [p.workspace for p in got] == [seed.ws] and f"--workspace {seed.ws} " in got[0].command
+
+
+def test_the_proposal_agrees_with_what_grant_create_accepts(seed):
+    from levain.authority import consent_resolved_workspace, consent_tool_shape_problem
+    assert consent_resolved_workspace(seed.ws) == (seed.ws, None)
+    assert consent_resolved_workspace(seed.root / "nope")[0] is None
+    assert consent_tool_shape_problem("mcp__srv__read_file") is None
+    assert consent_tool_shape_problem("mcp___srv__read_file") and consent_tool_shape_problem("a" * 129)
+
+
+@needs_browser
+def test_a_dashboard_reload_drops_the_cached_proposals(tmp_path, monkeypatch):
+    seed = Seed(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    for i in range(3):
+        seed.decide(ago=timedelta(days=3 + i))
+    _root, src, _ids = _install(tmp_path)
+    esc = "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); 1"
+    wait = "new Promise(r => setTimeout(() => r(1), 600))"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE},
+            {"eval": "(() => { const f = window.fetch; window.__calls = 0; window.fetch = function (u, o) {"
+                     " if (String(u).includes('proposals.json')) window.__calls++; return f.apply(this, arguments); }; return 1; })()"},
+            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": esc}, {"eval": wait},
+            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": "window.__calls"},                                   # [-5]: a plain reopen reuses the read
+            {"eval": esc}, {"eval": wait},
+            {"eval": "window.LevainCockpitTransport.reload().then(() => 1)"},
+            {"eval": wait},
+            {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
+            {"eval": "window.__calls"},                                   # after a reload: read again
+        ])
+    assert out["values"][-1] == 2 and out["values"][-9] == 1, out["values"]

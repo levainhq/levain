@@ -8,7 +8,7 @@ over the last :data:`levain.consent.listing.HISTORY`, counted per key in the dat
 
 What is never proposed is whatever the log would refuse at append, taken from the log's own constants and checks
 (:mod:`levain.authority`), never listed again here: a tool the log's allowlist does not name (a shell tool, an MCP
-tool off the read-only list), a request at the agent-config tier, a workspace of ``/`` or the home directory.
+tool off the read-only list), a request at the agent-config tier, a workspace that is not an existing directory, or is ``/`` or the home directory once resolved.
 
 Stdlib only (plus the record and listing helpers).
 """
@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from levain.authority import (CONSENT_AGENTS, CONSENT_POSTURES, consent_root_problem, consent_tool_problem,
-                              consent_workspace_problem)
+from levain.authority import (CONSENT_AGENTS, CONSENT_POSTURES, consent_resolved_workspace, consent_root_problem,
+                              consent_tool_problem, consent_tool_shape_problem)
 from levain.consent.listing import KeyEvidence
 
 __all__ = ["MIN_HAND_ALLOWS", "PROPOSED_LIFE", "PROPOSED_POSTURE", "PROPOSAL_CAP", "Proposal", "propose"]
@@ -36,7 +36,8 @@ PROPOSED_LIFE = timedelta(days=7)
 # a request carries no permission mode, and ``default`` is the one both agents report (CONSENT_POSTURES): the narrowest
 # posture, so the grant answers only prompts the operator would have seen under the default mode
 PROPOSED_POSTURE = "default"
-PROPOSAL_CAP = 10
+# the page draws every card the backend returns, so this is the number of cards the page can show
+PROPOSAL_CAP = 3
 
 
 @dataclass(frozen=True)
@@ -58,19 +59,22 @@ class Proposal:
                 "command": self.command, "note": self.note}
 
 
-def _proposable(agent: str, tool: str, workspace: str) -> bool:
-    """Whether the log would take a grant naming this agent, tool and workspace (it is the log's judgement, asked
-    through its own checks): never a tool :func:`~levain.authority.consent_tool_problem` refuses (a shell tool, a tool
-    off the agent's allowlist, an MCP tool off the read-only list)."""
+def _proposable(agent: str, tool: str, workspace: str) -> str | None:
+    """The workspace the grant would store (:func:`~levain.authority.consent_resolved_workspace`: an existing
+    directory, symlinks followed) when the log would take a grant naming this agent, tool and workspace, else None. It is
+    the log's judgement, asked through its own checks: never a tool name of a shape the log refuses
+    (:func:`~levain.authority.consent_tool_shape_problem`) or a tool :func:`~levain.authority.consent_tool_problem`
+    refuses (a shell tool, a tool off the agent's allowlist, an MCP tool off the read-only list)."""
     if agent not in CONSENT_AGENTS or PROPOSED_POSTURE not in CONSENT_POSTURES[agent]:
-        return False
-    if consent_tool_problem(agent, tool) is not None:
-        return False
+        return None
+    if consent_tool_shape_problem(tool) is not None or consent_tool_problem(agent, tool) is not None:
+        return None
     if tool.startswith("mcp__"):     # mcp__<server>__<tool>, both parts named: the log's read-only check lets "mcp____x" by
         server, sep, name = tool[len("mcp__"):].partition("__")
         if not (server and sep and name):
-            return False
-    return consent_workspace_problem(workspace) is None and consent_root_problem(workspace) is None
+            return None
+    resolved, _ = consent_resolved_workspace(workspace)
+    return resolved if resolved is not None and consent_root_problem(resolved) is None else None
 
 
 def _duration(life: timedelta) -> str:
@@ -86,14 +90,17 @@ def propose(evidence: list[KeyEvidence]) -> list[Proposal]:
     (one is already doing the work)."""
     out: list[Proposal] = []
     for k in evidence:
-        if k.hand_allows < MIN_HAND_ALLOWS or k.denied or k.latest_via_grant or not _proposable(k.agent, k.tool, k.cwd):
+        if k.hand_allows < MIN_HAND_ALLOWS or k.denied or k.latest_via_grant:
+            continue
+        ws = _proposable(k.agent, k.tool, k.cwd)
+        if ws is None:
             continue
         expires = _duration(PROPOSED_LIFE)
         command = " ".join(["levain consent grant create", "--agent", k.agent, "--tool", shlex.quote(k.tool),
-                            "--workspace", shlex.quote(k.cwd), "--posture", PROPOSED_POSTURE,
+                            "--workspace", shlex.quote(ws), "--posture", PROPOSED_POSTURE,
                             "--expires", expires, "--signing-key <key>"])
-        out.append(Proposal(k.agent, k.tool, k.cwd, k.hand_allows, k.last_hand_at, expires, PROPOSED_POSTURE, command,
-                            f"covers {k.tool} prompts under the {PROPOSED_POSTURE} permission mode inside {k.cwd}; "
+        out.append(Proposal(k.agent, k.tool, ws, k.hand_allows, k.last_hand_at, expires, PROPOSED_POSTURE, command,
+                            f"covers {k.tool} prompts under the {PROPOSED_POSTURE} permission mode inside {ws}; "
                             "other modes need their own --posture"))
     out.sort(key=lambda p: (p.count, p.last_at), reverse=True)
     return out[:PROPOSAL_CAP]
