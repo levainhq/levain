@@ -51,7 +51,7 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_grant", "consent_grant_tool_problem", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_grant", "consent_grant_tool_problem", "consent_tool_shape_problem", "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -740,6 +740,30 @@ def consent_workspace_problem(workspace: Any) -> str | None:
     return None
 
 
+def consent_tool_shape_problem(tool: Any) -> str | None:
+    """Why ``tool`` is not a name a consent grant may carry (None when it is): the exact-name grammar, and for an MCP
+    tool the ``mcp__<server>__<tool>`` shape. The one judgement of a tool name's SHAPE, used by the grant validator and
+    by the cockpit's proposals; whether the tool is grantable at all is :func:`consent_tool_problem`."""
+    if not isinstance(tool, str) or not _CONSENT_TOOL.fullmatch(tool):
+        return "a grant's tool must be an exact tool name (a letter, then letters, digits, _ . -, at most 128)"
+    if tool.startswith("mcp__") and not _CONSENT_MCP_TOOL.fullmatch(tool):
+        return "an MCP tool is named mcp__<server>__<tool>"
+    return None
+
+
+def consent_resolved_workspace(path: Any) -> tuple[str | None, str | None]:
+    """``(resolved, None)`` when ``path`` (``~`` expanded, symlinks followed) is an existing directory a consent
+    grant may name as its workspace, else ``(None, why)``. Pure of the home test, which :func:`consent_root_problem`
+    makes on the result. What ``levain consent grant create`` stores is exactly this."""
+    if not isinstance(path, (str, os.PathLike)) or not str(path):
+        return None, "the workspace must be a non-empty path"
+    resolved = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isdir(resolved):
+        return None, f"the workspace {resolved} is not a directory"
+    problem = consent_workspace_problem(resolved)
+    return (None, problem) if problem is not None else (resolved, None)
+
+
 def _validate_consent_grant(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
     """A consent grant's shape (Q4). ``at``: the link's own time, when the grant arrives in a link; its life
     ends at most 30 days after it (the bound a renew has), so no link can carry a longer one."""
@@ -770,8 +794,7 @@ def _consent_grant_body(grant: Mapping[str, Any], what: str, at: datetime | None
     agent = grant["agent"]
     if not isinstance(agent, str) or agent not in CONSENT_AGENTS:
         raise AuthorityError(f"{what}.agent must be one of {', '.join(CONSENT_AGENTS)}")
-    for name, ok in (("tools", lambda t: bool(_CONSENT_TOOL.fullmatch(t)) and (
-                        not t.startswith("mcp__") or bool(_CONSENT_MCP_TOOL.fullmatch(t)))),
+    for name, ok in (("tools", lambda t: consent_tool_shape_problem(t) is None),
                      ("postures", CONSENT_POSTURES[agent].__contains__)):
         items = grant[name]
         if not isinstance(items, (list, tuple)) or not items or not all(isinstance(i, str) and ok(i) for i in items):

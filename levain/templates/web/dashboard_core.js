@@ -255,6 +255,7 @@
 
     const board = document.getElementById("board");
     if (!board) return;
+    proposalRead = null;   // an authoritative reload: a denial or a grant answered since must withdraw its card, not wait out the 30 s
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
@@ -3383,9 +3384,9 @@
   // Standing-rule proposals (rows 13/17): when the operator has allowed the same agent + tool + working directory by hand
   // three times, the Decisions view offers the one `levain consent grant create` line that would make it a grant. The page
   // never signs; the card is text and a copy button. Fetched from /cockpit/consent/proposals.json with the page's token
-  // through the consent queue above, and kept for 30 s so a redraw does not re-read it. No token, or a read that fails:
+  // through the consent queue above, and kept for 30 s so a modal repaint does not re-read it; every dashboard reload (render) drops it. No token, or a read that fails:
   // no card (a proposal is an offer, never a gate).
-  const PROPOSAL_SHOWN = 3, PROPOSAL_TTL_MS = 30000;
+  const PROPOSAL_TTL_MS = 30000;
   let proposalRead = null, proposalAt = 0;
   function proposalFetch() {
     if (proposalRead && Date.now() - proposalAt < PROPOSAL_TTL_MS) return proposalRead;
@@ -3434,7 +3435,7 @@
   function proposalSlot() {
     const slot = el("div", "proposal-slot");
     proposalFetch().then((list) => {
-      const cards = list.slice(0, PROPOSAL_SHOWN).map(proposalCard);
+      const cards = list.map(proposalCard)   // every card the backend returns (its own cap);
       if (cards.length) slot.replaceChildren(el("div", "ext-grouphead", "standing rule proposals"), ...cards);
     }).catch(() => {});
     return slot;
