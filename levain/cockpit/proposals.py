@@ -7,8 +7,8 @@ key. Nothing here reads the authority log or signs anything; the evidence is the
 over the last :data:`levain.consent.listing.HISTORY`, counted per key in the database, read-only.
 
 What is never proposed is whatever the log would refuse at append, taken from the log's own constants and checks
-(:mod:`levain.authority`), never listed again here: a shell tool, an MCP tool off the read-only list, a request at
-the agent-config tier, a workspace of ``/`` or the home directory.
+(:mod:`levain.authority`), never listed again here: a tool the log's allowlist does not name (a shell tool, an MCP
+tool off the read-only list), a request at the agent-config tier, a workspace of ``/`` or the home directory.
 
 Stdlib only (plus the record and listing helpers).
 """
@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from levain.authority import (CONSENT_AGENTS, CONSENT_POSTURES, CONSENT_SHELL_TOOLS, _CONSENT_TOOL,
-                              consent_mcp_tool_problem, consent_root_problem, consent_workspace_problem)
+from levain.authority import (CONSENT_AGENTS, CONSENT_POSTURES, consent_root_problem, consent_tool_problem,
+                              consent_workspace_problem)
 from levain.consent.listing import KeyEvidence
 
 __all__ = ["MIN_HAND_ALLOWS", "PROPOSED_LIFE", "PROPOSED_POSTURE", "PROPOSAL_CAP", "Proposal", "propose"]
@@ -60,12 +60,11 @@ class Proposal:
 
 def _proposable(agent: str, tool: str, workspace: str) -> bool:
     """Whether the log would take a grant naming this agent, tool and workspace (it is the log's judgement, asked
-    through its own checks): never a shell tool, never an MCP tool off the read-only list."""
+    through its own checks): never a tool :func:`~levain.authority.consent_tool_problem` refuses (a shell tool, a tool
+    off the agent's allowlist, an MCP tool off the read-only list)."""
     if agent not in CONSENT_AGENTS or PROPOSED_POSTURE not in CONSENT_POSTURES[agent]:
         return False
-    if tool.lower() in CONSENT_SHELL_TOOLS or _CONSENT_TOOL.fullmatch(tool) is None:
-        return False
-    if consent_mcp_tool_problem(tool) is not None:
+    if consent_tool_problem(agent, tool) is not None:
         return False
     if tool.startswith("mcp__"):     # mcp__<server>__<tool>, both parts named: the log's read-only check lets "mcp____x" by
         server, sep, name = tool[len("mcp__"):].partition("__")
