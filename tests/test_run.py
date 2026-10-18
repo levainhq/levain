@@ -645,7 +645,9 @@ def test_the_repl_folds_the_standard_cred_stores_into_its_floor_by_default(
     cfg.write_text('{"deny_standard_creds": false}\n')
     opted_in = _repl_binding()
     assert opted_in.deny_standard_creds is False
-    assert crown_jewel_reason(opted_in.floor, netrc) is None
+    # the opt-in reopens the READ; ~/.netrc is still an immediate home entry, so the write floor keeps it
+    assert crown_jewel_reason(opted_in.floor, netrc, write=False) is None
+    assert crown_jewel_reason(opted_in.floor, netrc) is not None
     assert crown_jewel_reason(opted_in.floor, gh) is None
 
 

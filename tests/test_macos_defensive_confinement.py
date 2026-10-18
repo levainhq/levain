@@ -504,6 +504,32 @@ def test_home_top_level_entry_is_denied_by_editor_and_inode_guard(tmp_path, monk
     with pytest.raises(conf.ConfinementError, match="crown jewel with 2 names"):
         conf._refuse_multiply_linked_jewels(policy)
 
+    # The rule guards writing the entry itself, never reading it, and never working INSIDE a home child: a
+    # workspace at ~/proj (the common layout) failed str_replace, insert and its own listing ("Invalid `path`").
+    os.unlink(workspace / "alias")
+    proj = home / "proj"
+    proj.mkdir()
+    (proj / "main.py").write_text("a\n")
+    policy = conf.build_policy(policy.entity_dir, workspace=proj, deny_standard_creds=False)
+    assert conf.crown_jewel_reason(policy, top, write=False) is None
+    assert conf.crown_jewel_reason(policy, proj) is not None
+    assert conf.crown_jewel_reason(policy, proj, container=True) is None
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from openhands.tools.file_editor import FileEditorAction
+
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
+
+    editor = CrownJewelsFileEditorExecutor(policy=policy)
+    assert not editor(FileEditorAction(command="str_replace", path=str(proj / "main.py"), old_str="a",
+                                       new_str="b")).is_error
+    assert not editor(FileEditorAction(command="insert", path=str(proj / "main.py"), insert_line=1,
+                                       new_str="c")).is_error
+    assert not editor(FileEditorAction(command="view", path=str(proj))).is_error
+    assert not editor(FileEditorAction(command="view", path=str(top))).is_error
+    assert editor(FileEditorAction(command="str_replace", path=str(top), old_str="protected",
+                                   new_str="x")).is_error
+    assert (proj / "main.py").read_text() == "b\nc\n" and top.read_text() == "protected"
+
 
 @pytest.mark.parametrize("kind", ["config", "hook", "case-settings", "ordinary"])
 def test_hardlink_alias_of_persistence_file_refuses_spawn(tmp_path, monkeypatch, kind) -> None:

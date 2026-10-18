@@ -175,8 +175,8 @@ def test_a_link_flipped_after_the_path_check_is_refused_at_the_open(tmp_path: Pa
     ex = T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws))
     real_check = T.crown_jewel_reason
 
-    def check_then_flip(policy, path):
-        out = real_check(policy, path)
+    def check_then_flip(policy, path, **kw):
+        out = real_check(policy, path, **kw)
         if Path(path) == link:          # the shell swaps the file for a link right after the check
             link.unlink()
             link.symlink_to(jewel_dir / "secret.txt")
@@ -238,8 +238,8 @@ def test_a_write_through_a_flipped_link_neither_truncates_nor_writes_the_jewel(t
     ex = T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws))
     real_check = T.crown_jewel_reason
 
-    def check_then_flip(policy, path):
-        out = real_check(policy, path)
+    def check_then_flip(policy, path, **kw):
+        out = real_check(policy, path, **kw)
         if Path(path) == target and not target.is_symlink():
             target.symlink_to(jewel)
         return out
@@ -604,8 +604,8 @@ def test_a_denied_jewel_answers_exactly_as_a_missing_path(tmp_path: Path, monkey
         link = ws / "probe"
         link.write_text("benign")
 
-        def check_then_flip(policy, path, _t=target):
-            out = real_check(policy, path)
+        def check_then_flip(policy, path, _t=target, **kw):
+            out = real_check(policy, path, **kw)
             if Path(path) == link and not link.is_symlink():
                 link.unlink()
                 link.symlink_to(jewel_dir / _t)

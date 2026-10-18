@@ -141,6 +141,7 @@ import copy
 import gc
 import logging
 import math
+import platform
 import re
 import secrets
 import threading
@@ -316,8 +317,9 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "this server's chat routes from there, approving its own held actions. Chat refuses to "
             "host it; use `levain run` for this entity."
         )
-    # Grants are bound only on Linux: on macOS none reaches the shell (until B2), so none is cited.
-    if cfg.hands_user is None and grants_apply():
+    # A grant is bound to the shell only on Linux. On macOS the shell's spawn refuses every operator grant
+    # and says why (confinement._validate_macos_grant), so chat cites none, as for an unreadable grants file.
+    if cfg.hands_user is None and grants_apply() and platform.system() != "Darwin":
         try:
             granted = [g.name for g in load_operator_grants() if not g.gpg_extra]
         except ConfinementError:
@@ -417,8 +419,9 @@ def _hands_reach_this_server(session: Any) -> str | None:
     """What lets ``session``'s shell reach this server, read from the floor the hands enforce, or
     ``None``. Three ways: connecting to localhost, a container daemon socket (a container on the
     host network connects to localhost), and a socket the operator grants (not gpg's extra socket),
-    read from the conversation's own grant snapshot, the one its shell spawns with (a hands user's shell,
-    and any shell on macOS, has none). The floor carries no socket sources only when the
+    read from the conversation's own grant snapshot, the one its shell spawns with (a hands user's shell
+    has none; on macOS a granted socket makes the shell's spawn refuse, and a snapshot that holds one here
+    still counts, fail-closed). The floor carries no socket sources only when the
     entity opted out of the socket denies. An unreadable floor on a session with a shell counts
     as reaching it (fail-closed)."""
     if not getattr(session, "bash_ok", False):

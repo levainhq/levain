@@ -199,10 +199,11 @@ def test_chat_refuses_an_entity_whose_shell_gets_an_operator_grant(tmp_path, mon
     gf.write_text(json.dumps({"grants": podman}))
     assert opened.conversation.agent.tools_map["file_editor"].executor._floor.grants.get() == ()
     assert chat_mod._hands_reach_this_server(opened) is None
-    # On macOS no grant is bound, so chat cites none.
+    # On macOS no grant is bound: the shell's spawn refuses a granted socket and says why, so chat cites none.
+    # A session whose snapshot holds one anyway (a shell the spawn would have refused) still counts, fail-closed.
     monkeypatch.setattr(conf.platform, "system", lambda: "Darwin")
     assert chat_mod.chat_refusal(ent) is None
-    assert chat_mod._hands_reach_this_server(session_for()) is None
+    assert chat_mod._hands_reach_this_server(session_for()) == "may reach the sockets the operator grants"
 
 
 @pytest.mark.parametrize("held", ["workspace", "entity", "home"])

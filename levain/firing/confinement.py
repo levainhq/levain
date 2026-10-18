@@ -2803,7 +2803,7 @@ def opened_file_path(fd: int) -> str:
     return os.fsdecode(raw.split(b"\0", 1)[0])
 
 
-def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
+def opened_file_reason(policy: CrownJewelsPolicy, fd: int, *, write: bool = True) -> str | None:
     """Why the file ALREADY OPEN on ``fd`` must not be read or written through the file editor, or
     None. The editor's path check runs before the editor opens the path, so a link the shell flips in
     between (to ``/proc/<pid>/environ``, or to any jewel) passed it (L2 r1). This judges the object
@@ -2818,7 +2818,7 @@ def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
         path = opened_file_path(fd)
     except OSError as exc:
         return f"the opened file could not be identified ({exc}) — refused (fail-closed)"
-    reason = crown_jewel_reason(policy, path)
+    reason = crown_jewel_reason(policy, path, write=write)
     if reason is not None:
         return reason
     # The opened object's own identity, never a second stat of its name: the shell can unlink or
@@ -2862,7 +2862,8 @@ def persistence_agent_pin_reason(policy: CrownJewelsPolicy, path: Path | str) ->
     return None
 
 
-def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
+def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str, *, write: bool = True,
+                       container: bool = False) -> str | None:
     """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
 
     This is the IN-PROCESS twin of the seatbelt profile (:meth:`SeatbeltProvider.render_profile`),
@@ -2915,17 +2916,23 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
     if (why := _process_view_reason(path, p)) is not None:
         return why
-    for home in policy.persistence_home_dirs:
+    # The persistence floor is a WRITE floor, as the Seatbelt profile renders it (``deny file-write*``): a
+    # caller that only reads (``write=False``: the editor's ``view``, its read-only opens and its stat probe)
+    # is not refused by it, so the editor reads what the shell reads. Every other caller keeps the default,
+    # ``write=True``. The immediate-home-entry rule guards creating, replacing or renaming the entry itself;
+    # a directory judged as the place an operation works INSIDE (``container=True``: ``~/proj`` holding the
+    # file being edited) is not that entry's write, and its final target is judged on its own.
+    for home in (policy.persistence_home_dirs if write and not container else ()):
         if (_canon(str(lexical.parent)) == _canon(str(home))
                 or _canon(str(p.parent)) == _canon(str(home))):
             return f"{lexical} is an immediate operator-home entry and is write-protected"
-    for root in policy.persistence_agent_roots:
+    for root in (policy.persistence_agent_roots if write else ()):
         if _ci_within(lexical, root) or _ci_within(p, root):
             return f"{lexical} is under the whole write-protected agent directory {root}"
-    for root in policy.persistence_agent_dirs:
+    for root in (policy.persistence_agent_dirs if write else ()):
         if _ci_within(lexical, root) or _ci_within(p, root):
             return f"{p} is under the resolved write-protected agent directory {root}"
-    for target in policy.persistence_agent_files:
+    for target in (policy.persistence_agent_files if write else ()):
         if (_canon(str(lexical)) == _canon(str(target))
                 or _canon(str(p)) == _canon(str(target))):
             return f"{p} is a resolved file target below a write-protected agent directory"
@@ -2942,10 +2949,10 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
     if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
         return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
-    for subtree in policy.persistence_write_subtrees:
+    for subtree in (policy.persistence_write_subtrees if write else ()):
         if _ci_within(p, subtree):
             return f"{p} is under the write-protected persistence subtree {subtree}"
-    for protected in policy.persistence_write_files:
+    for protected in (policy.persistence_write_files if write else ()):
         if _canon(str(p)) == _canon(str(protected)):
             return f"{p} is a write-protected shell or git startup file"
     # Container sockets are write-denied through the SAME ``deny_write_files`` list as the ssh

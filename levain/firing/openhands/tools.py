@@ -370,7 +370,10 @@ def _floored_open(file, *args, **kwargs):
             if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
                 reason = "the opened path is not a regular file (a FIFO, device or socket)"
             else:
-                reason = opened_file_reason(policy, fd)
+                # an open that can change the file is judged as a write; a read-only open is not refused by
+                # the write-only persistence floor (crown_jewel_reason's ``write``)
+                writes = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+                reason = opened_file_reason(policy, fd, write=writes)
         except Exception as exc:  # noqa: BLE001 — a check that cannot run refuses
             reason = f"the opened file could not be checked ({exc})"
         if reason is not None:
@@ -451,11 +454,11 @@ def _held_dir(path: str | Path) -> tuple[int, str]:
         raise
 
 
-def _held_dir_reason(policy: CrownJewelsPolicy, fd: int, walked: str) -> str | None:
+def _held_dir_reason(policy: CrownJewelsPolicy, fd: int, walked: str, *, write: bool = True) -> str | None:
     """Why the held directory must not be used: its name is a jewel or inside one, or it or any
     ancestor (reached through ``..`` from the fd itself, so a rename since the walk is seen) is a
-    denied subtree root by identity."""
-    reason = crown_jewel_reason(policy, walked)
+    denied subtree root by identity. The directory is judged as a container (``container=True``)."""
+    reason = crown_jewel_reason(policy, walked, write=write, container=True)
     if reason is not None:
         return reason
     roots: dict[tuple[int, int], str] = {}
@@ -483,11 +486,11 @@ def _held_dir_reason(policy: CrownJewelsPolicy, fd: int, walked: str) -> str | N
         os.close(cur)
 
 
-def _judged_dir(path: str | Path) -> tuple[int, str]:
+def _judged_dir(path: str | Path, *, write: bool = True) -> tuple[int, str]:
     """:func:`_held_dir`, refused unless :func:`_held_dir_reason` passes it."""
     fd, walked = _held_dir(path)
     try:
-        reason = _held_dir_reason(_EDITOR_FLOOR.get(), fd, walked)
+        reason = _held_dir_reason(_EDITOR_FLOOR.get(), fd, walked, write=write)
     except OSError as exc:
         reason = f"{walked} could not be checked ({exc}) — refused"
     if reason is not None:
@@ -756,10 +759,11 @@ def _floored_stat(path) -> os.stat_result | None:
     if hands is not None:
         return hands.stat(path)
     policy = _EDITOR_FLOOR.get()
-    # Mapped whole first: the trusted root may be the path itself (the workspace dir).
+    # Mapped whole first: the trusted root may be the path itself (the workspace dir). A stat changes
+    # nothing, so it is judged as a read (``write=False``); a write that follows is judged where it writes.
     p = _trusted_spelling(os.path.abspath(os.path.expanduser(str(path))))
     try:
-        pfd, walked = _judged_dir(os.path.dirname(p))
+        pfd, walked = _judged_dir(os.path.dirname(p), write=False)
     except (_FloorRefusedWalk, OSError):
         return None
     try:
@@ -771,7 +775,7 @@ def _floored_stat(path) -> os.stat_result | None:
         except PermissionError:
             # Unreadable, so not opened: stat it, and judge it by identity against the jewels.
             st = os.stat(name, dir_fd=pfd)
-            if crown_jewel_reason(policy, os.path.join(walked, name)) is not None:
+            if crown_jewel_reason(policy, os.path.join(walked, name), write=False) is not None:
                 return None
             try:
                 jewels = _jewel_inodes(policy)
@@ -781,9 +785,9 @@ def _floored_stat(path) -> os.stat_result | None:
         try:
             st = os.fstat(fd)
             if stat.S_ISDIR(st.st_mode):
-                reason = _held_dir_reason(policy, fd, os.path.join(walked, name))
+                reason = _held_dir_reason(policy, fd, os.path.join(walked, name), write=False)
             else:
-                reason = opened_file_reason(policy, fd)
+                reason = opened_file_reason(policy, fd, write=False)
             return None if reason is not None else st
         finally:
             os.close(fd)
@@ -1302,7 +1306,8 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         # planted in its workspace would be followed into the operator's files. The helper refuses a
         # link and runs under the floor's profile, which denies every jewel to the hands user.
         reason = None if self._floor.hands is not None else (
-            crown_jewel_reason(policy, action.path) or linked_jewel_reason(policy, action.path))
+            crown_jewel_reason(policy, action.path, write=action.command != "view")
+            or linked_jewel_reason(policy, action.path))
         if reason is not None:
             return FileEditorObservation.from_text(
                 text=(
