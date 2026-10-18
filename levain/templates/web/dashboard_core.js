@@ -41,6 +41,8 @@
     const p = el("div", "panel" + (span2 ? " span2" : ""));
     p.dataset.zone = entry.zone || "";
     p.dataset.editClass = entry.edit_class || "";
+    // the panel's stable id: what a kept row or scroll position is filed under (the heading is not an identity)
+    if (entry.id) p.dataset.panelId = String(entry.id);
     if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
@@ -154,7 +156,13 @@
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
   // rows land. null = don't restore (cleared on a fresh user search → resets to top).
-  let modalRestoreScroll = null;
+  // what the reader holds while the page is drawn again, for the draw in progress (read by a typed panel filled in it)
+  let buildKept = null;
+  // The focus modal's kept state, carried while its rows are still on the way (a keyword search answers later): every
+  // rebuild until they land inherits it, never re-reading the emptied body. modalGen names the build a result belongs to.
+  let modalPending = null;
+  let modalAwaiting = false;
+  let modalGen = 0;
 
   // The starter jar (masthead): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
@@ -250,6 +258,7 @@
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
+    buildKept = kept;                  // a typed panel filled during this draw may owe the reader a later repaint of it
     board.replaceChildren();
 
     const entityEl = document.getElementById("entity");
@@ -353,10 +362,10 @@
       board.appendChild(renderErrors(view));
     }
     finalizePanels(board);  // wrap content + bound the long modules (scroll within, no reflow)
-    restoreKeptRows(board, kept);   // before the measure, which leaves an expanded row's toggle as "less"
-    measureClauses(board);  // reveal per-item expand toggles on clauses that overflow the clamp
+    // measure with every row closed, then hand the reader's state back (rows, scroll, overflow cue), then filter
+    settleKept(board, kept);
+    buildKept = null;
     applyFilter();
-    restoreKeptScroll(board, kept);
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
@@ -1089,8 +1098,9 @@
   // scrolled. Rows are known by their id (data-row-key, or data-keep-key for a typed panel's row), never by position,
   // inside the panel that holds them (data-ck-panel); a row that is gone simply stays closed. RE-RUNNABLE.
   const keptScope = (n) => {
-    const ck = n.closest ? n.closest("[data-ck-panel]") : null;
-    if (ck) return ck.dataset.ckPanel || "";
+    const ck = n.closest ? n.closest("[data-ck-panel], [data-panel-id]") : null;
+    if (ck) return ck.dataset.ckPanel || ck.dataset.panelId || "";
+    // only a panel the manifest gave no id falls through to its heading
     const pn = n.closest ? n.closest(".panel") : null;
     const h = pn ? pn.querySelector("h2") : null;
     return h ? "t:" + h.textContent : "";
@@ -1110,9 +1120,11 @@
     for (const sc of scrollersOf(root)) if (sc.scrollTop > 0) kept.scroll.set(keptScope(sc), sc.scrollTop);
     return kept;
   }
+  // Only a row the clause measure marked can be opened again: a row whose text no longer overflows has no control
+  // to close it with, so it stays closed. Run measureClauses first, on closed rows.
   function restoreKeptRows(root, kept) {
     if (!kept || !root || !root.querySelectorAll || !kept.open.size) return;
-    for (const row of root.querySelectorAll(".row")) {
+    for (const row of root.querySelectorAll(".row.has-more")) {
       const k = keptKey(row);
       if (k && kept.open.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, true);
     }
@@ -1120,6 +1132,19 @@
   function restoreKeptScroll(root, kept) {
     if (!kept || !root || !kept.scroll.size) return;
     for (const sc of scrollersOf(root)) { const t = kept.scroll.get(keptScope(sc)); if (t) sc.scrollTop = t; }
+  }
+
+  // The one order a drawn panel settles in: measure the clauses with every row closed, open again the rows the reader
+  // held (the measure decides which can be), put the scroll back, then measure each bounded body's overflow cue last,
+  // since the rows and the scroll both change what it reads. `root` is a board, a modal, or a single panel body.
+  function settleKept(root, kept) {
+    if (!root || !root.querySelectorAll) return;
+    measureClauses(root);
+    restoreKeptRows(root, kept);
+    restoreKeptScroll(root, kept);
+    const bodies = Array.from(root.querySelectorAll(".pbody.clamped"));
+    if (root.matches && root.matches(".pbody.clamped")) bodies.push(root);
+    for (const b of bodies) measureOverflow(b);
   }
 
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
@@ -1515,6 +1540,7 @@
   function episodeRow(e, verbs, showAgent) {
     const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
     if (e.row_id) row.dataset.rowKey = e.row_id;
+    else if (e.id) row.dataset.keepKey = "episode:" + e.id;   // a keyword hit has no row id: the same key the recent list's row carries
     if (showAgent && e.agent) row.appendChild(tagEl("tier", e.agent));
     if (e.type) row.appendChild(tagEl("etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
@@ -1535,6 +1561,7 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     const verbs = isVerbPanel(entry);
     const modal = !!(opts && opts.modal);
+    const myGen = modalGen;
 
     // spore-107: inline keyword search over the episodic store, READ-ONLY. Enter runs
     // a /recall.json query and swaps the recent list for matches; clearing the box
@@ -1557,16 +1584,16 @@
     // changes (search shrinks/grows it) — the body is .pbody once finalizePanels has run
     // (a no-op on the initial render, where finalizePanels measures instead).
     const reMeasure = () => {
+      // rows that arrive after the board's own measure (a search answer) get their expand controls here
+      measureClauses(results);
       const b = results.closest(".pbody"); if (b) measureOverflow(b);
-      // In the modal, re-apply the scroll preserved across a refresh-rebuild ONCE the
-      // (async) results have landed — buildModal's synchronous restore clamps to 0 here,
-      // because the episode list arrives after the /recall.json round-trip. Cleared by
-      // capture() on user input, so a fresh user search still resets to the top.
-      if (modal && modalRestoreScroll != null) {
-        // one-shot: apply the preserved scroll exactly once, then clear — buildModal
-        // re-sets it on the next rebuild, so stale global state can't re-apply (codex L3).
+      // In the modal, hand back what the reader held across a refresh-rebuild ONCE the (async) results have landed:
+      // the rows they had open and the scroll, which buildModal's synchronous restore could not reach because the list
+      // arrives after the /recall.json round-trip. One-shot, and only for the build this panel belongs to; the reader's
+      // own search (capture) drops it, so a fresh search still starts at the top.
+      if (modal && myGen === modalGen && modalPending && results.isConnected) {
         const sc = results.closest(".modal-body");
-        if (sc) { sc.scrollTop = modalRestoreScroll; modalRestoreScroll = null; }
+        if (sc) { const k = modalPending; modalPending = null; modalAwaiting = false; settleKept(sc, k); }
       }
     };
     const agents = [];
@@ -1649,7 +1676,7 @@
     const capture = () => {
       if (!modal) return;
       modalEpisodeQuery = input.value.trim();
-      modalRestoreScroll = null;  // user is driving the search → don't fight their scroll
+      modalPending = null; modalAwaiting = false;  // user is driving the search → don't fight their scroll
     };
     input.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") { ev.preventDefault(); capture(); search(input.value); }
@@ -1659,7 +1686,7 @@
     // under a changed box (codex L3); emptying also restores the recent list.
     input.addEventListener("input", () => { seq++; capture(); syncAgent(); if (!input.value.trim()) showRecent(); });
 
-    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; syncAgent(); search(modalEpisodeQuery); }
+    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; syncAgent(); modalAwaiting = true; search(modalEpisodeQuery); }
     else showRecent();
     return p;
   }
@@ -3599,6 +3626,7 @@
     const p = renderPanelSafe(entry, view, { modal: true, glance: modalGlance });
     if (!p) return null;
     const host = el("div", "modal-panel");
+    if (entry.id) host.dataset.panelId = String(entry.id);
     const phead = p.querySelector(".phead");
     const body = el("div", "pbody modal-pbody");
     if (phead) { while (phead.nextSibling) body.appendChild(phead.nextSibling); }
@@ -3611,8 +3639,15 @@
   }
 
   function buildModal(entry) {
+    const gen = ++modalGen;
+    modalAwaiting = false;
+    // A rebuild of the same open modal keeps the rows read in it open and its scroll. If an earlier rebuild's rows
+    // have not landed yet its body is empty and its scroll is clamped, so that rebuild's state is inherited instead.
+    const openBody = document.querySelector("#levain-modal .modal-body");
+    const modalKept = modalPending || captureKept(openBody);
+    buildKept = modalKept;   // a typed panel filled in this build may owe the reader a later repaint of it
     const content = currentView ? modalContent(entry, currentView) : null;
-    if (!content) { closeModal(); return; }
+    if (!content) { buildKept = null; closeModal(); return; }
 
     let overlay = document.getElementById("levain-modal");
     const firstOpen = !overlay;
@@ -3635,13 +3670,6 @@
       document.body.appendChild(overlay);
       document.body.classList.add("modal-open");
     }
-    // preserve scroll across a refresh-rebuild (a verb fired inside the modal) so a
-    // tombstone/compost doesn't yank a long list back to the top.
-    const prevBody = overlay.querySelector(".modal-body");
-    const modalKept = captureKept(prevBody);   // a rebuild of the same open modal keeps the rows read in it expanded
-    const prevScroll = prevBody ? prevBody.scrollTop : 0;
-    modalRestoreScroll = prevScroll;  // re-applied once async modal-episode rows land (reMeasure)
-
     overlay.dataset.zone = content.zone;
     const box = el("div", "modal");
     const head = el("div", "modal-head");
@@ -3682,9 +3710,9 @@
     const hadModalFocus = overlay.contains(document.activeElement);
     overlay.replaceChildren(box);
     pruneModalKinds();  // the typed panels the old modal body held end with it
-    restoreKeptRows(box, modalKept);
-    measureClauses(box);  // reveal per-item expand toggles inside the focus modal too
-    mbody.scrollTop = prevScroll;
+    settleKept(box, modalKept);   // clause toggles, the held rows and scroll, the overflow cue: in that order
+    buildKept = null;
+    modalPending = modalAwaiting && gen === modalGen ? modalKept : null;   // rows still on the way take it when they land
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
     if (newSearch) newSearch.focus();
     else if (firstOpen || hadModalFocus) close.focus();
@@ -3713,6 +3741,9 @@
     document.body.classList.remove("modal-open");
     modalKey = null;
     modalGlance = false;
+    modalPending = null;
+    modalAwaiting = false;
+    modalGen++;
     let rf = modalReturnFocus;
     modalReturnFocus = null;
     // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
@@ -3862,5 +3893,5 @@
     finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
   }
 
-  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, captureKept, restoreKeptRows, restoreKeptScroll, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
