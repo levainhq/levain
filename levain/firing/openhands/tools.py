@@ -496,6 +496,66 @@ def _judged_dir(path: str | Path) -> tuple[int, str]:
     return fd, walked
 
 
+def _mutation_spelling(path: str | Path, dir_fd: int | None = None) -> str:
+    """The dentry an unlink/rename-style operation mutates, including ``dir_fd`` calls."""
+    raw = os.path.expanduser(str(path))
+    if dir_fd is not None and not os.path.isabs(raw):
+        raw = os.path.join(opened_file_path(dir_fd), raw)
+    return _trusted_spelling(os.path.abspath(raw))
+
+
+def _mutation_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | None:
+    """The shared source/destination check for operations which remove or relocate a dentry."""
+    return (crown_jewel_reason(policy, path)
+            or persistence_agent_pin_reason(policy, path)
+            or linked_jewel_reason(policy, path))
+
+
+def _refuse_mutation(policy: CrownJewelsPolicy, path: str | Path, dir_fd: int | None = None) -> str:
+    target = _mutation_spelling(path, dir_fd)
+    reason = _mutation_reason(policy, target)
+    if reason is not None:
+        raise _FloorRefusedWalk(reason)
+    return target
+
+
+def _floored_unlink(path, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is not None:
+        _refuse_mutation(policy, path, kwargs.get("dir_fd"))
+    return os.unlink(path, *args, **kwargs)
+
+
+def _floored_rmdir(path, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is not None:
+        _refuse_mutation(policy, path, kwargs.get("dir_fd"))
+    return os.rmdir(path, *args, **kwargs)
+
+
+def _floored_rename(src, dst, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is not None:
+        _refuse_mutation(policy, src, kwargs.get("src_dir_fd"))
+        _refuse_mutation(policy, dst, kwargs.get("dst_dir_fd"))
+    return os.rename(src, dst, *args, **kwargs)
+
+
+def _floored_replace(src, dst, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is not None:
+        _refuse_mutation(policy, src, kwargs.get("src_dir_fd"))
+        _refuse_mutation(policy, dst, kwargs.get("dst_dir_fd"))
+    return os.replace(src, dst, *args, **kwargs)
+
+
+def _floored_rmtree(path, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is not None:
+        _refuse_mutation(policy, path, kwargs.get("dir_fd"))
+    return shutil.rmtree(path, *args, **kwargs)
+
+
 def _floored_move(src, dst, *args, **kwargs):
     """``shutil.move`` for the editor's ``insert``: its own temp file renamed onto ``dst`` relative to
     the held, judged parent directory, with the target name judged too and never a link."""
@@ -520,14 +580,21 @@ def _floored_move(src, dst, *args, **kwargs):
     try:
         return _floored_move_impl(policy, src, dst)
     except BaseException:
-        try:
-            os.unlink(src)   # the editor's temp file, holding the edit, on any failed move (L1 r3)
-        except OSError:
-            pass
+        # The stock editor supplies its own temp file, but this wrapper is still a mutation boundary:
+        # never let failure cleanup unlink a source which the resolved-set policy pins.
+        if _mutation_reason(policy, _mutation_spelling(src)) is None:
+            try:
+                os.unlink(src)   # the editor's temp file, holding the edit, on failed destination
+            except OSError:
+                pass
         raise
 
 
 def _floored_move_impl(policy: CrownJewelsPolicy, src, dst) -> str:
+    src_target = _mutation_spelling(src)
+    reason = _mutation_reason(policy, src_target)
+    if reason is not None:
+        raise _FloorRefusedWalk(reason)
     dst = _trusted_spelling(os.path.abspath(os.path.expanduser(str(dst))))
     name = os.path.basename(dst)
     pfd, walked = _judged_dir(os.path.dirname(dst))
@@ -667,6 +734,7 @@ class _FlooredShutil:
     """The editor module's ``shutil`` with ``move`` floored; everything else is the real module."""
 
     move = staticmethod(_floored_move)
+    rmtree = staticmethod(_floored_rmtree)
 
     def __getattr__(self, name):
         return getattr(shutil, name)
@@ -754,6 +822,28 @@ class _FlooredPath(type(Path())):
             raise FileNotFoundError(2, "No such file or directory", str(self))
         return st
 
+    def unlink(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().unlink(*args, **kwargs)
+        return _floored_unlink(self, *args, **kwargs)
+
+    def rmdir(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().rmdir(*args, **kwargs)
+        return _floored_rmdir(self, *args, **kwargs)
+
+    def rename(self, target):
+        if _EDITOR_FLOOR.get() is None:
+            return super().rename(target)
+        _floored_rename(self, target)
+        return self.__class__(target)
+
+    def replace(self, target):
+        if _EDITOR_FLOOR.get() is None:
+            return super().replace(target)
+        _floored_replace(self, target)
+        return self.__class__(target)
+
 
 def _floored_size_or_mtime(attr: str, stock):
     def fn(path):
@@ -780,6 +870,11 @@ class _FlooredOs:
     """``os`` for the editor modules: the real module with ``path`` floored."""
 
     path = _FlooredOsPath()
+    unlink = staticmethod(_floored_unlink)
+    remove = staticmethod(_floored_unlink)
+    rmdir = staticmethod(_floored_rmdir)
+    rename = staticmethod(_floored_rename)
+    replace = staticmethod(_floored_replace)
 
     def __getattr__(self, name):
         return getattr(os, name)

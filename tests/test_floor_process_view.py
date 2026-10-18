@@ -302,7 +302,9 @@ def test_a_file_shaped_procfs_mount_is_masked_not_tmpfsd(policy, tmp_path: Path,
 def _under_floor(tmp_path: Path, monkeypatch):
     from levain.firing.openhands import tools as T
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # Keep the ordinary-path controls below the test scratch root, not directly in HOME: immediate
+    # HOME entries are intentionally write-protected by the persistence floor.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     ent = tmp_path / "ent"
     (ent / ".levain").mkdir(parents=True, exist_ok=True)
     return T, T._EDITOR_FLOOR.set(build_policy(ent))
@@ -535,7 +537,7 @@ def test_a_cross_filesystem_insert_replaces_the_name_and_a_refused_one_leaves_no
 def _executor_through_a_linked_prefix(tmp_path: Path, monkeypatch):
     from levain.firing.openhands import tools as T
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     real = tmp_path / "real"
     (real / "ws").mkdir(parents=True)
     lnk = tmp_path / "lnk"                     # what macOS /tmp is to /private/tmp

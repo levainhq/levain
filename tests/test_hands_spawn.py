@@ -487,7 +487,9 @@ def test_the_in_process_editor_write_path_refuses_whole_agent_directories(tmp_pa
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     ent = _entity(tmp_path)
     workspace = tmp_path / "workspace"
-    (workspace / ".claude").mkdir(parents=True)
+    for anchor in (workspace, Path.home()):
+        for name in (".Claude", ".claude", ".codex", ".CODEX"):
+            (anchor / name).mkdir(parents=True, exist_ok=True)
     policy = confinement.build_policy(ent, workspace=workspace, deny_standard_creds=False)
     assert workspace in policy.persistence_agent_pins
     assert workspace not in policy.deny_write_dirs
@@ -512,6 +514,43 @@ def test_the_in_process_editor_write_path_refuses_whole_agent_directories(tmp_pa
         assert ordinary.read_text() == "ok"
     finally:
         T._EDITOR_FLOOR.reset(token)
+
+
+@pytest.mark.parametrize("operation", ["move", "unlink", "rmtree", "rename"])
+def test_editor_refuses_every_remove_or_relocate_of_a_resolved_set_pin(
+    tmp_path, monkeypatch, operation
+):
+    """Round 5: every editor mutation checks the source dentry, not only a move destination."""
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    ent = _entity(tmp_path)
+    workspace = tmp_path / "workspace"
+    dir_a = workspace / "dirA"
+    (dir_a / "real").mkdir(parents=True)
+    hop = workspace / "sub"
+    hop.symlink_to(dir_a, target_is_directory=True)
+    (workspace / ".codex").symlink_to(Path("sub") / "real", target_is_directory=True)
+    policy = confinement.build_policy(ent, workspace=workspace, deny_standard_creds=False)
+    source = hop if operation == "unlink" else dir_a
+    assert confinement.crown_jewel_reason(policy, source) is None
+    assert confinement.persistence_agent_pin_reason(policy, source) is not None
+
+    token = T._EDITOR_FLOOR.set(policy)
+    try:
+        with pytest.raises(T._FloorRefusedWalk):
+            if operation == "move":
+                T._floored_move_impl(policy, source, workspace / "moved")
+            elif operation == "unlink":
+                T._floored_unlink(source)
+            elif operation == "rmtree":
+                T._floored_rmtree(source)
+            else:
+                T._floored_rename(source, workspace / "renamed")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+
+    assert os.path.lexists(source)
 
 
 @_needs_zsh
