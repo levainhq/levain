@@ -438,3 +438,12 @@ def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monk
         ])
     assert out["values"][-3] == 1, "the show-all control was not found, so it was never clicked"
     assert out["values"][-4] == 1 and out["values"][-1] == 1
+
+
+def test_a_tool_off_the_logs_allowlist_is_never_proposed(seed):
+    """0.11.5: the log refuses a grant naming a tool it does not bound to the workspace, so the card never offers one."""
+    for _ in range(MIN_HAND_ALLOWS):
+        seed.decide(agent="claude_code", tool="Task", cwd="/work/a", tool_input={"prompt": "x"})
+        seed.decide(agent="codex", tool="write_stdin", cwd="/work/b", tool_input={"chars": "x"})
+        seed.decide(agent="claude_code", tool="Edit", cwd="/work/c")
+    assert [(p.agent, p.tool) for p in seed.propose()] == [("claude_code", "Edit")]
