@@ -493,6 +493,17 @@ def test_a_symlinked_workspace_is_proposed_as_the_directory_it_resolves_to(seed)
     assert [p.workspace for p in got] == [seed.ws] and f"--workspace {seed.ws} " in got[0].command
 
 
+def test_a_nul_relative_or_tilde_cwd_is_never_proposed_and_hides_no_other_card(seed):
+    """A hook's cwd is absolute and has no NUL; one malformed key must not take the other cards down with it
+    (L3 int r2: a NUL made realpath raise inside propose)."""
+    for bad in ("/w\x00x", "work/proj", "~/proj"):
+        for _ in range(3):
+            seed.decide(cwd=bad)
+    for _ in range(3):
+        seed.decide(cwd=seed.ws)
+    assert [p.workspace for p in seed.propose()] == [seed.ws]
+
+
 def test_the_proposal_agrees_with_what_grant_create_accepts(seed):
     from levain.authority import consent_resolved_workspace, consent_tool_shape_problem
     assert consent_resolved_workspace(seed.ws) == (seed.ws, None)
@@ -518,11 +529,12 @@ def test_a_dashboard_reload_drops_the_cached_proposals(tmp_path, monkeypatch):
             {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
             {"eval": esc}, {"eval": wait},
             {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
-            {"eval": "window.__calls"},                                   # [-5]: a plain reopen reuses the read
+            {"eval": "window.__calls"},                                   # a fresh open reads again
             {"eval": esc}, {"eval": wait},
             {"eval": "window.LevainCockpitTransport.reload().then(() => 1)"},
             {"eval": wait},
             {"eval": f"{TILE}.click(); 1"}, {"until": f"{_CARDS}.length === 1"},
             {"eval": "window.__calls"},                                   # after a reload: read again
         ])
-    assert out["values"][-1] == 2 and out["values"][-9] == 1, out["values"]
+    v = out["values"]
+    assert v[8] == 2 and v[-1] > v[8], v   # a fresh open reads again (2nd read); a reload and open read again after it

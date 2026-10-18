@@ -755,7 +755,7 @@ def consent_resolved_workspace(path: Any) -> tuple[str | None, str | None]:
     """``(resolved, None)`` when ``path`` (``~`` expanded, symlinks followed) is an existing directory a consent
     grant may name as its workspace, else ``(None, why)``. Pure of the home test, which :func:`consent_root_problem`
     makes on the result. What ``levain consent grant create`` stores is exactly this."""
-    if not isinstance(path, (str, os.PathLike)) or not str(path):
+    if not isinstance(path, (str, os.PathLike)) or not str(path) or "\x00" in str(path):
         return None, "the workspace must be a non-empty path"
     resolved = os.path.realpath(os.path.expanduser(path))
     if not os.path.isdir(resolved):
