@@ -37,9 +37,25 @@ Settings live in ``<levain home>/consent/codex.json`` (:data:`SETTINGS_NAME`), t
 
 plus ``away_word`` and ``away_idle_seconds`` once ``levain consent away`` has written them.
 
-:func:`install` writes the hook into ONE workspace's ``.codex/``. Levain never writes Codex's trust: Codex shows
+:func:`install` writes the hook into ONE workspace's ``.codex/`` and never writes Codex's trust for it: Codex shows
 "Hooks need review" at the next start and the user trusts the hook there; :func:`trust_status` reports what Codex
-itself says about it.
+itself says about it. ``levain init`` and ``levain update`` wire the machine-wide CODEX_HOME ``hooks.json`` instead,
+with the PreToolUse gate below, and DO write Codex's trust for that file's hooks (:func:`write_hook_trust`).
+
+Known edges of the PreToolUse gate (each measured or read, none built against):
+
+- input written into an exec session already open (``write_stdin``) runs no PreToolUse, so a halted session can
+  keep typing into a shell it opened before the halt (B7 measures it);
+- a patch the model sends through the shell (``apply_patch`` inside an ``exec_command``) reaches the hook as
+  ``Bash``, which is never parsed (the R-g class);
+- Codex's trust covers the gate's command, not its script: a same-uid edit of the script after install keeps the
+  trust and is caught only by ``levain doctor`` (and ``levain.hookrun`` exits 0 when the script is missing);
+- a subagent's ``session_id`` as the root's is read from Codex's source, not measured beyond the latch run;
+- ``config/batchWrite``'s upsert merge of ``hooks.state`` is unmeasured beyond the keys levain writes;
+- a queue store that exists and cannot be read denies every Codex call on the machine (deliberate: a halt cannot
+  then be ruled out);
+- the gate's last halt read and its allow are two statements, so a sibling call's halt landing between them lets
+  that one allow through (the read is the last statement before the return, so the window is the return itself).
 """
 from __future__ import annotations
 
@@ -49,6 +65,7 @@ import math
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,12 +83,17 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
-    hold_for_answer, hook_command, read_settings_file, still_away_from,
+    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
+from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
+    GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN, RULING_TEXT, U_IRR, U_REV, _pre,
+    _what, notify, send_repings,
+)
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
+from levain.consent.queue import DB_NAME as QUEUE_DB_NAME
 from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir
 from levain.consent.record import ExternalGateRequest
 
@@ -178,17 +200,18 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             return True
     else:
         return False
-    for target in targets:
-        if not isinstance(target, str) or not target:
-            return True
-        try:
-            if _claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected):
-                return True
-            if _in_codex_config(target, cwd, home, codex_dir):
-                return True
-        except (OSError, ValueError):
-            return True
-    return False
+    return any(_header_is_config(target, cwd, home, codex_dir, protected) for target in targets)
+
+
+def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...]) -> bool:
+    """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to)."""
+    if not isinstance(target, str) or not target:
+        return True
+    try:
+        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected)
+                or _in_codex_config(target, cwd, home, codex_dir))
+    except (OSError, ValueError):
+        return True
 
 
 # --- the decision ------------------------------------------------------------------------------------------
@@ -260,6 +283,357 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                 pass
 
 
+# --- the PreToolUse gate and its latch (Q14 B5) ---------------------------------------------------------------
+#
+# ``codex exec`` never asks for approval, so the PermissionRequest hook above never fires there; PreToolUse fires
+# for every tool call in every mode. The gate mirrors Claude Code's (levain.consent.adapters.claude_code.gate) with
+# what Codex 0.162.1 reads differently (source read at rust-v0.162.1, hooks/src/engine/output_parser.rs):
+#
+# - a deny is the plain ``permissionDecision: deny`` + reason. NEVER ``continue: false``: Codex rejects it as
+#   unsupported and DROPS the deny with it, so the call runs (measured, runs2 BC_1).
+# - ``permissionDecision: allow`` is unsupported too (the hook is marked failed and the call proceeds): a verified
+#   allow is delivered as no decision, with a line of additionalContext naming who allowed it.
+# - no hook output stops a Codex turn. What stops one is the LATCH (runs3-codex RUN 1, C4, n=2): the first undecided
+#   deny of the irreversible tier halts the session in the queue store (:meth:`ConsentQueue.mark_undecided` with
+#   ``halt``), and every later PreToolUse of that session is denied with :data:`HALT_TEXT` until the late ruling on
+#   the halting request releases it. The halt lives in the queue store, never in a file the agent's own sandbox
+#   could let it write.
+#
+# The halt is keyed by the hook's ``session_id`` alone (a subagent's ``agent_id`` is not appended): a halt raised
+# inside a subagent latches the whole session, never only the subagent (a subagent's id is read, not measured). When the store exists and cannot be read,
+# every call is denied (the halt cannot be ruled out); when it does not exist, no session can be halted.
+# A hook Codex kills at its timeout, or one that exits non-zero, FAILS OPEN on Codex (no ``onFailure`` setting
+# exists): the entry's timeout is the ceiling's (:data:`GATE_TIMEOUT`), and :func:`main` never raises.
+#
+# Codex keeps no per-call approval in its rollout, so the authority ledger cannot read after the fact who allowed
+# a gated call: the gate files the call's row itself when levain answered it (:func:`_ledger_note`).
+
+GATE_EVENT = "PreToolUse"
+# runs3-codex RUN 1 C4, verbatim as measured (the only form that stopped a Codex run), with the gap number
+HALT_TEXT = ("levain: this session is halted on gap #{n}. No further tool calls are allowed. Write a short summary of "
+             "what is done and end your turn.")
+
+
+def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home: Path | None = None,
+               codex_dir: Path | None = None, protected: tuple[Path, ...] = ()) -> str:
+    """The action in a few words: for a readable patch, ``apply_patch of <paths>`` naming the agent-config paths
+    FIRST and counting the rest (``apply_patch of .codex/hooks.json (+14 other files)``), so a cut never hides the
+    path that made the call gated (the agent orders the headers); else the Claude Code adapter's description."""
+    if tool_name == PATCH_TOOL and isinstance(tool_input, Mapping):
+        paths = patch_targets(tool_input.get("command"))
+        if paths:
+            tagged = []
+            if cwd:
+                home = home if home is not None else Path.home()
+                codex_dir = codex_dir if codex_dir is not None else codex_home()
+                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected)]
+            if tagged and len(tagged) < len(paths):
+                rest = len(paths) - len(tagged)
+                text = f"{PATCH_TOOL} of {', '.join(tagged)} (+{rest} other file{'s' if rest != 1 else ''})"
+            else:
+                text = f"{PATCH_TOOL} of {', '.join(paths)}"
+            return _what(PATCH_TOOL, None, text)
+    return _what(tool_name, tool_input)
+
+
+def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+               codex_dir: Path | None = None, protected: tuple[Path, ...] = ()) -> str | None:
+    """The gate's tier for a Codex call: ``irreversible`` for agent config and hooks (:func:`targets_agent_config`,
+    Q10's floor and Q14's irreversible tier at once), else ``None`` (not gated). A shell command is never parsed.
+    THE SEAM for B6: the push executor's tool joins here as ``irreversible``."""
+    if targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected):
+        return "irreversible"
+    return None
+
+
+def _deny(reason: str, context: str | None = None) -> dict[str, Any]:
+    out = _pre("deny", reason)
+    if context:
+        out["hookSpecificOutput"]["additionalContext"] = context
+    return out
+
+
+def gate_output(decision: Decision) -> dict[str, Any]:
+    """What Codex reads for a verified decision: a deny with the authority named, or, for an allow, no decision
+    and one line of context (Codex refuses ``permissionDecision: allow``; with no decision the call runs)."""
+    if decision.via == "ruling":
+        how = f"your ruling on gap #{decision.gap} (key {decision.signer_fp})"
+    elif decision.via == "grant":
+        how = f"your standing consent grant {decision.grant_id}"
+    else:
+        how = f"a signed levain answer (key {decision.signer_fp})"
+    if decision.decision == "allow":
+        return {"hookSpecificOutput": {"hookEventName": GATE_EVENT,
+                                       "additionalContext": f"levain: this call is allowed by {how}."}}
+    return _deny(f"levain: denied by {how}. Do not retry it and do not achieve it another way.")
+
+
+def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
+    """The deny at D: U-IRR for the irreversible tier (the latch is the stop, never ``continue: false``), U-REV
+    for the reversible one. The U-REV branch is UNEXECUTED: no reversible gated class exists in the product as of
+    main 5d330ec8 (it mirrors the Claude Code adapter's)."""
+    return _deny((U_IRR if tier == "irreversible" else U_REV).format(x=what, n=gap))
+
+
+def ruling_context(queue: ConsentQueue, session: str) -> str | None:
+    """This Codex session's late rulings not yet delivered, as DESIGN §3.6's text, one per line (claimed: each
+    reaches the session once), or ``None``."""
+    lines = []
+    for ruling in queue.claim_rulings_for(AGENT, session):
+        got = queue.get(ruling.request_id)
+        what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
+        text = RULING_TEXT.get(ruling.ruling)
+        if text is not None:
+            lines.append(text.format(n=ruling.gap, x=what))
+    return "\n".join(lines) or None
+
+
+def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
+                 *, decision: Decision | None = None, refused: str | None = None,
+                 request_id: str | None = None) -> None:
+    """File the gated call's ledger row at decision time: a verified allow is stamped with its authority
+    (``answer`` / ``grant`` / ``ruling``, phase ``pre``, the answering request), anything the gate denied is a
+    ``denied_by_gate`` row (stamp ``unknown``, outcome ``refused``) whose ``decision`` says how (``deny``,
+    ``undecided``, ``halted``, ``failed``). A ledger that cannot be written never changes the gate's answer: the
+    queue's receipts still record every decision."""
+    from levain.consent.ledger import Ledger
+
+    tool_use_id = event.get("tool_use_id")
+    turn_id, source, mode = event.get("turn_id"), event.get("transcript_path"), event.get("permission_mode")
+    common: dict[str, Any] = {
+        "agent": AGENT, "agent_session_id": session, "tool_name": tool_name, "tool_input": tool_input, "cwd": cwd,
+        "tool_use_id": tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None,
+        "source_path": source if isinstance(source, str) and source else None,
+        "turn_id": turn_id if isinstance(turn_id, str) and turn_id else None,
+        "permission_mode": mode if isinstance(mode, str) and mode else None}
+    try:
+        ledger = Ledger(queue_dir)
+        if decision is not None and decision.decision == "allow":
+            stamp = decision.via if decision.via in ("grant", "ruling") else "answer"
+            ledger.record_call(**common, phase="pre", stamp=stamp, request_id=decision.request_id,
+                               stamp_detail={"decision": "allow", "source": "levain_gate"})
+        else:
+            how = "deny" if decision is not None else (refused or "deny")
+            ledger.record_call(**common, phase="denied_by_gate", stamp="unknown", outcome="refused",
+                               request_id=decision.request_id if decision is not None else request_id,
+                               stamp_detail={"decision": how, "source": "levain_gate"})
+    except Exception as exc:  # noqa: BLE001 - the ledger is a record, never the gate
+        try:
+            print(f"levain consent gate: ledger row not written ({type(exc).__name__}: {exc})"[:300], file=sys.stderr)
+        except Exception:
+            pass
+
+
+def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
+    """What a later resume of this Codex session needs (:meth:`ConsentQueue.file`'s ``resume``): the hook's parent
+    process when it is ``codex`` itself (Codex runs the hook command as its own child, measured on 0.162.1), with
+    ``-p`` when that process is a ``codex exec`` and ``interactive`` otherwise; the event's cwd; and the CODEX_HOME
+    the session runs under (``None``: the default). Only the fields this queue's resume record accepts are kept."""
+    from levain.consent import queue as queue_module
+
+    pid: int | None = None
+    invocation = "interactive"
+    ppid = os.getppid()
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(ppid)], capture_output=True, text=True, timeout=2,
+                              stdin=subprocess.DEVNULL).stdout.split()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        args = []
+    if ppid > 1 and args and os.path.basename(args[0]) == "codex":
+        pid = ppid
+        if args[1:2] == ["exec"]:
+            invocation = "-p"
+    cwd, chome = event.get("cwd"), os.environ.get("CODEX_HOME", "")
+    record = {"invocation": invocation, "codex_pid": pid, "cwd": cwd if isinstance(cwd, str) and cwd else None,
+              "config_dir": chome if os.path.isabs(chome) else None}
+    keys = getattr(queue_module, "_RESUME_KEYS", frozenset(record))
+    return {k: v for k, v in record.items() if k in keys}
+
+
+def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
+         codex_dir: Path | None = None, sleep: Callable[[float], None] = time.sleep,
+         still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
+    """The gate's output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). The halt is read
+    first, as soon as the event names a session: a session halted on a gap gets :data:`HALT_TEXT` for EVERY call,
+    gated or not, until the ruling on that gap releases it. An event missing a required field (``session_id``,
+    ``tool_name``, ``cwd``) is denied. Else a gated call (:func:`gate_class`) is: run once on a ruled allow; else,
+    when something could decide it (:func:`nothing_can_decide` at the gated tier) and, in ``default`` mode (approvals
+    on), only while the operator is away, filed with its hold = D (``gate_hold_seconds``), pinged, held for a
+    verified decision (delivered), and at D marked undecided (the irreversible tier halting its session) and denied
+    (:func:`undecided_output`). Every allow is re-checked against the halt just before it is returned: a halt set
+    meanwhile wins. Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
+    rulings for the session ride whatever is returned, as ``additionalContext``."""
+    if getattr(queue, "directory", None) is None:
+        raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
+    if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
+        return None
+    tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
+    session = event.get("session_id")
+    has_session = isinstance(session, str) and bool(session)
+    if has_session:
+        try:
+            halted = queue.is_halted(AGENT, session)
+        except Exception as exc:
+            return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken. Do not retry "
+                         "it and do not achieve it another way.")
+        if halted is not None:
+            _ledger_note(Path(queue.directory), event, session, str(tool_name), tool_input,
+                         cwd if isinstance(cwd, str) else "", refused="halted")
+            return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session)
+    missing = [k for k, v in (("session_id", session), ("tool_name", tool_name), ("cwd", cwd))
+               if not isinstance(v, str) or not v]
+    if missing:
+        return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
+                     "retry it and do not achieve it another way.")
+    if tool_input is None:
+        tool_input = {}
+    try:
+        send_repings(queue, settings)
+    except Exception:
+        pass  # a re-ping is a ping: it never fails the gate
+    if still_away is None:
+        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings)
+    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
+                     sleep=sleep, still_away=still_away)
+    return _with_rulings(out, queue, session)
+
+
+def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str) -> dict[str, Any] | None:
+    try:
+        context = ruling_context(queue, session)
+    except Exception:
+        context = None  # undelivered rulings stay for the next hook
+    if context:
+        out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
+        spec = out["hookSpecificOutput"]
+        spec["additionalContext"] = f"{spec['additionalContext']}\n{context}" if spec.get("additionalContext") \
+            else context
+    return out
+
+
+def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
+               tool_input: Any, cwd: str, session: str, *, home: Path | None, codex_dir: Path | None,
+               sleep: Callable[[float], None],
+               still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import parse_stamp
+
+    qdir = Path(queue.directory)
+    note = lambda **kw: _ledger_note(qdir, event, session, tool_name, tool_input, cwd, **kw)  # noqa: E731
+
+    def halt_wins(request_id: str | None) -> dict[str, Any] | None:
+        halted = queue.is_halted(AGENT, session)
+        if halted is None:
+            return None
+        note(refused="halted", request_id=request_id)
+        return _deny(HALT_TEXT.format(n=halted))
+
+    def deliver(decision: Decision) -> dict[str, Any]:
+        # an allow only while the session is still not halted: a sibling call's undecided deny may have halted it
+        # while this one waited (L3 r1 codex 4). Read before the ledger note, so the common case logs no allow,
+        # and again as the last statement before the return, so the window left is the return itself (r2 codex 4)
+        if decision.decision != "allow":
+            note(decision=decision)
+            return gate_output(decision)
+        out = halt_wins(decision.request_id)
+        if out is not None:
+            return out
+        note(decision=decision)
+        return halt_wins(decision.request_id) or gate_output(decision)
+
+    tier: str | None = "irreversible"           # until classified: a failure before that denies with the latch's tier
+    what = "this call"
+    try:
+        protected = protected_paths(qdir, settings)
+        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected)
+        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected)
+        if tier is None:
+            return None
+        tool_use_id = event.get("tool_use_id")
+        event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
+        mode = event.get("permission_mode")
+        posture = mode if isinstance(mode, str) and mode else None
+        ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
+        if ruled is not None:
+            return deliver(ruled)
+        if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
+            return None
+        if posture == "default" and not effective_away(settings)[0]:
+            # approvals on and the operator present: Codex's own approval asks for an agent-config write (measured
+            # B5-fix1, MEASURE_away), so the gate holds only while he is away, as Claude Code's does (head ruling 10-18)
+            return None
+        hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
+        request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
+                             cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
+                             resume=resume_meta_of(event))
+    except Exception as exc:
+        note(refused="failed")
+        return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
+                     "Do not retry it and do not achieve it another way.")
+    try:
+        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
+               cwd=queue.directory)
+        if posture == "default" and still_away is not None:
+            # held only because he was away (above): when away ends, the call goes back to Codex's approval
+            got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
+                                        still_away=still_away)
+            if got is None and back:
+                if queue.withdraw(request.id, note=f"away mode ended ({back}); Codex's approval asks"):
+                    return halt_wins(request.id)  # Codex's approval asks only a session that is not halted
+                # not pending any more: an answer may have landed between the wait and the withdraw
+                got = _verified(queue.decision(request.id, tool_input=tool_input, posture=posture), request)
+                return deliver(got) if got is not None else None
+        else:
+            got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
+                                                 posture=posture), request)
+        if got is not None:
+            return deliver(got)
+        # the hold ends at expires_at (the library's deadline); mark_undecided applies at or after it
+        left = (parse_stamp(request.expires_at) - datetime.now(timezone.utc)).total_seconds()
+        still = queue.get(request.id)
+        if left > 0 and still is not None and still[1] == "pending":
+            sleep(min(left + 0.05, GATE_SLEEP_CAP))  # capped: a clock stepped back must not outlive the timeout
+        marked = queue.mark_undecided(request.id, halt=tier == "irreversible", tool_input=tool_input,
+                                      posture=posture)
+        if isinstance(marked.decision, Decision) and _verified(marked.decision, request) is not None:
+            return deliver(marked.decision)  # an answer verified in the last moments of the hold
+        if marked.state == "undecided" and marked.gap is not None:
+            note(refused="undecided", request_id=request.id)
+            return undecided_output(tier, what, marked.gap)
+        note(refused="deny", request_id=request.id)
+        why = marked.reason or "no verified decision"
+        return _deny(f"levain: the action was NOT taken: {what} ({why}). Do not retry it and do not achieve it "
+                     "another way.")
+    except Exception as exc:
+        note(refused="failed", request_id=request.id)
+        return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
+                     "Do not retry it and do not achieve it another way.")
+
+
+def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[str, Any] | None:
+    """:func:`main`'s answer when the gate raised before it could answer (the queue would not open): a deny when
+    the event lacks a valid ``session_id``, ``tool_name`` or ``cwd`` (as :func:`gate` denies it), when the call is
+    gated or cannot be classified, AND for every call while the queue store exists, since a halt on this session
+    cannot then be ruled out; ``None`` only for a well-formed ungated call with no store (nothing was ever filed,
+    so no session can be halted)."""
+    try:
+        tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
+        session = event.get("session_id")
+        if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)):
+            tier, what = "irreversible", "this call"
+        else:
+            protected = protected_paths(queue_dir, settings)
+            tier = gate_class(tool_name, tool_input, cwd, protected=protected)
+            what = _call_what(tool_name, tool_input, cwd, protected=protected)
+    except Exception:
+        tier, what = "irreversible", "this call"
+    if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):
+        return None
+    return _deny(f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it and do "
+                 "not achieve it another way.")
+
+
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
@@ -270,9 +644,14 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
 
 
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
-    """The hook entry point. Always exits 0; prints a decision only when the core verified one."""
+    """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
+    and ``PreToolUse`` (:func:`gate`). Always exits 0 (any other exit fails open on Codex). A PermissionRequest
+    prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
+    event: Any = None
+    queue_dir: Path | None = None
+    settings = AdapterSettings()
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-codex")
         parser.add_argument("--queue-dir", default=None)
@@ -281,12 +660,23 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
-        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+            out = gate(event, _queue_for(queue_dir, settings), settings)
+        else:
+            out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
+                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
+            try:
+                out = gate_failed(event, queue_dir, settings)
+                if out is not None:
+                    stdout.write(json.dumps(out) + "\n")
+                    stdout.flush()
+            except BaseException:
+                pass
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:
@@ -322,7 +712,8 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
     """Install the hook into ``workspace``: ``.codex/hooks/levain_consent.py`` and a ``PermissionRequest`` entry
     (matcher ``*``, ``timeout`` = :func:`levain.consent.adapters.claude_code.hook_timeout`) in ``.codex/hooks.json``,
     other hooks kept and any earlier levain entry replaced. Codex will not run it until the user trusts it at
-    Codex's "Hooks need review" screen; levain never writes that trust. Refuses (``UntestedAgentVersion``) when the
+    Codex's "Hooks need review" screen: this per-workspace install writes no trust (``levain init`` / ``update``
+    write it only for the machine-wide hooks they render, :func:`write_hook_trust`). Refuses (``UntestedAgentVersion``) when the
     installed ``codex`` is not a tested version (:data:`levain.consent.canary.TESTED_VERSIONS`), unless
     ``allow_untested_agent_version``. Returns (script, hooks.json)."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
@@ -435,6 +826,12 @@ def script_intact(script: Path, *, queue_dir: Path | str | None = None) -> bool:
 
 def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) -> dict[str, Any]:
     """Codex's own ``hooks/list`` for ``ws``, asked of a ``codex app-server`` started in it (stdio JSON-RPC)."""
+    return _app_server_call(ws, "hooks/list", {"cwds": [str(ws)]}, home=home, codex_bin=codex_bin, timeout=timeout)
+
+
+def _app_server_call(ws: Path, method: str, params: Mapping[str, Any], *, home: Path | None, codex_bin: str,
+                     timeout: float) -> dict[str, Any]:
+    """The result of one ``method`` asked of a ``codex app-server`` started in ``ws`` (stdio JSON-RPC)."""
     from levain.launch import child_env
     env = child_env()
     if home is not None:
@@ -442,7 +839,7 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
     msgs = [{"id": 1, "method": "initialize",
              "params": {"clientInfo": {"name": "levain-doctor", "version": "1"}, "capabilities": None}},
             {"method": "initialized"},
-            {"id": 2, "method": "hooks/list", "params": {"cwds": [str(ws)]}}]
+            {"id": 2, "method": method, "params": dict(params)}]
     # The server exits at stdin EOF before answering, so stdin stays open until the answer is read.
     proc = subprocess.Popen([codex_bin, "app-server"], cwd=ws, env=env, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -468,8 +865,8 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
                 except ValueError:
                     continue
                 if isinstance(msg, dict) and msg.get("id") == 2:
-                    if "result" not in msg:
-                        raise RuntimeError(f"hooks/list failed: {msg.get('error')}")
+                    if not isinstance(msg.get("result"), dict):
+                        raise RuntimeError(f"{method} failed: {msg.get('error')}")
                     return msg["result"]
     finally:
         for pipe in (proc.stdin, proc.stdout):
@@ -483,7 +880,7 @@ def _hooks_list(ws: Path, *, home: Path | None, codex_bin: str, timeout: float) 
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-    raise RuntimeError("codex app-server gave no hooks/list answer in time")
+    raise RuntimeError(f"codex app-server gave no {method} answer in time")
 
 
 def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: str | None = None,
@@ -534,6 +931,336 @@ def trust_status(workspace: Path | str, *, home: Path | None = None, codex_bin: 
                                intact)
     return TrustStatus("unlisted", "codex does not list levain's hook (is the project trusted in Codex?)", key,
                        trusted_hash, None, intact)
+
+
+# --- trust that levain writes (Q14 B5): Codex runs a hooks.json hook only when CODEX_HOME's config.toml holds
+# its hash under ``hooks.state."<key>".trusted_hash``. An untrusted or modified hook is skipped with NO error or
+# warning (runs3-codex RUN 2), so a gate whose trust is missing or stale is a gate that silently does not run.
+
+def _event_label(event: str) -> str:
+    """Codex's snake_case label of a hooks.json event name (``PreToolUse`` -> ``pre_tool_use``)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+
+
+def hook_trusted_hash(event: str, group: Mapping[str, Any], handler: Mapping[str, Any]) -> str:
+    """The ``trusted_hash`` Codex 0.162.1 expects for one command handler (runs3-codex RUN 2, from
+    ``hooks/src/engine/discovery.rs`` ``hook_hash`` and ``config/src/fingerprint.rs``): SHA-256 of the compact,
+    key-sorted JSON of the normalized identity: the event's label, the group's matcher when set, and the one
+    handler as ``type``, ``command``, ``timeout`` (600 when absent, at least 1), ``async`` (false when absent),
+    ``statusMessage`` only when set. Raises ``ValueError`` for a handler it cannot hash (not a command handler,
+    or a field Codex would hash that this formula does not cover)."""
+    import hashlib
+
+    if handler.get("type") != "command" or not isinstance(handler.get("command"), str):
+        raise ValueError("only a command handler with a string command is hashed")
+    unknown = set(handler) - {"type", "command", "timeout", "async", "statusMessage"}
+    if unknown:
+        raise ValueError(f"handler fields this formula does not cover: {sorted(unknown)}")
+    timeout = handler.get("timeout", 600)
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise ValueError("timeout must be an integer")
+    norm: dict[str, Any] = {"type": "command", "command": handler["command"], "timeout": max(timeout, 1),
+                            "async": bool(handler.get("async", False))}
+    if handler.get("statusMessage") is not None:
+        norm["statusMessage"] = handler["statusMessage"]
+    ident: dict[str, Any] = {"event_name": _event_label(event), "hooks": [norm]}
+    if group.get("matcher") is not None:
+        ident["matcher"] = group["matcher"]
+    text = json.dumps(ident, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def hook_identities(doc: Any) -> list[tuple[str, int, int, str]]:
+    """``(event, group index, handler index, trusted_hash)`` of every command handler in a hooks.json document
+    (Codex's key is ``<hooks.json path>:<event label>:<group>:<handler>``). Raises ``ValueError`` when the
+    document is not a hooks.json shape or a handler cannot be hashed."""
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    if not isinstance(hooks, dict):
+        raise ValueError("no 'hooks' object")
+    out = []
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise ValueError(f"hooks.{event} is not a list")
+        for g, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                raise ValueError(f"hooks.{event}[{g}] has no handler list")
+            for h, handler in enumerate(handlers):
+                if not isinstance(handler, dict):
+                    raise ValueError(f"hooks.{event}[{g}].hooks[{h}] is not an object")
+                out.append((event, g, h, hook_trusted_hash(event, group, handler)))
+    return out
+
+
+@dataclass(frozen=True)
+class HookTrust:
+    """One hook's trust after :func:`write_hook_trust`: its key, event, the formula's hash, and what Codex's own
+    ``hooks/list`` said afterwards (``trusted`` only when Codex reports it trusted AND enabled AND its current
+    hash is the formula's)."""
+    key: str
+    event: str
+    trusted_hash: str
+    status: str
+
+
+def _listed_hooks(chome: Path, hooks_path: Path, *, codex_bin: str, timeout: float) -> dict[str, dict[str, Any]]:
+    """Codex's own ``hooks/list`` entries for the hooks in CODEX_HOME's ``hooks_path``, keyed by the key's
+    ``:<event label>:<group>:<handler>`` suffix. Raises as :func:`_app_server_call` does."""
+    real = os.path.realpath(hooks_path)
+    got = _hooks_list(chome, home=chome, codex_bin=codex_bin, timeout=timeout)
+    found: dict[str, dict[str, Any]] = {}
+    for entry in got.get("data", []) if isinstance(got, dict) else []:
+        for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if isinstance(hook, dict) and isinstance(hook.get("key"), str) and isinstance(
+                    hook.get("sourcePath"), str) and os.path.realpath(hook["sourcePath"]) == real:
+                found[hook["key"].rpartition(str(hook["sourcePath"]))[2]] = hook
+    return found
+
+
+# The gate's script as the package ships it: Codex's trust covers the entry's command, so levain checks the bytes.
+GATE_SCRIPT_SOURCE = (Path(__file__).resolve().parents[2] / "templates" / "adapters" / "codex" / "activation"
+                      / "hooks" / "consent_codex.py")
+
+
+def gate_script_intact(script: Path | None) -> bool:
+    """True when ``script`` is a regular file holding exactly the package's own gate script
+    (:data:`GATE_SCRIPT_SOURCE`)."""
+    if script is None:
+        return False
+    try:
+        return script.is_file() and not script.is_symlink() and script.read_bytes() == GATE_SCRIPT_SOURCE.read_bytes()
+    except OSError:
+        return False
+
+
+def _command_script(handler: Mapping[str, Any]) -> Path | None:
+    """The script a hook command runs: its last token (the position every levain reader takes it from)."""
+    try:
+        tokens = shlex.split(handler.get("command") or "")
+    except ValueError:
+        return None
+    return Path(tokens[-1]) if tokens else None
+
+
+def _gate_entries(doc: Any) -> list[tuple[int, int, Mapping[str, Any], Mapping[str, Any]]]:
+    """``(group index, handler index, group, handler)`` of every PreToolUse handler in a hooks.json document."""
+    groups = (doc.get("hooks") or {}).get(GATE_EVENT) if isinstance(doc, dict) and isinstance(
+        doc.get("hooks"), dict) else None
+    out = []
+    for g, group in enumerate(groups if isinstance(groups, list) else []):
+        handlers = group.get("hooks") if isinstance(group, dict) else None
+        for h, handler in enumerate(handlers if isinstance(handlers, list) else []):
+            if isinstance(handler, dict):
+                out.append((g, h, group, handler))
+    return out
+
+
+def gate_entry_differences(group: Mapping[str, Any], handler: Mapping[str, Any], script: Path,
+                           python: str | None = None) -> list[str]:
+    """How a gate entry differs from levain's render (empty when it does not): matcher ``*``, a handler of exactly
+    ``type`` command, ``timeout`` :data:`GATE_TIMEOUT` (no ``async``, ``statusMessage`` or other field) and the
+    command ``<python> -EP -m levain.hookrun <script>``, where ``<python>`` is ``python`` (default: this levain's
+    own, ``sys.executable``), absolute and equal. A narrowed matcher, an async handler, a short
+    timeout or another interpreter keeps Codex's trust once re-trusted and still lets the call run (L3 r1 codex 3,
+    r2 codex 3)."""
+    python = os.path.abspath(python or sys.executable)
+    out = []
+    if group.get("matcher") != "*":
+        out.append(f"matcher {group.get('matcher')!r} (levain's is '*')")
+    extra = sorted(set(handler) - {"type", "command", "timeout"})
+    if extra:
+        out.append(f"field(s) {', '.join(extra)} (levain's has none)")
+    if handler.get("type") != "command":
+        out.append(f"type {handler.get('type')!r}")
+    if handler.get("timeout") != GATE_TIMEOUT:
+        out.append(f"timeout {handler.get('timeout')!r} (levain's is {GATE_TIMEOUT})")
+    try:
+        tokens = shlex.split(handler.get("command") or "")
+    except ValueError:
+        tokens = []
+    if len(tokens) != 5 or tokens[1:4] != [HOOK_FLAGS, *HOOKRUN] or tokens[4] != str(script):
+        out.append("command (not levain's '<python> -EP -m levain.hookrun <script>')")
+    elif tokens[0] != python:
+        out.append(f"interpreter {tokens[0]!r} (levain's is {python!r})")
+    return out
+
+
+def write_hook_trust(hooks_path: Path, expected_text: str, *, home: Path | None = None, codex_bin: str | None = None,
+                     timeout: float = TRUST_TIMEOUT) -> tuple[list[HookTrust], str | None]:
+    """Trust every hook in CODEX_HOME's ``hooks_path``, and only while its bytes are ``expected_text`` (the
+    render levain just wrote: every handler in it is levain's), then PROBE that Codex runs them. The hash is
+    :func:`hook_trusted_hash` (never read back from Codex); Codex's own ``hooks/list`` supplies the key it files
+    the hook under, and a hook whose ``currentHash`` there differs from the formula is not trusted (the formula
+    no longer matches this Codex). The write goes through Codex's ``config/batchWrite`` (``hooks.state``, upsert),
+    so Codex edits its own config.toml; then ``hooks/list`` is asked again. Returns ``(per-hook results, None)``,
+    or ``([], why)`` when nothing was written."""
+    try:
+        if hooks_path.read_text(encoding="utf-8") != expected_text:
+            return [], f"{hooks_path} is not the file levain rendered, so no hook in it is trusted"
+        doc = json.loads(expected_text)
+        mine = hook_identities(doc)
+    except (OSError, ValueError) as exc:
+        return [], f"{hooks_path} could not be read as levain's hooks ({exc})"
+    # Codex's trust covers the gate's command, never its script's bytes: the gate is trusted only while the script
+    # that command runs is the package's own (L3 r1 codex 1)
+    refused = {(GATE_EVENT, g, h) for g, h, _group, handler in _gate_entries(doc)
+               if not gate_script_intact(_command_script(handler))}
+    codex_bin = codex_bin or shutil.which("codex")
+    if not codex_bin:
+        return [], "codex is not on PATH, so its hook trust could not be written"
+    chome = Path(home) if home is not None else codex_home()
+    real = os.path.realpath(hooks_path)
+
+    def listed() -> dict[str, dict[str, Any]]:
+        return _listed_hooks(chome, hooks_path, codex_bin=codex_bin, timeout=timeout)
+
+    try:
+        before = listed()
+        updates: dict[str, dict[str, str]] = {}
+        for event, g, h, digest in mine:
+            hook = before.get(f":{_event_label(event)}:{g}:{h}")
+            if hook is not None and hook.get("currentHash") == digest and (event, g, h) not in refused:
+                updates[hook["key"]] = {"trusted_hash": digest}
+        if updates:
+            _app_server_call(chome, "config/batchWrite", {
+                "edits": [{"keyPath": "hooks.state", "value": updates, "mergeStrategy": "upsert"}],
+                "filePath": None, "expectedVersion": None, "reloadUserConfig": True},
+                home=chome, codex_bin=codex_bin, timeout=timeout)
+        after = listed()
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        return [], f"could not ask codex: {exc}"[:300]
+    out = []
+    for event, g, h, digest in mine:
+        hook = after.get(f":{_event_label(event)}:{g}:{h}")
+        if (event, g, h) in refused:
+            status = "script_changed"
+        elif hook is None:
+            status = "unlisted"
+        elif hook.get("currentHash") != digest:
+            status = "formula_mismatch"
+        elif hook.get("trustStatus") == "trusted" and hook.get("enabled") is True:
+            status = "trusted"
+        else:
+            status = {"untrusted": "untrusted", "modified": "changed"}.get(hook.get("trustStatus"), "unknown") \
+                if hook.get("enabled") is not False else "disabled"
+        out.append(HookTrust(hook["key"] if hook is not None else f"{real}:{_event_label(event)}:{g}:{h}", event,
+                             digest, status))
+    return out, None
+
+
+def _trust_states(home: Path | None) -> dict[str, Any]:
+    """CODEX_HOME's ``hooks.state`` table (empty when config.toml is missing). Raises ``OSError`` /
+    ``tomllib.TOMLDecodeError`` when it cannot be read."""
+    chome = Path(home) if home is not None else codex_home()
+    try:
+        with open(chome / "config.toml", "rb") as fh:
+            states = tomllib.load(fh).get("hooks", {}).get("state", {})
+    except FileNotFoundError:
+        return {}
+    return states if isinstance(states, dict) else {}
+
+
+def _held_state(states: Mapping[str, Any], hooks_path: Path, suffix: str) -> tuple[str, dict[str, Any] | None]:
+    """(key, state) for a hook whose key ends ``suffix``, under the hooks.json path as given or its real path."""
+    keys = [f"{hooks_path}{suffix}", f"{os.path.realpath(hooks_path)}{suffix}"]
+    for key in keys:
+        if isinstance(states.get(key), dict):
+            return key, states[key]
+    return keys[0], None
+
+
+def untrusted_hooks(hooks_path: Path, expected_text: str, *, home: Path | None = None) -> list[str] | None:
+    """Without starting Codex: the events of the hooks in ``hooks_path`` that config.toml does not trust exactly
+    as :func:`hook_trusted_hash` computes them (or that it disables); ``None`` when the file is not
+    ``expected_text`` or a file cannot be read."""
+    try:
+        if hooks_path.read_text(encoding="utf-8") != expected_text:
+            return None
+        mine = hook_identities(json.loads(expected_text))
+        states = _trust_states(home)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return None
+    out = []
+    for event, g, h, digest in mine:
+        _key, state = _held_state(states, hooks_path, f":{_event_label(event)}:{g}:{h}")
+        if state is None or state.get("trusted_hash") != digest or state.get("enabled") is False:
+            out.append(event)
+    return out
+
+
+def gate_trust(hooks_path: Path, script: Path, *, home: Path | None = None, codex_bin: str | None = None,
+               timeout: float = TRUST_TIMEOUT, python: str | None = None) -> TrustStatus:
+    """Whether Codex will run levain's PreToolUse gate in CODEX_HOME's ``hooks_path`` (the entry running
+    ``script``), by Codex's own verdict: ``trusted`` only when the entry is exactly levain's render
+    (:func:`gate_entry_differences`, its interpreter ``python``), ``script`` is the package's own
+    (:func:`gate_script_intact`) and Codex's ``hooks/list`` reports it trusted, enabled and with ``currentHash``
+    equal to :func:`hook_trusted_hash`.
+    Otherwise ``absent`` (no gate entry runs ``script``), ``changed`` (the entry differs from levain's render,
+    or Codex lists it modified), ``script_changed``, ``untrusted``, ``disabled``, ``formula_mismatch`` (Codex hashes
+    the entry differently: this Codex is not the one the formula was measured on), ``unlisted``, ``unknown``, or,
+    when Codex cannot be asked, ``unconfirmed`` (config.toml holds the formula's hash, which is not Codex's word)
+    or what config.toml says (``untrusted`` / ``changed`` / ``disabled``). ``trusted_hash`` is config.toml's,
+    ``current_hash`` the formula's."""
+    try:
+        doc = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return TrustStatus("unknown", f"{hooks_path} could not be read ({exc})")
+    found = None
+    for g, h, group, handler in _gate_entries(doc):
+        if _is_ours(handler, "", script):
+            found = (g, h, group, handler)
+    if found is None:
+        return TrustStatus("absent", f"no levain PreToolUse gate in {hooks_path}")
+    g, h, group, handler = found
+    diffs = gate_entry_differences(group, handler, script, python)
+    if diffs:
+        return TrustStatus("changed", "the gate entry differs from levain's render: " + "; ".join(diffs))
+    digest = hook_trusted_hash(GATE_EVENT, group, handler)
+    intact = gate_script_intact(script)
+    if not intact:
+        return TrustStatus("script_changed", f"{script} is not the package's gate script (Codex's trust covers the "
+                           "command, not the script)", None, None, digest, False)
+    why = ""
+    states: dict[str, Any] | None
+    try:
+        states = _trust_states(home)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        states, why = None, f"CODEX_HOME's config.toml could not be read ({exc})"
+    suffix = f":{_event_label(GATE_EVENT)}:{g}:{h}"
+    key, state = _held_state(states or {}, hooks_path, suffix)
+    held = state.get("trusted_hash") if state is not None else None
+    if states is None:
+        static = TrustStatus("unknown", why, key, None, digest, True)
+    elif state is not None and state.get("enabled") is False:
+        static = TrustStatus("disabled", "config.toml disables it", key, held, digest, True)
+    elif held is None:
+        static = TrustStatus("untrusted", "config.toml holds no trusted_hash for it", key, None, digest, True)
+    elif held != digest:
+        static = TrustStatus("changed", "config.toml's trusted_hash is not the entry's", key, held, digest, True)
+    else:
+        static = TrustStatus("unconfirmed", "config.toml holds the entry's hash", key, held, digest, True)
+    codex_bin = codex_bin or shutil.which("codex")
+    chome = Path(home) if home is not None else codex_home()
+    try:
+        if not codex_bin:
+            raise RuntimeError("codex is not on PATH")
+        hook = _listed_hooks(chome, hooks_path, codex_bin=codex_bin, timeout=timeout).get(suffix)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        return TrustStatus(static.status, f"{static.detail}; Codex could not be asked ({exc})"[:400], key, held,
+                           digest, True)
+    if hook is None:
+        return TrustStatus("unlisted", "Codex's hooks/list does not list the gate", key, held, digest, True)
+    got, enabled, current = hook.get("trustStatus"), hook.get("enabled"), hook.get("currentHash")
+    detail = f"Codex's hooks/list: trustStatus {got!r}, enabled {enabled!r}"
+    if current != digest:
+        return TrustStatus("formula_mismatch", f"{detail}, currentHash {current!r} is not levain's {digest!r}",
+                           key, held, digest, True)
+    if got == "trusted" and enabled is True:
+        return TrustStatus("trusted", detail, key, held, digest, True)
+    if enabled is False:
+        return TrustStatus("disabled", detail, key, held, digest, True)
+    return TrustStatus({"untrusted": "untrusted", "modified": "changed"}.get(got, "unknown"), detail, key, held,
+                       digest, True)
 
 
 if __name__ == "__main__":

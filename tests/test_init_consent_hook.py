@@ -62,7 +62,10 @@ def test_codex_init_wires_the_consent_hook_in_the_global_file(make_install, tmp_
     assert handler["timeout"] == claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)
     assert script.is_file() and not (cx / "activation" / "hooks" / "consent_claude_code.py").exists()
     assert set(json.loads(_cj(tmp_path).read_text())["hooks"]) == {
-        "SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "PermissionRequest"}
+        "SessionStart", "UserPromptSubmit", "Stop", "PostToolUse", "PermissionRequest", "PreToolUse"}
+    (gate,) = json.loads(_cj(tmp_path).read_text())["hooks"]["PreToolUse"]
+    # the gate (Q14 B5): the same script, the ceiling's timeout, and no onFailure (Codex has none)
+    assert gate["hooks"] == [{"type": "command", "command": handler["command"], "timeout": codex.GATE_TIMEOUT}]
 
 
 @pytest.mark.parametrize("adapter", ["claude-code", "codex"])
@@ -243,7 +246,7 @@ def test_codex_init_says_trust_and_machine_wide(make_install, monkeypatch):
     lines: list[str] = []
     cx = make_install("cx", adapter="codex")
     inst._emit_consent_hook(cx, "codex", lines.append)
-    assert any("Hooks need review" in ln and "every Codex session on this machine" in ln for ln in lines), lines
+    assert any("writes Codex's trust" in ln and "every Codex session on this machine" in ln for ln in lines), lines
 
 
 # --- doctor --------------------------------------------------------------------------------------------------

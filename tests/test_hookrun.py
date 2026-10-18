@@ -34,7 +34,7 @@ def _sh(cmd: str, stdin: str = "{}") -> subprocess.CompletedProcess[str]:
 @pytest.mark.skipif(sys.platform == "win32", reason="Codex runs hooks through sh here")
 def test_every_rendered_command_of_a_deleted_install_exits_0_silently(tmp_path):
     cmds = _commands(sys.executable, tmp_path / "gone")
-    assert len(cmds) == 5  # the four hooks and the consent hook
+    assert len(cmds) == 6  # the four hooks, the consent hook and the consent gate (one command, two events)
     for cmd in cmds:
         r = _sh(cmd)
         assert (r.returncode, r.stdout, r.stderr) == (0, "", ""), cmd

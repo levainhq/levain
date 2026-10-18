@@ -281,13 +281,16 @@ def _is_config_path(path: Path) -> bool:
     return False
 
 
-def nothing_can_decide(settings: AdapterSettings) -> bool:
+def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:
     """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
     files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
-    before any key was enrolled is not something that can decide (L3 r1 codex MED)."""
-    if settings.away_mode:
+    before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
+    (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
+    a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
+    (L3 r1 codex 6, r2)."""
+    if settings.away_mode and tier != AGENT_CONFIG_TIER:
         return False
     root = settings.cockpit_data_root
     if not root or not (Path(root) / "cockpit.db").is_file():
@@ -296,6 +299,10 @@ def nothing_can_decide(settings: AdapterSettings) -> bool:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
         return True  # an authority that does not replay verifies nothing; the dialog answers
+    if tier == AGENT_CONFIG_TIER:
+        from levain.consent.queue import class_covers
+
+        return not any(class_covers(key.key_class, tier) for key in snap.active_keys())
     return not snap.active_keys() and not _a_consent_grant_in_force(snap.policy.grants.values())
 
 
@@ -916,7 +923,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return gate_output(ruled)
-        if nothing_can_decide(settings):
+        if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
             return None
         if posture == "default" and not effective_away(settings)[0]:
             # an attended default-mode session: Claude Code's own dialog (or the operator's own allow rule) decides,

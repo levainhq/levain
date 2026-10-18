@@ -1154,7 +1154,7 @@ def test_a_default_mode_gate_hold_ends_when_the_operator_comes_back(queue, monke
     away ends the request is withdrawn and Claude Code's own dialog asks."""
     import threading
 
-    monkeypatch.setattr(cc, "nothing_can_decide", lambda s: False)
+    monkeypatch.setattr(cc, "nothing_can_decide", lambda s, tier=None: False)
     queue.pending()  # the queue makes its own directory, owner-only
     settings_file = Path(queue.directory) / cc.SETTINGS_NAME
     settings_file.write_text(json.dumps({"away_word": "on", "gate_hold_seconds": 3}))

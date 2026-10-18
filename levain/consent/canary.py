@@ -162,6 +162,9 @@ def _agent_findings(agent: str, install: Path, script: Path, config: Path, codex
         "absent": "the hook script is here but .codex/hooks.json has no levain entry: reinstall it",
     }
     if wired_by_init:
+        # levain writes the machine-wide hooks' trust itself, so its own command restores it
+        hints["untrusted"] = hints["changed"] = ("run `levain update`, which writes Codex's trust for levain's hooks "
+                                                 "and confirms it with Codex")
         # A user-level hook: what Codex lists for it when it is not loaded is not measured, so no cause is named.
         hints["unlisted"] = (f"Codex does not list levain's hook from {config}: start `codex` and look at its "
                              "hooks review screen")
