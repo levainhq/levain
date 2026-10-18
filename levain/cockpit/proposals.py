@@ -103,7 +103,7 @@ def propose(evidence: list[KeyEvidence]) -> list[Proposal]:
                             "--workspace", shlex.quote(ws), "--posture", PROPOSED_POSTURE,
                             "--expires", expires, "--signing-key <key>"])
         out.append(Proposal(k.agent, k.tool, ws, k.hand_allows, k.last_hand_at, expires, PROPOSED_POSTURE, command,
-                            f"covers {k.tool} prompts under the {PROPOSED_POSTURE} permission mode inside {ws}; "
+                            f"covers {k.tool} prompts under the {PROPOSED_POSTURE} permission mode inside that directory; "
                             "other modes need their own --posture"))
     out.sort(key=lambda p: (p.count, p.last_at), reverse=True)
     return out[:PROPOSAL_CAP]
