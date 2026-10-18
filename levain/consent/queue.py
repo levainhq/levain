@@ -133,6 +133,10 @@ VIA: tuple[str, ...] = ("signature", "grant", "ruling")
 # a ruled allow not taken by the call it rules on within this long of the queue applying it (its decided_at, the
 # queue's own clock) pre-authorises nothing; nor does one applied this long or more after it was signed
 RULED_ALLOW_LAPSE = timedelta(hours=24)
+#: How long past ``expires_at`` (the end of the hook's hold) a pending request stays pending for the hook to
+#: mark it undecided (:meth:`ConsentQueue.mark_undecided`) before a sweep or a read expires it. No answer is
+#: applied once ``expires_at`` has passed; only the hook's undecided mark is.
+UNDECIDED_GRACE = timedelta(seconds=60)
 # how far ahead of the queue's clock a ruling's signed_at may be (two honest clocks disagree by seconds)
 RULING_SKEW = timedelta(minutes=2)
 # the longest a snooze may put off asking again: a week
@@ -567,7 +571,8 @@ class ConsentQueue:
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
              hold: timedelta, tier: str = "T2", event_id: str | None = None,
              resume: Mapping[str, Any] | None = None) -> ExternalGateRequest:
-        """File one gate an agent is waiting on; it expires ``hold`` after now. ``tier`` must be one an
+        """File one gate an agent is waiting on; its hold (``expires_at``) ends ``hold`` after now, after which no
+        answer applies and only the hook's :meth:`mark_undecided` does until it expires. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
         permission event when its agent has one; without it the request gets an unpredictable one. Either
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
@@ -634,14 +639,15 @@ class ConsentQueue:
         return dict(zip([d[0] for d in cur.description], row))
 
     def get(self, request_id: str) -> tuple[ExternalGateRequest, str] | None:
-        """The request and its state, after expiring it if its time is up. ``None`` if unknown or its seal
+        """The request and its state, after expiring it if its hold ended :data:`UNDECIDED_GRACE` ago or more
+        (a request past ``expires_at`` inside the grace reads ``pending``; no answer applies to it). ``None`` if unknown or its seal
         does not match (a row someone edited is never answered). Takes the write lock only when the row is
         actually due to expire."""
         with self._read() as conn:
             row = self._row(conn, request_id)
         if row is None:
             return None
-        if row["state"] == "pending" and row["expires_at"] <= utc_stamp(_now_utc(self._clock)):
+        if row["state"] == "pending" and self._expiry_due(row["expires_at"], utc_stamp(_now_utc(self._clock))):
             self._expire_one(request_id)
             with self._read() as conn:
                 row = self._row(conn, request_id)
@@ -760,18 +766,27 @@ class ConsentQueue:
                                                            ensure_ascii=False, sort_keys=True)))
         return True
 
-    def _settle(self, conn: sqlite3.Connection, request_id: str
+    @staticmethod
+    def _expiry_due(expires_at: str, stamp: str) -> bool:
+        """A pending request is expired by a read or a sweep only :data:`UNDECIDED_GRACE` after its hold ended:
+        the hook's undecided mark at the deadline takes precedence over the expire."""
+        try:
+            return parse_stamp(expires_at) + UNDECIDED_GRACE <= parse_stamp(stamp)
+        except ConsentError:
+            return True
+
+    def _settle(self, conn: sqlite3.Connection, request_id: str, *, expire: bool = True
                 ) -> tuple[ExternalGateRequest | None, str | None, str]:
-        """Inside a held write lock: read the clock NOW, expire the request if it is due, and return the
-        sealed request (or ``None``), its state after that, and the stamp every further transition in this
-        transaction uses."""
+        """Inside a held write lock: read the clock NOW, expire the request if it is due (:meth:`_expiry_due`;
+        never when ``expire`` is false, the hook's undecided mark), and return the sealed request (or ``None``),
+        its state after that, and the stamp every further transition in this transaction uses."""
         stamp = utc_stamp(_now_utc(self._clock))
         row = self._row(conn, request_id)
         request = None if row is None else self._request_of(row)
         if row is None or request is None:
             return None, None, stamp
         state = row["state"]
-        if state == "pending" and request.expires_at <= stamp:
+        if expire and state == "pending" and self._expiry_due(request.expires_at, stamp):
             self._transition(conn, request, "expired", stamp=stamp)
             state = "expired"
         return request, state, stamp
@@ -781,12 +796,13 @@ class ConsentQueue:
             self._settle(conn, request_id)
 
     def sweep(self) -> int:
-        """Expire every pending request whose time is up; returns how many."""
+        """Expire every pending request whose hold ended :data:`UNDECIDED_GRACE` ago or more; returns how many."""
         done = 0
         with self._write() as conn:
-            stamp = utc_stamp(_now_utc(self._clock))
+            now = _now_utc(self._clock)
+            stamp = utc_stamp(now)
             cur = conn.execute(f"SELECT {', '.join(_FIELDS)} FROM requests WHERE state = 'pending' "
-                               "AND expires_at <= ?", (stamp,))
+                               "AND expires_at <= ?", (utc_stamp(now - UNDECIDED_GRACE),))
             names = [d[0] for d in cur.description]
             for raw in cur.fetchall():
                 request = self._request_of(dict(zip(names, raw)))
@@ -884,15 +900,19 @@ class ConsentQueue:
         """The hook's hold ended with no verified decision: move the pending request to ``undecided`` and give it
         the next gap number of its agent and session, with its receipt, and, when ``halt`` (the irreversible /
         agent-config tier), the session's halt on it (:meth:`is_halted`), all in ONE write transaction (the clock
-        read under the lock, a due request expired first): a hook killed part way leaves either nothing or all of
-        it. Returns a :class:`Marked`: the request's state after the call, its gap, why, whether its session is
+        read under the lock): a hook killed part way leaves either nothing or all of it. The library owns the
+        deadline (the smaller of the two L3 r1 options, no separate answer-expiry in :meth:`file`): pending ->
+        undecided is allowed at or after ``expires_at``, because the hook calls this only once its hold ended
+        with the call not run, and it takes precedence over the expire, which a sweep or a read applies only
+        :data:`UNDECIDED_GRACE` after ``expires_at`` and which this call never applies. No answer or grant is
+        applied once ``expires_at`` has passed. Returns a :class:`Marked`: the request's state after the call, its gap, why, whether its session is
         halted on it, and, for a request decided before this call, what decided it (a re-verified
         :class:`Decision` for a signed or grant answer, ``tool_input`` / ``posture`` passed to :meth:`decision`;
         a :class:`Ruling`, information only, for a late ruling). A request already undecided keeps its gap (a
         retry of the hook) and gains the halt when ``halt``."""
         decided: str | None = None
         with self._write() as conn:
-            request, state, stamp = self._settle(conn, request_id)
+            request, state, stamp = self._settle(conn, request_id, expire=False)
             if request is None:
                 return Marked(None, None, f"no sealed request {request_id!r}")
             if state == "undecided":
@@ -1108,12 +1128,14 @@ class ConsentQueue:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
         was, or becomes ``expired`` when the answer came too late). The answer is verified against a fresh
         replay from the queue's authority source."""
-        got = self.get(request_id)                         # expires it first if its time is up
+        got = self.get(request_id)                         # expires it first if it is due (UNDECIDED_GRACE)
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
         request, state = got
         if state != "pending":
             raise AnswerRefused(f"request {request_id} is already {state}")
+        if request.expires_at <= utc_stamp(_now_utc(self._clock)):
+            raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
         authority = self._fresh_authority()
         if authority is None:
             raise AnswerRefused("the authority log cannot be replayed now: no answer is authority")
@@ -1124,6 +1146,8 @@ class ConsentQueue:
         message = answer_message(dict(payload))
         with self._write() as conn:
             current, now_state, stamp = self._settle(conn, request_id)
+            if now_state == "pending" and request.expires_at <= stamp:
+                now_state = "expired"                # the hold ended: only the hook's undecided mark applies
             moved = current is not None and now_state == "pending" and self._transition(
                 conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
                 signature=signature, signer_fp=payload["signer_fp"], via="signature")
@@ -1141,6 +1165,8 @@ class ConsentQueue:
         request, state = got
         if state != "pending":
             raise AnswerRefused(f"request {request_id} is already {state}")
+        if request.expires_at <= utc_stamp(_now_utc(self._clock)):
+            raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
                               signed_at=utc_stamp(_now_utc(self._clock)))
 
@@ -1410,7 +1436,7 @@ class ConsentQueue:
         moved = False
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id)
-            if request is not None and state == "pending":
+            if request is not None and state == "pending" and request.expires_at > stamp:
                 found = self._matching_grant(authority, request, tool_input=tool_input, posture=posture,
                                              now=parse_stamp(stamp))
                 if found is not None:
@@ -1494,8 +1520,8 @@ class ConsentQueue:
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
                        sleep: Callable[[float], None] = time.sleep, tool_input: Any = None,
                        posture: str | None = None) -> Decision | Ruling | None:
-        """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request
-        expired, was withdrawn, went undecided, is unknown, its stored answer no longer verifies, or it is still
+        """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request's hold
+        ended (its ``expires_at``), it expired, was withdrawn, went undecided, is unknown, its stored answer no longer verifies, or it is still
         pending when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
         lets it expire). A request ruled late returns its :class:`Ruling`, information only, as :meth:`decision`
         does. ``poll`` below 1ms (or not a number) is 1ms. ``tool_input`` / ``posture`` are passed to
@@ -1508,6 +1534,8 @@ class ConsentQueue:
                 return None
             if got[1] != "pending":
                 return self.decision(request_id, tool_input=tool_input, posture=posture)
+            if got[0].expires_at <= utc_stamp(_now_utc(self._clock)):
+                return None                          # the hold ended: the hook marks it undecided
             left = deadline - time.monotonic()
             if left <= 0:
                 return None

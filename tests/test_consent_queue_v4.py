@@ -21,7 +21,8 @@ from levain.cockpit.consent import utc_stamp
 from levain.consent import ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message
 from levain.consent.listing import read_listing
 from levain.consent.queue import (
-    PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, Decision, Ruling,
+    PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, UNDECIDED_GRACE, Decision,
+    Ruling,
 )
 from levain.consent.record import RULING_FORMAT, RULING_NAMESPACE, ruling_message, ruling_payload
 from tests.test_consent_queue import NOW, Clock, FakeAgent, Log, _raw, signed
@@ -123,11 +124,33 @@ def test_a_request_decided_before_the_deadline_returns_its_decision(queue, keys)
     assert queue.get(request.id)[1] == "denied" and queue.gap(request.id) is None
 
 
+def test_the_hook_marks_undecided_at_the_real_deadline(queue, clock):
+    """L3 r1 codex MED: at and after expires_at (the hold's end) the hook's mark wins; no answer applies then."""
+    at = ask(queue, "at", hold=timedelta(seconds=30))
+    past = ask(queue, "past", hold=timedelta(seconds=30))
+    clock.now = NOW + timedelta(seconds=30)                                # exactly the deadline
+    assert queue.get(at.id)[1] == "pending" and queue.await_decision(at.id, 5, poll=0.01) is None
+    assert queue.mark_undecided(at.id).state == "undecided"
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE * 2          # no sweep ran: still the hook's
+    assert queue.mark_undecided(past.id).state == "undecided"
+
+
+def test_a_sweeper_racing_the_hook_at_the_deadline_expires_nothing(queue, clock):
+    request = ask(queue, hold=timedelta(seconds=30))
+    clock.now = NOW + timedelta(seconds=31)
+    assert queue.sweep() == 0 and queue.pending() == [request]
+    got = queue.mark_undecided(request.id, halt=True)
+    assert (got.state, got.gap, got.halted) == ("undecided", 1, True)
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE
+    assert queue.sweep() == 0 and queue.get(request.id)[1] == "undecided"
+
+
 def test_an_expired_or_withdrawn_request_is_never_undecided(queue, clock):
     late = ask(queue, "late", hold=timedelta(seconds=30))
     gone = ask(queue, "gone")
     queue.withdraw(gone.id)
-    clock.now = NOW + timedelta(seconds=31)                # read under the lock: a due request expires first
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE   # unmarked past the grace: a sweep expires it
+    assert queue.sweep() == 1
     got = queue.mark_undecided(late.id, halt=True)
     assert (got.state, got.gap, got.halted, got.decision) == ("expired", None, False, None)
     assert "expired" in got.reason

@@ -22,6 +22,7 @@ import levain.authority as auth
 from levain.authority import ReplayCache
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.cockpit.firejournal import UNINITIALISED, CockpitDB
+from levain.consent.queue import UNDECIDED_GRACE
 from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
 )
@@ -155,7 +156,8 @@ def test_silence_expires_and_is_no_decision(tmp_path, authority):
     t0 = time.monotonic()
     assert q.await_decision(request.id, 10, poll=0.05) is None
     assert time.monotonic() - t0 < 5                             # it ended at expiry, not at the wait's end
-    assert q.get(request.id)[1] == "expired"
+    assert q.get(request.id)[1] == "pending"                    # the hook's to mark undecided (UNDECIDED_GRACE)
+    assert q.mark_undecided(request.id).state == "undecided"    # past expires_at, at the real deadline
     face = q.receipt(request.id)["face"]
     assert face["gate"] is None and face["terminal_state"] == "timed_out"
 
@@ -219,8 +221,10 @@ def test_refuses_an_answer_after_expiry(queue, clock, keys, authority):
     clock.now = NOW + timedelta(seconds=30)
     with pytest.raises(AnswerRefused, match="already expired"):
         queue.answer(request.id, payload, sig)
-    assert queue.get(request.id)[1] == "expired"
+    assert queue.get(request.id)[1] == "pending"                # applied nothing; the hook marks it undecided
     assert queue.decision(request.id) is None
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE
+    assert queue.get(request.id)[1] == "expired"
 
 
 def test_refuses_a_second_answer_to_a_terminal_request(queue, keys, authority):
@@ -426,14 +430,14 @@ def test_an_answer_whose_lock_wait_crosses_expiry_is_refused(queue, clock, keys,
     monkeypatch.setattr(queue, "_connect", connect)
     with pytest.raises(AnswerRefused, match="already expired"):
         queue.answer(request.id, payload, sig)
-    assert queue.get(request.id)[1] == "expired"
+    assert queue.get(request.id)[1] == "pending"                # applied nothing; the hook marks it undecided
     assert queue.decision(request.id) is None
 
 
 def test_withdraw_after_expiry_records_the_expiry(queue, clock):
-    """F3: a due request expires before a withdraw is considered."""
+    """F3: a due request (its hold ended UNDECIDED_GRACE ago) expires before a withdraw is considered."""
     request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
-    clock.now = NOW + timedelta(seconds=30)
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE
     assert queue.withdraw(request.id) is False
     assert queue.receipt(request.id)["state"] == "expired"
 
@@ -485,7 +489,7 @@ def test_polling_a_pending_request_takes_no_write_lock(queue):
 def test_a_late_signed_answer_with_a_forged_decided_at_is_no_decision(queue, clock, keys):
     """G1: "in time" is the signed signed_at, never the row's decided_at a raw writer can set."""
     request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
-    clock.now = NOW + timedelta(seconds=40)
+    clock.now = NOW + timedelta(seconds=40) + UNDECIDED_GRACE
     assert queue.get(request.id)[1] == "expired"
     payload, sig = signed(queue, request, keys["phone"])     # a real signature, made after the expiry
     _raw(queue, ("DROP TRIGGER requests_frozen", ()),
@@ -666,7 +670,9 @@ def test_sweep_and_pending(queue, clock):
     agent = FakeAgent(queue)
     short, long_ = agent.ask("a", hold=timedelta(seconds=10)), agent.ask("b", hold=timedelta(hours=1))
     assert [r.id for r in queue.pending()] == [short.id, long_.id]
-    clock.now = NOW + timedelta(seconds=11)
+    clock.now = NOW + timedelta(seconds=10)
+    assert queue.sweep() == 0                                   # the hook's to mark undecided first
+    clock.now = NOW + timedelta(seconds=11) + UNDECIDED_GRACE
     assert queue.sweep() == 1
     assert [r.id for r in queue.pending()] == [long_.id]
     assert queue.sweep() == 0
