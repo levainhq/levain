@@ -58,7 +58,7 @@ def test_a_linked_file_under_a_hidden_subtree_is_refused(home) -> None:
     (store / "deep").mkdir(parents=True)
     (store / "deep" / "memory.db").write_text("store")
     os.link(store / "deep" / "memory.db", home / "copy.db")
-    with pytest.raises(ConfinementError, match="memory.db is a crown jewel"):
+    with pytest.raises(ConfinementError, match="is a crown jewel"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home)))
 
 
@@ -71,9 +71,10 @@ def test_a_subtree_root_that_is_a_linked_file_is_refused(home) -> None:
 
 
 def test_a_symlink_inside_a_subtree_is_not_followed(home) -> None:
-    outside = home / "shared.txt"
+    outside = home / "work" / "shared.txt"
+    outside.parent.mkdir()
     outside.write_text("not a jewel")
-    os.link(outside, home / "shared2.txt")
+    os.link(outside, outside.parent / "shared2.txt")
     store = home / ".anneal-memory"
     store.mkdir()
     (store / "pointer").symlink_to(outside)
@@ -312,7 +313,7 @@ def test_a_linked_private_key_under_the_hidden_ssh_dir_is_refused(home) -> None:
     ssh.mkdir()
     (ssh / "id_ed25519").write_text("PRIVATE KEY")
     os.link(ssh / "id_ed25519", home / "key")
-    with pytest.raises(ConfinementError, match="id_ed25519 is a crown jewel"):
+    with pytest.raises(ConfinementError, match="is a crown jewel"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent"))
 
 
@@ -339,9 +340,10 @@ def test_linked_jewel_reason_names_the_jewel_for_a_link_and_spares_plain_files(h
     from levain.firing.confinement import linked_jewel_reason
     secret = _secret(home)
     os.link(secret, home / "t")
-    plain = home / "notes.txt"
+    plain = home / "work" / "notes.txt"
+    plain.parent.mkdir()
     plain.write_text("x")
-    os.link(plain, home / "notes2.txt")   # two names, neither a jewel
+    os.link(plain, plain.parent / "notes2.txt")   # two names, neither a jewel
     policy = build_policy(_entity(home), deny_files=(secret,))
     reason = linked_jewel_reason(policy, home / "t")
     assert reason and "token" in reason and "hardlink" in reason

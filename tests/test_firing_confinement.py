@@ -1084,10 +1084,11 @@ def test_crown_jewel_reason_deny_standard_creds(tmp_path: Path, monkeypatch) -> 
     assert crown_jewel_reason(on, tmp_path / ".config" / "gh" / "hosts.yml") is not None
     assert crown_jewel_reason(on, tmp_path / ".aws" / "credentials") is not None
     assert crown_jewel_reason(on, tmp_path / ".netrc") is not None
-    # default OFF → the same paths are reachable (the entity's own gh/aws hands work)
+    # The credential READ floor is default-off, but Round 3's persistence floor independently
+    # write-protects every immediate HOME entry in the in-process editor.
     off = build_policy(ent)
     assert crown_jewel_reason(off, tmp_path / ".config" / "gh" / "hosts.yml") is None
-    assert crown_jewel_reason(off, tmp_path / ".netrc") is None
+    assert crown_jewel_reason(off, tmp_path / ".netrc") is not None
 
 
 # =============================================================================================
@@ -1577,6 +1578,7 @@ def _sock_policy(tmp_path: Path, monkeypatch, sock: Path, **kw):
     exercised against a socket the test owns rather than the operator's docker daemon."""
     from levain.firing import confinement as _conf
     monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(sock),))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return build_policy(tmp_path / "ent", **kw)
 
 

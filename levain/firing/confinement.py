@@ -575,6 +575,143 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
         ) from exc
     return _spellings(spec)
 
+
+_PERSISTENCE_AGENT_NAMES = (".claude", ".codex")
+
+
+def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
+    tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]
+]:
+    """Return ``(roots, directory_targets, file_targets, protected_hops)`` for the
+    whole-directory Claude/Codex persistence floor.
+
+    ``roots`` are lexical names below HOME/workspace (including existing case variants).
+    The target sets cover every existing symlink reached below such a root. ``protected_hops``
+    pins both the spelling of each link target and the fully resolved chain so an intermediate
+    link cannot be swapped after policy construction. Any existing link that cannot be resolved,
+    or a link cycle in a protected tree, refuses the floor by name.
+    """
+    roots: list[Path] = []
+    directory_targets: list[Path] = []
+    file_targets: list[Path] = []
+    target_spellings: list[Path] = []
+
+    def fail(path: Path, exc: BaseException) -> NoReturn:
+        raise ConfinementError(
+            f"the protected persistence path {path} cannot be resolved ({exc}) — "
+            "refusing to build the floor (fail-closed)"
+        ) from exc
+
+    def resolve_existing(path: Path) -> Path:
+        try:
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            fail(path, exc)
+
+    def remember_link_target(link: Path, *, required: bool) -> Path | None:
+        try:
+            value = os.readlink(link)
+        except OSError as exc:
+            fail(link, exc)
+        target = Path(value)
+        if not target.is_absolute():
+            target = link.parent / target
+        target = Path(os.path.abspath(target))
+        target_spellings.append(target)
+        try:
+            return link.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError, RuntimeError) as exc:
+            # A broken/looping child link has no reachable data target. The whole-root regex still
+            # denies unlinking or replacing that lexical link. Roots and their resolution hops are
+            # different: the floor depends on their targets, so those always fail closed.
+            if not required:
+                return None
+            fail(link, exc)
+        except (OSError, ValueError) as exc:
+            fail(link, exc)
+
+    def scan_root(path: Path) -> None:
+        """Capture direct child links, including the ruled `.claude/settings.json` shape.
+
+        Ordinary directories need no recursive policy expansion: the root's ``subpath`` deny and
+        inode walk cover them. A direct symlinked directory becomes another whole protected target.
+        """
+        real = resolve_existing(path)
+        try:
+            st = os.stat(real)
+        except OSError as exc:
+            fail(path, exc)
+        if not stat.S_ISDIR(st.st_mode):
+            file_targets.append(real)
+            return
+        directory_targets.append(real)
+        try:
+            entries = list(os.scandir(real))
+        except OSError as exc:
+            fail(real, exc)
+        for entry in entries:
+            child = Path(entry.path)
+            try:
+                is_link = entry.is_symlink()
+            except OSError as exc:
+                fail(child, exc)
+            if not is_link:
+                continue
+            target = remember_link_target(child, required=False)
+            if target is None:
+                continue
+            try:
+                if target.is_dir():
+                    directory_targets.append(target)
+                else:
+                    file_targets.append(target)
+            except OSError as exc:
+                fail(child, exc)
+
+    for anchor in (home, workspace):
+        candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
+        try:
+            with os.scandir(anchor) as entries:
+                candidates.extend(
+                    Path(entry.path) for entry in entries
+                    if entry.name.casefold() in _PERSISTENCE_AGENT_NAMES
+                )
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError as exc:
+            fail(anchor, exc)
+
+        for raw in _dedup_paths(candidates):
+            # Validate even the lower-case requested spelling: Path.resolve catches a loop while
+            # still allowing an absent name, which must remain denied for future creation.
+            _required_spellings(raw, "whole Claude/Codex agent directory")
+            try:
+                roots.extend((raw, raw.parent.resolve() / raw.name))
+            except (OSError, RuntimeError, ValueError) as exc:
+                fail(raw, exc)
+            if not os.path.lexists(raw):
+                continue
+            if raw.is_symlink():
+                resolved = remember_link_target(raw, required=True)
+                assert resolved is not None
+            else:
+                resolved = resolve_existing(raw)
+            try:
+                if resolved.is_dir():
+                    directory_targets.append(resolved)
+                    scan_root(resolved)
+                else:
+                    file_targets.append(resolved)
+            except OSError as exc:
+                fail(raw, exc)
+
+    root_t = _dedup_paths(roots)
+    dir_t = _dedup_paths(directory_targets)
+    file_t = _dedup_paths(file_targets)
+    protected = [*root_t, *dir_t, *file_t, *target_spellings]
+    hops = _dedup_paths([*protected, *_write_deny_ancestors(protected)])
+    return root_t, dir_t, file_t, hops
+
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
 # ⛔ A REACHABLE CONTAINER DAEMON IS A TOTAL BYPASS OF EVERYTHING ELSE IN THIS MODULE, and it
@@ -1409,10 +1546,12 @@ class CrownJewelsPolicy:
     # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
     # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
     persistence_home_dirs: tuple[Path, ...] = ()  # immediate children are WRITE-denied on macOS
-    persistence_write_subtrees: tuple[Path, ...] = ()  # bin/hooks/LaunchAgents/git config trees
-    persistence_write_files: tuple[Path, ...] = ()  # shell/git startup + Codex config/hooks
-    persistence_settings_dirs: tuple[Path, ...] = ()  # immediate settings*.json are WRITE-denied
-    persistence_protected_names: tuple[Path, ...] = ()  # exact .claude/.codex roots: no link planting
+    persistence_write_subtrees: tuple[Path, ...] = ()  # bin/LaunchAgents/git config trees
+    persistence_write_files: tuple[Path, ...] = ()  # shell/git startup files
+    persistence_agent_roots: tuple[Path, ...] = ()  # lexical .claude/.codex roots (whole-dir deny)
+    persistence_agent_dirs: tuple[Path, ...] = ()  # resolved protected directory targets
+    persistence_agent_files: tuple[Path, ...] = ()  # resolved symlinked-file targets below them
+    persistence_agent_hops: tuple[Path, ...] = ()  # exact resolution-chain nodes: no swapping
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -2268,8 +2407,6 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
-            (home / ".claude" / "hooks", "operator Claude hooks"),
-            (ws / ".claude" / "hooks", "workspace Claude hooks"),
         )
         for p in _required_spellings(root, label)
     ])
@@ -2280,31 +2417,11 @@ def build_policy(
                 ".zshrc", ".zprofile", ".zlogin", ".zshenv", ".bashrc", ".bash_profile",
                 ".bash_login", ".profile", ".gitconfig",
             )),
-            (home / ".codex" / "hooks.json", "operator Codex hooks"),
-            (home / ".codex" / "config.toml", "operator Codex config"),
-            (ws / ".codex" / "hooks.json", "workspace Codex hooks"),
-            (ws / ".codex" / "config.toml", "workspace Codex config"),
         )
         for p in _required_spellings(root, label)
     ])
-    persistence_settings_dirs = _dedup([
-        p
-        for root, label in (
-            (home / ".claude", "operator Claude settings"),
-            (ws / ".claude", "workspace Claude settings"),
-        )
-        for p in _required_spellings(root, label)
-    ])
-    persistence_protected_names = _dedup([
-        p
-        for root, label in (
-            (home / ".claude", "operator Claude root"),
-            (home / ".codex", "operator Codex root"),
-            (ws / ".claude", "workspace Claude root"),
-            (ws / ".codex", "workspace Codex root"),
-        )
-        for p in _required_spellings(root, label)
-    ])
+    (persistence_agent_roots, persistence_agent_dirs, persistence_agent_files,
+     persistence_agent_hops) = _persistence_agent_paths(home, ws)
 
     # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, the entity's
     # own store files, AND the config file (all relocate the same way). Including ``deny_write_files_t``
@@ -2319,8 +2436,9 @@ def build_policy(
     all_jewels = (
         list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t)
         + list(own_memory_files_t) + list(persistence_write_subtrees)
-        + list(persistence_write_files) + list(persistence_settings_dirs)
-        + list(persistence_protected_names) + [config_file]
+        + list(persistence_write_files) + list(persistence_agent_roots)
+        + list(persistence_agent_dirs) + list(persistence_agent_files)
+        + list(persistence_agent_hops) + [config_file]
     )
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
@@ -2384,8 +2502,10 @@ def build_policy(
         persistence_home_dirs=persistence_home_dirs,
         persistence_write_subtrees=persistence_write_subtrees,
         persistence_write_files=persistence_write_files,
-        persistence_settings_dirs=persistence_settings_dirs,
-        persistence_protected_names=persistence_protected_names,
+        persistence_agent_roots=persistence_agent_roots,
+        persistence_agent_dirs=persistence_agent_dirs,
+        persistence_agent_files=persistence_agent_files,
+        persistence_agent_hops=persistence_agent_hops,
     )
 
 
@@ -2718,7 +2838,9 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
     moat, not this predicate, is what keeps recall/capture off the operator's store."""
     try:
-        p = Path(path).expanduser().resolve()
+        expanded = Path(path).expanduser()
+        lexical = Path(os.path.abspath(expanded))
+        p = expanded.resolve()
     # ⛔ RuntimeError IS IN THIS CLAUSE FOR THE SAME REASON IT IS IN `doctor.py`'s, AND THIS
     # FUNCTION IS THE ONE WHERE IT MATTERS MOST. `Path("~someuser/...").expanduser()` raises
     # RuntimeError — not OSError, not ValueError — for a user with no passwd entry. MEASURED:
@@ -2736,6 +2858,23 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
     if (why := _process_view_reason(path, p)) is not None:
         return why
+    for home in policy.persistence_home_dirs:
+        if (_canon(str(lexical.parent)) == _canon(str(home))
+                or _canon(str(p.parent)) == _canon(str(home))):
+            return f"{lexical} is an immediate operator-home entry and is write-protected"
+    for root in policy.persistence_agent_roots:
+        if _ci_within(lexical, root):
+            return f"{lexical} is under the whole write-protected agent directory {root}"
+    for root in policy.persistence_agent_dirs:
+        if _ci_within(p, root):
+            return f"{p} is under the resolved write-protected agent directory {root}"
+    for target in policy.persistence_agent_files:
+        if _canon(str(p)) == _canon(str(target)):
+            return f"{p} is a resolved file target below a write-protected agent directory"
+    for hop in policy.persistence_agent_hops:
+        if (_canon(str(lexical)) == _canon(str(hop))
+                or _canon(str(p)) == _canon(str(hop))):
+            return f"{lexical} is a protected agent-directory resolution hop"
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
@@ -2754,14 +2893,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
             return f"{p} is under the write-protected persistence subtree {subtree}"
     for protected in policy.persistence_write_files:
         if _canon(str(p)) == _canon(str(protected)):
-            return f"{p} is a write-protected agent configuration or hook file"
-    for settings_dir in policy.persistence_settings_dirs:
-        if (_canon(str(p.parent)) == _canon(str(settings_dir))
-                and p.name.startswith("settings") and p.name.endswith(".json")):
-            return f"{p} is a write-protected Claude settings file"
-    for protected in policy.persistence_protected_names:
-        if _canon(str(p)) == _canon(str(protected)):
-            return f"{p} is a protected agent-config root and cannot be created or replaced"
+            return f"{p} is a write-protected shell or git startup file"
     # Container sockets are write-denied through the SAME ``deny_write_files`` list as the ssh
     # vectors (build_policy arm (ii)), so the loop below must say WHICH it matched or it tells an
     # operator that ``/var/run/docker.sock`` is "an ssh persistence/exec vector
@@ -4557,6 +4689,15 @@ def _sbpl_regex(value: str) -> str:
     return "".join(out)
 
 
+def _agent_root_regex(path: Path) -> str:
+    """An anchored SBPL regex for one whole `.claude`/`.codex` root, ASCII-case-insensitive."""
+    name = path.name.casefold()
+    if name not in _PERSISTENCE_AGENT_NAMES:
+        raise ConfinementError(f"invalid protected agent-directory root {path} — refusing fail-closed")
+    folded = "\\." + "".join(f"[{ch.lower()}{ch.upper()}]" for ch in name[1:])
+    return f'^{_sbpl_regex(str(path.parent))}\\/{folded}($|\\/.*)'
+
+
 def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
     """True if the CALLER explicitly made ``path`` a crown jewel (in ``deny_files``, or under a
     ``deny_read_write`` subtree). Used so the ssh convenience re-allow of ``known_hosts`` / ``config``
@@ -4664,18 +4805,20 @@ def _macos_persistence_lines(policy: CrownJewelsPolicy) -> list[str]:
     """Render the persistence descriptions carried by the shared crown-jewels policy."""
     lines = [
         ";; HOME PERSISTENCE — immediate home entries cannot be created, replaced or renamed.",
-        ";; Execution-bearing subtrees and only the named agent config/hook paths are write-denied.",
+        ";; Execution-bearing subtrees and whole .claude/.codex directories are write-denied.",
         "(deny file-write*",
     ]
     for home in policy.persistence_home_dirs:
         lines.append(f'    (regex #"^{_sbpl_regex(str(home))}\\/[^\\/]+$")')
     for subtree in policy.persistence_write_subtrees:
         lines.append(f'    (subpath "{_sbpl_string(str(subtree))}")')
-    for settings_dir in policy.persistence_settings_dirs:
-        lines.append(
-            f'    (regex #"^{_sbpl_regex(str(settings_dir))}\\/settings[^\\/]*\\.json$")'
-        )
-    for path in (*policy.persistence_write_files, *policy.persistence_protected_names):
+    for root in policy.persistence_agent_roots:
+        lines.append(f'    (regex #"{_agent_root_regex(root)}")')
+    for root in policy.persistence_agent_dirs:
+        lines.append(f'    (literal "{_sbpl_string(str(root))}")')
+        lines.append(f'    (subpath "{_sbpl_string(str(root))}")')
+    for path in (*policy.persistence_write_files, *policy.persistence_agent_files,
+                 *policy.persistence_agent_hops):
         lines.append(f'    (literal "{_sbpl_string(str(path))}")')
     lines += [")", ""]
     return lines
@@ -4930,7 +5073,7 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append("")
 
         # Last: no convenience allow above may override the persistence floor. Ordinary workspace
-        # paths are not matched; only its Claude/Codex config and hook paths are.
+        # paths are not matched; its whole `.claude` and `.codex` directories are.
         lines.extend(_macos_persistence_lines(policy))
 
         if ssh_agent is not None:
@@ -5552,7 +5695,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
                     for b in (Path(rd) / "bus", Path(rd) / "systemd" / "private")]
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
              *policy.sqlite_sidecars, *policy.persistence_write_files,
-             *policy.persistence_protected_names, *sockets]
+             *policy.persistence_agent_files, *policy.persistence_agent_hops, *sockets]
     if policy.config_file is not None:
         named.append(policy.config_file)
     for f in named:
@@ -5574,10 +5717,11 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
         except OSError as exc:
             unverifiable(str(root), exc)
 
-    for root in policy.persistence_settings_dirs:
-        scan_children(root, lambda name: name.startswith("settings") and name.endswith(".json"))
+    for home in policy.persistence_home_dirs:
+        scan_children(home, lambda _name: True)
 
     roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees,
+                    *policy.persistence_agent_roots, *policy.persistence_agent_dirs,
                     *([policy.ssh_dir] if policy.ssh_dir else [])}, key=lambda p: str(p))
     walked: list[Path] = []
     for root in roots:
@@ -8212,7 +8356,8 @@ _HANDS_POLICY_NARROWED = ("deny_read_write", "deny_files", "deny_write_dirs", "d
                           "socket_spellings", "own_memory_files", "sqlite_sidecars", "trust_spellings",
                           "ssh_dir", "config_file", "persistence_home_dirs",
                           "persistence_write_subtrees", "persistence_write_files",
-                          "persistence_settings_dirs", "persistence_protected_names")
+                          "persistence_agent_roots", "persistence_agent_dirs",
+                          "persistence_agent_files", "persistence_agent_hops")
 _HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs", "cred_dir_sources",
                       "trusted_roots")
 
