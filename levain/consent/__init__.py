@@ -10,9 +10,11 @@ from levain.consent.queue import (
     AnswerRefused, AuthoritySource, ConsentQueue, Decision, QueueStoreError, authority_source, default_queue_dir,
 )
 from levain.consent.record import (
-    ANSWER_NAMESPACE, GRANT_ANSWER_FORMAT, ExternalGateRequest, answer_message, answer_payload,
+    ANSWER_NAMESPACE, GRANT_ANSWER_FORMAT, RULING_NAMESPACE, ExternalGateRequest, answer_message, answer_payload,
+    ruling_message, ruling_payload,
 )
 
-__all__ = ["ANSWER_NAMESPACE", "GRANT_ANSWER_FORMAT", "AnswerRefused", "AuthoritySource", "ConsentQueue", "Decision",
-           "ExternalGateRequest", "PolicyNotEligible", "QueueStoreError", "authority_source", "answer_message",
-           "answer_payload", "default_queue_dir", "guarded_policy"]
+__all__ = ["ANSWER_NAMESPACE", "GRANT_ANSWER_FORMAT", "RULING_NAMESPACE", "AnswerRefused", "AuthoritySource",
+           "ConsentQueue", "Decision", "ExternalGateRequest", "PolicyNotEligible", "QueueStoreError",
+           "authority_source", "answer_message", "answer_payload", "default_queue_dir", "guarded_policy",
+           "ruling_message", "ruling_payload"]

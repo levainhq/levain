@@ -52,6 +52,11 @@
    "namespace": "levain-consent-answer",
    "status": "shipped",
    "owner": "levain/consent/record.py"
+  },
+  {
+   "namespace": "levain-consent-ruling",
+   "status": "shipped",
+   "owner": "levain/consent/record.py"
   }
  ],
  "families": [

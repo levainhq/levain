@@ -1,7 +1,7 @@
 """levain.consent.queue — the consent queue: external agents' gates, their answers, their receipts.
 
 A hook files an :class:`~levain.consent.record.ExternalGateRequest`; the request is ``pending`` until exactly
-one of four things ends it:
+one of these ends it or moves it on:
 
   - ``allowed`` by a standing consent grant (:meth:`ConsentQueue.answer_by_grant`, Q4): a grant a fresh replay of
     the authority log holds, whose criteria (:func:`levain.consent.policy.grant_refusal`) hold for the request, the
@@ -14,7 +14,18 @@ one of four things ends it:
     decision, never an allow (the 10-08 rule): the request stays pending;
   - ``expired``: its ``expires_at`` passed with no verified answer. Silence is NO decision: the hook outputs
     nothing and the agent's native dialog stands;
-  - ``withdrawn``: the requester gave up (the human answered the native dialog, the hook stopped holding).
+  - ``withdrawn``: the requester gave up (the human answered the native dialog, the hook stopped holding);
+  - ``undecided`` (:meth:`ConsentQueue.mark_undecided`): the hook's hold ended with no verified answer and the
+    action was NOT taken. The request is given a gap number, unique and never reused within its agent and
+    session. It is the one state that is not terminal, with exactly one way out: a late RULING that verifies
+    (:meth:`ConsentQueue.answer_late`), a record binding this queue, the request, its digest, its gap number,
+    the decision and when it was signed, in :data:`~levain.consent.record.RULING_NAMESPACE` (never an answer's
+    namespace, so neither verifies as the other), checked against the authority log exactly as an answer is.
+    A ruled allow pre-authorises that one call once (:meth:`ConsentQueue.take_ruled_allow`), for a bounded time
+    (:data:`RULED_ALLOW_LAPSE`).
+
+A pending or undecided request can be snoozed (:meth:`ConsentQueue.snooze`): a time to ask the operator again,
+recorded apart and unsigned, since it changes no authority, only when he is asked.
 
 What became of a request levain left to the agent's own dialog (withdrawn, expired, or answered in that dialog
 while the hook still held it) is recorded apart, UNSIGNED, in ``dialog_outcomes`` (:meth:`ConsentQueue.record_ran`,
@@ -26,23 +37,29 @@ touches the request's state, answer or signature, and is never authority: it is 
 did not make.
 
 The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
-delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`) re-reads the
-stored answer and signature, checks the answer binds this queue, this request and the row's decision, and
+delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`,
+:meth:`ConsentQueue.take_ruled_allow`) re-reads the stored answer or ruling and its signature, checks it binds
+this queue, this request (and, for a ruling, the request's gap number) and the row's decision, and
 re-verifies it against a FRESH replay of the authority log taken at delivery (the queue's ``authority``
 source): a key revoked after it answered delivers nothing. A grant answer is re-verified the same way: the grant
 must still be in a fresh replay, unexpired, its criteria still true for the tool input and posture the deliverer
 holds. Anything that fails is ``None``, never an allow;
 a raw write can only take a decision away (the native dialog then stands), never make one.
 
-A terminal request never changes again: SQL triggers refuse any update of a terminal row, any change of a
-request's fields, and any delete (a guard against a buggy writer; authority is the signature above). Every
-terminal transition writes its receipt (built by :mod:`levain.autonomic.receipt`) in the same transaction, so
+A terminal request never changes again: SQL triggers refuse any update of a terminal row, any move but
+``pending`` to a terminal state or to ``undecided`` and ``undecided`` to ``allowed``/``denied`` by a ruling, any
+change of a request's fields, and any delete (a guard against a buggy writer; authority is the signature above).
+Gap numbers, takes of a ruled allow, snoozes and session halts (:meth:`ConsentQueue.halt`, released in the
+transaction of the ruling on the halting request) are append-only tables beside the request row, which they
+never change. Every transition writes its receipt (built by :mod:`levain.autonomic.receipt`) in the same transaction, so
 a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
 its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
 
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
-operator's alone (0700, refused otherwise).
+operator's alone (0700, refused otherwise). A store of the previous format (:data:`PRIOR_FORMAT`) is migrated
+in place on open, in one transaction, its rows unchanged; any other format is refused, and a levain that knows
+only the previous format refuses this one.
 
 Stdlib only.
 """
@@ -71,25 +88,34 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.policy import grant_refusal
 from levain.consent.record import (
-    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, ExternalGateRequest, answer_message,
-    answer_payload, grant_answer_payload, redact_display, tool_input_digest,
+    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, RULING_FORMAT, RULING_NAMESPACE,
+    ExternalGateRequest, answer_message, answer_payload, grant_answer_payload, redact_display, ruling_message,
+    ruling_payload, tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue",
-           "Decision", "QueueStoreError", "authority_source", "default_queue_dir"]
+__all__ = ["DB_NAME", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused",
+           "AuthoritySource", "ConsentQueue", "Decision", "QueueStoreError", "Reping", "authority_source",
+           "default_queue_dir"]
 
 DB_NAME = "queue.db"
-STORE_FORMAT = "levain-consent-queue/3"
-STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn")
-TERMINAL: frozenset[str] = frozenset(STATES[1:])
+STORE_FORMAT = "levain-consent-queue/4"
+# the format this one migrates from in place; the listing reads either
+PRIOR_FORMAT = "levain-consent-queue/3"
+STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn", "undecided")
+TERMINAL: frozenset[str] = frozenset({"allowed", "denied", "expired", "withdrawn"})
 _ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                           "signer_fp", "signed_at"})
 _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
-# how a decided request was answered: a signed answer, or a standing consent grant
-VIA: tuple[str, ...] = ("signature", "grant")
+_RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
+                          "signed_at"})
+# how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
+VIA: tuple[str, ...] = ("signature", "grant", "ruling")
+# a ruled allow not taken by the call it rules on within this long of being signed pre-authorises nothing
+RULED_ALLOW_LAPSE = timedelta(hours=24)
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
+_ROW_COLUMNS = _FIELDS + ("state", "decided_at", "answer", "signature", "signer_fp", "note", "via")
 _STATE_OF = {"allow": "allowed", "deny": "denied"}
 _ACCESS_BY_OTHERS = 0o077
 # what became of a request left to the agent's own dialog (unsigned; never a decision)
@@ -99,31 +125,50 @@ DIALOG_OUTCOMES: tuple[str, ...] = ("ran", "ran_unasked", "did_not_run")
 # dialog came 12-13 s after [judged by levain seat lane H, 2026-10-17, against those two measured runs]
 UNASKED_WITHIN = timedelta(seconds=0.5)
 
+def _requests_table(name: str) -> str:
+    return (f"CREATE TABLE IF NOT EXISTS {name} (id TEXT PRIMARY KEY, agent TEXT NOT NULL, "
+            "agent_session_id TEXT NOT NULL, "
+            "event_id TEXT NOT NULL, tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, display TEXT NOT NULL, "
+            "cwd TEXT NOT NULL, tier TEXT NOT NULL, received_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (state IN ('pending','allowed','denied','expired','withdrawn','undecided')), "
+            "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT, "
+            "via TEXT CHECK (via IS NULL OR via IN ('signature','grant','ruling')))")
+
+
+def _receipts_table(name: str) -> str:
+    # one receipt per transition: an undecided request has its undecided receipt, then its ruling's
+    return (f"CREATE TABLE IF NOT EXISTS {name} (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL "
+            "REFERENCES requests(id), state TEXT NOT NULL, created_at TEXT NOT NULL, face TEXT NOT NULL, "
+            "UNIQUE (request_id, state))")
+
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, agent TEXT NOT NULL, agent_session_id TEXT NOT NULL, "
-    "event_id TEXT NOT NULL, tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, display TEXT NOT NULL, "
-    "cwd TEXT NOT NULL, tier TEXT NOT NULL, received_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
-    "state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','allowed','denied','expired','withdrawn')), "
-    "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT, "
-    "via TEXT CHECK (via IS NULL OR via IN ('signature','grant')))",
+    _requests_table("requests"),
     "CREATE INDEX IF NOT EXISTS requests_pending ON requests (state, expires_at)",
     # the cockpit's read-only listing reads the last day's decided requests by this (levain.consent.listing)
     "CREATE INDEX IF NOT EXISTS requests_decided ON requests (decided_at)",
     # a hook's own event id names one permission event: a retry of it, at any time, is refused
     "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
     "WHERE event_id LIKE 'hook:%'",
-    "CREATE TABLE IF NOT EXISTS receipts (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL UNIQUE "
-    "REFERENCES requests(id), state TEXT NOT NULL, created_at TEXT NOT NULL, face TEXT NOT NULL)",
-    # terminal is terminal; a request's fields never change; nothing is deleted; receipts are append-only
-    "CREATE TRIGGER IF NOT EXISTS requests_frozen BEFORE UPDATE ON requests WHEN OLD.state != 'pending' "
-    "OR NEW.state = 'pending' OR NEW.id IS NOT OLD.id OR NEW.agent IS NOT OLD.agent "
+    _receipts_table("receipts"),
+    # terminal is terminal; the only moves are pending -> a terminal state (never by a ruling), pending -> undecided
+    # (with no answer) and undecided -> allowed/denied by a ruling; a request's fields never change; nothing is
+    # deleted; receipts are append-only
+    "CREATE TRIGGER IF NOT EXISTS requests_frozen BEFORE UPDATE ON requests WHEN NOT ("
+    "(OLD.state = 'pending' AND NEW.state IN ('allowed','denied','expired','withdrawn') AND NEW.via IS NOT 'ruling') "
+    "OR (OLD.state = 'pending' AND NEW.state = 'undecided' AND NEW.via IS NULL AND NEW.answer IS NULL "
+    "AND NEW.signature IS NULL AND NEW.signer_fp IS NULL) "
+    "OR (OLD.state = 'undecided' AND NEW.state IN ('allowed','denied') AND NEW.via IS 'ruling')) "
+    "OR NEW.id IS NOT OLD.id OR NEW.agent IS NOT OLD.agent "
     "OR NEW.agent_session_id IS NOT OLD.agent_session_id OR NEW.event_id IS NOT OLD.event_id "
     "OR NEW.tool_name IS NOT OLD.tool_name "
     "OR NEW.tool_input_digest IS NOT OLD.tool_input_digest OR NEW.display IS NOT OLD.display "
     "OR NEW.cwd IS NOT OLD.cwd OR NEW.tier IS NOT OLD.tier OR NEW.received_at IS NOT OLD.received_at "
     "OR NEW.expires_at IS NOT OLD.expires_at "
-    "BEGIN SELECT RAISE(ABORT, 'a consent request changes only once, from pending to a terminal state'); END",
+    "BEGIN SELECT RAISE(ABORT, 'a consent request moves only from pending to a terminal state or to undecided, "
+    "and from undecided by a ruling'); END",
     "CREATE TRIGGER IF NOT EXISTS requests_kept BEFORE DELETE ON requests "
     "BEGIN SELECT RAISE(ABORT, 'consent requests are never deleted'); END",
     "CREATE TRIGGER IF NOT EXISTS receipts_frozen BEFORE UPDATE ON receipts "
@@ -139,7 +184,79 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'a dialog outcome is written once'); END",
     "CREATE TRIGGER IF NOT EXISTS dialog_outcomes_kept BEFORE DELETE ON dialog_outcomes "
     "BEGIN SELECT RAISE(ABORT, 'dialog outcomes are never deleted'); END",
+    # the gap number an undecided request was given, once; per agent and session, never reused
+    "CREATE TABLE IF NOT EXISTS gaps (request_id TEXT PRIMARY KEY REFERENCES requests(id), agent TEXT NOT NULL, "
+    "agent_session_id TEXT NOT NULL, gap INTEGER NOT NULL CHECK (typeof(gap) = 'integer' AND gap >= 1), "
+    "created_at TEXT NOT NULL)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS gaps_per_session ON gaps (agent, agent_session_id, gap)",
+    "CREATE TRIGGER IF NOT EXISTS gaps_frozen BEFORE UPDATE ON gaps "
+    "BEGIN SELECT RAISE(ABORT, 'a gap number is given once'); END",
+    "CREATE TRIGGER IF NOT EXISTS gaps_kept BEFORE DELETE ON gaps "
+    "BEGIN SELECT RAISE(ABORT, 'gap numbers are never deleted'); END",
+    # a ruled allow taken by the call it pre-authorised: at most once
+    "CREATE TABLE IF NOT EXISTS ruled_takes (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
+    "taken_at TEXT NOT NULL, event TEXT)",
+    "CREATE TRIGGER IF NOT EXISTS ruled_takes_frozen BEFORE UPDATE ON ruled_takes "
+    "BEGIN SELECT RAISE(ABORT, 'a ruled allow is taken once'); END",
+    "CREATE TRIGGER IF NOT EXISTS ruled_takes_kept BEFORE DELETE ON ruled_takes "
+    "BEGIN SELECT RAISE(ABORT, 'takes of a ruled allow are never deleted'); END",
+    # when to ask the operator again about a pending or undecided request (unsigned: it changes no authority)
+    "CREATE TABLE IF NOT EXISTS snoozes (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL "
+    "REFERENCES requests(id), reping_at TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS snoozes_request ON snoozes (request_id, seq)",
+    "CREATE TABLE IF NOT EXISTS repings (snooze_seq INTEGER PRIMARY KEY REFERENCES snoozes(seq), "
+    "repinged_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS snoozes_frozen BEFORE UPDATE ON snoozes "
+    "BEGIN SELECT RAISE(ABORT, 'snoozes are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS snoozes_kept BEFORE DELETE ON snoozes "
+    "BEGIN SELECT RAISE(ABORT, 'snoozes are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS repings_frozen BEFORE UPDATE ON repings "
+    "BEGIN SELECT RAISE(ABORT, 'repings are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS repings_kept BEFORE DELETE ON repings "
+    "BEGIN SELECT RAISE(ABORT, 'repings are append-only'); END",
+    # a session halted on an undecided request (the irreversible / agent-config tier), and its release, written in
+    # the transaction of the ruling on that request
+    "CREATE TABLE IF NOT EXISTS halts (request_id TEXT PRIMARY KEY REFERENCES gaps(request_id), "
+    "agent TEXT NOT NULL, agent_session_id TEXT NOT NULL, gap INTEGER NOT NULL, halted_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS halts_session ON halts (agent, agent_session_id, gap)",
+    "CREATE TABLE IF NOT EXISTS halt_releases (request_id TEXT PRIMARY KEY REFERENCES halts(request_id), "
+    "released_at TEXT NOT NULL, by_request_id TEXT NOT NULL REFERENCES requests(id))",
+    "CREATE TRIGGER IF NOT EXISTS halts_frozen BEFORE UPDATE ON halts "
+    "BEGIN SELECT RAISE(ABORT, 'halts are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS halts_kept BEFORE DELETE ON halts "
+    "BEGIN SELECT RAISE(ABORT, 'halts are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS halt_releases_frozen BEFORE UPDATE ON halt_releases "
+    "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS halt_releases_kept BEFORE DELETE ON halt_releases "
+    "BEGIN SELECT RAISE(ABORT, 'halt releases are append-only'); END",
 )
+# the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
+_REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
+
+
+def _migrate_from_prior(conn: sqlite3.Connection) -> None:
+    """Inside the caller's write transaction: rebuild ``requests`` (its state and via checks) and ``receipts``
+    (its uniqueness, per request and state) under the new definitions, copying every row with its rowid and
+    seq, and mark the store this format. SQLite cannot alter a CHECK or drop a column's UNIQUE in place, hence
+    the copy. The caller then runs the schema, which recreates the indexes and triggers dropped with the old
+    tables."""
+    for trigger in _REBUILT_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    before = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("requests", "receipts")}
+    cols = ", ".join(_ROW_COLUMNS)
+    conn.execute(_requests_table("requests_next"))
+    conn.execute(f"INSERT INTO requests_next (rowid, {cols}) SELECT rowid, {cols} FROM requests ORDER BY rowid")
+    conn.execute("DROP TABLE requests")
+    conn.execute("ALTER TABLE requests_next RENAME TO requests")
+    rcols = "seq, request_id, state, created_at, face"
+    conn.execute(_receipts_table("receipts_next"))
+    conn.execute(f"INSERT INTO receipts_next ({rcols}) SELECT {rcols} FROM receipts ORDER BY seq")
+    conn.execute("DROP TABLE receipts")
+    conn.execute("ALTER TABLE receipts_next RENAME TO receipts")
+    after = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("requests", "receipts")}
+    if after != before:
+        raise QueueStoreError(f"the migration from {PRIOR_FORMAT} copied {after} rows of {before}")
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
 
 
 class QueueStoreError(RuntimeError):
@@ -157,7 +274,8 @@ class Decision:
     it filed for the input it is holding (``ExternalGateRequest.digest``). ``via`` says how it was answered:
     ``signature`` (``signer_fp`` is the key) or ``grant`` (``signer_fp`` is None; ``grant_id`` names the standing
     grant, ``grant_seq``/``grant_hash`` the authority link that created or last renewed it, ``posture`` the
-    agent's reported posture it matched)."""
+    agent's reported posture it matched), or ``ruling`` (a late ruling on an undecided request: ``signer_fp`` is
+    the key, ``gap`` the request's gap number)."""
     request_id: str
     decision: str
     signer_fp: str | None
@@ -168,6 +286,17 @@ class Decision:
     grant_seq: int | None = None
     grant_hash: str | None = None
     posture: str | None = None
+    gap: int | None = None
+
+
+@dataclass(frozen=True)
+class Reping:
+    """A snoozed request whose time to ask the operator again has come: ``seq`` names the snooze
+    (:meth:`ConsentQueue.mark_repinged` takes it), ``state`` is the request's state now (pending or undecided)."""
+    seq: int
+    request_id: str
+    reping_at: str
+    state: str
 
 
 def class_covers(key_class: str, tier: str) -> bool:
@@ -292,7 +421,9 @@ class ConsentQueue:
                     "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is None):
                 raise QueueStoreError("the database holds tables but no consent-queue format marker")
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
-            if row is not None and row[0] != STORE_FORMAT:
+            if row is not None and row[0] == PRIOR_FORMAT:
+                _migrate_from_prior(conn)
+            elif row is not None and row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
@@ -405,15 +536,32 @@ class ConsentQueue:
         return [r for r in (self._request_of(row) for row in rows) if r is not None]
 
     def receipt(self, request_id: str) -> dict[str, Any] | None:
+        """The request's latest receipt (an undecided request that was ruled on has two; see :meth:`receipts`)."""
+        got = self.receipts(request_id)
+        return got[-1] if got else None
+
+    def receipts(self, request_id: str) -> list[dict[str, Any]]:
+        """Every receipt of the request, oldest first: one per transition."""
         with self._read() as conn:
-            row = conn.execute("SELECT state, created_at, face FROM receipts WHERE request_id = ?",
-                               (request_id,)).fetchone()
-        return None if row is None else {"state": row[0], "created_at": row[1], "face": json.loads(row[2])}
+            rows = conn.execute("SELECT state, created_at, face FROM receipts WHERE request_id = ? ORDER BY seq",
+                                (request_id,)).fetchall()
+        return [{"state": r[0], "created_at": r[1], "face": json.loads(r[2])} for r in rows]
+
+    def gap(self, request_id: str) -> int | None:
+        """The gap number the request was given when it went undecided, or ``None``."""
+        with self._read() as conn:
+            got = self._gap_of(conn, request_id)
+        return None if got is None else got[0]
+
+    @staticmethod
+    def _gap_of(conn: sqlite3.Connection, request_id: str) -> tuple[int, str] | None:
+        row = conn.execute("SELECT gap, created_at FROM gaps WHERE request_id = ?", (request_id,)).fetchone()
+        return None if row is None or type(row[0]) is not int else (row[0], row[1])
 
     # --- transitions ---------------------------------------------------------------------------------
     @staticmethod
     def _face(request: ExternalGateRequest, state: str, signer_fp: str | None,
-              grant: Mapping[str, Any] | None = None) -> dict[str, Any]:
+              grant: Mapping[str, Any] | None = None, gap: int | None = None) -> dict[str, Any]:
         common: dict[str, Any] = dict(context_id=request.id, query_text=request.display, query_date=request.received_at[:10],
                       producers=[request.agent])
         if grant is not None:
@@ -425,29 +573,33 @@ class ConsentQueue:
                                                f"posture={grant['posture']}"),
                 terminal_state="fired", downstream_id=request.id)
         if state in ("allowed", "denied"):
+            grant_text = f"signed-answer:{signer_fp}" if gap is None else f"signed-ruling:{signer_fp} gap=#{gap}"
             return build_gate_face(
                 **common,
                 gate=build_gate_verdict(verdict="approved" if state == "allowed" else "denied", by="human"),
-                authority=AuthorityScope(grantor="human", grant=f"signed-answer:{signer_fp}"),
+                authority=AuthorityScope(grantor="human", grant=grant_text),
                 terminal_state="fired" if state == "allowed" else "refused", downstream_id=request.id)
         face = build_action_face(**common)          # no decision: the gate slice stays null
-        if state == "expired":
+        if state in ("expired", "undecided"):
             face["terminal_state"] = "timed_out"
         return face
 
     def _transition(self, conn: sqlite3.Connection, request: ExternalGateRequest, state: str, *, stamp: str,
                     answer: str | None = None, signature: str | None = None, signer_fp: str | None = None,
                     note: str | None = None, via: str | None = None,
-                    grant: Mapping[str, Any] | None = None) -> bool:
-        """One ``pending -> state`` move plus its receipt, inside the caller's write transaction. False when
-        the request is no longer pending: nothing is written. ``grant`` is the grant answer record when a
-        standing grant answered (its receipt names the grant and its link)."""
+                    grant: Mapping[str, Any] | None = None, from_state: str = "pending",
+                    gap: int | None = None) -> bool:
+        """One ``from_state -> state`` move plus its receipt, inside the caller's write transaction. False when
+        the request is no longer in ``from_state``: nothing is written. ``grant`` is the grant answer record when
+        a standing grant answered (its receipt names the grant and its link); ``gap`` the gap number a ruling
+        rules on (its receipt names it)."""
         if conn.execute("UPDATE requests SET state = ?, decided_at = ?, answer = ?, signature = ?, signer_fp = ?, "
-                        "note = ?, via = ? WHERE id = ? AND state = 'pending'",
-                        (state, stamp, answer, signature, signer_fp, note, via, request.id)).rowcount != 1:
+                        "note = ?, via = ? WHERE id = ? AND state = ?",
+                        (state, stamp, answer, signature, signer_fp, note, via, request.id, from_state)
+                        ).rowcount != 1:
             return False
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
-                     (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp, grant),
+                     (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp, grant, gap),
                                                            ensure_ascii=False, sort_keys=True)))
         return True
 
@@ -569,6 +721,101 @@ class ConsentQueue:
                 return False
             return self._transition(conn, request, "withdrawn", stamp=stamp, note=note or None)
 
+    # --- the deadline: undecided, gaps, halts, snoozes -------------------------------------------------
+    def mark_undecided(self, request_id: str, *, tool_input: Any = None,
+                       posture: str | None = None) -> int | Decision | None:
+        """The hook's hold ended with no verified decision: move the pending request to ``undecided`` and give it
+        the next gap number of its agent and session, with its receipt, in one write transaction (the clock read
+        under the lock, a due request expired first). Returns the gap number; the same number again for a request
+        already undecided; the request's decision, re-verified as :meth:`decision` delivers it (``tool_input`` /
+        ``posture`` are passed to it), when it was decided before this call; ``None`` when it is unknown, expired,
+        withdrawn, or decided by an answer that no longer verifies."""
+        decided = False
+        with self._write() as conn:
+            request, state, stamp = self._settle(conn, request_id)
+            if request is None:
+                return None
+            if state == "undecided":
+                got = self._gap_of(conn, request_id)
+                return None if got is None else got[0]
+            if state != "pending":
+                decided = state in ("allowed", "denied")
+            else:
+                last = conn.execute("SELECT MAX(gap) FROM gaps WHERE agent = ? AND agent_session_id = ?",
+                                    (request.agent, request.agent_session_id)).fetchone()[0]
+                gap = (last if type(last) is int else 0) + 1
+                if not self._transition(conn, request, "undecided", stamp=stamp,
+                                        note="the hold ended with no verified decision"):
+                    return None
+                conn.execute("INSERT INTO gaps (request_id, agent, agent_session_id, gap, created_at) "
+                             "VALUES (?, ?, ?, ?, ?)", (request.id, request.agent, request.agent_session_id, gap,
+                                                        stamp))
+                return gap
+        return self.decision(request_id, tool_input=tool_input, posture=posture) if decided else None
+
+    def halt(self, request_id: str) -> int | None:
+        """Halt the request's session on it (the irreversible / agent-config tier, after :meth:`mark_undecided`):
+        :meth:`is_halted` names its gap until a ruling on this request releases it. Returns the gap number, the
+        same again when already halted; ``None`` when the request is not undecided (a ruled request is never
+        halted again)."""
+        with self._write() as conn:
+            row = self._row(conn, request_id)
+            got = self._gap_of(conn, request_id)
+            if row is None or got is None or row["state"] != "undecided":
+                return None
+            conn.execute("INSERT OR IGNORE INTO halts (request_id, agent, agent_session_id, gap, halted_at) "
+                         "VALUES (?, ?, ?, ?, ?)", (request_id, row["agent"], row["agent_session_id"], got[0],
+                                                    utc_stamp(_now_utc(self._clock))))
+            return got[0]
+
+    def is_halted(self, agent: str, agent_session_id: str) -> int | None:
+        """The lowest gap number this session is halted on and not yet released, or ``None``."""
+        with self._read() as conn:
+            row = conn.execute("SELECT MIN(h.gap) FROM halts h WHERE h.agent = ? AND h.agent_session_id = ? "
+                               "AND NOT EXISTS (SELECT 1 FROM halt_releases r WHERE r.request_id = h.request_id)",
+                               (agent, agent_session_id)).fetchone()
+        return row[0] if row is not None and type(row[0]) is int else None
+
+    def snooze(self, request_id: str, minutes: float = 30) -> str | None:
+        """Ask the operator again about a pending or undecided request ``minutes`` from now: records the time and
+        returns it; ``None`` when the request is in neither state. Unsigned: it changes no authority, only when he
+        is asked. A later snooze of the same request replaces the earlier one."""
+        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not minutes > 0 \
+                or minutes == float("inf"):
+            raise ConsentError("minutes must be a positive finite number")
+        with self._write() as conn:
+            request, state, stamp = self._settle(conn, request_id)
+            if request is None or state not in ("pending", "undecided"):
+                return None
+            reping_at = utc_stamp(parse_stamp(stamp) + timedelta(minutes=minutes))
+            conn.execute("INSERT INTO snoozes (request_id, reping_at, created_at) VALUES (?, ?, ?)",
+                         (request_id, reping_at, stamp))
+        return reping_at
+
+    def due_repings(self, now: datetime | None = None) -> list[Reping]:
+        """The snoozed requests to ask about again at ``now`` (default the queue's clock): each request's latest
+        snooze, due and not yet re-pinged, while the request is undecided or pending and unexpired. Oldest due
+        first."""
+        stamp = utc_stamp(_now_utc(self._clock) if now is None else now)
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT s.seq, s.request_id, s.reping_at, r.state FROM snoozes s "
+                "JOIN requests r ON r.id = s.request_id "
+                "WHERE s.seq = (SELECT MAX(seq) FROM snoozes l WHERE l.request_id = s.request_id) "
+                "AND s.reping_at <= ? AND NOT EXISTS (SELECT 1 FROM repings p WHERE p.snooze_seq = s.seq) "
+                "AND (r.state = 'undecided' OR (r.state = 'pending' AND r.expires_at > ?)) "
+                "ORDER BY s.reping_at, s.seq", (stamp, stamp)).fetchall()
+        return [Reping(*r) for r in rows]
+
+    def mark_repinged(self, seq: int) -> bool:
+        """The operator was asked again for snooze ``seq``. False when there is no such snooze or it was already
+        marked."""
+        with self._write() as conn:
+            if conn.execute("SELECT 1 FROM snoozes WHERE seq = ?", (seq,)).fetchone() is None:
+                return False
+            return conn.execute("INSERT OR IGNORE INTO repings (snooze_seq, repinged_at) VALUES (?, ?)",
+                                (seq, utc_stamp(_now_utc(self._clock)))).rowcount == 1
+
     # --- answers -------------------------------------------------------------------------------------
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
                  authority: AuthoritySnapshot) -> str | None:
@@ -598,6 +845,16 @@ class ConsentQueue:
         decision = payload["decision"]
         if decision not in DECISIONS:
             return f"decision {decision!r} is not one of {DECISIONS}"
+        return self._signer_refusal(request, payload, signature, authority, noun="answer",
+                                    encode_record=answer_message, namespace=ANSWER_NAMESPACE)
+
+    def _signer_refusal(self, request: ExternalGateRequest, payload: Mapping[str, Any], signature: Any,
+                        authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
+                        namespace: str) -> str | None:
+        """The key and signature checks an answer and a ruling share: the named signer is a key ``authority``
+        holds active, of a class covering the request's tier for an allow, and ``signature`` verifies over the
+        record's bytes in ``namespace``."""
+        decision = payload["decision"]
         signer_fp = payload["signer_fp"]
         key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
         if key is None:
@@ -607,7 +864,7 @@ class ConsentQueue:
         if decision == "allow" and not class_covers(key.key_class, request.tier):
             return f"key class {key.key_class} does not cover {request.tier}"
         if not isinstance(signature, str) or not signature:
-            return "the answer carries no signature"
+            return f"the {noun} carries no signature"
         if key.custody == PASSKEY:
             # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
             # verification, not only where the phone port converted the assertion
@@ -617,16 +874,45 @@ class ConsentQueue:
             if problem is not None:
                 return problem
         try:
-            message = answer_message(dict(payload))
+            message = encode_record(dict(payload))
         except ConsentError as exc:
-            return f"the answer cannot be encoded: {exc}"
+            return f"the {noun} cannot be encoded: {exc}"
         kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
         try:
             ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
-                                 namespace=ANSWER_NAMESPACE, **kwargs)
+                                 namespace=namespace, **kwargs)
         except VerifierUnavailable as exc:
-            return f"the answer could not be verified: {exc}"
-        return None if ok else "the answer's signature does not verify"
+            return f"the {noun} could not be verified: {exc}"
+        return None if ok else f"the {noun}'s signature does not verify"
+
+    def _ruling_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any,
+                        signature: Any, authority: AuthoritySnapshot) -> str | None:
+        """Why ``payload``/``signature`` is not a ruling on ``request`` (gap number and the time it went undecided
+        in ``gap``) under ``authority``; ``None`` when it verifies. Checked when it is applied and again every time
+        it is delivered or taken."""
+        if not isinstance(payload, Mapping) or set(payload) != _RULING_KEYS:
+            return "the ruling is not a ruling record"
+        if payload["format"] != RULING_FORMAT:
+            return f"ruling format {payload['format']!r} is not {RULING_FORMAT!r}"
+        if payload["queue_id"] != queue_id:
+            return "the ruling names another queue"
+        if payload["request_id"] != request.id:
+            return "the ruling is for another request"
+        if payload["request_digest"] != request.digest:
+            return "the ruling signs another version of this request"
+        if type(payload["gap"]) is not int or payload["gap"] != gap[0]:
+            return f"the ruling names gap {payload['gap']!r}, not this request's gap #{gap[0]}"
+        signed_at = payload["signed_at"]
+        try:
+            parse_stamp(signed_at)
+        except ConsentError:
+            return "the ruling's signed_at is not a timestamp"
+        if signed_at < gap[1]:
+            return "the ruling was signed before the request went undecided"
+        if payload["decision"] not in DECISIONS:
+            return f"decision {payload['decision']!r} is not one of {DECISIONS}"
+        return self._signer_refusal(request, payload, signature, authority, noun="ruling",
+                                    encode_record=ruling_message, namespace=RULING_NAMESPACE)
 
     def answer(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
@@ -667,6 +953,121 @@ class ConsentQueue:
             raise AnswerRefused(f"request {request_id} is already {state}")
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
                               signed_at=utc_stamp(_now_utc(self._clock)))
+
+    # --- late rulings ----------------------------------------------------------------------------------
+    def _undecided(self, request_id: str) -> tuple[ExternalGateRequest, tuple[int, str], str]:
+        with self._read() as conn:
+            row = self._row(conn, request_id)
+            gap = self._gap_of(conn, request_id)
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        request = None if row is None else self._request_of(row)
+        if row is None or request is None:
+            raise AnswerRefused(f"no sealed request {request_id!r}")
+        if row["state"] != "undecided":
+            raise AnswerRefused(f"request {request_id} is {row['state']}, not undecided: a ruling answers only an "
+                                "undecided request")
+        if gap is None:
+            raise AnswerRefused(f"request {request_id} is undecided but has no gap number")
+        return request, gap, queue_id
+
+    def ruling_payload(self, request_id: str, decision: str, signer_fp: str) -> dict[str, Any]:
+        """The record to sign to rule on the undecided ``request_id``, ``signed_at`` now by the queue's clock.
+        Raises :class:`AnswerRefused` when there is no sealed undecided request."""
+        request, gap, queue_id = self._undecided(request_id)
+        return ruling_payload(queue_id=queue_id, request=request, gap=gap[0], decision=decision,
+                              signer_fp=signer_fp, signed_at=utc_stamp(_now_utc(self._clock)))
+
+    def answer_late(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
+        """Apply a signed late ruling to the undecided ``request_id``, or raise :class:`AnswerRefused` (the request
+        stays undecided). The ruling is verified against a fresh replay from the queue's authority source exactly
+        as :meth:`answer` verifies an answer (the signer enrolled and unrevoked, of a class covering the tier for
+        an allow), in :data:`~levain.consent.record.RULING_NAMESPACE`. The move to ``allowed``/``denied``, its
+        receipt and the release of a halt on this request are one transaction."""
+        request, gap, queue_id = self._undecided(request_id)
+        authority = self._fresh_authority()
+        if authority is None:
+            raise AnswerRefused("the authority log cannot be replayed now: no ruling is authority")
+        why = self._ruling_refusal(request, queue_id, gap, payload, signature, authority)
+        if why is not None:
+            raise AnswerRefused(why)
+        decision = payload["decision"]
+        message = ruling_message(dict(payload))
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            moved = self._transition(conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
+                                     signature=signature, signer_fp=payload["signer_fp"], via="ruling",
+                                     from_state="undecided", gap=gap[0])
+            if moved:
+                conn.execute("INSERT INTO halt_releases (request_id, released_at, by_request_id) "
+                             "SELECT request_id, ?, request_id FROM halts WHERE request_id = ?", (stamp, request.id))
+        if not moved:
+            raise AnswerRefused(f"request {request_id} is no longer undecided")
+        return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
+                        request_digest=request.digest, via="ruling", gap=gap[0])
+
+    def _ruling_decision(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
+                         gap: tuple[int, str] | None, payload: Mapping[str, Any],
+                         authority: AuthoritySnapshot | None) -> Decision | None:
+        """A ruled row's decision, re-verified under ``authority``: the stored ruling names this row's decision and
+        signer and verifies (:meth:`_ruling_refusal`) for the request's gap."""
+        named = payload.get("decision")
+        if gap is None or authority is None or not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
+                or payload.get("signer_fp") != row["signer_fp"]:
+            return None
+        if self._ruling_refusal(request, queue_id, gap, payload, row["signature"], authority) is not None:
+            return None
+        return Decision(request_id=request.id, decision=named, signer_fp=payload["signer_fp"],
+                        decided_at=row["decided_at"], request_digest=request.digest, via="ruling", gap=gap[0])
+
+    @staticmethod
+    def _stored_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The row's stored answer record when it is the canonical encoding of itself, else ``None``."""
+        stored = row["answer"]
+        if not isinstance(stored, str) or not isinstance(row["decided_at"], str):
+            return None
+        try:
+            payload = json.loads(stored)
+            if not isinstance(payload, dict) or answer_message(payload) != stored.encode("utf-8"):
+                return None
+        except (ValueError, ConsentError, RecursionError):
+            return None
+        return payload
+
+    def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *,
+                         event: str | None = None) -> Decision | None:
+        """The ruled ALLOW that pre-authorises this call, taken once: the oldest ruled-allowed request of this agent
+        and session for ``tool_name`` and this exact input (its digest) not yet taken, whose ruling re-verifies
+        against a fresh replay and was signed less than :data:`RULED_ALLOW_LAPSE` ago. The take is recorded in the
+        same write transaction; a second take of it returns ``None``. ``None`` when there is none."""
+        digest = tool_input_digest(tool_input)
+        authority = self._fresh_authority()
+        if authority is None:
+            return None
+        with self._write() as conn:
+            now = _now_utc(self._clock)
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+            cur = conn.execute(
+                f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signature, signer_fp, via FROM requests r "
+                "WHERE agent = ? AND agent_session_id = ? AND tool_name = ? AND tool_input_digest = ? "
+                "AND state = 'allowed' AND via = 'ruling' "
+                "AND NOT EXISTS (SELECT 1 FROM ruled_takes t WHERE t.request_id = r.id) "
+                "ORDER BY decided_at, rowid", (agent, agent_session_id, tool_name, digest))
+            names = [d[0] for d in cur.description]
+            for raw in cur.fetchall():
+                row = dict(zip(names, raw))
+                request = self._request_of(row)
+                payload = None if request is None else self._stored_record(row)
+                if request is None or payload is None:
+                    continue
+                got = self._ruling_decision(row, request, queue_id, self._gap_of(conn, request.id), payload,
+                                            authority)
+                if got is None or got.decision != "allow" \
+                        or now >= parse_stamp(payload["signed_at"]) + RULED_ALLOW_LAPSE:
+                    continue
+                conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
+                             (request.id, utc_stamp(now), event))
+                return got
+        return None
 
     # --- standing grants (Q4) --------------------------------------------------------------------------
     def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,
@@ -738,24 +1139,24 @@ class ConsentQueue:
         signature must verify under a key a fresh replay holds active (and of a class covering the tier, for an
         allow). A grant answer (``via`` ``grant``): delivered only to a caller holding the request's tool input
         and the posture recorded, while the grant still answers it in a fresh replay (:meth:`_grant_decision`);
-        without ``tool_input`` it is ``None``. ``None`` while pending, for expired/withdrawn, and for anything
+        without ``tool_input`` it is ``None``. A late ruling (``via`` ``ruling``): the stored ruling must name
+        this row's decision and signer and verify for the request's gap number under a fresh replay
+        (:meth:`_ruling_refusal`). ``None`` while pending or undecided, for expired/withdrawn, and for anything
         that fails."""
         with self._read() as conn:
             row = self._row(conn, request_id)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
+            gap = self._gap_of(conn, request_id)
         if row is None or queue_id is None or row["state"] not in ("allowed", "denied"):
             return None
         request = self._request_of(row)
-        stored, decided_at = row["answer"], row["decided_at"]
+        decided_at = row["decided_at"]
         # "in time" is the SIGNED signed_at (checked in _refusal), never decided_at, which a raw writer sets
-        if request is None or not isinstance(stored, str) or not isinstance(decided_at, str):
+        payload = None if request is None else self._stored_record(row)
+        if request is None or payload is None:
             return None
-        try:
-            payload = json.loads(stored)
-            if not isinstance(payload, dict) or answer_message(payload) != stored.encode("utf-8"):
-                return None
-        except (ValueError, ConsentError, RecursionError):
-            return None
+        if row["via"] == "ruling":
+            return self._ruling_decision(row, request, queue_id[0], gap, payload, self._fresh_authority())
         if row["via"] == "grant":
             return self._grant_decision(row, request, queue_id[0], payload, tool_input=tool_input, posture=posture)
         if row["via"] != "signature":

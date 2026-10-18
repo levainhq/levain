@@ -28,8 +28,8 @@ from levain.autonomic.pending import seal_pending_id
 from levain.cockpit.consent import ConsentError, encode, parse_stamp, record_sha256, value_sha256
 
 __all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE",
-           "ExternalGateRequest", "answer_message", "answer_payload", "grant_answer_payload", "redact_display",
-           "tool_input_digest"]
+           "RULING_FORMAT", "RULING_NAMESPACE", "ExternalGateRequest", "answer_message", "answer_payload",
+           "grant_answer_payload", "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
@@ -38,6 +38,11 @@ POSTURE = "external-gate"
 ANSWER_FORMAT = "levain-consent-answer/1"
 # its own SSHSIG namespace: an answer verifies as nothing else, and nothing else verifies as an answer
 ANSWER_NAMESPACE = "levain-consent-answer"
+# a late ruling on a request that went undecided (its hold ended with no verified answer): signed after the hold
+# ended, so it is never an answer; its own format and its own SSHSIG namespace, so an answer never verifies as a
+# ruling and a ruling never verifies as an answer
+RULING_FORMAT = "levain-consent-ruling/1"
+RULING_NAMESPACE = "levain-consent-ruling"
 # what the queue stores when a standing consent grant answered (Q4): never signed per request; the grant's own
 # link in the authority log is the signature, re-verified at every delivery
 GRANT_ANSWER_FORMAT = "levain-consent-grant-answer/1"
@@ -213,3 +218,23 @@ def grant_answer_payload(*, queue_id: str, request: ExternalGateRequest, grant_i
             "request_digest": request.digest, "decision": "allow", "expires_at": request.expires_at,
             "grant_id": _need("grant_id", grant_id), "grant_seq": grant_seq,
             "grant_hash": _need("grant_hash", grant_hash), "posture": _need("posture", posture)}
+
+
+def ruling_payload(*, queue_id: str, request: ExternalGateRequest, gap: int, decision: str, signer_fp: str,
+                   signed_at: str) -> dict[str, Any]:
+    """The record a late ruling signs: this queue, this request and its digest, the gap number the request was
+    given when it went undecided, the decision, the key, and when it was made (``signed_at``, a
+    :func:`~levain.cockpit.consent.utc_stamp`). No expiry: a ruling is made after the request's hold ended."""
+    if decision not in DECISIONS:
+        raise ConsentError(f"decision must be one of {DECISIONS}: {decision!r}")
+    if type(gap) is not int or gap < 1:
+        raise ConsentError("gap must be a gap number (an integer >= 1)")
+    parse_stamp(signed_at)
+    return {"format": RULING_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
+            "request_digest": request.digest, "gap": gap, "decision": decision,
+            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
+
+
+def ruling_message(payload: dict[str, Any]) -> bytes:
+    """The exact bytes a ruling signs, in :data:`RULING_NAMESPACE`: the payload's JCS encoding."""
+    return encode(payload)

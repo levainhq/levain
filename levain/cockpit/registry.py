@@ -103,7 +103,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # and `expires_at` are registered above. The request's body is never a facet: the panel is token-free on
     # loopback, so the body is served only to a token holder (web_server's /cockpit/consent/<id>.json)
     "tool": ("str", _is_str),
-    "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn")),
+    "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn", "undecided")),
     "consent_tier": ("str", _is_str),
     "decided_at": ("timestamp", _is_str),    # a decided request's time (an unswept one: its expiry); `at` stays the filing
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)

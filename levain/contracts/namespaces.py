@@ -28,6 +28,8 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-consent": ("reserved", "fleet design §11o item 1", "a consent envelope"),
     "levain-consent-answer": ("shipped", "levain/consent/record.py",
                               "a consent-queue answer to an external agent's gate (Q1)"),
+    "levain-consent-ruling": ("shipped", "levain/consent/record.py",
+                              "a late ruling on a consent-queue request that went undecided (Q14)"),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

@@ -223,10 +223,11 @@ def _open_ro(directory: Path | str | None) -> sqlite3.Connection | None:
 
 
 def _check_format(conn: sqlite3.Connection) -> None:
-    from levain.consent.queue import STORE_FORMAT, QueueStoreError
+    from levain.consent.queue import PRIOR_FORMAT, STORE_FORMAT, QueueStoreError
 
     fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-    if fmt is None or fmt[0] != STORE_FORMAT:
+    # a store of the previous format holds the same request columns; a queue migrates it on its next open
+    if fmt is None or fmt[0] not in (STORE_FORMAT, PRIOR_FORMAT):
         raise QueueStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
 
 
