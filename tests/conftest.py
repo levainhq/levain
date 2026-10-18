@@ -17,7 +17,7 @@ LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
 LIVE_SEATBELT_REASON = (
     f"applies a LIVE macOS Seatbelt profile on this host, off unless {LIVE_SEATBELT_ENV}=1: a hand-written Seatbelt "
     "profile kernel-panicked a Mac on 2026-10-07, so a broad pytest run must never apply one to the host kernel. "
-    "Run these in a disposable VM (CI runners are), with the variable set."
+    "Run these in a disposable macOS VM with the variable set; no CI job sets it."
 )
 
 
