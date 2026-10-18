@@ -341,7 +341,8 @@ def gate_output(decision: Decision) -> dict[str, Any]:
 
 def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
     """The deny at D: U-IRR for the irreversible tier (the latch is the stop, never ``continue: false``), U-REV
-    for the reversible one."""
+    for the reversible one. The U-REV branch is UNEXECUTED: no reversible gated class exists in the product as of
+    main 5d330ec8 (it mirrors the Claude Code adapter's)."""
     return _deny((U_IRR if tier == "irreversible" else U_REV).format(x=what, n=gap))
 
 
