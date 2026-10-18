@@ -487,7 +487,10 @@ def test_the_in_process_editor_write_path_refuses_whole_agent_directories(tmp_pa
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     ent = _entity(tmp_path)
     workspace = tmp_path / "workspace"
+    (workspace / ".claude").mkdir(parents=True)
     policy = confinement.build_policy(ent, workspace=workspace, deny_standard_creds=False)
+    assert workspace in policy.persistence_agent_pins
+    assert workspace not in policy.deny_write_dirs
     token = T._EDITOR_FLOOR.set(policy)
     try:
         relative_targets = (
