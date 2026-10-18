@@ -435,7 +435,8 @@ def _decision_rows_in(got: Any) -> list[RowIn]:
 
 def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
     """The consent queue's listing (``levain.consent.listing.ConsentListing``) as rows: ``consent:<request_id>``
-    per request an agent waits on, and per one decided in the last day, with the count of entries that did not
+    per request an agent waits on (pending, or undecided and waiting on a late ruling, however old), and per one
+    decided in the last day, with the count of entries that did not
     build (each row is built on its own, so one bad entry never blanks the rest). A row carries who asks, for
     which tool, its tier, state and times (``at`` is when it was filed; a decided one adds
     ``decided_at``), and nothing of the request's body: the display, cwd, targets, answer commands and how it
@@ -444,7 +445,7 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
     ``expires_at``), so its version does not change every second."""
     rows: list[RowIn] = []
     bad = 0
-    for e in (*got.pending, *got.recent):
+    for e in (*got.pending, *got.undecided, *got.recent):
         try:
             r = e.request
             pending = e.state == "pending"

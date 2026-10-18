@@ -197,8 +197,9 @@ def answer_signature_problem(signature: str, public_key: str) -> str | None:
     """Why ``signature`` is not a consent answer a passkey ``public_key`` may give, or None. Run by the consent
     queue on every verification of a passkey key's answer (on answer and at each delivery), beside ssh-keygen:
     the signature must be a WebAuthn assertion (never a plain sk signature), carry user verification, and come
-    from a same-origin page on the key's own host. A passkey signs consent answers only; the authority replay
-    and the broker refuse its signature for anything else."""
+    from a same-origin page on the key's own host. A passkey signs consent answers and late rulings on undecided
+    requests (the queue runs this check for both, in their own namespaces) only; the authority replay and the
+    broker refuse its signature for anything else."""
     try:
         _key_blob, application = _key_parts(public_key)
         text = signature.strip()

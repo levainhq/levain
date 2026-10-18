@@ -960,8 +960,10 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
         reader = consent()
         if reader is not None:
             try:
-                for e in reader(ctx.now).pending:
-                    if e.state == "pending":
+                got = reader(ctx.now)
+                # an undecided request waits on a late ruling: the session waits on the operator as for a pending one
+                for e in (*got.pending, *got.undecided):
+                    if e.state in ("pending", "undecided"):
                         k = (e.request.agent, e.request.agent_session_id)
                         waiting[k] = waiting.get(k, 0) + 1
             except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting

@@ -20,12 +20,21 @@ one of these ends it or moves it on:
     session. It is the one state that is not terminal, with exactly one way out: a late RULING that verifies
     (:meth:`ConsentQueue.answer_late`), a record binding this queue, the request, its digest, its gap number,
     the decision and when it was signed, in :data:`~levain.consent.record.RULING_NAMESPACE` (never an answer's
-    namespace, so neither verifies as the other), checked against the authority log exactly as an answer is.
-    A ruled allow pre-authorises that one call once (:meth:`ConsentQueue.take_ruled_allow`), for a bounded time
-    (:data:`RULED_ALLOW_LAPSE`).
+    namespace, so neither verifies as the other), checked against the authority log exactly as an answer is,
+    and signed no later than the queue's clock (read under the lock) plus :data:`RULING_SKEW`. Only the LATEST ruling on an identical call (agent, session, tool,
+    input digest and working directory) counts: a ruled allow pre-authorises that one call once
+    (:meth:`ConsentQueue.take_ruled_allow`, the ONLY delivery of a ruled allow), for :data:`RULED_ALLOW_LAPSE`
+    from when the queue applied it; a later ruling on the identical call voids every earlier one not yet taken, so
+    a later deny takes the allow back and two allows give one run. :meth:`ConsentQueue.decision`,
+    :meth:`ConsentQueue.mark_undecided` and :meth:`ConsentQueue.claim_rulings_for` return a ruling as a
+    :class:`Ruling` (information: what was ruled, for the text the agent is told), never as a :class:`Decision`
+    an adapter delivers.
 
 A pending or undecided request can be snoozed (:meth:`ConsentQueue.snooze`): a time to ask the operator again,
-recorded apart and unsigned, since it changes no authority, only when he is asked.
+recorded apart and unsigned, since it changes no authority, only when he is asked; a due re-ping is claimed by
+one sweeper only (:meth:`ConsentQueue.claim_repings`). What a later resume of the agent's session needs (its
+permission mode, how it was invoked, Codex's pid, the original working directory) is recorded beside the request
+at filing (:meth:`ConsentQueue.resume_meta`), unsigned: it is never authority.
 
 What became of a request levain left to the agent's own dialog (withdrawn, expired, or answered in that dialog
 while the hook still held it) is recorded apart, UNSIGNED, in ``dialog_outcomes`` (:meth:`ConsentQueue.record_ran`,
@@ -37,22 +46,23 @@ touches the request's state, answer or signature, and is never authority: it is 
 did not make.
 
 The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
-delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`,
-:meth:`ConsentQueue.take_ruled_allow`) re-reads the stored answer or ruling and its signature, checks it binds
-this queue, this request (and, for a ruling, the request's gap number) and the row's decision, and
+delivery or reading of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`,
+:meth:`ConsentQueue.take_ruled_allow`, :meth:`ConsentQueue.claim_rulings_for`) re-reads the stored answer or
+ruling and its signature, checks it binds this queue, this request (and, for a ruling, the request's gap number) and the row's decision, and
 re-verifies it against a FRESH replay of the authority log taken at delivery (the queue's ``authority``
 source): a key revoked after it answered delivers nothing. A grant answer is re-verified the same way: the grant
 must still be in a fresh replay, unexpired, its criteria still true for the tool input and posture the deliverer
 holds. Anything that fails is ``None``, never an allow;
-a raw write can only take a decision away (the native dialog then stands), never make one.
+a raw write can only take a decision away (the native dialog then stands), never make one (one stated
+exception, a deleted later deny, under known edges below).
 
 A terminal request never changes again: SQL triggers refuse any update of a terminal row, any move but
 ``pending`` to a terminal state or to ``undecided`` and ``undecided`` to ``allowed``/``denied`` by a ruling, any
 change of a request's fields, and any delete (a guard against a buggy writer; authority is the signature above).
-Gap numbers, takes of a ruled allow, snoozes and session halts (:meth:`ConsentQueue.halt`, released in the
-transaction of the ruling on the halting request) are append-only tables beside the request row, which they
-never change. Every transition writes its receipt (built by :mod:`levain.autonomic.receipt`) in the same transaction, so
-a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
+Gap numbers, takes of a ruled allow, deliveries of a ruling's text, resume metadata, snoozes and session
+halts (:meth:`ConsentQueue.halt`, released in the transaction of the ruling on the halting request) are
+append-only tables beside the request row, which they never change. Every transition writes its receipt
+(built by :mod:`levain.autonomic.receipt`) in the same transaction, so a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
 its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
 
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
@@ -60,6 +70,15 @@ synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite.
 operator's alone (0700, refused otherwise). A store of the previous format (:data:`PRIOR_FORMAT`) is migrated
 in place on open, in one transaction, its rows unchanged; any other format is refused, and a levain that knows
 only the previous format refuses this one.
+
+Known edges (each stated, none built against):
+  - the take, the ruling-text claim and an answer read the authority log before taking the write lock: a key
+    revoked between that read and the write still takes or applies; every later delivery re-verifies.
+  - a process of an older levain that already opened this store (its ready flag cached) keeps writing it as
+    the format it knew, after a newer one migrated it in place.
+  - which ruling on a call is the latest is read from rows a raw writer can delete: deleting a later deny row
+    (triggers dropped) makes an earlier untaken allow the latest again; ordering itself is checked against the
+    signed ``signed_at``, so a reorder alone voids, never revives.
 
 Stdlib only.
 """
@@ -93,9 +112,9 @@ from levain.consent.record import (
     ruling_payload, tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused",
-           "AuthoritySource", "ConsentQueue", "Decision", "QueueStoreError", "Reping", "authority_source",
-           "default_queue_dir"]
+__all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
+           "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue", "Decision",
+           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "authority_source", "default_queue_dir"]
 
 DB_NAME = "queue.db"
 STORE_FORMAT = "levain-consent-queue/4"
@@ -111,8 +130,16 @@ _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", 
                           "signed_at"})
 # how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
 VIA: tuple[str, ...] = ("signature", "grant", "ruling")
-# a ruled allow not taken by the call it rules on within this long of being signed pre-authorises nothing
+# a ruled allow not taken by the call it rules on within this long of the queue applying it (its decided_at, the
+# queue's own clock) pre-authorises nothing; nor does one applied this long or more after it was signed
 RULED_ALLOW_LAPSE = timedelta(hours=24)
+# how far ahead of the queue's clock a ruling's signed_at may be (two honest clocks disagree by seconds)
+RULING_SKEW = timedelta(minutes=2)
+# the longest a snooze may put off asking again: a week
+SNOOZE_MAX_MINUTES = 7 * 24 * 60
+# how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
+INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
+_RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _ROW_COLUMNS = _FIELDS + ("state", "decided_at", "answer", "signature", "signer_fp", "note", "via")
@@ -193,6 +220,23 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'a gap number is given once'); END",
     "CREATE TRIGGER IF NOT EXISTS gaps_kept BEFORE DELETE ON gaps "
     "BEGIN SELECT RAISE(ABORT, 'gap numbers are never deleted'); END",
+    # the take's lookup: the ruled requests of one identical call (agent, session, tool, input digest, cwd)
+    "CREATE INDEX IF NOT EXISTS requests_ruled ON requests (agent, agent_session_id, tool_name, tool_input_digest, "
+    "cwd) WHERE via = 'ruling'",
+    # a ruling's text delivered to its session (both allow and deny): once
+    "CREATE TABLE IF NOT EXISTS ruling_deliveries (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
+    "agent TEXT NOT NULL, agent_session_id TEXT NOT NULL, delivered_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS ruling_deliveries_frozen BEFORE UPDATE ON ruling_deliveries "
+    "BEGIN SELECT RAISE(ABORT, 'a ruling is delivered once'); END",
+    "CREATE TRIGGER IF NOT EXISTS ruling_deliveries_kept BEFORE DELETE ON ruling_deliveries "
+    "BEGIN SELECT RAISE(ABORT, 'ruling deliveries are never deleted'); END",
+    # what a later resume of the request's session needs, recorded at filing (unsigned; never authority)
+    "CREATE TABLE IF NOT EXISTS resume_meta (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
+    "meta TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS resume_meta_frozen BEFORE UPDATE ON resume_meta "
+    "BEGIN SELECT RAISE(ABORT, 'resume metadata is written once'); END",
+    "CREATE TRIGGER IF NOT EXISTS resume_meta_kept BEFORE DELETE ON resume_meta "
+    "BEGIN SELECT RAISE(ABORT, 'resume metadata is never deleted'); END",
     # a ruled allow taken by the call it pre-authorised: at most once
     "CREATE TABLE IF NOT EXISTS ruled_takes (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
     "taken_at TEXT NOT NULL, event TEXT)",
@@ -292,11 +336,54 @@ class Decision:
 @dataclass(frozen=True)
 class Reping:
     """A snoozed request whose time to ask the operator again has come: ``seq`` names the snooze
-    (:meth:`ConsentQueue.mark_repinged` takes it), ``state`` is the request's state now (pending or undecided)."""
+    (claimed once by :meth:`ConsentQueue.claim_repings`), ``state`` is the request's state now (pending or
+    undecided)."""
     seq: int
     request_id: str
     reping_at: str
     state: str
+
+
+@dataclass(frozen=True)
+class Ruling:
+    """A late ruling on an undecided request, re-verified when read: INFORMATION (what was ruled, for the text the
+    agent is told), never a deliverable decision. It is deliberately not a :class:`Decision`: an adapter delivers
+    only a ``Decision``, and the one delivery of a ruled allow is :meth:`ConsentQueue.take_ruled_allow`. ``ruling``
+    is ``allow`` or ``deny``; ``taken`` says whether a ruled allow has been taken by the call it ruled on;
+    ``decided_at`` is when the queue applied it (its own clock), ``signed_at`` what the signer signed."""
+    request_id: str
+    ruling: str
+    signer_fp: str
+    decided_at: str
+    signed_at: str
+    request_digest: str
+    gap: int
+    taken: bool = False
+
+
+@dataclass(frozen=True)
+class Marked:
+    """What :meth:`ConsentQueue.mark_undecided` did, so the hook can word its deny truthfully. ``state`` is the
+    request's state after the call (``None`` when there is no sealed request of that id); ``gap`` its gap number
+    when it has one; ``reason`` says why in a sentence; ``halted`` whether its session is halted on it.
+    ``decision`` is what decided it before the deadline: a :class:`Decision` for a signed or grant answer that
+    re-verifies (deliverable, as :meth:`ConsentQueue.decision` delivers it), a :class:`Ruling` for a late ruling
+    (information only), ``None`` otherwise."""
+    state: str | None
+    gap: int | None
+    reason: str
+    halted: bool = False
+    decision: "Decision | Ruling | None" = None
+
+
+@dataclass(frozen=True)
+class Gapped:
+    """A request that was given a gap number: the request, its gap, its state now (``undecided``, or
+    ``allowed``/``denied`` once ruled) and when it went undecided."""
+    request: ExternalGateRequest
+    gap: int
+    state: str
+    undecided_at: str
 
 
 def class_covers(key_class: str, tier: str) -> bool:
@@ -460,13 +547,35 @@ class ConsentQueue:
         return snap if isinstance(snap, AuthoritySnapshot) else None
 
     # --- filing --------------------------------------------------------------------------------------
+    @staticmethod
+    def _resume_record(resume: Mapping[str, Any] | None) -> str | None:
+        """``resume`` checked and encoded, or ``None`` for none; raises :class:`ConsentError` on a bad one."""
+        if resume is None:
+            return None
+        if not isinstance(resume, Mapping) or not set(resume) <= _RESUME_KEYS or "invocation" not in resume:
+            raise ConsentError(f"resume must be a mapping of {sorted(_RESUME_KEYS)} naming the invocation")
+        if resume["invocation"] not in INVOCATIONS:
+            raise ConsentError(f"resume invocation must be one of {INVOCATIONS}: {resume['invocation']!r}")
+        for k in ("permission_mode", "cwd"):
+            if k in resume and resume[k] is not None and not (isinstance(resume[k], str) and resume[k]):
+                raise ConsentError(f"resume {k} must be a non-empty string or None")
+        pid = resume.get("codex_pid")
+        if pid is not None and (type(pid) is not int or pid < 1):
+            raise ConsentError("resume codex_pid must be a positive integer or None")
+        return json.dumps(dict(resume), sort_keys=True, ensure_ascii=False)
+
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
-             hold: timedelta, tier: str = "T2", event_id: str | None = None) -> ExternalGateRequest:
+             hold: timedelta, tier: str = "T2", event_id: str | None = None,
+             resume: Mapping[str, Any] | None = None) -> ExternalGateRequest:
         """File one gate an agent is waiting on; it expires ``hold`` after now. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
         permission event when its agent has one; without it the request gets an unpredictable one. Either
         way two filings are two requests, never one returned twice: a hook event id is unique per agent and
-        session in the store, so filing the same event again raises, at any time."""
+        session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
+        resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
+        ``codex_pid``, ``cwd`` the original working directory), written with the request in its transaction and
+        read back by :meth:`resume_meta`; unsigned, never authority."""
+        meta = self._resume_record(resume)
         if tier not in _TIER_NEEDS:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
@@ -486,10 +595,26 @@ class ConsentQueue:
             with self._write() as conn:
                 conn.execute(f"INSERT INTO requests ({', '.join(_FIELDS)}) VALUES "
                              f"({', '.join('?' for _ in _FIELDS)})", tuple(request.fields()[f] for f in _FIELDS))
+                if meta is not None:
+                    conn.execute("INSERT INTO resume_meta (request_id, meta, created_at) VALUES (?, ?, ?)",
+                                 (request.id, meta, request.received_at))
         except sqlite3.IntegrityError:
             raise ConsentError(f"request {request.id} (event {event}) is already filed: one event is filed once"
                                ) from None
         return request
+
+    def resume_meta(self, request_id: str) -> dict[str, Any] | None:
+        """What was recorded at filing for a later resume of the request's session (:meth:`file`'s ``resume``),
+        or ``None``. Unsigned: a hint for how to resume, never authority."""
+        with self._read() as conn:
+            row = conn.execute("SELECT meta FROM resume_meta WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            got = json.loads(row[0])
+        except ValueError:
+            return None
+        return got if isinstance(got, dict) else None
 
     # --- reading -------------------------------------------------------------------------------------
     @staticmethod
@@ -557,6 +682,38 @@ class ConsentQueue:
     def _gap_of(conn: sqlite3.Connection, request_id: str) -> tuple[int, str] | None:
         row = conn.execute("SELECT gap, created_at FROM gaps WHERE request_id = ?", (request_id,)).fetchone()
         return None if row is None or type(row[0]) is not int else (row[0], row[1])
+
+    def _gapped(self, where: str, args: tuple[Any, ...]) -> list[Gapped]:
+        with self._read() as conn:
+            cur = conn.execute(f"SELECT {', '.join('r.' + f for f in _FIELDS)}, r.state, g.gap, g.created_at "
+                               "FROM gaps g JOIN requests r ON r.id = g.request_id WHERE " + where +
+                               " ORDER BY g.created_at, g.agent, g.agent_session_id, g.gap", args)
+            names = [d[0] for d in cur.description]
+            rows = [dict(zip(names, r)) for r in cur.fetchall()]
+        out: list[Gapped] = []
+        for row in rows:
+            request = self._request_of(row)
+            if request is not None and type(row["gap"]) is int:
+                out.append(Gapped(request, row["gap"], row["state"], row["created_at"]))
+        return out
+
+    def undecided_for(self, agent: str | None = None, agent_session_id: str | None = None) -> list[Gapped]:
+        """The undecided requests (sealed rows only), oldest gap first; of one agent and/or one session when
+        named."""
+        where, args = "r.state = 'undecided'", ()
+        if agent is not None:
+            where, args = where + " AND g.agent = ?", args + (agent,)
+        if agent_session_id is not None:
+            where, args = where + " AND g.agent_session_id = ?", args + (agent_session_id,)
+        return self._gapped(where, args)
+
+    def request_by_gap(self, agent: str, agent_session_id: str, gap: int) -> Gapped | None:
+        """The request this agent and session gave gap number ``gap``, in whatever state it is now (undecided, or
+        ruled), or ``None``."""
+        if type(gap) is not int:
+            return None
+        got = self._gapped("g.agent = ? AND g.agent_session_id = ? AND g.gap = ?", (agent, agent_session_id, gap))
+        return got[0] if got else None
 
     # --- transitions ---------------------------------------------------------------------------------
     @staticmethod
@@ -722,36 +879,68 @@ class ConsentQueue:
             return self._transition(conn, request, "withdrawn", stamp=stamp, note=note or None)
 
     # --- the deadline: undecided, gaps, halts, snoozes -------------------------------------------------
-    def mark_undecided(self, request_id: str, *, tool_input: Any = None,
-                       posture: str | None = None) -> int | Decision | None:
+    def mark_undecided(self, request_id: str, *, halt: bool = False, tool_input: Any = None,
+                       posture: str | None = None) -> Marked:
         """The hook's hold ended with no verified decision: move the pending request to ``undecided`` and give it
-        the next gap number of its agent and session, with its receipt, in one write transaction (the clock read
-        under the lock, a due request expired first). Returns the gap number; the same number again for a request
-        already undecided; the request's decision, re-verified as :meth:`decision` delivers it (``tool_input`` /
-        ``posture`` are passed to it), when it was decided before this call; ``None`` when it is unknown, expired,
-        withdrawn, or decided by an answer that no longer verifies."""
-        decided = False
+        the next gap number of its agent and session, with its receipt, and, when ``halt`` (the irreversible /
+        agent-config tier), the session's halt on it (:meth:`is_halted`), all in ONE write transaction (the clock
+        read under the lock, a due request expired first): a hook killed part way leaves either nothing or all of
+        it. Returns a :class:`Marked`: the request's state after the call, its gap, why, whether its session is
+        halted on it, and, for a request decided before this call, what decided it (a re-verified
+        :class:`Decision` for a signed or grant answer, ``tool_input`` / ``posture`` passed to :meth:`decision`;
+        a :class:`Ruling`, information only, for a late ruling). A request already undecided keeps its gap (a
+        retry of the hook) and gains the halt when ``halt``."""
+        decided: str | None = None
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id)
             if request is None:
-                return None
+                return Marked(None, None, f"no sealed request {request_id!r}")
             if state == "undecided":
                 got = self._gap_of(conn, request_id)
-                return None if got is None else got[0]
-            if state != "pending":
-                decided = state in ("allowed", "denied")
-            else:
+                if got is None:
+                    return Marked("undecided", None, "the request is undecided but has no gap number")
+                if halt:
+                    self._insert_halt(conn, request, got[0], stamp)
+                return Marked("undecided", got[0], "the request was already undecided",
+                              self._halted_on(conn, request_id))
+            if state == "pending":
                 last = conn.execute("SELECT MAX(gap) FROM gaps WHERE agent = ? AND agent_session_id = ?",
                                     (request.agent, request.agent_session_id)).fetchone()[0]
                 gap = (last if type(last) is int else 0) + 1
                 if not self._transition(conn, request, "undecided", stamp=stamp,
                                         note="the hold ended with no verified decision"):
-                    return None
+                    return Marked(state, None, "the request moved while it was being marked")
                 conn.execute("INSERT INTO gaps (request_id, agent, agent_session_id, gap, created_at) "
                              "VALUES (?, ?, ?, ?, ?)", (request.id, request.agent, request.agent_session_id, gap,
                                                         stamp))
-                return gap
-        return self.decision(request_id, tool_input=tool_input, posture=posture) if decided else None
+                if halt:
+                    self._insert_halt(conn, request, gap, stamp)
+                return Marked("undecided", gap, "the hold ended with no verified decision", halt)
+            if state == "expired":
+                return Marked(state, None, "the request expired before its hold ended: nothing to rule on")
+            if state == "withdrawn":
+                return Marked(state, None, "the request was withdrawn to the agent's own dialog")
+            decided = state
+            got_gap = self._gap_of(conn, request_id)
+        got = self.decision(request_id, tool_input=tool_input, posture=posture)
+        gap_no = None if got_gap is None else got_gap[0]
+        if isinstance(got, Ruling):
+            return Marked(decided, got.gap, f"the request was ruled {got.ruling} late, on gap #{got.gap}",
+                          decision=got)
+        if got is None:
+            return Marked(decided, gap_no, f"the request is {decided} by an answer or ruling that no longer verifies")
+        return Marked(decided, None, f"the request was answered {got.decision} before the deadline", decision=got)
+
+    @staticmethod
+    def _insert_halt(conn: sqlite3.Connection, request: ExternalGateRequest, gap: int, stamp: str) -> None:
+        conn.execute("INSERT OR IGNORE INTO halts (request_id, agent, agent_session_id, gap, halted_at) "
+                     "VALUES (?, ?, ?, ?, ?)", (request.id, request.agent, request.agent_session_id, gap, stamp))
+
+    @staticmethod
+    def _halted_on(conn: sqlite3.Connection, request_id: str) -> bool:
+        return conn.execute("SELECT 1 FROM halts h WHERE h.request_id = ? AND NOT EXISTS "
+                            "(SELECT 1 FROM halt_releases r WHERE r.request_id = h.request_id)",
+                            (request_id,)).fetchone() is not None
 
     def halt(self, request_id: str) -> int | None:
         """Halt the request's session on it (the irreversible / agent-config tier, after :meth:`mark_undecided`):
@@ -763,9 +952,10 @@ class ConsentQueue:
             got = self._gap_of(conn, request_id)
             if row is None or got is None or row["state"] != "undecided":
                 return None
-            conn.execute("INSERT OR IGNORE INTO halts (request_id, agent, agent_session_id, gap, halted_at) "
-                         "VALUES (?, ?, ?, ?, ?)", (request_id, row["agent"], row["agent_session_id"], got[0],
-                                                    utc_stamp(_now_utc(self._clock))))
+            request = self._request_of(row)
+            if request is None:
+                return None
+            self._insert_halt(conn, request, got[0], utc_stamp(_now_utc(self._clock)))
             return got[0]
 
     def is_halted(self, agent: str, agent_session_id: str) -> int | None:
@@ -777,12 +967,15 @@ class ConsentQueue:
         return row[0] if row is not None and type(row[0]) is int else None
 
     def snooze(self, request_id: str, minutes: float = 30) -> str | None:
-        """Ask the operator again about a pending or undecided request ``minutes`` from now: records the time and
-        returns it; ``None`` when the request is in neither state. Unsigned: it changes no authority, only when he
-        is asked. A later snooze of the same request replaces the earlier one."""
+        """Ask the operator again about a pending or undecided request ``minutes`` from now (at most
+        :data:`SNOOZE_MAX_MINUTES`; past it, or not a positive finite number, :class:`ConsentError`): records the
+        time and returns it; ``None`` when the request is in neither state. Unsigned: it changes no authority, only
+        when he is asked. A later snooze of the same request replaces the earlier one."""
         if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not minutes > 0 \
                 or minutes == float("inf"):
             raise ConsentError("minutes must be a positive finite number")
+        if minutes > SNOOZE_MAX_MINUTES:
+            raise ConsentError(f"minutes must be at most {SNOOZE_MAX_MINUTES} (a week)")
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id)
             if request is None or state not in ("pending", "undecided"):
@@ -792,12 +985,13 @@ class ConsentQueue:
                          (request_id, reping_at, stamp))
         return reping_at
 
-    def due_repings(self, now: datetime | None = None) -> list[Reping]:
-        """The snoozed requests to ask about again at ``now`` (default the queue's clock): each request's latest
-        snooze, due and not yet re-pinged, while the request is undecided or pending and unexpired. Oldest due
-        first."""
-        stamp = utc_stamp(_now_utc(self._clock) if now is None else now)
-        with self._read() as conn:
+    def claim_repings(self, now: datetime | None = None) -> list[Reping]:
+        """Claim the snoozed requests to ask about again at ``now`` (default the queue's clock): each request's
+        latest snooze, due and not yet re-pinged, while the request is undecided or pending and unexpired, oldest
+        due first. The read and the marking are ONE write transaction, so two sweepers never both claim one
+        re-ping: the caller that gets it sends it."""
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock) if now is None else _now_utc(lambda: now))
             rows = conn.execute(
                 "SELECT s.seq, s.request_id, s.reping_at, r.state FROM snoozes s "
                 "JOIN requests r ON r.id = s.request_id "
@@ -805,16 +999,9 @@ class ConsentQueue:
                 "AND s.reping_at <= ? AND NOT EXISTS (SELECT 1 FROM repings p WHERE p.snooze_seq = s.seq) "
                 "AND (r.state = 'undecided' OR (r.state = 'pending' AND r.expires_at > ?)) "
                 "ORDER BY s.reping_at, s.seq", (stamp, stamp)).fetchall()
+            conn.executemany("INSERT INTO repings (snooze_seq, repinged_at) VALUES (?, ?)",
+                             [(r[0], stamp) for r in rows])
         return [Reping(*r) for r in rows]
-
-    def mark_repinged(self, seq: int) -> bool:
-        """The operator was asked again for snooze ``seq``. False when there is no such snooze or it was already
-        marked."""
-        with self._write() as conn:
-            if conn.execute("SELECT 1 FROM snoozes WHERE seq = ?", (seq,)).fetchone() is None:
-                return False
-            return conn.execute("INSERT OR IGNORE INTO repings (snooze_seq, repinged_at) VALUES (?, ?)",
-                                (seq, utc_stamp(_now_utc(self._clock)))).rowcount == 1
 
     # --- answers -------------------------------------------------------------------------------------
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
@@ -977,12 +1164,15 @@ class ConsentQueue:
         return ruling_payload(queue_id=queue_id, request=request, gap=gap[0], decision=decision,
                               signer_fp=signer_fp, signed_at=utc_stamp(_now_utc(self._clock)))
 
-    def answer_late(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
+    def answer_late(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Ruling:
         """Apply a signed late ruling to the undecided ``request_id``, or raise :class:`AnswerRefused` (the request
         stays undecided). The ruling is verified against a fresh replay from the queue's authority source exactly
         as :meth:`answer` verifies an answer (the signer enrolled and unrevoked, of a class covering the tier for
-        an allow), in :data:`~levain.consent.record.RULING_NAMESPACE`. The move to ``allowed``/``denied``, its
-        receipt and the release of a halt on this request are one transaction."""
+        an allow), in :data:`~levain.consent.record.RULING_NAMESPACE`, and its ``signed_at`` must be no later than
+        the queue's clock read under the write lock plus :data:`RULING_SKEW`. The move to ``allowed``/``denied``,
+        its receipt and the release of a halt on this request are one transaction. Returns the :class:`Ruling`
+        (information: applying a ruling delivers nothing; a ruled allow reaches the agent only through
+        :meth:`take_ruled_allow`)."""
         request, gap, queue_id = self._undecided(request_id)
         authority = self._fresh_authority()
         if authority is None:
@@ -992,32 +1182,48 @@ class ConsentQueue:
             raise AnswerRefused(why)
         decision = payload["decision"]
         message = ruling_message(dict(payload))
+        early = False
         with self._write() as conn:
-            stamp = utc_stamp(_now_utc(self._clock))
-            moved = self._transition(conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
-                                     signature=signature, signer_fp=payload["signer_fp"], via="ruling",
-                                     from_state="undecided", gap=gap[0])
+            now = _now_utc(self._clock)
+            stamp = utc_stamp(now)
+            if parse_stamp(payload["signed_at"]) > now + RULING_SKEW:
+                early, moved = True, False
+            else:
+                moved = self._transition(conn, request, _STATE_OF[decision], stamp=stamp,
+                                         answer=message.decode("utf-8"), signature=signature,
+                                         signer_fp=payload["signer_fp"], via="ruling", from_state="undecided",
+                                         gap=gap[0])
             if moved:
                 conn.execute("INSERT INTO halt_releases (request_id, released_at, by_request_id) "
                              "SELECT request_id, ?, request_id FROM halts WHERE request_id = ?", (stamp, request.id))
+        if early:
+            raise AnswerRefused(f"the ruling's signed_at {payload['signed_at']} is later than the queue's clock "
+                                f"{stamp} plus {int(RULING_SKEW.total_seconds())} s")
         if not moved:
             raise AnswerRefused(f"request {request_id} is no longer undecided")
-        return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
-                        request_digest=request.digest, via="ruling", gap=gap[0])
+        return Ruling(request_id=request.id, ruling=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
+                      signed_at=payload["signed_at"], request_digest=request.digest, gap=gap[0])
 
-    def _ruling_decision(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
+    def _verified_ruling(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
                          gap: tuple[int, str] | None, payload: Mapping[str, Any],
-                         authority: AuthoritySnapshot | None) -> Decision | None:
-        """A ruled row's decision, re-verified under ``authority``: the stored ruling names this row's decision and
-        signer and verifies (:meth:`_ruling_refusal`) for the request's gap."""
+                         authority: AuthoritySnapshot | None, *, taken: bool = False) -> Ruling | None:
+        """A ruled row's ruling, re-verified under ``authority``: the stored ruling names this row's decision and
+        signer, verifies (:meth:`_ruling_refusal`) for the request's gap, and was signed no later than the row's
+        ``decided_at`` plus :data:`RULING_SKEW` (the bound :meth:`answer_late` applied)."""
         named = payload.get("decision")
         if gap is None or authority is None or not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
-                or payload.get("signer_fp") != row["signer_fp"]:
+                or payload.get("signer_fp") != row["signer_fp"] or not isinstance(row["decided_at"], str):
             return None
         if self._ruling_refusal(request, queue_id, gap, payload, row["signature"], authority) is not None:
             return None
-        return Decision(request_id=request.id, decision=named, signer_fp=payload["signer_fp"],
-                        decided_at=row["decided_at"], request_digest=request.digest, via="ruling", gap=gap[0])
+        try:
+            if parse_stamp(payload["signed_at"]) > parse_stamp(row["decided_at"]) + RULING_SKEW:
+                return None
+        except ConsentError:
+            return None
+        return Ruling(request_id=request.id, ruling=named, signer_fp=payload["signer_fp"],
+                      decided_at=row["decided_at"], signed_at=payload["signed_at"], request_digest=request.digest,
+                      gap=gap[0], taken=taken)
 
     @staticmethod
     def _stored_record(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1033,25 +1239,86 @@ class ConsentQueue:
             return None
         return payload
 
-    def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *,
+    _RULED_COLS = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
+
+    def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *, cwd: str,
                          event: str | None = None) -> Decision | None:
-        """The ruled ALLOW that pre-authorises this call, taken once: the oldest ruled-allowed request of this agent
-        and session for ``tool_name`` and this exact input (its digest) not yet taken, whose ruling re-verifies
-        against a fresh replay and was signed less than :data:`RULED_ALLOW_LAPSE` ago. The take is recorded in the
-        same write transaction; a second take of it returns ``None``. ``None`` when there is none."""
+        """The ONE delivery of a ruled allow: the :class:`Decision` that pre-authorises this call, taken once.
+        The identical call is this agent, session, ``tool_name``, exact input (its digest) and ``cwd`` (the sealed
+        working directory). Of its ruled requests only the LATEST ruling counts (by when the queue applied it): it
+        must be an allow, not yet taken, re-verified against a fresh replay, applied less than
+        :data:`RULED_ALLOW_LAPSE` ago and less than that after it was signed, and no other ruling on the call may
+        carry a later signed ``signed_at`` (a raw reorder of ``decided_at`` then voids, never revives). So a later
+        deny voids every earlier allow not yet taken, and two allows give one run. The take is recorded in the
+        same write transaction; a second take returns ``None``. A cheap read-only check runs first: a call with no
+        untaken ruled allow costs no replay and no write lock."""
         digest = tool_input_digest(tool_input)
+        key = (agent, agent_session_id, tool_name, digest, cwd)
+        where = ("FROM requests r WHERE agent = ? AND agent_session_id = ? AND tool_name = ? "
+                 "AND tool_input_digest = ? AND cwd = ? AND via = 'ruling'")
+        with self._read() as conn:
+            if conn.execute("SELECT 1 " + where + " AND state = 'allowed' AND NOT EXISTS "
+                            "(SELECT 1 FROM ruled_takes t WHERE t.request_id = r.id) LIMIT 1", key).fetchone() is None:
+                return None
         authority = self._fresh_authority()
         if authority is None:
             return None
         with self._write() as conn:
             now = _now_utc(self._clock)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
-            cur = conn.execute(
-                f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signature, signer_fp, via FROM requests r "
-                "WHERE agent = ? AND agent_session_id = ? AND tool_name = ? AND tool_input_digest = ? "
-                "AND state = 'allowed' AND via = 'ruling' "
-                "AND NOT EXISTS (SELECT 1 FROM ruled_takes t WHERE t.request_id = r.id) "
-                "ORDER BY decided_at, rowid", (agent, agent_session_id, tool_name, digest))
+            cur = conn.execute(f"SELECT {self._RULED_COLS} " + where + " AND state IN ('allowed','denied') "
+                               "ORDER BY decided_at DESC, rowid DESC", key)
+            names = [d[0] for d in cur.description]
+            rows = [dict(zip(names, raw)) for raw in cur.fetchall()]
+            if not rows or rows[0]["state"] != "allowed":
+                return None
+            latest = rows[0]
+            if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (latest["id"],)).fetchone():
+                return None
+            request = self._request_of(latest)
+            payload = None if request is None else self._stored_record(latest)
+            if request is None or payload is None:
+                return None
+            got = self._verified_ruling(latest, request, queue_id, self._gap_of(conn, request.id), payload,
+                                        authority)
+            if got is None or got.ruling != "allow":
+                return None
+            signed, decided = parse_stamp(got.signed_at), parse_stamp(got.decided_at)
+            if now >= decided + RULED_ALLOW_LAPSE or decided >= signed + RULED_ALLOW_LAPSE:
+                return None
+            for other in rows[1:]:
+                rec = self._stored_record(other)
+                try:
+                    if rec is not None and parse_stamp(rec.get("signed_at")) > signed:
+                        return None                  # a ruling signed later sorts earlier: fail closed
+                except (ConsentError, TypeError):
+                    continue
+            conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
+                         (request.id, utc_stamp(now), event))
+        return Decision(request_id=got.request_id, decision="allow", signer_fp=got.signer_fp,
+                        decided_at=got.decided_at, request_digest=got.request_digest, via="ruling", gap=got.gap)
+
+    def claim_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
+        """This session's rulings (allow and deny) whose text has not been delivered to it yet, oldest applied
+        first, each re-verified against a fresh replay, marked delivered in the SAME write transaction: a ruling's
+        text reaches its session once. A ruling that no longer verifies is neither returned nor marked. What the
+        agent is told is the caller's; a returned allow still runs only through :meth:`take_ruled_allow`."""
+        with self._read() as conn:
+            if conn.execute("SELECT 1 FROM requests r WHERE agent = ? AND agent_session_id = ? AND via = 'ruling' "
+                            "AND NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) LIMIT 1",
+                            (agent, agent_session_id)).fetchone() is None:
+                return []
+        authority = self._fresh_authority()
+        if authority is None:
+            return []
+        out: list[Ruling] = []
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+            cur = conn.execute(f"SELECT {self._RULED_COLS} FROM requests r WHERE agent = ? AND agent_session_id = ? "
+                               "AND via = 'ruling' AND state IN ('allowed','denied') AND NOT EXISTS "
+                               "(SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) "
+                               "ORDER BY decided_at, rowid", (agent, agent_session_id))
             names = [d[0] for d in cur.description]
             for raw in cur.fetchall():
                 row = dict(zip(names, raw))
@@ -1059,15 +1326,15 @@ class ConsentQueue:
                 payload = None if request is None else self._stored_record(row)
                 if request is None or payload is None:
                     continue
-                got = self._ruling_decision(row, request, queue_id, self._gap_of(conn, request.id), payload,
-                                            authority)
-                if got is None or got.decision != "allow" \
-                        or now >= parse_stamp(payload["signed_at"]) + RULED_ALLOW_LAPSE:
+                taken = conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (request.id,)).fetchone()
+                got = self._verified_ruling(row, request, queue_id, self._gap_of(conn, request.id), payload,
+                                            authority, taken=taken is not None)
+                if got is None:
                     continue
-                conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
-                             (request.id, utc_stamp(now), event))
-                return got
-        return None
+                conn.execute("INSERT INTO ruling_deliveries (request_id, agent, agent_session_id, delivered_at) "
+                             "VALUES (?, ?, ?, ?)", (request.id, agent, agent_session_id, stamp))
+                out.append(got)
+        return out
 
     # --- standing grants (Q4) --------------------------------------------------------------------------
     def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,
@@ -1133,16 +1400,18 @@ class ConsentQueue:
                         request_digest=request.digest, via="grant", grant_id=gid, grant_seq=payload["grant_seq"],
                         grant_hash=payload["grant_hash"], posture=posture)
 
-    def decision(self, request_id: str, *, tool_input: Any = None, posture: str | None = None) -> Decision | None:
+    def decision(self, request_id: str, *, tool_input: Any = None, posture: str | None = None
+                 ) -> Decision | Ruling | None:
         """The decision of a terminal request, re-verified now. A signed answer: the stored answer must be the
         canonical record of this row's decision for this queue and request, decided before its expiry, and its
         signature must verify under a key a fresh replay holds active (and of a class covering the tier, for an
         allow). A grant answer (``via`` ``grant``): delivered only to a caller holding the request's tool input
         and the posture recorded, while the grant still answers it in a fresh replay (:meth:`_grant_decision`);
-        without ``tool_input`` it is ``None``. A late ruling (``via`` ``ruling``): the stored ruling must name
-        this row's decision and signer and verify for the request's gap number under a fresh replay
-        (:meth:`_ruling_refusal`). ``None`` while pending or undecided, for expired/withdrawn, and for anything
-        that fails."""
+        without ``tool_input`` it is ``None``. A late ruling (``via`` ``ruling``) comes back as a :class:`Ruling`,
+        INFORMATION and never a deliverable decision (a ruled allow is delivered only by :meth:`take_ruled_allow`,
+        once; ``taken`` says whether it has been): the stored ruling must name this row's decision and signer and
+        verify for the request's gap number under a fresh replay (:meth:`_verified_ruling`). ``None`` while
+        pending or undecided, for expired/withdrawn, and for anything that fails."""
         with self._read() as conn:
             row = self._row(conn, request_id)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
@@ -1156,7 +1425,10 @@ class ConsentQueue:
         if request is None or payload is None:
             return None
         if row["via"] == "ruling":
-            return self._ruling_decision(row, request, queue_id[0], gap, payload, self._fresh_authority())
+            with self._read() as conn:
+                taken = conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (request_id,)).fetchone()
+            return self._verified_ruling(row, request, queue_id[0], gap, payload, self._fresh_authority(),
+                                         taken=taken is not None)
         if row["via"] == "grant":
             return self._grant_decision(row, request, queue_id[0], payload, tool_input=tool_input, posture=posture)
         if row["via"] != "signature":
@@ -1173,11 +1445,12 @@ class ConsentQueue:
 
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
                        sleep: Callable[[float], None] = time.sleep, tool_input: Any = None,
-                       posture: str | None = None) -> Decision | None:
+                       posture: str | None = None) -> Decision | Ruling | None:
         """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request
-        expired, was withdrawn, is unknown, its stored answer no longer verifies, or it is still pending
-        when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
-        lets it expire). ``poll`` below 1ms (or not a number) is 1ms. ``tool_input`` / ``posture`` are passed to
+        expired, was withdrawn, went undecided, is unknown, its stored answer no longer verifies, or it is still
+        pending when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
+        lets it expire). A request ruled late returns its :class:`Ruling`, information only, as :meth:`decision`
+        does. ``poll`` below 1ms (or not a number) is 1ms. ``tool_input`` / ``posture`` are passed to
         :meth:`decision` (a grant answer is delivered only with them)."""
         poll = poll if poll >= 0.001 else 0.001             # NaN compares false: it becomes 1ms too
         deadline = time.monotonic() + max(0.0, timeout)

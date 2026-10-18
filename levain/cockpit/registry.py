@@ -249,7 +249,8 @@ CONSENT_ROW_PREFIX = "consent:"      # an external agent's consent request (Q6a)
 
 def _queue_group(row: RowIn, today: date) -> str:
     if row.id.startswith(CONSENT_ROW_PREFIX):
-        return "needs_input" if row.facets.get("consent_state") == "pending" else "resolved"
+        # an undecided request waits on the operator's late ruling, as a pending one waits on his answer
+        return "needs_input" if row.facets.get("consent_state") in ("pending", "undecided") else "resolved"
     if row.id.startswith(PENDING_ROW_PREFIX):
         return "waiting"
     if row.id.startswith(OUTCOME_ROW_PREFIX):

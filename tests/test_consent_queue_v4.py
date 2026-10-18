@@ -20,12 +20,15 @@ from levain.authority import ReplayCache
 from levain.cockpit.consent import utc_stamp
 from levain.consent import ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message
 from levain.consent.listing import read_listing
-from levain.consent.queue import PRIOR_FORMAT, RULED_ALLOW_LAPSE, STORE_FORMAT
+from levain.consent.queue import (
+    PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, Decision, Ruling,
+)
 from levain.consent.record import RULING_FORMAT, RULING_NAMESPACE, ruling_message, ruling_payload
 from tests.test_consent_queue import NOW, Clock, FakeAgent, Log, _raw, signed
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "consent_queue_v3_d430b804.py"
+CWD = "/work/proj"
 
 
 def ruled(q, request_id, key, decision="allow", **override):
@@ -43,9 +46,9 @@ def ask(q, command="touch /tmp/x", *, session="sess-1", agent="claude_code", tie
 
 def undecided(q, *a, **kw):
     request = ask(q, *a, **kw)
-    gap = q.mark_undecided(request.id)
-    assert isinstance(gap, int)
-    return request, gap
+    marked = q.mark_undecided(request.id)
+    assert marked.state == "undecided" and isinstance(marked.gap, int)
+    return request, marked.gap
 
 
 def _own_log(tmp_path, keys, *more):
@@ -62,14 +65,16 @@ def _own_log(tmp_path, keys, *more):
 
 def test_the_deadline_moves_a_pending_request_to_undecided_with_gap_and_receipt(queue, keys):
     request = ask(queue)
-    assert queue.mark_undecided(request.id) == 1
+    marked = queue.mark_undecided(request.id)
+    assert (marked.state, marked.gap, marked.halted, marked.decision) == ("undecided", 1, False, None)
     assert queue.get(request.id)[1] == "undecided"
     assert queue.gap(request.id) == 1
     assert queue.receipt(request.id)["state"] == "undecided"
     assert queue.receipt(request.id)["face"]["terminal_state"] == "timed_out"
     assert queue.decision(request.id) is None
     assert queue.await_decision(request.id, 0.05, poll=0.01) is None
-    assert queue.mark_undecided(request.id) == 1           # a retry of the hook: the same gap, nothing new
+    again = queue.mark_undecided(request.id)               # a retry of the hook: the same gap, nothing new
+    assert (again.state, again.gap, again.reason) == ("undecided", 1, "the request was already undecided")
     assert len(queue.receipts(request.id)) == 1
     payload, sig = signed(queue, request, keys["phone"])
     with pytest.raises(AnswerRefused, match="already undecided"):
@@ -96,7 +101,7 @@ def test_gap_numbers_are_unique_under_two_connections(tmp_path, authority):
 
     def mark(q, chunk):
         for r in chunk:
-            g = q.mark_undecided(r.id)
+            g = q.mark_undecided(r.id).gap
             with lock:
                 got.append(g)
 
@@ -113,7 +118,8 @@ def test_a_request_decided_before_the_deadline_returns_its_decision(queue, keys)
     payload, sig = signed(queue, request, keys["phone"], "deny")
     queue.answer(request.id, payload, sig)
     got = queue.mark_undecided(request.id)
-    assert got.decision == "deny" and got.via == "signature"
+    assert got.state == "denied" and got.gap is None and "answered deny" in got.reason
+    assert got.decision.decision == "deny" and got.decision.via == "signature"
     assert queue.get(request.id)[1] == "denied" and queue.gap(request.id) is None
 
 
@@ -122,10 +128,14 @@ def test_an_expired_or_withdrawn_request_is_never_undecided(queue, clock):
     gone = ask(queue, "gone")
     queue.withdraw(gone.id)
     clock.now = NOW + timedelta(seconds=31)                # read under the lock: a due request expires first
-    assert queue.mark_undecided(late.id) is None
+    got = queue.mark_undecided(late.id, halt=True)
+    assert (got.state, got.gap, got.halted, got.decision) == ("expired", None, False, None)
+    assert "expired" in got.reason
     assert queue.get(late.id)[1] == "expired"
-    assert queue.mark_undecided(gone.id) is None
-    assert queue.mark_undecided("no-such-request") is None
+    got = queue.mark_undecided(gone.id)
+    assert (got.state, got.gap) == ("withdrawn", None) and "withdrawn" in got.reason
+    got = queue.mark_undecided("no-such-request")
+    assert (got.state, got.gap) == (None, None) and "no sealed request" in got.reason
 
 
 # --- the trigger refuses every other move ----------------------------------------------------------------------
@@ -178,7 +188,7 @@ def test_a_raw_ruling_move_is_allowed_by_the_trigger_and_delivers_nothing(queue)
     _raw(queue, ("UPDATE requests SET state = 'allowed', via = 'ruling', decided_at = ? WHERE id = ?",
                  (utc_stamp(NOW), request.id)))
     assert queue.decision(request.id) is None
-    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}) is None
+    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD) is None
 
 
 def test_a_ruled_request_is_terminal(queue, keys):
@@ -207,9 +217,10 @@ def test_a_signed_ruling_decides_an_undecided_request(queue, keys):
     payload, sig = ruled(queue, request.id, keys["phone"])
     assert payload["format"] == RULING_FORMAT and payload["gap"] == gap
     d = queue.answer_late(request.id, payload, sig)
-    assert (d.decision, d.via, d.gap, d.signer_fp) == ("allow", "ruling", gap, keys["phone"].fp)
+    assert isinstance(d, Ruling) and not isinstance(d, Decision)    # information, never a deliverable decision
+    assert (d.ruling, d.gap, d.signer_fp, d.taken) == ("allow", gap, keys["phone"].fp, False)
     again = queue.decision(request.id)
-    assert (again.decision, again.via, again.gap) == ("allow", "ruling", gap)
+    assert isinstance(again, Ruling) and (again.ruling, again.gap) == ("allow", gap)
     assert [r["state"] for r in queue.receipts(request.id)] == ["undecided", "allowed"]
     assert f"gap=#{gap}" in queue.receipt(request.id)["face"]["authority_scope"]["grant"]
 
@@ -217,8 +228,8 @@ def test_a_signed_ruling_decides_an_undecided_request(queue, keys):
 def test_a_ruling_deny(queue, keys):
     request, _ = undecided(queue)
     payload, sig = ruled(queue, request.id, keys["presence"], "deny")   # a deny needs only an enrolled key
-    assert queue.answer_late(request.id, payload, sig).decision == "deny"
-    assert queue.decision(request.id).decision == "deny"
+    assert queue.answer_late(request.id, payload, sig).ruling == "deny"
+    assert queue.decision(request.id).ruling == "deny"
 
 
 def test_a_ruling_is_only_for_an_undecided_request(queue, keys):
@@ -291,10 +302,10 @@ def test_an_agent_config_ruling_allow_needs_the_laptop_key(queue, keys):
     with pytest.raises(AnswerRefused, match="does not cover T3"):
         queue.answer_late(request.id, payload, sig)
     payload, sig = ruled(queue, request.id, keys["phone"], "deny")
-    assert queue.answer_late(request.id, payload, sig).decision == "deny"
+    assert queue.answer_late(request.id, payload, sig).ruling == "deny"
     other, _ = undecided(queue, "other", tier="T3")
     payload, sig = ruled(queue, other.id, keys["laptop"])
-    assert queue.answer_late(other.id, payload, sig).decision == "allow"
+    assert queue.answer_late(other.id, payload, sig).ruling == "allow"
 
 
 def test_unknown_and_revoked_signers_cannot_rule(queue, keys):
@@ -310,11 +321,11 @@ def test_a_signer_revoked_after_ruling_delivers_nothing(tmp_path, keys, clock):
     q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
     request, _ = undecided(q)
     payload, sig = ruled(q, request.id, keys["phone"])
-    assert q.answer_late(request.id, payload, sig).decision == "allow"
-    assert q.decision(request.id).decision == "allow"
+    assert q.answer_late(request.id, payload, sig).ruling == "allow"
+    assert q.decision(request.id).ruling == "allow"
     log.revoke("phone")
     assert q.decision(request.id) is None
-    assert q.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}) is None
+    assert q.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD) is None
 
 
 def test_a_ruling_relabelled_by_a_raw_writer_delivers_nothing(queue, keys):
@@ -324,7 +335,7 @@ def test_a_ruling_relabelled_by_a_raw_writer_delivers_nothing(queue, keys):
     _raw(queue, ("DROP TRIGGER requests_frozen", ()),
          ("UPDATE requests SET state = 'allowed' WHERE id = ?", (request.id,)))
     assert queue.decision(request.id) is None
-    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}) is None
+    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD) is None
 
 
 def test_the_record_helpers_refuse_a_bad_gap():
@@ -346,18 +357,24 @@ def test_a_ruled_allow_is_taken_once(queue, keys):
     payload, sig = ruled(queue, request.id, keys["phone"])
     queue.answer_late(request.id, payload, sig)
     args = ("claude_code", "sess-1", "Edit")
-    assert queue.take_ruled_allow(*args, {"command": "touch /tmp/other"}) is None     # another digest
-    assert queue.take_ruled_allow("claude_code", "sess-2", "Edit", {"command": "touch /tmp/x"}) is None
-    assert queue.take_ruled_allow("claude_code", "sess-1", "Write", {"command": "touch /tmp/x"}) is None
-    got = queue.take_ruled_allow(*args, {"command": "touch /tmp/x"}, event="hook:tu-1")
+    x = {"command": "touch /tmp/x"}
+    assert queue.take_ruled_allow(*args, {"command": "touch /tmp/other"}, cwd=CWD) is None     # another digest
+    assert queue.take_ruled_allow("claude_code", "sess-2", "Edit", x, cwd=CWD) is None
+    assert queue.take_ruled_allow("claude_code", "sess-1", "Write", x, cwd=CWD) is None
+    assert queue.take_ruled_allow(*args, x, cwd="/elsewhere") is None                         # another cwd
+    assert queue.decision(request.id).taken is False
+    got = queue.take_ruled_allow(*args, x, cwd=CWD, event="hook:tu-1")
+    assert isinstance(got, Decision)
     assert (got.request_id, got.decision, got.via, got.gap) == (request.id, "allow", "ruling", gap)
-    assert queue.take_ruled_allow(*args, {"command": "touch /tmp/x"}) is None          # consumed
-    assert queue.decision(request.id).decision == "allow"   # the request row itself is unchanged
+    assert queue.take_ruled_allow(*args, x, cwd=CWD) is None          # consumed
+    info = queue.decision(request.id)                       # the request row itself is unchanged
+    assert isinstance(info, Ruling) and (info.ruling, info.taken) == ("allow", True)
     _refused(queue, "DELETE FROM ruled_takes WHERE request_id = ?", (request.id,))
     _refused(queue, "UPDATE ruled_takes SET event = 'x' WHERE request_id = ?", (request.id,))
 
 
-def test_the_oldest_unconsumed_ruled_allow_is_taken_first(queue, keys, clock):
+def test_two_ruled_allows_on_one_call_give_one_run(queue, keys, clock):
+    """R-j: only the latest ruling on an identical call counts; the earlier untaken allow is void."""
     a, _ = undecided(queue)
     b, _ = undecided(queue)                                 # two identical calls, both ruled allow
     for r in (a, b):
@@ -365,16 +382,15 @@ def test_the_oldest_unconsumed_ruled_allow_is_taken_first(queue, keys, clock):
         payload, sig = ruled(queue, r.id, keys["phone"])
         queue.answer_late(r.id, payload, sig)
     args = ("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"})
-    assert queue.take_ruled_allow(*args).request_id == a.id
-    assert queue.take_ruled_allow(*args).request_id == b.id
-    assert queue.take_ruled_allow(*args) is None
+    assert queue.take_ruled_allow(*args, cwd=CWD).request_id == b.id
+    assert queue.take_ruled_allow(*args, cwd=CWD) is None
 
 
 def test_a_ruled_deny_pre_authorises_nothing(queue, keys):
     request, _ = undecided(queue)
     payload, sig = ruled(queue, request.id, keys["phone"], "deny")
     queue.answer_late(request.id, payload, sig)
-    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}) is None
+    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD) is None
 
 
 def test_a_ruled_allow_lapses_after_its_window(queue, keys, clock):
@@ -383,9 +399,9 @@ def test_a_ruled_allow_lapses_after_its_window(queue, keys, clock):
     queue.answer_late(request.id, payload, sig)
     args = ("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"})
     clock.now = NOW + RULED_ALLOW_LAPSE
-    assert queue.take_ruled_allow(*args) is None
+    assert queue.take_ruled_allow(*args, cwd=CWD) is None
     clock.now = NOW + RULED_ALLOW_LAPSE - timedelta(seconds=1)
-    assert queue.take_ruled_allow(*args).request_id == request.id
+    assert queue.take_ruled_allow(*args, cwd=CWD).request_id == request.id
 
 
 # --- snooze ----------------------------------------------------------------------------------------------------
@@ -398,19 +414,17 @@ def test_snooze_records_when_to_ask_again(queue, clock):
     assert queue.snooze(p.id) == utc_stamp(NOW + timedelta(minutes=30))
     assert queue.snooze(u.id, minutes=10) == utc_stamp(NOW + timedelta(minutes=10))
     assert queue.snooze(done.id) is None
-    assert queue.due_repings() == []
+    assert queue.claim_repings() == []
     clock.now = NOW + timedelta(minutes=10)
-    assert [(r.request_id, r.state) for r in queue.due_repings()] == [(u.id, "undecided")]
-    due = queue.due_repings(NOW + timedelta(minutes=30))
-    assert [r.request_id for r in due] == [u.id, p.id]
-    assert queue.mark_repinged(due[0].seq) is True
-    assert queue.mark_repinged(due[0].seq) is False
-    assert queue.mark_repinged(999) is False
-    assert [r.request_id for r in queue.due_repings(NOW + timedelta(minutes=30))] == [p.id]
+    first = queue.claim_repings()
+    assert [(r.request_id, r.state) for r in first] == [(u.id, "undecided")]
+    assert queue.claim_repings() == []                     # claimed once
+    assert [r.request_id for r in queue.claim_repings(NOW + timedelta(minutes=30))] == [p.id]
     queue.snooze(p.id, minutes=60)                         # a later snooze replaces the earlier one
-    assert queue.due_repings(NOW + timedelta(minutes=30)) == []
+    assert queue.claim_repings(NOW + timedelta(minutes=30)) == []
+    assert [r.request_id for r in queue.claim_repings(NOW + timedelta(minutes=70))] == [p.id]   # snoozed at +10
     _refused(queue, "DELETE FROM snoozes WHERE request_id = ?", (p.id,))
-    _refused(queue, "UPDATE repings SET repinged_at = 'x' WHERE snooze_seq = ?", (due[0].seq,))
+    _refused(queue, "UPDATE repings SET repinged_at = 'x' WHERE snooze_seq = ?", (first[0].seq,))
 
 
 def test_a_snooze_of_a_request_that_expired_or_was_ruled_is_not_due(queue, clock, keys):
@@ -420,10 +434,11 @@ def test_a_snooze_of_a_request_that_expired_or_was_ruled_is_not_due(queue, clock
     queue.snooze(u.id)
     payload, sig = ruled(queue, u.id, keys["phone"])
     queue.answer_late(u.id, payload, sig)
-    assert queue.due_repings(NOW + timedelta(minutes=31)) == []
+    assert queue.claim_repings(NOW + timedelta(minutes=31)) == []
 
 
-@pytest.mark.parametrize("minutes", [0, -5, True, float("nan"), float("inf"), "30"])
+@pytest.mark.parametrize("minutes", [0, -5, True, float("nan"), float("inf"), "30", 1e12, 1e300,
+                                     SNOOZE_MAX_MINUTES + 1])
 def test_snooze_minutes_must_be_positive(queue, minutes):
     from levain.cockpit.consent import ConsentError
     request = ask(queue)
@@ -532,7 +547,7 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     assert new.get(expiring.id)[1] == "expired"
     assert new.dialog_outcome(late.id) == ("ran", utc_stamp(NOW))
     # the /4 machinery works on the migrated store, its triggers rebuilt
-    assert new.mark_undecided(open_.id) == 1
+    assert new.mark_undecided(open_.id).gap == 1
     _refused(new, "UPDATE requests SET state = 'expired' WHERE id = ?", (open_.id,))
     _refused(new, "UPDATE requests SET state = 'denied' WHERE id = ?", (allowed.id,))
     _refused(new, "DELETE FROM receipts WHERE request_id = ?", (allowed.id,))
@@ -580,4 +595,345 @@ def test_the_listing_reads_a_v3_store_and_shows_an_undecided_request(tmp_path, k
     new = ConsentQueue(d, authority=log.source, clock=Clock(NOW))
     new.mark_undecided(r.id)
     listing = read_listing(d, now=NOW)
-    assert listing.pending == () and [(e.request.id, e.state) for e in listing.recent] == [(r.id, "undecided")]
+    assert listing.pending == () and listing.recent == ()
+    assert [(e.request.id, e.state, e.gap) for e in listing.undecided] == [(r.id, "undecided", 1)]
+
+
+# --- B1 fix round: L1 + L2 (1017+30) ----------------------------------------------------------------------------
+
+X = {"command": "touch /tmp/x"}
+TAKE = ("claude_code", "sess-1", "Edit", X)
+
+
+def _rule(q, request, key, decision="allow"):
+    payload, sig = ruled(q, request.id, key, decision)
+    return q.answer_late(request.id, payload, sig)
+
+
+def test_a_later_deny_voids_an_earlier_untaken_allow(queue, keys, clock):
+    """L2 H1's probe: gap #1 ALLOW, gap #2 on the same call DENY five minutes later -> the take gives nothing."""
+    a, ga = undecided(queue)
+    b, gb = undecided(queue)
+    assert (ga, gb) == (1, 2)
+    _rule(queue, a, keys["phone"])
+    clock.now = NOW + timedelta(minutes=5)
+    _rule(queue, b, keys["phone"], "deny")
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+    assert queue.decision(a.id).ruling == "allow" and queue.decision(a.id).taken is False   # the row is unchanged
+
+
+def test_a_deny_on_another_cwd_is_another_call(queue, keys, clock):
+    a, _ = undecided(queue)
+    other = queue.file(agent="claude_code", agent_session_id="sess-1", tool_name="Edit", tool_input=X,
+                       cwd="/other/proj", hold=timedelta(minutes=5))
+    queue.mark_undecided(other.id)
+    _rule(queue, a, keys["phone"])
+    clock.now = NOW + timedelta(minutes=5)
+    _rule(queue, other, keys["phone"], "deny")
+    assert queue.take_ruled_allow(*TAKE, cwd="/other/proj") is None      # the deny is the latest there
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == a.id      # the allow is the latest here
+
+
+def test_a_later_allow_after_a_run_is_a_new_run(queue, keys, clock):
+    a, _ = undecided(queue)
+    _rule(queue, a, keys["phone"])
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == a.id
+    clock.now = NOW + timedelta(minutes=5)                                # the agent tried again: a new gap
+    b, _ = undecided(queue)
+    _rule(queue, b, keys["phone"])
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == b.id
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+
+
+def test_a_raw_reorder_of_decided_at_voids_never_revives(queue, keys, clock):
+    """An earlier allow whose decided_at a raw writer moves past a later deny is still voided: the deny's signed
+    signed_at is later."""
+    a, _ = undecided(queue)
+    b, _ = undecided(queue)
+    _rule(queue, a, keys["phone"])
+    clock.now = NOW + timedelta(minutes=5)
+    _rule(queue, b, keys["phone"], "deny")
+    _raw(queue, ("DROP TRIGGER requests_frozen", ()),
+         ("UPDATE requests SET decided_at = ? WHERE id = ?", (utc_stamp(NOW + timedelta(minutes=9)), a.id)))
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+
+
+def test_only_the_take_delivers_a_ruled_allow(queue, keys):
+    """L2 M2: decision() and mark_undecided() give a ruling as information (a Ruling, never a Decision), so the
+    adapters' delivery check refuses it before and after the take."""
+    from levain.consent.adapters.claude_code import _verified
+    request, gap = undecided(queue)
+    _rule(queue, request, keys["phone"])
+    for got in (queue.decision(request.id), queue.mark_undecided(request.id).decision,
+                queue.await_decision(request.id, 0.01, poll=0.01)):
+        assert isinstance(got, Ruling) and not isinstance(got, Decision) and _verified(got, request) is None
+    marked = queue.mark_undecided(request.id)
+    assert (marked.state, marked.gap) == ("allowed", gap) and f"gap #{gap}" in marked.reason
+    assert _verified(queue.take_ruled_allow(*TAKE, cwd=CWD), request) is not None
+    after = (queue.decision(request.id), queue.mark_undecided(request.id).decision)
+    assert all(isinstance(g, Ruling) and g.taken and _verified(g, request) is None for g in after)
+
+
+def test_undecided_and_halt_are_one_transaction(queue, monkeypatch):
+    """L2 M3: a hook killed between the gap and the halt leaves neither."""
+    request = ask(queue, tier="T3")
+    import levain.consent.queue as qmod
+
+    def boom(*a, **kw):
+        raise RuntimeError("killed")
+    monkeypatch.setattr(qmod.ConsentQueue, "_insert_halt", staticmethod(boom))
+    with pytest.raises(RuntimeError):
+        queue.mark_undecided(request.id, halt=True)
+    assert queue.get(request.id)[1] == "pending" and queue.gap(request.id) is None
+    assert queue.receipts(request.id) == []
+    monkeypatch.undo()
+    marked = queue.mark_undecided(request.id, halt=True)
+    assert (marked.state, marked.gap, marked.halted) == ("undecided", 1, True)
+    assert queue.is_halted("claude_code", "sess-1") == 1
+
+
+def test_a_retry_with_halt_halts_an_already_undecided_request(queue):
+    request, gap = undecided(queue, tier="T3")
+    assert queue.is_halted("claude_code", "sess-1") is None
+    marked = queue.mark_undecided(request.id, halt=True)
+    assert (marked.state, marked.gap, marked.halted) == ("undecided", gap, True)
+
+
+def test_mark_undecided_says_why_an_answer_no_longer_verifies(tmp_path, keys, clock):
+    log = _own_log(tmp_path, keys)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request = ask(q)
+    payload, sig = signed(q, request, keys["phone"])
+    q.answer(request.id, payload, sig)
+    log.revoke("phone")
+    marked = q.mark_undecided(request.id)
+    assert (marked.state, marked.gap, marked.decision) == ("allowed", None, None)
+    assert "no longer verifies" in marked.reason
+
+
+def test_a_ruling_signed_ahead_of_the_queue_clock_is_refused(queue, keys):
+    """L1 #2's probe: a ruling signed 30 days ahead was accepted and its lapse pushed out."""
+    request, _ = undecided(queue)
+    for ahead in (timedelta(days=30), RULING_SKEW + timedelta(seconds=1)):
+        payload = {**queue.ruling_payload(request.id, "allow", keys["phone"].fp),
+                   "signed_at": utc_stamp(NOW + ahead)}
+        with pytest.raises(AnswerRefused, match="later than the queue's clock"):
+            queue.answer_late(request.id, payload, keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE))
+        assert queue.get(request.id)[1] == "undecided"
+    payload = {**queue.ruling_payload(request.id, "allow", keys["phone"].fp), "signed_at": utc_stamp(NOW + RULING_SKEW)}
+    assert queue.answer_late(request.id, payload,
+                             keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE)).ruling == "allow"
+
+
+def test_the_lapse_runs_from_when_the_queue_applied_the_ruling(queue, keys, clock):
+    request, _ = undecided(queue)
+    payload = queue.ruling_payload(request.id, "allow", keys["phone"].fp)    # signed at NOW
+    clock.now = NOW + timedelta(hours=1)                                    # applied an hour later
+    queue.answer_late(request.id, payload, keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE))
+    clock.now = NOW + timedelta(hours=1) + RULED_ALLOW_LAPSE - timedelta(seconds=1)
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD).request_id == request.id
+
+
+def test_a_raw_stretch_of_decided_at_is_bounded_by_the_signature(queue, keys, clock):
+    request, _ = undecided(queue)
+    _rule(queue, request, keys["phone"])                                   # signed and applied at NOW
+    _raw(queue, ("DROP TRIGGER requests_frozen", ()),
+         ("UPDATE requests SET decided_at = ? WHERE id = ?", (utc_stamp(NOW + RULED_ALLOW_LAPSE), request.id)))
+    clock.now = NOW + RULED_ALLOW_LAPSE + timedelta(hours=1)
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+    _raw(queue, ("UPDATE requests SET decided_at = ? WHERE id = ?",          # decided before it was signed
+                 (utc_stamp(NOW - RULING_SKEW - timedelta(seconds=1)), request.id)))
+    assert queue.decision(request.id) is None
+
+
+def test_claim_rulings_for_delivers_each_ruling_once(queue, keys, clock):
+    a, ga = undecided(queue, "a")
+    b, gb = undecided(queue, "b")
+    o, _ = undecided(queue, "o", session="sess-2")
+    c, _ = undecided(queue, "c")                                            # still undecided: no ruling yet
+    _rule(queue, a, keys["phone"])
+    clock.now = NOW + timedelta(seconds=1)
+    _rule(queue, b, keys["phone"], "deny")
+    _rule(queue, o, keys["phone"])
+    got = queue.claim_rulings_for("claude_code", "sess-1")
+    assert [(r.request_id, r.ruling, r.gap) for r in got] == [(a.id, "allow", ga), (b.id, "deny", gb)]
+    assert all(isinstance(r, Ruling) for r in got)
+    assert queue.claim_rulings_for("claude_code", "sess-1") == []
+    assert [r.request_id for r in queue.claim_rulings_for("claude_code", "sess-2")] == [o.id]
+    _rule(queue, c, keys["phone"])
+    assert [r.request_id for r in queue.claim_rulings_for("claude_code", "sess-1")] == [c.id]
+    _refused(queue, "DELETE FROM ruling_deliveries WHERE request_id = ?", (a.id,))
+    _refused(queue, "UPDATE ruling_deliveries SET delivered_at = 'x' WHERE request_id = ?", (a.id,))
+
+
+def test_a_ruling_that_no_longer_verifies_is_not_claimed(tmp_path, keys, clock):
+    log = _own_log(tmp_path, keys)
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request, _ = undecided(q)
+    _rule(q, request, keys["phone"])
+    log.revoke("phone")
+    assert q.claim_rulings_for("claude_code", "sess-1") == []
+
+
+def test_undecided_for_and_request_by_gap(queue, keys):
+    a, ga = undecided(queue, "a")
+    b, gb = undecided(queue, "b", session="sess-2")
+    c, gc = undecided(queue, "c", agent="codex")
+    _rule(queue, a, keys["phone"], "deny")
+    assert [g.request.id for g in queue.undecided_for()] == [b.id, c.id]
+    assert [g.request.id for g in queue.undecided_for(agent="codex")] == [c.id]
+    assert [g.request.id for g in queue.undecided_for("claude_code", "sess-2")] == [b.id]
+    assert queue.undecided_for("claude_code", "sess-1") == []
+    got = queue.request_by_gap("claude_code", "sess-1", ga)
+    assert (got.request.id, got.gap, got.state) == (a.id, 1, "denied")    # a ruled one is still found by its gap
+    assert queue.request_by_gap("claude_code", "sess-1", 2) is None
+    assert queue.request_by_gap("codex", "sess-1", gc).request.id == c.id
+    assert queue.request_by_gap("claude_code", "sess-1", True) is None
+
+
+def test_resume_meta_is_written_with_the_request_and_read_back(queue):
+    meta = {"permission_mode": "bypassPermissions", "invocation": "bg", "codex_pid": None, "cwd": "/work/proj"}
+    r = queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit", tool_input=X, cwd="/work/proj",
+                   hold=timedelta(minutes=5), resume=meta)
+    assert queue.resume_meta(r.id) == meta
+    plain = ask(queue, "plain")
+    assert queue.resume_meta(plain.id) is None
+    from levain.cockpit.consent import ConsentError
+    for bad in ({"invocation": "fork"}, {"permission_mode": "x"}, {"invocation": "-p", "codex_pid": True},
+                {"invocation": "-p", "codex_pid": 0}, {"invocation": "-p", "extra": 1}, {"invocation": "-p", "cwd": ""},
+                ["invocation"]):
+        with pytest.raises(ConsentError):
+            queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit", tool_input={"bad": str(bad)},
+                       cwd="/w", hold=timedelta(minutes=5), resume=bad)
+    assert len(queue.pending()) == 2                                        # a refused resume filed nothing
+    _refused(queue, "UPDATE resume_meta SET meta = '{}' WHERE request_id = ?", (r.id,))
+    _refused(queue, "DELETE FROM resume_meta WHERE request_id = ?", (r.id,))
+
+
+def test_two_sweepers_never_both_claim_a_reping(tmp_path, authority, clock):
+    d = tmp_path / "consent"
+    qs = [ConsentQueue(d, authority=authority, clock=clock) for _ in range(4)]
+    for i in range(12):
+        qs[0].snooze(ask(qs[0], f"r{i}", hold=timedelta(hours=2)).id, minutes=1)
+    clock.now = NOW + timedelta(minutes=2)
+    got: list[str] = []
+    lock = threading.Lock()
+
+    def sweep(q):
+        for _ in range(3):
+            claimed = q.claim_repings()
+            with lock:
+                got.extend(r.request_id for r in claimed)
+
+    threads = [threading.Thread(target=sweep, args=(q,)) for q in qs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(got) == 12 and len(set(got)) == 12
+
+
+def test_the_take_checks_cheaply_before_the_replay_and_the_lock(queue, keys, monkeypatch):
+    calls = []
+    real = ConsentQueue._fresh_authority
+    monkeypatch.setattr(ConsentQueue, "_fresh_authority", lambda self: calls.append(1) or real(self))
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+    assert calls == []                                                    # nothing ruled: no replay
+    request, _ = undecided(queue)
+    _rule(queue, request, keys["phone"])
+    calls.clear()
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is not None and calls == [1]
+    calls.clear()
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None and calls == []   # taken: no replay
+    conn = sqlite3.connect(queue.path)
+    try:
+        plan = " ".join(str(r) for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM requests r WHERE agent = ? AND agent_session_id = ? AND tool_name = ? "
+            "AND tool_input_digest = ? AND cwd = ? AND via = 'ruling' AND state = 'allowed'",
+            ("a", "b", "c", "d", "e")).fetchall())
+    finally:
+        conn.close()
+    assert "requests_ruled" in plan
+
+
+def _take_in_a_process(qdir, cockpit_db, out):
+    from levain.consent.queue import ConsentQueue as Q, authority_source as src
+    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1))
+    got = q.take_ruled_allow(*TAKE, cwd=CWD)
+    out.put(None if got is None else got.request_id)
+
+
+def test_a_ruled_allow_is_taken_once_across_processes(tmp_path, keys, clock):
+    import multiprocessing
+    log = _own_log(tmp_path, keys)
+    d = tmp_path / "consent"
+    q = ConsentQueue(d, authority=log.source, clock=clock)
+    request, _ = undecided(q)
+    _rule(q, request, keys["phone"])
+    ctx = multiprocessing.get_context("spawn")
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_take_in_a_process, args=(d, log.path, out)) for _ in range(3)]
+    for p in procs:
+        p.start()
+    got = [out.get(timeout=60) for _ in procs]
+    for p in procs:
+        p.join(timeout=60)
+    assert sorted(got, key=str) == [None, None, request.id]
+
+
+# --- the surfaces --------------------------------------------------------------------------------------------
+
+def test_the_listing_keeps_every_undecided_request_past_the_day(queue, keys, clock):
+    old, gap = undecided(queue, "old")
+    done, _ = undecided(queue, "done")
+    _rule(queue, done, keys["phone"], "deny")
+    clock.now = NOW + timedelta(days=3)
+    listing = read_listing(queue.directory, now=clock.now)
+    assert [(e.request.id, e.state, e.gap) for e in listing.undecided] == [(old.id, "undecided", gap)]
+    assert listing.recent == ()                                           # the ruled one is past the day
+    from levain.consent.listing import audit_line, find_entry
+    assert find_entry(listing, old.id).gap == gap
+    assert audit_line(listing.undecided[0]).startswith(f"undecided: ") and f"gap #{gap}" in \
+        audit_line(listing.undecided[0])
+
+
+def test_the_audit_line_names_a_ruling_as_a_ruling(queue, keys):
+    a, ga = undecided(queue, "a")
+    b, gb = undecided(queue, "b")
+    _rule(queue, a, keys["phone"])
+    _rule(queue, b, keys["phone"], "deny")
+    from levain.consent.listing import audit_line
+    lines = {e.request.id: audit_line(e) for e in read_listing(queue.directory, now=NOW).recent}
+    assert lines[a.id] == f"allowed by a late ruling on gap #{ga}, key {keys['phone'].fp}"
+    assert lines[b.id] == f"denied by a late ruling on gap #{gb}, key {keys['phone'].fp}"
+
+
+def test_the_cockpit_groups_an_undecided_request_under_needs_input(tmp_path, keys):
+    from levain.cockpit import Cockpit
+    log = _own_log(tmp_path, keys)
+    d = tmp_path / "consent"
+    q = ConsentQueue(d, authority=log.source, clock=Clock(NOW))
+    waiting, _ = undecided(q)
+    ck = Cockpit(clock=lambda: NOW + timedelta(days=2))
+    ck.attach_consent_rows(lambda now: read_listing(d, now=now))
+    p = ck.panel("decisions", credential_class="token")
+    by_id = {r["id"]: r for r in p["rows"]}
+    row = by_id[f"consent:{waiting.id}"]
+    assert row["group"] == "needs_input" and row["facets"]["consent_state"] == "undecided"
+    assert p["count"] == 1
+
+
+def test_the_sessions_tile_counts_an_undecided_request_as_waiting(tmp_path, monkeypatch):
+    from levain.cockpit.providers import build_default_cockpit
+    from tests.test_cockpit_sessions import _fixture
+    root, src = _fixture(tmp_path, monkeypatch)
+    from levain.consent.queue import authority_source
+    home = tmp_path / "levain_home" / "consent"
+    q = ConsentQueue(home, authority=authority_source(home, anchor=None))
+    (filed,) = q.pending()
+    assert q.mark_undecided(filed.id).state == "undecided"
+    ck = build_default_cockpit(src)
+    ck.attach_consent_rows(lambda now: read_listing(now=now))
+    p = ck.panel("sessions", credential_class="none")
+    meta = {r["facets"]["agent"] + ":" + r["facets"]["session_activity"]: r["facets"]["legacy_meta"] for r in p["rows"]}
+    assert "1 waiting" in meta["claude_code:active"]

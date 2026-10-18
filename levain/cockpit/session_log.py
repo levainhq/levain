@@ -90,7 +90,7 @@ def _consent(consent_reader: Callable[[datetime], Any] | None, now: datetime, ag
         listing = consent_reader(now)
         rows = [{"at": e.request.received_at, "tool": e.request.tool_name, "state": e.state, "via": e.via,
                  "decided_at": e.decided_at}
-                for e in (*listing.pending, *listing.recent)
+                for e in (*listing.pending, *listing.undecided, *listing.recent)
                 if e.request.agent == agent and e.request.agent_session_id == sid]
         rows.sort(key=lambda r: r["at"])
     except Exception:  # noqa: BLE001 - an unread queue is an answer (None), never a dead transcript
