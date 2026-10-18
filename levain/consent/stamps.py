@@ -45,10 +45,12 @@ DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024
 SKIP_REASONS = ("too_long", "not_utf8", "not_json")
 
 
-def _lines(path: str | os.PathLike[str], max_bytes: int, max_line_bytes: int, skipped: dict[str, int]):
+def _lines(path: str | os.PathLike[str], max_bytes: int, max_line_bytes: int, skipped: dict[str, int],
+           needles: Mapping[str, bytes] | None = None, oversized: set[str] | None = None):
     """Yield a JSONL file's raw lines, never holding more than ``max_line_bytes`` of one line: a longer line is
     read past in bounded chunks and skipped (counted in ``skipped['too_long']``). Stops after ``max_bytes`` bytes
-    in all. The callers parse the few lines they need and skip one that does not parse (a half-written last line)."""
+    in all. With ``needles`` (name -> bytes), the names whose bytes occur inside a skipped line go into ``oversized``
+    (a bounded tail is kept across chunk edges). The callers parse the few lines they need and skip one that does not parse (a half-written last line)."""
     read = 0
     with open(path, "rb") as fh:
         while True:
@@ -59,9 +61,16 @@ def _lines(path: str | os.PathLike[str], max_bytes: int, max_line_bytes: int, sk
             if read > max_bytes:
                 return
             if len(chunk) > max_line_bytes and not chunk.endswith(b"\n"):
+                keep = max((len(n) for n in needles.values()), default=1) - 1 if needles else 0
+                window = chunk
                 while True:                                    # discard the rest of this line, a chunk at a time
+                    if needles and oversized is not None:
+                        oversized.update(k for k, n in needles.items() if n in window)
                     rest = fh.readline(1 << 20)
                     read += len(rest)
+                    window = (window[-keep:] if keep else b"") + rest
+                    if needles and oversized is not None and rest:
+                        oversized.update(k for k, n in needles.items() if n in window)
                     if not rest or rest.endswith(b"\n"):
                         break
                     if read > max_bytes:
@@ -94,7 +103,8 @@ def claude_scan(transcript_path: str | os.PathLike[str] | None, tool_use_ids: It
     """Find every call of ``tool_use_ids`` in a Claude Code transcript in ONE pass.
 
     States: ``no_source`` (no path: it will never be there); ``missing_file`` (no such file, it may appear later);
-    ``unreadable`` (another OSError, may pass); ``no_result`` (no ``tool_result`` for the call yet); ``no_decision``
+    ``unreadable`` (another OSError, may pass); ``no_result`` (no ``tool_result`` for the call yet); ``result_oversized`` (a line over the cap holds the id, so it
+    could not be read); ``no_decision``
     (the result is there with no ``permissionDecision``); ``decided`` (the decision mapping is returned). A call
     that appears twice takes the copy that carries a decision. The scan stops once every call is decided."""
     wanted = {i: i.encode("utf-8") for i in tool_use_ids if i}
@@ -103,8 +113,9 @@ def claude_scan(transcript_path: str | os.PathLike[str] | None, tool_use_ids: It
     if not transcript_path:
         return ClaudeScan({i: ("no_source", None) for i in wanted}, skipped)
     open_ids = set(wanted)
+    oversized: set[str] = set()
     try:
-        for raw in _lines(transcript_path, max_bytes, max_line_bytes, skipped):
+        for raw in _lines(transcript_path, max_bytes, max_line_bytes, skipped, wanted, oversized):
             hits = [i for i in open_ids if wanted[i] in raw]
             if not hits:
                 continue
@@ -133,6 +144,9 @@ def claude_scan(transcript_path: str | os.PathLike[str] | None, tool_use_ids: It
         return ClaudeScan({i: ("missing_file", None) for i in wanted}, skipped)
     except OSError:
         return ClaudeScan({i: ("unreadable", None) for i in wanted}, skipped)
+    for i in oversized:                                        # a skipped line held the id: not "no result", unreadable
+        if states[i][0] == "no_result":
+            states[i] = ("result_oversized", None)
     return ClaudeScan(states, skipped)
 
 
