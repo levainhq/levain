@@ -480,23 +480,30 @@ openhands = pytest.importorskip("openhands.tools.file_editor", reason="openhands
 _needs_zsh = pytest.mark.skipif(not Path("/bin/zsh").exists(), reason="the hands helper needs /bin/zsh")
 
 
-def test_the_in_process_editor_write_path_refuses_agent_config(tmp_path, monkeypatch):
-    """Round 2 HIGH 1: exercise the patched open/write path, not only policy text or its predicate."""
+def test_the_in_process_editor_write_path_refuses_whole_agent_directories(tmp_path, monkeypatch):
+    """Round 3: exercise the actual open/write path for every ruled case spelling and anchor."""
     from levain.firing.openhands import tools as T
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     ent = _entity(tmp_path)
     workspace = tmp_path / "workspace"
-    (workspace / ".codex").mkdir(parents=True)
     policy = confinement.build_policy(ent, workspace=workspace, deny_standard_creds=False)
     token = T._EDITOR_FLOOR.set(policy)
     try:
-        target = workspace / ".codex" / "config.toml"
-        with pytest.raises(T._FloorRefusedOpen):
-            with T._floored_open(target, "w") as fh:
-                fh.write("model = 'attacker'")
-        assert not target.exists()
+        relative_targets = (
+            Path(".Claude/settings.json"), Path(".claude/Settings.json"),
+            Path(".claude/settings.json"), Path(".codex/config.toml"),
+            Path(".CODEX/hooks.json"),
+        )
+        for anchor in (workspace, Path.home()):
+            for relative in relative_targets:
+                target = anchor / relative
+                with pytest.raises(T._FloorRefusedOpen):
+                    with T._floored_open(target, "w") as fh:
+                        fh.write("attacker")
+                assert not target.exists()
         ordinary = workspace / "ordinary.txt"
+        ordinary.parent.mkdir(parents=True, exist_ok=True)
         with T._floored_open(ordinary, "w") as fh:
             fh.write("ok")
         assert ordinary.read_text() == "ok"

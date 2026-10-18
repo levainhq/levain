@@ -203,7 +203,10 @@ def test_opened_file_reason_names_a_jewel_by_the_opened_object(policy, tmp_path:
     jewel = tmp_path / ".anneal-memory" / "m.db"
     jewel.parent.mkdir(exist_ok=True)
     jewel.write_text("x")
-    other = tmp_path / "plain"
+    # An immediate HOME file is now persistence-protected too; use a nested ordinary path as the
+    # control so this test continues to isolate opened-object identity.
+    other = tmp_path / "work" / "plain"
+    other.parent.mkdir()
     other.write_text("y")
     pol = build_policy(tmp_path / "ent")
     with open(jewel) as a, open(other) as b:

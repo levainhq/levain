@@ -58,23 +58,14 @@ def test_profile_denies_home_and_agent_persistence_but_not_the_workspace(tmp_pat
         home / ".local" / "bin",
         home / "Library" / "LaunchAgents",
         home / ".config" / "git",
-        home / ".claude" / "hooks",
-        workspace / ".claude" / "hooks",
     ):
         assert f'(subpath "{path}")' in text
-    for path in (
-        home / ".codex" / "hooks.json",
-        home / ".codex" / "config.toml",
-        workspace / ".codex" / "hooks.json",
-        workspace / ".codex" / "config.toml",
-    ):
-        assert f'(literal "{path}")' in text
-    assert f'^{conf._sbpl_regex(str(home / ".claude"))}\\/settings[^\\/]*\\.json$' in text
-    assert f'^{conf._sbpl_regex(str(workspace / ".claude"))}\\/settings[^\\/]*\\.json$' in text
+    for path in policy.persistence_agent_roots:
+        assert f'(regex #"{conf._agent_root_regex(path)}")' in text
+    assert r"\.[cC][lL][aA][uU][dD][eE]($|\/.*)" in text
+    assert r"\.[cC][oO][dD][eE][xX]($|\/.*)" in text
     assert f'(subpath "{workspace}")' not in text
     assert str(workspace / "ordinary.txt") not in text
-    assert f'(subpath "{home / ".claude"}")' not in text
-    assert f'(subpath "{home / ".codex"}")' not in text
 
 
 def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monkeypatch) -> None:
@@ -85,16 +76,21 @@ def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monke
     for path in (
         workspace / ".codex" / "config.toml",
         workspace / ".codex" / "hooks.json",
+        workspace / ".codex" / "notes.txt",
         workspace / ".claude" / "settings.local.json",
         workspace / ".claude" / "hooks" / "plant.sh",
+        workspace / ".claude" / "ordinary.md",
     ):
         assert conf.crown_jewel_reason(policy, path) is not None
-    assert conf.crown_jewel_reason(policy, workspace / ".codex" / "notes.txt") is None
     assert conf.crown_jewel_reason(policy, workspace / "ordinary.txt") is None
     for path in policy.persistence_write_files:
         assert f'(literal "{path}")' in text
     for path in policy.persistence_write_subtrees:
         assert f'(subpath "{path}")' in text
+    for path in policy.persistence_agent_dirs:
+        assert f'(subpath "{path}")' in text
+    for path in policy.persistence_agent_hops:
+        assert f'(literal "{path}")' in text
 
 
 def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
@@ -119,7 +115,73 @@ def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monke
     assert conf.crown_jewel_reason(policy, workspace / ".claude" / "settings.json") is not None
     assert conf.crown_jewel_reason(policy, real_claude / "settings.json") is not None
     assert f'(literal "{workspace / ".codex"}")' in text
-    assert f'(literal "{real_codex / "config.toml"}")' in text
+    assert f'(subpath "{real_codex}")' in text
+    assert f'(subpath "{real_claude}")' in text
+
+
+@pytest.mark.parametrize("name", [".claude", ".Claude", ".CLAUDE", ".codex", ".Codex", ".CODEX"])
+def test_agent_directories_are_wholly_denied_case_insensitively(tmp_path, monkeypatch, name) -> None:
+    policy = _policy(tmp_path, monkeypatch)
+    for anchor in (Path.home(), policy.workspace):
+        assert conf.crown_jewel_reason(policy, anchor / name) is not None
+        assert conf.crown_jewel_reason(policy, anchor / name / "ordinary.txt") is not None
+
+
+def test_symlinked_file_below_agent_root_protects_its_resolved_target(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    protected = workspace / ".claude" / "settings.json"
+    target = workspace / "real-config" / "settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("SAFE")
+    protected.parent.mkdir()
+    protected.symlink_to(target)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    assert target in policy.persistence_agent_files
+    assert f'(literal "{target}")' in text
+    assert conf.crown_jewel_reason(policy, protected) is not None
+    assert conf.crown_jewel_reason(policy, target) is not None
+
+
+def test_swappable_intermediate_agent_symlink_is_pinned(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    dir_a = workspace / "dirA"
+    real = dir_a / "real"
+    real.mkdir(parents=True)
+    workspace.joinpath("sub").symlink_to(dir_a, target_is_directory=True)
+    workspace.joinpath(".codex").symlink_to(Path("sub") / "real", target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+
+    policy = conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for hop in (workspace / ".codex", workspace / "sub", dir_a, real):
+        assert hop in policy.persistence_agent_hops
+        assert f'(literal "{hop}")' in text
+        assert conf.crown_jewel_reason(policy, hop) is not None
+    assert f'(subpath "{real}")' in text
+    assert conf.crown_jewel_reason(policy, real / "config.toml") is not None
+
+
+def test_broken_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".claude").symlink_to(workspace / "missing")
+    monkeypatch.setenv("HOME", str(home))
+    entity = tmp_path / "entity"
+    (entity / ".levain").mkdir(parents=True)
+    with pytest.raises(conf.ConfinementError, match=r"protected persistence path .*\.claude.*cannot be resolved"):
+        conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
 
 
 def test_looping_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
@@ -134,14 +196,33 @@ def test_looping_agent_root_refuses_policy_build(tmp_path, monkeypatch) -> None:
         conf.build_policy(entity, workspace=workspace, deny_standard_creds=False)
 
 
-@pytest.mark.parametrize("kind", ["config", "hook"])
+def test_home_top_level_entry_is_denied_by_editor_and_inode_guard(tmp_path, monkeypatch) -> None:
+    policy = _policy(tmp_path, monkeypatch)
+    home, workspace = Path.home(), policy.workspace
+    home.mkdir(parents=True)
+    top = home / ".inputrc"
+    top.write_text("protected")
+    workspace.mkdir(parents=True)
+    os.link(top, workspace / "alias")
+    policy = conf.build_policy(policy.entity_dir, workspace=workspace, deny_standard_creds=False)
+
+    assert conf.crown_jewel_reason(policy, top) is not None
+    with pytest.raises(conf.ConfinementError, match="crown jewel with 2 names"):
+        conf._refuse_multiply_linked_jewels(policy)
+
+
+@pytest.mark.parametrize("kind", ["config", "hook", "case-settings", "ordinary"])
 def test_hardlink_alias_of_persistence_file_refuses_spawn(tmp_path, monkeypatch, kind) -> None:
     policy = _policy(tmp_path, monkeypatch)
     home, workspace = Path.home(), policy.workspace
     if kind == "config":
         protected = home / ".codex" / "config.toml"
-    else:
+    elif kind == "hook":
         protected = home / ".claude" / "hooks" / "commit.sh"
+    elif kind == "case-settings":
+        protected = home / ".Claude" / "Settings.JSON"
+    else:
+        protected = home / ".codex" / "ordinary.txt"
     protected.parent.mkdir(parents=True, exist_ok=True)
     protected.write_text("protected")
     workspace.mkdir(parents=True, exist_ok=True)
