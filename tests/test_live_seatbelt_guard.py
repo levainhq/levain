@@ -41,7 +41,11 @@ def test_the_opt_in_lets_the_spawn_through(monkeypatch) -> None:
 def test_other_spawns_are_untouched(monkeypatch) -> None:
     monkeypatch.setattr(conftest, "LIVE_SEATBELT_OPT_IN", False)
     assert subprocess.run(["/usr/bin/true"]).returncode == 0
-    # naming the driver as an operand applies no profile
-    assert subprocess.run(["/usr/bin/true", MISSING]).returncode == 0
-    assert not _spawns_seatbelt_driver(["/usr/bin/which", "sandbox-exec"])
-    assert not _spawns_seatbelt_driver(["/usr/bin/codesign", "-v", "/usr/bin/sandbox-exec"])
+
+
+def test_every_driver_option_shape_is_caught() -> None:
+    # a predefined profile (-n) and a parameter before the profile (-D) apply a profile too (L3 r2 codex)
+    assert _spawns_seatbelt_driver([MISSING, "-n", "no-network", "/usr/bin/true"])
+    assert _spawns_seatbelt_driver(["/usr/bin/env", MISSING, "-D", "K=v", "-p", "x", "/usr/bin/true"])
+    # deliberately broad: naming the driver as an operand is skipped as well
+    assert _spawns_seatbelt_driver(["/usr/bin/which", "sandbox-exec"])

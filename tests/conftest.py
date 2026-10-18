@@ -24,22 +24,20 @@ LIVE_SEATBELT_REASON = (
 # Read once, when this module loads: a test's own setenv/monkeypatch cannot open the guard for the run.
 LIVE_SEATBELT_OPT_IN = os.environ.get(LIVE_SEATBELT_ENV) == "1"
 _DRIVER = "sandbox" + "-exec"
-_PROFILE_FLAGS = ("-p", "-f")
 
 
 def _spawns_seatbelt_driver(args, executable=None) -> bool:
-    """True iff a spawn applies a profile: the driver (by basename) followed by its profile flag, anywhere in argv
-    (the hands path puts it after sudo/env), or the driver as ``executable=``. A command that only names the
-    driver as an operand (``which``, ``codesign -v``) is not one."""
+    """True iff a spawn names the Seatbelt driver: any argv element by basename (the hands path puts it after
+    sudo/env, and its options vary: -p, -f, -n, -D), or ``executable=``. Deliberately broad: a command that only
+    names the driver as an operand is skipped too, and a skip costs less than a profile on the host."""
     if isinstance(args, (str, bytes, os.PathLike)):
         args = [args]
     try:
-        names = [os.path.basename(os.fsdecode(a)) for a in args]
         if executable is not None and os.path.basename(os.fsdecode(executable)) == _DRIVER:
             return True
+        return any(os.path.basename(os.fsdecode(a)) == _DRIVER for a in args)
     except TypeError:
         return False
-    return any(n == _DRIVER and i + 1 < len(names) and names[i + 1] in _PROFILE_FLAGS for i, n in enumerate(names))
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -50,7 +48,8 @@ def _no_live_seatbelt_profile_unless_opted_in():
     there rather than on each test: such a test is SKIPPED at the spawn (with the reason above) unless
     ``LEVAIN_LIVE_SEATBELT=1`` was set when the run started, and a NEW live test cannot apply one by forgetting a
     marker. Nothing is spawned when it skips. Known edges, closed as constructions no test here writes: a child
-    process's own spawn, ``os.exec*``/``posix_spawn``, a shell string, and a spawn on a worker thread (the skip ends
+    process's own spawn, ``os.exec*``/``posix_spawn``, a shell string, ``executable`` passed by position, a
+    test that sets ``LIVE_SEATBELT_OPT_IN`` itself, and a spawn on a worker thread (the skip ends
     that thread, not the test). Beneath all of them the product refuses a kernel-mask rule before every launch
     (``levain.firing.seatbelt_guard``)."""
     real_init = subprocess.Popen.__init__
