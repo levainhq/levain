@@ -60,8 +60,10 @@ def seal_pending_id(
     KEYLESS, so it does NOT defend against a MALICIOUS local process that can ALSO recompute it (full
     local compromise, out of scope). The §1.5 re-screen + manifest re-check in the gate's resolve guard
     are the independent second layer; the gate's auto-fire ALLOWLIST closes the autonomous (cooling-off
-    auto-fire) half (a code-side gate-origin control a JSON writer can't mint); a KEYED HMAC is the
-    boundary-crossing hardening for the confirm-class residual IF the store ever leaves the trusted laptop.
+    auto-fire) half (a code-side gate-origin control a JSON writer can't mint). A keyed HMAC was once named
+    as the hardening for the confirm-class residual if the store ever left the trusted laptop; that
+    mechanism is retired (2026-10-17): an irreversible action approved from off the laptop rides the
+    consent queue's signed answer (a passkey SSHSIG verified against the authority log), never a token.
 
     The basis is STRUCTURALLY-ENCODED canonical JSON (L3 codex ship-gate HIGH-2), NOT a delimiter-join:
     a delimiter-join lets a field carrying the delimiter byte (``\\x00`` in a string, ``\\x01`` in a
