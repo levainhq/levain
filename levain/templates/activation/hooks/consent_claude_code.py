@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# Levain's consent hook for Claude Code (PermissionRequest), wired by `levain init` and `levain update`. It reports
-# a decision only when levain verified a signed answer or a standing consent grant; otherwise it prints nothing and
-# Claude Code's own permission dialog stands. Any failure here, including levain missing, is no decision. It takes
-# no arguments: the queue is levain's default one and the hold ceiling is the adapter's default.
+# Levain's consent hook for Claude Code, wired by `levain init` and `levain update` for two events. PermissionRequest:
+# it reports a decision only when levain verified a signed answer or a standing consent grant; otherwise it prints
+# nothing and Claude Code's own permission dialog stands. PreToolUse (the gate): a call that edits agent config or
+# hooks is held for a signed answer and, unanswered, denied as UNDECIDED with the session stopped; its entry blocks
+# on failure. It takes no arguments: the queue is levain's default one and the holds are the adapter's settings.
 import os
 import sys
 

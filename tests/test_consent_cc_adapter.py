@@ -1086,3 +1086,21 @@ def test_long_content_is_not_tagged():
     body = "def f(x):\n    return x / 2  # 50% of it\n" * 3000
     assert not cc.targets_agent_config("mcp__x__write", {"path": "src/a.py", "content": body}, "/work/proj",
                                        home=Path("/home/u"))
+
+
+# --- the PreToolUse gate (Q14 B2) ----------------------------------------------------------------------------
+
+from tests.test_consent_queue import authority, clock, keys, queue  # noqa: E402,F401 - the shared queue fixtures
+
+
+def test_a_late_ruling_names_the_action_not_its_stored_display(queue, keys):
+    """Seen in B2's RUN: a stored request keeps only its input's digest, so the ruling text read back the display
+    and told the agent "Do Edit {"file_path": ...} now". It names the action as the deny did, and is claimed once."""
+    from tests.test_consent_queue_v4 import ruled, undecided
+    from levain.consent.adapters.claude_code import RULING_TEXT, ruling_context
+
+    path = "/work/proj/.claude/settings.json"
+    request, gap = undecided(queue, tool_input={"file_path": path, "old_string": "a", "new_string": "b"})
+    queue.answer_late(request.id, *ruled(queue, request.id, keys["laptop"]))
+    assert ruling_context(queue, "sess-1") == RULING_TEXT["allow"].format(n=gap, x=f"Edit of {path}")
+    assert ruling_context(queue, "sess-1") is None

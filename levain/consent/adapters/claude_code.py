@@ -1,4 +1,5 @@
-"""Claude Code's ``PermissionRequest`` hook on the consent queue (Q2, first slice).
+"""Claude Code's ``PermissionRequest`` hook on the consent queue (Q2, first slice), and its ``PreToolUse`` gate
+(Q14 B2, :func:`gate`: the one that holds in bypass and auto, where no dialog ever fires; see its section below).
 
 Claude Code runs this hook when it is about to show its permission dialog, and shows the dialog AT ONCE while the
 hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it and the tool runs. So the hook:
@@ -85,6 +86,10 @@ DEFAULT_MAX_HOLD = 900.0
 # hook is tagged agent_config and filed at AGENT_CONFIG_TIER (all three from levain.consent.policy): an allow then
 # needs a key class covering T3, and no policy is ever asked (fail toward the human).
 DEFAULT_TIER = "T2"
+# The PreToolUse gate's hold D (Q14 B2, DESIGN §3.2): ``gate_hold_seconds`` in the settings file, default 300 s,
+# never past the ceiling of 840 s (a longer hold is a frozen session, which the principle rules out).
+DEFAULT_GATE_HOLD = 300.0
+GATE_HOLD_CEILING = 840.0
 
 @dataclass(frozen=True)
 class AdapterSettings:
@@ -97,6 +102,11 @@ class AdapterSettings:
     explicit_off: bool = False
     away_idle_seconds: float = IDLE_THRESHOLD
     legacy: bool = False
+    # the PreToolUse gate (Q14 B2): its hold D; the notify command it pings the operator with (R-f: an argv, the
+    # message appended as its last argument; None = no ping); the phone page's link the ping carries
+    gate_hold_seconds: float = DEFAULT_GATE_HOLD
+    notify_argv: tuple[str, ...] | None = None
+    phone_url: str | None = None
 
 
 def load_settings(queue_dir: Path) -> AdapterSettings:
@@ -130,7 +140,9 @@ def settings_from(data: Any) -> AdapterSettings:
     be told apart, and an operator's off is never undone by an upgrade); a hold only when it is a finite number >= 0
     (an integer too large for a float is malformed), an idle threshold
     (``away_idle_seconds``) only when it is a finite number > 0, else :data:`IDLE_THRESHOLD`, a cockpit root only
-    when absolute (:func:`_absolute_root`)."""
+    when absolute (:func:`_absolute_root`). The PreToolUse gate's keys: ``gate_hold_seconds`` (a finite number > 0,
+    at most :data:`GATE_HOLD_CEILING`; else :data:`DEFAULT_GATE_HOLD`), ``notify_argv`` (:func:`_argv`) and
+    ``phone_url`` (:func:`_line`)."""
     if not isinstance(data, dict):
         return AdapterSettings()
     word = data.get("away_word")
@@ -140,7 +152,26 @@ def settings_from(data: Any) -> AdapterSettings:
     return AdapterSettings(away_mode=word == "on", away_hold_seconds=_seconds(data.get("away_hold_seconds", 0), 0.0),
                            cockpit_data_root=_absolute_root(data.get("cockpit_data_root")), explicit_off=word == "off",
                            away_idle_seconds=_seconds(data.get("away_idle_seconds"), IDLE_THRESHOLD, positive=True),
-                           legacy=legacy)
+                           legacy=legacy,
+                           gate_hold_seconds=min(_seconds(data.get("gate_hold_seconds"), DEFAULT_GATE_HOLD,
+                                                          positive=True), GATE_HOLD_CEILING),
+                           notify_argv=_argv(data.get("notify_argv")), phone_url=_line(data.get("phone_url")))
+
+
+def _argv(value: Any) -> tuple[str, ...] | None:
+    """``value`` as a command's argv: a non-empty list of non-empty strings with no NUL; ``None`` for anything
+    else (no ping)."""
+    if not isinstance(value, list) or not value or \
+            not all(isinstance(a, str) and a and "\x00" not in a for a in value):
+        return None
+    return tuple(value)
+
+
+def _line(value: Any) -> str | None:
+    """``value`` when it is a non-empty one-line string, else ``None``."""
+    if not isinstance(value, str) or not value or any(c in value for c in "\x00\r\n"):
+        return None
+    return value
 
 
 def _seconds(value: Any, default: float, *, positive: bool = False) -> float:
@@ -556,6 +587,279 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                 pass
 
 
+# --- the PreToolUse gate (Q14 B2) ----------------------------------------------------------------------------
+#
+# PermissionRequest fires only when Claude Code is about to show its dialog, so it never fires in bypass or auto
+# (DESIGN §2.2, measured). PreToolUse fires in every mode and can deny with a reason the agent reads (§2.3). So a
+# gated call (T3: agent config and hooks, :func:`targets_agent_config`) is held here, in every mode where no dialog
+# would ask (:data:`DIALOG_MODES` are left to the PermissionRequest hook above and the agent's own dialog):
+#
+# 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
+# 2. else the request is filed with ``expires_at`` = now + D (the library owns the deadline, B1 fix 3), the operator
+#    is pinged through the notify seam (R-f; a failed ping never fails the gate), and the hook waits up to D for a
+#    verified decision, which it delivers;
+# 3. at D, :meth:`ConsentQueue.mark_undecided` gives the request its gap number and the hook denies with the
+#    UNDECIDED text (DESIGN §3.3). The irreversible tier (T3 here; the push executor's tool is B6's,
+#    :func:`gate_class`) adds top-level ``"continue": false`` + ``stopReason``: words do not stop an agent, this does
+#    (runs2 RUN B, 3/3 ``terminal_reason: hook_stopped``).
+#
+# Every PreToolUse also carries this session's late rulings, not yet delivered, as ``additionalContext`` (DESIGN
+# §3.6; :meth:`ConsentQueue.claim_rulings_for`), and, when a notify command is configured, the snoozed re-pings that
+# are due (R-e). The entry is installed with ``"onFailure": "block"`` and ``timeout`` = :func:`gate_timeout` of D.
+
+GATE_EVENT = "PreToolUse"
+# Claude Code's ``timeout`` for the gate entry is D + this margin (interpreter start, the undecided mark)
+GATE_TIMEOUT_MARGIN = 30
+# The modes where Claude Code asks the human itself: the gate holds nothing there (PermissionRequest does). Any other
+# mode, a missing one included, is held.
+DIALOG_MODES = frozenset({"default", "plan"})
+# how often the hold re-reads the request
+GATE_POLL = 0.25
+# DESIGN §3.3, verbatim (U-REV with its bundling clause): the reversible tier; the agent may work around the gap
+U_REV = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
+         "This is not a rejection of your approach; it is open as gap #{n} and the operator will rule on it later. "
+         "Do not retry it and do not achieve it another way. If your command had several steps, none of them ran; "
+         "redo only the parts that do not depend on it. Continue only work that does not depend on it. If the rest "
+         "of the task depends on it, stop cleanly: write a short summary of what is done, what waits on gap #{n}, "
+         "and end your turn.")
+# The irreversible tier's text, verbatim as measured (runs/setup.py UIRR); on Claude Code the stop itself is
+# ``continue: false``, never these words
+U_IRR = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
+         "This class of action stops the task: do no further work. Do not retry it or achieve it another way. "
+         "Write a short summary of what is done and what waits on gap #{n}, and end your turn.")
+# DESIGN §3.6, verbatim: a late ruling delivered to its live session
+RULING_TEXT = {
+    "allow": ("levain: ruling on gap #{n}: ALLOW. Do {x} now, it will be allowed. Then list what you skipped or "
+              "deferred because of gap #{n}, and do it now (or undo what assumed {x}); check the work since the gap "
+              "for anything inconsistent with this ruling and fix it."),
+    "deny": ("levain: ruling on gap #{n}: DENY. Do not do {x}. Then list what you skipped or deferred because of "
+             "gap #{n}, and do it now (or undo what assumed {x}); check the work since the gap for anything "
+             "inconsistent with this ruling and fix it."),
+}
+# the longest a description of the action runs in a reason, a ping or a ruling
+WHAT_MAX = 300
+
+
+def gate_timeout(hold: float) -> int:
+    """Claude Code's ``timeout`` for the gate entry: ``ceil(hold)`` + :data:`GATE_TIMEOUT_MARGIN`."""
+    return int(math.ceil(hold)) + GATE_TIMEOUT_MARGIN
+
+
+def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+               protected: Iterable[Path] = ()) -> str | None:
+    """The gate's tier for a call: ``irreversible`` (T3, agent config and hooks, which is Q10's floor and Q14's
+    irreversible tier at once, R-h), ``reversible``, or ``None`` (not gated). Bash is never parsed (ruling 1, R-g).
+    THE SEAM for B6: the push executor's tool joins here as ``irreversible``."""
+    if targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):
+        return "irreversible"
+    return None
+
+
+def _what(tool_name: str, tool_input: Any, display: str | None = None) -> str:
+    """The action in a few words: ``<tool> of <path>`` for a tool that names the paths it writes, else its display
+    (:func:`levain.consent.record.redact_display`), at most :data:`WHAT_MAX` characters. With no ``tool_input``
+    (a stored request keeps only its digest), the input is read back from ``display`` when it was not cut."""
+    from levain.consent.record import redact_display
+
+    if tool_input is None and display is not None:
+        try:
+            tool_input = json.loads(display.partition(" ")[2])
+        except (ValueError, RecursionError):
+            tool_input = None
+    paths = _targets(tool_name, tool_input)
+    if paths and all(isinstance(p, str) and p for p in paths):
+        text = f"{tool_name} of {', '.join(paths)}"
+    else:
+        text = display if display is not None else redact_display(tool_name, tool_input)
+    return text if len(text) <= WHAT_MAX else text[:WHAT_MAX - 1] + "…"
+
+
+def notify(settings: AdapterSettings, message: str) -> bool:
+    """Ping the operator (R-f): start ``notify_argv`` + ``[message]``, detached, never waited on. True when it
+    started; False when none is configured or it could not start. A failed ping never fails the gate."""
+    if not settings.notify_argv:
+        return False
+    import subprocess
+
+    text = message if settings.phone_url is None else f"{message} {settings.phone_url}"
+    try:
+        subprocess.Popen([*settings.notify_argv, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:
+        return False
+    return True
+
+
+def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
+    """R-e: claim the snoozed re-pings that are due and send each (only when a notify command is configured: a
+    claimed re-ping is never sent again, so one is never claimed with nowhere to send it). Returns how many
+    started."""
+    if not settings.notify_argv:
+        return 0
+    sent = 0
+    for reping in queue.claim_repings():
+        got = queue.get(reping.request_id)
+        if got is None:
+            continue
+        gap = queue.gap(reping.request_id)
+        what = _what(got[0].tool_name, None, got[0].display)
+        head = f"levain: asking again, gap #{gap}" if gap is not None else "levain: asking again"
+        sent += notify(settings, f"{head}: {what} (request {reping.request_id}).")
+    return sent
+
+
+def _pre(decision: str, reason: str, **extra: Any) -> dict[str, Any]:
+    return {**extra, "hookSpecificOutput": {"hookEventName": GATE_EVENT, "permissionDecision": decision,
+                                            "permissionDecisionReason": reason}}
+
+
+def _stop(tier: str | None, what: str, why: str) -> dict[str, Any]:
+    """The top-level fields that end the session's turn for the irreversible tier; nothing for any other."""
+    if tier != "irreversible":
+        return {}
+    return {"continue": False, "stopReason": f"levain: stopped at a gated action ({what}): {why}"}
+
+
+def gate_output(decision: Decision) -> dict[str, Any]:
+    """What Claude Code reads from the gate for a verified decision (a signed answer, a grant, a ruled allow)."""
+    if decision.via == "ruling":
+        how = f"your ruling on gap #{decision.gap} (key {decision.signer_fp})"
+    elif decision.via == "grant":
+        how = f"your standing consent grant {decision.grant_id}"
+    else:
+        how = f"a signed levain answer (key {decision.signer_fp})"
+    if decision.decision == "allow":
+        return _pre("allow", f"levain: allowed by {how}.")
+    return _pre("deny", f"levain: denied by {how}. Do not retry it and do not achieve it another way.")
+
+
+def undecided_output(tier: str | None, what: str, gap: int) -> dict[str, Any]:
+    """The deny at D: U-IRR and the hard stop for the irreversible tier, U-REV for the reversible one."""
+    text = (U_IRR if tier == "irreversible" else U_REV).format(x=what, n=gap)
+    return _pre("deny", text, **_stop(tier, what, f"gap #{gap} is open and waits on the operator's ruling."))
+
+
+def ruling_context(queue: ConsentQueue, session: str) -> str | None:
+    """This session's late rulings not yet delivered, as DESIGN §3.6's text, one per line (claimed: each reaches
+    the session once), or ``None``. The ruled allow itself still runs only through ``take_ruled_allow``."""
+    lines = []
+    for ruling in queue.claim_rulings_for(AGENT, session):
+        got = queue.get(ruling.request_id)
+        what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
+        lines.append(RULING_TEXT[ruling.ruling].format(n=ruling.gap, x=what))
+    return "\n".join(lines) or None
+
+
+def _session_of(event: Mapping[str, Any]) -> str | None:
+    session = event.get("session_id")
+    if not isinstance(session, str) or not session:
+        return None
+    agent_id = event.get("agent_id")
+    return f"{session}#agent:{agent_id}" if isinstance(agent_id, str) and agent_id else session
+
+
+def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Path | None = None,
+         sleep: Callable[[float], None] = time.sleep) -> dict[str, Any] | None:
+    """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
+    A gated call (:func:`gate_class`) gets a ruled allow (taken once), else, outside :data:`DIALOG_MODES` and when
+    something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
+    pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
+    (:func:`undecided_output`). Anything that fails after the call is known gated is a deny (with the hard stop for
+    the irreversible tier), never an allow: the request it filed stays pending until a read or sweep expires it.
+    Late rulings for the session (:func:`ruling_context`) ride whatever is returned, as ``additionalContext``."""
+    if getattr(queue, "directory", None) is None:
+        raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
+    if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
+        return None
+    tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
+    session = _session_of(event)
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd or session is None:
+        return None
+    if tool_input is None:
+        tool_input = {}
+    try:
+        send_repings(queue, settings)
+    except Exception:
+        pass  # a re-ping is a ping: it never fails the gate
+    out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep)
+    try:
+        context = ruling_context(queue, session)
+    except Exception:
+        context = None  # undelivered rulings stay for the next hook
+    if context:
+        out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
+        out["hookSpecificOutput"]["additionalContext"] = context
+    return out
+
+
+def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, tool_name: str,
+               tool_input: Any, cwd: str, session: str, *, home: Path | None,
+               sleep: Callable[[float], None]) -> dict[str, Any] | None:
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import parse_stamp
+
+    tier = gate_class(tool_name, tool_input, cwd, home=home,
+                      protected=protected_paths(Path(queue.directory), settings))
+    if tier is None:
+        return None
+    what = _what(tool_name, tool_input)
+    tool_use_id = event.get("tool_use_id")
+    event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
+    mode = event.get("permission_mode")
+    posture = mode if isinstance(mode, str) and mode else None
+    try:
+        ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
+        if ruled is not None:
+            return gate_output(ruled)
+        if posture in DIALOG_MODES or nothing_can_decide(settings):
+            return None
+        hold = settings.gate_hold_seconds
+        request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
+                             cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id)
+    except Exception as exc:
+        return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
+                    "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
+    try:
+        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).")
+        got = _verified(queue.await_decision(request.id, hold + 5.0, poll=GATE_POLL, tool_input=tool_input,
+                                             posture=posture), request)
+        if got is not None:
+            return gate_output(got)
+        # the hold ends at expires_at (the library's deadline); mark_undecided applies at or after it
+        left = (parse_stamp(request.expires_at) - datetime.now(timezone.utc)).total_seconds()
+        if left > 0:
+            sleep(left + 0.05)
+        marked = queue.mark_undecided(request.id, halt=tier == "irreversible", tool_input=tool_input,
+                                      posture=posture)
+        if isinstance(marked.decision, Decision) and _verified(marked.decision, request) is not None:
+            return gate_output(marked.decision)  # an answer verified in the last moments of the hold
+        if marked.state == "undecided" and marked.gap is not None:
+            return undecided_output(tier, what, marked.gap)
+        return _pre("deny", f"levain: the action was NOT taken: {what} ({marked.reason}). Do not retry it and do "
+                    "not achieve it another way.", **_stop(tier, what, marked.reason))
+    except Exception as exc:
+        return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
+                    "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
+
+
+def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[str, Any] | None:
+    """:func:`main`'s answer when the gate itself raised before it could classify the call (the queue would not
+    open): a deny with the hard stop when the call is gated, or when that cannot be told; ``None`` otherwise."""
+    try:
+        tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
+        if not isinstance(tool_name, str) or not isinstance(cwd, str) or not cwd:
+            return None
+        tier = gate_class(tool_name, tool_input, cwd, protected=protected_paths(queue_dir, settings))
+        what = _what(tool_name, tool_input)
+    except Exception:
+        tier, what = "irreversible", "this call"
+    if tier is None:
+        return None
+    return _pre("deny", f"levain: the gate could not run, so the action was NOT taken: {what}. Do not retry it "
+                "and do not achieve it another way.", **_stop(tier, what, "the gate could not run."))
+
+
 def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
     if settings.cockpit_data_root:
         root = Path(settings.cockpit_data_root)
@@ -568,9 +872,14 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
 
 
 def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
-    """The hook entry point. Always exits 0; prints a decision only when the core verified one."""
+    """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
+    and ``PreToolUse`` (:func:`gate`). Always exits 0. A PermissionRequest prints a decision only when the core
+    verified one; a PreToolUse whose gate raised prints :func:`gate_failed` (a deny for a gated call)."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
+    event: Any = None
+    queue_dir: Path | None = None
+    settings = AdapterSettings()
     try:
         parser = argparse.ArgumentParser(prog="levain-consent-claude-code")
         parser.add_argument("--queue-dir", default=None)
@@ -579,12 +888,23 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
-        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
+            out = gate(event, _queue_for(queue_dir, settings), settings)
+        else:
+            out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
+                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
+        if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT and queue_dir is not None:
+            try:
+                out = gate_failed(event, queue_dir, settings)
+                if out is not None:
+                    stdout.write(json.dumps(out) + "\n")
+                    stdout.flush()
+            except BaseException:
+                pass
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:
@@ -738,15 +1058,16 @@ def _is_ours(h: Any, command: str, script: Path | None) -> bool:
 
 
 def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any],
-                   script: Path | None = None) -> None:
-    """Remove ONLY the handlers this installation owns (:func:`_is_ours`; other handlers and every group field
-    kept; a group dropped only when that leaves it with no handlers), then add ``handler`` in its own group."""
+                   script: Path | None = None, event: str = EVENT) -> None:
+    """Under ``hooks.<event>`` (default ``PermissionRequest``), remove ONLY the handlers this installation owns
+    (:func:`_is_ours`; other handlers and every group field kept; a group dropped only when that leaves it with no
+    handlers), then add ``handler`` in its own group."""
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("settings 'hooks' is not a JSON object")
-    groups = hooks.get(EVENT, [])
+    groups = hooks.get(event, [])
     if not isinstance(groups, list):
-        raise ValueError(f"settings 'hooks.{EVENT}' is not a list")
+        raise ValueError(f"settings 'hooks.{event}' is not a list")
     kept = []
     for group in groups:
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
@@ -756,7 +1077,7 @@ def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, An
         if handlers or not group["hooks"]:
             kept.append({**group, "hooks": handlers})
     kept.append({"matcher": "*", "hooks": [handler]})
-    hooks[EVENT] = kept
+    hooks[event] = kept
 
 
 # Q9, cross-session messaging (DESIGN_Q9). Inbound: Claude Code's `crossSessionInbound`. Outbound: ``ask`` puts

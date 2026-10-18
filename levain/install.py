@@ -2028,8 +2028,23 @@ def consent_hook_handler(python_path: str, install: Path, adapter: str) -> tuple
     return command, {"type": "command", "command": command, "timeout": hook_timeout(DEFAULT_MAX_HOLD)}, script
 
 
+def consent_gate_handler(python_path: str, install: Path) -> tuple[str, dict[str, Any], Path]:
+    """(command, handler, script) of Claude Code's PreToolUse gate entry (Q14 B2): the same command and script as
+    :func:`consent_hook_handler` (the script routes by event), ``"onFailure": "block"`` (a crashed or timed-out gate
+    blocks the call, never lets it run; measured runs2 RUN C) and ``timeout`` = the gate's hold D + 30 s, D read
+    from the consent settings the hook reads (``gate_hold_seconds``, default 300 s): a D changed there takes effect
+    in the timeout at the next `levain update`."""
+    from levain.consent.adapters.claude_code import gate_timeout, load_settings
+
+    command, _handler, script = consent_hook_handler(python_path, install, "claude-code")
+    hold = load_settings(_consent_queue_dir()).gate_hold_seconds
+    return command, {"type": "command", "command": command, "timeout": gate_timeout(hold),
+                     "onFailure": "block"}, script
+
+
 def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str) -> str:
-    """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry merged in
+    """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry (and for
+    Claude Code the PreToolUse gate entry, :func:`consent_gate_handler`) merged in
     through the adapters' own ``_merge_handler`` (only an entry this install owns is replaced; anything else is
     kept). Always rendered, whatever agent version is installed, so `init` and `update` render the same bytes;
     never while the install records ``consent_hook: off`` (the template carries no consent entry)."""
@@ -2044,6 +2059,11 @@ def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str
             raise ValueError("the rendered hook file is not a JSON object")
         command, handler, script = consent_hook_handler(python_path, install, adapter)
         _merge_handler(doc, command, handler, script=script)
+        if adapter == "claude-code":
+            from levain.consent.adapters.claude_code import GATE_EVENT
+
+            command, handler, script = consent_gate_handler(python_path, install)
+            _merge_handler(doc, command, handler, script=script, event=GATE_EVENT)
     except ValueError as e:
         raise InitError(f"the {adapter} hook file could not take the consent hook: {e}") from e
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
