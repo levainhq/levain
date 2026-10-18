@@ -2042,9 +2042,19 @@ def consent_gate_handler(python_path: str, install: Path) -> tuple[str, dict[str
     return command, {"type": "command", "command": command, "timeout": GATE_TIMEOUT, "onFailure": "block"}, script
 
 
+def codex_gate_handler(python_path: str, install: Path) -> tuple[str, dict[str, Any], Path]:
+    """(command, handler, script) of Codex's PreToolUse gate entry (Q14 B5): the consent hook's command and script
+    (the script routes by event) and ``timeout`` = the gate's ceiling timeout, never the D set now: Codex has no
+    ``onFailure``, so a hook it kills at the timeout fails OPEN."""
+    from levain.consent.adapters.codex import GATE_TIMEOUT
+
+    command, _handler, script = consent_hook_handler(python_path, install, "codex")
+    return command, {"type": "command", "command": command, "timeout": GATE_TIMEOUT}, script
+
+
 def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str) -> str:
-    """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry (and for
-    Claude Code the PreToolUse gate entry, :func:`consent_gate_handler`) merged in
+    """``text`` (a rendered Claude Code settings.json or Codex hooks.json) with the consent hook entry and the
+    PreToolUse gate entry (:func:`consent_gate_handler`, :func:`codex_gate_handler`) merged in
     through the adapters' own ``_merge_handler`` (only an entry this install owns is replaced; anything else is
     kept). Always rendered, whatever agent version is installed, so `init` and `update` render the same bytes;
     never while the install records ``consent_hook: off`` (the template carries no consent entry)."""
@@ -2064,6 +2074,11 @@ def _apply_consent_hook(text: str, python_path: str, install: Path, adapter: str
 
             command, handler, script = consent_gate_handler(python_path, install)
             _merge_handler(doc, command, handler, script=script, event=GATE_EVENT)
+        elif adapter == "codex":
+            from levain.consent.adapters.codex import GATE_EVENT as CODEX_GATE_EVENT
+
+            command, handler, script = codex_gate_handler(python_path, install)
+            _merge_handler(doc, command, handler, script=script, event=CODEX_GATE_EVENT)
     except ValueError as e:
         raise InitError(f"the {adapter} hook file could not take the consent hook: {e}") from e
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
@@ -2157,8 +2172,8 @@ def _emit_consent_hook(install: Path, adapter: str, emit: Callable[[str], None])
         note = "WARN: " + untested_message(agent, version).split("; pass")[0]
     emit(f"  consent hook ({AGENT_LABELS[agent]}): wired; {note}")
     if adapter == "codex":
-        emit("  consent hook (Codex): Codex lists it at its next start under \"Hooks need review\" and runs it only "
-             "once you trust it there; it runs in every Codex session on this machine.")
+        emit("  consent hook (Codex): levain writes Codex's trust for its own hooks (each confirmed with Codex) "
+             "and they run in every Codex session on this machine.")
 
 
 # `levain init --messaging` (the opt-out for Q9). The template carries no messaging keys; the renderer adds
@@ -2690,8 +2705,9 @@ def _install_codex(
     codex_home = _codex_home()
     codex_home.mkdir(parents=True, exist_ok=True)
     with codex_home_lock(codex_home):
-        _write_codex_pair(codex_home, _codex_fragment(adapter_root, python_path, install),
-                          _codex_hooks_json(adapter_root, python_path, install), emit)
+        hooks_text = _codex_hooks_json(adapter_root, python_path, install)
+        _write_codex_pair(codex_home, _codex_fragment(adapter_root, python_path, install), hooks_text, emit)
+        _trust_codex_hooks(codex_home, hooks_text, emit)
 
     emit("  Codex adapter installed.")
 
@@ -3076,6 +3092,10 @@ def _refresh_adapter(
         if adapter == "codex":
             _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
+            if apply:
+                # still under the codex home lock: trust only the file levain rendered for this install
+                _trust_codex_hooks(_codex_home(), _codex_hooks_json(adapter_root, python_path, install),
+                                   lines.append, quiet=True)
     if out.refreshed or lines:
         emit(f"\n• adapter files ({adapter}):")
         verb = "refreshed" if apply else "would refresh"
@@ -4126,6 +4146,35 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
     notes.append(f"  ! {hooks} could not be written, so the change to {config} above was undone: "
                  f"it is back as it was (any backup listed above is a copy of it).")
     return False
+
+
+def _trust_codex_hooks(codex_home: Path, hooks_text: str, emit: Callable[[str], None], *,
+                       quiet: bool = False) -> bool:
+    """Write Codex's trust for every hook in ``codex_home``'s hooks.json while it holds ``hooks_text`` (levain's
+    render), then probe it (:func:`levain.consent.adapters.codex.write_hook_trust`). Codex skips an untrusted hook
+    with no warning, so a hook left untrusted is said here, never failed on: `levain doctor` reports the gate RED
+    until it is trusted. True when every hook is trusted. ``quiet`` (update): Codex is not asked when config.toml
+    already trusts every hook as rendered, and nothing is said on success or when the file is not levain's render
+    (update stages such a file and says so itself)."""
+    from levain.consent.adapters.codex import untrusted_hooks, write_hook_trust
+
+    hooks = codex_home / "hooks.json"
+    if quiet and untrusted_hooks(hooks, hooks_text, home=codex_home) == []:
+        return True
+    results, why = write_hook_trust(hooks, hooks_text, home=codex_home)
+    if why is not None:
+        if not (quiet and "is not the file levain rendered" in why):
+            emit(f"  ! codex hooks NOT trusted: {why}. Codex runs no untrusted hook, levain's consent gate "
+                 f"included, and says nothing; `levain update` writes the trust again.")
+        return False
+    bad = [r for r in results if r.status != "trusted"]
+    if bad:
+        emit("  ! codex did not confirm trust for: " + ", ".join(f"{r.event} ({r.status})" for r in bad)
+             + ". Codex skips those hooks silently; `levain doctor` shows the gate's state.")
+        return False
+    if not quiet:
+        emit(f"  codex hooks trusted ({len(results)}), each confirmed by codex's own hooks/list.")
+    return True
 
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
@@ -5587,10 +5636,10 @@ def _next_steps_lines(install: Path, adapter: str, store_ok: bool = True) -> lis
         lines.append("  - Open in Claude Code:")
         lines.append(f"        cd {install} && claude")
     if adapter == "codex":
-        lines.append("  - IMPORTANT — Codex hook trust is per-content-hash. The very")
-        lines.append("    first invocation MUST be interactive `codex` (not `codex exec`)")
-        lines.append("    so Codex can prompt to trust the hook scripts. Editing the")
-        lines.append("    hook scripts invalidates trust until re-approved interactively.")
+        lines.append("  - Codex runs a hook only while CODEX_HOME's config.toml trusts its")
+        lines.append("    definition exactly. levain wrote that trust for its own hooks")
+        lines.append("    above; a hook whose entry changes is skipped SILENTLY until")
+        lines.append("    `levain update` trusts it again (`levain doctor` shows it RED).")
         lines.append(f"        cd {install} && codex")
     if adapter == "openhands":
         # Hookless: no verify-hooks (there are none) — the activation is the runtime

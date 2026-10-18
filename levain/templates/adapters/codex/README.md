@@ -197,13 +197,14 @@ Codex shows trust / approval prompts on first run:
 - **Project trust** — the partnership directory may need `trust_level =
   "trusted"` set in `~/.codex/config.toml` (Codex prompts the first time
   you `cd` in and run `codex`).
-- **Hook trust (LOAD-BEARING)** — Codex maintains per-content-hash trust
-  for hook scripts. The first interactive `codex` invocation that
-  encounters configured hooks prompts the operator to trust each one.
-  **Hooks will not fire until trust is established.** Once established,
-  trust persists for that exact script content; editing the hook script
-  silently invalidates trust until re-approved. This is a Codex platform
-  behavior, not a Levain-specific gate. Implications:
+- **Hook trust (LOAD-BEARING)** — Codex runs a hook only while
+  `~/.codex/config.toml` holds the hash of its definition (command,
+  matcher, timeout) under `hooks.state`. `levain init` and `levain update`
+  write that trust for levain's own hooks and confirm each with Codex;
+  `levain doctor` reports the consent gate RED when Codex would skip it.
+  **An untrusted or changed hook is skipped silently.** The notes below
+  are for hooks levain did not trust (another tool's, or a workspace
+  `.codex/hooks.json`). Implications:
     1. **Run interactive `codex` once before any `codex exec` invocation**
        to establish trust — `codex exec` does not surface trust prompts and
        will silently skip untrusted hooks.
