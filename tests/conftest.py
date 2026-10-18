@@ -4,12 +4,55 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 # TEST ONLY: the per-test seam that lets a binding's effect run on a test executor (see the module).
 from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401
+
+
+LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
+LIVE_SEATBELT_REASON = (
+    f"applies a LIVE macOS Seatbelt profile on this host, off unless {LIVE_SEATBELT_ENV}=1: a hand-written Seatbelt "
+    "profile kernel-panicked a Mac on 2026-10-07, so a broad pytest run must never apply one to the host kernel. "
+    "Run these in a disposable VM (CI runners are), with the variable set."
+)
+
+
+def _spawns_seatbelt_driver(args) -> bool:
+    """True iff a spawn's argv names the Seatbelt driver (the hands path puts it after sudo/env, so any element)."""
+    if isinstance(args, (str, bytes, os.PathLike)):
+        args = [args]
+    try:
+        return any(os.path.basename(os.fsdecode(a)) == "sandbox-exec" for a in args)
+    except TypeError:
+        return False
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_live_seatbelt_profile_unless_opted_in():
+    """TEST ONLY: the one place that keeps a broad pytest run from applying a live Seatbelt profile to the host.
+
+    Every real launch of the driver goes through ``subprocess.Popen`` (``subprocess.run`` included), so the
+    guard sits there rather than on each test: a test that would apply a profile is SKIPPED at the spawn (with
+    the reason above) unless ``LEVAIN_LIVE_SEATBELT=1``, and a NEW live test cannot apply one by forgetting a
+    marker. Nothing is spawned when it skips. Text-rendering tests never spawn the driver and keep running; a
+    test that replaces ``subprocess.Popen`` with a fake never reaches this. The guard in product code
+    (``seatbelt_guard``) stays the floor beneath it."""
+    real_init = subprocess.Popen.__init__
+
+    def guarded(self, args, *a, **kw):
+        if os.environ.get(LIVE_SEATBELT_ENV) != "1" and _spawns_seatbelt_driver(args):
+            pytest.skip(LIVE_SEATBELT_REASON)
+        return real_init(self, args, *a, **kw)
+
+    subprocess.Popen.__init__ = guarded
+    try:
+        yield
+    finally:
+        subprocess.Popen.__init__ = real_init
 
 
 @pytest.fixture(autouse=True)
