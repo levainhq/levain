@@ -1063,3 +1063,16 @@ def test_the_sessions_tile_counts_an_undecided_request_as_waiting(tmp_path, monk
     p = ck.panel("sessions", credential_class="none")
     meta = {r["facets"]["agent"] + ":" + r["facets"]["session_activity"]: r["facets"]["legacy_meta"] for r in p["rows"]}
     assert "1 waiting" in meta["claude_code:active"]
+
+
+def test_a_raw_receipt_never_lifts_an_older_allow_over_a_newer_deny(queue, keys):
+    """L3 r2 codex HIGH: allow A then deny B in one stamp second; a raw writer appends a second terminal receipt
+    for A (a 'denied' one: the unique (request_id, state) index refuses a second 'allowed', no trigger refuses an
+    insert) to give A the highest seq. A ruling has exactly one terminal receipt, naming its row's state, so A's
+    sequence is void and the take fails closed instead of delivering A."""
+    a, _ = undecided(queue)
+    b, _ = undecided(queue)
+    _rule(queue, a, keys["phone"])
+    _rule(queue, b, keys["phone"], "deny")
+    _raw(queue, ("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, 'denied', 'x', '{}')", (a.id,)))
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None

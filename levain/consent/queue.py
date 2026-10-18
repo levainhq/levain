@@ -886,8 +886,9 @@ class ConsentQueue:
 
     def withdraw(self, request_id: str, *, note: str = "") -> bool:
         """The requester stops waiting (the human answered the native dialog; the hook gave up). Needs no
-        signature: it decides nothing, it leaves the agent's own dialog. False if the request is not pending
-        (a request whose time is up is expired, not withdrawn)."""
+        signature: it decides nothing, it leaves the agent's own dialog. False if the request is not pending. A
+        request past its hold stays pending for :data:`UNDECIDED_GRACE`, so it can still be withdrawn then; after
+        that a read or a sweep has expired it, and it is not withdrawn."""
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id)
             if request is None or state != "pending":
@@ -1126,7 +1127,7 @@ class ConsentQueue:
 
     def answer(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
-        was, or becomes ``expired`` when the answer came too late). The answer is verified against a fresh
+        was: an answer after ``expires_at`` is refused, and the request stays pending until its grace ends). The answer is verified against a fresh
         replay from the queue's authority source."""
         got = self.get(request_id)                         # expires it first if it is due (UNDECIDED_GRACE)
         if got is None:
@@ -1270,9 +1271,12 @@ class ConsentQueue:
 
     _RULED_COLS = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
     # the queue's own APPLICATION SEQUENCE of a ruling: the seq of its allowed/denied receipt (append-only,
-    # AUTOINCREMENT), never a clock (decided_at / signed_at tie within a stamp and step backwards) or rowid
-    _RULING_SEQ = ("(SELECT MAX(c.seq) FROM receipts c WHERE c.request_id = r.id "
-                   "AND c.state IN ('allowed','denied')) AS ruling_seq")
+    # AUTOINCREMENT), never a clock (decided_at / signed_at tie within a stamp and step backwards) or rowid.
+    # A ruling is applied once, so it has exactly ONE terminal receipt and that receipt names the row's state;
+    # anything else (a receipt a raw writer appended to lift an older ruling above a newer one) is NULL, and a
+    # NULL on any ruled row of the call fails the take closed (B1 L3 r2, codex HIGH)
+    _RULING_SEQ = ("(SELECT CASE WHEN COUNT(*) = 1 AND MIN(c.state) = r.state THEN MIN(c.seq) END "
+                   "FROM receipts c WHERE c.request_id = r.id AND c.state IN ('allowed','denied')) AS ruling_seq")
 
     def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *, cwd: str,
                          event: str | None = None) -> Decision | None:
@@ -1308,8 +1312,11 @@ class ConsentQueue:
                 now = _now_utc(self._clock)
                 row = conn.execute(f"SELECT r.state, {self._RULING_SEQ} FROM requests r WHERE r.id = ?",
                                    (got.request_id,)).fetchone()
-                newest = conn.execute(f"SELECT MAX(ruling_seq) FROM (SELECT {self._RULING_SEQ} " + where +
-                                      " AND state IN ('allowed','denied'))", key).fetchone()[0]
+                newest, unsequenced = conn.execute(
+                    f"SELECT MAX(ruling_seq), SUM(ruling_seq IS NULL) FROM (SELECT {self._RULING_SEQ} " + where +
+                    " AND state IN ('allowed','denied'))", key).fetchone()
+                if unsequenced:
+                    return None                      # a ruled row on the call lost its one ruling receipt: fail closed
                 if row is None or row[0] != "allowed" or row[1] != seq or newest != seq:
                     continue                         # it moved between the read and the lock
                 if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (got.request_id,)).fetchone():
