@@ -8,7 +8,8 @@ an interrupt) the whole process group is killed and the directory, which holds t
 The node drivers also exit when their parent dies, which covers a pytest killed outright.
 
 THIS IS THE WAY to take a cockpit screenshot (or drive any page): ``python tests/_page_drive_run.py <chrome> <url>
-<steps.json> [--timeout N]`` with a ``{"shot": "<abs path.png>"}`` step. Never write an ad-hoc Chrome launcher for a
+<steps.json> [--timeout N]`` with a ``{"shot": "<abs path.png>"}`` step. For app content that loads asynchronously (the driver only waits for the document's load event), put an
+``until`` step before the ``shot``. Never write an ad-hoc Chrome launcher for a
 shot: one that skips this reaping leaves a headless Chrome under PID 1 that macOS then routes new-window requests to.
 """
 from __future__ import annotations

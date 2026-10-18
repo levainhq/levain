@@ -6,6 +6,7 @@
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
+// App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -64,6 +65,11 @@ const evaluate = async (expression) => {
   return r.result?.exceptionDetails ? { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") }
     : r.result?.result?.value ?? null;
 };
+// Page.navigate returns at commit: wait (bounded) for the load before the first step, or an early shot sees a blank page
+for (const end = Date.now() + 15000; Date.now() < end;) {
+  if (await evaluate("document.readyState") === "complete") break;
+  await sleep(100);
+}
 for (const s of steps) {
   const deadline = Date.now() + (s.ms || 20000);
   if (s.emulate !== undefined) {
