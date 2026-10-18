@@ -804,6 +804,8 @@ def ruling_line(queue: ConsentQueue, ruling: Any, *, quote: bool = False) -> str
         return None
     got = queue.get(ruling.request_id)
     what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
+    if quote:   # the agent wrote ``what``: no closing mark or line break of its own can end the quote early
+        what = what.translate({ord(c): None for c in "«»\r\n"})
     return text.format(n=ruling.gap, x=f"«{what}»" if quote else what)
 
 

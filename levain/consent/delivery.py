@@ -86,7 +86,8 @@ _MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions", "auto
 # session would run with fewer constraints than it was started with (each also as ``--flag=value``)
 _UNRESTORED = ("--settings", "--mcp-config", "--strict-mcp-config", "--add-dir", "--allowedTools", "--allowed-tools",
                "--disallowedTools", "--disallowed-tools", "--tools", "--append-system-prompt",
-               "--append-system-prompt-file", "--system-prompt", "--system-prompt-file", "--agents", "--plugin-dir")
+               "--append-system-prompt-file", "--system-prompt", "--system-prompt-file", "--agents", "--plugin-dir",
+               "--permission-prompt-tool", "--setting-sources")
 # the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
 _BYPASS_FLAG = "--dangerously-skip-permissions"
 # a session id: Claude Code's and Codex's are UUIDs; a subagent's key adds ``#agent:<id>``
@@ -418,11 +419,17 @@ def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str
     settle = RESUME_SETTLE
     try:
         log.parent.mkdir(mode=0o700, exist_ok=True)
-        with open(log, "ab") as fh:
-            proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=fh,
-                                    stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    except Exception as exc:  # noqa: BLE001 - Popen raised, so nothing was started: a retryable failure
+        fh = open(log, "ab")
+    except Exception as exc:  # noqa: BLE001 - nothing was started: a retryable failure
         return f"{type(exc).__name__}: {exc}"
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=fh,
+                                stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    except Exception as exc:  # noqa: BLE001 - Popen raised, so nothing was started: a retryable failure
+        fh.close()
+        return f"{type(exc).__name__}: {exc}"
+    # the child is spawned: from here an exception (this close's included) propagates, never a retryable failure
+    fh.close()
     try:
         code = proc.wait(timeout=settle)
     except subprocess.TimeoutExpired:
