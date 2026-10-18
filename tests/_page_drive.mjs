@@ -5,9 +5,10 @@
 //   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
+//   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,6 +72,17 @@ for (const s of steps) {
   } else if (s.scheme !== undefined) {
     await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s.scheme }] });
     await sleep(300);
+  } else if (s.shot !== undefined) {
+    // a page still being attached answers "Not attached to an active page": retry until the step's deadline
+    let r;
+    for (;;) {
+      r = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: !!s.full });
+      if (r.result?.data || Date.now() >= deadline) break;
+      await sleep(200);
+    }
+    if (!r.result?.data) throw new Error("screenshot failed: " + JSON.stringify(r.error || r.result));
+    writeFileSync(s.shot, Buffer.from(r.result.data, "base64"));
+    values.push({ shot: s.shot });
   } else if (s.posts !== undefined) {
     while (posts.length < s.posts && Date.now() < deadline) await sleep(100);
   } else if (s.until !== undefined) {

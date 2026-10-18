@@ -6,6 +6,10 @@ the macOS keychain for Chrome's storage key (a dialog on the operator's screen).
 own session and its own temporary directory: on EVERY return (a normal exit with a surviving child, a timeout,
 an interrupt) the whole process group is killed and the directory, which holds the Chrome profile, is removed.
 The node drivers also exit when their parent dies, which covers a pytest killed outright.
+
+THIS IS THE WAY to take a cockpit screenshot (or drive any page): ``python tests/_page_drive_run.py <chrome> <url>
+<steps.json> [--timeout N]`` with a ``{"shot": "<abs path.png>"}`` step. Never write an ad-hoc Chrome launcher for a
+shot: one that skips this reaping leaves a headless Chrome under PID 1 that macOS then routes new-window requests to.
 """
 from __future__ import annotations
 
@@ -71,3 +75,31 @@ def _keep_partial(exc: BaseException | None, out: object, err: object) -> None:
     """Keep what the driver printed before it died on the exception that is re-raised (a timeout carries it already)."""
     if isinstance(exc, subprocess.TimeoutExpired):
         exc.stdout, exc.stderr = out, err
+
+
+def main(args: Sequence[str]) -> int:
+    """CLI: run ``_page_drive.mjs`` under :func:`run`; its stdout and stderr pass through, its exit code is returned."""
+    import argparse
+    ap = argparse.ArgumentParser(description="drive a page in headless Chrome with the reaping runner")
+    ap.add_argument("chrome"); ap.add_argument("url"); ap.add_argument("steps")
+    ap.add_argument("--timeout", type=float, default=120)
+    ns = ap.parse_args(args)
+    node = shutil.which("node")
+    if not node:
+        print("node not found on PATH", file=sys.stderr)
+        return 127
+    driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_page_drive.mjs")
+    try:
+        r = run([node, driver, ns.chrome, ns.url, ns.steps], timeout=ns.timeout)
+    except subprocess.TimeoutExpired as e:
+        sys.stdout.write(e.stdout if isinstance(e.stdout, str) else "")
+        sys.stderr.write(e.stderr if isinstance(e.stderr, str) else "")
+        print(f"timed out after {ns.timeout}s", file=sys.stderr)
+        return 124
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    return r.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
