@@ -104,7 +104,8 @@ class _World:
     ("file:///srv/r.git", "file:///srv/r.git"),
     ("file:///srv/r.git/", "file:///srv/r.git"),
     ("FILE:///srv/R.git", "file:///srv/R.git"),
-    ("SSH://git@GitHub.com:22/org/repo.git", "ssh://git@github.com/org/repo.git"),
+    ("SSH://git@GitHub.com:22/org/repo.git", "ssh://git@github.com:22/org/repo.git"),
+    ("SSH://git@GitHub.com/org/repo.git", "ssh://git@github.com/org/repo.git"),
     ("ssh://host:2222/x", "ssh://host:2222/x"),
     ("git@GitHub.com:org/repo.git", "git@github.com:org/repo.git"),
     ("host:/abs/r.git", "ssh://host/abs/r.git"),
@@ -280,7 +281,8 @@ def test_d_callers_git_env_has_no_effect(world, monkeypatch):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert push.git_env()["GIT_TERMINAL_PROMPT"] == "0"
-    assert not [k for k in push.git_env() if k.startswith("GIT_") and k != "GIT_TERMINAL_PROMPT"]
+    assert sorted(k for k in push.git_env() if k.startswith("GIT_")) == [
+        "GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT"]
     res = world.run()
     assert res.ok and world.remote_sha("refs/heads/claude/x") == tip
     assert world.git(f"--git-dir={world.evil}", "for-each-ref", env={"PATH": os.environ["PATH"]}).stdout == ""
@@ -382,9 +384,10 @@ def test_journal_has_intent_before_and_outcome_after(world):
 def test_receipt_failure_leaves_the_journal(world):
     def boom(rec):
         raise OSError("disk full")
-    with pytest.raises(OSError):
+    with pytest.raises(push.PushRecordIncomplete, match="receipt: OSError: disk full") as ei:
         push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
                      refusal=world.refusal, receipt=boom)
+    assert ei.value.result.ok and ei.value.result.status == "new"
     key = push.repo_key(str(world.proj))
     states = [json.loads(x)["state"] for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
     assert states == ["intent", "done"]
@@ -433,3 +436,286 @@ def test_push_argv_is_the_only_shape():
         assert bad not in flat
     cs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
     assert cs == list(push.PUSH_CONFIG)
+
+
+# --- round 2: the trust boundary (L3 r1) ------------------------------------------------------------------------
+# Each test below was run against the round-1 code first; the run report says which ones failed there.
+
+def _secret(world):
+    """A repository OUTSIDE the workspace with a commit the agent must not be able to push."""
+    sec = world.root / "secret"
+    world.git("init", "-q", "-b", "main", sec)
+    (sec / "s.txt").write_text("outside the workspace\n")
+    world.git("-C", sec, "add", "s.txt")
+    world.git("-C", sec, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "secret")
+    return sec, world.git("-C", sec, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.mark.parametrize("how", ["alternates", "http-alternates", "commondir", "objects-link", "object-file-link"])
+def test_d1_objects_from_outside_the_workspace_refuse(world, how):
+    sec, s = _secret(world)
+    gd = world.proj / ".git"
+    objs = gd / "objects"
+    if how == "alternates":
+        (objs / "info" / "alternates").write_text(f"{sec}/.git/objects\n")
+        world.git("-C", world.proj, "update-ref", "refs/heads/claude/s", s)
+    elif how == "http-alternates":
+        (objs / "info" / "http-alternates").write_text("https://example.invalid/objects\n")
+        world.git("-C", world.proj, "branch", "claude/s")
+    elif how == "commondir":
+        # an outside repository of the user's that happens to carry a matching branch
+        world.git("-C", sec, "branch", "claude/s")
+        (gd / "commondir").write_text(f"{sec}/.git\n")
+    elif how == "objects-link":
+        world.git("-C", world.proj, "branch", "claude/s")
+        os.rename(objs, gd / "objects.real")
+        objs.symlink_to(gd / "objects.real")
+    else:
+        # every loose object of the secret repo, symlinked into the agent's object store by name
+        for f in (sec / ".git" / "objects").glob("??/*"):
+            d = objs / f.parent.name
+            d.mkdir(exist_ok=True)
+            if not (d / f.name).exists():
+                (d / f.name).symlink_to(f)
+        world.git("-C", world.proj, "update-ref", "refs/heads/claude/s", s)
+    with pytest.raises(push.PushRefused, match="object store|commondir"):
+        world.run("claude/s")
+    assert world.remote_sha("refs/heads/claude/s") is None
+    assert world.receipts == []
+
+
+def _promisor(world):
+    srv = world.root / "srv"
+    world.git("init", "-q", "-b", "main", srv)
+    (srv / "f.txt").write_text("hello\n")
+    world.git("-C", srv, "add", "f.txt")
+    world.git("-C", srv, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "one")
+    world.git("-C", srv, "config", "uploadpack.allowFilter", "true")
+    pc = world.ws / "pc"
+    world.git("clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{srv}", pc)
+    world.git("-C", pc, "branch", "claude/p", "main")
+    world.git("-C", pc, "config", "remote.origin.url", "ssh://nowhere.invalid/x")
+    world.git("-C", pc, "config", "core.sshCommand", world.marker("lazy-ssh"))
+    return pc
+
+
+def test_d2_a_partial_clone_refuses_and_lazy_fetch_is_off(world):
+    pc = _promisor(world)
+    assert list((pc / ".git" / "objects" / "pack").glob("*.promisor"))
+    with pytest.raises(push.PushRefused, match="partial clone"):
+        world.run("claude/p", repo=pc)
+    # the config alone refuses too (the .promisor pack file removed)
+    for p in (pc / ".git" / "objects" / "pack").glob("*.promisor"):
+        p.unlink()
+    with pytest.raises(push.PushRefused, match="partial clone"):
+        world.run("claude/p", repo=pc)
+    assert world.fired() == []
+    assert push.git_env()["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def test_d2_a_callers_lazy_fetch_switch_is_overridden(world, monkeypatch):
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
+    assert push.git_env()["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def test_toctou_a_repo_swapped_under_the_lock_refuses(world):
+    sec, s = _secret(world)
+    world.git("-C", sec, "branch", "claude/x")
+
+    def swap(**kw):
+        os.rename(world.proj, world.ws / "proj.orig")
+        world.proj.symlink_to(sec)
+        return world.refusal(**kw)
+    with pytest.raises(push.PushRefused, match="changed"):
+        world.run(refusal=swap)
+    assert world.remote_sha("refs/heads/claude/x") is None
+
+
+def test_toctou_a_git_dir_swapped_under_the_lock_refuses(world):
+    sec, s = _secret(world)
+    world.git("-C", sec, "branch", "claude/x")
+
+    def swap(**kw):
+        os.rename(world.proj / ".git", world.proj / "git.orig")
+        (world.proj / ".git").symlink_to(sec / ".git")
+        return world.refusal(**kw)
+    with pytest.raises(push.PushRefused, match="changed|not a directory"):
+        world.run(refusal=swap)
+    assert world.remote_sha("refs/heads/claude/x") is None
+
+
+def test_path_a_planted_git_on_path_never_runs(world, monkeypatch):
+    fake = world.root / "fakebin"
+    fake.mkdir()
+    g = fake / "git"
+    g.write_text(f"#!/bin/sh\necho \"$@\" >> {world.marks}/fake-git.fired\nexit 0\n")
+    g.chmod(0o755)
+    path = os.environ["PATH"]
+    tip = world.tip()
+    monkeypatch.setenv("PATH", f"{fake}:{path}")
+    res = world.run()
+    monkeypatch.setenv("PATH", path)   # the test's own git calls use PATH
+    assert res.ok and world.remote_sha("refs/heads/claude/x") == tip
+    assert world.fired() == []
+
+
+def test_path_and_loader_env_are_fixed(world, monkeypatch):
+    for k in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+              "DYLD_INSERT_LIBRARIES"):
+        monkeypatch.setenv(k, str(world.marks))
+    monkeypatch.setenv("PATH", f"{world.marks}:/usr/bin")
+    env = push.git_env()
+    assert env["PATH"] == push.TRUSTED_PATH
+    assert not [k for k in env if k.startswith(("LD_", "DYLD_"))]
+    assert env["HOME"] == str(world.home)
+
+
+def test_path_a_git_not_owned_by_root_refuses(world, monkeypatch):
+    mine = world.root / "mygit"
+    mine.write_text("#!/bin/sh\nexit 0\n")
+    mine.chmod(0o755)
+    monkeypatch.setattr(push, "GIT_CANDIDATES", (str(mine),))
+    with pytest.raises(push.PushRefused, match="root-owned git"):
+        world.run()
+    monkeypatch.setattr(push, "GIT_CANDIDATES", ("/nonexistent/git",))
+    with pytest.raises(push.PushRefused, match="root-owned git"):
+        world.run()
+    assert world.remote_sha("refs/heads/claude/x") is None
+
+
+def test_ssh_explicit_port_22_is_kept():
+    assert push.canonical_remote("ssh://git@host:22/r.git") == "ssh://git@host:22/r.git"
+    assert push.canonical_remote("ssh://git@host/r.git") == "ssh://git@host/r.git"
+    assert push.canonical_remote("ssh://git@host:22/r.git") != push.canonical_remote("ssh://git@host/r.git")
+
+
+@pytest.mark.parametrize("url", ["host:/~bob/x", "u@host:/~/x", "host:/~"])
+def test_d6_scp_absolute_tilde_refuses(url):
+    with pytest.raises(ValueError, match="~"):
+        push.canonical_remote(url)
+
+
+def test_journal_writes_the_whole_record_through_short_writes(world, monkeypatch):
+    real_write = os.write
+
+    def one_byte(fd, data):
+        return real_write(fd, bytes(data[:1]))
+    (world.lhome / "push").mkdir()
+    monkeypatch.setattr(push.os, "write", one_byte)
+    push._journal(world.lhome, "k", {"state": "intent", "x": "y" * 50})
+    monkeypatch.undo()
+    lines = (world.lhome / "push" / "k.journal.jsonl").read_text().splitlines()
+    assert [json.loads(x) for x in lines] == [{"state": "intent", "x": "y" * 50}]
+
+
+def test_journal_a_write_that_makes_no_progress_raises(world, monkeypatch):
+    (world.lhome / "push").mkdir()
+    monkeypatch.setattr(push.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError):
+        push._journal(world.lhome, "k", {"state": "intent"})
+
+
+def test_journal_fsyncs_the_directory_when_it_creates_the_file(world, monkeypatch):
+    (world.lhome / "push").mkdir()
+    real_fsync, dirs = os.fsync, []
+
+    def spy(fd):
+        import stat as st
+        if st.S_ISDIR(os.fstat(fd).st_mode):
+            dirs.append(fd)
+        return real_fsync(fd)
+    monkeypatch.setattr(push.os, "fsync", spy)
+    push._journal(world.lhome, "k", {"state": "intent"})
+    assert len(dirs) == 1
+    push._journal(world.lhome, "k", {"state": "done"})
+    assert len(dirs) == 1
+
+
+def test_an_intent_journal_failure_aborts_before_the_push(world, monkeypatch):
+    def fail(home, key, record):
+        raise OSError("EIO")
+    monkeypatch.setattr(push, "_journal", fail)
+    with pytest.raises(OSError):
+        world.run()
+    assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []
+
+
+def test_d4_a_done_journal_failure_still_reaches_the_receipt(world, monkeypatch):
+    real = push._journal
+
+    def fail_done(home, key, record):
+        if record["state"] == "done":
+            raise OSError("disk full")
+        return real(home, key, record)
+    monkeypatch.setattr(push, "_journal", fail_done)
+    tip = world.tip()
+    with pytest.raises(push.PushRecordIncomplete, match="push completed") as ei:
+        world.run()
+    assert world.remote_sha("refs/heads/claude/x") == tip
+    assert [r["status"] for r in world.receipts] == ["new"]
+    assert ei.value.result.status == "new"
+
+
+def test_d5_a_push_that_timed_out_reaches_the_receipt_as_unknown(world, monkeypatch):
+    real = push._git
+
+    def slow_push(argv, **kw):
+        r = real(argv, **kw)
+        if "push" in argv:
+            raise subprocess.TimeoutExpired(argv, 600)
+        return r
+    monkeypatch.setattr(push, "_git", slow_push)
+    with pytest.raises(push.PushOutcomeUnknown):
+        world.run()
+    assert [r["status"] for r in world.receipts] == ["unknown"]
+    key = push.repo_key(str(world.proj))
+    lines = [json.loads(x) for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert [(x["state"], x.get("status")) for x in lines] == [("intent", None), ("done", "unknown")]
+
+
+def test_d5_unknown_when_git_cannot_even_start(world, monkeypatch):
+    real = push._git
+
+    def nogit(argv, **kw):
+        if "push" in argv:
+            raise OSError("exec failed")
+        return real(argv, **kw)
+    monkeypatch.setattr(push, "_git", nogit)
+    with pytest.raises(push.PushOutcomeUnknown):
+        world.run()
+    assert world.receipts[-1]["status"] == "unknown"
+
+
+def test_d7_a_branch_naming_a_tag_object_pushes_the_commit_in_the_receipt(world):
+    tip = world.tip()
+    world.git("-C", world.proj, "-c", "user.name=t", "-c", "user.email=t@x", "tag", "-a", "-m", "t", "tg", tip)
+    tag = world.git("-C", world.proj, "rev-parse", "tg").stdout.strip()
+    # git's update-ref refuses a tag on a branch; the agent writes the ref file itself
+    (world.proj / ".git" / "refs" / "heads" / "claude" / "t").write_text(tag + "\n")
+    res = world.run("claude/t")
+    assert res.new_sha == tip
+    assert world.remote_sha("refs/heads/claude/t") == tip
+    assert world.receipts[-1]["new_sha"] == tip
+
+
+def test_sha256_repositories_refuse_by_name(world):
+    s2 = world.ws / "s2"
+    world.git("init", "-q", "--object-format=sha256", "-b", "claude/z", s2)
+    world.git("-C", s2, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "--allow-empty", "-m", "z")
+    with pytest.raises(push.PushRefused, match="SHA-256 repositories are not supported yet"):
+        world.run("claude/z", repo=s2)
+
+
+def test_toctou_a_different_real_repo_at_the_same_path_refuses(world):
+    """No symlink at all: another repository renamed onto the checked path. Only the (device, inode)
+    comparison catches this one."""
+    sec, s = _secret(world)
+    world.git("-C", sec, "branch", "claude/x")
+
+    def swap(**kw):
+        os.rename(world.proj, world.ws / "proj.orig")
+        os.rename(sec, world.proj)
+        return world.refusal(**kw)
+    with pytest.raises(push.PushRefused, match="a different repository"):
+        world.run(refusal=swap)
+    assert world.remote_sha("refs/heads/claude/x") is None

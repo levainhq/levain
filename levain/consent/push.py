@@ -19,10 +19,34 @@ or ``.git/hooks`` is executed by levain. The branch tip is FETCHED out of the ag
 bare mirror (a fetch runs the source's ``upload-pack``, which runs no hook and honours
 ``uploadpack.packObjectsHook`` only from protected config; measured on Apple git 2.50.1, case c of
 ``tests/test_consent_push_exec.py``), and the push runs from the mirror, whose config levain rewrites on every
-use. Every ``GIT_*`` variable of the caller is removed from git's environment. What it does NOT confine,
-stated: the operator's system and global git config apply (credential helpers live there, and an edit of
-``~/.gitconfig`` is outside every workspace), except that a ``url.*.insteadOf`` / ``pushInsteadOf`` that would
-rewrite the pinned URL refuses the push; ``git`` is the one on the server's ``PATH``.
+use. Every ``GIT_*`` variable of the caller is removed from git's environment (then ``GIT_TERMINAL_PROMPT=0``,
+``GIT_NO_LAZY_FETCH=1`` and ``GIT_NO_REPLACE_OBJECTS=1`` are set by levain), and so are the loader's
+``LD_*`` / ``DYLD_*`` search variables. ``git`` is never looked up on ``PATH``: it is :data:`GIT_CANDIDATES`
+(``/usr/bin/git``), refused unless it and its directory are root-owned and not group- or world-writable, and
+git's own children (``ssh``, a credential helper) see the fixed :data:`TRUSTED_PATH`.
+
+The agent's object store is read only when it is its own: ``.git/objects`` a real directory with no symlink
+anywhere under it, no ``objects/info/alternates`` or ``http-alternates``, no ``.git/commondir``, not a partial
+clone (``extensions.partialclone``, a ``remote.<n>.promisor``, or an ``objects/pack/*.promisor`` file refuses),
+and not SHA-256 (refused by name: the mirror is SHA-1). That check runs twice: before the lock, and again under
+it immediately before the fetch, which must find the same directories (same realpath, device and inode).
+
+What it does NOT confine, stated: the operator's system and global git config apply (credential helpers live
+there, and an edit of ``~/.gitconfig`` is outside every workspace), except that a ``url.*.insteadOf`` /
+``pushInsteadOf`` that would rewrite the pinned URL refuses the push.
+
+Known edges (one line each, not built against):
+
+- a swap of the repository or its ``.git`` between the under-lock check and git opening the directory is not
+  closed (git takes a path, not a descriptor); the window is one ``git fetch`` start.
+- a HARD link the agent makes inside its object store to an object file outside it is not detected (a hard
+  link is indistinguishable from the file); the agent must be able to name that file to make one.
+- a credential helper or ``core.sshCommand`` in the operator's own config named by a bare command that lives
+  outside :data:`TRUSTED_PATH` (a Homebrew ``gh``, say) is not found; give it an absolute path. The system
+  config's ``osxkeychain`` helper resolves (git's exec path), measured on Apple git 2.50.1.
+- on macOS ``/usr/bin/git`` is the ``xcrun`` shim: it picks the developer directory from ``xcode-select``
+  (root's) and ``DEVELOPER_DIR`` (dropped from the environment by the allowlist), and keeps a per-user lookup
+  cache (``xcrun_db``) in the user's temp directory, which levain does not inspect.
 
 Stdlib only.
 """
@@ -44,8 +68,14 @@ from typing import Any
 
 from levain.launch import child_env
 
-__all__ = ["MIRROR_CONFIG", "PUSH_CONFIG", "PushRefused", "PushResult", "branch_matches", "branch_problem",
-           "canonical_remote", "execute", "git_env", "push_argv", "repo_key"]
+__all__ = ["GIT_CANDIDATES", "MIRROR_CONFIG", "PUSH_CONFIG", "TRUSTED_PATH", "PushOutcomeUnknown",
+           "PushRecordIncomplete", "PushRefused", "PushResult", "branch_matches", "branch_problem",
+           "canonical_remote", "execute", "git_bin", "git_env", "push_argv", "repo_key"]
+
+# The git levain runs, by absolute path; the first that passes :func:`git_bin`'s ownership test is used.
+GIT_CANDIDATES: tuple[str, ...] = ("/usr/bin/git",)
+# git's children (ssh, credential helpers, the xcrun shim's lookups) search only these.
+TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 # The config flags of every push (§3 step 3), plus core.abbrev=no so --porcelain reports full object names
 # (git abbreviates them to 7 by default, which a receipt cannot carry).
@@ -62,7 +92,9 @@ _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
 _TRANSPORT = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
 _HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
 _USER = re.compile(r"^[A-Za-z0-9._~][A-Za-z0-9._~-]*$")
-_DEFAULT_PORT = {"ssh": "22", "https": "443"}
+# Only https drops its default port. An explicit ssh :22 is kept: with ``Host h / Port 2222`` in the ssh config,
+# ``ssh://h:22/r`` and ``ssh://h/r`` reach different ports, so the two spellings are not one destination.
+_DEFAULT_PORT = {"https": "443"}
 _SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
 
@@ -70,11 +102,33 @@ class PushRefused(ValueError):
     """A push levain will not run. Raised before any effect on the remote; the message says why."""
 
 
+class PushOutcomeUnknown(RuntimeError):
+    """``git push`` started and did not report (it timed out, or could not be run or read): the remote may or
+    may not have the ref. The journal's ``done`` line and the receipt both carry status ``"unknown"`` (as far
+    as each could be written; ``record_errors`` names any that failed). ``result`` is that record."""
+
+    def __init__(self, msg: str, result: "PushResult", record_errors: list[str]):
+        super().__init__(msg)
+        self.result = result
+        self.record_errors = record_errors
+
+
+class PushRecordIncomplete(RuntimeError):
+    """The push ran and git reported on it (``result``), but the ``done`` journal line or the receipt could not
+    be written. The effect on the remote is what ``result`` says; ``record_errors`` names what failed."""
+
+    def __init__(self, msg: str, result: "PushResult", record_errors: list[str]):
+        super().__init__(msg)
+        self.result = result
+        self.record_errors = record_errors
+
+
 @dataclass(frozen=True)
 class PushResult:
     """What one granted push did. ``ok`` is git's verdict on the one ref: ``status`` is ``"new"`` (a new
     branch), ``"fast-forward"``, ``"up-to-date"``, ``"rejected"`` (git refused it: non-fast-forward, or the
-    remote's own rules) or ``"error"`` (git failed without a ref line)."""
+    remote's own rules), ``"error"`` (git failed without a ref line) or ``"unknown"`` (git did not report; only
+    in a :class:`PushOutcomeUnknown`)."""
 
     ok: bool
     status: str
@@ -122,10 +176,12 @@ def _host_port(hostport: str, scheme: str) -> str:
 def canonical_remote(url: str) -> str:
     """The one spelling of a remote URL a push grant pins. Accepted: ``ssh://[user@]host[:port]/path``, scp-form
     ``[user@]host:path``, ``https://[user@]host[:port]/path``, ``file:///abs/path``. Scheme and host are
-    lower-cased; ports 22 (ssh) and 443 (https) dropped; one trailing ``/`` dropped; ``.git`` kept as written.
-    An scp-form URL with an absolute path becomes ``ssh://[user@]host/path`` (git sends the same path either
-    way); one with a relative path STAYS scp-form, because ``ssh://host/path`` would name ``/path`` on the server
-    while ``host:path`` names it relative to the login directory. Raises :class:`ValueError` naming why for:
+    lower-cased; port 443 (https) dropped, an explicit ssh port (22 included) kept; one trailing ``/`` dropped;
+    ``.git`` kept as written. An scp-form URL with an absolute path becomes ``ssh://[user@]host/path`` (git sends
+    the same path either way), except one whose first segment starts with ``~``, which is refused (git expands
+    ``ssh://host/~u/x`` server-side but sends scp-form ``host:/~u/x`` literally); one with a relative path STAYS
+    scp-form, because ``ssh://host/path`` would name ``/path`` on the server while ``host:path`` names it
+    relative to the login directory. Raises :class:`ValueError` naming why for:
     ``<transport>::`` (ext, fd, remote helpers), any other scheme, userinfo carrying a password, a query or
     fragment, ``%``-escapes, whitespace or control characters, a relative path, and an empty, ``.`` or ``..``
     path segment."""
@@ -192,6 +248,9 @@ def canonical_remote(url: str) -> str:
     if path.startswith("/"):
         if p := _path_problem(path):
             raise ValueError(p)
+        if path.startswith("/~"):
+            raise ValueError("an scp-form absolute path whose first segment starts with '~' names a different "
+                             "server path as ssh://; give the ssh:// URL")
         return f"ssh://{user + '@' if user else ''}{host}{path}"
     if path.startswith("-"):
         raise ValueError("the remote path begins with '-'")
@@ -205,8 +264,7 @@ def canonical_remote(url: str) -> str:
 
 
 def _ref_format_ok(name: str) -> bool:
-    r = subprocess.run(["git", "check-ref-format", "--branch", name], cwd="/", env=git_env(),
-                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    r = _git(["git", "check-ref-format", "--branch", name], timeout=30)
     return r.returncode == 0 and r.stdout.strip() == name
 
 
@@ -254,11 +312,44 @@ def git_env() -> dict[str, str]:
     """git's environment for a granted push: :func:`levain.launch.child_env` (the allowlist; ``HOME`` and
     ``SSH_AUTH_SOCK`` are on it, so the user's own credentials work) with EVERY ``GIT_*`` name removed, so a
     caller's ``GIT_DIR``, ``GIT_CONFIG_COUNT``/``KEY_n``/``VALUE_n``, ``GIT_SSH_COMMAND`` and the rest mean
-    nothing; then ``GIT_TERMINAL_PROMPT=0`` (levain's own value: a push from a server with no terminal must
-    fail, never hang on a prompt)."""
-    env = {k: v for k, v in child_env().items() if not k.upper().startswith("GIT_")}
+    nothing; the loader's ``LD_*`` / ``DYLD_*`` variables removed too, and ``PATH`` replaced by
+    :data:`TRUSTED_PATH` (an agent-writable directory on the server's own ``PATH``, a workspace virtualenv say,
+    must not supply git's ``ssh`` or a library). Then levain's own values: ``GIT_TERMINAL_PROMPT=0`` (a push from
+    a server with no terminal must fail, never hang on a prompt), ``GIT_NO_LAZY_FETCH=1`` (a partial clone's
+    upload-pack must never fetch a missing object through the agent's remote config; Apple git 2.50.1 was
+    measured to default to this inside upload-pack, an older git may not) and ``GIT_NO_REPLACE_OBJECTS=1``."""
+    env = {k: v for k, v in child_env().items()
+           if not k.upper().startswith(("GIT_", "LD_", "DYLD_"))}
+    env["PATH"] = TRUSTED_PATH
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     return env
+
+
+def _root_owned(path: str, *, want_dir: bool) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    kind = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+    return kind and st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def git_bin() -> str:
+    """The absolute path of the git levain runs: the first of :data:`GIT_CANDIDATES` that, after resolving
+    links, is a regular file owned by root and not group- or world-writable, in a directory of the same kind
+    (and, for a link, the link's own directory too). Never a ``PATH`` lookup. Raises :class:`PushRefused`
+    naming the candidates when none qualifies."""
+    for c in GIT_CANDIDATES:
+        if not os.path.isabs(c):
+            continue
+        real = os.path.realpath(c)
+        dirs = {os.path.dirname(real), os.path.dirname(os.path.normpath(c))}
+        if _root_owned(real, want_dir=False) and all(_root_owned(d, want_dir=True) for d in dirs):
+            return real
+    raise PushRefused(f"no root-owned git at {', '.join(GIT_CANDIDATES)} (owned by root, not group- or "
+                      "world-writable, in a directory of the same kind); levain never runs a git found on PATH")
 
 
 def repo_key(realpath: str) -> str:
@@ -267,10 +358,81 @@ def repo_key(realpath: str) -> str:
 
 def push_argv(mirror: Path, remote: str, branch: str) -> list[str]:
     """The only push argv levain builds: no force, no delete, no tags, same-name ``refs/heads/<b>``."""
-    argv = ["git", f"--git-dir={mirror}"]
+    argv = ["git", f"--git-dir={mirror}"]   # argv[0] is replaced by :func:`git_bin` when it runs
     for c in PUSH_CONFIG:
         argv += ["-c", c]
     return argv + ["push", "--no-verify", "--porcelain", remote, f"{SRC_REF}:refs/heads/{branch}"]
+
+
+def _walk_objects(objs: str) -> None:
+    """Refuse a symlink anywhere under the object store (a fan-out directory, a loose object, a pack), and a
+    ``.promisor`` pack file."""
+    stack = [objs]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError as exc:
+            raise PushRefused(f"could not read the object store at {d}: {exc.strerror}") from None
+        for e in entries:
+            if e.is_symlink():
+                raise PushRefused(f"the object store holds a symlink ({e.path}); levain reads only objects the "
+                                  "repository holds itself")
+            if e.is_dir(follow_symlinks=False):
+                stack.append(e.path)
+            elif e.name.endswith(".promisor"):
+                raise PushRefused(f"the repository is a partial clone ({e.path}); a partial clone is not pushed")
+
+
+def _config_problem(gitdir: str) -> str | None:
+    """Why the repository's own config refuses (a partial clone, SHA-256), read as a file: nothing in it runs."""
+    for name in ("config", "config.worktree"):
+        f = os.path.join(gitdir, name)
+        if not os.path.lexists(f):
+            continue
+        r = _git(["git", "config", "--file", f, "--includes", "-z", "--get-regexp",
+                  r"^(extensions\.(partialclone|objectformat)|remote\..*\.promisor)$"], timeout=30)
+        if r.returncode not in (0, 1):
+            return f"could not read {f}: {r.stderr.strip()[-200:]}"
+        for item in r.stdout.split("\0"):
+            key, _, value = item.partition("\n")
+            key, value = key.lower(), value.strip().lower()
+            if key == "extensions.objectformat" and value not in ("", "sha1"):
+                return ("SHA-256 repositories are not supported yet" if value == "sha256"
+                        else f"object format {value!r} is not supported")
+            if key == "extensions.partialclone" or (key.endswith(".promisor") and value not in ("false", "no",
+                                                                                              "off", "0")):
+                return f"the repository is a partial clone ({key} in {f}); a partial clone is not pushed"
+    return None
+
+
+def _repo_topology(repo_path: str | os.PathLike) -> tuple[str, tuple]:
+    """(realpath, identity) of a repository levain will read, or :class:`PushRefused`. The identity is the
+    (device, inode) of the repository, its ``.git`` and its ``.git/objects``, so a second call can tell a
+    swap."""
+    real = _repo_realpath(repo_path)
+    gitdir = os.path.join(real, ".git")
+    if os.path.lexists(os.path.join(gitdir, "commondir")):
+        raise PushRefused(f"{real}/.git/commondir exists: a repository sharing another's refs and object store "
+                          "is refused")
+    objs = os.path.join(gitdir, "objects")
+    try:
+        ost = os.lstat(objs)
+    except OSError:
+        raise PushRefused(f"{real}/.git has no object store") from None
+    if not stat.S_ISDIR(ost.st_mode):
+        raise PushRefused(f"{real}/.git/objects is not a real directory: levain reads only the repository's own "
+                          "object store")
+    for alt in ("alternates", "http-alternates"):
+        if os.path.lexists(os.path.join(objs, "info", alt)):
+            raise PushRefused(f"the object store borrows objects (objects/info/{alt}); levain reads only the "
+                              "repository's own objects")
+    _walk_objects(objs)
+    if problem := _config_problem(gitdir):
+        raise PushRefused(problem)
+    ident = tuple((s.st_dev, s.st_ino) for s in (os.lstat(real), os.lstat(gitdir), ost))
+    return real, ident
 
 
 def _repo_realpath(repo_path: str | os.PathLike) -> str:
@@ -311,8 +473,11 @@ def _private_dir(path: Path) -> None:
 
 
 def _git(argv: list[str], *, timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, env=git_env(), cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          timeout=timeout)
+    """Run ``argv`` (``argv[0]`` is ``"git"``) as :func:`git_bin`, in :func:`git_env`, from ``/``."""
+    if argv[0] != "git":
+        raise ValueError("levain runs only git here")
+    return subprocess.run([git_bin(), *argv[1:]], env=git_env(), cwd="/", stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=timeout)
 
 
 def _mirror(levain_home: Path, grant_id: str, key: str) -> Path:
@@ -361,13 +526,32 @@ def _rewrites(mirror: Path, remote: str) -> list[str]:
 
 
 def _journal(levain_home: Path, key: str, record: dict[str, Any]) -> None:
+    """Append ``record`` as one line, whole (a short write is continued; a write that makes no progress
+    raises), fsync it, and on the journal's first creation fsync its directory too."""
     path = levain_home / "push" / f"{key}.journal.jsonl"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
     try:
-        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(path, flags)
+        created = False
+    try:
+        data = memoryview((json.dumps(record, sort_keys=True) + "\n").encode())
+        while data:
+            n = os.write(fd, data)
+            if n <= 0:
+                raise OSError(f"journal write to {path} made no progress")
+            data = data[n:]
         os.fsync(fd)
     finally:
         os.close(fd)
+    if created:
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 def _parse_porcelain(stdout: str, dst: str) -> tuple[str, str | None, str]:
@@ -393,6 +577,22 @@ def _parse_porcelain(stdout: str, dst: str) -> tuple[str, str | None, str]:
 Refusal = Callable[..., "tuple[str, int] | str"]
 
 
+def _record(home: Path, key: str, result: PushResult, real: str,
+            receipt: Callable[[dict[str, Any]], Any]) -> list[str]:
+    """The ``done`` journal line, then the receipt, each attempted whatever the other did. Returns what failed
+    (empty when both were written)."""
+    errs = []
+    try:
+        _journal(home, key, {"state": "done", "at": time.time(), **result.to_dict()})
+    except Exception as exc:  # noqa: BLE001 - any failure here must still reach the receipt
+        errs.append(f"done journal: {type(exc).__name__}: {exc}")
+    try:
+        receipt({**result.to_dict(), "repo": real})
+    except Exception as exc:  # noqa: BLE001 - reported to the caller as a record error, never swallowed
+        errs.append(f"receipt: {type(exc).__name__}: {exc}")
+    return errs
+
+
 def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str, branch: str,
             levain_home: str | os.PathLike, refusal: Refusal,
             receipt: Callable[[dict[str, Any]], Any]) -> PushResult:
@@ -406,8 +606,12 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     ``<levain_home>/push/`` before the push and an outcome line after it, so a receipt write that fails after
     the effect leaves a record.
 
-    Raises :class:`PushRefused` for anything refused before the push. A rejection by git (non-fast-forward, a
-    protected branch) is a :class:`PushResult` with ``ok`` False: reported, never forced."""
+    Raises :class:`PushRefused` for anything refused before the push (an ``OSError`` writing the intent line
+    also aborts before it). A rejection by git (non-fast-forward, a protected branch) is a :class:`PushResult`
+    with ``ok`` False: reported, never forced. Once the push has started every path writes the ``done`` line and
+    calls ``receipt``, each attempted whatever the other did: a push that did not report (timeout, git could not
+    run) raises :class:`PushOutcomeUnknown` with status ``"unknown"``; a push that reported but whose done line
+    or receipt failed raises :class:`PushRecordIncomplete` carrying the result."""
     try:
         canon = canonical_remote(remote)
     except ValueError as exc:
@@ -417,7 +621,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     gid = grant.get("id") if isinstance(grant, dict) else None
     if not isinstance(gid, str):
         raise PushRefused("the grant carries no id")
-    real = _repo_realpath(repo_path)
+    real, ident = _repo_topology(repo_path)
     home = Path(os.path.abspath(os.fspath(levain_home)))
     if not os.path.isdir(home):
         raise PushRefused(f"levain home {home} is not a directory")
@@ -438,6 +642,14 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
             raise PushRefused(f"the covering grant is now {found_id}, not {gid}; ask again")
         # step 2: the tip, fetched out of the agent's repo into levain's mirror
         mirror = _mirror(home, gid, key)
+        # the topology again, immediately before git reads the repository: the same directories, or refuse
+        try:
+            again = _repo_topology(real)
+        except PushRefused as exc:
+            raise PushRefused(f"{real} changed while waiting for the lock: {exc}") from None
+        if again != (real, ident):
+            raise PushRefused(f"{real} changed while waiting for the lock (a different repository, .git or object "
+                              "store is at that path now)")
         f = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never",
                   "-c", "protocol.fd.allow=never", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
                   "--no-recurse-submodules", real, f"+refs/heads/{branch}:{SRC_REF}"])
@@ -447,13 +659,28 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         new = rp.stdout.strip()
         if rp.returncode or not _SHA.match(new):
             raise PushRefused(f"branch {branch} of {real} is not a commit")
+        # the private ref names the verified commit itself (a branch naming a tag object would push the tag)
+        u = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "update-ref", "--no-deref",
+                  SRC_REF, new])
+        if u.returncode:
+            raise PushRefused(f"could not pin the mirror's ref to {new}: {u.stderr.strip()[-200:]}")
         # step 3: the pin must mean the destination
         if hits := _rewrites(mirror, canon):
             raise PushRefused(f"the git config rewrites the pinned remote ({hits[0]}); a pin must mean the "
                               "destination")
         base = {"grant_id": gid, "grant_seq": seq, "remote": canon, "branch": branch, "repo": real, "new_sha": new}
         _journal(home, key, {"state": "intent", "at": time.time(), **base})
-        p = _git(push_argv(mirror, canon, branch))
+        # from here on the remote may change: every path reaches the receipt
+        try:
+            p = _git(push_argv(mirror, canon, branch))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            result = PushResult(ok=False, status="unknown", grant_id=gid, grant_seq=seq, remote=canon,
+                                branch=branch, old_sha=None, new_sha=new, exit=-1,
+                                detail=f"git push did not report: {type(exc).__name__}: {exc}"[:400])
+            errs = _record(home, key, result, real, receipt)
+            raise PushOutcomeUnknown(f"the push of {branch} to {canon} may or may not have landed ({result.detail})"
+                                     + (f"; record errors: {'; '.join(errs)}" if errs else ""),
+                                     result, errs) from exc
         status, old, detail = _parse_porcelain(p.stdout, f"refs/heads/{branch}")
         if status == "error":
             detail = (p.stderr.strip() or p.stdout.strip())[-400:]
@@ -462,9 +689,10 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
             old = new
         result = PushResult(ok=ok, status=status, grant_id=gid, grant_seq=seq, remote=canon, branch=branch,
                             old_sha=old, new_sha=new, exit=p.returncode, detail=detail)
-        _journal(home, key, {"state": "done", "at": time.time(), **result.to_dict()})
-        # step 4: the receipt (policy head and the store are the caller's)
-        receipt({**result.to_dict(), "repo": real})
+        # step 4: the done line and the receipt (policy head and the store are the caller's)
+        if errs := _record(home, key, result, real, receipt):
+            raise PushRecordIncomplete(f"the push completed ({status}) but its record is incomplete: "
+                                       f"{'; '.join(errs)}", result, errs)
         return result
     finally:
         os.close(lock_fd)
