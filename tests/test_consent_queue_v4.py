@@ -658,6 +658,37 @@ def test_a_raw_reorder_of_decided_at_voids_never_revives(queue, keys, clock):
     assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
 
 
+@pytest.mark.parametrize("first,second,wins", [
+    (("b", "allow"), ("a", "deny"), None), (("a", "allow"), ("b", "deny"), None),
+    (("a", "deny"), ("b", "allow"), "b"), (("b", "deny"), ("a", "allow"), "a")])
+def test_the_latest_ruling_is_the_last_applied_within_one_second(queue, keys, first, second, wins):
+    """L3 r1 codex HIGH: two rulings in the same stamp second, in either order: the one the queue applied last
+    counts (its receipt's seq), never the request filed later."""
+    reqs = {"a": undecided(queue)[0], "b": undecided(queue)[0]}
+    _rule(queue, reqs[first[0]], keys["phone"], first[1])
+    _rule(queue, reqs[second[0]], keys["phone"], second[1])
+    got = queue.take_ruled_allow(*TAKE, cwd=CWD)
+    assert (got is None) if wins is None else (got.request_id == reqs[wins].id)
+
+
+def test_the_latest_ruling_survives_a_clock_stepping_backwards(queue, keys, clock):
+    a, _ = undecided(queue)
+    b, _ = undecided(queue)
+    clock.now = NOW + timedelta(minutes=5)
+    _rule(queue, a, keys["phone"])
+    clock.now = NOW                                                       # the clock steps back
+    _rule(queue, b, keys["phone"], "deny")                                # applied last: the deny counts
+    assert queue.take_ruled_allow(*TAKE, cwd=CWD) is None
+
+
+def test_claim_rulings_for_delivers_in_application_order_within_one_second(queue, keys):
+    a, _ = undecided(queue, "a")
+    b, _ = undecided(queue, "b")
+    _rule(queue, b, keys["phone"], "deny")
+    _rule(queue, a, keys["phone"])
+    assert [r.request_id for r in queue.claim_rulings_for("claude_code", "sess-1")] == [b.id, a.id]
+
+
 def test_only_the_take_delivers_a_ruled_allow(queue, keys):
     """L2 M2: decision() and mark_undecided() give a ruling as information (a Ruling, never a Decision), so the
     adapters' delivery check refuses it before and after the take."""

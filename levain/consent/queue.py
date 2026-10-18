@@ -1240,15 +1240,20 @@ class ConsentQueue:
         return payload
 
     _RULED_COLS = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
+    # the queue's own APPLICATION SEQUENCE of a ruling: the seq of its allowed/denied receipt (append-only,
+    # AUTOINCREMENT), never a clock (decided_at / signed_at tie within a stamp and step backwards) or rowid
+    _RULING_SEQ = ("(SELECT MAX(c.seq) FROM receipts c WHERE c.request_id = r.id "
+                   "AND c.state IN ('allowed','denied')) AS ruling_seq")
 
     def take_ruled_allow(self, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, *, cwd: str,
                          event: str | None = None) -> Decision | None:
         """The ONE delivery of a ruled allow: the :class:`Decision` that pre-authorises this call, taken once.
         The identical call is this agent, session, ``tool_name``, exact input (its digest) and ``cwd`` (the sealed
-        working directory). Of its ruled requests only the LATEST ruling counts (by when the queue applied it): it
+        working directory). Of its ruled requests only the LATEST ruling counts (the highest application sequence,
+        the seq of its ruling receipt; never a clock, which ties within a stamp and can step backwards): it
         must be an allow, not yet taken, re-verified against a fresh replay, applied less than
         :data:`RULED_ALLOW_LAPSE` ago and less than that after it was signed, and no other ruling on the call may
-        carry a later signed ``signed_at`` (a raw reorder of ``decided_at`` then voids, never revives). So a later
+        carry a later signed ``signed_at`` (a tamper bound only: it can void, never revive). So a later
         deny voids every earlier allow not yet taken, and two allows give one run. The take is recorded in the
         same write transaction; a second take returns ``None``. A cheap read-only check runs first: a call with no
         untaken ruled allow costs no replay and no write lock."""
@@ -1266,12 +1271,12 @@ class ConsentQueue:
         with self._write() as conn:
             now = _now_utc(self._clock)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
-            cur = conn.execute(f"SELECT {self._RULED_COLS} " + where + " AND state IN ('allowed','denied') "
-                               "ORDER BY decided_at DESC, rowid DESC", key)
+            cur = conn.execute(f"SELECT {self._RULED_COLS}, {self._RULING_SEQ} " + where +
+                               " AND state IN ('allowed','denied') ORDER BY ruling_seq DESC", key)
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, raw)) for raw in cur.fetchall()]
-            if not rows or rows[0]["state"] != "allowed":
-                return None
+            if not rows or rows[0]["state"] != "allowed" or any(type(r["ruling_seq"]) is not int for r in rows):
+                return None                          # a ruled row with no ruling receipt: fail closed
             latest = rows[0]
             if conn.execute("SELECT 1 FROM ruled_takes WHERE request_id = ?", (latest["id"],)).fetchone():
                 return None
@@ -1290,7 +1295,7 @@ class ConsentQueue:
                 rec = self._stored_record(other)
                 try:
                     if rec is not None and parse_stamp(rec.get("signed_at")) > signed:
-                        return None                  # a ruling signed later sorts earlier: fail closed
+                        return None                  # applied earlier yet signed later: fail closed
                 except (ConsentError, TypeError):
                     continue
             conn.execute("INSERT INTO ruled_takes (request_id, taken_at, event) VALUES (?, ?, ?)",
@@ -1300,7 +1305,8 @@ class ConsentQueue:
 
     def claim_rulings_for(self, agent: str, agent_session_id: str) -> list[Ruling]:
         """This session's rulings (allow and deny) whose text has not been delivered to it yet, oldest applied
-        first, each re-verified against a fresh replay, marked delivered in the SAME write transaction: a ruling's
+        first (by application sequence, the seq of the ruling's receipt), each re-verified against a fresh replay,
+        marked delivered in the SAME write transaction: a ruling's
         text reaches its session once. A ruling that no longer verifies is neither returned nor marked. What the
         agent is told is the caller's; a returned allow still runs only through :meth:`take_ruled_allow`."""
         with self._read() as conn:
@@ -1315,10 +1321,10 @@ class ConsentQueue:
         with self._write() as conn:
             stamp = utc_stamp(_now_utc(self._clock))
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
-            cur = conn.execute(f"SELECT {self._RULED_COLS} FROM requests r WHERE agent = ? AND agent_session_id = ? "
-                               "AND via = 'ruling' AND state IN ('allowed','denied') AND NOT EXISTS "
-                               "(SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) "
-                               "ORDER BY decided_at, rowid", (agent, agent_session_id))
+            cur = conn.execute(f"SELECT {self._RULED_COLS}, {self._RULING_SEQ} FROM requests r WHERE agent = ? "
+                               "AND agent_session_id = ? AND via = 'ruling' AND state IN ('allowed','denied') "
+                               "AND NOT EXISTS (SELECT 1 FROM ruling_deliveries d WHERE d.request_id = r.id) "
+                               "ORDER BY ruling_seq IS NULL, ruling_seq", (agent, agent_session_id))
             names = [d[0] for d in cur.description]
             for raw in cur.fetchall():
                 row = dict(zip(names, raw))
