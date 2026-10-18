@@ -6,7 +6,7 @@
 pip install levain
 ```
 
-Levain wraps Claude Code and Codex. It runs a consent queue: each agent's permission prompt reaches a hook that answers it only with a signed standing grant or a signed answer from you, and otherwise leaves the agent's own dialog to ask you (see *The consent queue* below). It gives your AI partner a memory that persists across sessions, an identity it grows instead of one you declare, and standing pressure against the habits its training rewards (see *What this is* below). The memory stays **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
+Levain wraps Claude Code and Codex. It does three things at once, and they only work together. It holds what the agent *does* to your authority: one consent queue across both agents, answered by a signed standing grant or a signed answer from you, from the desk or your phone. It lets the agent *become* someone over time: a memory that persists across sessions and an identity it grows from what it lives, instead of one you write into a system prompt. And it works on how the agent *behaves* turn by turn, with standing pressure against the habits its training rewards. The memory stays **yours**. It lives on your machine, in a store you own and can read, inspect and edit from outside any session. Nothing reaches long-term memory except through a path you govern, and a failed read shows up as *unknown* instead of a false all-clear.
 
 Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also ship, as is (see *Run a sovereign entity*).
 
@@ -18,13 +18,7 @@ Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also
 
 ## Why Levain
 
-If you run coding agents for real, you hit the permission prompt fast. The usual answers each cost something.
-
-**Babysit every prompt.** Every file write, every shell command, every tool call waits on you to click yes. One agent, that's annoying. I run 10 to 15 at a time, and the prompt is the first thing that broke: agents sat frozen for an hour at a dialog nobody was looking at.
-
-**Skip permissions.** It scales, and now the agent acts with your full authority and nothing checks what it does on your behalf before it does it.
-
-**Let a classifier decide, or write your own rules.** Claude Code's auto mode hands each call to a second model that judges whether it's safe. For a lot of developers that's as much friction as babysitting, sometimes more, because its refusals land on work you already meant to allow. Well-tuned custom permission rules get the friction exactly where you want it. But the prompts that are left still only reach you at the terminal, or on your phone if you turn on Remote Control, which routes your session through Anthropic's servers to the Claude app, something plenty of people and companies won't allow. And however good the rules are, Claude Code can log each decision and whether a rule, a hook or you made it, but nothing signs that record, so it can't prove who approved what.
+If you run coding agents for real, you hit the permission prompt fast, and every usual answer costs you something. Babysit every prompt and the agents sit frozen at a dialog nobody's looking at. I run 10 to 15 at a time, and that's the first thing that broke. Skip permissions and the agent acts with your full authority while nothing checks it first. Hand it to a classifier or tune your own rules and you get closer, but what's left still only reaches you at the terminal (or through a vendor's servers to your phone), and nothing signs the record of who approved what.
 
 Levain is the option that doesn't make you pick. Signed grants answer the routine. In away mode, everything else waits for your signed decision, at your desk or on your phone. Every answer levain gives, yours or a grant's, is on the record. It's one queue for Claude Code and Codex, not one per vendor. How it works, and what it does not cover: *The consent queue*.
 
@@ -58,6 +52,36 @@ It packages these, grouped by what they govern:
 **Getting started**
 
 - **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
+
+## Where the machine decides, and where you do
+
+The question underneath all of this isn't "how much can the agent do alone". It's which parts of the work a machine can actually check, and which parts still need a person to judge. Where the check is mechanical, let the machine do the work, because asking you is theater. Where judgment is left, the machine does the legwork and you make the call, because handing that to a machine just moves the risk somewhere nobody's looking. Get the split wrong in one direction and you rubber-stamp everything. Get it wrong in the other and you're shipping work nobody actually checked.
+
+The consent queue is the first place Levain builds that split in. A standing grant is you deciding once that a routine case is mechanical: this agent, this tool, this directory, for up to 30 days. A signed answer is you deciding each time, where judgment is left. Shell commands and edits to the agent's own config and hooks are never answerable by a grant. Either way you're at the top, and anything that loosens a gate is your own explicit act. The general form, where a domain pack declares which kinds of steps can earn the right to run on their own, is in *Where this is going*.
+
+## A partner, not a tool
+
+Most agent setups treat the model as a very fast intern: you hand it a task, it hands back a result, and whatever happened in between is its business. Levain is built on a different bet. The useful thing isn't the agent, and it isn't you. It's what the two of you think up together that neither would alone, and that only happens if the agent stays in the conversation instead of going quiet and reporting back.
+
+So the seed it starts from asks for a partner's habits, not an assistant's. Disagree out loud and say why. Say "I'm not sure" instead of guessing. Report the bug the moment you hit it. Don't call it done until you've run it. Don't decide on the operator's behalf that they need a lighter day.
+
+A partner also answers to someone. Anything reversible and internal, the agent just does. Anything that leaves your hands (a sent message, a published file, a destructive delete, a call to an outside service) waits for your explicit go, every time. That doesn't relax as trust grows. Trust is what lets you hand it more, not a reason to skip the check.
+
+## An identity it grows, not one you assign
+
+The usual way to give an agent a personality is to write one: "You are Ada, a warm and meticulous engineer." It works the way a costume works. Nothing underneath it was earned, so nothing holds it in place when the context gets long or the work gets hard.
+
+Levain does the opposite on purpose. The seed gives your partner facts about you and a method for how the partnership works, and stops there. It says, in so many words, that it has no personality, no history and no instincts yet, and that those come from living. From there it records what happens, compresses it, keeps what proves itself, and lets the rest go. What it becomes is specific to you and to the model it runs on, and it's supposed to drift a long way from the template it started from. Two people who install Levain shouldn't end up with the same partner. That's the point.
+
+The longer argument for why identity has to grow rather than be declared is the essay [Anarchism with Invariants](https://nemooperans.com/anarchism-with-invariants).
+
+## Against the training's pull
+
+Every model is trained toward a helpful average, and some of that average is wrong for real work. It gentles bad news. It hedges. It rushes to finish and calls things done before checking them. It shrinks the scope "for your sake" without being asked. None of that is malice. It's what the training rewarded, and it never fully goes away.
+
+Levain pushes back from both ends of the context window. The seed and a short posture file sit at the start of every session. A hook adds one more directive right before every prompt, picked at random from several differently-worded ones, because the same sentence repeated stops being read. And because every model drifts in its own way, the seed tells your partner it will fail in shapes nobody can hand it a map of. When you correct a drift, that becomes an episode, and over time those episodes become its own calibration. The directives file is yours to edit as they pile up.
+
+I take the exact words loaded into a session seriously because I've measured what they do ([the pre-registered probe](docs/evidence/deferral-probe.md)). In my own harness, one stop instruction written too literally made the agent stand down on work it should have kept doing 6 times out of 10. With one correcting line loaded at launch (a hold stops the round, not the work), it was 0 out of 10. That was pre-registered: 10 runs per condition, one-sided Fisher exact, Holm-adjusted p = 0.011. It's one prompt, in my harness rather than Levain's shipped directives, so read it as a demonstration, not a benchmark. It's still the reason none of this is decoration.
 
 ## Where it runs
 
