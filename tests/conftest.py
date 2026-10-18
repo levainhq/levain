@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -138,8 +139,9 @@ def _isolate_activation_env(monkeypatch):
 def _isolate_consent_hook_wiring(monkeypatch, tmp_path_factory):
     """`levain init` creates the consent adapter's settings file in levain's consent queue directory, which
     defaults to the REAL `~/.levain/consent` of whoever runs the suite, and reports the installed agent's version
-    by running the real `claude` / `codex`; doctor also asks the real `codex app-server` about hook trust. Every
-    test gets its own queue directory (made on first use), no agent version and no codex to ask. A test that means to exercise either sets its own. A call
+    by running the real `claude` / `codex`; doctor, init and update also ask the real `codex app-server` about hook
+    trust. Every test gets its own queue directory (made on first use), no agent version and no codex to ask (a
+    trust write is taken as confirmed). A test that means to exercise either sets its own. A call
     that names a binary, or finds one a test put on PATH under the pytest tmp dir, still runs it."""
     import levain.consent.canary as canary
     import levain.install as install
@@ -170,9 +172,32 @@ def _isolate_consent_hook_wiring(monkeypatch, tmp_path_factory):
         # doctor asks the codex on PATH; a test that means to ask one passes it
         return real_trust(*args, codex_bin=codex_bin or "/nonexistent/levain-test-codex", **kwargs)
 
+    real_write = cx.write_hook_trust
+
+    def codex_confirms(hooks_path, expected_text, *, home=None, codex_bin=None, timeout=cx.TRUST_TIMEOUT):
+        # init and update write Codex's hook trust through the codex on PATH; with none named, the file check is
+        # real and Codex's confirmation is assumed (a test of the trust write itself names its codex)
+        if codex_bin:
+            return real_write(hooks_path, expected_text, home=home, codex_bin=codex_bin, timeout=timeout)
+        try:
+            if hooks_path.read_text(encoding="utf-8") != expected_text:
+                return [], f"{hooks_path} is not the file levain rendered, so no hook in it is trusted"
+            mine = cx.hook_identities(json.loads(expected_text))
+        except (OSError, ValueError) as exc:
+            return [], f"{hooks_path} could not be read as levain's hooks ({exc})"
+        return [cx.HookTrust(f"{hooks_path}:{cx._event_label(e)}:{g}:{h}", e, d, "trusted")
+                for e, g, h, d in mine], None
+
+    real_gate_trust = cx.gate_trust
+
+    def no_ambient_gate_codex(*args, codex_bin=None, **kwargs):
+        return real_gate_trust(*args, codex_bin=codex_bin or "/nonexistent/levain-test-codex", **kwargs)
+
     monkeypatch.setattr(install, "_consent_queue_dir", queue_dir)
     monkeypatch.setattr(canary, "agent_version", no_ambient_version)
     monkeypatch.setattr(cx, "trust_status", no_ambient_codex)
+    monkeypatch.setattr(cx, "write_hook_trust", codex_confirms)
+    monkeypatch.setattr(cx, "gate_trust", no_ambient_gate_codex)
 
 
 @pytest.fixture(autouse=True)

@@ -2902,26 +2902,50 @@ def _codex_takeover_hint(install: Path) -> str:
 
 
 def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -> list[CheckResult]:
-    """Codex's PreToolUse consent gate (Q14 B5) and whether Codex will run it, read from CODEX_HOME's config.toml
-    without starting Codex. RED unless trusted exactly as written: Codex skips an untrusted, changed or disabled
-    hook with no error or warning, so the gate would silently not run."""
-    from levain.consent.adapters.codex import gate_trust
-    from levain.install import CONSENT_HOOK_SCRIPTS, persisted_consent_hook
+    """Codex's PreToolUse consent gate (Q14 B5) and whether Codex will run it, by Codex's own ``hooks/list``
+    (:func:`levain.consent.adapters.codex.gate_trust`). GREEN only when the entry is levain's render, its script is
+    the package's and Codex reports it trusted, enabled and hashed as levain's formula: Codex skips an untrusted,
+    changed or disabled hook with no error or warning, so the gate would silently not run. A WARN when Codex
+    cannot be asked (config.toml alone is not Codex's word), or when nothing can decide a gated call now."""
+    from levain.consent.adapters import codex
+    from levain.consent.adapters.claude_code import nothing_can_decide
+    from levain.consent.policy import AGENT_CONFIG_TIER
+    from levain.install import CONSENT_HOOK_SCRIPTS, _consent_queue_dir, persisted_consent_hook
 
     if persisted_consent_hook(install) == "off":
         return []
     name = "Codex consent gate (PreToolUse)"
-    got = gate_trust(hooks_path, install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS["codex"], home=codex_home)
-    if got.status == "trusted":
-        return [CheckResult(name, True, "wired to this install and trusted by Codex as written")]
+    got = codex.gate_trust(hooks_path, install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS["codex"],
+                           home=codex_home, timeout=10.0)
     if got.status == "absent":
         return [CheckResult(name, False, f"not wired: {got.detail}; agent config and hook edits in `codex exec` "
                             "are not gated", "Run `levain update` to add it.", upgrade_pending=True)]
-    what = {"untrusted": "NOT trusted", "changed": "trusted once, changed since",
-            "disabled": "disabled", "unknown": "trust unreadable"}.get(got.status, got.status)
-    return [CheckResult(name, False, f"{what} ({got.detail}): Codex skips it silently, so agent config and hook "
-                        "edits are not gated", "Run `levain update`, which writes Codex's trust for levain's "
-                        "hooks and confirms it with Codex.")]
+    update = "Run `levain update`, which writes Codex's trust for levain's hooks and confirms it with Codex."
+    if got.status == "script_changed":
+        return [CheckResult(name, False, f"{got.detail}: Codex still runs whatever the script now does, so the gate "
+                            "cannot be relied on", "Restore the script: `levain update` lists it for review.")]
+    if got.status == "changed" and "differs from levain's render" in got.detail:
+        return [CheckResult(name, False, f"{got.detail}: Codex runs the entry as it now stands, if at all, so agent "
+                            "config and hook edits may not be gated", update)]
+    if got.status == "unconfirmed":
+        return [CheckResult(name, True, f"wired to this install; {got.detail}, but Codex's own verdict could not be "
+                            "read, so whether Codex runs the gate is unconfirmed",
+                            "Run `levain doctor` again where `codex` is on PATH.", warn=True)]
+    if got.status != "trusted":
+        what = {"untrusted": "NOT trusted", "changed": "trusted once, changed since",
+                "disabled": "disabled", "unknown": "trust unreadable", "unlisted": "not listed by Codex",
+                "formula_mismatch": "hashed differently by this Codex"}.get(got.status, got.status)
+        return [CheckResult(name, False, f"{what} ({got.detail}): Codex skips it silently, so agent config and "
+                            "hook edits are not gated", update)]
+    settings = codex.load_settings(_consent_queue_dir())
+    if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
+        return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list), but "
+                            "nothing can decide a gated call now: no active key whose class signs T3 and away is "
+                            "not on by your word, so agent config and hook edits run without a question",
+                            "Enrol a laptop-presence key in this install's cockpit, or `levain consent away on` "
+                            "to hold them.", warn=True)]
+    return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list: trusted, "
+                        "enabled, levain's hash)")]
 
 
 def _check_codex(install: Path) -> list[CheckResult]:
