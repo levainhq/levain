@@ -30,7 +30,7 @@
       try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) { /* the address stays */ }
     }
     const m = /(?:^#|&)phone_token=([^&]+)/.exec(location.hash);
-    if (m) store.set("sessionStorage", TOKEN_KEY, decodeURIComponent(m[1]));      // phone.js repeats this and clears the bar
+    if (m) store.set("sessionStorage", TOKEN_KEY, decodeURIComponent(m[1]));
     else if (!store.get("sessionStorage", TOKEN_KEY)) {
       const dev = store.get("localStorage", DEVICE_KEY);
       if (dev) store.set("sessionStorage", TOKEN_KEY, dev);
