@@ -55,7 +55,7 @@ def test_events_in_order_with_the_record_fields_and_a_quoted_resume(tmp_path):
     assert [e["kind"] for e in body["events"]] == ["prompt", "tool", "reply"]
     assert body["events"][2] == {"at": "2026-10-15T23:50:00Z", "kind": "reply", "text": "done", "cut": 12}
     assert body["agent"] == "claude_code" and body["workspace"] == CWD and body["skipped"] == 0
-    assert set(body) == {"agent", "workspace", "first_seen", "last_seen", "resume", "events", "consent", "skipped"}
+    assert set(body) == {"agent", "workspace", "first_seen", "last_seen", "resume", "events", "consent", "skipped", "context"}
     assert body["resume"] == f"cd -- {shlex.quote(CWD)} && claude --resume {shlex.quote(SID)}"
     assert shlex.split(body["resume"])[:3] == ["cd", "--", CWD]          # the space and the quote survive a shell
     cx = _put(root, "codex", SID, CWD, timedelta(minutes=2))

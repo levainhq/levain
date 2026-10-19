@@ -728,10 +728,11 @@ def _sessions_dir(directory: Path) -> None:
         os.chmod(directory, 0o700, follow_symlinks=False)
 
 
-def session_touch(session_id, cwd, event, context_delivered=None) -> None:
+def session_touch(session_id, cwd, event, context_delivered=None, transcript=None) -> None:
     """Record that this session just fired `event` ("SessionStart" | "UserPromptSubmit").
     first_seen and (when `context_delivered` is None) context_delivered are kept from the
-    existing file. Atomic (tmp + replace) under the sessions-directory lock, pruned to the newest
+    existing file; `transcript` (the payload's transcript_path, kept when a later call lacks it) is stored only when it
+    is an absolute .jsonl path, for the cockpit's context meter. Atomic (tmp + replace) under the sessions-directory lock, pruned to the newest
     _SESSIONS_KEEP by mtime. Fail-soft: ANY exception is swallowed; a hook never fails a session
     over this."""
     try:
@@ -745,7 +746,7 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
         with _sessions_lock(directory) as held:
             if not held:
                 return
-            first_seen, kept = now, None
+            first_seen, kept, kept_tx = now, None, None
             try:
                 old = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(old, dict):
@@ -753,6 +754,8 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
                         first_seen = old["first_seen"]
                     if isinstance(old.get("context_delivered"), bool):
                         kept = old["context_delivered"]
+                    if isinstance(old.get("transcript"), str):
+                        kept_tx = old["transcript"]
             except Exception:
                 pass  # absent or corrupt: start the record fresh
             delivered = context_delivered if isinstance(context_delivered, bool) else kept
@@ -766,6 +769,10 @@ def session_touch(session_id, cwd, event, context_delivered=None) -> None:
                 "last_event": event,
                 "context_delivered": delivered,
             }
+            tx = transcript if isinstance(transcript, str) and transcript.endswith(".jsonl") and os.path.isabs(transcript) \
+                and len(transcript) <= 1024 else kept_tx
+            if tx:
+                record["transcript"] = tx
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
             try:
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)

@@ -857,7 +857,8 @@ SESSION_EVENTS = ("SessionStart", "UserPromptSubmit")
 SANDBOX_UNSEEN = "CLAUDE_CONFIG_DIR relocation, --settings, server-managed settings"
 SESSIONS_NOTE = ("Sandbox is what the settings files say for each session's working directory, not proof it is confined; "
                  f"not visible to doctor or here: {SANDBOX_UNSEEN}. A session shows when it last fired a hook; "
-                 "nothing says when one ends, so a silent one goes Quiet.")
+                 "nothing says when one ends, so a silent one goes Quiet. Context is read from each session's transcript; a "
+                 "relocated config directory is only found for sessions whose hook has recorded the path.")
 SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta"})
 
 
@@ -892,6 +893,9 @@ def _session_record(path: Path) -> dict[str, Any] | None:
         return None
     if path.stem != hashlib.sha1(f"{d['agent']}:{sid}".encode("utf-8", "replace")).hexdigest()[:24]:
         return None
+    tx = d.get("transcript")
+    if tx is not None and not (isinstance(tx, str) and len(tx) <= 1024 and os.path.isabs(tx) and tx.endswith(".jsonl")):
+        d = {k: v for k, v in d.items() if k != "transcript"}    # a display field: a bad one is dropped, the record stands
     if d.get("context_delivered") not in (True, False, None) or _session_stamp(d.get("first_seen")) is None:
         return None
     seen = _session_stamp(d.get("last_seen"))
@@ -929,6 +933,15 @@ def _sandbox_chip(agent: str, cwd: str, cache: dict[str, str]) -> str:
         except Exception:  # noqa: BLE001 - an unreadable settings layer is "not read", never a dark panel
             cache[cwd] = "sandbox not read"
     return cache[cwd]
+
+
+def _context_chip(rec: dict[str, Any]) -> tuple[str, Any]:
+    from levain.cockpit.session_context import context_chip
+
+    try:
+        return context_chip(rec)
+    except Exception:  # noqa: BLE001 - a meter that cannot read is said, never a dark panel
+        return "context not read: unreadable", None
 
 
 def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime], Any] | None]
@@ -987,6 +1000,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                 chips.append("memory loaded at start")
             elif rec["context_delivered"] is False:
                 chips.append("memory not loaded")
+            chips.append(_context_chip(rec)[0])
             if not consent_read:
                 chips.append("consent not read")
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):

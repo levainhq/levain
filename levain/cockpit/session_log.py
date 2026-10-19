@@ -122,6 +122,13 @@ def read_session(install_root: Path, stem: str, now: datetime,
         else:
             events.append(ev)
     agent, sid, cwd = rec["agent"], rec["session_id"], rec["cwd"]
-    return {"agent": agent, "workspace": cwd, "first_seen": rec["first_seen"], "last_seen": rec["last_seen"],
+    from levain.cockpit.session_context import CONTEXT_WARN_TOKENS, find_transcript, last_context
+
+    path, why = find_transcript(rec)
+    ctx, why = last_context(path, agent) if path is not None else (None, why)
+    context = ({"tokens": ctx.tokens, "window": ctx.window, "model": ctx.model, "warn": ctx.tokens >= CONTEXT_WARN_TOKENS,
+                "read_at": now.isoformat()} if ctx else {"tokens": None, "window": None, "model": None, "warn": False,
+                                                           "read_at": now.isoformat(), "why": why})
+    return {"context": context, "agent": agent, "workspace": cwd, "first_seen": rec["first_seen"], "last_seen": rec["last_seen"],
             "resume": _resume(agent, cwd, sid), "events": events[-EVENTS_SHOWN:],
             "consent": _consent(consent_reader, now, agent, sid), "skipped": skipped}

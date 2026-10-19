@@ -192,7 +192,7 @@ def main() -> int:
             hook.state_seen_record(session_id, pending_sig)
         # Session registry: after emit(), so it can never change what was delivered.
         try:
-            hook.session_touch(session_id, payload.get("cwd"), "UserPromptSubmit")
+            hook.session_touch(session_id, payload.get("cwd"), "UserPromptSubmit", None, payload.get("transcript_path"))
         except Exception:
             pass
         # Transcript line (Q8): the operator's prompt, for the cockpit's read-only view.
