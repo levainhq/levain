@@ -716,3 +716,13 @@ def test_an_override_root_with_any_name_renders_and_is_denied(tmp_path, monkeypa
     # The '+' in a name is escaped, so it cannot widen the match.
     assert r"\+1($|\/.*)" in text
 
+
+def test_agent_root_regex_under_slash_and_non_ascii(tmp_path) -> None:
+    # L3 r4 (complement, gemini): a root directly under / doubled the separator, so its deny matched nothing.
+    assert conf._agent_root_regex(Path("/claudecfg")).startswith(r"^\/[cC]")
+    assert conf._agent_root_regex(Path("/Users/a/.claude")).startswith(r"^\/Users\/a\/\.[cC]")
+    with pytest.raises(conf.ConfinementError, match="non-ASCII"):
+        conf._agent_root_regex(Path("/x/Caf\u00e9"))
+    with pytest.raises(conf.ConfinementError):
+        conf._agent_root_regex(Path("claude"))
+

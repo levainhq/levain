@@ -4786,11 +4786,17 @@ def _agent_root_regex(path: Path) -> str:
     can be any name (`~/.config/claude`): the macOS VM run of 10-19 (1019-conf/mac-final) measured a
     non-dot override refusing the whole shell here."""
     name = path.name
-    if not name or name in (".", ".."):
+    if not path.is_absolute() or not name or name in (".", ".."):
         raise ConfinementError(f"invalid protected agent-directory root {path} — refusing fail-closed")
-    folded = "".join(f"[{ch.lower()}{ch.upper()}]" if ch.isascii() and ch.isalpha() else _sbpl_regex(ch)
-                     for ch in name)
-    return f'^{_sbpl_regex(str(path.parent))}\\/{folded}($|\\/.*)'
+    if not name.isascii():
+        # Only ASCII letters can be folded here; a case variant of another letter would miss the deny
+        # on a case-insensitive volume (L3 r4, complement).
+        raise ConfinementError(f"the agent configuration directory {path} has a non-ASCII name, which the "
+                               "macOS floor cannot match in every letter case — refusing fail-closed. "
+                               "Use an ASCII name for CLAUDE_CONFIG_DIR / CODEX_HOME.")
+    folded = "".join(f"[{ch.lower()}{ch.upper()}]" if ch.isalpha() else _sbpl_regex(ch) for ch in name)
+    # A root directly under / has the parent "/", which must not double the separator (L3 r4).
+    return f'^{_sbpl_regex(str(path.parent).rstrip("/"))}\\/{folded}($|\\/.*)'
 
 
 def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
