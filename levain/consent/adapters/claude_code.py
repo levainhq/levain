@@ -1125,8 +1125,8 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     path (``bin/ping``) is refused, since it would resolve against a directory the agent can write. When ``cwd`` is
     a queue directory, the ping is also written to the notification record (``kind`` and ``ref``, ``request:<id>``
     or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
-    same child pushes it to each paired phone when one with pings on was live at that moment. With no ``cwd`` there is no queue directory, so
-    nothing is recorded and no push is sent.
+    same child pushes it to each paired phone when one with pings on was live at that moment. With no ``cwd`` there
+    is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a
     command that did not start is still written to the record, as not started). A failed ping never fails the
     gate."""
