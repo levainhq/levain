@@ -3147,8 +3147,8 @@ def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -
     if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
         return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list), but "
                             "nothing can decide a gated call now: no active key whose class signs T3 (away mode "
-                            "alone does not count: no key could answer a held call), so agent config and hook "
-                            "edits run without a question",
+                            "alone does not count: no key could answer a held call), so an agent config or hook "
+                            "edit is refused outright outside approval mode, and asked by Codex's own approval in it",
                             "Enrol a laptop-presence key in this install's cockpit.", warn=True)]
     return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list: trusted, "
                         "enabled, levain's hash)")]
