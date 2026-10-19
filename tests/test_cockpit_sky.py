@@ -108,3 +108,108 @@ def test_equal_events_count_as_occurrences_and_an_outcome_change_is_fresh():
 def test_a_repo_less_review_is_left_out_of_the_auto_single_repo_view():
     m = _model([_ev("commit", "only"), _ev("review", None, outcome="failed")], {})
     assert m["single"] == "only" and m["counts"]["review"] == 0 and m["counts"]["failed"] == 0
+
+
+# ── the Levain marks: lanes, tracks, strip, empty window, tooltips; and flow's feed unchanged ──
+
+_NOW = "2026-10-19T19:13:00Z"
+_LEV_JS = ("const {buildModel,normalise,eventTip}=require(process.argv[1]);const i=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+           "const now=Date.parse(i.now);const ev=normalise({events:i.events});"
+           "const m=buildModel(ev,Object.assign({windowHours:14,topRows:5,pinnedRows:[],single:''},i.opts),now);"
+           "const id=e=>e.kind+'@'+new Date(e.t).toISOString().slice(11,16);const by=f=>Object.fromEntries(ev.map(e=>[id(e),f(e)]));"
+           "console.log(JSON.stringify({rows:m.rows.map(r=>r.id),lev:m.lev,empty:m.empty,tracks:m.tracks,counts:m.counts,"
+           "where:by(e=>m.rowOf(e)),track:by(e=>e.track===undefined?null:e.track),tips:by(eventTip)}));")
+
+
+def _lev(events: list[dict], opts: dict | None = None) -> dict:
+    return _node(_LEV_JS, {"events": events, "opts": opts or {}, "now": _NOW})
+
+
+def _at(hm: str) -> str:
+    return f"2026-10-19T{hm}:00Z"
+
+
+def _e(kind, hm, repo=None, agent=None, outcome="ok", **extra) -> dict:
+    return {"kind": kind, "at": _at(hm), "repo": repo, "agent": agent, "outcome": outcome, **extra}
+
+
+_LEVAIN_FEED = [
+    _e("commit", "14:00", "ledgerline"), _e("commit", "15:00", "tally"),
+    _e("session", "12:00", "ledgerline", "claude_code", "ok", end=_at("13:00")),
+    _e("session", "12:30", "tally", "codex", "live", end=_at("19:13")),
+    _e("session", "13:30", "tally", "codex", "ok", end=_at("14:00")),
+    _e("decision", "16:00", None, "claude_code", "waiting", label="Bash git push origin main"),
+    _e("decision", "16:30", None, "claude_code", "denied", label="Bash rm -rf build/"),
+    _e("memory", "15:30", None, "claude_code", "ok", label="observation"),
+    _e("question", "17:00", None, "claude_code", "open", label="Run the backfill now?"),
+]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_levain_feed_gets_repo_lanes_then_sessions_decisions_memory_questions():
+    m = _lev(_LEVAIN_FEED)
+    assert m["lev"] is True
+    assert m["rows"] == ["r:ledgerline", "r:tally", "sessions", "decisions", "memory", "questions"]
+    w = m["where"]
+    assert (w["commit@14:00"], w["commit@15:00"], w["session@12:00"], w["decision@16:00"], w["memory@15:30"], w["question@17:00"]) == (
+        "r:ledgerline", "r:tally", "sessions", "decisions", "memory", "questions")
+    c = m["counts"]
+    assert (c["commit"], c["sessions"], c["decisions"], c["memory"], c["questions"], c["waiting"]) == (2, 3, 2, 1, 1, 2)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_overlapping_sessions_take_separate_tracks_and_a_later_one_reuses_the_first():
+    m = _lev(_LEVAIN_FEED)
+    assert m["tracks"] == 2
+    # 12:00-13:00 track 0; 12:30 (live) overlaps it -> track 1; 13:30 starts after track 0 ended (+6 min gap) -> track 0
+    t = m["track"]
+    assert (t["session@12:00"], t["session@12:30"], t["session@13:30"]) == (0, 1, 0)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_flow_shaped_feed_keeps_flow_rows_and_a_decision_outcome_ok_is_not_a_levain_decision():
+    flow = [_e("commit", "15:00", "a"), _e("commit", "15:10", "b"), _e("review", "15:20", "a", "codex", "failed"),
+            _e("memory", "15:30"), _e("decision", "15:40", None, "flow", "ok")]
+    m = _lev(flow)
+    assert m["lev"] is False
+    assert m["rows"] == ["r:a", "r:b", "memory", "decisions"]
+    assert [m["where"][k] for k in ("commit@15:00", "commit@15:10", "review@15:20", "memory@15:30", "decision@15:40")] == ["r:a", "r:b", "r:a", "memory", "decisions"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_strip_merges_the_repos_and_drops_lanes_nothing_landed_on():
+    m = _lev(_LEVAIN_FEED, {"size": "strip"})
+    assert m["rows"] == ["commit", "sessions", "memory", "decisions"]
+    assert m["where"]["commit@14:00"] == m["where"]["commit@15:00"] == "commit"
+    assert m["where"]["question@17:00"] == m["where"]["decision@16:00"] == "decisions"   # the question shares the decisions lane
+    only = _lev([_e("commit", "15:00", "a")], {"size": "strip"})
+    assert only["rows"] == ["commit"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_an_empty_window_is_flagged_so_the_page_can_say_so_and_keeps_its_lanes():
+    m = _lev([])
+    assert m["empty"] is True and m["rows"] == ["memory", "decisions"]   # flow's bare frame, as before
+    old = _lev([_e("commit", "01:00", "a")])   # 18 h before now: outside the 14 h window
+    assert old["empty"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_session_that_began_before_the_window_but_is_live_is_still_drawn():
+    m = _lev([_e("session", "03:00", "a", "claude_code", "live", end=_at("19:13"))])
+    assert m["empty"] is False and "sessions" in m["rows"] and m["counts"]["sessions"] == 1
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_tooltips_name_kind_repo_and_time_and_use_the_label_when_there_is_one():
+    import datetime as d
+    m = _lev(_LEVAIN_FEED)
+    hhmm = lambda hm: d.datetime.fromisoformat(f"2026-10-19T{hm}:00+00:00").astimezone().strftime("%H:%M")   # the page shows local time
+    assert m["tips"]["commit@14:00"] == f"commit · ledgerline · {hhmm('14:00')}"
+    assert m["tips"]["decision@16:00"] == f"decision · Bash git push origin main · waiting · {hhmm('16:00')}"
+    assert m["tips"]["decision@16:30"] == f"decision · Bash rm -rf build/ · denied · {hhmm('16:30')}"
+    assert m["tips"]["memory@15:30"] == f"memory write · observation · {hhmm('15:30')}"
+    assert m["tips"]["question@17:00"] == f"question · Run the backfill now? · open · {hhmm('17:00')}"
+    assert m["tips"]["session@12:30"] == f"session · codex · tally · {hhmm('12:30')}–now"
+    flow = _lev([_e("review", "15:00", "a", "codex", "failed")])["tips"]["review@15:00"]
+    assert flow.startswith("review · a · codex · failed · ")   # flow's own tooltip is unchanged

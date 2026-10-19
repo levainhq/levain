@@ -2,9 +2,16 @@
    window of rows by time, with new commits and failed reviews arriving as meteors.
 
      LevainSky.mount(el, value, opts) -> { update(value), destroy() }
-       value  {events: [{kind, at, repo, agent, outcome}], legend}   (the `ambient` kind's contract)
+       value  {events: [{kind, at, repo, agent, outcome, end?, label?}], legend}   (the `ambient` kind's contract)
        opts   windowHours (14)   topRows (5)   pinnedRows ([])   single (a repo name, or auto)
               ambient (true)     now (() => ms; a replay supplies its own clock)
+              size ('compact' | 'large' | 'strip'; default and 'compact' are today's size, 'large' is the Build tab's,
+                    'strip' is the phone's: merged lanes, no gutter, no tooltip, no summary)
+     LevainSky.legendNode() -> a DOM key for the Levain marks (the host may place it, as the hero does with its own).
+
+   A feed is Levain-shaped when it carries a session or question, a decision with an outcome of allowed / denied / waiting
+   / failed, or a labelled memory write; it then gets the lanes repos, sessions, decisions, memory, questions. Any other
+   feed (flow's) keeps its rows and its marks exactly.
 
    Design rules this file keeps:
    - The motion is the data itself, never a mascot of it: between events nothing moves.
@@ -78,15 +85,20 @@
     return Date.parse(NAIVE.test(s) ? s.replace(' ', 'T') + 'Z' : s);
   }
 
+  var LEVAIN_OUT = { allowed: 1, denied: 1, waiting: 1, failed: 1 };
   function normalise(value) {
     var out = [];
     var src = (value && value.events) || [];
     for (var i = 0; i < src.length; i++) {
-      var e = src[i], t = parseAt(e.at);
-      if (!e || isNaN(t) || !e.kind) continue;
+      var e = src[i];
+      if (!e) continue;
+      var t = parseAt(e.at), t2 = e.end == null ? NaN : parseAt(e.end);
+      if (isNaN(t) || !e.kind) continue;
       if (e.repo != null) noteRepo(e.repo);
       out.push({ t: t, kind: String(e.kind), repo: e.repo == null ? null : String(e.repo),
         agent: e.agent == null ? null : String(e.agent), ok: e.outcome !== 'failed',
+        out: e.outcome == null ? '' : String(e.outcome), t2: isNaN(t2) ? null : t2,
+        label: e.label == null || e.label === '' ? null : String(e.label).slice(0, 160),
         key: e.at + '|' + e.kind + '|' + e.repo + '|' + e.agent + '|' + e.outcome });
     }
     out.sort(function (a, b) { return a.t - b.t; });
@@ -109,16 +121,36 @@
   // A repo-less commit or review belongs to no single repo, so the single-repo view leaves it out.
   function offView(e, single) { return single && e.repo !== single && (e.kind === 'commit' || e.kind === 'review'); }
 
+  // A session bar ends at its `end` (never past now); a live one runs to now; one with no end is a point.
+  function sessEnd(e, nowMs) {
+    if (e.out === 'live') return nowMs;
+    return e.t2 == null ? e.t : Math.min(Math.max(e.t2, e.t), nowMs);
+  }
+  // The kinds and outcomes only a Levain feed carries; flow's feed has none of them.
+  function isLev(e) {
+    return e.kind === 'session' || e.kind === 'question' || (e.kind === 'decision' && !!LEVAIN_OUT[e.out]) || (e.kind === 'memory' && e.label != null);
+  }
+
   // Which rows, and which row each event lands on. Pure: no DOM, so it is testable under node.
   function buildModel(events, opts, nowMs) {
-    var start = nowMs - opts.windowHours * 3600000;
-    var inWin = events.filter(function (e) { return e.t >= start && e.t <= nowMs; });
+    var start = nowMs - opts.windowHours * 3600000, strip = opts.size === 'strip';
+    var inWin = events.filter(function (e) {
+      if (e.kind === 'session') return e.t <= nowMs && sessEnd(e, nowMs) >= start;
+      return e.t >= start && e.t <= nowMs;
+    });
+    var lev = inWin.some(isLev);
     var repos = {};
     inWin.forEach(function (e) { if (e.repo && (e.kind === 'commit' || e.kind === 'review')) repos[e.repo] = (repos[e.repo] || 0) + 1; });
     var names = Object.keys(repos);
-    var single = opts.single || (names.length <= 1 && !opts.pinnedRows.length ? (names[0] || '') : '');
+    var single = lev || strip ? '' : opts.single || (names.length <= 1 && !opts.pinnedRows.length ? (names[0] || '') : '');
     var rows, rowOf, folded = [], noRepo = 0;
-    if (single) {
+    if (strip) {
+      // the phone's strip: one lane per kind of thing, the repos merged
+      rows = [{ id: 'commit', label: 'commits' }, { id: 'sessions', label: 'sessions' }, { id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' }];
+      rowOf = function (e) {
+        return e.kind === 'commit' || e.kind === 'review' ? 'commit' : e.kind === 'session' ? 'sessions' : e.kind === 'decision' || e.kind === 'question' ? 'decisions' : 'memory';
+      };
+    } else if (single) {
       rows = [{ id: 'commit', label: 'commits' }, { id: 'review', label: 'reviews' }, { id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' }];
       rowOf = function (e) { return e.kind === 'commit' ? 'commit' : e.kind === 'review' ? 'review' : e.kind === 'decision' ? 'decisions' : 'memory'; };
     } else {
@@ -134,8 +166,11 @@
       });
       folded = Object.keys(foldedSet).sort();
       if (folded.length || noRepo) rows.push({ id: 'other', label: 'other', folded: folded, noRepo: noRepo });
-      rows.push({ id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' });
+      if (lev) rows.push({ id: 'sessions', label: 'sessions' }, { id: 'decisions', label: 'decisions' }, { id: 'memory', label: 'memory' }, { id: 'questions', label: 'questions' });
+      else rows.push({ id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' });
       rowOf = function (e) {
+        if (lev && e.kind === 'session') return 'sessions';
+        if (lev && e.kind === 'question') return 'questions';
         if (e.kind === 'decision') return 'decisions';
         if (e.kind !== 'commit' && e.kind !== 'review') return 'memory';
         return e.repo && mainSet[e.repo] ? 'r:' + e.repo : 'other';
@@ -143,29 +178,76 @@
     }
     // a phone drops the rows nothing landed on (memory and decisions are the ones that can be empty) and shortens their names;
     // if nothing landed anywhere the rows stay, so the plot is never a bare frame
-    if (opts.compact) {
+    if (opts.compact || strip) {
       var used = {};
       inWin.forEach(function (e) { if (!offView(e, single)) used[rowOf(e)] = 1; });
       var kept = rows.filter(function (r) { return used[r.id]; });
       if (kept.length) rows = kept;
-      rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
+      if (opts.compact) rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
     }
-    var counts = { commit: 0, review: 0, failed: 0, memory: 0 };
+    var counts = { commit: 0, review: 0, failed: 0, memory: 0, sessions: 0, decisions: 0, questions: 0, waiting: 0 };
     inWin.forEach(function (e) {
       if (offView(e, single)) return;
       if (e.kind === 'commit') counts.commit++;
       else if (e.kind === 'review') { counts.review++; if (!e.ok) counts.failed++; }
-      else if (e.kind !== 'decision') counts.memory++;
+      else if (e.kind === 'session') counts.sessions++;
+      else if (e.kind === 'question') { counts.questions++; if (e.out === 'open') counts.waiting++; }
+      else if (e.kind === 'decision') { counts.decisions++; if (e.out === 'waiting') counts.waiting++; }
+      else counts.memory++;
     });
-    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, hasDecisions: inWin.some(function (e) { return e.kind === 'decision'; }) };
+    // sessions are packed into tracks (a bar starting within 6 minutes of the last one's end takes the next track)
+    var ends = [];
+    inWin.filter(function (e) { return e.kind === 'session'; }).sort(function (a, b) { return a.t - b.t; }).forEach(function (e) {
+      var i = 0;
+      while (i < ends.length && e.t < ends[i] + 360000) i++;
+      ends[i] = sessEnd(e, nowMs); e.track = i;
+    });
+    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.length, tracks: ends.length,
+      hasDecisions: inWin.some(function (e) { return e.kind === 'decision'; }) };
+  }
+
+  // The hover text for one mark: "commit · ledgerline · 09:41"; a labelled event reads "decision · <label> · waiting · 13:20".
+  function eventTip(e) {
+    if (e.kind === 'session') return 'session · ' + (e.agent || 'agent') + (e.repo ? ' · ' + e.repo : '') + ' · ' + hhmm(e.t) + '–' + (e.out === 'live' ? 'now' : e.t2 == null ? hhmm(e.t) : hhmm(e.t2));
+    if (e.label != null) return (e.kind === 'memory' ? 'memory write' : e.kind) + ' · ' + e.label + (e.out && e.out !== 'ok' ? ' · ' + e.out : '') + ' · ' + hhmm(e.t);
+    if (e.out === 'failed' && e.kind !== 'review') return e.kind + (e.repo ? ' · ' + e.repo : '') + ' · failed · ' + hhmm(e.t);
+    return e.kind + (e.repo ? ' · ' + e.repo : '') + (e.agent ? ' · ' + e.agent : '') + (e.kind === 'review' ? (e.ok ? ' · ok' : ' · failed') : '') + ' · ' + hhmm(e.t);
+  }
+
+  // The key to the Levain marks, drawn with the same custom properties as the marks. `review` is reserved for DISPATCH.
+  function legendNode() {
+    var box = el('div', { class: 'sky-keys' });
+    box.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px';
+    function item(glyphCss, text, extra) {
+      var it = el('span', { class: 'sky-key' });
+      it.style.cssText = 'display:inline-flex;align-items:center;gap:6px;white-space:nowrap';
+      var gl = el('i'); gl.style.cssText = 'display:inline-block;flex:none;' + glyphCss;
+      it.append(gl, document.createTextNode(text));
+      if (extra) it.style.opacity = extra;
+      box.appendChild(it);
+    }
+    var dia = 'width:8px;height:8px;transform:rotate(45deg) scale(.85);';
+    item('width:6px;height:6px;border-radius:50%;background:var(--contrast,#f3f5f9)', 'commit');
+    item('width:14px;height:5px;border-radius:3px;background:var(--label,#9ba6ba);opacity:.55', 'session');
+    item('width:2px;height:11px;border-radius:1px;background:var(--info,#5aa9ff)', 'memory write');
+    item(dia + 'background:var(--ok,#3ecf8e)', 'decision');
+    item('width:6px;height:6px;border-radius:50%;background:var(--violet,#b48cff)', 'question');
+    item(dia + 'background:var(--accent,#ff8a3d)', 'waiting on you');
+    item('width:7px;height:7px;border-radius:50%;border:1.6px solid var(--bad,#e5484d)', 'failed or denied');
+    item('width:7px;height:7px;border-radius:50%;border:1.4px dashed var(--meta,#7d889c)', 'review: when DISPATCH lands', '.8');
+    return box;
   }
 
   function mount(host, value, userOpts) {
     var o = userOpts || {};
-    var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '' };
+    var size = o.size === 'large' || o.size === 'strip' ? o.size : 'compact';
+    var strip = size === 'strip', sc = size === 'large' ? 1.4 : strip ? 0.8 : 1;   // mark scale
+    var padT = strip ? 6 : PAD_T, padB = strip ? 4 : PAD_B, padR = strip ? 4 : PAD_R;
+    var trackH = size === 'large' ? 11 : strip ? 5 : 7, trackGap = size === 'large' ? 4 : 3;
+    var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size };
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
-    var ambientOn = o.ambient !== false && !(reduce && reduce.matches);
+    var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
 
     var root = el('div', { class: 'sky-panel' });
     root.style.position = 'relative';
@@ -173,16 +255,17 @@
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
     // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
-    if (o.toggleHost) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
+    if (strip) bar.hidden = true;   // the phone's strip is a glance: no summary line, no toggle
+    if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
     var cv = el('canvas', { class: 'sky-canvas', role: 'img' });
     cv.style.display = 'block'; cv.style.width = '100%'; cv.style.height = '320px';
     var axis = el('div', { class: 'sky-axis' });
-    axis.style.position = 'relative'; axis.style.height = '24px';
+    axis.style.position = 'relative'; axis.style.height = strip ? '18px' : '24px';
     var tip = el('div', { class: 'sky-tip', role: 'status' });
     tip.style.cssText = 'position:absolute;pointer-events:none;display:none;z-index:2;white-space:nowrap;padding:6px 10px;border-radius:10px;font-size:12px;border:1px solid var(--hair-2,#28324a);background:var(--base,#060912);color:var(--contrast,var(--text,#f3f5f9))';
-    var showLegend = o.legend !== false;    // a host that draws its own legend passes legend:false
+    var showLegend = o.legend !== false && !strip;    // a host that draws its own legend passes legend:false
     var legend = el('div', { class: 'sky-legend' });
     legend.hidden = !showLegend;   // the host's own legend stands in; an empty strip would still take its padding
     plot.append(cv, axis, tip);
@@ -190,7 +273,7 @@
     host.appendChild(root);
 
     var g = cv.getContext('2d');
-    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = GUTTER_MIN;
+    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = strip ? 6 : GUTTER_MIN, rowBase = ROW_H_MIN, sumW = 1, wOf = {}, cumOf = {};
     var events = [], model = null, meteors = [], feed = { seen: {}, loaded: false }, raf = 0, timer = 0, ro = null, dead = false, hits = [];
 
     function css(name, fallback) {
@@ -200,7 +283,7 @@
     function palette() {
       return { base: css('--base', '#060912'), accent: css('--accent', '#ff8a3d'), contrast: css('--contrast', css('--text', '#f3f5f9')),
         label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a'),
-        bad: css('--bad', '#e5484d'),
+        bad: css('--bad', '#e5484d'), ok: css('--ok', '#3ecf8e'), info: css('--info', '#5aa9ff'), violet: css('--violet', '#b48cff'),
         hues: (function () { var o = {}; for (var i = 1; i <= HUE_SLOTS; i++) o[String(i)] = css('--hue-' + i, ''); return o; })() };
     }
 
@@ -217,13 +300,16 @@
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
     setToggle();
 
-    var xOf = function (t, now) { var span = opts.windowHours * 3600000 / NOW_AT; return gutter + (W - gutter - PAD_R) * ((t - (now - opts.windowHours * 3600000)) / span); };
+    var xOf = function (t, now) { var span = opts.windowHours * 3600000 / NOW_AT; return gutter + (W - gutter - padR) * ((t - (now - opts.windowHours * 3600000)) / span); };
+    // each row has a weight (1 = a plain row; the sessions row grows with its tracks), so the plain rows are spaced as ever
     var rowY = function (id) {
-      for (var i = 0; i < model.rows.length; i++) if (model.rows[i].id === id) return PAD_T + (H - PAD_T - PAD_B) * (i + 0.5) / model.rows.length;
-      return PAD_T;
+      if (!(id in wOf)) return padT;
+      return padT + (H - padT - padB) * (cumOf[id] + wOf[id] / 2) / sumW;
     };
+    var rowPx = function (id) { return (H - padT - padB) * wOf[id] / sumW; };
 
     function measureGutter() {
+      if (strip) { gutter = 6; return; }   // the strip's lanes are told apart by their marks, not labelled
       g.font = FONT_MONO;
       var w = GUTTER_MIN;
       model.rows.forEach(function (r) { w = Math.max(w, g.measureText(r.label).width + GUTTER_PAD * 2); });
@@ -245,18 +331,29 @@
 
     function rebuild() {
       var now = clock();
-      var hw = host.getBoundingClientRect().width, narrow = hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
+      var hw = host.getBoundingClientRect().width, narrow = !strip && hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
       opts.compact = narrow;
       model = buildModel(events, opts, now);
-      var rowsH = Math.max(narrow ? 200 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 48 : ROW_H_MIN));
+      rowBase = size === 'large' ? 44 : strip ? 18 : narrow ? 48 : ROW_H_MIN;
+      sumW = 0; wOf = {}; cumOf = {};
+      model.rows.forEach(function (r) {
+        var w = 1;
+        if (r.id === 'sessions' && model.tracks) w = Math.max(1, (model.tracks * (trackH + trackGap) + (strip ? 4 : size === 'large' ? 16 : 10)) / rowBase);
+        wOf[r.id] = w; cumOf[r.id] = sumW; sumW += w;
+      });
+      if (!sumW) sumW = 1;
+      var rowsH = Math.max(size === 'large' ? 240 : strip ? 60 : narrow ? 200 : 160, padT + padB + sumW * rowBase);
       cv.style.height = rowsH + 'px';
-      var c = model.counts;
-      var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes';
+      var c = model.counts, lev = model.lev;
+      var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + (lev ? c.sessions + ' sessions, ' + c.decisions + ' decisions, ' + c.memory + ' memory writes, ' + c.questions + ' questions, ' + c.waiting + ' waiting on you'
+        : c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes');
       var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
       var txt = function (x) { return document.createTextNode(x); };
-      summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
+      if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));
+      else summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
       cv.setAttribute('aria-label', line + '. ' + (value && value.legend ? value.legend : ''));
-      legend.textContent = showLegend && value && value.legend ? value.legend : '';
+      if (showLegend && lev) legend.replaceChildren(legendNode());
+      else legend.textContent = showLegend && value && value.legend ? value.legend : '';
       var r = cv.getBoundingClientRect(); W = r.width; H = r.height;
       if (W) { measureGutter(); cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); }
     }
@@ -282,42 +379,88 @@
       g.font = FONT_MONO; g.textAlign = 'right';
       model.rows.forEach(function (r) {
         var y = rowY(r.id);
-        g.globalAlpha = 1; g.fillStyle = P.hair; g.fillRect(gutter, y, W - PAD_R - gutter, 1);
+        g.globalAlpha = 1; g.fillStyle = P.hair; g.fillRect(gutter, y, W - padR - gutter, 1);
         g.fillStyle = P.meta;
-        var shown = fit(r.label, gutter - GUTTER_PAD * 2 + 8);
-        g.fillText(shown, gutter - GUTTER_PAD, y + 4);
-        var sw = P.hues && r.id.indexOf('r:') === 0 ? P.hues[hueKey(r.id.slice(2))] : '';
+        var shown = strip ? '' : fit(r.label, gutter - GUTTER_PAD * 2 + 8);
+        if (!strip) g.fillText(shown, gutter - GUTTER_PAD, y + 4);
+        var sw = !strip && P.hues && r.id.indexOf('r:') === 0 ? P.hues[hueKey(r.id.slice(2))] : '';
         if (sw) { g.fillStyle = sw; g.beginPath(); g.arc(gutter - GUTTER_PAD - g.measureText(shown).width - 8, y, 3, 0, 7); g.fill(); g.fillStyle = P.meta; }
         hits.push({ label: true, row: r, x0: 0, x1: gutter, y: y });
       });
       var h0 = Math.ceil(model.start / 3600000) * 3600000;
       for (var t = h0; t < now; t += 3600000) {
-        var x = xOf(t, now); if (x < gutter || x > W - PAD_R) continue;
-        g.fillStyle = (new Date(t).getHours() % 3 === 0) ? P.hair : P.hair2; g.fillRect(x, PAD_T - 10, 1, H - PAD_T);
+        var x = xOf(t, now); if (x < gutter || x > W - padR) continue;
+        g.fillStyle = (new Date(t).getHours() % 3 === 0) ? P.hair : P.hair2; g.fillRect(x, padT - 10, 1, H - padT);
+      }
+      var lev = model.lev, R = 4 * sc;
+      function diamond(x, y, h) { g.beginPath(); g.moveTo(x, y - h); g.lineTo(x + h, y); g.lineTo(x, y + h); g.lineTo(x - h, y); g.closePath(); }
+      function pill(x, y, w, h) {
+        var r = h / 2; w = Math.max(w, h);
+        g.beginPath(); g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.arc(x + w - r, y + r, r, -Math.PI / 2, Math.PI / 2);
+        g.lineTo(x + r, y + h); g.arc(x + r, y + r, r, Math.PI / 2, Math.PI * 1.5); g.closePath();
       }
       events.forEach(function (e) {
+        if (e.kind === 'session') {
+          if (!('sessions' in wOf) || e.t > now) return;
+          var sEnd = sessEnd(e, now); if (sEnd < model.start) return;
+          var x1 = Math.max(gutter, xOf(Math.max(e.t, model.start), now)), x2 = Math.max(x1 + 3, xOf(sEnd, now));
+          var top = rowY('sessions') - rowPx('sessions') / 2 + (strip ? 2 : size === 'large' ? 8 : 5), yy = top + (e.track || 0) * (trackH + trackGap);
+          g.globalAlpha = e.out === 'live' ? 0.85 : 0.5; g.fillStyle = e.out === 'live' ? P.ok : P.label;
+          pill(x1, yy, x2 - x1, trackH); g.fill(); g.globalAlpha = 1;
+          hits.push({ e: e, x: x1, x2: x2, y: yy + trackH / 2 });
+          return;
+        }
         if (e.t < model.start || e.t > now) return;
         if (offView(e, model.single)) return;
-        var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (hash01(e.t + e.kind.length) - 0.5) * 12;
+        var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (lev || strip ? 0 : (hash01(e.t + e.kind.length) - 0.5) * 12);
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
-        var hue = P.hues ? P.hues[hueKey(e.repo)] : '';
-        if (e.kind === 'commit') { g.globalAlpha = hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath(); g.arc(x, y, (hue ? 2 : 1.3) + hash01(e.t) * 0.9, 0, 7); g.fill(); }
+        var hue = lev || !P.hues ? '' : P.hues[hueKey(e.repo)];
+        if (e.out === 'failed' && e.kind !== 'review') {   // a failure is a red ring, whatever failed
+          g.globalAlpha = 1; g.strokeStyle = P.bad; g.lineWidth = 1.6; g.beginPath(); g.arc(x, y, R + 0.5, 0, 7); g.stroke();
+        }
+        else if (e.kind === 'commit') {
+          g.globalAlpha = lev ? Math.max(a, 0.6) : hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath();
+          g.arc(x, y, lev ? 2.6 * sc : ((hue ? 2 : 1.3) + hash01(e.t) * 0.9) * sc, 0, 7); g.fill();
+        }
         else if (e.kind === 'review') {
           g.globalAlpha = e.ok ? a * 0.8 : 1; g.lineWidth = e.ok ? 1.2 : 1.5;
           var glow = !e.ok;   // a failed review glows red
           g.strokeStyle = e.ok ? (hue || P.label) : (glow ? P.bad : P.accent);
           if (glow) { g.shadowColor = P.bad; g.shadowBlur = 12; g.lineWidth = 2; }
-          g.beginPath(); g.arc(x, y, e.ok ? 2.8 : 3.6, 0, 7); g.stroke(); g.shadowBlur = 0;
+          g.beginPath(); g.arc(x, y, (e.ok ? 2.8 : 3.6) * sc, 0, 7); g.stroke(); g.shadowBlur = 0;
         }
-        else if (e.kind === 'decision') { g.globalAlpha = 1; g.fillStyle = P.contrast; g.beginPath(); g.moveTo(x, y - 4); g.lineTo(x + 4, y); g.lineTo(x, y + 4); g.lineTo(x - 4, y); g.closePath(); g.fill(); }
+        else if (e.kind === 'decision') {
+          g.globalAlpha = 1;
+          var h = R + (lev ? 1.5 : 0);
+          if (e.out === 'waiting') {   // orange is spent only on "waiting on you"
+            g.globalAlpha = 0.22; g.fillStyle = P.accent; diamond(x, y, h + 4); g.fill(); g.globalAlpha = 1;
+            g.fillStyle = P.accent; diamond(x, y, h); g.fill();
+          } else if (e.out === 'denied') { g.fillStyle = P.base; g.strokeStyle = P.bad; g.lineWidth = 1.6; diamond(x, y, h); g.fill(); g.stroke(); }
+          else if (e.out === 'allowed') { g.fillStyle = P.ok; diamond(x, y, h); g.fill(); }
+          else { g.fillStyle = P.contrast; diamond(x, y, h); g.fill(); }
+        }
+        else if (e.kind === 'question') {
+          g.globalAlpha = 1; g.fillStyle = P.violet; g.beginPath(); g.arc(x, y, R * 0.95, 0, 7); g.fill();
+          if (e.out === 'open') { g.strokeStyle = P.accent; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, R * 0.95 + 3, 0, 7); g.stroke(); }
+        }
+        else if (lev) {   // a memory write: a blue tick
+          var th = (strip ? 10 : size === 'large' ? 18 : 12);
+          g.globalAlpha = 1; g.fillStyle = P.info; g.fillRect(x - 1, y - th / 2, 2.2, th);
+        }
         else { g.globalAlpha = a * 0.55; g.fillStyle = P.contrast; g.fillRect(x, y, 1.4, 1.4); }
         g.globalAlpha = 1;
         hits.push({ e: e, x: x, y: y });
       });
-      if (!model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
-      var grad = g.createLinearGradient(0, PAD_T - 10, 0, H);
+      if (!model.lev && !strip && !model.empty && !model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
+      if (model.empty) {   // the lanes stay (a bare frame reads as broken) and one line says why they are bare
+        var msg = 'Nothing yet in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
+        g.font = FONT_MONO; g.textAlign = 'center'; var mw = g.measureText(msg).width;
+        g.fillStyle = P.base; g.globalAlpha = 0.85; g.fillRect(mx - mw / 2 - 8, my - 10, mw + 16, 20); g.globalAlpha = 1;
+        g.fillStyle = P.meta; g.fillText(msg, mx, my + 4);
+      }
+      var grad = g.createLinearGradient(0, padT - 10, 0, H);
       grad.addColorStop(0, 'transparent'); grad.addColorStop(0.25, P.accent); grad.addColorStop(1, P.accent);
-      g.globalAlpha = 0.5; g.fillStyle = grad; g.fillRect(nowX, PAD_T - 10, 1.5, H - PAD_T + 10); g.globalAlpha = 1;
+      g.globalAlpha = 0.5; g.fillStyle = grad; g.fillRect(nowX, padT - 10, 1.5, H - padT + 10); g.globalAlpha = 1;
       meteors.forEach(function (m) {
         var tail = g.createLinearGradient(m.x, m.y, m.x + m.len, m.y - m.len * 0.4);
         tail.addColorStop(0, m.fail ? P.accent : P.contrast); tail.addColorStop(1, 'transparent');
@@ -334,12 +477,13 @@
       var perHour = xOf(now, now) - xOf(now - 3600000, now), step = 12;
       [2, 3, 4, 6, 12].some(function (n) { if (perHour * n >= 56) { step = n; return true; } return false; });
       for (var t = h0; t < now; t += 3600000) {
-        var x = xOf(t, now); if (x < gutter || x > W - PAD_R - 20 || Math.abs(x - nowX) < 34) continue;
+        var x = xOf(t, now); if (x < gutter || x > W - padR - 20 || Math.abs(x - nowX) < (strip ? 12 : 34)) continue;
         var hr = new Date(t).getHours(); if (hr % step) continue;
         var s = el('span', null, pad2(hr) + ':00');
         s.style.cssText = 'position:absolute;top:6px;transform:translateX(-50%);font:11px ui-monospace,"SF Mono",Menlo,monospace;color:var(--meta,#7d889c);left:' + x + 'px';
         axis.appendChild(s);
       }
+      if (strip) return;
       var n = el('span', null, 'now');
       n.style.cssText = 'position:absolute;top:6px;transform:translateX(-50%);font:11px ui-monospace,"SF Mono",Menlo,monospace;color:var(--accent,#ff8a3d);left:' + nowX + 'px';
       axis.appendChild(n);
@@ -373,15 +517,15 @@
         if (r.noRepo) lines.push(r.noRepo + (r.noRepo === 1 ? ' review' : ' reviews') + ' with no repo recorded');
         return lines.join('\n');
       }
-      var e = h.e;
-      return e.kind + (e.repo ? ' · ' + e.repo : '') + (e.agent ? ' · ' + e.agent : '') + (e.kind === 'review' ? (e.ok ? ' · ok' : ' · failed') : '') + ' · ' + hhmm(e.t);
+      return eventTip(h.e);
     }
     cv.addEventListener('mousemove', function (ev) {
+      if (strip) return;   // the strip is a glance: no tooltip
       var b = cv.getBoundingClientRect(), x = ev.clientX - b.left, y = ev.clientY - b.top, best = null, bd = 100;
       for (var i = 0; i < hits.length; i++) {
         var h = hits[i];
         if (h.label) { if (x < h.x1 && Math.abs(y - h.y) < 10) { best = h; bd = 0; } continue; }
-        var d = Math.abs(h.x - x) + Math.abs(h.y - y);
+        var d = (h.x2 === undefined ? Math.abs(h.x - x) : x < h.x ? h.x - x : x > h.x2 ? x - h.x2 : 0) + Math.abs(h.y - y);
         if (d < bd && d < 10) { best = h; bd = d; }
       }
       var text = best && tipFor(best);
@@ -423,7 +567,7 @@
     };
   }
 
-  var api = { mount: mount, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
+  var api = { mount: mount, legendNode: legendNode, eventTip: eventTip, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();
