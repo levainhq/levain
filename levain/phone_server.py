@@ -829,7 +829,7 @@ class _PhoneServer(ThreadingHTTPServer):
 
         def run() -> None:
             try:
-                d = deliver(queue, request_id, notify=agent_notify(self.queue_dir, agent))
+                d = deliver(queue, request_id, notify=agent_notify(self.queue_dir, agent, request_id))
                 box["d"] = {"route": d.route, "reason": d.reason}
             except Exception as exc:  # noqa: BLE001 - the ruling stands; `levain consent deliver` retries it
                 box["d"] = {"route": "failed", "reason": f"delivery raised {type(exc).__name__}; the ruling stands: "

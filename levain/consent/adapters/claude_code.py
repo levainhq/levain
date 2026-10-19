@@ -1104,13 +1104,44 @@ def _what(tool_name: str, tool_input: Any, display: str | None = None) -> str:
     return text[:head] + "…" + text[-(WHAT_MAX - head - 1):]
 
 
-def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = None) -> bool:
+def ping_configured(settings: AdapterSettings, queue_dir: Path | str | None) -> bool:
+    """True when a ping has somewhere to go: a ``notify_argv`` command, or a paired phone with pings on for this
+    queue directory (:func:`levain.webpush.live`)."""
+    if settings.notify_argv:
+        return True
+    try:
+        from levain.webpush import live
+
+        return live(queue_dir)
+    except Exception:  # noqa: BLE001 - a ping is optional
+        return False
+
+
+def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = None, kind: str = "consent",
+           ref: str | None = None) -> bool:
     """Ping the operator (R-f): start ``notify_argv`` + ``[message]``, detached, never waited on, in ``cwd`` (the
     queue directory from the gate; the home directory when none is given), never the project the agent works in.
     The command is an absolute path or a bare name found on the child's ``PATH`` as an absolute path; a relative
-    path (``bin/ping``) is refused, since it would resolve against a directory the agent can write. True when it
-    started; False when none is configured, the command is refused, or it could not start. A failed ping never
-    fails the gate."""
+    path (``bin/ping``) is refused, since it would resolve against a directory the agent can write. When ``cwd`` is
+    a queue directory with a paired phone's pings on, the same words also go out as a web push (``kind`` and ``ref``,
+    ``request:<id>`` or ``question:<n>``, name it in the notification record), started detached the same way.
+    True when either started; False when neither is configured or neither could start. A failed ping never fails
+    the gate."""
+    started = _notify_argv(settings, message, cwd=cwd)
+    pushed = False
+    if cwd is not None:
+        try:
+            from levain.webpush import live, sender
+
+            if live(cwd):
+                body = message[len("levain: "):] if message.startswith("levain: ") else message
+                pushed = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body)
+        except Exception:  # noqa: BLE001 - a failed ping never fails the gate
+            pushed = False
+    return started or pushed
+
+
+def _notify_argv(settings: AdapterSettings, message: str, *, cwd: Path | str | None) -> bool:
     if not settings.notify_argv:
         return False
     import shutil
@@ -1136,10 +1167,10 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
 
 
 def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
-    """R-e: claim the snoozed re-pings that are due and send each (only when a notify command is configured: a
-    claimed re-ping is never sent again, so one is never claimed with nowhere to send it). Returns how many
-    started."""
-    if not settings.notify_argv:
+    """R-e: claim the snoozed re-pings that are due and send each (only when a ping is configured, a notify command
+    or a phone with pings on: a claimed re-ping is never sent again, so one is never claimed with nowhere to send
+    it). Returns how many started."""
+    if not ping_configured(settings, queue.directory):
         return 0
     sent = 0
     for reping in queue.claim_repings():
@@ -1150,7 +1181,8 @@ def send_repings(queue: ConsentQueue, settings: AdapterSettings) -> int:
         what = _what(got[0].tool_name, None, got[0].display)
         head = (f"levain: asking again, gap {gap_label(gap, got[0].agent_session_id)}" if gap is not None
                 else "levain: asking again")
-        sent += notify(settings, f"{head}: {what} (request {reping.request_id}).", cwd=queue.directory)
+        sent += notify(settings, f"{head}: {what} (request {reping.request_id}).", cwd=queue.directory,
+                       kind="reping", ref=f"request:{reping.request_id}")
     return sent
 
 
@@ -1417,7 +1449,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
-               cwd=queue.directory)
+               cwd=queue.directory, ref=f"request:{request.id}")
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
             # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)
