@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
+import stat
 import tempfile
 from pathlib import Path
 
@@ -35,15 +35,13 @@ def _records(log: Path) -> list[dict]:
     return [json.loads(line) for line in log.read_text().splitlines()]
 
 
-def _free_gwport() -> int:
+async def _serve_in_gateway_range(stub: Stub):
+    """Bind the first free port in 47100-47163 by trying the real bind (no probe-then-release race)."""
     for port in range(GWPORT_BASE, GWPORT_BASE + 64):
-        with socket.socket() as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # a prior run's TIME_WAIT must not skip the port
-            try:
-                s.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
+        try:
+            return await stub.serve_tcp(port), port
+        except OSError:
+            continue
     pytest.skip("no free port in the gateway range 47100-47163")
 
 
@@ -54,6 +52,8 @@ def test_stub_answers_slot_request():
         # Linux shape: a unix socket; the peer uid is the kernel's answer, the slot is configured.
         sock_path = tmp / "gw.sock"
         unix = await Stub(log, slot=3).serve_unix(sock_path)
+        # the slot reaches the socket through its GROUP (contract §2.2): group must have write, whatever the umask
+        assert stat.S_IMODE(os.lstat(sock_path).st_mode) == 0o660
         r, w = await asyncio.open_unix_connection(str(sock_path))
         resp = await _post(r, w, "/r/anthropic/v1/messages")
         assert resp.startswith(b"HTTP/1.1 200 ") and resp.endswith(FIXED_BODY)
@@ -62,12 +62,15 @@ def test_stub_answers_slot_request():
         assert head.startswith(b"HTTP/1.1 200 ") and echoed == b"tunnel-bytes"
         r, w = await asyncio.open_unix_connection(str(sock_path))
         assert (await _post(r, w, "/v1/messages")).startswith(b"HTTP/1.1 404 ")  # not a /r/<route> path: refused
+        r, w = await asyncio.open_unix_connection(str(sock_path))
+        w.write(b"POST /r/anthropic/v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n")
+        await w.drain()
+        assert (await r.read()).startswith(b"HTTP/1.1 400 ")  # chunked framing, even beside a Content-Length
         unix.close()
         await unix.wait_closed()
 
         # macOS shape: TCP on 127.0.0.1:47100+n; the slot comes from the port, the uid is unknown.
-        port = _free_gwport()
-        tcp = await Stub(log).serve_tcp(port)
+        tcp, port = await _serve_in_gateway_range(Stub(log))
         r, w = await asyncio.open_connection("127.0.0.1", port)
         resp = await _post(r, w, "/r/openrouter-glm/api/v1/chat/completions")
         assert resp.endswith(FIXED_BODY)
@@ -86,7 +89,14 @@ def test_stub_answers_slot_request():
                            "path": "/r/openrouter-glm/api/v1/chat/completions"}
         assert recs[3] == {"peer_uid": None, "slot": port - GWPORT_BASE, "route": None, "method": "CONNECT",
                            "path": "github.com:443"}
-        assert len(recs) == 4  # the refused request logged nothing
+        assert len(recs) == 4  # the refused requests logged nothing
+
+        # never bound over a file that is not a socket
+        plain = tmp / "not-a-socket"
+        plain.write_text("keep me")
+        with pytest.raises(FileExistsError):
+            await Stub(log, slot=0).serve_unix(plain)
+        assert plain.read_text() == "keep me"
 
     # /tmp, not pytest's tmp_path: macOS caps a unix socket path at 104 bytes.
     with tempfile.TemporaryDirectory(dir="/tmp") as d:

@@ -22,12 +22,15 @@ import asyncio
 import json
 import os
 import re
+import signal
 import socket
+import stat
 import struct
 import sys
 from pathlib import Path
 
 GWPORT_BASE = 47100
+SLOTS = 64  # the egress index space, contract §1.1
 FIXED_BODY = b'{"stub":"levain-gateway-stub/1"}'
 _HEAD_CAP = 64 * 1024
 _BODY_CAP = 1024 * 1024
@@ -53,6 +56,7 @@ class Stub:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.slot = slot  # the unix-socket shape names its slot; the TCP shape derives it from the port
+        self.bound: tuple[str, int] | None = None
 
     def _log(self, rec: dict) -> None:
         with self.log_path.open("a", encoding="utf-8") as fh:
@@ -61,8 +65,8 @@ class Stub:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             await self._serve(reader, writer)
-        except (ConnectionError, asyncio.IncompleteReadError):
-            pass  # the client went away mid-request or mid-tunnel: nothing to answer
+        except (OSError, asyncio.IncompleteReadError):
+            pass  # the client went away mid-request or mid-tunnel (incl. a peer-cred read on a dead socket)
         finally:
             writer.close()
 
@@ -71,12 +75,10 @@ class Stub:
         uid = peer_uid(sock)
         slot = self.slot
         if sock.family != socket.AF_UNIX:
-            n = writer.get_extra_info("sockname")[1] - GWPORT_BASE
-            slot = n if 0 <= n < 64 else None  # off the gateway range: no slot, never a made-up one
+            slot = writer.get_extra_info("sockname")[1] - GWPORT_BASE  # serve_tcp admits only the gateway range
         try:
             head = await reader.readuntil(b"\r\n\r\n")
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-            writer.close()
             return
         lines = head.split(b"\r\n")
         parts = lines[0].split(b" ")
@@ -84,11 +86,11 @@ class Stub:
             await self._refuse(writer, 400)
             return
         method, target = parts[0], parts[1]
-        headers = {}
+        headers: dict[bytes, list[bytes]] = {}
         for line in lines[1:]:
             if b":" in line:
                 k, v = line.split(b":", 1)
-                headers[k.strip().lower()] = v.strip()
+                headers.setdefault(k.strip().lower(), []).append(v.strip())
 
         if method == b"CONNECT":
             self._log({"peer_uid": uid, "slot": slot, "route": None, "method": "CONNECT",
@@ -98,38 +100,72 @@ class Stub:
             while chunk := await reader.read(65536):
                 writer.write(chunk)
                 await writer.drain()
-            writer.close()
             return
 
+        # Framing first, so every answer below is sent after the body is read (an unread body makes the
+        # close an RST that can destroy the status). Chunked, or any framing but one plain Content-Length: 400.
+        lengths = headers.get(b"content-length", [b"0"] if method != b"POST" else [])
+        if b"transfer-encoding" in headers or len(lengths) != 1 or not lengths[0].isdigit():
+            await self._refuse(writer, 400)
+            return
+        length = int(lengths[0])
+        if length > _BODY_CAP:
+            await self._refuse(writer, 413)
+            return
+        await reader.readexactly(length)
         m = _ROUTE.match(target)
         if method != b"POST" or not m:
             await self._refuse(writer, 404)
             return
-        try:
-            length = int(headers.get(b"content-length", b""))
-        except ValueError:
-            await self._refuse(writer, 400)
-            return
-        if not 0 <= length <= _BODY_CAP:
-            await self._refuse(writer, 413)
-            return
-        await reader.readexactly(length)
         self._log({"peer_uid": uid, "slot": slot, "route": m.group(1).decode(), "method": "POST",
                    "path": target.decode("ascii", "replace")})
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
                      b"Connection: close\r\n\r\n" % len(FIXED_BODY) + FIXED_BODY)
         await writer.drain()
-        writer.close()
 
     async def _refuse(self, writer: asyncio.StreamWriter, status: int) -> None:
         writer.write(b"HTTP/1.1 %d Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % status)
         await writer.drain()
-        writer.close()
 
     async def serve_unix(self, path: Path | str) -> asyncio.base_events.Server:
-        return await asyncio.start_unix_server(self._handle, path=str(path), limit=_HEAD_CAP)
+        """Bind `path` mode 0660 (the slot reaches it through the socket's GROUP, contract §2.2), never over an
+        existing file. A stale SOCKET at the path is replaced; any other file refuses (FileExistsError)."""
+        if self.slot is None or not 0 <= self.slot < SLOTS:
+            raise ValueError(f"the unix shape needs a slot index in 0..{SLOTS - 1}")
+        path = str(path)
+        try:
+            if stat.S_ISSOCK(os.lstat(path).st_mode):
+                os.unlink(path)
+            else:
+                raise FileExistsError(path)
+        except FileNotFoundError:
+            pass
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(path)
+            self.bound = (path, os.lstat(path).st_ino)
+            os.chmod(path, 0o660)  # the socket's mode is the umask's until set; group must be able to connect
+            return await asyncio.start_unix_server(self._handle, sock=s, limit=_HEAD_CAP)
+        except BaseException:
+            s.close()
+            self.unbind()
+            raise
+
+    def unbind(self) -> None:
+        """Remove the socket this process bound, only while the path still names that inode."""
+        if self.bound is None:
+            return
+        path, ino = self.bound
+        self.bound = None
+        try:
+            if os.lstat(path).st_ino == ino:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     async def serve_tcp(self, port: int, host: str = "127.0.0.1") -> asyncio.base_events.Server:
+        if not GWPORT_BASE <= port < GWPORT_BASE + SLOTS:
+            raise ValueError(f"the TCP shape serves only the gateway range {GWPORT_BASE}..{GWPORT_BASE + SLOTS - 1}")
         return await asyncio.start_server(self._handle, host=host, port=port, limit=_HEAD_CAP)
 
 
@@ -138,28 +174,30 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(prog="python -m levain.broker.stub")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--unix", help="socket path (the Linux front shape)")
-    g.add_argument("--port", type=int, help="TCP port on 127.0.0.1 (the macOS front shape, 47100 + slot)")
+    g.add_argument("--unix", help="socket path (the Linux front shape); needs --slot")
+    g.add_argument("--port", type=int, help=f"TCP port on 127.0.0.1 (the macOS front shape, {GWPORT_BASE} + slot)")
     ap.add_argument("--slot", type=int, help="slot index for the unix shape")
     ap.add_argument("--log", required=True)
     a = ap.parse_args(argv)
+    if a.unix and a.slot is None:
+        ap.error("--unix needs --slot")
+    if a.port is not None and a.slot is not None:
+        ap.error("--slot is the port's index in the TCP shape; do not pass it")
     stub = Stub(a.log, slot=a.slot)
 
     async def run() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):  # a plain `kill` must clean up too, not only Ctrl-C
+            loop.add_signal_handler(sig, stop.set)
         server = await (stub.serve_unix(a.unix) if a.unix else stub.serve_tcp(a.port))
         async with server:
-            await server.serve_forever()
+            await stop.wait()
 
     try:
         asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
     finally:
-        if a.unix:
-            try:
-                os.unlink(a.unix)
-            except FileNotFoundError:
-                pass
+        stub.unbind()
     return 0
 
 
