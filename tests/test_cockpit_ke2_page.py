@@ -102,7 +102,7 @@ def test_ke_regions_map_and_the_reading_draws_its_icon_and_pill(tmp_path: Path) 
     assert out["face"] == "count"
     # the hero is the header in every mode: its weather is not a Build-dropped reading (Phill 10-12: "why is the
     # header in Build mode missing the weather?"); the brief, an orientation read, still leaves Build
-    assert out["modes"]["weather"].split() == ["morning", "board", "build"]
+    assert out["modes"]["weather"].split() == ["morning", "board", "build", "memory"]
     assert "build" not in out["modes"]["brief"].split()
     assert out["old"]["ke"] and "focus" not in out["old"]["layout"]
     assert out["icon"] == 1

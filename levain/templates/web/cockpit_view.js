@@ -365,18 +365,22 @@
     return t;
   }
 
-  // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
-  // sky); Build drops the readings that are only for orientation; Board is everything. An ambient panel, and anything placed in the hero, is in all.
-  const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
-  const BUILD_DROPS = new Set(["brief", "reading", "section"]);
+  // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, loops, Now,
+  // Keep, episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
+  // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
+  // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
+  const ALL_TABS = "morning board build memory";
+  // Null-prototype tables: a panel id comes from the wire, and "constructor" or "__proto__" must read as not-in-the-table
+  // rather than an inherited function.
+  const tableOf = (o) => Object.assign(Object.create(null), o);
+  const TABS_OF_ID = tableOf({
+    tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
+    edits: "build", jobs: "build", sessions: "morning board build", health: "memory",
+    graph: "memory", wraps: "memory", crystals: "memory"
+  });
+  const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });
   function modesOf(e) {
-    const k = e.pkind || e.kind;
-    if (k === "ambient") return "morning board build";
-    const out = [];
-    if (MORNING_KINDS.has(k) || e.kind === "tray" || e.kind === "section") out.push("morning");
-    out.push("board");
-    if (!BUILD_DROPS.has(k) && e.kind !== "section") out.push("build");
-    return out.join(" ");
+    return TABS_OF_ID[e.id] || TABS_OF_REGION[e.region || e.zone] || "board";
   }
 
   // The entity record: a bad masthead string is omitted and named in view.errors.entity; the jar is all-or-null.
@@ -601,6 +605,9 @@
       const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
       if (region) entry.region = region;
+      // how many rows the panel holds, from the kernel's own count: the page's count pill reads this, never the title's words
+      const held = isNum(panel.count) ? panel.count : (isNum(head.count) ? head.count : null);
+      if (held !== null) entry.count = held;
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -766,7 +773,7 @@
     // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
     // readings Build drops
     const inHero = new Set(view.ke ? view.ke.hero : []);
-    for (const e of view.layout) e.modes = inHero.has(e.id) ? "morning board build" : modesOf(e);
+    for (const e of view.layout) e.modes = inHero.has(e.id) ? ALL_TABS : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
@@ -783,7 +790,7 @@
   const states = new Set();             // every live typed panel body (a panel and its expanded copy are two)
   const FILTER_KEY = "levain_cockpit_filter:";
   const MODE_KEY = "levain_cockpit_mode";
-  const MODES = ["morning", "board", "build"];
+  const MODES = ["morning", "board", "build", "memory"];
   const SEARCH_DEBOUNCE_MS = 250;
   const STORE_LIMIT = 50;
   let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
@@ -1057,7 +1064,9 @@
     s.units = 0; s.hidden = 0;
     if (d.face === "count") {
       const n = isNum(d.count) ? d.count : (d.lines || []).length;
-      host.appendChild(el("div", "big num", n));
+      const big = el("div", "big num", n);
+      big.dataset.count = String(n);   // the glow below reads this, not the figure's drawn text
+      host.appendChild(big);
       // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it, but only for
       // a clean, fresh read: on a degraded one (partial, stale, cached, alerted, something held back) the zero may be a
       // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
@@ -1655,23 +1664,71 @@
     return "applied";
   }
 
+  // ---- the theme (F6): one token set, two themes, three choices. System (no choice: dashboard.css follows prefers-color-scheme),
+  // dark, light. A choice is kept per browser, never anywhere an agent reads; `?theme=light|dark` is a one-visit override that is not
+  // kept. A browser that refuses storage still switches for the page's life.
+  const THEME_KEY = "levain_cockpit_theme";
+  const isTheme = (t) => t === "light" || t === "dark";
+  function storedTheme() { try { const t = root.localStorage.getItem(THEME_KEY); return isTheme(t) ? t : ""; } catch (_) { return ""; } }
+  function queryTheme() {
+    try { const t = new URLSearchParams(root.location.search).get("theme"); return isTheme(t) ? t : ""; } catch (_) { return ""; }
+  }
+  const pageRoot = () => (typeof document !== "undefined" && document.documentElement) || null;   // a DOM without an <html> (the test fake) has no theme to set
+  // the choice the page is under right now: "light", "dark", or "system" when neither is set
+  function chosenTheme() {
+    const t = pageRoot() && pageRoot().dataset ? pageRoot().dataset.theme : "";
+    return isTheme(t) ? t : "system";
+  }
+  function paintThemeSwitch() {
+    const now = chosenTheme();
+    for (const b of document.querySelectorAll("[data-theme-set]")) b.setAttribute("aria-pressed", b.dataset.themeSet === now ? "true" : "false");
+  }
+  function setTheme(t, keep) {
+    const html = pageRoot();
+    if (html && html.dataset) { if (isTheme(t)) html.dataset.theme = t; else delete html.dataset.theme; }
+    if (keep) { try { if (isTheme(t)) root.localStorage.setItem(THEME_KEY, t); else root.localStorage.removeItem(THEME_KEY); } catch (_) { /* the page still switched */ } }
+    paintThemeSwitch();
+  }
+  // run as this file loads (it is in the <head>): the theme is set before the body paints, so a stored light theme never flashes dark
+  (function earlyTheme() {
+    const html = pageRoot();
+    const t = queryTheme() || storedTheme();
+    if (html && html.dataset && t) html.dataset.theme = t;
+  })();
   // ---- the modes and the keys ----
-  function applyMode(m) {
+  // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
+  // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
+  // part it keeps as `key=value`. The name is read with that suffix removed and, when the address is rewritten, written bare.
+  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => (MODES.indexOf(p.replace(/=$/, "")) >= 0 ? p.replace(/=$/, "") : p));
+  function hashMode() { return hashParts().find((p) => MODES.indexOf(p) >= 0) || ""; }
+  // the address follows the tab the reader chose; any other fragment part stays
+  function writeHash(m) {
+    try { root.history.replaceState(null, "", root.location.pathname + root.location.search + "#" + hashParts().filter((p) => MODES.indexOf(p) < 0).concat(m).join("&")); }
+    catch (_) { /* an address that cannot be rewritten is still a working page */ }
+  }
+  // `fromReader`: the tab was chosen by the reader (a click, a key, the jump box), so the address follows; the first paint does not write it
+  function applyMode(m, fromReader) {
     if (MODES.indexOf(m) < 0) m = "board";
     document.body.dataset.mode = m;
     save(MODE_KEY, m);
+    if (fromReader) writeHash(m);
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     fillGrids();
   }
-  // The grids keep their designed widths whatever a mode hides (10-14: a lone widget or a lone Work card stretched
-  // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
-  // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
+  // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
+  // tab list (page chrome) is on every tab.
+  function revealTab(node) {
+    const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean);
+    if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
+  }
+  // The grids are laid out from what a mode shows: the glance is a strip sharing its row (tiles from four), and a zone grid is six
+  // tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }
   // A card with nothing to list is its header and the one empty-state line, not a populated card's height with a gap in it.
   // Decided at render (this runs after each one): a card the person is filtering keeps its height, since the filter is the
   // reason the list is short and a collapsing card would jump under the cursor.
   function markEmptyCards() {
-    for (const p of document.querySelectorAll(".ck-zgrid > .panel")) {
+    for (const p of document.querySelectorAll(".ck-zgrid .panel")) {
       const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".xfilter, .pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
       p.classList.toggle("ck-is-empty", none);
       // an empty card folds into a slim bar at the end of its zone, unless it has a compose box or an editor behind an Edit link on it
@@ -1742,21 +1799,53 @@
     }
     // the Decisions tile glows only while something waits on the operator
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
-      const big = w.querySelector(".big");
-      const n = big ? parseInt(big.textContent, 10) : 0;
+      const big = w.querySelector(".big[data-count]");
+      const n = big ? Number(big.dataset.count) : 0;
       if (n > 0) w.dataset.signal = "on"; else delete w.dataset.signal;
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
   if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) tintRepos(); }, 1500);
+  // The glance is a compact strip (one bordered row of equal tiles) on Board and whenever fewer than four tiles show; four or more are full
+  // tiles. A zone's grid is told which of its columns have a card on this tab, and a card that would sit alone in a row of a wider grid
+  // is stretched to the row: a lone card never leaves a hole beside it. Measured after layout, so it is redone on every tab change.
+  function layoutGrid(g) {
+    for (const p of g.querySelectorAll(".panel[data-stretch]")) delete p.dataset.stretch;
+    const cols = Array.from(g.querySelectorAll(":scope > .ck-col"));
+    let live = 0;
+    for (const c of cols) {
+      const on = Array.from(c.querySelectorAll(".panel")).some(shown);
+      c.classList.toggle("ck-col-off", !on);
+      if (on) live++;
+    }
+    if (cols.length) g.dataset.cols = String(live);
+    const flat = (p) => p.parentElement === g || (p.parentElement.classList.contains("ck-col") && getComputedStyle(p.parentElement).display === "contents");
+    const rows = new Map();
+    for (const p of g.querySelectorAll(".panel")) {
+      if (!shown(p) || !flat(p)) continue;
+      const r = p.getBoundingClientRect();
+      const k = Math.round(r.top);
+      if (!rows.has(k)) rows.set(k, []);
+      rows.get(k).push([p, r.width]);
+    }
+    const full = g.clientWidth;
+    for (const row of rows.values()) if (row.length === 1 && row[0][1] < full * 0.9) row[0][0].dataset.stretch = "1";
+  }
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
     tintRepos();
+    const board = document.body.dataset.mode === "board";
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       w.style.setProperty("--ck-n", String(Math.max(4, n)));
+      w.dataset.shape = board || n < 4 ? "strip" : "tiles";
+      w.dataset.n = String(n);
+      const tiles = Array.from(w.children).filter(shown);
+      for (const t of tiles) delete t.dataset.last;
+      if (tiles.length % 2 === 1) tiles[tiles.length - 1].dataset.last = "1";   // the narrow page is two across: an odd one out takes the row
     }
+    for (const g of document.querySelectorAll(".ck-zgrid")) layoutGrid(g);
   }
   function typing(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
   function visibleFilters() {
@@ -1809,11 +1898,13 @@
     const choose = (it) => {
       close();
       if (it.kind === "panel") {
-        // a panel the current mode hides is reached through Board, which shows every panel
-        if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        // a panel the current tab hides is reached through the first tab that shows it
+        revealTab(it.node);
         if (it.node.ckShowTab) it.node.ckShowTab();
         it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
-      applyMode("board");
+      // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
+      revealTab(it.state.p);
+      if (it.state.p.ckShowTab) it.state.p.ckShowTab();
       it.state.setQuery(it.q, true);
       it.state.p.scrollIntoView({ block: "start" });
       if (it.state.filterInput) it.state.filterInput.focus();
@@ -1845,13 +1936,21 @@
   }
 
   function install() {
-    applyMode(saved(MODE_KEY) || "board");
+    // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
+    applyMode(hashMode() || saved(MODE_KEY) || "board");
+    setTheme(queryTheme() || storedTheme(), false);
+    if (root.matchMedia) { const mq = root.matchMedia("(prefers-color-scheme: light)"); if (mq.addEventListener) mq.addEventListener("change", paintThemeSwitch); }
+    if (typeof root.addEventListener === "function") root.addEventListener("hashchange", () => { const m = hashMode(); if (m) applyMode(m); });
+    document.addEventListener("click", (ev) => {
+      const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
+      if (b) setTheme(b.dataset.themeSet, true);
+    });
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
       const t = ev.target && ev.target.closest ? ev.target.closest("[data-mode-tab],#jumpbtn") : null;
       if (!t) return;
-      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab);
+      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab, true);
     });
     // a filter keeps focus through a re-render until the operator goes somewhere else
     document.addEventListener("mousedown", (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest(".xfilter"))) focusKeep = null; });
@@ -1873,7 +1972,7 @@
         const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
         near.focus(onScreen ? { preventScroll: true } : undefined);
         near.select();
-      } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
+      } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)], true);
     });
   }
   if (typeof document !== "undefined") {
@@ -1881,7 +1980,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
+  Object.assign(K, { fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

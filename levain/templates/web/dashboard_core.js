@@ -43,7 +43,7 @@
     p.dataset.editClass = entry.edit_class || "";
     // the panel's stable id: what a kept row or scroll position is filed under (the heading is not an identity)
     if (entry.id) p.dataset.panelId = String(entry.id);
-    if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
+    if (entry.modes) p.dataset.modes = entry.modes;   // which of the four tabs (Morning / Board / Build / Memory) show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
     if (entry.edit_class) {
@@ -269,7 +269,7 @@
     const storeEl = document.getElementById("store");
     if (!view || typeof view !== "object") {
       board.appendChild(el("p", "empty", "No substrate data delivered."));
-      keShell(false);      // the KE regions, the moved masthead and the state line must not outlive the data they showed
+      keShell(false);      // the KE regions and the state line (moved into the now band) must not outlive the data they showed
       renderState(null);
       closeModal();  // don't leave a focus-modal open over a view we can't render
       return;
@@ -340,7 +340,7 @@
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
     keShell(!!view.ke);
-    if (view.ke) { renderKe(view, board); if (window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids(); }
+    if (view.ke) renderKe(view, board);
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
       // In the "All" view, drop a zone separator before each zone's first panel.
@@ -370,6 +370,9 @@
     settleKept(board, kept);
     buildKept = null;
     applyFilter();
+    // the cards are on the page and wrapped: the grids learn which columns hold a card on this tab, which card is empty, and which stands
+    // alone in its row (measured, so it waits for the bodies)
+    if (view.ke && window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids();
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
@@ -474,37 +477,29 @@
   // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
   // stale modal: the board and the focus modal both draw through this.
   // ---------------------------------------------------------------- the KE page ----
-  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the
-  // clock column with the weather under it, the sky beside it with the tool strip above), the brief, one row
-  // of widgets, then each zone as a 3-column grid of cards. The nav bar's contents live in the hero's strip.
+  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the now band: clock, date,
+  // the state line, the wrap line; the sky as a card under it), the brief, one row of widgets, then each zone as a grid of cards.
+  // The masthead above them is the page's bar and stays where the static page put it.
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
   const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
-  // the two structural nodes the KE page moves into its regions. A region that fails restores its own node here, BEFORE
-  // anything is cleared, so no catch can strand them inside a region it is about to wipe.
+  // the one structural node the KE page moves into a region: the state line, which lives in the now band while the KE page is up.
+  // A region that fails restores it here BEFORE anything is cleared, so no catch can strand it inside a region it is about to wipe.
+  // (The masthead and the brand no longer move: the bar is the same on every page.)
   function restoreState() {
     const state = document.getElementById("state"), store = document.getElementById("store");
     if (state && store && store.parentNode && state.parentNode !== store.parentNode) store.parentNode.insertBefore(state, store);
   }
-  function restoreMasthead() {
-    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand");
-    const state = document.getElementById("state"), store = document.getElementById("store");
-    if (!mast || !store || !store.parentNode) return;
-    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
-    const anchor = state && state.parentNode === store.parentNode ? state : store;
-    if (mast.parentNode !== store.parentNode || mast.nextSibling !== anchor) store.parentNode.insertBefore(mast, anchor);
-  }
-  // a failed hero render: the masthead goes home and the CONTENT mounts are emptied (stale weather and sky beside the
-  // error line would read as current); the structural mounts (#ck-hero, #ck-skycol, #ck-strip) stay for the next render
+  // a failed hero render: the CONTENT mounts are emptied (stale weather and sky beside the error line would read as current);
+  // the structural mounts (#ck-hero, #ck-band, #ck-skycol) stay for the next render
   function restoreHero() {
-    restoreMasthead();
-    for (const id of ["ck-when", "ck-sky", "ck-legend"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
   }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
-    // the hero's legend band follows the hero: shown by the sky's own render, hidden with the region
+    // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
     // the section headers are page chrome that follows its region: hidden here, set by the region's own render
@@ -513,11 +508,10 @@
     const bd = document.getElementById("board");
     if (bd) bd.classList.toggle("ke", on);
     if (on) return;
-    // back to the pre-KE page: the brand, the masthead and the state line return to where the static page put them
+    // back to the pre-KE page: the state line returns to where the static page put it
     restoreState();
-    restoreMasthead();
     // what the regions drew is stale once the page is no longer the KE page
-    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {
@@ -561,11 +555,49 @@
     return node;
   }
 
+  // The band's right cell, never blank. With wrap history: "Last wrap Mon 06:02" over the wrap count (the health panel's own total when
+  // the page holds it; else "N wraps held", or "N+ wraps" when the list is as long as a history list is sent: it is a floor then, not
+  // a count). Without history: "No wraps yet" over a fact the install has (its name, and the day's episodes when the jar counts them).
+  // When the wraps panel could not be read the line says nothing about wraps at all: unreadable is not "never".
+  function wrapLineOf(view) {
+    const WRAP_LIST_CAP = 50;   // the longest history list the page is sent
+    const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const unread = !!((view.errors && view.errors.wraps) || (view.health && view.health.wrap_history_unavailable));
+    const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? ws[0] : null;
+    const at = last ? new Date(last.wrapped_at) : null;
+    const box = el("div", "wrapline");
+    const first = el("div"), second = el("div");
+    if (at && !Number.isNaN(at.getTime())) {
+      const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+      first.append(el("b", null, "Last wrap"), " " + when);
+      const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
+      second.textContent = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+        : ws.length >= WRAP_LIST_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap held" : " wraps held");
+    } else {
+      const today = view.jar && Number.isInteger(view.jar.today) ? view.jar.today + " today" : "";
+      const name = typeof view.entity_name === "string" ? view.entity_name : "";
+      if (unread) {
+        first.appendChild(el("b", null, name || "This install"));
+        second.textContent = today;
+      } else {
+        const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : 0;
+        if (total > 0) {   // the history list was not sent but the health panel counts wraps: a count, never "none yet"
+          first.appendChild(el("b", null, total + (total === 1 ? " wrap" : " wraps")));
+          second.textContent = [name, today].filter(Boolean).join(" · ");
+        } else {
+          first.appendChild(el("b", null, "No wraps yet"));
+          second.textContent = [name, today].filter(Boolean).join(" · ") || "a fresh install";
+        }
+      }
+    }
+    box.append(first, second);
+    return box;
+  }
+
   let heroEpoch = 0;
   function renderHero(view, byId) {
-    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), skycol = document.getElementById("ck-skycol");
-    const strip = document.getElementById("ck-strip"), skyHost = document.getElementById("ck-sky");
-    const mast = document.querySelector("header.masthead");
+    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), wrapline = document.getElementById("ck-wrapline");
+    const skyHost = document.getElementById("ck-sky");
     // The legend band (#ck-legend) is the hero's: cleared and hidden here, filled and placed with the other mounts at
     // the end, and only when a sky painted a key. Until then the sky hands its legend to `place`, which holds it off
     // the page; after, `place` writes the band (a hot repaint) and `hide` clears it (a dropped or failed sky).
@@ -580,16 +612,19 @@
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
-    // the nav bar's brand sits over the clock; everything else it carried is the strip above the sky
-    const brand = document.querySelector(".brand");
+    // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
+    // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), the sky's event count and the
+    // weather when a provider supplies one. A bare install has no sky and no weather and the band is still whole.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
-    // everything that can throw is built off the page; the structural mounts (when, strip, sky) and the masthead
+    // everything that can throw is built off the page; the structural mounts (when, wrap line, sky)
     // are touched only once all of it exists
-    const whenKids = [], skyKids = [];
+    const whenKids = [], metaKids = [], skyKids = [];
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
-    whenKids.push(stamp, events);
+    whenKids.push(stamp);
+    metaKids.push(wrapLineOf(view));
+    metaKids.push(events);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
@@ -616,16 +651,14 @@
         });
         node.appendChild(again);
       }
-      whenKids.push(node);
-    } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
+      metaKids.push(node);
+    }
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
     for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
-    when.replaceChildren();
-    if (brand) when.appendChild(brand);
-    when.append(...whenKids);
-    if (mast) strip.replaceChildren(mast);
+    when.replaceChildren(...whenKids);
+    if (wrapline) wrapline.replaceChildren(...metaKids);
     skyHost.replaceChildren(...skyKids);
     hero.hidden = false;
     live = true;
@@ -633,18 +666,21 @@
     pending = null;
   }
 
+  // TODAY: where to begin, one card. The state line is not in it any more: it lives in the now band (#ck-state-slot), so a
+  // bare install, which has no brief panel, draws no Today card and no heading at all.
   function renderBriefRegion(view, byId) {
     const region = document.getElementById("ck-brief");
     const state = document.getElementById("state");
-    const card = el("div", "ck-card ck-briefcard");
+    const slot = document.getElementById("ck-state-slot");
     const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
     const bodies = entries.map((e) => bareNode(e, view, "ck-brief-body", { region: "brief" }));   // may throw: #state has not moved yet
-    if (state) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; card.appendChild(state); }
-    for (const node of bodies) card.appendChild(node);
-    region.replaceChildren(card);
-    // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
-    const st = view.state;
-    region.hidden = !entries.length && !(st && (st.text || (commit && st.can_edit !== false)));
+    if (state && slot) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; slot.appendChild(state); }
+    if (bodies.length) {
+      const card = el("div", "ck-card ck-briefcard");
+      for (const node of bodies) card.appendChild(node);
+      region.replaceChildren(card);
+    } else region.replaceChildren();
+    region.hidden = !entries.length;
     const hb = document.getElementById("ck-h-brief"); if (hb) hb.hidden = region.hidden;   // page chrome: the section's header follows its region
   }
 
@@ -697,6 +733,10 @@
     pruneLineTiles();     // the last render's tiles went with their cards: nothing may keep watching them
     for (const f of fitLines) f();
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.fitWidgets) window.LevainCockpitKinds.fitWidgets(region);   // after attach: the room a tile has is only known on the page
+    if (!region.dataset.ckWatched && typeof MutationObserver === "function") {   // the glance tiles alone can change: the strip's count and shape follow them
+      region.dataset.ckWatched = "1";
+      new MutationObserver(scheduleLayout).observe(region, { childList: true });
+    }
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
     region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
   }
@@ -797,14 +837,113 @@
           // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
           if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
+          if (e.kind === "external") node.dataset.ckExternal = "1";
+          ckCountPill(node, e.count);
           nodes.push(node);
           grid.appendChild(node);
         }
         if (c.tabs && nodes.length > 1) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
       }
     }
+    stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
+    dashPass(grid);
+    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
+  }
+
+  // A panel's count ("Tray (2)" in the kernel's title) is a pill beside the title, hidden at 0: the title says what the card is, the
+  // pill how many it holds. The number is the panel's own count (`count`, from the manifest), never parsed out of the title's words:
+  // a title that ends in a number of its own ("Annual plan (2026)") keeps it. Only the kernel's own " (count)" suffix is lifted off.
+  // The pill is a sibling of the h2, so the heading's text (what the jump box lists) stays the name alone.
+  function ckCountPill(node, count) {
+    if (!Number.isInteger(count) || count < 0) return;
+    const h2 = node.querySelector(":scope > .phead > h2");
+    if (!h2) return;
+    const tail = " (" + count + ")";
+    const text = String(h2.textContent);
+    if (text.endsWith(tail)) h2.textContent = text.slice(0, -tail.length).replace(/\s+$/, "");
+    const pill = el("span", "ck-count", String(count));
+    pill.hidden = count === 0;
+    h2.after(pill);
+  }
+
+  // The Board is two independent stacks, not rows that pair: Tray and Now down the left, Open loops and Keep down the right, each as
+  // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
+  // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
+  // direct, full-width child.
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, now: 0, loops: 1, keep: 1 });
+  function stackColumns(grid) {
+    const kids = Array.from(grid.children);
+    const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
+    if (!kids.some((k) => side(k) === 0) || !kids.some((k) => side(k) === 1)) return;
+    const first = kids.find((k) => side(k) !== undefined);
+    const cols = [el("div", "ck-col"), el("div", "ck-col")];
+    cols[0].dataset.side = "left"; cols[1].dataset.side = "right";
+    grid.insertBefore(cols[0], first);
+    grid.insertBefore(cols[1], first);
+    for (const k of kids) if (side(k) !== undefined) cols[side(k)].appendChild(k);
+    grid.classList.add("ck-twocol");
+  }
+
+  // F7, the empty provider: an external panel that reports empty and says how to fix it collapses to ONE dashed line (its title, the
+  // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
+  // provider's own report (a `no_` state key; its words are never read). Team without a ledger and an Inbox with no source
+  // are the cases. A compose box stays reachable: the line carries its action ("Send"), which opens the box under the line.
+  // A card of the page's own (Tray, Keep, Identity) keeps its card: its box is its content. An empty list card folds in
+  // markEmptyCards (cockpit_view.js). Idempotent: it toggles classes and adds the action once, so the observer that calls it again
+  // cannot loop.
+  function emptyProvider(p) {
+    if (!p.dataset.ckPanel || !p.dataset.ckExternal) return false;
+    const rows = p.querySelectorAll(".pbody .row");
+    if (rows.length === 0) return !!p.querySelector(".pbody .empty");
+    if (rows.length > 1) return false;
+    const key = rows[0].dataset.keepKey || "";
+    return /^no_/.test(key);   // the provider's own sentinel row id; a row's words (a command in backticks) say nothing about it
+  }
+  function dashAction(p) {
+    const head = p.querySelector(":scope > .phead");
+    const compose = p.querySelector(".tray-dump");
+    let act = head ? head.querySelector(".ck-dash-act") : null;
+    if (!head || !compose) { if (act) act.remove(); p.classList.remove("ck-dash-open"); return; }
+    if (act) return;
+    const go = compose.querySelector(".tray-dump-btn");
+    const label = (go && go.textContent.trim()) || "Write";
+    act = el("button", "ck-dash-act", label.charAt(0).toUpperCase() + label.slice(1));
+    act.type = "button";
+    act.setAttribute("aria-expanded", "false");
+    act.addEventListener("click", () => {
+      const open = p.classList.toggle("ck-dash-open");
+      act.setAttribute("aria-expanded", open ? "true" : "false");
+      const ta = compose.querySelector("textarea, input");
+      if (open && ta) ta.focus();
+    });
+    head.appendChild(act);
+  }
+  function dashPass(grid) {
+    for (const p of grid.querySelectorAll(".panel")) {
+      const dash = emptyProvider(p);
+      p.classList.toggle("ck-dash", dash);
+      if (dash) dashAction(p);
+      else {
+        // a card that stops being dashed gives its line's action and open state back
+        const act = p.querySelector(":scope > .phead > .ck-dash-act");
+        if (act) act.remove();
+        p.classList.remove("ck-dash-open");
+      }
+    }
+  }
+  // The zone grids' layout (which columns are live, which card takes its row) is measured after layout. A repaint inside a grid (a card
+  // folding, a dashed line appearing, a refetch) can change it, so the same observer that re-runs dashPass asks for it again here:
+  // one debounced path, however many mutations a repaint makes.
+  let layoutTimer = null;
+  function scheduleLayout() {
+    if (layoutTimer !== null) window.clearTimeout(layoutTimer);
+    layoutTimer = window.setTimeout(() => {
+      layoutTimer = null;
+      const K = window.LevainCockpitKinds;
+      if (K && typeof K.fillGrids === "function") K.fillGrids();
+    }, 60);
   }
 
   // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries
