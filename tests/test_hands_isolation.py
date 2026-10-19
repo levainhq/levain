@@ -30,6 +30,15 @@ from levain.firing.hands import (
     sudoers_text,
 )
 
+_REAL_LINUX_TOOL_MISSING = hands.linux_tool_missing
+
+
+@pytest.fixture(autouse=True)
+def _linux_tools_present(monkeypatch) -> None:
+    # A plan test that sets host_os to linux must not depend on this machine having `setfacl`; the
+    # two tests of the check itself call the real function.
+    monkeypatch.setattr(hands, "linux_tool_missing", lambda: None)
+
 
 def _entity(tmp_path: Path, name: str = "coyote") -> Path:
     d = tmp_path / name
@@ -917,3 +926,29 @@ def test_linux_setup_refuses_by_name_when_the_kernel_refuses_nftables(monkeypatc
         argv, 1, "", "Error: Operation not permitted (you must be root)\n"))
     problem = hands.egress_unavailable()
     assert problem is not None and problem.startswith("the kernel refused nftables (Error: Operation not permitted")
+
+
+# --- a Linux host without `setfacl` (RUN on argushub 2026-10-19: setup stopped half-applied) -------
+
+
+def test_linux_setup_refuses_before_any_step_without_setfacl_dry_run_too(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(hands, "linux_tool_missing", _REAL_LINUX_TOOL_MISSING)
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "setfacl" else f"/usr/bin/{name}")
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    ran: list = []
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: ran.append(argv)
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    ed = _entity(tmp_path)
+    for dry in (True, False):
+        assert hands.cmd_setup_isolation(ed, undo=False, dry_run=dry) == 1
+        assert "refusing: acl is not installed (no `setfacl`" in capsys.readouterr().out
+    assert ran == []
+
+
+def test_linux_undo_without_setfacl_skips_the_acl_step_instead_of_crashing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "setfacl" else f"/usr/bin/{name}")
+    ed = _entity(tmp_path)
+    plan = _undo(ed, "linux", hands_user=hands_user_name(ed), hands_id=999)
+    step = next(s for s in plan.steps if s.why == "remove the workspace ACLs")
+    assert step.call() == (True, "setfacl is not installed, so setup set no ACLs here")

@@ -230,6 +230,17 @@ def egress_unit_text(hands_user: str) -> str:
     ])
 
 
+def linux_tool_missing() -> str | None:
+    """A program a Linux setup runs that is not installed, or None. Checked before the first step,
+    dry run included: on 2026-10-19 a stock Ubuntu (argushub) without the ``acl`` package ran setup
+    to its first ``setfacl`` step and stopped there half-applied."""
+    for tool, package in (("setfacl", "acl"),):
+        if shutil.which(tool, path=SECURE_PATH) is None:
+            return (f"{package} is not installed (no `{tool}` on {SECURE_PATH}); setup gives you read access "
+                    f"to the hands user's workspace with it. Install {package}, then run setup again")
+    return None
+
+
 def egress_unavailable() -> str | None:
     """Why this Linux host cannot carry the boundary, or None. Setup refuses by this name rather
     than set up a hands user whose network nothing confines."""
@@ -842,7 +853,10 @@ def plan_undo(
              call=lambda: _to_operator_group(tree, hands_id, operator_gid)),
         Step("remove the workspace ACLs",
              call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(tree)) if host == "darwin"
-                                  else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)),
+                                  else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)
+             if host == "darwin" or shutil.which("setfacl", path=SECURE_PATH) is not None
+             # Setup's own ACL steps need setfacl, so with none installed it set none to remove.
+             else (True, "setfacl is not installed, so setup set no ACLs here")),
         Step("let your group read it, and empty the hooks and settings of the entity's repositories",
              call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
@@ -1672,6 +1686,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
     except HandsSetupError as exc:
         print(f"setup-isolation: {exc}")
         return 1
+    if host == "linux":
+        missing = linux_tool_missing()
+        if missing:
+            print(f"setup-isolation: refusing: {missing}.")
+            return 1
     if host == "linux" and not dry_run:
         unavailable = egress_unavailable()
         if unavailable:
