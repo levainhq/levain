@@ -43,7 +43,7 @@
     p.dataset.editClass = entry.edit_class || "";
     // the panel's stable id: what a kept row or scroll position is filed under (the heading is not an identity)
     if (entry.id) p.dataset.panelId = String(entry.id);
-    if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
+    if (entry.modes) p.dataset.modes = entry.modes;   // which of the four tabs (Morning / Board / Build / Memory) show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
     if (entry.edit_class) {
@@ -269,7 +269,7 @@
     const storeEl = document.getElementById("store");
     if (!view || typeof view !== "object") {
       board.appendChild(el("p", "empty", "No substrate data delivered."));
-      keShell(false);      // the KE regions, the moved masthead and the state line must not outlive the data they showed
+      keShell(false);      // the KE regions and the state line (moved into the now band) must not outlive the data they showed
       renderState(null);
       closeModal();  // don't leave a focus-modal open over a view we can't render
       return;
@@ -340,7 +340,7 @@
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
     keShell(!!view.ke);
-    if (view.ke) { renderKe(view, board); if (window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids(); }
+    if (view.ke) renderKe(view, board);
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
       // In the "All" view, drop a zone separator before each zone's first panel.
@@ -370,6 +370,9 @@
     settleKept(board, kept);
     buildKept = null;
     applyFilter();
+    // the cards are on the page and wrapped: the grids learn which columns hold a card on this tab, which card is empty, and which stands
+    // alone in its row (measured, so it waits for the bodies)
+    if (view.ke && window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids();
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
@@ -474,9 +477,9 @@
   // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
   // stale modal: the board and the focus modal both draw through this.
   // ---------------------------------------------------------------- the KE page ----
-  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the
-  // clock column with the weather under it, the sky beside it with the tool strip above), the brief, one row
-  // of widgets, then each zone as a 3-column grid of cards. The nav bar's contents live in the hero's strip.
+  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the now band: clock, date,
+  // the state line, the wrap line; the sky as a card under it), the brief, one row of widgets, then each zone as a grid of cards.
+  // The masthead above them is the page's bar and stays where the static page put it.
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
   const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
@@ -552,17 +555,26 @@
     return node;
   }
 
-  // The band's last-wrap line, from the wraps the page already holds (the Projection history panel): "Last wrap Mon 06:02" over
-  // "3 wraps". A page with no wrap history draws none, and the band keeps the clock, the date and the state line.
+  // The band's right cell, never blank. With wrap history: "Last wrap Mon 06:02" over the wrap count (the health panel's own total when
+  // the page holds it, else "N wraps held": the history list is what the page was sent, not necessarily every wrap there was).
+  // Without: "No wraps yet" over a fact the install has (its name, and the day's episodes when the jar counts them).
   function wrapLineOf(view) {
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
-    const at = ws.length && ws[0] ? new Date(ws[0].wrapped_at) : null;
-    if (!at || Number.isNaN(at.getTime())) return null;
+    const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? ws[0] : null;
+    const at = last ? new Date(last.wrapped_at) : null;
     const box = el("div", "wrapline");
-    const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-    const first = el("div");
-    first.append(el("b", null, "Last wrap"), " " + when);
-    box.append(first, el("div", null, ws.length + (ws.length === 1 ? " wrap" : " wraps")));
+    const first = el("div"), second = el("div");
+    if (at && !Number.isNaN(at.getTime())) {
+      const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+      first.append(el("b", null, "Last wrap"), " " + when);
+      const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
+      second.textContent = total !== null ? total + (total === 1 ? " wrap" : " wraps") : ws.length + (ws.length === 1 ? " wrap held" : " wraps held");
+    } else {
+      first.appendChild(el("b", null, "No wraps yet"));
+      const today = view.jar && Number.isInteger(view.jar.today) ? view.jar.today + " today" : "";
+      second.textContent = [typeof view.entity_name === "string" ? view.entity_name : "", today].filter(Boolean).join(" · ") || "a fresh install";
+    }
+    box.append(first, second);
     return box;
   }
 
@@ -585,18 +597,17 @@
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
     // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
-    // wrap line, the sky's event count and the weather when a provider supplies one. A bare install has no sky and no weather and
-    // the band is still whole: clock, date, state, wrap line.
+    // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), the sky's event count and the
+    // weather when a provider supplies one. A bare install has no sky and no weather and the band is still whole.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
-    // everything that can throw is built off the page; the structural mounts (when, strip, sky) and the masthead
+    // everything that can throw is built off the page; the structural mounts (when, wrap line, sky)
     // are touched only once all of it exists
     const whenKids = [], metaKids = [], skyKids = [];
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
     whenKids.push(stamp);
-    const wl = wrapLineOf(view);
-    if (wl) metaKids.push(wl);
+    metaKids.push(wrapLineOf(view));
     metaKids.push(events);
     if (wx) {
       const node = bareNode(wx, view, "wx");
@@ -806,27 +817,90 @@
           // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
           if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
+          if (e.kind === "external") node.dataset.ckExternal = "1";
+          ckCountPill(node);
           nodes.push(node);
           grid.appendChild(node);
         }
         if (c.tabs && nodes.length > 1) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
       }
     }
+    stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
     dashPass(grid);
     if (typeof MutationObserver === "function") new MutationObserver(() => dashPass(grid)).observe(grid, { childList: true, subtree: true });
   }
 
-  // F7, the empty provider: a panel that says only "nothing here yet" collapses to ONE dashed line (its title, the sentence, the fix),
-  // never a card with a body gap. The Team panel on an install with no team ledger is the case; a panel with a compose box or an
-  // editor (Tray, Keep, Inbox, Identity) stays a card because the box is its content, and an empty list card folds in
-  // markEmptyCards (cockpit_view.js). Idempotent: it only toggles a class, so the observer that calls it again cannot loop.
+  // A count in a title ("Tray (2)") is a pill beside the title, hidden at 0: the title says what the card is, the pill how many it holds.
+  // The pill is a sibling of the h2, so the heading's text (what the jump box lists) stays the name alone.
+  function ckCountPill(node) {
+    const h2 = node.querySelector(":scope > .phead > h2");
+    const m = h2 ? /^(.*?)\s*\((\d+)\)\s*$/.exec(h2.textContent) : null;
+    if (!m) return;
+    h2.textContent = m[1];
+    const pill = el("span", "ck-count", m[2]);
+    pill.hidden = Number(m[2]) === 0;
+    h2.after(pill);
+  }
+
+  // The Board is two independent stacks, not rows that pair: Tray and Now down the left, Open loops and Keep down the right, each as
+  // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
+  // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
+  // direct, full-width child.
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, now: 0, loops: 1, keep: 1 });
+  function stackColumns(grid) {
+    const kids = Array.from(grid.children);
+    const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
+    if (!kids.some((k) => side(k) === 0) || !kids.some((k) => side(k) === 1)) return;
+    const first = kids.find((k) => side(k) !== undefined);
+    const cols = [el("div", "ck-col"), el("div", "ck-col")];
+    cols[0].dataset.side = "left"; cols[1].dataset.side = "right";
+    grid.insertBefore(cols[0], first);
+    grid.insertBefore(cols[1], first);
+    for (const k of kids) if (side(k) !== undefined) cols[side(k)].appendChild(k);
+    grid.classList.add("ck-twocol");
+  }
+
+  // F7, the empty provider: an external panel that reports empty and says how to fix it collapses to ONE dashed line (its title, the
+  // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
+  // provider's own report (a `no_` state key, or a fix written as a `command`). Team without a ledger and an Inbox with no source
+  // are the cases. A compose box stays reachable: the line carries its action ("Send"), which opens the box under the line.
+  // A card of the page's own (Tray, Keep, Identity) keeps its card: its box is its content. An empty list card folds in
+  // markEmptyCards (cockpit_view.js). Idempotent: it toggles classes and adds the action once, so the observer that calls it again
+  // cannot loop.
+  function emptyProvider(p) {
+    if (!p.dataset.ckPanel || !p.dataset.ckExternal) return false;
+    const rows = p.querySelectorAll(".pbody .row");
+    if (rows.length === 0) return !!p.querySelector(".pbody .empty");
+    if (rows.length > 1) return false;
+    const key = rows[0].dataset.keepKey || "";
+    return /^no_/.test(key) || /`[^`]+`/.test(rows[0].textContent);
+  }
+  function dashAction(p) {
+    const head = p.querySelector(":scope > .phead");
+    const compose = p.querySelector(".tray-dump");
+    let act = head ? head.querySelector(".ck-dash-act") : null;
+    if (!head || !compose) { if (act) act.remove(); p.classList.remove("ck-dash-open"); return; }
+    if (act) return;
+    const go = compose.querySelector(".tray-dump-btn");
+    const label = (go && go.textContent.trim()) || "Write";
+    act = el("button", "ck-dash-act", label.charAt(0).toUpperCase() + label.slice(1));
+    act.type = "button";
+    act.setAttribute("aria-expanded", "false");
+    act.addEventListener("click", () => {
+      const open = p.classList.toggle("ck-dash-open");
+      act.setAttribute("aria-expanded", open ? "true" : "false");
+      const ta = compose.querySelector("textarea, input");
+      if (open && ta) ta.focus();
+    });
+    head.appendChild(act);
+  }
   function dashPass(grid) {
-    for (const p of grid.children) {
-      const rows = p.querySelectorAll(".pbody .row");
-      const bare = rows.length === 1 && rows[0].dataset.keepKey === "no_team";
-      p.classList.toggle("ck-dash", !!(p.dataset.ckPanel && bare));
+    for (const p of grid.querySelectorAll(".panel")) {
+      const dash = emptyProvider(p);
+      p.classList.toggle("ck-dash", dash);
+      if (dash) dashAction(p);
     }
   }
 

@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Levain · substrate control</title>
 <link rel="stylesheet" href="/dashboard.css" />
+<!-- cockpit_view.js loads here, not at the end of the body: its first act is to set the chosen theme, so a stored light theme never
+     flashes dark (the CSP forbids an inline script). Everything else in it runs when the document is ready. -->
+<script src="/cockpit_view.js"></script>
 </head>
 <body>
   <div class="deck">
@@ -34,6 +37,7 @@
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
+          <button type="button" data-theme-set="system" aria-pressed="false" aria-label="Follow the system theme" title="System">&#9680;</button>
           <button type="button" data-theme-set="dark" aria-pressed="false" aria-label="Dark theme" title="Dark">&#9790;</button>
           <button type="button" data-theme-set="light" aria-pressed="false" aria-label="Light theme" title="Light">&#9788;</button>
         </div>
@@ -68,7 +72,6 @@
      CDN, no framework, runs offline. -->
 <script src="/dashboard_core.js"></script>
 <script src="/sky.js"></script>
-<script src="/cockpit_view.js"></script>
 <script src="/dashboard_boot.js"></script>
 <script src="/cockpit_stream.js"></script>
 <script src="/dashboard_chat.js"></script>
