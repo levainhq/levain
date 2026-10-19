@@ -1529,13 +1529,13 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
     settings = mod.load_settings(qdir)
     try:
         mark, unread = claude_code.away_mark_of(qdir, settings, mod.AGENT), None
-    except Exception as e:  # noqa: BLE001 - the hook holds on a store it cannot read
+    except Exception as e:  # noqa: BLE001 - a store the hook cannot open: say what that costs
         mark, unread = None, e
     if unread is not None:
         out.append(CheckResult(f"{label} away mode", True,
-                               f"on: the consent queue store in {qdir} cannot be read ({type(unread).__name__}), so "
-                               "the hook holds every request as if `levain consent away on` stood",
-                               "Check the store with `levain consent away show`.", warn=True))
+                               f"{claude_code.store_unreadable(qdir)} ({type(unread).__name__})",
+                               "Repair the store, or move it aside: a store moved aside reads as no away mark, "
+                               "which ends a standing `levain consent away on` too.", warn=True))
     elif mark is not None and not mark.left:
         detail = ("on (signed to leave): `levain consent away on` set it, and the hook holds until a signed "
                   "`levain consent away off --signing-key <key>` leaves it, whatever the settings file says")

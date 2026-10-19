@@ -328,6 +328,7 @@ _SCHEMA = (
 )
 # what an away mark is read from (:meth:`ConsentQueue.away_mark`)
 _AWAY_TABLES = frozenset({"meta", "away_marks", "away_leaves"})
+_AUTHORITY_NOW_UNREADABLE = "the authority log cannot be replayed now"
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
 
@@ -549,6 +550,8 @@ class ConsentQueue:
         self._clock = clock
         self._ssh_keygen = ssh_keygen
         self._ready = False
+        # a stored leave's verdict by its whole row (:meth:`away_mark`): one verify per queue, so per hook process
+        self._leave_verdicts: dict[tuple[Any, ...], str | None] = {}
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -617,20 +620,27 @@ class ConsentQueue:
     @contextmanager
     def _read_as_is(self, tables: frozenset[str]) -> Iterator[sqlite3.Connection | None]:
         """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
-        (no write lock, no sync). ``None`` when it lacks any of ``tables``; raises when it is another format."""
+        (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet) or a store of
+        :data:`PRIOR_FORMAT`, which predates ``tables``; raises :class:`QueueStoreError` for any other format, a
+        database with no format marker, and a current-format store missing any of ``tables`` (damaged, never read
+        as holding nothing)."""
         self._check_directory()
         conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0,
                                isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 30000")
             conn.execute("BEGIN")
-            if not tables <= {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}:
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
+            if not have or (row is not None and row[0] == PRIOR_FORMAT):
                 conn.execute("COMMIT")
                 yield None
                 return
-            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
             if row is None or row[0] != STORE_FORMAT:
-                raise QueueStoreError(f"store format {None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+                raise QueueStoreError(f"{self.path} is not a consent queue store: format "
+                                      f"{None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+            if not tables <= have:
+                raise QueueStoreError(f"{self.path} is damaged: it lacks {', '.join(sorted(tables - have))}")
             yield conn
             conn.execute("COMMIT")
         finally:
@@ -1353,7 +1363,7 @@ class ConsentQueue:
             return "the stored leave names another signer than its row"
         authority = self._fresh_authority()
         if authority is None:
-            return "the authority log cannot be replayed now"
+            return _AUTHORITY_NOW_UNREADABLE
         why = self._leave_refusal(mark_id, agent, set_at, queue_id, payload, signature, authority)
         if why is not None:
             return why
@@ -1365,10 +1375,12 @@ class ConsentQueue:
 
     def away_mark(self, agent: str, *, as_is: bool = False) -> AwayMark | None:
         """``agent``'s latest away mark, or ``None`` when it never had one. A stored leave counts (``left``) only
-        when it re-verifies now (:meth:`_stored_leave_refusal`): a leave by a key revoked since, or a changed row,
-        leaves the mark standing. With ``as_is`` (a reader that holds no queue of its own) the store is read as it
-        stands and never written: one without the away tables has no mark. Raises when the store cannot be read
-        (the hook takes that as away)."""
+        when it re-verifies (:meth:`_stored_leave_refusal`): a leave by a key revoked since, or a changed row,
+        leaves the mark standing. The verdict is kept for this queue's life by the whole row, so a hook process
+        verifies a leave once and its recheck ticks reuse it (a new mark or a changed row is read afresh; a log
+        that could not be replayed is tried again). With ``as_is`` (a reader that holds no queue of its own) the
+        store is read as it stands and never written (:meth:`_read_as_is`: a prior-format store has no mark).
+        Raises when the store cannot be read (the hook takes that as away)."""
         self._check_agent(agent)
         reading = self._read_as_is(_AWAY_TABLES) if as_is and not self._ready else self._read()
         with reading as conn:
@@ -1380,7 +1392,13 @@ class ConsentQueue:
             return None
         if row[3] is None:
             return AwayMark(id=row[0], agent=agent, set_at=row[1], left=False)
-        why = self._stored_leave_refusal(agent, row, queue_id)
+        key = (queue_id, *row)
+        if key in self._leave_verdicts:
+            why = self._leave_verdicts[key]
+        else:
+            why = self._stored_leave_refusal(agent, row, queue_id)
+            if why != _AUTHORITY_NOW_UNREADABLE:
+                self._leave_verdicts[key] = why
         return AwayMark(id=row[0], agent=agent, set_at=row[1], left=why is None, leave_by=row[5], leave_refusal=why)
 
     def away_leave_payload(self, agent: str, signer_fp: str) -> dict[str, str]:

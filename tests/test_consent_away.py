@@ -294,3 +294,46 @@ def test_both_hooks_and_the_verb_share_one_reader(qdir):
 def test_a_huge_integer_hold_from_a_library_caller_is_a_value_error(qdir):
     with pytest.raises(ValueError):
         away.set_away(qdir, "claude_code", True, int("9" * 400))
+
+
+def test_a_verifier_that_cannot_run_is_a_refusal_not_a_traceback(qdir, monkeypatch, capsys):
+    """Fix r2 (codex MED), reproduced on 00152acb: with a mark standing, `off --signing-key` while ssh-keygen could
+    not fingerprint the key raised VerifierUnavailable out of the CLI. It is the normal refusal now."""
+    from levain.authority import VerifierUnavailable
+    from levain.cockpit import keys
+
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+
+    def no_verifier(*_a, **_k):
+        raise VerifierUnavailable("ssh-keygen could not fingerprint the key (FileNotFoundError)")
+    monkeypatch.setattr(keys, "fingerprint_of", no_verifier)
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 1
+    assert "away mode not left: ssh-keygen could not fingerprint" in capsys.readouterr().err
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+
+
+@pytest.mark.parametrize("damage", ["drop_leaves", "foreign"])
+def test_a_damaged_or_foreign_store_is_unreadable_never_no_mark(qdir, damage, capsys):
+    """Fix r2 (codex MED), reproduced on 00152acb: a current-format store that lost away_leaves, and an unrelated
+    SQLite file, read as "no mark", so an unsigned `off` exited 0. Both are unreadable now, and say what that costs."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    db = qdir / "queue.db"
+    if damage == "foreign":
+        db.unlink()
+    conn = sqlite3.connect(db, isolation_level=None)
+    if damage == "foreign":
+        conn.execute("CREATE TABLE notes (body TEXT)")
+    else:
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE "
+                                    "'%away_leaves%'").fetchall():
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("DROP TABLE away_leaves")
+    conn.close()
+    capsys.readouterr()
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    err = capsys.readouterr().err
+    assert "consent store unreadable at" in err and "neither hold nor file" in err and "move it aside" in err
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "on"   # nothing written
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    assert "neither hold nor file requests" in capsys.readouterr().out

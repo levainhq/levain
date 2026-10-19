@@ -108,9 +108,10 @@ class AdapterSettings:
     away_idle_seconds: float = IDLE_THRESHOLD
     legacy: bool = False
     # away mode stands by the operator's away mark in the queue store (:func:`with_away_mark`), not by the file alone;
-    # away_unreadable: the store could not be read, so it is held as such a mark
+    # away_unreadable: the store could not be read (:func:`store_unreadable`'s words, else empty): counted as such a
+    # mark, though a hook that cannot open the store can neither hold nor file a request
     away_marked: bool = False
-    away_unreadable: bool = False
+    away_unreadable: str = ""
     # the PreToolUse gate (Q14 B2): its hold D; the notify command it pings the operator with (R-f: an argv, the
     # message appended as its last argument; None = no ping); the phone page's link the ping carries
     gate_hold_seconds: float = DEFAULT_GATE_HOLD
@@ -486,11 +487,18 @@ def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | 
     return hold_seconds(settings, agent, source) if away else 0.0
 
 
+def store_unreadable(queue_dir: Path) -> str:
+    """What the operator is told when the consent queue store at ``queue_dir`` cannot be read."""
+    return (f"consent store unreadable at {Path(queue_dir) / DB_NAME}: levain can neither hold nor file requests "
+            "until it opens")
+
+
 def away_mark_of(queue_dir: Path, settings: AdapterSettings, agent: str, *, queue: Any = None) -> AwayMark | None:
     """``agent``'s latest away mark in the queue store at ``queue_dir``, its leave re-verified against the authority
     ``settings`` name (:meth:`ConsentQueue.away_mark`); ``None`` when there is no store or no mark. Read through
-    ``queue`` when it is a :class:`ConsentQueue` (the hook's own, whose schema is checked once), else from the store
-    as it is, never written (no away tables: no mark). Raises when the store cannot be read."""
+    ``queue`` when it is a :class:`ConsentQueue` (the hook's own, whose schema is checked once, and which verifies
+    a stored leave once), else from the store as it is, never written (a store of the prior format: no mark).
+    Raises when the store cannot be read."""
     if not os.path.lexists(Path(queue_dir) / DB_NAME):
         return None
     if isinstance(queue, ConsentQueue):
@@ -502,15 +510,15 @@ def with_away_mark(settings: AdapterSettings, queue_dir: Path, agent: str, *, qu
     """``settings`` as the hook acts on them: when ``agent``'s latest away mark has no leave that verifies
     (:func:`away_mark_of`, through ``queue`` when given), away mode is on by the operator's word whatever the file
     says (``away_marked``), holding the file's hold when it is above zero, else the agent's :data:`DEFAULT_HOLDS`.
-    A store that cannot be read counts as such a mark (``away_unreadable`` too): the read fails toward holding,
-    never toward off. An ``agent`` that is not one of :data:`DEFAULT_HOLDS` has no marks."""
+    A store that cannot be read counts as such a mark, never as away off (``away_unreadable``: why, in
+    :func:`store_unreadable`'s words). An ``agent`` that is not one of :data:`DEFAULT_HOLDS` has no marks."""
     if agent not in DEFAULT_HOLDS:
         return settings
-    unreadable = False
+    unreadable = ""
     try:
         mark = away_mark_of(queue_dir, settings, agent, queue=queue)
-    except Exception:  # noqa: BLE001 - an unreadable store is held, never read as away off
-        mark, unreadable = AwayMark(id="", agent=agent, set_at="", left=False), True
+    except Exception:  # noqa: BLE001 - an unreadable store is never read as away off
+        mark, unreadable = AwayMark(id="", agent=agent, set_at="", left=False), store_unreadable(queue_dir)
     if mark is None or mark.left:
         return settings
     hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[agent]
@@ -523,7 +531,9 @@ def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None =
     """The recheck a hook entry point holds with: :func:`effective_away` of a fresh read of the settings file at
     ``path``, or of ``started`` (what the hold started with) when that read fails, with the away mark of ``agent``
     (default: the file's name without ``.json``) read again from the store beside it (:func:`with_away_mark`,
-    through the hook's ``queue`` when given, so a recheck tick takes no write lock)."""
+    through the hook's ``queue`` when given, so a recheck tick takes no write lock and reuses the leave verified at
+    the hold's start). Known edge: the hook's ``queue`` verifies leaves against the cockpit the settings named when
+    it opened, so a ``cockpit_data_root`` changed during a hold takes effect at the next hook call."""
     agent = agent if agent is not None else path.stem
 
     def recheck() -> tuple[bool, str, str]:

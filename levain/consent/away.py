@@ -18,7 +18,9 @@ and the hooks read away mode there too (:func:`levain.consent.adapters.claude_co
 one any process of the operator's can write, so leaving a marked away mode (``off`` or ``auto``) takes a leave
 signed by an enrolled key in :data:`~levain.consent.record.AWAY_NAMESPACE`, stored before the file is written (the
 store is the truth; the word follows). Revoking the key that signed a leave puts away mode back on (the leave is
-re-verified on every read). Input-idle away has no mark: the operator's input still ends it.
+re-verified by each hook call). Any enrolled key may sign a leave, whatever its class (a design ruling: leaving only
+lowers what the hook holds). Input-idle away has no mark: the operator's input still ends it. A store that cannot be
+read is never read as no mark: ``off`` and ``auto`` refuse until it is repaired or moved aside.
 """
 from __future__ import annotations
 
@@ -40,7 +42,12 @@ from levain.consent.adapters.claude_code import (
     _refuse_symlink,
 )
 from levain.consent.auto_away import DEFAULT_HOLDS
-from levain.consent.queue import AnswerRefused, ConsentQueue, authority_source
+from levain.consent.queue import (
+    AnswerRefused,
+    ConsentQueue,
+    QueueStoreError,
+    authority_source,
+)
 from levain.consent.record import AWAY_NAMESPACE, away_leave_message
 
 __all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "read", "set_away", "settings",
@@ -141,29 +148,57 @@ def why_unanswerable(adapter_settings: Any) -> str | None:
     return None
 
 
-def _leave(qdir: Path, agent: str, adapter_settings: Any, signing_key: Path | None) -> None:
+def _unreadable(qdir: Path) -> str:
+    return (f"{claude_code.store_unreadable(qdir)}. Away mode not changed: repair the store, or move it aside (a "
+            "store moved aside reads as no away mark, which ends away mode too)")
+
+
+def _check_signing_key(signing_key: Path) -> None:
+    """``signing_key`` as ``ssh_signer`` will read it: the file readable, and its public half (``<path>.pub``, or
+    the path itself when it is the ``.pub``). Raises ``ValueError``."""
+    from levain.cockpit.keys import KeyError_, signing_public_key
+    path = Path(signing_key).expanduser()
+    try:
+        with path.open("rb") as fh:
+            fh.read(1)
+        signing_public_key(path)
+    except (OSError, KeyError_) as e:
+        raise ValueError(f"--signing-key {path} cannot be used: {getattr(e, 'strerror', None) or e}") from e
+
+
+def _leave(qdir: Path, agent: str, adapter_settings: Any, signing_key: Path | None) -> bool:
     """Leave ``agent``'s away mark when it has one standing (:func:`claude_code.away_mark_of`): a leave signed with
     ``signing_key`` in :data:`AWAY_NAMESPACE`, stored by the queue once it verifies. A mark whose stored leave no
-    longer verifies (its key revoked since) is marked anew and that mark left. Raises ``ValueError`` when a mark
-    stands and there is no key, or the leave is refused."""
-    mark = claude_code.away_mark_of(qdir, adapter_settings, agent)
+    longer verifies (its key revoked since) is marked anew and that mark left. Returns whether the store changed.
+    Raises ``ValueError`` when the store cannot be read, a mark stands and there is no key, or the leave is
+    refused or cannot be signed or checked."""
+    try:
+        mark = claude_code.away_mark_of(qdir, adapter_settings, agent)
+    except (QueueStoreError, sqlite3.Error, OSError) as e:
+        raise ValueError(_unreadable(qdir)) from e
     if mark is None or mark.left:
-        return
+        return False
     if signing_key is None:
         raise ValueError("away mode was set by `levain consent away on`, and leaving it takes a signature: run it "
                          "again with --signing-key <an enrolled key>")
+    from levain.authority import AuthorityError
     from levain.cockpit.consent import ConsentError
     from levain.cockpit.keys import KeyError_, ssh_signer
 
     queue = claude_code._queue_for(qdir, adapter_settings)
+    marked = False
     try:
         signer_fp, sign = ssh_signer(Path(signing_key), namespace=AWAY_NAMESPACE)
         if mark.leave_by is not None:
             queue.mark_away(agent)   # the stored leave no longer verifies and cannot be replaced: leave anew
+            marked = True
         payload = queue.away_leave_payload(agent, signer_fp)
         queue.leave_away(payload, sign(away_leave_message(payload)))
-    except (AnswerRefused, ConsentError, KeyError_) as e:
-        raise ValueError(f"away mode not left: {e}") from e
+    except (AnswerRefused, ConsentError, KeyError_, AuthorityError, OSError) as e:
+        # AuthorityError covers VerifierUnavailable: ssh-keygen missing, untrusted or out of time
+        again = "; a new away mark was recorded first, so away mode stands" if marked else ""
+        raise ValueError(f"away mode not left: {e}{again}") from e
+    return True
 
 
 def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
@@ -176,11 +211,13 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     :func:`why_unanswerable` names a reason (a hold nobody can answer
     only delays the agent); no word never holds without an enrolled key (the hook checks). ``on`` appends an away
     mark to the queue store first; ``off`` and ``auto`` leave a standing mark first, by a leave signed with
-    ``signing_key`` (:func:`_leave`; refused without one). Then by an atomic replace of its settings file; returns
-    the new settings.
+    ``signing_key`` (:func:`_leave`; refused without one, and a ``signing_key`` that cannot be read is refused
+    before the store is touched). Then by an atomic replace of its settings file, whose new body is checked before
+    the store changes; returns the new settings. When the store changed and the file write then fails, the
+    ``ValueError`` says so: the hook follows the store.
     Raises ``ValueError`` for a hold outside (0, :data:`MAX_HOLD`], an ``idle_after`` that is not a finite number
-    above 0, a missing settings file, or a queue directory that breaks the queue's own rule
-    (``QueueStoreError``)."""
+    above 0, a missing settings file, a store that cannot be read, or a queue directory that breaks the queue's own
+    rule (``QueueStoreError``)."""
     if hold is not None and _valid_hold(hold) is None:
         raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
     if idle_after is not None:
@@ -192,6 +229,8 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
         if not ok:
             raise ValueError("--idle-after must be a finite number of seconds above 0")
     check_queue_dir(qdir)
+    if not on and signing_key is not None:
+        _check_signing_key(signing_key)
     got = _read_keyed(qdir, agent)
     if got is None:
         raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
@@ -205,13 +244,6 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
         if reason:
             raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
     adapter_settings = claude_code.settings_from(data)
-    try:
-        if on:
-            claude_code._queue_for(qdir, adapter_settings).mark_away(agent)
-        else:
-            _leave(qdir, agent, adapter_settings, signing_key)
-    except sqlite3.Error as e:
-        raise ValueError(f"the consent queue store cannot be read or written ({e}); away mode not changed") from e
     data["away_mode"] = on is True
     data["away_word"] = "auto" if on is None else "on" if on else "off"
     if hold is not None:
@@ -222,6 +254,27 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     body = json.dumps(data, indent=2) + "\n"
     if len(body.encode("utf-8")) > _MAX_BYTES:
         raise ValueError(f"{path} would be larger than a consent settings file once written; not changed")
+    try:
+        if on:
+            claude_code._queue_for(qdir, adapter_settings).mark_away(agent)
+            changed = "an away mark was recorded"
+        else:
+            changed = "the away mark was left" if _leave(qdir, agent, adapter_settings, signing_key) else ""
+    except (QueueStoreError, sqlite3.Error) as e:
+        raise ValueError(_unreadable(qdir)) from e
+    try:
+        _write_settings(qdir, path, body, key)
+    except (OSError, ValueError) as e:
+        if not changed:
+            raise
+        raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}); the hook follows "
+                         "the store, so away mode is as the store says: run it again to bring the file in line") \
+            from e
+    return data
+
+
+def _write_settings(qdir: Path, path: Path, body: str, key: tuple[int, int, int, int]) -> None:
+    """Replace ``path`` with ``body`` atomically, unless it is no longer the file read as ``key``."""
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=qdir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -240,4 +293,3 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
-    return data

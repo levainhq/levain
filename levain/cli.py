@@ -2084,7 +2084,9 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                     "mark in the consent queue store, which the hook reads as well as the settings file: leaving it "
                     "(`off` or `auto`) takes a leave signed by a key enrolled in the install's cockpit "
                     "(--signing-key), and rewriting the away words in the settings file does not end it. Revoking the "
-                    "key that signed a leave puts away mode back on. A process running as you is beyond what levain "
+                    "key that signed a leave puts away mode back on. Any enrolled key may sign a leave, whatever its "
+                    "class. A consent store that cannot be read is never read as no mark: `off` and `auto` refuse "
+                    "until it is repaired or moved aside. A process running as you is beyond what levain "
                     "stops without OS confinement: it can rewrite the store, or point the settings file's "
                     "cockpit_data_root at a cockpit holding its own key (doctor warns on a foreign cockpit). "
                     "Input-idle away needs no signature to end: your input ends it. Changes only "
@@ -2102,8 +2104,9 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                            "else 600).")
     away.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
                       help="With `off` or `auto`: an enrolled key that signs leaving an away mode `on` set (its "
-                           "private key file, or the .pub of a key an agent holds); one signature per agent. Not "
-                           "needed when no `on` stands.")
+                           "private key file, or the .pub of a key an agent holds). With --agent all, one "
+                           "signature per marked agent, in turn: a failure part way leaves the agents before it "
+                           "left and exits non-zero. Not needed when no `on` stands.")
     away.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                       help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     away.set_defaults(func=_cmd_consent_away)
@@ -2133,12 +2136,15 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
         print(f"levain consent away: {e}", file=sys.stderr)
         return 1
     if args.action in ("off", "auto") and args.signing_key is None:
-        # refused before any agent changes, so `--agent all` never leaves one off and another still marked
+        # a missing key is refused before any agent changes; with a key, each marked agent takes its own signature
+        # in the loop below, so one failing part way leaves the agents before it left (and exits non-zero)
         marked = []
         for agent in agents:
             try:
-                if away.read(qdir, agent) is not None and away.settings(qdir, agent).away_marked:
-                    marked.append(agent)
+                if away.read(qdir, agent) is not None:
+                    cur = away.settings(qdir, agent)
+                    if cur.away_marked and not cur.away_unreadable:   # an unreadable store: the loop below says so
+                        marked.append(agent)
             except (OSError, ValueError, QueueStoreError):
                 pass   # the loop below reports it
         if marked:
@@ -2177,10 +2183,14 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
             continue
         on, source, why = effective_away(got)
         reason = away.why_unanswerable(got)
+        if got.away_unreadable:
+            print(f"{agent}: {got.away_unreadable}; repair it, or move it aside (a store moved aside reads as no "
+                  "away mark, which ends away mode too)")
+            rc = 1
+            continue
         if on:
             hold = min(hold_seconds(got, agent, source), away.MAX_HOLD)
-            state = (" (consent store unreadable: held as away)" if got.away_unreadable else
-                     " (signed to leave)" if got.away_marked else "")
+            state = " (signed to leave)" if got.away_marked else ""
             line = f"{agent}: away mode ON{state}, holds up to {hold:g}s"
             line += " (Claude Code's own dialog shows meanwhile)" if agent == "claude_code" else \
                 " (Codex shows no dialog until the hold ends)"
@@ -2191,8 +2201,8 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
         if got.away_marked:
             try:
                 mark = away_mark_of(qdir, away.claude_code.settings_from(away.read(qdir, agent)), agent)
-            except Exception as e:  # noqa: BLE001 - the hook holds on an unreadable store; say so
-                line += f"; the consent queue store cannot be read ({type(e).__name__}), so the hook holds"
+            except Exception:  # noqa: BLE001 - read a moment ago; say what the hook meets
+                line += f"; {away.claude_code.store_unreadable(qdir)}"
             else:
                 if mark is not None and mark.leave_by is not None and mark.leave_refusal is not None:
                     line += (f"; a leave signed by {mark.leave_by} does not verify ({mark.leave_refusal}), so the "

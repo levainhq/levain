@@ -53,8 +53,9 @@ def away_state(settings: Any, idle: Callable[[], float | None] | None = None) ->
     ``idle`` (input idle decided) or ``none`` (no idle source; off). ``idle`` (default :func:`input_idle_seconds`)
     is read only when no explicit word stands."""
     if settings.away_mode:
-        if getattr(settings, "away_unreadable", False):
-            return True, "word", "consent store unreadable: held as away"
+        unreadable = getattr(settings, "away_unreadable", "")
+        if unreadable:
+            return True, "word", unreadable
         if getattr(settings, "away_marked", False):
             return True, "word", "explicit word: on (leaving needs a signed `levain consent away off`)"
         return True, "word", "explicit word: on"
