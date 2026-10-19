@@ -40,9 +40,12 @@ import argparse
 import json
 import math
 import os
+import pwd
 import re
 import shlex
+import shutil
 import site
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -229,11 +232,14 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 # MCP server definitions: a ``.mcp.json`` anywhere (a workspace's). The user's ``~/.claude.json`` is matched by
 # its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
-# directly in a ``.git/`` directory (or a linked worktree's ``.git/worktrees/<name>/``, a submodule's
-# ``.git/modules/<name>/``): the config files git reads
-# executables from (``core.hooksPath``, ``core.fsmonitor``, aliases, filters)
-GIT_CONFIG_NAMES = frozenset({"config", "config.worktree"})
 USER_CONFIG_NAME = ".claude.json"
+
+# Under a ``.git`` directory component, what git itself writes and never executes from: its object store, refs and
+# reflogs (directories), and its state files. Everything else there (config, config.worktree, hooks, info/, a
+# linked worktree's or a submodule's git directory) is agent config (L3 r2 G1'): tagged by path, never parsed.
+GIT_STATE_DIRS = frozenset({"objects", "refs", "logs"})
+GIT_STATE_FILES = frozenset({"head", "index", "packed-refs", "orig_head", "fetch_head", "commit_editmsg"})
+GIT_ASK_TIMEOUT = 2.0        # seconds one ``git rev-parse --git-path hooks`` may take
 
 
 # The names a file inside a directory is probed under, so that a directory is agent config exactly when a file the
@@ -241,7 +247,7 @@ USER_CONFIG_NAME = ".claude.json"
 # A name that is config in ANY directory (``.mcp.json``) is not probed, or every directory would be: the file-name
 # field naming it is itself a candidate, tagged on its own.
 _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NAME, "x.pth", "sitecustomize.py",
-               "levain", *sorted(GIT_CONFIG_NAMES))
+               "levain", "config")
 
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
@@ -265,193 +271,118 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, roots, sites, user_configs, home, git_cache):
+            if _tags_path(p / probe, cwd, roots, sites, user_configs, git_cache):
                 return True
     return False
 
 
-def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str],
-               home: Path, git_cache: dict[Any, Any] | None = None) -> bool:
+def _tags_path(path: Path, cwd: str, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str],
+               git_cache: dict[Any, Any] | None = None) -> bool:
     """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
     return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
-            or _redirects_the_import(path, sites) or _under_hooks_path(path, home, git_cache))
+            or _redirects_the_import(path, sites) or _under_hooks_path(path, cwd, git_cache))
 
 
-def _is_git_exec_config(rest: list[str]) -> bool:
-    """What follows a ``.git`` directory component names a file git executes from or reads executables out of:
-    anything under its ``hooks/``, its ``config`` or ``config.worktree``, and the same in a linked worktree's git
-    directory (``worktrees/<name>/``) or a submodule's (``modules/<name>/``, where the name may hold slashes),
-    nested to any depth (a submodule's own worktrees and submodules). Never objects, refs or anything else."""
-    if (len(rest) > 1 and rest[0] == "hooks") or (len(rest) == 1 and rest[0] in GIT_CONFIG_NAMES):
-        return True
-    if len(rest) >= 3 and rest[0] in ("worktrees", "modules"):
-        # a worktree's name is one component; a submodule's may be several (``modules/libs/foo/``)
-        ends = range(2, len(rest)) if rest[0] == "modules" else (2,)
-        return any(_is_git_exec_config(rest[j:]) for j in ends)
-    return False
+def _is_git_config(rest: list[str]) -> bool:
+    """What follows a ``.git`` directory component (lower-cased) is something git reads or executes from: anything
+    but its object store, refs and reflogs (:data:`GIT_STATE_DIRS`) and its state files (:data:`GIT_STATE_FILES`)
+    directly in it. A linked worktree's or a submodule's git directory (``worktrees/<name>/``, ``modules/<name>/``)
+    is tagged whole, its objects and refs included: an over-match costs a gated call, and git writes those itself."""
+    if not rest:
+        return False
+    if len(rest) > 1 and rest[0] in GIT_STATE_DIRS:
+        return False
+    return not (len(rest) == 1 and rest[0] in GIT_STATE_FILES)
 
 
-# --- git's effective core.hooksPath (L3 r1 G1b): read from the config files, never by running git ----------------
+# --- where git runs hooks from (L3 r2 G1'): asked of git, never read out of its config ------------------------------
 
-GIT_WALK_LIMIT = 64          # ancestors searched for the directory holding a target's ``.git``
-GIT_READ_MAX = 1 << 20       # bytes read of one git config file (or gitfile, commondir)
+def operator_home() -> Path:
+    """The operator's home directory from the password database, not ``$HOME`` (which the agent's environment
+    sets): the home the operator's own shell and git read the user's git config from."""
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError):
+        return Path(os.path.expanduser("~"))
 
 
 def global_git_configs(home: Path) -> tuple[Path, ...]:
-    """The user-level git config files every repository reads: ``~/.gitconfig`` and ``$XDG_CONFIG_HOME/git/config``
-    (``~/.config/git/config`` when the variable is unset or empty), as git itself resolves them."""
+    """The user-level git config files, tagged by full path: ``~/.gitconfig`` and ``~/.config/git/config`` for
+    ``home`` (where a ``~`` in a target expands) and for :func:`operator_home`, ALWAYS, whatever
+    ``$XDG_CONFIG_HOME`` says (an agent-set value must not move the protected file), plus
+    ``$XDG_CONFIG_HOME/git/config`` when that variable is set to an absolute path."""
+    out: list[Path] = []
+    for h in dict.fromkeys((Path(home), operator_home())):
+        out += [h / ".gitconfig", h / ".config" / "git" / "config"]
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path(home) / ".config"
-    return (Path(home) / ".gitconfig", base / "git" / "config")
+    if xdg and os.path.isabs(xdg):
+        out.append(Path(xdg) / "git" / "config")
+    return tuple(out)
 
 
-def _read_small(path: Path) -> str | None:
-    """A file's text (at most :data:`GIT_READ_MAX` bytes), or ``None`` when it cannot be read: git would not read
-    it either, so nothing is tagged on its account."""
-    try:
-        with open(path, "rb") as fh:
-            return fh.read(GIT_READ_MAX).decode("utf-8", "replace")
-    except (OSError, ValueError):
+def _git_env() -> dict[str, str]:
+    """The environment git is asked in: the absolute entries of ``PATH`` (``os.defpath`` when none), ``HOME`` from
+    :func:`operator_home`, ``LANG=C``, nothing else (no ``GIT_*``, no ``XDG_*``): the answer is what the operator's
+    own shell would get, not what an agent-set variable says."""
+    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(p)]
+    return {"PATH": os.pathsep.join(entries) or os.defpath, "HOME": str(operator_home()), "LANG": "C"}
+
+
+def _ask_git_hooks(directory: Path) -> Path | None:
+    """``git -C <directory> rev-parse --git-path hooks``: git's own answer to where the repository holding
+    ``directory`` runs hooks from (``core.hooksPath`` from every config file git reads, includes, linked worktrees
+    and submodules applied), absolute (a relative answer is relative to ``directory``). ``None`` when git is not
+    found, fails, or takes longer than :data:`GIT_ASK_TIMEOUT` (not a repository, a config git cannot read): git
+    could not run hooks from that repository either. ``rev-parse`` runs no hooks and nothing is overridden."""
+    env = _git_env()
+    git = shutil.which("git", path=env["PATH"])
+    if not git or not os.path.isabs(git):
         return None
+    try:
+        got = subprocess.run([git, "-C", str(directory), "rev-parse", "--git-path", "hooks"], env=env,
+                             stdin=subprocess.DEVNULL, capture_output=True, timeout=GIT_ASK_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    answer = got.stdout.decode("utf-8", "surrogateescape").rstrip("\r\n") if got.returncode == 0 else ""
+    if not answer or "\n" in answer:
+        return None
+    return Path(answer) if os.path.isabs(answer) else directory / answer
 
 
-def _git_value(raw: str) -> str:
-    """A git config value as git reads it: double quotes removed, ``\\"`` ``\\\\`` ``\\n`` ``\\t`` ``\\b``
-    unescaped, a ``#`` or ``;`` outside quotes starting a comment, unquoted outer whitespace dropped."""
-    out: list[str] = []
-    quoted, kept, i = False, 0, 0   # ``kept``: ``out``'s length up to its last char that was quoted or not a space
-    while i < len(raw):
-        c = raw[i]
-        if c == "\\" and i + 1 < len(raw):
-            out.append({"n": "\n", "t": "\t", "b": "\b"}.get(raw[i + 1], raw[i + 1]))
-            kept, i = len(out), i + 2
-            continue
-        i += 1
-        if c == '"':
-            quoted = not quoted
-        elif not quoted and c in "#;":
-            break
-        elif quoted or not c.isspace():
-            out.append(c)
-            kept = len(out)
-        elif out:
-            out.append(c)   # inner unquoted space: kept only if something follows it
-    return "".join(out[:kept])
-
-
-def git_hooks_paths(text: str) -> list[str]:
-    """Every ``core.hooksPath`` value in one git config file's text, in file order: a ``[core]`` section (the name
-    case-insensitive; ``[core "x"]`` is another section), a ``hooksPath`` key in any case, a line continued by a
-    trailing backslash, a key on the header's own line. A key with no ``=`` (a boolean) or an empty value is none."""
-    out: list[str] = []
-    section: str | None = None
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-        while (len(line) - len(line.rstrip("\\"))) % 2 == 1 and i < len(lines):
-            line = line[:-1] + lines[i]   # an odd count of trailing backslashes continues the line
-            i += 1
-        s = line.strip()
-        if s.startswith("["):
-            end = s.find("]")
-            if end < 0:
-                section = None
-                continue
-            section = s[1:end].strip().lower()
-            s = s[end + 1:].strip()
-        if section != "core" or not s or s[0] in "#;":
-            continue
-        key, eq, value = s.partition("=")
-        if eq and key.strip().lower() == "hookspath":
-            got = _git_value(value)
-            if got:
-                out.append(got)
+def git_hooks_dirs(dirs: Iterable[Path], cache: dict[Any, Any] | None = None) -> set[Path]:
+    """The hooks directories git answers (:func:`_ask_git_hooks`) for each of ``dirs``, git asked once per
+    directory per ``cache`` (one gate call's)."""
+    asked = (cache if cache is not None else {}).setdefault("git_hooks", {})
+    out: set[Path] = set()
+    for d in dirs:
+        key = str(d)
+        if key not in asked:
+            asked[key] = _ask_git_hooks(d)
+        if asked[key] is not None:
+            out.add(asked[key])
     return out
 
 
-def _git_root(start: Path, seen: dict[str, Path | None]) -> Path | None:
-    """The nearest of ``start`` and its ancestors (at most :data:`GIT_WALK_LIMIT`) holding a ``.git`` (a directory
-    or a gitfile): the worktree root, where git runs hooks. ``None`` when none does. Every directory a walk that
-    ended (found one, or reached ``/``) visited is cached in ``seen``, so one call's many candidates walk once."""
-    visited: list[str] = []
-    d, found, ended = start, None, False
-    for _ in range(GIT_WALK_LIMIT):
-        key = str(d)
-        if key in seen:
-            found, ended = seen[key], True
-            break
-        visited.append(key)
-        dotgit = d / ".git"
-        try:
-            here = dotgit.is_dir() or dotgit.is_file()
-        except OSError:
-            here = False
-        if here:
-            found, ended = d, True
-            break
-        if d.parent == d:
-            ended = True
-            break
+def _nearest_dir(start: Path) -> Path:
+    """``start`` or its nearest ancestor that is an existing directory (``/`` at the latest)."""
+    d = start
+    while not d.is_dir() and d.parent != d:
         d = d.parent
-    if ended:
-        seen.update(dict.fromkeys(visited, found))
-    return found
+    return d
 
 
-def _git_config_files(root: Path) -> list[Path]:
-    """The repository's own config files for the worktree ``root`` (:func:`_git_root`): its git directory's
-    ``config`` and ``config.worktree`` and its ``commondir``'s (a linked worktree's main git directory). The git
-    directory is ``root/.git``, or what a gitfile there names (``gitdir:``, relative to ``root``: a linked
-    worktree's or a submodule's). A gitfile that does not name one gives none."""
-    dotgit = root / ".git"
-    gitdir: Path | None = dotgit
-    if dotgit.is_file():
-        text = _read_small(dotgit) or ""
-        first = text.splitlines()[0].strip() if text.strip() else ""
-        gitdir = root / first[7:].strip() if first.lower().startswith("gitdir:") and first[7:].strip() else None
-    if gitdir is None:
-        return []
-    files = [gitdir / "config", gitdir / "config.worktree"]
-    common = (_read_small(gitdir / "commondir") or "").strip()
-    if common:   # an absolute value replaces ``gitdir``
-        files += [gitdir / common / "config", gitdir / common / "config.worktree"]
-    return files
-
-
-def _hooks_dirs(root: Path | None, home: Path, cache: dict[Any, Any]) -> tuple[str, ...]:
-    """Every ``core.hooksPath`` set in the repository's config files (``root``'s, :func:`_git_config_files`) or the
-    user's (:func:`global_git_configs`), ``~`` expanded, a relative one joined to ``root`` (none without a root),
-    each as written and resolved, lower-cased. Cached per root in ``cache``."""
-    key = ("hooks", str(root) if root is not None else None)
-    if key not in cache:
-        out: set[str] = set()
-        for f in [*(_git_config_files(root) if root is not None else []), *global_git_configs(home)]:
-            text = _read_small(f)
-            for value in git_hooks_paths(text) if text is not None else ():
-                if value == "~" or value.startswith("~/"):
-                    hp = Path(str(home) + value[1:])
-                elif os.path.isabs(value):
-                    hp = Path(value)
-                elif root is not None:
-                    hp = root / value
-                else:
-                    continue
-                out |= {os.path.normpath(hp).lower(), os.path.realpath(hp).lower()}
-        cache[key] = tuple(out)
-    return cache[key]
-
-
-def _under_hooks_path(path: Path, home: Path, cache: dict[Any, Any] | None = None) -> bool:
-    """``path`` lies under a ``core.hooksPath`` git would run hooks from (husky's ``.husky/``, a ``.githooks/``) for
-    the repository holding it (:func:`_git_root`, :func:`_hooks_dirs`). Every value found counts, not only the one
-    git would use last: an over-match costs a gated call. Git is never run; an unreadable config file tags nothing
-    (git would not read it either). ``cache`` is one call's, shared by its candidates."""
+def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None) -> bool:
+    """``path`` lies under a directory git runs hooks from (husky's ``.husky/``, a ``.githooks/``, an absolute
+    ``core.hooksPath`` outside the worktree) for the repository of the event's ``cwd`` or of the target's nearest
+    existing ancestor directory, as git answers (:func:`git_hooks_dirs`). ``cache`` is one call's, shared by its
+    candidates."""
     cache = cache if cache is not None else {}
     try:
-        root = _git_root(path.parent, cache.setdefault("roots", {}))
-        return _under(path, _hooks_dirs(root, home, cache))
+        dirs = [Path(cwd)] if cwd and os.path.isabs(cwd) else []
+        dirs.append(_nearest_dir(path.parent))
+        hooks = tuple({s for h in git_hooks_dirs(dirs, cache)
+                       for s in (os.path.normpath(h).lower(), os.path.realpath(h).lower())})
+        return _under(path, hooks)
     except (OSError, ValueError):
         return True   # a path that cannot be examined is tagged, as the other checks do
 
@@ -461,7 +392,7 @@ def _is_config_path(path: Path) -> bool:
     if parts and parts[-1] in CONFIG_FILE_NAMES:
         return True
     if parts and parts[-1] == ".git":
-        return True  # a gitfile (a linked worktree's ``.git``): it names the git directory whose config and hooks run
+        return True  # a gitfile (a linked worktree's or a submodule's ``.git``): it names the git directory
     for i, part in enumerate(parts[:-1]):
         rest = parts[i + 1:]
         if part == ".claude":
@@ -472,7 +403,7 @@ def _is_config_path(path: Path) -> bool:
             return True
         if part == "activation" and rest[0] == "hooks" and len(rest) > 1:
             return True  # a levain install's hook scripts (the consent hook among them) run in every agent session
-        if part == ".git" and _is_git_exec_config(rest):
+        if part == ".git" and _is_git_config(rest):
             return True  # git runs what these name, unsandboxed, at the operator's next git command
         if part == ".claude-plugin":
             return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
@@ -568,17 +499,17 @@ def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
 
 
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
-                         protected: Iterable[Path] = ()) -> bool:
+                         protected: Iterable[Path] = (), git_cache: dict[Any, Any] | None = None) -> bool:
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
     ``.claude/hooks/``, the one `levain init` wires under the install's ``activation/hooks/``, below); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
-    ``.codex/config.toml``; git's executable config: anything under a ``.git/hooks/`` directory, a ``config`` or
-    ``config.worktree`` directly in a ``.git/`` directory, the same under a linked worktree's
-    ``.git/worktrees/<name>/`` or a submodule's ``.git/modules/<name>/`` (nested), a file named ``.git`` (a
-    gitfile, which names the git directory), anything under a ``core.hooksPath`` the repository's or the user's git
-    config sets (:func:`_under_hooks_path`), and the user's ``~/.gitconfig`` and XDG ``git/config``
-    (:func:`global_git_configs`), never ``.gitignore``, ``.gitattributes`` or objects and refs; anything under a ``.claude-plugin/`` directory, or
+    ``.codex/config.toml``; git's config and hooks, by path and never by parsing git's config: anything under a
+    ``.git`` directory but its objects, refs, reflogs and state files (:func:`_is_git_config`; its ``config``,
+    ``hooks/``, ``info/``, a linked worktree's or a submodule's git directory), a file named ``.git`` (a gitfile,
+    which names the git directory), anything under the directory git itself answers it runs hooks from for the
+    repository of ``cwd`` or of the target (:func:`_under_hooks_path`: ``core.hooksPath`` wherever it points), and
+    the user's git config files (:func:`global_git_configs`), never ``.gitignore`` or ``.gitattributes``; anything under a ``.claude-plugin/`` directory, or
     under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
@@ -587,7 +518,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     field of any name), each also tagged when it names a config directory or ``.claude.json``
     (:func:`names_config_dir`), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
-    missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
+    missing one). Other tools are never tagged: Bash is not parsed (ruling 1). ``git_cache`` is one gate call's,
+    shared across the calls a caller makes for it (Codex's patch headers), so git is asked once per directory."""
     targets = _targets(tool_name, tool_input)
     if targets is None and not tool_name.startswith("mcp__"):
         return False
@@ -604,10 +536,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
-        git_cache: dict[Any, Any] = {}   # one walk per directory and one read per git config file, per call
+        git_cache = git_cache if git_cache is not None else {}   # git asked once per directory, per call
         home = Path(home)
-        # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``, the XDG one),
-        # which every repository reads executables from as it does its own ``.git/config`` (L3 r1 G1c)
+        # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
+        # ``~/.config/git/config``, the XDG one), which every repository reads executables from (L3 r1 G1c, r2 G1')
         user_configs = frozenset({s for f in (home / USER_CONFIG_NAME, *global_git_configs(home))
                                   for s in (os.path.normpath(f).lower(), os.path.realpath(f).lower())})
     except (OSError, ValueError, ImportError, TypeError):
@@ -623,8 +555,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if (_tags_path(written, roots, sites, user_configs, home, git_cache)
-                or _tags_path(resolved, roots, sites, user_configs, home, git_cache)):
+        if (_tags_path(written, cwd, roots, sites, user_configs, git_cache)
+                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache)):
             return True
     try:
         return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache) for target in extra)
@@ -1250,8 +1182,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    An event with no valid ``tool_name``, ``cwd`` or session id is denied when its call could be gated
-    (:func:`_malformed`). A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
+    An event with no valid ``tool_name``, ``cwd`` or session id is denied when its tool is unnamed, a file tool or
+    an MCP tool (:func:`_malformed`). A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
     or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
     allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
     ``default`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
@@ -1306,31 +1238,30 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
 
 def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, *,
                home: Path | None) -> dict[str, Any] | None:
-    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, ``cwd`` or session id (L3 r1 G4):
-    fail closed, as Codex's gate does, whenever the call could be gated: a deny with the irreversible tier's hard
-    stop when the tool is unnamed (it cannot be classified), or when :func:`gate_class` (``cwd`` taken as ``""``
-    when it is not a string) tags it, or that classification fails. A call that is not gated goes on (``None``):
-    nothing here was ever the gate's to answer. Nothing is filed or ledgered: there is no session to file under."""
-    tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
+    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, ``cwd`` or session id (L3 r1 G4,
+    r2 G4'): fail closed, as Codex's gate does, for every call whose targets can be gated: a deny with the
+    irreversible tier's hard stop when the tool is unnamed, a file tool (:data:`FILE_TOOLS`, the ones
+    :func:`levain.consent.policy.targets` reads a path from) or an MCP tool, never classified (a relative target
+    cannot be anchored without ``cwd``, and the event is not trusted to say what it is). Any other named tool (Bash,
+    which is never parsed) is not the gate's to answer and goes on (``None``). Nothing is filed or ledgered: there is
+    no session to file under."""
+    tool_name, tool_input = event.get("tool_name"), event.get("tool_input", {})
+    cwd = event.get("cwd")
     missing = [k for k, ok in (("session_id", _session_of(event) is not None),
                                ("tool_name", isinstance(tool_name, str) and bool(tool_name)),
                                ("cwd", isinstance(cwd, str) and bool(cwd))) if not ok]
+    named = isinstance(tool_name, str) and bool(tool_name)
+    if named and tool_name not in FILE_TOOLS and not tool_name.startswith("mcp__"):
+        return None
     what = "this call"
-    if isinstance(tool_name, str) and tool_name:
+    if named:
         try:
             what = _what(tool_name, tool_input)
-            tier = gate_class(tool_name, tool_input if tool_input is not None else {},
-                              cwd if isinstance(cwd, str) else "", home=home,
-                              protected=protected_paths(Path(queue.directory), settings))
-        except Exception:  # noqa: BLE001 - a call that cannot be classified is treated as gated
-            tier = "irreversible"
-        if tier is None:
-            return None
-    else:
-        tier = "irreversible"
+        except Exception:  # noqa: BLE001 - the deny stands whatever the description does
+            what = tool_name
     return _pre("deny", f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken: "
                 f"{what}. Do not retry it and do not achieve it another way.",
-                **_stop(tier, what, "the hook event was malformed."))
+                **_stop("irreversible", what, "the hook event was malformed."))
 
 
 def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
