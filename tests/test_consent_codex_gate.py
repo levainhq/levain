@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 from levain.consent import ConsentQueue, authority_source
@@ -105,6 +106,32 @@ def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unco
     assert "deny" in _run(qdir, {**event, "permission_mode": "acceptEdits"})  # run 4 C5: floored, not attended
     for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR"):
         monkeypatch.delenv(var, raising=False)
+    # gemini r3 MED: a relative or blank cwd anchors nothing, so the event is malformed and denied
+    for bad in (".", " ", "ws"):
+        spec = json.loads(_run(qdir, {**event, "cwd": bad}))["hookSpecificOutput"]
+        assert spec["permissionDecision"] == "deny" and "no valid cwd" in spec["permissionDecisionReason"], bad
+
+    # codex r3 HIGH: benign headers in many directories whose git query blocks, then .codex/hooks.json. The gate
+    # call's git budget is ONE (the description and the classification share it), a blocked query is cut at the
+    # deadline and tags its header, so the patch is denied well inside Codex's hook timeout instead of running
+    from levain.consent.adapters import claude_code as cc
+
+    fake = tmp_path / "fake-git"
+    fake.write_text('#!/bin/sh\ncase "$2" in *slow*) exec /bin/sleep 5;; esac\n'
+                    'echo "fatal: not a git repository (or any of the parent directories): .git" >&2\nexit 128\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(cc, "_GIT_BINARY", [str(fake)])
+    headers = []
+    for i in range(20):
+        (tmp_path / f"slow{i}").mkdir()
+        (tmp_path / f"slow{i}" / "HEAD").write_text("ref: refs/heads/main\n")   # each could start a repository
+        headers.append(f"*** Add File: slow{i}/a.txt\n+x\n")
+    many = {"command": "*** Begin Patch\n" + "".join(headers) + "*** Add File: .codex/hooks.json\n+{}\n*** End Patch"}
+    started = time.monotonic()
+    spec = json.loads(_run(qdir, _event("S9", "apply_patch", many, str(tmp_path))))["hookSpecificOutput"]
+    took = time.monotonic() - started
+    assert spec["permissionDecision"] == "deny" and took < cc.GIT_BUDGET_SECONDS + 1, took
+
     monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
     assert _run(qdir, event) == ""
     assert ConsentQueue(qdir, authority=authority_source(qdir, anchor=None)).pending() == []

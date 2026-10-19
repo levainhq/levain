@@ -1351,9 +1351,9 @@ def _git_case(name, tmp_path, monkeypatch):
     if name == "git-info":
         return ws, home, ".git/info/attributes", True
     if name == "git-objects":
-        return ws, home, ".git/objects/xx", False
+        return ws, home, ".git/objects/xx", True    # r3: git answers no work tree there, so fail closed
     if name == "git-logs":
-        return ws, home, ".git/logs/HEAD", False
+        return ws, home, ".git/logs/HEAD", True     # (the known edge: an over-match, git writes these itself)
     if name == "hookspath-local":
         _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
         return ws, home, ".husky/pre-commit", True
@@ -1387,7 +1387,40 @@ def _git_case(name, tmp_path, monkeypatch):
     if name == "hookspath-unreadable":
         _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
         (ws / ".git" / "config").chmod(0)
-        return ws, home, ".husky/pre-commit", False
+        return ws, home, ".husky/pre-commit", True   # r3: a git error but "not a git repository" fails closed
+    if name == "hookspath-relative-from-subdir":
+        # complement r3 HIGH: a relative hooksPath, the cwd a worktree subdirectory, ``.husky/`` already there
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        (ws / ".husky").mkdir()
+        (ws / "sub").mkdir()
+        return ws / "sub", home, "../.husky/pre-commit", True
+    if name == "hookspath-relative-inside-husky":
+        # the same, git asked from inside ``.husky/`` itself (the cwd outside any repository)
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        (ws / ".husky").mkdir()
+        (tmp_path / "elsewhere").mkdir()
+        return tmp_path / "elsewhere", home, str(ws / ".husky" / "pre-commit"), True
+    if name == "fake-git-on-path":
+        # codex r3 HIGH: a ``git`` earlier on the session's PATH that prints nothing is never the one asked (were
+        # it, its empty answer would fail closed and tag this ordinary file)
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "git").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "git").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+        return ws, home, "src/a.py", False
+    if name == "git-times-out":
+        # codex r3 HIGH: a query that times out (the budget spent) tags the target, never leaves it untagged
+        def timed_out(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout") or 0)
+        monkeypatch.setattr(cc.subprocess, "run", timed_out)
+        return ws, home, "src/a.py", True
+    if name == "xdg-hookspath":
+        # complement r3 MED: the operator's XDG global config sets hooksPath; asked with XDG_CONFIG_HOME as well
+        (tmp_path / "xdg" / "git").mkdir(parents=True)
+        (tmp_path / "xdg" / "git" / "config").write_text(f"[core]\n  hooksPath = {tmp_path / 'xdg-hooks'}\n")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        return ws, home, str(tmp_path / "xdg-hooks" / "pre-commit"), True
     if name == "global-gitconfig":
         return ws, home, str(home / ".gitconfig"), True
     if name == "xdg-git-config":
@@ -1409,7 +1442,8 @@ def _git_case(name, tmp_path, monkeypatch):
     "submodule-config", "submodule-hook-nested", "git-info", "git-objects", "git-logs", "hookspath-local",
     "no-hookspath", "hookspath-outside-absolute", "hookspath-outside-relative", "hookspath-global-tilde",
     "hookspath-worktree", "hookspath-submodule-gitfile", "hookspath-unreadable", "global-gitconfig",
-    "xdg-git-config", "xdg-spoofed", "xdg-set", "gitconfig-elsewhere"])
+    "xdg-git-config", "xdg-spoofed", "xdg-set", "gitconfig-elsewhere", "hookspath-relative-from-subdir",
+    "hookspath-relative-inside-husky", "fake-git-on-path", "git-times-out", "xdg-hookspath"])
 def test_git_executable_config_includes_submodules_the_effective_hooks_path_and_global_config(name, tmp_path,
                                                                                             monkeypatch):
     """L3 r1 G1 + r2 G1' (codex, gemini): everything under a ``.git`` directory but its objects, refs, reflogs and
@@ -1417,9 +1451,12 @@ def test_git_executable_config_includes_submodules_the_effective_hooks_path_and_
     the directory git runs hooks from is ASKED of git for the event cwd's repository and the target's
     (``git rev-parse --git-path hooks``: a relative or an absolute ``core.hooksPath``, one outside the worktree, the
     user's ``~/.gitconfig``, a linked worktree's, a submodule's through its gitfile), never parsed; ``.husky/`` with
-    no hooksPath set is ordinary; a config git cannot read tags nothing; ``~/.gitconfig`` and ``~/.config/git/config``
+    no hooksPath set is ordinary; ``~/.gitconfig`` and ``~/.config/git/config``
     of the operator's home (the password database's) are config by full path whatever ``XDG_CONFIG_HOME`` says,
-    and ``$XDG_CONFIG_HOME/git/config`` too. Both adapters agree."""
+    and ``$XDG_CONFIG_HOME/git/config`` too. r3 (complement, codex, gemini): git answers in absolute paths (a
+    relative hooksPath from a subdirectory, or asked from inside ``.husky/``), from a fixed binary (never the PATH's),
+    asked with and without the operator's XDG_CONFIG_HOME; a config git cannot read, a timeout, or no work tree
+    (inside ``.git/objects``) fails closed. Both adapters agree."""
     import types
 
     from levain.consent.adapters import codex as cx
@@ -1452,7 +1489,11 @@ def test_a_malformed_pretooluse_event_naming_a_gated_call_is_denied(queue, monke
                          ({**good, "session_id": None, "tool_input": {"file_path": "/work/proj/src/a.py",
                                                                       "content": "x"}}, "session_id"),
                          ({**good, "cwd": None, "tool_name": "mcp__fs__write_file",
-                           "tool_input": {"path": "notes.txt"}}, "cwd")):
+                           "tool_input": {"path": "notes.txt"}}, "cwd"),
+                         # gemini r3 MED: a relative or blank cwd anchors nothing either
+                         ({**good, "cwd": "."}, "cwd"), ({**good, "cwd": " "}, "cwd"),
+                         ({**good, "cwd": "ws", "tool_input": {"file_path": ".husky/pre-commit", "content": "x"}},
+                          "cwd")):
         out = cc.gate(bad, queue, settings, home=Path("/home/u"))
         assert out["hookSpecificOutput"]["permissionDecision"] == "deny", missing
         assert out["continue"] is False and f"no valid {missing}" in out["hookSpecificOutput"][
