@@ -1058,11 +1058,16 @@ def build_default_cockpit(
     (the feed's name when the row names none); the entity's own rows carry the entity's name.
 
     ``exclude`` leaves out Levain-native panels a downstream draws its own way (ids in ``OPTIONAL_NATIVE``; any
-    other id raises ``ValueError``). The ``activity`` ambient holds the hero's one ambient slot, so a downstream
-    registering its own hero ambient excludes it."""
+    other id raises ``ValueError``). The ``activity`` ambient holds the hero's ambient slot only until a
+    downstream registers its own hero ambient: it yields (``Cockpit.yield_hero``), so flow's ``sky`` takes the
+    slot with no opt-out."""
     if isinstance(exclude, str):
         raise ValueError("exclude is a collection of panel ids, not one string")
-    bad_ids = sorted(set(exclude) - OPTIONAL_NATIVE)
+    try:
+        exclude = frozenset(exclude)       # read once: a generator would be spent by the first membership test
+    except TypeError:
+        raise ValueError("exclude is a collection of panel ids") from None
+    bad_ids = sorted(exclude - OPTIONAL_NATIVE)
     if bad_ids:
         raise ValueError(f"exclude {bad_ids}: only {sorted(OPTIONAL_NATIVE)} may be left out")
     feeds = tuple((episode_feeds or {}).items())
@@ -1139,14 +1144,16 @@ def build_default_cockpit(
             "activity", "ambient", "Activity", "feed",
             activity_reader(install_root=source.install_root, episodic_db=source.anneal.episodic_db,
                             consent=lambda: ck.consent_reader, questions=lambda: ck.question_store),
-            region="hero", rank=1, optional=True, timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0))
+            region="hero", rank=1, optional=True, timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C))
+        ck.yield_hero("activity")
     if "memory_glance" not in exclude:
         ck.register(ProviderSpec("memory_glance", "metric-grid", "Memory", "gauge",
                                  memory_glance_reader(lambda ctx: _view(source, ctx)), region="widgets", rank=30,
                                  edit_class=CLASS_C))
     if "doctor" not in exclude:
         ck.register(ProviderSpec("doctor", "status-dots", "Levain health", "gauge",
-                                 doctor_reader(source.install_root), region="widgets", rank=45, timeout_s=20.0))
+                                 doctor_reader(source.install_root), region="widgets", rank=45, timeout_s=20.0,
+                                 edit_class=CLASS_C))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
                              size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(
