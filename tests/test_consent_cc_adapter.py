@@ -133,11 +133,13 @@ def test_an_exception_is_no_decision_never_allow(monkeypatch, boom):
     assert (rc, out) == (0, "")
 
 
-@pytest.mark.parametrize("stdin_text", ["", "not json", "[]", json.dumps({"hook_event_name": "PreToolUse"}),
-                                        json.dumps(event(session_id=None))])
+@pytest.mark.parametrize("stdin_text", ["", "not json", "[]", json.dumps(event(session_id=None))])
 def test_bad_input_is_no_decision(monkeypatch, stdin_text):
     q = FakeQueue("allow")
     assert run_main(monkeypatch, q, stdin_text) == (0, "")
+    # a PreToolUse naming no tool is no longer no decision: it is denied (L3 r1 G4)
+    rc, out = run_main(monkeypatch, q, json.dumps({"hook_event_name": "PreToolUse"}))
+    assert rc == 0 and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_nothing_on_stdin_is_a_decision(monkeypatch):
@@ -1231,6 +1233,8 @@ def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path
         monkeypatch.delenv(var, raising=False)
     home, ws = tmp_path / "home", tmp_path / "ws" / "proj"
     home.mkdir()
+    managed = tmp_path / "etc" / "managed-settings.json"   # L3 r1 G3: the machine-wide files count too
+    monkeypatch.setattr(cc, "SYSTEM_SETTINGS_FILES", (("json", managed), ("toml", tmp_path / "etc" / "config.toml")))
     (ws / "sub").mkdir(parents=True)
     target = str(ws / ".claude" / "hooks" / "x.sh")
     ev = {**_hook_write("bypassPermissions"), "cwd": str(ws / "sub"),
@@ -1244,7 +1248,15 @@ def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path
                        (ws / ".claude" / "settings.local.json", json.dumps({"env": {cc.UNCONFINED_ENV: "0"}})),
                        (home / ".claude" / "settings.json", "{not json"),
                        (tmp_path / "ws" / ".codex" / "config.toml",
-                        f'[shell_environment_policy.set]\n{cc.UNCONFINED_ENV} = "1"\n')):
+                        f'[shell_environment_policy.set]\n{cc.UNCONFINED_ENV} = "1"\n'),
+                       # L3 r1 G3: a mention anywhere, not only an ``env`` key: a JSON value, a TOML list value, an
+                       # escaped spelling, and the machine-wide files
+                       (ws / ".claude" / "settings.json",
+                        json.dumps({"hooks": {"SessionStart": [{"command": f"export {cc.UNCONFINED_ENV}=1"}]}})),
+                       (ws / ".codex" / "config.toml", f'[profiles.p]\nset = ["{cc.UNCONFINED_ENV}=1"]\n'),
+                       (ws / ".claude" / "settings.local.json", '{"x": "\\u004cEVAIN_UNCONFINED"}'),
+                       (managed, json.dumps({"env": {cc.UNCONFINED_ENV: "1"}})),
+                       (tmp_path / "etc" / "config.toml", f'x = "{cc.UNCONFINED_ENV}"\n')):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
         assert cc.unconfined_state(str(ws / "sub"), home=home) == "ignored", path
@@ -1314,3 +1326,96 @@ def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_i
               "session_id": "sess-1", "permission_mode": "acceptEdits",
               "tool_input": {"file_path": "/work/proj/.claude/settings.json", "content": "{}"}}
     assert cc.decide(dialog, q, settings, home=home) is None and calls == []
+
+
+# --- L3 r1 G1: git's executable config beyond .git/hooks and .git/config ----------------------------------------
+
+def _git_case(name, tmp_path):
+    """(workspace, home, target, expected) for one G1 case, its files laid out under ``tmp_path``."""
+    home, ws = tmp_path / "home", tmp_path / "ws"
+    (home).mkdir()
+    (ws / ".git").mkdir(parents=True)
+    cfg = ws / ".git" / "config"
+    if name == "submodule-config":
+        return ws, home, ".git/modules/sub/config", True
+    if name == "submodule-hook-nested":
+        return ws, home, ".git/modules/libs/foo/modules/inner/hooks/pre-commit", True
+    if name == "submodule-refs":
+        return ws, home, ".git/modules/sub/refs/heads/main", False
+    if name == "hookspath-local":
+        cfg.write_text('[core]\n\tbare = false\n[Core] HooksPath = ".husky" ; husky\n')
+        return ws, home, ".husky/pre-commit", True
+    if name == "no-hookspath":
+        cfg.write_text('[core]\n\tbare = false\n[core "x"]\n\thooksPath = .husky\n')
+        return ws, home, ".husky/pre-commit", False
+    if name == "hookspath-global-tilde":
+        (home / ".gitconfig").write_text("[core]\n  hooksPath = ~/.githooks\n")
+        return ws, home, str(home / ".githooks" / "pre-push"), True
+    if name == "hookspath-worktree-commondir":
+        main = tmp_path / "main"
+        (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
+        (main / ".git" / "config").write_text("[core]\nhooksPath = .githooks\n")
+        (main / ".git" / "worktrees" / "wt" / "commondir").write_text("../..\n")
+        (ws / ".git").rmdir()
+        (ws / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n")
+        return ws, home, ".githooks/post-checkout", True
+    if name == "hookspath-submodule-gitfile":
+        (ws / ".git" / "modules" / "sub").mkdir(parents=True)
+        (ws / ".git" / "modules" / "sub" / "config").write_text("[core]\n\thooksPath = .hooks\n")
+        (ws / "sub").mkdir()
+        (ws / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+        return ws, home, "sub/.hooks/pre-commit", True
+    if name == "hookspath-unreadable":
+        cfg.write_text("[core]\n\thooksPath = .husky\n")
+        cfg.chmod(0)
+        return ws, home, ".husky/pre-commit", False
+    if name == "global-gitconfig":
+        return ws, home, str(home / ".gitconfig"), True
+    if name == "xdg-git-config":
+        return ws, home, "~/.config/git/config", True
+    if name == "gitconfig-elsewhere":
+        return ws, home, "fixtures/.gitconfig", False
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize("name", [
+    "submodule-config", "submodule-hook-nested", "submodule-refs", "hookspath-local", "no-hookspath",
+    "hookspath-global-tilde", "hookspath-worktree-commondir", "hookspath-submodule-gitfile", "hookspath-unreadable",
+    "global-gitconfig", "xdg-git-config", "gitconfig-elsewhere"])
+def test_git_executable_config_includes_submodules_the_effective_hooks_path_and_global_config(name, tmp_path,
+                                                                                            monkeypatch):
+    """L3 r1 G1 (codex H3 + complement 1/2): (a) a submodule's git directory ``.git/modules/<name>/`` (nested, a
+    name with slashes) holds config and hooks git runs; (b) the ``core.hooksPath`` the repository's or the user's
+    git config sets (husky's ``.husky/``) is a hooks directory, read from the files (a linked worktree's through its
+    gitfile and ``commondir``, a submodule's through its gitfile), never by running git, and ``.husky/`` with no
+    hooksPath set is ordinary; an unreadable config tags nothing and does not crash; (c) ``~/.gitconfig`` and the XDG
+    ``git/config`` are config by full path. Both adapters agree."""
+    from levain.consent.adapters import codex as cx
+
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    ws, home, target, expected = _git_case(name, tmp_path)
+    try:
+        got = cc.targets_agent_config("Write", {"file_path": target, "content": "x"}, str(ws), home=home)
+        patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch"}
+        got_cx = cx.targets_agent_config("apply_patch", patch, str(ws), home=home, codex_dir=home / ".codex")
+    finally:
+        (ws / ".git" / "config").exists() and (ws / ".git" / "config").chmod(0o600)
+    assert (got, got_cx) == (expected, expected)
+
+
+def test_a_malformed_pretooluse_event_naming_a_gated_call_is_denied(queue, monkeypatch):
+    """L3 r1 G4 (codex M6): an event with no session id, no cwd or no tool name returned None, so the gated write
+    ran in bypass. Now it is denied with the hard stop when the call could be gated (an unnamed tool cannot be
+    classified); an ungated call with a missing field still goes on."""
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    settings = cc.AdapterSettings()
+    good = _hook_write("bypassPermissions")
+    for bad, missing in (({**good, "session_id": None}, "session_id"), ({**good, "cwd": ""}, "cwd"),
+                         ({k: v for k, v in good.items() if k != "tool_name"}, "tool_name")):
+        out = cc.gate(bad, queue, settings, home=Path("/home/u"))
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", missing
+        assert out["continue"] is False and f"no valid {missing}" in out["hookSpecificOutput"][
+            "permissionDecisionReason"], missing
+    ungated = {**good, "session_id": None, "tool_input": {"file_path": "/work/proj/src/a.py", "content": "x"}}
+    assert cc.gate(ungated, queue, settings, home=Path("/home/u")) is None
+    assert queue.pending() == []

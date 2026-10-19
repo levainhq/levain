@@ -132,3 +132,19 @@ def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeyp
         out = json.loads(_run(qdir, _event("S1", tool, inp, str(tmp_path))))
         assert out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1), tool
     assert _run(qdir, _event("S2", "apply_patch", patch, str(tmp_path))) == ""  # another session is unconfined
+
+    # L3 r1 G2: a halt set AFTER the gate's first read (a sibling call's undecided deny) still wins the unconfined
+    # pass and the floor's default/plan pass: each re-checks the halt just before returning
+    real = cx.unconfined_state
+    for session, mode, unconfined in (("S3", "bypassPermissions", True), ("S4", "default", False),
+                                      ("S5", "plan", False)):
+        def halting(*a, _s=session, _u=unconfined, **kw):
+            r = ConsentQueue(qdir, authority=source, clock=lambda: t0).file(
+                agent="codex", agent_session_id=_s, tool_name="apply_patch", tool_input=patch, cwd=str(tmp_path),
+                hold=timedelta(seconds=20), tier="T3")
+            ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21)).mark_undecided(
+                r.id, halt=True)
+            return real(*a, **kw) if _u else None
+        monkeypatch.setattr(cx, "unconfined_state", halting)
+        out = json.loads(_run(qdir, {**_event(session, "apply_patch", patch, str(tmp_path)), "permission_mode": mode}))
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1), session
