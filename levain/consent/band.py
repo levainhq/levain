@@ -65,7 +65,9 @@ __all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parser
 
 # the session a question names when the environment names none (no hook's session is ever this)
 NO_SESSION = "levain-ask"
-# what an agent is told so it asks instead of stopping (the line a template or brief carries)
+# what an agent is told so it asks instead of stopping. No template, hook or brief carries it today (DESIGN_QMCP
+# amendment R-q23): it is the wording for a brief that wants it; the `ask` tool reaches the agent through the MCP
+# server's own tools/list, not through this line.
 AGENT_LINE = ("When you need the operator's judgement and can keep working on something else, run `levain ask "
               "--what \"<the question, one line>\" --option <key>=<label> --option <key>=<label> --rec <key> "
               "--blocks \"<what waits on the answer>\"` (2-6 options; keys lowercase a-z, 0-9, _ or -), or the "
@@ -216,15 +218,17 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
 
 
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
-                  qdir: Path, *, no_session_hint: str = "(pass --session)") -> tuple[Question | None, str]:
+                  qdir: Path, *, no_session_hint: str = "(pass --session)",
+                  session_source: str = "--session") -> tuple[Question | None, str]:
     """File one question, ping, and say so: the one path under ``levain ask`` and the ``ask`` MCP tool, so the
     refusals, the ping, the resume meta and the wording are the same for both. Returns the question (``None`` when
     it was refused or could not be written) and the text the caller shows the agent; ``no_session_hint`` is what
-    that text says to do when the question names no session."""
+    that text says to do when the question names no session, and ``session_source`` what a refusal names as the
+    session's source (the MCP door has no ``--session`` flag)."""
     try:
         if _SUBAGENT in session:
-            raise ValueError("--session must name the main session (no #agent: part): only its hooks receive "
-                             "answers")
+            raise ValueError(f"{session_source} must name the main session (no #agent: part): only its hooks "
+                             "receive answers")
         try:
             resume = ask_resume_meta(agent, session)
         except Exception:  # noqa: BLE001 - no resume record: the answer then waits for the session's next hook

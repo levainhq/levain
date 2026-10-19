@@ -111,3 +111,61 @@ def test_an_mcp_servers_agent_process_is_its_parent_never_claude_pid(monkeypatch
     # the server's nearest ancestor is the claude that started it: the pid the meta names is that one's
     monkeypatch.setattr(band, "_ancestors", lambda: iter([(os.getpid(), ["claude", "-p"]), (1111, ["zsh"])]))
     assert band.ask_resume_meta("claude_code", SESSION)["claude_pid"] == os.getpid()
+
+
+# ---- L1 fix lane (1018+51): nesting, line separators, keys, the subagent refusal's words ------------------------
+
+def test_nesting_deep_enough_to_overflow_the_decoder_is_a_parse_error_and_the_server_goes_on(tmp_path):
+    replies, code = _talk(tmp_path, ["[" * 200000, _req(1, "ping")])
+    assert code == 0
+    assert replies[0]["error"]["code"] == -32700 and replies[0]["id"] is None
+    assert replies[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+def _raw_talk(tmp_path: Path, lines: list[str]) -> str:
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "CODEX", "LEVAIN"))}
+    base.update({"LEVAIN_HOME": str(tmp_path / "home"), "CLAUDE_CODE_SESSION_ID": SESSION})
+    proc = subprocess.run([sys.executable, "-P", "-m", "levain.consent.band_mcp", "--agent", "claude_code"],
+                          input="".join(x + "\n" for x in lines).encode("utf-8"), capture_output=True, env=base,
+                          timeout=60, cwd=str(tmp_path))
+    return proc.stdout.decode("utf-8")
+
+
+def test_a_line_separator_in_the_question_round_trips_and_never_splits_the_reply(tmp_path):
+    """The store refuses U+2028 in a question (one line of plain text), so it comes back as the refusal; other
+    non-ASCII text files and comes back intact; and a separator a reply DOES echo (an unknown method's name) stays one
+    line for any splitter, Python's str.splitlines included."""
+    sep = "merge\u2028the\u2029branch\x85?"
+    accented = "fusionner la branche d\u00e9j\u00e0 \u2014 maintenant?"
+    method = "tools/\u2028list"
+    raw = json.dumps({"jsonrpc": "2.0", "id": 3, "method": method}, ensure_ascii=False)
+    out = _raw_talk(tmp_path, [
+        _req(1, "tools/call", {"name": "ask", "arguments": {**ARGS, "what": sep}}),
+        _req(2, "tools/call", {"name": "ask", "arguments": {**ARGS, "what": accented, "blocks": accented}}),
+        raw,
+    ])
+    assert out.isascii() and len(out.splitlines()) == 3            # three replies, three lines, for any splitter
+    r1, r2, r3 = (json.loads(x) for x in out.splitlines())
+    assert r1["result"]["isError"] is True and "no control characters" in r1["result"]["content"][0]["text"]
+    assert r2["result"]["isError"] is False and accented in r2["result"]["content"][0]["text"]
+    assert r3["error"]["message"] == f"method not found: {method}"
+    (q,) = _store(tmp_path).open_questions()
+    assert q.what == accented
+
+
+def test_option_keys_are_stripped_as_levain_ask_strips_them(tmp_path):
+    spaced = [{"key": " a ", "label": " merge now "}, {"key": "b\t", "label": "wait"}]
+    replies, _ = _talk(tmp_path, [_req(1, "tools/call", {"name": "ask", "arguments": {**ARGS, "options": spaced}})])
+    assert replies[0]["result"]["isError"] is False, replies
+    (q,) = _store(tmp_path).open_questions()
+    assert list(q.options) == band._options([" a = merge now ", "b\t=wait"]) == [("a", "merge now"), ("b", "wait")]
+
+
+def test_a_subagent_session_refusal_names_no_flag_the_tool_cannot_pass(tmp_path):
+    replies, _ = _talk(tmp_path, [_req(1, "tools/call", {"name": "ask", "arguments": ARGS})],
+                       env={"CLAUDE_CODE_SESSION_ID": SESSION + "#agent:x1"})
+    result = replies[0]["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert text.startswith("levain ask: refused") and "--session" not in text
+    assert "the session in this server's environment must name the main session" in text

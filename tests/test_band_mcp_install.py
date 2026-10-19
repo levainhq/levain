@@ -148,7 +148,7 @@ def test_doctor_cc_band_row_ok_then_warn(make_install):
     data["mcpServers"]["levain_band"]["command"] = "/opt/wrap/levain-band"
     mcp.write_text(json.dumps(data), encoding="utf-8")
     (row,) = _band_rows(doctor._check_claude_code(install))
-    assert row.ok and row.warn and row.hint == "levain update", row
+    assert row.ok and row.warn and ".levain/pending/.mcp.json" in row.hint, row   # update keeps it: the hint names what helps
     del data["mcpServers"]["levain_band"]
     mcp.write_text(json.dumps(data), encoding="utf-8")
     (row,) = _band_rows(doctor._check_claude_code(install))
@@ -246,7 +246,7 @@ def test_doctor_codex_band_row_ok_then_warn(make_install, tmp_path):
     assert row.ok and not row.warn, row
     _edit_band(_config(tmp_path), '[mcp_servers.levain_band]\ncommand = "/opt/wrap/levain-band"\nargs = []\n')
     (row,) = _band_rows(doctor._check_codex(install))
-    assert row.ok and row.warn and row.hint == "levain update", row
+    assert row.ok and row.warn and "delete the [mcp_servers.levain_band] table" in row.hint, row
     _edit_band(_config(tmp_path), "")
     (row,) = _band_rows(doctor._check_codex(install))
     assert row.ok and row.warn and "missing" in row.detail, row
@@ -266,3 +266,167 @@ def test_codex_reinit_keeps_an_operator_band_block_and_says_so(make_install, tmp
     assert run_init(install, "codex", force=True, answers_file=tmp_path / "entity-answers.json") == 0
     assert inst._codex_band_block(config.read_text(encoding="utf-8")) == mine
     assert "[mcp_servers.levain_band]: yours is kept" in capsys.readouterr().out
+
+
+# ---- L1 + L2 fix lane (1018+51) ----------------------------------------------------------------------------------
+
+CODEX_ROOT = Path(inst.__file__).parent / "templates" / "adapters" / "codex"
+
+
+def _pair(home: Path, notes: list[str], hooks_text: str = '{"hooks": {}}\n') -> None:
+    inst._write_codex_pair(home, inst._codex_fragment(CODEX_ROOT, sys.executable, home / "inst"), hooks_text,
+                           notes.append, band_fragment=inst._codex_band_fragment(CODEX_ROOT, sys.executable))
+
+
+@pytest.mark.parametrize("hooks_already_there", [False, True])
+def test_a_band_merge_failure_leaves_config_toml_as_it_was_and_names_the_band(tmp_path, monkeypatch,
+                                                                               hooks_already_there):
+    """L2 #1: the band merge failing after the anneal merge wrote config.toml put nothing back (the undo could not
+    prove the file levain's) and blamed hooks.json. Now config.toml is byte-for-byte as before, whatever hooks.json
+    holds, and the note names the band block."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    orig = '[mcp_servers.other]\ncommand = "x"\n'
+    (home / "config.toml").write_text(orig, encoding="utf-8")
+    hooks_text = '{"hooks": {}}\n'
+    if hooks_already_there:
+        (home / "hooks.json").write_text(hooks_text, encoding="utf-8")
+
+    def boom(*_a, **_k):
+        raise inst.InitError("the band merge failed")
+
+    monkeypatch.setattr(inst, "_merge_codex_band", boom)
+    notes: list[str] = []
+    with pytest.raises(inst.InitError, match="the band merge failed"):
+        _pair(home, notes, hooks_text)
+    assert (home / "config.toml").read_text(encoding="utf-8") == orig
+    assert sorted(p.name for p in home.iterdir()) == (["config.toml", "hooks.json"] if hooks_already_there
+                                                       else ["config.toml"])
+    text = "\n".join(notes)
+    assert "its levain_band block could not be added to" in text and "was undone" in text, text
+    assert "hooks.json could not be written" not in text
+
+
+def test_a_quoted_band_header_is_kept_never_a_duplicate_table(tmp_path):
+    """L2 #4c: `[mcp_servers."levain_band"]` is the same table to TOML; levain neither appends a second one (a parse
+    refusal, then the L2 #1 undo) nor edits it."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    orig = '[mcp_servers."levain_band"]\ncommand = "x"\nargs = []\n'
+    (home / "config.toml").write_text(orig, encoding="utf-8")
+    notes: list[str] = []
+    _pair(home, notes)
+    after = (home / "config.toml").read_text(encoding="utf-8")
+    servers = tomllib.loads(after)["mcp_servers"]
+    assert servers["levain_band"] == {"command": "x", "args": []} and "anneal_memory" in servers
+    assert after.count("levain_band") == 1
+    assert any("form levain does not edit" in n for n in notes), notes
+
+
+@pytest.mark.parametrize("header", ['[mcp_servers."levain_band"]', '  [mcp_servers.levain_band]'])
+def test_update_stages_a_band_table_levain_cannot_edit(make_install, tmp_path, header):
+    install = make_install("codex")
+    config = _config(tmp_path)
+    _edit_band(config, f'{header}\ncommand = "/opt/wrap/levain-band"\nargs = []\n')
+    before = config.read_text(encoding="utf-8")
+    r, _out = _refresh(install)                                    # the package has not moved: kept quietly
+    assert config.read_text(encoding="utf-8") == before and not r.review
+    assert not any("levain_band" in x for x in r.refreshed)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)               # the package moved: kept, staged, said once
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data["files"][inst.CODEX_BAND_KEY] = "0" * 64
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    r, out = _refresh(install)
+    assert config.read_text(encoding="utf-8") == before
+    assert inst.CODEX_BAND_KEY in r.review and "yours is kept" in out
+    assert not any("levain_band" in x for x in r.refreshed)
+    data["files"].pop(inst.CODEX_BAND_KEY)                          # no record at all: the same
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    r, out = _refresh(install)
+    assert config.read_text(encoding="utf-8") == before and inst.CODEX_BAND_KEY in r.review
+
+
+def test_the_band_block_ends_at_its_last_key_line():
+    text = ('[mcp_servers.levain_band]\n# about the band\ncommand = "x"\n\nargs = [\n  "-P",\n]\n'
+            '\n# my precious server\n[mcp_servers.mine]\ncommand = "y"\n')
+    m = inst._CODEX_BAND_BLOCK_RE.search(text)
+    assert m.group(0) == '[mcp_servers.levain_band]\n# about the band\ncommand = "x"\n\nargs = [\n  "-P",\n]\n'
+    tail = '[mcp_servers.levain_band]\ncommand = "x"\nargs = []\n\n# note\n  [mcp_servers.mine]\ncommand = "y"\n'
+    assert inst._CODEX_BAND_BLOCK_RE.search(tail).group(0) == '[mcp_servers.levain_band]\ncommand = "x"\nargs = []\n'
+    assert inst._CODEX_BAND_BLOCK_RE.search('[mcp_servers.levain_band]\ncommand = "x"').group(0) == \
+        '[mcp_servers.levain_band]\ncommand = "x"'
+
+
+def test_a_replace_keeps_the_operators_comment_above_the_next_table(make_install, tmp_path):
+    """L1 #1 / L2 #4a: the band block's regex ran to the next header, so a replace deleted the operator's comment
+    above it, and the comment then made the block read as the operator's forever."""
+    install = make_install("codex")
+    config = _config(tmp_path)
+    levains = inst._codex_band_block(config.read_text(encoding="utf-8"))
+    tail = "\n# my precious server\n[mcp_servers.mine]\ncommand = \"y\"\n"
+    _edit_band(config, '[mcp_servers.levain_band]\ncommand = "/old/venv/bin/python3.11"\n'
+                       'args = ["-P", "-m", "levain.consent.band_mcp", "--agent", "codex"]\n' + tail)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data["files"].pop(inst.CODEX_BAND_KEY)                          # no record: judged by shape
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    r, _out = _refresh(install)
+    assert any("levain_band" in x for x in r.refreshed), r
+    text = config.read_text(encoding="utf-8")
+    assert levains + tail in text
+    r2, out2 = _refresh(install)                                     # levain's own now: nothing staged
+    assert inst.CODEX_BAND_KEY not in r2.review and "levain_band" not in out2
+
+
+def test_init_keeping_an_operator_band_block_records_no_hash_for_it(make_install, tmp_path):
+    """L1 #9: init recorded levain's block hash although the operator's was kept. Unrecorded, update judges it by
+    shape: kept, levain's staged, listed once."""
+    install = make_install("codex")
+    config = _config(tmp_path)
+    mine = '[mcp_servers.levain_band]\ncommand = "/opt/wrap/levain-band"\nargs = ["--agent", "codex"]\n'
+    _edit_band(config, mine)
+    assert run_init(install, "codex", force=True, answers_file=tmp_path / "entity-answers.json") == 0
+    receipt = json.loads(install.joinpath(*ADAPTER_RECEIPT_REL).read_text(encoding="utf-8"))
+    assert inst.CODEX_BAND_KEY not in receipt["files"]
+    r, out = _refresh(install)
+    assert inst._codex_band_block(config.read_text(encoding="utf-8")) == mine
+    assert inst.CODEX_BAND_KEY in r.review and "yours is kept" in out
+    r2, out2 = _refresh(install)
+    assert inst.CODEX_BAND_KEY not in r2.review and "levain_band" not in out2
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.warn and "levain update` keeps a block it did not write" in row.hint, row
+
+
+def test_init_writing_levains_band_block_records_it(make_install, tmp_path):
+    install = make_install("codex")
+    receipt = json.loads(install.joinpath(*ADAPTER_RECEIPT_REL).read_text(encoding="utf-8"))
+    block = inst._codex_band_block(_config(tmp_path).read_text(encoding="utf-8"))
+    assert receipt["files"][inst.CODEX_BAND_KEY] == inst._sha256_text(block)
+
+
+def test_doctor_band_row_warns_on_a_lookalike_interpreter_and_on_extra_keys(make_install, tmp_path):
+    """L2 #3: OK only for THIS levain's interpreter with exactly levain's keys."""
+    install = make_install()
+    mcp = install / ".mcp.json"
+    data = json.loads(mcp.read_text(encoding="utf-8"))
+    entry = data["mcpServers"]["levain_band"]
+    data["mcpServers"]["levain_band"] = {**entry, "command": "/tmp/evil/python3"}
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    (row,) = _band_rows(doctor._check_claude_code(install))
+    assert row.warn and "not this levain's Python" in row.detail, row
+    data["mcpServers"]["levain_band"] = {**entry, "env": {"PYTHONPATH": "/tmp/evil"}}
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    (row,) = _band_rows(doctor._check_claude_code(install))
+    assert row.warn and "carries env" in row.detail, row
+
+    cx = make_install("codex", name="cx")
+    config = _config(tmp_path)
+    block = inst._codex_band_block(config.read_text(encoding="utf-8"))
+    _edit_band(config, block + 'env = { PYTHONPATH = "/tmp/evil" }\n')
+    (row,) = _band_rows(doctor._check_codex(cx))
+    assert row.warn and "carries env" in row.detail, row
+    _edit_band(config, block)
+    config.write_text(config.read_text(encoding="utf-8") + '\n[mcp_servers.levain_band.env]\nPYTHONPATH = "/x"\n',
+                      encoding="utf-8")
+    (row,) = _band_rows(doctor._check_codex(cx))
+    assert row.warn and "carries env" in row.detail, row

@@ -2985,14 +2985,46 @@ def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
     if not isinstance(server, dict):
         return CheckResult(BAND_ROW, True, f"missing from {where}: the agent can still file questions with "
                                            f"`levain ask`, not with the `ask` tool", "levain update", warn=True)
+    # `levain update` replaces only a registration levain itself wrote; one carrying anything else is kept (and,
+    # for Claude Code, levain's render staged), so the hint names what helps instead (QMCP L1 #9).
+    keep_hint = (f"`levain update` keeps {where}'s entry as yours; merge levain's levain_band entry from "
+                 f".levain/pending/.mcp.json (staged by `levain update`)" if agent == "claude_code" else
+                 f"`levain update` keeps a block it did not write: delete the [mcp_servers.levain_band] table "
+                 f"from {where}, then run `levain update`, which writes levain's")
+    extra = sorted(str(k) for k in server if k not in _BAND_KEYS)
+    command = server.get("command")
     if not _is_levain_launcher({"mcp_servers": {BAND_SERVER: server}}, None, server=BAND_SERVER, agent=agent):
         args = server.get("args")
         shown = " ".join(str(a) for a in args) if isinstance(args, list) else repr(args)
-        return CheckResult(BAND_ROW, True, f"{where} starts it as `{server.get('command')} {shown}`, not levain's "
+        return CheckResult(BAND_ROW, True, f"{where} starts it as `{command} {shown}`, not levain's "
                                            f"launcher (<python> -P -m levain.consent.band_mcp --agent {agent})",
-                           "levain update", warn=True)
-    return CheckResult(BAND_ROW, True, f"{where}: {server.get('command')} -P -m levain.consent.band_mcp "
+                           keep_hint, warn=True)
+    if extra:  # an `env` (PYTHONPATH, say) or any other key changes what the server runs (QMCP L2 #3)
+        return CheckResult(BAND_ROW, True, f"{where}'s levain_band entry carries {', '.join(extra)} beside "
+                                           f"levain's launcher: it may not run the band levain ships",
+                           keep_hint, warn=True)
+    if not _is_this_python(command):
+        return CheckResult(BAND_ROW, True, f"{where} starts it with `{command}`, not this levain's Python "
+                                           f"({sys.executable})", "levain update", warn=True)
+    return CheckResult(BAND_ROW, True, f"{where}: {command} -P -m levain.consent.band_mcp "
                                        f"--agent {agent}")
+
+
+_BAND_KEYS = frozenset({"type", "command", "args"})
+
+
+def _is_this_python(command: object) -> bool:
+    """``command`` is this levain's interpreter: the same path, or the same binary in the same directory (the
+    directory picks the venv), the rule `_check_mcp_command` applies."""
+    if not isinstance(command, str) or not command:
+        return False
+    here = os.path.abspath(sys.executable)
+    try:
+        cmd_abs = os.path.abspath(command)
+        return cmd_abs == here or (os.path.dirname(cmd_abs) == os.path.dirname(here)
+                                   and os.path.realpath(cmd_abs) == os.path.realpath(here))
+    except (OSError, ValueError):
+        return False
 
 
 def _codex_takeover_hint(install: Path) -> str:

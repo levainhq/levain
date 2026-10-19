@@ -68,7 +68,8 @@ def _arguments(raw: Any) -> tuple[str, list[tuple[str, str]], str, str]:
     if not isinstance(opts, list) or not all(
             isinstance(o, dict) and isinstance(o.get("key"), str) and isinstance(o.get("label"), str) for o in opts):
         raise _RpcError(INVALID_PARAMS, "options must be an array of {key, label} strings")
-    return raw["what"], [(o["key"], o["label"].strip()) for o in opts], raw["rec"], raw["blocks"]
+    # key and label both stripped, as `levain ask --option KEY=LABEL` strips them (band._options)
+    return raw["what"], [(o["key"].strip(), o["label"].strip()) for o in opts], raw["rec"], raw["blocks"]
 
 
 def _ask(agent: str, arguments: Any) -> dict[str, Any]:
@@ -79,7 +80,8 @@ def _ask(agent: str, arguments: Any) -> dict[str, Any]:
     from levain.consent.queue import default_queue_dir
 
     q, text = band.file_question(agent, session, what, options, rec, blocks, default_queue_dir(),
-                                 no_session_hint="(this server's environment names no session)")
+                                 no_session_hint="(this server's environment names no session)",
+                                 session_source="the session in this server's environment")
     return {"content": [{"type": "text", "text": text}], "isError": q is None}
 
 
@@ -132,12 +134,15 @@ def serve(agent: str, stdin: Any = None, stdout: Any = None) -> None:
             continue
         try:
             msg = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):  # nesting deep enough to overflow the decoder is a parse error too,
+            # never the end of the server (the agent would lose the tool for the session)
             reply: dict[str, Any] | None = _error(None, PARSE_ERROR, "parse error")
         else:
             reply = handle(agent, msg)
         if reply is not None:
-            stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            # ASCII-escaped: a raw U+2028 / U+2029 / U+0085 inside a string splits the line for a client that
+            # splits on every line break (str.splitlines), and one reply would become two broken ones
+            stdout.write(json.dumps(reply, ensure_ascii=True) + "\n")
             stdout.flush()
 
 

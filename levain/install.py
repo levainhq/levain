@@ -2862,7 +2862,14 @@ def record_adapter_receipt(
         if block is not None:
             extra[CODEX_CONFIG_KEY] = block
         band_block = _codex_band_block(_codex_band_fragment(codex_root, python_path))
-        if band_block is not None:
+        # Recorded only when config.toml holds levain's block: one init KEPT as the operator's is not "the block
+        # levain recorded writing" (QMCP L1 #9). Unrecorded, `levain update` judges it by shape (the
+        # path every pre-band install takes): kept, levain's staged and listed once.
+        try:
+            written = _codex_band_block((_codex_home() / "config.toml").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            written = None
+        if band_block is not None and written == band_block:
             extra[CODEX_BAND_KEY] = _sha256_text(band_block)
     try:
         _write_adapter_receipt(install, {
@@ -3496,6 +3503,19 @@ def _without_band_keys(parsed: dict | None) -> dict | None:
     return {**parsed, "mcp_servers": servers}
 
 
+def _codex_band_unmatched(text: str) -> bool:
+    """``text`` parses to a config that has ``mcp_servers.levain_band`` while :data:`_CODEX_BAND_BLOCK_RE` finds no
+    block (a quoted ``[mcp_servers."levain_band"]``, a dotted key, an indented header): a block levain cannot edit,
+    and appending its own would write a duplicate table (QMCP L2 #4c)."""
+    if _CODEX_BAND_BLOCK_RE.search(text) is not None:
+        return False
+    try:
+        servers = tomllib.loads(text).get("mcp_servers")
+    except tomllib.TOMLDecodeError:
+        return False
+    return isinstance(servers, dict) and BAND_SERVER in servers
+
+
 def _codex_band_is_levains(block: str, new_block: str) -> bool:
     """Whether ``block`` is a band registration levain itself writes: its launcher (R-q21) and nothing the
     operator added beside it."""
@@ -3517,6 +3537,10 @@ def _merge_codex_band(path: Path, fragment: str, *, judge: bool,
         return "current"
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     old = _CODEX_BAND_BLOCK_RE.search(existing)
+    if old is None and _codex_band_unmatched(existing):
+        emit(f"  {path}: it already defines mcp_servers.levain_band in a form levain does not edit (a quoted or "
+             f"dotted table name, say), so yours is kept and levain added none beside it.")
+        return "kept"
     if old is not None:
         old_text = old.group(0).rstrip() + "\n"
         if old_text == new_block:
@@ -3604,7 +3628,7 @@ def _refresh_codex_band(
         return
     record = (_read_adapter_receipt(install) or {}).get(CODEX_BAND_KEY)
     if old_text is None:
-        levains = True
+        levains = not _codex_band_unmatched(existing)  # one levain cannot edit is the operator's
     elif record is not None:
         levains = _sha256_text(old_text) == record
     else:
@@ -4204,9 +4228,10 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     """Write codex's two machine-global files as one unit, under :func:`codex_home_lock`
     held by the caller. Both texts are rendered before either file is touched. config.toml
     goes first, so its parse refusal (``_require_toml``, judged on the exact text written)
-    fires before anything changes. If hooks.json then does not hold the new text, config.toml
-    is put back, so an I/O failure between the two cannot leave codex registering this
-    install's store while firing another install's hooks.
+    fires before anything changes. If the levain_band block (written second, by its own merge)
+    then fails, or hooks.json does not hold the new text, config.toml is put back, so an I/O
+    failure between the writes cannot leave codex registering this install's store while firing
+    another install's hooks (or none).
 
     The undo is a RENAME, never a rewrite (the lockfile / conffile frame, git's lockfile.c and
     dpkg's .dpkg-old): before the merge, the file config.toml resolves to (a symlink is written
@@ -4233,26 +4258,37 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     kept = _keep_original(written)
     ours: tuple[int, int, bytes] | None = None  # the file the merge wrote: (dev, inode, bytes)
     leave_kept = False
+    # What failed, for the undo's message: the band block (QMCP L2 #1) or hooks.json.
+    cause = f"{hooks} could not be written"
     try:
         try:
             _merge_codex_config(config, fragment, emit=notes.append)
-            if band_fragment is not None:  # the question band's block beside anneal's (QMCP R-q20)
-                _merge_codex_band(config, band_fragment, judge=True, emit=notes.append)
+            # The identity is taken after EACH write, so a band-block failure still finds the file the anneal
+            # merge wrote and can prove it levain's (QMCP L2 #1: taken only after both, a band refusal left
+            # config.toml with the new anneal block and no hooks).
             ours = _file_identity(written)
+            if band_fragment is not None:  # the question band's block beside anneal's (QMCP R-q20)
+                cause = f"its levain_band block could not be added to {config}"
+                _merge_codex_band(config, band_fragment, judge=True, emit=notes.append)
+                ours = _file_identity(written)
+            cause = f"{hooks} could not be written"
             _write_codex_hooks(hooks, hooks_text, notes.append)
         except BaseException:
+            # hooks.json already holding this text (a re-init) settles a hooks failure only; a band failure is
+            # undone whatever hooks.json holds, so config.toml is as it was
             try:
-                landed = hooks.read_text(encoding="utf-8") == hooks_text
+                landed = (cause == f"{hooks} could not be written"
+                          and hooks.read_text(encoding="utf-8") == hooks_text)
             except BaseException:
                 landed = False
             if not landed:
                 leave_kept = kept is not None  # owned by the undo until it proves otherwise
                 try:
                     leave_kept = _put_codex_config_back(config, written, was_link, before, ours,
-                                                        kept, hooks, notes)
+                                                        kept, hooks, notes, cause=cause)
                 except Exception as e:  # the original stays on disk, named; hooks' error raises
                     where = f"; the original is kept at {kept}" if kept is not None else ""
-                    notes.append(f"  ! {hooks} could not be written, and putting {config} back "
+                    notes.append(f"  ! {cause}, and putting {config} back "
                                  f"failed ({e}){where}. It may register this install's store.")
             raise
     finally:
@@ -4309,10 +4345,14 @@ def _file_identity(path: Path) -> tuple[int, int, bytes] | None:
 
 def _put_codex_config_back(config: Path, written: Path, was_link: bool,
                            before: tuple[int, int] | None, ours: tuple[int, int, bytes] | None,
-                           kept: Path | None, hooks: Path, notes: list[str]) -> bool:
+                           kept: Path | None, hooks: Path, notes: list[str],
+                           cause: str | None = None) -> bool:
     """:func:`_write_codex_pair`'s undo. ``before`` is the original live file's (dev, inode),
-    ``ours`` the file the merge wrote (None when it could not be read). True when the kept
-    original must stay on disk (it is named in ``notes``)."""
+    ``ours`` the file the merge wrote (None when it could not be read). ``cause`` names what
+    failed (default: hooks.json could not be written). True when the kept original must stay
+    on disk (it is named in ``notes``)."""
+    if cause is None:
+        cause = f"{hooks} could not be written"
     try:  # the name still leads where it led: a link swapped in since (one to `kept`, say) does not
         same_name = config.is_symlink() == was_link and config.resolve() == written
     except (OSError, RuntimeError):
@@ -4341,7 +4381,7 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
                  if gone else
                  "could not be confirmed as the file levain wrote, so it was left as it is")
         risk = "" if gone else " It may register this install's store:"
-        notes.append(f"  ! {hooks} could not be written, and {config} {state}{where}.{risk} "
+        notes.append(f"  ! {cause}, and {config} {state}{where}.{risk} "
                      f"Re-run `levain init --adapter codex` from the install codex should use.")
         return kept is not None
     try:
@@ -4351,11 +4391,11 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
             os.replace(kept, written)
     except OSError as e:
         where = f" The original is kept at {kept}." if kept is not None else ""
-        notes.append(f"  ! {hooks} could not be written, AND {config} could not be put back "
+        notes.append(f"  ! {cause}, AND {config} could not be put back "
                      f"({e}): it now registers this install's store.{where} Re-run `levain init "
                      f"--adapter codex` from the install codex should use.")
         return kept is not None
-    notes.append(f"  ! {hooks} could not be written, so the change to {config} above was undone: "
+    notes.append(f"  ! {cause}, so the change to {config} above was undone: "
                  f"it is back as it was (any backup listed above is a copy of it).")
     return False
 
@@ -5168,9 +5208,13 @@ _CODEX_MCP_BLOCK_RE = re.compile(
 
 
 # The `[mcp_servers.levain_band]` table (QMCP R-q20): its own regex, the anneal one's shape, never a
-# generalisation of it, so a change to either block's matching cannot move the other's.
+# generalisation of it, so a change to either block's matching cannot move the other's. The block ends at its own
+# last key line: blank and comment lines after it belong to what follows (an operator's note above their next
+# table survives a replace; QMCP L1 #1 / L2 #4), and a header indented by whitespace ends it too. Blank and
+# comment lines BETWEEN its keys are its own.
 _CODEX_BAND_BLOCK_RE = re.compile(
-    r"(?ms)^\[mcp_servers\.levain_band\][^\n]*\n(?:(?!^\[)[^\n]*\n?)*",
+    r"(?m)^\[mcp_servers\.levain_band\][^\n]*(?:\n|\Z)"
+    r"(?:(?:[ \t]*(?:#[^\n]*)?\n)*[ \t]*[^\s#\[][^\n]*(?:\n|\Z))*",
 )
 
 
