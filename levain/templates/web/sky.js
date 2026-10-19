@@ -89,7 +89,7 @@
     return Date.parse(NAIVE.test(s) ? s.replace(' ', 'T') + 'Z' : s);
   }
 
-  var LEVAIN_OUT = { allowed: 1, denied: 1, waiting: 1, failed: 1 };
+  var LEVAIN_OUT = { allowed: 1, denied: 1, waiting: 1 };   // not 'failed': flow's feed carries that outcome too
   function normalise(value) {
     var out = [];
     var src = (value && value.events) || [];
@@ -130,9 +130,9 @@
     if (e.out === 'live') return nowMs;
     return e.t2 == null ? e.t : Math.min(Math.max(e.t2, e.t), nowMs);
   }
-  // The kinds and outcomes only a Levain feed carries; flow's feed has none of them.
+  // The kinds, outcomes and labels only a Levain feed carries; flow's feed has none of them (never `failed` alone: flow's review and decision carry it).
   function isLev(e) {
-    return e.kind === 'session' || e.kind === 'question' || (e.kind === 'decision' && !!LEVAIN_OUT[e.out]) || (e.kind === 'memory' && e.label != null);
+    return e.kind === 'session' || e.kind === 'question' || (e.kind === 'decision' && !!LEVAIN_OUT[e.out]) || e.label != null;
   }
 
   // Which rows, and which row each event lands on. Pure: no DOM, so it is testable under node.
@@ -202,27 +202,36 @@
     });
     // sessions are packed into tracks: a bar starting within PACK_GAP_MS of a track's last end takes the next track; past
     // MAX_TRACKS the rest share the last one (`overflow` counts them). The track lives in the model, never on the event.
-    var ends = [], trackOf = new Map(), overflow = 0;
+    var ends = [], trackOf = new Map(), overflow = 0, bumped = [];
     inWin.filter(function (e) { return e.kind === 'session'; }).sort(function (a, b) { return a.t - b.t; }).forEach(function (e) {
       var i = 0;
       while (i < ends.length && e.t < ends[i] + PACK_GAP_MS) i++;
-      if (i >= MAX_TRACKS) { i = MAX_TRACKS - 1; overflow++; }
+      if (i >= MAX_TRACKS) { i = MAX_TRACKS - 1; overflow++; bumped.push(e); }
       ends[i] = Math.max(ends[i] || 0, sessEnd(e, nowMs)); trackOf.set(e, i);
     });
-    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.length, tracks: ends.length,
-      trackOf: trackOf, overflow: overflow, waiting: waiting,
+    // a bar on the shared track says how many bumped sessions overlap it; a bar no bumped one overlaps says nothing
+    var sharedWith = new Map();
+    bumped.forEach(function (b) {
+      inWin.forEach(function (e) {
+        if (e.kind !== 'session' || e === b || trackOf.get(e) !== MAX_TRACKS - 1) return;
+        if (e.t < sessEnd(b, nowMs) && b.t < sessEnd(e, nowMs)) sharedWith.set(e, (sharedWith.get(e) || 0) + 1);
+      });
+      sharedWith.set(b, sharedWith.get(b) || 0);
+    });
+    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.some(function (e) { return !offView(e, single); }), tracks: ends.length,
+      trackOf: trackOf, overflow: overflow, sharedWith: sharedWith, waiting: waiting,
       hasDecisions: inWin.some(function (e) { return e.kind === 'decision'; }) };
   }
 
   // The hover text for one mark: "commit · ledgerline · 09:41"; a labelled event reads "decision · <label> · waiting · 13:20".
   // A session's end reads as the bar is drawn: never before its start, and with `nowMs` given never past now.
-  function eventTip(e, nowMs) {
+  function eventTip(e, nowMs, lev) {
     if (e.kind === 'session') {
       var end = e.out === 'live' ? 'now' : hhmm(nowMs == null ? Math.max(e.t2 == null ? e.t : e.t2, e.t) : sessEnd(e, nowMs));
       return 'session · ' + (e.agent || 'agent') + (e.repo ? ' · ' + e.repo : '') + ' · ' + hhmm(e.t) + '–' + end;
     }
     if (e.label != null) return (e.kind === 'memory' ? 'memory write' : e.kind) + ' · ' + e.label + (e.out && e.out !== 'ok' ? ' · ' + e.out : '') + ' · ' + hhmm(e.t);
-    if (e.out === 'failed' && e.kind !== 'review') return e.kind + (e.repo ? ' · ' + e.repo : '') + ' · failed · ' + hhmm(e.t);
+    if (lev && e.out === 'failed' && e.kind !== 'review') return e.kind + (e.repo ? ' · ' + e.repo : '') + ' · failed · ' + hhmm(e.t);
     return e.kind + (e.repo ? ' · ' + e.repo : '') + (e.agent ? ' · ' + e.agent : '') + (e.kind === 'review' ? (e.ok ? ' · ok' : ' · failed') : '') + ' · ' + hhmm(e.t);
   }
 
@@ -452,7 +461,7 @@
         var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (lev || strip ? 0 : (hash01(e.t + e.kind.length) - 0.5) * 12);
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
         var hue = lev || !P.hues ? '' : P.hues[hueKey(e.repo)];
-        if (e.out === 'failed' && e.kind !== 'review') {   // a failure is a red ring, whatever failed
+        if (lev && e.out === 'failed' && e.kind !== 'review') {   // a failure is a red ring, whatever failed
           g.globalAlpha = 1; g.strokeStyle = P.bad; g.lineWidth = 1.6; g.beginPath(); g.arc(x, y, R + 0.5, 0, 7); g.stroke();
         }
         else if (e.kind === 'commit') {
@@ -552,8 +561,9 @@
         if (r.noRepo) lines.push(r.noRepo + (r.noRepo === 1 ? ' review' : ' reviews') + ' with no repo recorded');
         return lines.join('\n');
       }
-      var t = eventTip(h.e, clock());
-      if (h.e.kind === 'session' && model.overflow && model.trackOf.get(h.e) === MAX_TRACKS - 1) t += ' · track shared with ' + model.overflow + ' more';
+      var t = eventTip(h.e, clock(), model.lev);
+      var also = h.e.kind === 'session' ? model.sharedWith.get(h.e) : 0;
+      if (also) t += ' · this row also holds ' + also + (also === 1 ? ' later session' : ' later sessions');
       return t;
     }
     cv.addEventListener('mousemove', function (ev) {

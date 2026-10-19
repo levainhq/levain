@@ -294,17 +294,14 @@ def _fake(tmp_path: Path, sky: Path, feeds: list, now: str = _NOW, **kw) -> dict
 
 
 _FLOW_FEED = [_e("commit", "15:00", "a"), _e("commit", "15:10", "b"), _e("commit", "18:30", "a"), _e("review", "15:20", "a", "codex", "failed"),
-              _e("review", "16:20", "b", "codex", "ok"), _e("memory", "15:30"), _e("decision", "15:40", None, "flow", "ok")]
+              _e("review", "16:20", "b", "codex", "ok"), _e("memory", "15:30"), _e("decision", "15:40", None, "flow", "ok"),
+              _e("commit", "16:00", "a", outcome="failed"), _e("decision", "16:10", None, "flow", "failed")]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 @pytest.mark.parametrize("opts", [{}, {"single": "a"}, {"windowHours": 6}])
 def test_a_flow_feed_draws_exactly_what_cockpit_ks_sky_drew(tmp_path: Path, opts: dict) -> None:
-    old = tmp_path / "old_sky.js"
-    shown = subprocess.run(["git", "-C", str(ROOT), "show", "origin/cockpit-k:levain/templates/web/sky.js"], capture_output=True, text=True)
-    if shown.returncode:
-        pytest.skip("origin/cockpit-k is not fetched here")
-    old.write_text(shown.stdout)
+    old = ROOT / "tests" / "fixtures" / "sky_flow_baseline.js"   # cockpit-k's sky.js, frozen
     new = _fake(tmp_path, SKY, [_FLOW_FEED], opts=opts)
     was = _fake(tmp_path, old, [_FLOW_FEED], opts=opts)
     assert len(was["log"]) > 50 and new["log"] == was["log"]
@@ -403,4 +400,32 @@ def test_a_session_end_before_its_start_or_not_a_date_or_in_the_future_reads_as_
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_repo_named_like_an_object_prototype_key_is_a_repo(tmp_path: Path) -> None:
     m = _lev([_e("commit", "15:00", "constructor"), _e("commit", "15:10", "__proto__"), _e("commit", "15:20", "other_one")], {"topRows": 1})
-    assert m["rows"][0] in ("r:constructor", "r:__proto__", "r:other_one") and "other" in m["rows"]
+    assert m["rows"] == ["r:__proto__", "other", "memory", "decisions"]   # ties sort by name; the other two fold into "other"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_failed_outcome_alone_is_not_a_levain_feed_and_draws_no_levain_ring(tmp_path: Path) -> None:
+    feed = [_e("commit", "15:00", "a"), _e("decision", "16:10", None, "flow", "failed")]
+    m = _lev(feed)
+    assert m["lev"] is False and "failed" not in m["tips"]["decision@16:10"]
+    assert _lev(feed + [_e("session", "12:00", "a", "codex", "ok", end=_at("13:00"))])["lev"] is True
+    assert _lev([_e("decision", "16:10", None, "flow", "failed", label="x")])["lev"] is True   # a labelled event is Levain's
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_window_with_only_off_view_events_is_empty_in_single_mode() -> None:
+    assert _lev([_e("review", "15:00", None, "codex", "ok")], {"single": "a"})["empty"] is True
+    assert _lev([_e("commit", "15:00", "a")], {"single": "a"})["empty"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_shared_track_note_appears_only_on_bars_a_bumped_session_overlaps() -> None:
+    long_ = [_e("session", "12:00", "a", f"s{i}", "live", end=_at("19:13")) for i in range(10)]
+    early = _e("session", "00:00", "a", "early", "ok", end=_at("00:30"))
+    js = ("const {buildModel,normalise}=require(process.argv[1]);const i=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+          "const ev=normalise({events:i.events});const m=buildModel(ev,{windowHours:24,topRows:5,pinnedRows:[],single:''},Date.parse(i.now));"
+          "console.log(JSON.stringify(ev.map(e=>[e.agent,m.trackOf.get(e),m.sharedWith.get(e)||0])));")
+    rows = _node(js, {"events": long_ + [early], "now": _NOW})
+    by = {a: (t, n) for a, t, n in rows}
+    assert by["early"][1] == 0                      # no bumped session overlaps it
+    assert by["s7"] == (7, 2) and by["s9"] == (7, 1)   # s7 holds the track; s8 and s9 were bumped, each overlapped by the other
