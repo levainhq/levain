@@ -3,7 +3,9 @@
 The phone link's token is minted per run of ``levain consent phone`` and travels in the URL fragment. A page added to an
 iPhone's Home Screen opens its manifest's ``start_url`` with no address bar, so that token cannot reach it, and it would
 die at the next restart anyway. Pairing bridges the two: a page holding a live token mints a ONE-TIME code, the code rides
-the manifest's ``start_url`` into the installed app, and the app's first open trades it for a DEVICE token it keeps.
+the manifest's ``start_url`` into the installed app, and the app's first open trades it for a DEVICE token it keeps. A
+page on the run token that turns pings on is given a device the same way (:func:`mint_device`), so every push
+subscription belongs to a device a revoke can stop.
 
 What a device token opens is what the run token opens (the phone server decides that, not this module): read the queue,
 start a passkey challenge, answer a question with words. It never signs; every answer that authorises still needs the
@@ -21,7 +23,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-__all__ = ["PAIRING_TTL", "OPEN_PAIRINGS_KEPT", "LABEL_MAX", "mint_pairing", "redeem", "verify", "revoke", "list_devices"]
+__all__ = ["PAIRING_TTL", "OPEN_PAIRINGS_KEPT", "LABEL_MAX", "mint_pairing", "redeem", "mint_device", "verify", "revoke",
+           "list_devices"]
 
 # Long enough to mint on the laptop's page, walk to the phone and add it to the Home Screen later in the day; short
 # enough that a code left in an old manifest is dead by tomorrow.
@@ -69,14 +72,27 @@ def mint_pairing(conn: sqlite3.Connection, label: str | None, now: datetime) -> 
     return code
 
 
+def _insert_device(conn: sqlite3.Connection, label: Any, now: datetime) -> tuple[str, str]:
+    """A new device row in the caller's transaction; returns ``(device_id, device_token)``."""
+    token = secrets.token_urlsafe(32)
+    device_id = "d-" + secrets.token_hex(6)
+    conn.execute("INSERT INTO devices (id, label, token_hash, created, last_seen, revoked_at) VALUES (?, ?, ?, ?, ?, NULL)",
+                 (device_id, _label(label), _hash(token), _stamp(now), _stamp(now)))
+    return device_id, token
+
+
+def mint_device(conn: sqlite3.Connection, label: str | None, now: datetime) -> tuple[str, str]:
+    """A new device for a caller already holding the run token (no code to spend); ``(device_id, device_token)``."""
+    with conn:
+        return _insert_device(conn, label, now)
+
+
 def redeem(conn: sqlite3.Connection, code: Any, now: datetime) -> tuple[str, str] | None:
     """Trade a live pairing code for ``(device_id, device_token)``, once. The code is spent and the device created in
     one transaction, so two racing opens of the same code cannot both get a token. None for an unknown, spent or
     expired code (the three are not told apart)."""
     if not isinstance(code, str) or not 8 <= len(code) <= 64:
         return None
-    token = secrets.token_urlsafe(32)
-    device_id = "d-" + secrets.token_hex(6)
     conn.isolation_level = None   # explicit BEGIN IMMEDIATE below; restored before return
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -87,8 +103,7 @@ def redeem(conn: sqlite3.Connection, code: Any, now: datetime) -> tuple[str, str
                 conn.execute("ROLLBACK")
                 return None
             conn.execute("UPDATE pairings SET used_at = ? WHERE code_hash = ?", (_stamp(now), _hash(code)))
-            conn.execute("INSERT INTO devices (id, label, token_hash, created, last_seen, revoked_at) "
-                         "VALUES (?, ?, ?, ?, ?, NULL)", (device_id, row[0], _hash(token), _stamp(now), _stamp(now)))
+            device_id, token = _insert_device(conn, row[0], now)
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -110,8 +125,11 @@ def verify(conn: sqlite3.Connection, token: Any, now: datetime) -> str | None:
         return None
     seen = _parse(row[1])
     if seen is None or now - seen >= _SEEN_EVERY:
-        with conn:
-            conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (_stamp(now), row[0]))
+        try:
+            with conn:
+                conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (_stamp(now), row[0]))
+        except sqlite3.OperationalError:
+            pass                  # a busy store skips the display stamp; the device is still the device
     return row[0]
 
 

@@ -41,15 +41,20 @@ def test_store_permissions_and_append_only_record(tmp_path):
             with pytest.raises(sqlite3.DatabaseError, match="never|rows"):
                 c.execute(sql)
     assert store.record()[0]["deliveries"][0]["status"] == 201
-    # a re-subscribe under another credential keeps the device; live subscriptions cap at 5 per device, 20 overall
-    assert store.add_subscription("https://fcm.googleapis.com/x", "k2", "a2", None) == sid
+    # a sub is always owned, and a re-subscribe takes the device subscribing now
+    with pytest.raises(ValueError):
+        store.add_subscription("https://fcm.googleapis.com/x", "k2", "a2", None)
     assert store.add_subscription("https://fcm.googleapis.com/x", "k3", "a3", "dev-b") == sid
     with store.read() as c:
-        assert c.execute("SELECT device_id FROM subscriptions WHERE id = ?", (sid,)).fetchone()[0] == "dev-a"
+        assert c.execute("SELECT device_id FROM subscriptions WHERE id = ?", (sid,)).fetchone()[0] == "dev-b"
+    # live subscriptions cap at 5 per device, 20 overall, and the least recently subscribed retire first: the oldest
+    # row, subscribed again, stays
     for i in range(7):
         store.add_subscription(f"https://fcm.googleapis.com/n{i}", "k", "a", "dev-a")
-    live = store.live_subscriptions()
-    assert len([r for r in live if r["device_id"] == "dev-a"]) == 5 and live[-1]["endpoint"].endswith("/n6")
+        if i == 5:
+            store.add_subscription("https://fcm.googleapis.com/n0", "k", "a", "dev-a")
+    live = {r["endpoint"].rsplit("/", 1)[1] for r in store.live_subscriptions() if r["device_id"] == "dev-a"}
+    assert live == {"n0", "n3", "n4", "n5", "n6"}
     for i in range(30):
         store.add_subscription(f"https://fcm.googleapis.com/m{i}", "k", "a", f"d{i}")
     assert len(store.live_subscriptions()) == 20
@@ -123,8 +128,8 @@ def test_payload_fits_the_request_and_sender_paths(tmp_path, monkeypatch):
     ok = store.add_subscription("https://fcm.googleapis.com/ok", key, ece.b64e(os.urandom(16)), "d")
     gone = store.add_subscription("https://web.push.apple.com/gone", key, ece.b64e(os.urandom(16)), "d")
     with store.write() as c:
-        c.execute("INSERT INTO subscriptions (endpoint, p256dh, auth, created) VALUES (?,?,?,?)",
-                  ("https://127.0.0.1.nip.io/x", key, ece.b64e(os.urandom(16)), "2026-10-19T00:00:00Z"))
+        c.execute("INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created) VALUES (?,?,?,?,?)",
+                  ("d", "https://127.0.0.1.nip.io/x", key, ece.b64e(os.urandom(16)), "2026-10-19T00:00:00Z"))
     seen = []
 
     def fake(req):
@@ -149,3 +154,30 @@ def test_payload_fits_the_request_and_sender_paths(tmp_path, monkeypatch):
     assert sender.spawn(tmp_path, kind="consent", ref="r", title="t", body="-secret consent text")
     assert "-secret consent text" not in " ".join(started["argv"]) and started["kw"]["stdin"] == sender.subprocess.PIPE
     assert json.loads(started["data"])["body"] == "-secret consent text"
+
+
+def test_a_run_token_subscribe_is_owned_by_a_device_a_revoke_stops(tmp_path):
+    from datetime import datetime, timezone
+
+    from levain.webpush import devices
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    keys = {"p256dh": ece.b64e(ece.public_bytes(key)), "auth": ece.b64e(os.urandom(16))}
+    status, data, _ = routes.handle("POST", "/webpush/subscribe", {}, json.dumps(
+        {"endpoint": "https://fcm.googleapis.com/run", "keys": keys}).encode(), queue_dir=tmp_path, authorized=True,
+        device_id=None)
+    got = json.loads(data)
+    store = PushStore(tmp_path)
+    conn = store.connection()
+    try:
+        now = datetime.now(timezone.utc)
+        assert status == 200 and devices.verify(conn, got["token"], now) == got["device_id"]
+        assert [r["device_id"] for r in store.live_subscriptions()] == [got["device_id"]]
+        assert devices.revoke(conn, got["device_id"], now) and store.live_subscriptions() == []
+        # a row stored without a device before this round is retired when the store is next opened
+        with conn:
+            conn.execute("INSERT INTO subscriptions (endpoint, p256dh, auth, created) VALUES (?,?,?,?)",
+                         ("https://fcm.googleapis.com/old", "k", "a", "2026-10-19T00:00:00Z"))
+    finally:
+        conn.close()
+    assert PushStore(tmp_path).live_subscriptions() == []

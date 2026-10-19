@@ -3,14 +3,17 @@
 Phill ruled the shape 10-19 (project_memory/1019-app/SHAPE.md, a1 and b1, *"that is approved"*):
 
 - a1: the phone sets the SAME state line the cockpit, ``levain state`` and the TUI set. No second store.
-- b1: the board is the cockpit's Tray, Open loops and Keep panels; the Tray takes resolve, snooze and capture from the
-  phone, Loops and Keep are read there.
+- b1: the board is the cockpit's Tray, Open loops and Keep panels; the Tray takes resolve and snooze from the phone
+  (capture stays on the laptop), Loops and Keep are read there.
 
 Both go through the cockpit's own verb kernel (:func:`levain.cockpit.verbs.dispatch`) over the install the queue's consent
 hook names, never around it: the kernel computes each verb's tier, and the phone fires only what the kernel says is a
 DIRECT gesture for a surface token. Anything higher (a signed or laptop-only gesture) is shown to the phone as laptop-only and
-refused here; the phone has no path to the broker. On top of that the phone has an allowlist (:data:`PHONE_VERBS`), so a
-verb added to a panel later does not reach the phone until someone decides it should.
+refused here; the phone has no path to the broker. The tiers come from the install's signed authority log, read
+read-only and checked against its anchor per request (``RequestAuthority.capture``), so a verb the laptop raised is
+laptop-only here too; on a governed install whose log cannot be read the phone takes no writes. On top of that the
+phone has an allowlist (:data:`PHONE_VERBS`), so a verb added to a panel later does not reach the phone until someone
+decides it should.
 
 The phone port authenticates the request (its run token or a paired device token); this module is only called for a
 request that passed, and records the write's source as ``phone``.
@@ -18,6 +21,7 @@ request that passed, and records the write's source as ``phone``.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,9 +29,9 @@ from typing import Any
 
 __all__ = ["PHONE_VERBS", "BOARD_PANELS", "PhoneApp", "PhoneAppError"]
 
-# panel -> the verbs the phone may fire on it (b1: Tray resolve / snooze / capture; a1: the state line)
+# panel -> the verbs the phone may fire on it (b1: Tray resolve / snooze; capture stays on the laptop; a1: the state line)
 PHONE_VERBS: dict[str, frozenset[str]] = {
-    "tray": frozenset({"spore_descend", "spore_surface_at", "spore_seed"}),
+    "tray": frozenset({"spore_descend", "spore_surface_at"}),
     "state": frozenset({"operator_state"}),
 }
 BOARD_PANELS = ("tray", "loops", "keep")          # b1's order: the Tray you act on, then the two you read
@@ -57,10 +61,15 @@ class PhoneApp:
     """The state line and the board for one phone port. Built lazily on first use and cached; one lock serialises the
     kernel calls (the phone port is threaded and the cockpit snapshot is built per request)."""
 
-    def __init__(self, queue_dir: Path) -> None:
+    def __init__(self, queue_dir: Path, *, marker_directory: Path | None = None) -> None:
+        from levain.authority import ReplayCache
+
         self.queue_dir = Path(queue_dir)
+        self._marker_directory = marker_directory
         self._lock = threading.Lock()
         self._built: tuple[Any, Any, Any] | None = None
+        self._governed = False
+        self._replays = ReplayCache()
 
     # --- the cockpit this port reads and writes ------------------------------------------------------------------
     def _parts(self) -> tuple[Any, Any, Any]:
@@ -79,14 +88,51 @@ class PhoneApp:
         if install is None:
             raise PhoneAppError(503, "no_install", "the consent hook's cockpit is not a Levain install's, so this "
                                 "port does not know its state line or board")
+        from levain.cockpit.install import marker_path, marker_present
+
+        try:
+            self._governed = marker_present(marker_path(roots[0], self._marker_directory))
+        except OSError:
+            self._governed = True       # an unreadable marker is never taken for a reported install
         source = SubstrateSource.local(install)
         cockpit = build_default_cockpit(source)
         registry = VerbRegistry({})
         # no broker here: the class web_server's broker_install_class gives a server without one, so no reported
         # gesture renders that this port would then refuse
         cockpit.attach_verbs(VerbView(registry, cockpit, "none"))
+        data_root = Path(roots[0])
+        cockpit.attach_authority(lambda now: self._capture(data_root, now))
         self._built = (source, cockpit, registry)
         return self._built
+
+    def _capture(self, data_root: Path, now: datetime) -> Any:
+        """The authority one request tiers under, read-only from the install's cockpit journal: the anchor first, then
+        the verified replay. No trace of a log on the data root is the shipped default; a fault raises."""
+        from levain.authority import anchor_path
+        from levain.cockpit.authority import RequestAuthority, inactive
+        from levain.cockpit.firejournal import DB_NAME
+
+        journal, anchor = data_root / DB_NAME, anchor_path(data_root)
+        trace = False
+        for p in (journal, journal.with_name(DB_NAME + "-wal"), anchor):
+            try:
+                p.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            trace = True
+        if not trace:
+            return RequestAuthority(now, inactive("no authority log is kept on this install"), no_log=True,
+                                    log_empty=True)
+        conn = sqlite3.connect(journal.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=30.0)
+        try:
+            conn.execute("BEGIN")
+            got = RequestAuthority.capture(conn, now=now, anchor=anchor, source=str(journal), cache=self._replays)
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        return got
 
     # --- reads ---------------------------------------------------------------------------------------------------
     def _panel(self, cockpit: Any, panel_id: str) -> dict[str, Any]:
@@ -137,6 +183,12 @@ class PhoneApp:
         with self._lock:
             source, cockpit, registry = self._parts()
             install_class = cockpit.install_class() or "none"
+            if self._governed:
+                auth = cockpit.authority()
+                if auth.authority is None and not auth.log_empty:
+                    raise PhoneAppError(503, "authority_unreadable", "this install is governed and its authority log "
+                                        f"cannot be read now ({auth.authority_error}), so the phone takes no writes; "
+                                        "reading still works")
             try:
                 dry = dispatch(registry=registry, cockpit=cockpit, scope=source.write_scope,
                                req={**body, "dry_run": True}, credential=dict(_CREDENTIAL),
