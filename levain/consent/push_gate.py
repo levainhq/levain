@@ -313,7 +313,8 @@ def _gated(args: argparse.Namespace, queue: ConsentQueue, adapter: Any, settings
         # from here until a verified decision or the undecided mark, any exit withdraws the request
         try:
             say(f"levain push: waiting up to {hold:g} s for the operator to allow the {what} (request {request.id}). "
-                "Let it finish: stopping it before then withdraws the request.")
+                "Let it finish: stopping it before then withdraws the request, or on a kill leaves it pending to "
+                "its expiry.")
             claude_code.notify(settings, f"levain: {agent} asks to push, up to {hold:g} s: {what} "
                                          f"(request {request.id}).", cwd=qdir)
             got, _why = adapter.hold_for_answer(queue, request, hold + 5.0, tool_input=call, posture=None)
