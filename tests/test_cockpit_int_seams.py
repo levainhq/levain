@@ -86,3 +86,89 @@ def test_i5_a_dot_row_carries_the_detail_as_its_title(tmp_path: Path) -> None:
     src = (WEB / "cockpit_view.js").read_text(encoding="utf-8")
     assert 'row.title = m.label + ": " + m.detail' in src
     assert "m.detail == null || typeof m.detail" in src                       # the payload check admits it
+
+
+def test_i6_a_status_dots_detail_reaches_the_lines_and_the_focus_filter(tmp_path: Path) -> None:
+    out = run_node(r"""
+const m = [{ label: "hooks", value: "1 failing", detail: "activation/hooks/ · levain doctor", status: "bad" }];
+const v = V.fromManifest(fixture({ ops: head("ops", "status-dots", "Ops") }, { ops: head("ops", "status-dots", "Ops", { value: { metrics: m } }) }));
+const d = (v.extra_panels || {}).ops; out.ep = JSON.stringify(v.extra_panels).slice(0, 300);
+out.line = (d.lines || [])[0] && d.lines[0].text;
+""", tmp_path)
+    assert "activation/hooks/" in (out.get("line") or ""), out
+    src = (WEB / "cockpit_view.js").read_text(encoding="utf-8")
+    assert "m.read, m.detail, m.status" in src      # paintFiltered's haystack names the detail
+
+
+def test_i7_the_sky_counts_and_legend_survive_a_malformed_feed(tmp_path: Path) -> None:
+    out = run_node(r"""
+out.counts = K.skyCounts({ events: undefined, legend: undefined }).text;
+const h = new N("div"); h.title = "x"; K.paintLegend(h, { events: [], legend: undefined }); out.title = h.title;
+""", tmp_path)
+    assert out["counts"] == "0 events" and out["title"] == ""
+
+
+def test_i8_the_payloads_dialect_decides_the_key_and_the_lanes_not_the_current_window(tmp_path: Path) -> None:
+    aged = [{"kind": "commit", "at": "2026-10-19T12:00:00Z", "repo": "r", "agent": None, "outcome": None}]    # the labelled events aged out
+    out = run_node(r"""
+const S = require(%s);
+Object.defineProperty(N.prototype, "style", { get() { return this._s || (this._s = {}); } });
+globalThis.window = globalThis; globalThis.LevainSky = S;
+const legend = (sky) => { const h = new N("div"); K.paintLegend(h, sky); return h.textContent; };
+out.levainNoLabelled = legend({ events: %s, legend: "l", dialect: "levain" });
+out.noField = legend({ events: %s, legend: "l" });
+out.flowField = legend({ events: %s, legend: "l", dialect: "flow" });
+out.api = [S.isLevainFeed({ events: %s, dialect: "levain" }), S.isLevainFeed({ events: %s }), S.isLevainFeed({ events: %s, dialect: "flow" })];
+const now = Date.parse("2026-10-19T13:00:00Z");
+out.lanes = [S.buildModel(S.normalise({ events: %s }), { windowHours: 14, topRows: 5, pinnedRows: [], single: "", size: "compact", dialect: "levain" }, now).lev,
+             S.buildModel(S.normalise({ events: %s }), { windowHours: 14, topRows: 5, pinnedRows: [], single: "", size: "compact" }, now).lev];
+""" % ((json.dumps(str(WEB / "sky.js")),) + (json.dumps(aged),) * 8), tmp_path)
+    assert "waiting on you" in out["levainNoLabelled"] and "waiting on you" not in out["noField"] and "waiting on you" not in out["flowField"]
+    assert out["api"] == [True, False, False] and out["lanes"] == [True, False]
+
+
+def test_i9_the_native_activity_value_says_levain_and_the_validator_takes_only_a_known_dialect() -> None:
+    from levain.cockpit.engine import ProviderSpec, _v_ambient
+
+    spec = ProviderSpec("a", "ambient", "A", "feed", lambda c: None)
+    base = {"events": [], "legend": "l"}
+    assert _v_ambient(spec, dict(base))["legend"] == "l"                                  # flow's own feed has no field
+    assert _v_ambient(spec, {**base, "dialect": "levain"}) and _v_ambient(spec, {**base, "dialect": "flow"})
+    with pytest.raises(Exception, match="dialect"):
+        _v_ambient(spec, {**base, "dialect": "other"})
+    assert '"dialect": "levain"' in (Path(__file__).resolve().parent.parent / "levain" / "cockpit" / "activity.py").read_text(encoding="utf-8")
+
+
+from tests.test_cockpit_flip_parity import _drive, needs_browser  # noqa: E402
+from tests.test_cockpit_k2a import _install, _serve  # noqa: E402
+
+
+@needs_browser
+def test_i10_a_levain_feed_keeps_its_key_when_its_labelled_events_aged_out_also_across_a_tab_switch(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from levain.cockpit.engine import ProviderSpec
+    from levain.cockpit.providers import build_default_cockpit
+    from levain.cockpit.results import Read
+
+    _root, src, _ids = _install(tmp_path)
+    now = datetime.now(timezone.utc)
+    # the labelled events have aged out of the payload: what is left carries no Levain-only kind, label or outcome
+    value = {"events": [{"kind": "commit", "at": (now - timedelta(minutes=5)).isoformat(), "repo": "r", "agent": None, "outcome": "ok"}],
+             "legend": "levain", "dialect": "levain"}
+    ck = build_default_cockpit(src)
+    ck.register(ProviderSpec("sky", "ambient", "Sky", "feed", lambda c: Read(value=value), region="hero"))
+    key = "(document.querySelector('.legendbar') || {textContent: ''}).textContent.indexOf('waiting on you') >= 0"
+    with _serve(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            {"until": f"document.querySelector('.legendbar') && 1"},
+            {"eval": key},
+            {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"},
+            {"eval": f"new Promise(r => setTimeout(() => r([{key}, document.body.dataset.mode]), 600))"},
+            {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"},
+            {"eval": f"new Promise(r => setTimeout(() => r({key}), 600))"},
+        ])["values"]
+    assert out[1] is True, f"the Levain key is missing on first paint: {out}"
+    assert out[3] == [True, "build"], f"the Levain key was lost across Board -> Build: {out}"
+    assert out[5] is True, out

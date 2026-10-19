@@ -297,13 +297,13 @@
       out.typed = true;
       out.lines = ms.map((m) => ({
         meta: m.label,
-        text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),
+        text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || "", m.detail || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),   // the detail rides along: the focus filter, the jump box and a touch reader have no hover
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
     } else if (kind === "ambient") {
       if (Array.isArray(v.events)) {
         need(v.events.every((e) => isObj(e) && typeof e.kind === "string" && typeof e.at === "string"), "events");
         need(typeof v.legend === "string", "legend");
-        out.sky = { events: v.events, legend: v.legend };
+        out.sky = { events: v.events, legend: v.legend, dialect: v.dialect };
         out.typed = true;
       } else out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
     } else if (kind === "brief") {
@@ -1197,7 +1197,7 @@
     const d = s.data, dots = d.kind === "status-dots";
     const all = (dots ? d.metrics : d.numbers) || [];
     const terms = termsOf(s.query);
-    const hay = (m) => fold([m.label, m.value, m.unit, m.read, m.status].filter((x) => x != null).join(" "));
+    const hay = (m) => fold([m.label, m.value, m.unit, m.read, m.detail, m.status].filter((x) => x != null).join(" "));
     const ms = terms.length ? all.filter((m) => hits(hay(m), terms)) : all;
     if (s.countEl) s.countEl.textContent = terms.length ? ms.length + " of " + all.length : all.length + " metrics";
     if (!ms.length) { s.body.appendChild(el("p", "empty", terms.length ? "no match" : d.empty)); return; }
@@ -1291,7 +1291,7 @@
   }
   function isLevFeed(sky) {
     const S = root.LevainSky;
-    try { return !!(S && typeof S.isLevainFeed === "function" && S.isLevainFeed({ events: sky.events })); } catch (_) { return false; }
+    try { return !!(S && typeof S.isLevainFeed === "function" && S.isLevainFeed({ events: sky.events, dialect: sky.dialect })); } catch (_) { return false; }
   }
   // the Build tab draws the sky large, the others compact
   function skySize() { return document.body && document.body.dataset && document.body.dataset.mode === "build" ? "large" : "compact"; }
@@ -1300,9 +1300,10 @@
     return !!k && k.size === skySize();
   }
   function skyCounts(sky) {
-    const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
-    const failed = sky.events.filter((e) => e.outcome === "failed").length;
-    const n = sky.events.length + (sky.events.length === 1 ? " event" : " events");
+    const evs = Array.isArray(sky.events) ? sky.events : [];
+    const repos = new Set(evs.map((e) => e && e.repo).filter((r) => typeof r === "string" && r));
+    const failed = evs.filter((e) => e && e.outcome === "failed").length;
+    const n = evs.length + (evs.length === 1 ? " event" : " events");
     return { text: repos.size ? n + " from " + repos.size + (repos.size === 1 ? " repo" : " repos") : n, failed: failed };
   }
   // the failed count is the one accent on the line: a failed review is where attention goes
@@ -1318,7 +1319,7 @@
   function updateSky(s, sky) {
     const k = s.skyParts;
     if (!k || k.size !== skySize() || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
-    try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
+    try { s.skyHandle.update({ events: sky.events, legend: sky.legend, dialect: sky.dialect }); } catch (_) { return false; }
     paintCounts(k.win, sky);
     paintLegend(k.legend, sky);
     return true;
@@ -1350,7 +1351,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, hero ? { legend: false, size: skySize(), toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize() }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize() }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -1368,7 +1369,7 @@
   const DRAWN_KINDS = new Set(["commit", "review", "decision", "memory"]);
   function paintLegend(host, sky) {
     host.replaceChildren();
-    host.title = sky.legend;
+    host.title = sky.legend || "";
     // a Levain feed has its own key (sky.js), and the mock's hint beside it
     if (isLevFeed(sky) && root.LevainSky && typeof root.LevainSky.legendNode === "function") {
       host.appendChild(root.LevainSky.legendNode());
@@ -1860,6 +1861,7 @@
     const full = g.clientWidth;
     for (const row of rows.values()) if (row.length === 1 && row[0][1] < full * 0.9) row[0][0].dataset.stretch = "1";
   }
+  const MIN_TILE_PX = 200;
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
@@ -1868,9 +1870,13 @@
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       // more than four tiles wrap into rows of at most four (6 -> 3 x 2), whatever the tab: a tile never shares a row so narrow it clips its text
-      const cols = n > 4 ? (n % 3 === 0 ? 3 : 4) : Math.max(4, n);
+      let cols = n > 4 ? (n % 3 === 0 ? 3 : 4) : Math.max(4, n);
+      const shape = (board && n <= 4) || n < 4 ? "strip" : "tiles";
+      // ...and never so many that a tile is narrower than MIN_TILE_PX: the 720px rule covers the phone, this covers the half-screen laptop in between
+      const room = w.clientWidth;
+      if (shape === "tiles" && room > 0) cols = Math.max(2, Math.min(cols, Math.floor(room / MIN_TILE_PX)));
       w.style.setProperty("--ck-n", String(cols));
-      w.dataset.shape = (board && n <= 4) || n < 4 ? "strip" : "tiles";
+      w.dataset.shape = shape;
       w.dataset.n = String(n);
       const tiles = Array.from(w.children).filter(shown);
       for (const t of tiles) delete t.dataset.last;

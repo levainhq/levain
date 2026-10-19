@@ -149,7 +149,8 @@ def _things(state: dict[str, Any], names: list[str], search: bool = False) -> An
 @needs_browser
 def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> None:
     """A typed panel whose data moved repaints its body without a board render: the row the reader opened stays open
-    and closable, found by its id (the other row moving must not shift the open state onto it)."""
+    and closable, found by its id (the other row moving must not shift the open state onto it).
+    The drive is NARROW (390px) because the three-line clamp only fires on a narrow card; wider, no row is clamped to expand."""
     from levain.cockpit.providers import build_default_cockpit
 
     _root, src = _install_long(tmp_path)
@@ -177,7 +178,8 @@ def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> Non
 @needs_browser
 def test_a_store_search_answer_keeps_an_expanded_row(tmp_path: Path) -> None:
     """A searchable typed panel repaints a second time when its store search answers, after a refetch has restored its
-    rows: the row open among the answers stays open."""
+    rows: the row open among the answers stays open.
+    The drive is NARROW (390px) because the three-line clamp only fires on a narrow card; wider, no row is clamped to expand."""
     from levain.cockpit.providers import build_default_cockpit
 
     _root, src = _install_long(tmp_path)

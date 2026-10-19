@@ -142,7 +142,8 @@
       if (e.kind === 'session') return e.t <= nowMs && sessEnd(e, nowMs) >= start;
       return e.t >= start && e.t <= nowMs;
     });
-    var lev = !!opts.lev || inWin.some(isLev);   // opts.lev: a mount that has shown Levain lanes keeps them as events age out
+    // the payload's own `dialect` decides when it carries one; only a feed without the field is inferred, and an inferred mount keeps its lanes as events age out (opts.lev)
+    var lev = opts.dialect === 'levain' ? true : opts.dialect === 'flow' ? false : (!!opts.lev || inWin.some(isLev));
     var repos = Object.create(null);
     inWin.forEach(function (e) { if (e.repo && (e.kind === 'commit' || e.kind === 'review')) repos[e.repo] = (repos[e.repo] || 0) + 1; });
     var names = Object.keys(repos);
@@ -267,7 +268,7 @@
     var strip = size === 'strip', sc = size === 'large' ? 1.4 : strip ? 0.8 : 1;   // mark scale
     var padT = strip ? 6 : PAD_T, padB = strip ? 4 : PAD_B, padR = strip ? 4 : PAD_R;
     var trackH = size === 'large' ? 11 : strip ? 5 : 7, trackGap = size === 'large' ? 4 : 3;
-    var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size };
+    var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size, dialect: dialectOf(value) };
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
     var ambientOn = o.ambient !== false && !strip && !(reduce && reduce.matches);
@@ -586,6 +587,7 @@
     function update(next) {
       if (dead) return;
       value = next;
+      opts.dialect = dialectOf(next);
       var evs = normalise(next), fresh = diffFresh(evs, feed);
       events = evs;
       rebuild();
@@ -626,7 +628,8 @@
   }
 
   // true when a feed carries what only a Levain feed carries (the host picks the Levain key over flow's)
-  function isLevainFeed(value) { return normalise(value).some(isLev); }
+  function dialectOf(value) { var d = value && value.dialect; return d === 'levain' || d === 'flow' ? d : ''; }
+  function isLevainFeed(value) { var d = dialectOf(value); return d ? d === 'levain' : normalise(value).some(isLev); }
 
   var api = { mount: mount, legendNode: legendNode, isLevainFeed: isLevainFeed, eventTip: eventTip, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;

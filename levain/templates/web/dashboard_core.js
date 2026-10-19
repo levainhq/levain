@@ -738,7 +738,7 @@
       new MutationObserver(scheduleLayout).observe(region, { childList: true });
     }
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
-    region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
+    // --ck-n (the tile grid's column count) has one writer: LevainCockpitKinds.fillGrids
   }
 
   // An untyped lines tile (rows the page draws itself) draws the rows that fit the tile and counts the rest in a "+N more" line, then
