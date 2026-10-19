@@ -137,6 +137,7 @@
                 el("span", "meta", (push.agent || "") + " \u00b7 undecided, gap " + (push.gap_label || "#" + push.gap)));
       leads.append(ph, el("pre", "display", typeof push.display === "string" ? push.display : ""));
       if (push.cwd) leads.appendChild(el("div", "where", "in " + push.cwd));
+      for (const n of checkLines(push)) leads.appendChild(n);   // the same two digests and hint the push shows as its own card
     }
     leads.hidden = !(link && push);
     // shown, never kept in `notes`: it is about this listing, and the next one may make the option signable
@@ -160,6 +161,44 @@
     return card;
   }
 
+  // Q12 / Q16: the two digests the terminal prints before signing (short here, the whole value one tap away), and what a
+  // shell command looks like. Text only: the command is the agent's. A hint informs and never authorises
+  function digestLine(label, value) {
+    const full = typeof value === "string" ? value : "";
+    if (!full) {                                   // a missing digest is shown as missing, never dropped
+      const gone = el("div", "dg");
+      gone.append(el("span", "dg-label", label + ": "), el("code", "dg-val", "(none)"));
+      return gone;
+    }
+    const at = full.indexOf(":") + 1;
+    const short = full.length > at + 12 ? full.slice(0, at + 12) + "\u2026" : full;
+    const line = el("div", "dg");
+    const code = el("code", "dg-val", short);
+    code.tabIndex = 0;
+    code.setAttribute("role", "button");
+    code.title = full;
+    let open = false;
+    const flip = () => { open = !open; code.textContent = open ? full : short; };
+    code.addEventListener("click", flip);
+    code.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } });
+    line.append(el("span", "dg-label", label + " "), code);
+    return line;
+  }
+  const NO_PATTERN = "no pattern matched: read the command";
+  function checkLines(r) {
+    const out = [];
+    // the hint comes first, with a rule at its left, so it reads apart from the metadata; a shell request always has one
+    const hints = Array.isArray(r.hints) ? r.hints.filter((h) => typeof h === "string" && h) : [];
+    if (hints.length) {
+      const box = el("div", "dg hint");
+      box.appendChild(el("span", "dg-label", "hint (a few patterns only; informs, never authorises)"));
+      for (const h of hints) box.appendChild(el("div", h === NO_PATTERN ? "dg-hint dg-none" : "dg-hint", "\u2022 " + h));
+      out.push(box);
+    }
+    out.push(digestLine("input digest", r.tool_input_digest), digestLine("request digest", r.digest));
+    return out.filter(Boolean);
+  }
+
   function row(r, ruling) {
     const card = el("article", "req");
     const head = el("div", "req-head");
@@ -168,6 +207,7 @@
     card.append(head, el("pre", "display", typeof r.display === "string" ? r.display : ""));
     if (r.cwd) card.appendChild(el("div", "where", "in " + r.cwd));
     if (r.targets) card.appendChild(el("div", "where", "touches " + r.targets));
+    for (const n of checkLines(r)) card.appendChild(n);
     const note = el("div", "note");
     const say = (text, kind) => { notes.set(r.id, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
     if (notes.has(r.id)) say(notes.get(r.id)[0], notes.get(r.id)[1]);

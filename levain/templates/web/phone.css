@@ -80,6 +80,12 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .display { font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; margin: var(--sp-4) 0;
            padding: var(--sp-4); border-radius: var(--r-md); background: var(--base); border: 1px solid var(--hair);
            overflow: visible; }   /* no max-height, no scroll box: the whole request is always in view */
+.dg { font: 12px/1.4 var(--mono); color: var(--meta); overflow-wrap: anywhere; }
+.dg-label { font-family: var(--round); font-weight: 600; }
+.dg-val { cursor: pointer; user-select: all; }
+.dg.hint { padding-left: var(--sp-3); border-left: 2px solid var(--hair-2); margin: var(--sp-3) 0; }   /* a rule, not a colour: it separates the hint from the metadata and is no verdict */
+.dg-hint { margin-top: 2px; }
+.dg-none { font-style: italic; }
 .where { font: 12px/1.4 var(--mono); color: var(--meta); overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--sp-4); margin-top: var(--sp-5); }
 button { font: 600 15px/1.2 var(--round); border-radius: var(--r-md); border: 1px solid var(--hair-2); background: var(--card-2);

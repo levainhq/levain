@@ -142,13 +142,24 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
     offers no commands: ``levain consent answer`` refuses to sign what it cannot show."""
     r = entry.request
     pending = entry.state == "pending"
-    answerable = pending and filed_input(r) is not UNSHOWN
-    return {"id": r.id, "agent": r.agent, "tool": r.tool_name, "tier": r.tier, "state": entry.state,
-            "display": r.display, "cwd": r.cwd, "targets": consent_targets(r),
+    shown = filed_input(r)
+    answerable = pending and shown is not UNSHOWN
+    from levain.cockpit.hintview import hints_for, visible     # rendering only: what a shell command looks like (Q16)
+
+    try:
+        hints = [visible(h) for h in hints_for(r, shown, shown is UNSHOWN)]
+    except Exception:  # noqa: BLE001 - a hint is a reading aid: it never takes the decision surface down
+        hints = []
+    return {"id": r.id, "agent": visible(r.agent), "tool": visible(r.tool_name), "tier": r.tier, "state": entry.state,
+            # agent-controlled text: invisible format characters show as markers (a bidi override must not reorder it)
+            "display": visible(r.display), "cwd": visible(r.cwd), "targets": visible(consent_targets(r)),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
             "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>" if answerable else None,
             "note": TOO_LONG if pending and not answerable else "",
-            "audit": "" if pending else audit_line(entry)}
+            # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
+            "tool_input_digest": r.tool_input_digest, "digest": r.digest,
+            "hints": hints,
+            "audit": "" if pending else visible(audit_line(entry))}
 
 
 def _check_directory(directory: Path) -> None:
