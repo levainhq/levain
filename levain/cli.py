@@ -2275,6 +2275,15 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_phone.add_argument("--port", type=int, default=None,
                           help=f"The loopback port (default {_phone_port_default()}).")
     cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=queue_help)
+    cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
+                          type=_sign_namespace, metavar="NS",
+                          help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "
+                               "(repeatable), for a user-verified passkey signature (Face ID, Touch ID or the device "
+                               "passcode, as the authenticator reports it). levain checks user verification; a "
+                               "caller's `ssh-keygen -Y verify -n NS` checks the key, the message and the namespace "
+                               "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
+                               "namespace beginning 'levain', one levain verifies in, or git, file or email is "
+                               "refused.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
 
@@ -2291,6 +2300,15 @@ def _phone_port_default() -> int:
     return DEFAULT_PHONE_PORT
 
 
+def _sign_namespace(text: str) -> str:
+    from levain.consent.sign import namespace_problem
+
+    problem = namespace_problem(text)
+    if problem is not None:
+        raise argparse.ArgumentTypeError(problem)
+    return text
+
+
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
     from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_server
 
@@ -2299,7 +2317,8 @@ def _cmd_consent_phone(args: argparse.Namespace) -> int:
     # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
     return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
-                            port=DEFAULT_PHONE_PORT if args.port is None else args.port)
+                            port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                            sign_namespaces=tuple(dict.fromkeys(args.sign_namespaces or ())))
 
 
 def _consent_queue_dir(args: argparse.Namespace) -> Path:

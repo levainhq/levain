@@ -70,6 +70,7 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
                margin: 0 0 var(--sp-5); min-width: 0; }
 .req { border-top: 2px solid var(--accent); }   /* the one warm colour marks what is waiting on you */
 .req:has(.tier.t3) { border-top-color: var(--warn); }
+.req.sign .display { user-select: text; }   /* a statement to be signed: selectable, so it can be copied out and checked */
 .req-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .tool { font: 700 16px/1.25 var(--round); letter-spacing: -.01em; overflow-wrap: anywhere; }
 .tier { font: 600 11px/1 var(--mono); letter-spacing: var(--track-caps); border: 1px solid var(--hair-2); color: var(--label);
