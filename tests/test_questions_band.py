@@ -116,7 +116,7 @@ def test_ask_without_a_session_says_it_will_not_be_delivered(tmp_path, monkeypat
 
 def test_ask_pings_through_the_agents_notify_seam(tmp_path, monkeypatch):
     sent = []
-    monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None: sent.append(text) or True)
+    monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None, **_kw: sent.append(text) or True)
     code, out = _run(["ask", "--what", "merge?", "--option", "a=yes", "--option", "b=no", "--rec", "a", "--blocks",
                       "the merge", "--queue-dir", str(tmp_path / "consent")], monkeypatch,
                      env={"CLAUDE_CODE_SESSION_ID": SESSION})
@@ -353,7 +353,7 @@ def test_l3r1_reads_never_write_an_empty_store(tmp_path):
 
 def test_l3r1_the_ping_names_a_custom_store(tmp_path, monkeypatch):
     sent = []
-    monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None: sent.append(text) or True)
+    monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None, **_kw: sent.append(text) or True)
     qdir = tmp_path / "my consent"
     _run(["ask", "--what", "q?", "--option", "a=x", "--option", "b=y", "--rec", "a", "--blocks", "z", "--queue-dir",
           str(qdir)], monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})

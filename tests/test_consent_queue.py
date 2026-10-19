@@ -11,6 +11,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from levain.consent.queue import UNDECIDED_GRACE
 from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
 )
+from levain.consent.receipt_log import head as receipts_head
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 
 NOW = datetime(2026, 10, 13, 20, 0, tzinfo=timezone.utc)
@@ -123,8 +125,13 @@ class FakeAgent:
 
 
 def signed(queue, request, key, decision="allow", **override):
-    payload = answer_payload(queue_id=queue.queue_id, request=request, decision=decision, signer_fp=key.fp,
-                             signed_at=utc_stamp(queue._clock()))
+    if isinstance(queue, ConsentQueue):
+        payload = answer_payload(queue_id=queue.queue_id, request=request, decision=decision, signer_fp=key.fp,
+                                 signed_at=utc_stamp(queue._clock()), receipts_head=receipts_head(queue))
+    else:   # the frozen /3 code (tests/fixtures): its own record, from before the receipts were chained
+        payload = sys.modules[type(queue).__module__].answer_payload(
+            queue_id=queue.queue_id, request=request, decision=decision, signer_fp=key.fp,
+            signed_at=utc_stamp(queue._clock()))
     payload.update(override)
     return payload, key.sign(answer_message(payload))
 
@@ -251,7 +258,7 @@ def test_refuses_an_answer_for_another_queue(queue, keys, authority):
 def test_a_yes_signed_by_another_key_than_it_names_is_no_decision(queue, keys, authority):
     request = FakeAgent(queue).ask()
     payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp,
-                             signed_at=utc_stamp(NOW))
+                             signed_at=utc_stamp(NOW), receipts_head=receipts_head(queue))
     sig = keys["stranger"].sign(answer_message(payload))
     with pytest.raises(AnswerRefused, match="does not verify"):
         queue.answer(request.id, payload, sig)
@@ -262,7 +269,7 @@ def test_a_yes_signed_by_another_key_than_it_names_is_no_decision(queue, keys, a
 def test_a_signature_in_another_namespace_is_no_decision(queue, keys, authority, namespace):
     request = FakeAgent(queue).ask()
     payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp,
-                             signed_at=utc_stamp(NOW))
+                             signed_at=utc_stamp(NOW), receipts_head=receipts_head(queue))
     sig = keys["phone"].sign(answer_message(payload), namespace)
     with pytest.raises(AnswerRefused, match="does not verify"):
         queue.answer(request.id, payload, sig)

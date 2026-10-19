@@ -29,7 +29,8 @@ def _stamp(when: datetime) -> str:
 class Seed:
     """Files requests at a moving clock and decides them in the store."""
 
-    def __init__(self, base: Path) -> None:
+    def __init__(self, base: Path, now: datetime = NOW) -> None:
+        self.now = now          # the instant "ago" counts back from; tests that drive a live server pass the real now
         self.dir = base / "consent"
         self.dir.mkdir(mode=0o700, parents=True)
         self.clock = [NOW - timedelta(days=5)]
@@ -49,14 +50,14 @@ class Seed:
                ago: timedelta = timedelta(hours=1)) -> str:
         self.n += 1
         cwd = self.ws if cwd is None else cwd
-        self.clock[0] = NOW - ago
+        self.clock[0] = self.now - ago
         r = self.q.file(agent=agent, agent_session_id=f"s{self.n}", tool_name=tool,
                         tool_input=tool_input or {"file_path": f"{cwd}/f{self.n}.txt", "content": "x"}, cwd=cwd,
                         hold=timedelta(minutes=5), tier=tier, event_id=f"e{self.n}")
         conn = sqlite3.connect(self.dir / "queue.db", isolation_level=None)
         try:
             conn.execute("UPDATE requests SET state = ?, decided_at = ?, via = ?, signer_fp = ? WHERE id = ?",
-                         (state, _stamp(NOW - ago + timedelta(seconds=20)), via, "SHA256:testkey", r.id))
+                         (state, _stamp(self.now - ago + timedelta(seconds=20)), via, "SHA256:testkey", r.id))
         finally:
             conn.close()
         return r.id
@@ -400,7 +401,7 @@ def test_f6_a_rejected_read_is_not_cached_for_thirty_seconds(tmp_path, monkeypat
 
 @needs_browser
 def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path, monkeypatch):
-    seed = Seed(tmp_path)
+    seed = Seed(tmp_path, now=datetime.now(timezone.utc))
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     for i in range(3):
         seed.decide(ago=timedelta(hours=2 + i))
@@ -420,7 +421,7 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
 
 @needs_browser
 def test_g1_filtering_then_clearing_then_show_all_keeps_the_cards(tmp_path, monkeypatch):
-    seed = Seed(tmp_path)
+    seed = Seed(tmp_path, now=datetime.now(timezone.utc))
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     for i in range(3):
         seed.decide(ago=timedelta(hours=2 + i))

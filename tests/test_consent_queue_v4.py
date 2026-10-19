@@ -7,6 +7,7 @@ The /3 store is built by the /3 code itself: ``tests/fixtures/consent_queue_v3_d
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sqlite3
 import sys
@@ -24,7 +25,9 @@ from levain.consent.queue import (
     PRIOR_FORMAT, RULED_ALLOW_LAPSE, RULING_SKEW, SNOOZE_MAX_MINUTES, STORE_FORMAT, UNDECIDED_GRACE, Decision,
     Ruling,
 )
-from levain.consent.record import RULING_FORMAT, RULING_NAMESPACE, ruling_message, ruling_payload
+from levain.consent.receipt_log import verify as verify_receipts
+from levain.consent.record import (RULING_FORMAT, RULING_FORMAT_UNCHAINED, RULING_NAMESPACE, ruling_message,
+                                   ruling_payload)
 from tests.test_consent_queue import NOW, Clock, FakeAgent, Log, _raw, signed
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
 
@@ -299,7 +302,7 @@ def test_a_ruling_signature_never_verifies_as_an_answer(queue, keys):
     ({"request_digest": "0" * 64}, "another version"),
     ({"queue_id": "cq-other"}, "another queue"),
     ({"signed_at": utc_stamp(NOW - timedelta(seconds=1))}, "before the request went undecided"),
-    ({"format": "levain-consent-ruling/2"}, "ruling format"),
+    ({"format": "levain-consent-ruling/3"}, "ruling format"),
     ({"decision": "maybe"}, "is not one of"),
 ])
 def test_a_ruling_binds_its_request_gap_and_time(queue, keys, override, why):
@@ -370,10 +373,50 @@ def test_the_record_helpers_refuse_a_bad_gap():
     for gap in (0, True, "1", 1.0):
         with pytest.raises(ConsentError):
             ruling_payload(queue_id="cq-1", request=r, gap=gap, decision="allow", signer_fp="fp",
-                           signed_at=utc_stamp(NOW))
+                           signed_at=utc_stamp(NOW), receipts_head={"size": 0, "root": hashlib.sha256().hexdigest()})
 
 
 # --- a ruled allow pre-authorises the call once ----------------------------------------------------------------
+
+def _unchained_ruling(q, request_id, key):
+    payload = {k: v for k, v in q.ruling_payload(request_id, "allow", key.fp).items() if k != "receipts_head"}
+    payload["format"] = RULING_FORMAT_UNCHAINED
+    return payload, key.sign(ruling_message(payload), RULING_NAMESPACE)
+
+
+def test_a_ruling_applied_before_the_chaining_is_still_taken_but_one_is_never_applied_now(queue, keys,
+                                                                                          monkeypatch):
+    # Q11 head call 1: the head is an APPLY-time rule. A ruled allow applied by the code before Q11 (a /1 ruling,
+    # its 24 h lapse not yet run) is still taken once, its signature re-verified; a /1 ruling is refused if applied
+    request, gap = undecided(queue)
+    payload, sig = _unchained_ruling(queue, request.id, keys["phone"])
+    with pytest.raises(AnswerRefused, match="signed before the queue's receipts were chained.*rule on the request "
+                                            "again"):
+        queue.answer_late(request.id, payload, sig)
+    assert queue.get(request.id)[1] == "undecided"
+    # the code before Q11 applied it: no format check of the head, no log check
+    import levain.consent.queue as qmod
+    real = qmod.ConsentQueue._ruling_refusal
+    monkeypatch.setattr(qmod.ConsentQueue, "_ruling_refusal",
+                        lambda self, *a, **kw: real(self, *a, **{**kw, "unchained_ok": True}))
+    monkeypatch.setattr(qmod, "head_refusal", lambda *a, **kw: None)
+    monkeypatch.setattr(qmod, "_detached", lambda payload: payload)      # nor copied the payload (Old stays Old)
+
+    class Old(dict):                       # the old apply never read a head; the record stored is the /1 one
+        def __missing__(self, key):
+            return None
+
+    queue.answer_late(request.id, Old(payload), sig)
+    monkeypatch.undo()
+    info = queue.decision(request.id)
+    assert isinstance(info, Ruling) and (info.ruling, info.taken) == ("allow", False)
+    got = queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD)
+    assert isinstance(got, Decision) and (got.request_id, got.gap) == (request.id, gap)
+    assert queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd=CWD) is None
+    report = verify_receipts(queue.directory, authority_for=lambda r: queue._authority)
+    assert report.ok and report.unchained == (request.id,) and report.last_signed is None
+
+
 
 def test_a_ruled_allow_is_taken_once(queue, keys):
     request, gap = undecided(queue)
@@ -577,6 +620,11 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     payload, sig = ruled(new, open_.id, keys["phone"])
     assert new.answer_late(open_.id, payload, sig).gap == 1
     assert [r["state"] for r in new.receipts(open_.id)] == ["undecided", "allowed"]
+    # Q11: the /3 answers are signed before chaining (their signatures re-verified, listed, never failed); the
+    # ruling, signed now, covers every receipt before it
+    report = verify_receipts(d, authority_for=lambda request: log.source)
+    assert report.ok and set(report.unchained) == {allowed.id, denied.id} and not report.mismatches
+    assert report.last_signed.request_id == open_.id and report.last_signed.size == 6
     # a levain that knows only /3 refuses the /4 store
     with pytest.raises(v3.QueueStoreError, match="levain-consent-queue/4"):
         v3.ConsentQueue(d, authority=v3.authority_source(log.path, anchor=None)).pending()
