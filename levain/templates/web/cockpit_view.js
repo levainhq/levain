@@ -605,6 +605,9 @@
       const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
       if (region) entry.region = region;
+      // how many rows the panel holds, from the kernel's own count: the page's count pill reads this, never the title's words
+      const held = isNum(panel.count) ? panel.count : (isNum(head.count) ? head.count : null);
+      if (held !== null) entry.count = held;
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -1061,7 +1064,9 @@
     s.units = 0; s.hidden = 0;
     if (d.face === "count") {
       const n = isNum(d.count) ? d.count : (d.lines || []).length;
-      host.appendChild(el("div", "big num", n));
+      const big = el("div", "big num", n);
+      big.dataset.count = String(n);   // the glow below reads this, not the figure's drawn text
+      host.appendChild(big);
       // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it, but only for
       // a clean, fresh read: on a degraded one (partial, stale, cached, alerted, something held back) the zero may be a
       // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
@@ -1692,7 +1697,9 @@
   })();
   // ---- the modes and the keys ----
   // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
-  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean);
+  // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
+  // part it keeps as `key=value`. The name is read with that suffix removed and, when the address is rewritten, written bare.
+  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => p.replace(/=$/, ""));
   function hashMode() { return hashParts().find((p) => MODES.indexOf(p) >= 0) || ""; }
   // the address follows the tab the reader chose; any other fragment part stays
   function writeHash(m) {
@@ -1793,8 +1800,8 @@
     }
     // the Decisions tile glows only while something waits on the operator
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
-      const big = w.querySelector(".big");
-      const n = big ? parseInt(big.textContent, 10) : 0;
+      const big = w.querySelector(".big[data-count]");
+      const n = big ? Number(big.dataset.count) : 0;
       if (n > 0) w.dataset.signal = "on"; else delete w.dataset.signal;
     }
   }

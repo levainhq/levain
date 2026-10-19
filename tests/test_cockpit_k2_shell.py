@@ -6,6 +6,7 @@ Each case names the finding it was written from (k-reviews/K2_L1L2.md): L1-1, L1
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -166,7 +167,7 @@ out.one = lines({ wraps: [{ wrapped_at: "2026-10-19T06:02:00" }], health: { tota
     assert out["total"][1] == "41 wraps" and out["one"][1] == "1 wrap"                     # the health panel's own total, when sent
 
 
-def test_an_empty_provider_collapses_to_one_line_whatever_its_key(tmp_path: Path) -> None:
+def test_an_empty_provider_is_found_by_its_sentinel_key_never_by_its_text(tmp_path: Path) -> None:
     fn = _cut("  function emptyProvider(p) {", "  function dashAction(p) {")
     out = _node(r"""
 const panel = (o) => ({ dataset: Object.assign({ ckPanel: "x" }, o.ext === false ? {} : { ckExternal: "1" }),
@@ -176,24 +177,30 @@ out.noRowsWithEmptyLine = emptyProvider(panel({ empty: true }));
 out.noRowsNoLine = emptyProvider(panel({}));                                           // nothing says it is empty: it is not
 out.noTeam = emptyProvider(panel({ rows: [{ key: "no_team", text: "This install has no team ledger." }] }));
 out.anyOtherEmptyKey = emptyProvider(panel({ rows: [{ key: "no_inbox", text: "No source connected." }] }));
-out.fixWrittenAsCommand = emptyProvider(panel({ rows: [{ key: "state", text: "Nothing yet. Run `levain connect`." }] }));
+out.backticksAreNotAnEmptyState = emptyProvider(panel({ rows: [{ key: "state", text: "Nothing yet. Run `levain connect`." }] }));   // text is never sniffed
+out.realRowWithCode = emptyProvider(panel({ rows: [{ key: "runbook:1", text: "Deploy using `make release`" }] }));
 out.oneRealRow = emptyProvider(panel({ rows: [{ key: "m1", text: "hello from the bridge" }] }));   // a genuine row is never collapsed
 out.twoRows = emptyProvider(panel({ rows: [{ key: "no_a", text: "`x`" }, { key: "no_b", text: "`y`" }] }));
 out.ownCard = emptyProvider(panel({ ext: false, empty: true }));                        // the page's own card keeps its box
 """, tmp_path, fn)
     assert out == {"noRowsWithEmptyLine": True, "noRowsNoLine": False, "noTeam": True, "anyOtherEmptyKey": True,
-                   "fixWrittenAsCommand": True, "oneRealRow": False, "twoRows": False, "ownCard": False}
+                   "backticksAreNotAnEmptyState": False, "realRowWithCode": False, "oneRealRow": False, "twoRows": False, "ownCard": False}
 
 
-def test_a_count_in_a_title_is_a_pill_hidden_at_zero(tmp_path: Path) -> None:
-    fn = _cut("  function ckCountPill(node) {", "  // The Board is two independent stacks")
+def test_a_count_pill_comes_from_the_panels_count_never_from_title_text(tmp_path: Path) -> None:
+    fn = _cut("  function ckCountPill(node", "  // The Board is two independent stacks")
     out = _node(r"""
 const card = (title) => { const h2 = el("h2", null, title); h2.after = (n) => { h2.sibling = n; }; return { h2, querySelector: () => h2 }; };
-const run = (title) => { const c = card(title); ckCountPill(c); return [c.h2.textContent, c.h2.sibling ? c.h2.sibling.textContent : null, c.h2.sibling ? c.h2.sibling.hidden : null]; };
-out.tray = run("Tray (2)"); out.zero = run("Recent edits (0)"); out.plain = run("Neocortex"); out.mid = run("A (b) c");
+const run = (title, count) => { const c = card(title); ckCountPill(c, count); return [c.h2.textContent, c.h2.sibling ? c.h2.sibling.textContent : null, c.h2.sibling ? c.h2.sibling.hidden : null]; };
+out.tray = run("Tray (2)", 2); out.zero = run("Recent edits (0)", 0); out.plain = run("Neocortex", null);
+out.year = run("Annual plan (2026)", null);        // a number in a title is a title
+out.yearWithCount = run("Annual plan (2026)", 3);  // the structural count is 3; the year stays in the name
+out.mid = run("A (b) c", undefined);
 """, tmp_path, fn)
     assert out["tray"] == ["Tray", "2", False] and out["zero"] == ["Recent edits", "0", True]
     assert out["plain"] == ["Neocortex", None, None] and out["mid"] == ["A (b) c", None, None]
+    assert out["year"] == ["Annual plan (2026)", None, None]
+    assert out["yearWithCount"] == ["Annual plan (2026)", "3", False]
 
 
 def _block(css: str, opener: str) -> dict[str, str]:
@@ -220,3 +227,140 @@ def test_no_panel_carries_a_colour_strip_and_orange_is_for_what_waits() -> None:
     css = (WEB / "dashboard.css").read_text(encoding="utf-8")
     assert "stripe" not in css
     assert 'data-ck-panel="tray"], [data-ck-panel="loops"]' not in css       # the strips were selected by panel id
+
+
+# ---- L3 r1 (K2_L3r1.md): G the band's wrap line through the manifest, H the deep link after the token strip, C-F ----
+
+_FIGS = ["links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap", "tombstones",
+         "wraps", "graduated", "demoted"]
+
+
+def _views(tmp_path: Path) -> dict:
+    """SubstrateViews built by cockpit_view.js's fromManifest from a wraps panel and an optional health panel."""
+    return run_node(r"""
+const FIGS = %s;
+const rows = (n) => Array.from({ length: n }, (_, i) => ({ wrapped_at: "2026-10-19T06:%%02d:00" .replace("%%02d", String(10 + (i %% 40))), continuity_chars: 100 }));
+const metrics = (wraps) => FIGS.map((l) => ({ label: l, value: l === "wraps" ? wraps : 1 })).concat([{ label: "write path", value: "live" }]);
+const build = (withHealth, wrapsPanel, total) => {
+  const heads = { wraps: head("wraps", "visual", "Wraps") };
+  const payloads = { wraps: wrapsPanel };
+  if (withHealth) { heads.health = head("health", "metric", "Health"); payloads.health = head("health", "metric", "Health", { value: { metrics: metrics(total) } }); }
+  const v = V.fromManifest(fixture(heads, payloads));
+  return { wraps: v.wraps, health: v.health, errors: v.errors, entity_name: "Sage" };
+};
+const good = (n) => head("wraps", "visual", "Wraps", { value: { data: rows(n) } });
+const bad = head("wraps", "visual", "Wraps", { status: "error", error: "boom" });
+out.withTotal = build(true, good(50), 312);
+out.cappedNoTotal = build(false, good(50), 0);
+out.underCapNoTotal = build(false, good(3), 0);
+out.faultedWithHealth = build(true, bad, 41);
+out.faultedNoHealth = build(false, bad, 0);
+""" % json.dumps(_FIGS), tmp_path)
+
+
+def test_the_wrap_line_through_the_manifest_never_claims_what_it_does_not_know(tmp_path: Path) -> None:
+    views = _views(tmp_path)
+    fn = _cut("  function wrapLineOf(view) {", "  let heroEpoch = 0;")
+    out = _node("const V = " + json.dumps(views) + r"""; out.l = {};
+for (const k of Object.keys(V)) out.l[k] = wrapLineOf(V[k]).kids.map((x) => x.textContent);
+""", tmp_path, fn)["l"]
+    assert out["withTotal"][1] == "312 wraps"                  # the health panel's total beats the held list
+    assert out["cappedNoTotal"][1] == "50+ wraps"              # a full history list is a floor, not a count
+    assert out["underCapNoTotal"][1] == "3 wraps held"
+    for k in ("faultedWithHealth", "faultedNoHealth"):         # an unreadable wraps panel is no evidence of "never"
+        assert "No wraps yet" not in out[k][0], (k, out[k])
+        assert not any("wrap" in x.lower() for x in out[k]), (k, out[k])
+        assert out[k][0], (k, out[k])                          # and the cell is never blank
+
+
+def test_a_deep_link_survives_the_write_token_strip(tmp_path: Path) -> None:
+    """The cockpit is opened as `#write_token=T&memory`; dashboard_boot.js strips the token (URLSearchParams spells the rest
+    `memory=`), and cockpit_view.js, loaded after it as the page orders its scripts, must still open that tab."""
+    drv = tmp_path / "deep.js"
+    drv.write_text(r"""
+const fs = require("fs");
+const [boot, view] = [fs.readFileSync(process.argv[2], "utf8"), fs.readFileSync(process.argv[3], "utf8")];
+const store = {};
+globalThis.window = globalThis;
+globalThis.location = { hash: process.argv[4], search: "", pathname: "/" };
+globalThis.history = { replaceState: (a, b, url) => { globalThis.location.hash = url.slice(url.indexOf("#") >= 0 ? url.indexOf("#") : url.length); } };
+globalThis.localStorage = { getItem: (k) => store[k] || null, setItem: (k, v) => { store[k] = v; }, removeItem: (k) => { delete store[k]; } };
+globalThis.fetch = () => Promise.reject(new Error("offline"));
+const node = () => ({ dataset: {}, classList: { add() {}, contains: () => false, toggle() {}, remove() {} }, addEventListener() {}, setAttribute() {}, appendChild() {}, append() {} });
+globalThis.document = { readyState: "complete", visibilityState: "visible", activeElement: null, body: node(), documentElement: node(), addEventListener() {},
+  querySelectorAll: () => [], querySelector: () => null, getElementById: () => null, createElement: node, createElementNS: node, createTextNode: () => node() };
+new Function(boot)();                 // page order: dashboard_boot.js first
+new Function(view)();                 // then cockpit_view.js
+const K = globalThis.LevainCockpitKinds;
+console.log(JSON.stringify({ hash: globalThis.location.hash, mode: K.hashMode(), token: store.levain_write_token || null }));
+process.exit(0);                      // the page's repaint interval would keep node alive
+""", encoding="utf-8")
+    import subprocess
+    got = {}
+    for hash_ in ("#write_token=T&memory", "#write_token=T&build", "#memory&write_token=T", "#write_token=T"):
+        r = subprocess.run([NODE, str(drv), str(WEB / "dashboard_boot.js"), str(WEB / "cockpit_view.js"), hash_], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+        got[hash_] = json.loads(r.stdout.strip().splitlines()[-1])
+    assert [got[h]["mode"] for h in ("#write_token=T&memory", "#write_token=T&build", "#memory&write_token=T")] == ["memory", "build", "memory"], got
+    assert got["#write_token=T"]["mode"] == ""
+    assert all(g["token"] == "T" for g in got.values()), got                # the token was taken and kept
+
+
+def test_the_tab_name_with_a_trailing_equals_is_read_and_rewritten_once(tmp_path: Path) -> None:
+    out = run_node(r"""
+globalThis.location = { hash: "#memory=", search: "", pathname: "/" };
+out.read = K.hashMode();
+const calls = [];
+globalThis.history = { replaceState: (a, b, url) => calls.push(url) };
+K.applyMode("build", true);
+out.written = calls;
+""", tmp_path)
+    assert out["read"] == "memory" and out["written"] == ["/#build"], out
+
+
+def test_the_legacy_page_keeps_only_the_two_mode_rules_it_had() -> None:
+    css = (WEB / "dashboard.css").read_text(encoding="utf-8")
+    bare = [l for l in css.splitlines() if re.match(r'\s*body\[data-mode="(board|memory)"\] \[data-modes\]', l)]
+    assert bare == [], bare                                    # board / memory hide only on the KE page (body.ke)
+    assert 'body.ke[data-mode="board"] [data-modes]:not([data-modes~="board"])' in css
+
+
+def test_a_glance_with_every_tile_hidden_on_a_tab_is_hidden_whole(tmp_path: Path) -> None:
+    css = (WEB / "dashboard.css").read_text(encoding="utf-8")
+    assert re.search(r'\.ck-widgets\[data-n="0"\]\s*\{\s*display:\s*none', css)
+    out = run_node(r"""
+globalThis.getComputedStyle = () => ({ display: "none" });
+const props = {};
+const w = Object.assign(new N("section"), { style: { setProperty: (k, v) => { props[k] = v; } }, children: [Object.assign(new N("div"), { dataset: {} })] });
+globalThis.document.body.dataset.mode = "build";
+globalThis.document.querySelectorAll = (sel) => (sel === ".ck-widgets" ? [w] : []);
+K.fillGrids();
+out.n = w.dataset.n;
+""", tmp_path)
+    assert out["n"] == "0"
+
+
+def test_a_panel_that_stops_being_dashed_loses_its_open_state_and_action(tmp_path: Path) -> None:
+    fn = _cut("  function dashAction(p) {", "  // Tabs of one card:") + "\n" + _cut("  function emptyProvider(p) {", "  function dashAction(p) {")
+    out = _node(r"""
+const cls = new Set(["ck-dash", "ck-dash-open"]); let act = { removed: false, remove() { this.removed = true; } };
+const p = { dataset: { ckPanel: "x", ckExternal: "1" }, classList: { toggle: (c, on) => { on ? cls.add(c) : cls.delete(c); }, remove: (c) => cls.delete(c), add: (c) => cls.add(c) },
+  querySelectorAll: () => [{ dataset: { keepKey: "m1" }, textContent: "a real row" }], querySelector: (sel) => (/ck-dash-act/.test(sel) ? act : null) };
+dashPass({ querySelectorAll: () => [p] });
+out.cls = Array.from(cls); out.actRemoved = act.removed;
+""", tmp_path, fn)
+    assert out["cls"] == [] and out["actRemoved"] is True, out
+
+
+def test_the_grid_layout_is_rerun_from_the_one_debounced_path(tmp_path: Path) -> None:
+    assert "function scheduleLayout()" in CORE, "dashboard_core.js has no scheduleLayout()"
+    fn = _cut("  let layoutTimer = null;", "  // Tabs of one card:")
+    out = _node(r"""
+let calls = 0; const timers = [];
+globalThis.window = { LevainCockpitKinds: { fillGrids: () => { calls++; } }, setTimeout: (f) => { timers.push(f); return timers.length; }, clearTimeout: (i) => { timers[i - 1] = null; } };
+scheduleLayout(); scheduleLayout(); scheduleLayout();
+for (const f of timers) if (f) f();
+out.calls = calls;
+""", tmp_path, fn)
+    assert out["calls"] == 1
+    assert "scheduleLayout" in re.search(r"new MutationObserver\([^\n]*", CORE).group(0)

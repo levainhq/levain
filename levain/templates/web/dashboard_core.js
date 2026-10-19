@@ -556,10 +556,13 @@
   }
 
   // The band's right cell, never blank. With wrap history: "Last wrap Mon 06:02" over the wrap count (the health panel's own total when
-  // the page holds it, else "N wraps held": the history list is what the page was sent, not necessarily every wrap there was).
-  // Without: "No wraps yet" over a fact the install has (its name, and the day's episodes when the jar counts them).
+  // the page holds it; else "N wraps held", or "N+ wraps" when the list is as long as a history list is sent: it is a floor then, not
+  // a count). Without history: "No wraps yet" over a fact the install has (its name, and the day's episodes when the jar counts them).
+  // When the wraps panel could not be read the line says nothing about wraps at all: unreadable is not "never".
   function wrapLineOf(view) {
+    const WRAP_LIST_CAP = 50;   // the longest history list the page is sent
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const unread = !!((view.errors && view.errors.wraps) || (view.health && view.health.wrap_history_unavailable));
     const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? ws[0] : null;
     const at = last ? new Date(last.wrapped_at) : null;
     const box = el("div", "wrapline");
@@ -568,11 +571,18 @@
       const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
       first.append(el("b", null, "Last wrap"), " " + when);
       const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
-      second.textContent = total !== null ? total + (total === 1 ? " wrap" : " wraps") : ws.length + (ws.length === 1 ? " wrap held" : " wraps held");
+      second.textContent = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+        : ws.length >= WRAP_LIST_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap held" : " wraps held");
     } else {
-      first.appendChild(el("b", null, "No wraps yet"));
       const today = view.jar && Number.isInteger(view.jar.today) ? view.jar.today + " today" : "";
-      second.textContent = [typeof view.entity_name === "string" ? view.entity_name : "", today].filter(Boolean).join(" · ") || "a fresh install";
+      const name = typeof view.entity_name === "string" ? view.entity_name : "";
+      if (unread) {
+        first.appendChild(el("b", null, name || "This install"));
+        second.textContent = today;
+      } else {
+        first.appendChild(el("b", null, "No wraps yet"));
+        second.textContent = [name, today].filter(Boolean).join(" · ") || "a fresh install";
+      }
     }
     box.append(first, second);
     return box;
@@ -818,7 +828,7 @@
           if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
           if (e.kind === "external") node.dataset.ckExternal = "1";
-          ckCountPill(node);
+          ckCountPill(node, e.count);
           nodes.push(node);
           grid.appendChild(node);
         }
@@ -829,18 +839,22 @@
     sec.appendChild(grid);
     board.appendChild(sec);
     dashPass(grid);
-    if (typeof MutationObserver === "function") new MutationObserver(() => dashPass(grid)).observe(grid, { childList: true, subtree: true });
+    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
   }
 
-  // A count in a title ("Tray (2)") is a pill beside the title, hidden at 0: the title says what the card is, the pill how many it holds.
+  // A panel's count ("Tray (2)" in the kernel's title) is a pill beside the title, hidden at 0: the title says what the card is, the
+  // pill how many it holds. The number is the panel's own count (`count`, from the manifest), never parsed out of the title's words:
+  // a title that ends in a number of its own ("Annual plan (2026)") keeps it. Only the kernel's own " (count)" suffix is lifted off.
   // The pill is a sibling of the h2, so the heading's text (what the jump box lists) stays the name alone.
-  function ckCountPill(node) {
+  function ckCountPill(node, count) {
+    if (!Number.isInteger(count) || count < 0) return;
     const h2 = node.querySelector(":scope > .phead > h2");
-    const m = h2 ? /^(.*?)\s*\((\d+)\)\s*$/.exec(h2.textContent) : null;
-    if (!m) return;
-    h2.textContent = m[1];
-    const pill = el("span", "ck-count", m[2]);
-    pill.hidden = Number(m[2]) === 0;
+    if (!h2) return;
+    const tail = " (" + count + ")";
+    const text = String(h2.textContent);
+    if (text.endsWith(tail)) h2.textContent = text.slice(0, -tail.length).replace(/\s+$/, "");
+    const pill = el("span", "ck-count", String(count));
+    pill.hidden = count === 0;
     h2.after(pill);
   }
 
@@ -864,7 +878,7 @@
 
   // F7, the empty provider: an external panel that reports empty and says how to fix it collapses to ONE dashed line (its title, the
   // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
-  // provider's own report (a `no_` state key, or a fix written as a `command`). Team without a ledger and an Inbox with no source
+  // provider's own report (a `no_` state key; its words are never read). Team without a ledger and an Inbox with no source
   // are the cases. A compose box stays reachable: the line carries its action ("Send"), which opens the box under the line.
   // A card of the page's own (Tray, Keep, Identity) keeps its card: its box is its content. An empty list card folds in
   // markEmptyCards (cockpit_view.js). Idempotent: it toggles classes and adds the action once, so the observer that calls it again
@@ -875,7 +889,7 @@
     if (rows.length === 0) return !!p.querySelector(".pbody .empty");
     if (rows.length > 1) return false;
     const key = rows[0].dataset.keepKey || "";
-    return /^no_/.test(key) || /`[^`]+`/.test(rows[0].textContent);
+    return /^no_/.test(key);   // the provider's own sentinel row id; a row's words (a command in backticks) say nothing about it
   }
   function dashAction(p) {
     const head = p.querySelector(":scope > .phead");
@@ -901,7 +915,25 @@
       const dash = emptyProvider(p);
       p.classList.toggle("ck-dash", dash);
       if (dash) dashAction(p);
+      else {
+        // a card that stops being dashed gives its line's action and open state back
+        const act = p.querySelector(":scope > .phead > .ck-dash-act");
+        if (act) act.remove();
+        p.classList.remove("ck-dash-open");
+      }
     }
+  }
+  // The zone grids' layout (which columns are live, which card takes its row) is measured after layout. A repaint inside a grid (a card
+  // folding, a dashed line appearing, a refetch) can change it, so the same observer that re-runs dashPass asks for it again here:
+  // one debounced path, however many mutations a repaint makes.
+  let layoutTimer = null;
+  function scheduleLayout() {
+    if (layoutTimer !== null) window.clearTimeout(layoutTimer);
+    layoutTimer = window.setTimeout(() => {
+      layoutTimer = null;
+      const K = window.LevainCockpitKinds;
+      if (K && typeof K.fillGrids === "function") K.fillGrids();
+    }, 60);
   }
 
   // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries
