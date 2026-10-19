@@ -303,12 +303,22 @@ def test_a_hostile_git_config_runs_nothing_and_the_commit_still_reads(tmp_path, 
         pytest.fail("CONTROL FAILED: no planted vector fired under a plain git, so the neutralised read proves nothing")
     for p in sentinels.iterdir():
         p.unlink()
-    # (b) the activity read on that repository: its commit, and no sentinel
+    # (b) the activity read on that repository: its include refuses it (c-2), named, and nothing runs
     root = tmp_path / "inst"
     _session(root, "hs", str(repo), timedelta(minutes=2))
     read = act.activity_reader(install_root=root, episodic_db=tmp_path / "none.db", consent=lambda: None,
                                questions=lambda: None, home=str(tmp_path))
     v = read(ReadContext(datetime.now(timezone.utc))).value
+    with capsys.disabled():
+        print(f"[hostile] with its include: errors {[e for e in v['errors'] if e.startswith('hostile')]}; "
+              f"sentinels: {sorted(p.name for p in sentinels.iterdir())}")
+    assert "hostile: its config includes another config file, not read" in v["errors"]
+    assert not list(sentinels.iterdir())
+    # (c) the include taken out, every other planted program still there: its commit reads, and no sentinel
+    cfg = repo / ".git" / "config"
+    cfg.write_text(cfg.read_text().replace(f"[include]\n\tpath = {tmp_path / 'bin' / 'included.cfg'}\n", ""))
+    assert "[include]" not in cfg.read_text() and "fsmonitor" in cfg.read_text()
+    v = read(ReadContext(datetime.now(timezone.utc), fresh=True)).value
     commits = [e for e in v["events"] if e["kind"] == "commit"]
     after = sorted(p.name for p in sentinels.iterdir())
     with capsys.disabled():
@@ -379,13 +389,20 @@ def test_the_refusals_name_partial_clones_and_borrowed_objects(tmp_path):
     g = fresh("prom")
     _git(g.parent, "config", "remote.agentname.promisor", "true", check=True)
     assert act.repo_refusal(g) == "a partial clone (remote.<name>.promisor in config), not read"
-    g = fresh("promoff")
+    g = fresh("promoff")                                      # any promisor key, whatever its value (L2-2)
     _git(g.parent, "config", "remote.o.promisor", "false", check=True)
-    assert act.repo_refusal(g) is None
-    g = fresh("incl")                                         # the key in a file the config includes
+    assert act.repo_refusal(g) == "a partial clone (remote.<name>.promisor in config), not read"
+    g = fresh("incl")                                         # any include, whatever it holds (c-2)
     (tmp_path / "inc.cfg").write_text("[remote \"o\"]\n\tpromisor = true\n")
     _git(g.parent, "config", "include.path", str(tmp_path / "inc.cfg"), check=True)
-    assert act.repo_refusal(g) == "a partial clone (remote.<name>.promisor in config), not read"
+    assert act.repo_refusal(g) == "its config includes another config file, not read"
+    g = fresh("incif")                                        # true only where git runs with --git-dir
+    _git(g.parent, "config", f"includeIf.gitdir:{os.path.realpath(g.parent)}/.path", str(tmp_path / "inc.cfg"),
+         check=True)
+    seen = subprocess.run(["git", f"--git-dir={g}", "config", "--get", "remote.o.promisor"], cwd="/", text=True,
+                          env={**GIT_ISOLATED, "HOME": str(tmp_path)}, capture_output=True, timeout=30)
+    assert seen.stdout.strip() == "true", "CONTROL: git under --git-dir does not see the conditional include"
+    assert act.repo_refusal(g) == "its config includes another config file, not read"
     g = fresh("pack")
     (g / "objects" / "pack" / "pack-1.promisor").write_text("")
     assert act.repo_refusal(g) == "a partial clone (a .promisor pack), not read"
@@ -573,7 +590,8 @@ def test_the_cache_gives_copies_and_the_event_cap_keeps_the_newest(tmp_path):
                                questions=lambda: None, home=str(tmp_path), scan=many)
     v = read(ReadContext(now)).value
     assert len(v["events"]) == act.ACTIVITY_EVENTS_MAX
-    assert f"6 older events past the cap of {act.ACTIVITY_EVENTS_MAX} not shown (the newest are)" in v["errors"]
+    assert (f"6 older events past the cap of {act.ACTIVITY_EVENTS_MAX} not shown (the newest, and every item "
+            "still waiting, are)") in v["errors"]
     assert v["events"][-1]["kind"] == "session"                 # the newest survive the cap
     for e in v["events"]:
         e["repo"] = "MUTATED"
@@ -606,3 +624,107 @@ def test_the_doctor_tile_holds_a_fault_and_counts_the_install_root_on_the_hooks_
     groups = dict(glance._checks(tmp_path / "no-such-install"))
     assert any(r.name == "install root" and not r.ok for r in groups["hooks"])
     assert glance._dot("hooks", groups["hooks"])["status"] == "bad"
+
+
+# --- K1 L3 r1 -------------------------------------------------------------------------------------------------
+
+def test_c1_a_commondir_planted_in_a_linked_worktrees_repository_is_refused(tmp_path, capsys):
+    main = _repo(tmp_path / "work" / "mainrepo")
+    wt = tmp_path / "work" / "mainrepo-seat"
+    _git(main, "worktree", "add", "-q", "-b", "seat", str(wt), check=True)
+    evil, sentinel = _promisor_repo(tmp_path)
+    (main / ".git" / "commondir").write_text(str(evil / ".git") + "\n")
+    # (a) CONTROL: git on exactly that git directory follows the planted commondir into the partial clone
+    _git(tmp_path, f"--git-dir={main / '.git'}", "log", "--branches", "--format=%H")
+    fired = sentinel.exists()
+    with capsys.disabled():
+        print(f"\n[commondir] control (plain git --git-dir=<common> log) sentinel: {fired}")
+    if not fired:
+        pytest.fail("CONTROL FAILED: git did not follow <common>/commondir; the refusal proves nothing")
+    sentinel.unlink()
+    # (b) refused at the walk and at the refusal, and the feed names it and runs nothing
+    assert act.find_repo_gitdir(str(wt), str(tmp_path)) == \
+        (None, "its repository names another repository (commondir), not read")
+    assert act.repo_refusal(main / ".git") == "it names another repository (commondir), not read"
+    root = tmp_path / "inst"
+    _session(root, "w1", str(wt), timedelta(minutes=2))
+    read = act.activity_reader(install_root=root, episodic_db=tmp_path / "none.db", consent=lambda: None,
+                               questions=lambda: None, home=str(tmp_path))
+    v = read(ReadContext(datetime.now(timezone.utc))).value
+    with capsys.disabled():
+        print(f"[commondir] feed read errors: {[e for e in v['errors'] if e.startswith(('mainrepo', 'commits'))]}; "
+              f"sentinel: {sentinel.exists()}")
+    assert not sentinel.exists()
+    assert "mainrepo-seat: its repository names another repository (commondir), not read" in v["errors"]
+    assert "commits" in v["unreadable"]
+
+
+def test_c3_exclude_of_mixed_types_is_a_value_error(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    with pytest.raises(ValueError):
+        build_default_cockpit(src, exclude={1, "activty"})
+
+
+def test_c4_the_event_cap_keeps_what_is_still_waiting(tmp_path):
+    root = tmp_path / "inst"
+    (tmp_path / "r" / ".git").mkdir(parents=True)
+    _session(root, "s", str(tmp_path / "r"), timedelta(minutes=1))
+    now = datetime.now(timezone.utc)
+    base = int((now - timedelta(hours=2)).timestamp())
+    old = _stamp(timedelta(hours=act.ACTIVITY_WINDOW_H + 3))
+
+    def many(repos, since):
+        return [{"kind": "commit", "at": act._iso(datetime.fromtimestamp(base + i, timezone.utc)), "repo": "r",
+                 "agent": None, "outcome": "ok"} for i in range(act.ACTIVITY_EVENTS_MAX + 5)], [], 1
+    read = act.activity_reader(install_root=root, episodic_db=tmp_path / "none.db",
+                               consent=lambda: (lambda n: _Listing(_Entry(old, "pending"))), questions=lambda: None,
+                               home=str(tmp_path), scan=many)
+    v = read(ReadContext(now)).value
+    assert len(v["events"]) == act.ACTIVITY_EVENTS_MAX
+    waiting = [e for e in v["events"] if e["kind"] == "decision"]
+    assert len(waiting) == 1 and waiting[0]["outcome"] == "waiting" and "since" in waiting[0]
+    assert v["events"][0] is waiting[0] and v["events"][-1]["kind"] == "session"
+    assert (f"7 older events past the cap of {act.ACTIVITY_EVENTS_MAX} not shown (the newest, and every item still "
+            "waiting, are)") in v["errors"]
+
+
+def test_codex_a_doctor_fault_drops_the_cached_ok(tmp_path, monkeypatch):
+    from levain.cockpit import glance
+    clock = [1000.0]
+    monkeypatch.setattr(glance.time, "monotonic", lambda: clock[0])
+    calls: list[int] = []
+    state = {"fail": False}
+
+    def checks(install):
+        calls.append(1)
+        if state["fail"]:
+            raise RuntimeError("x")
+        return [("hooks", [])]
+    monkeypatch.setattr(glance, "_checks", checks)
+    read = glance.doctor_reader(tmp_path)
+    assert isinstance(read(ReadContext(datetime.now(timezone.utc))), Read)
+    state["fail"] = True
+    clock[0] += 10
+    assert isinstance(read(ReadContext(datetime.now(timezone.utc), fresh=True)), Fault)
+    clock[0] += glance.DOCTOR_FAULT_CACHE_S + 5            # the fault expired; the ok is younger than its own TTL
+    assert isinstance(read(ReadContext(datetime.now(timezone.utc))), Fault)
+    assert len(calls) == 3                                  # the checks ran again, never the stale ok served
+
+
+def test_codex_a_cached_commit_leaves_with_the_window(tmp_path):
+    root = tmp_path / "inst"
+    (tmp_path / "r" / ".git").mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+    _session(root, "s", str(tmp_path / "r"), timedelta(minutes=1))
+    edge = now - timedelta(hours=act.ACTIVITY_WINDOW_H) + timedelta(seconds=1)
+    scans: list[int] = []
+
+    def one(repos, since):
+        scans.append(1)
+        return [{"kind": "commit", "at": act._iso(edge), "repo": "r", "agent": None, "outcome": "ok"}], [], 1
+    read = act.activity_reader(install_root=root, episodic_db=tmp_path / "none.db", consent=lambda: None,
+                               questions=lambda: None, home=str(tmp_path), scan=one)
+    assert [e for e in read(ReadContext(now)).value["events"] if e["kind"] == "commit"]
+    later = read(ReadContext(now + timedelta(seconds=5))).value
+    assert len(scans) == 1                                  # still the cached scan
+    assert not [e for e in later["events"] if e["kind"] == "commit"]

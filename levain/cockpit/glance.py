@@ -104,6 +104,7 @@ def doctor_reader(install_root: Path | None) -> Callable[[Any], Result]:
                     groups = _checks(Path(install_root))
                 except Exception as exc:  # noqa: BLE001 - a check that raises is the tile's fault, named
                     cache["fault"], cache["fault_at"] = f"doctor's checks did not run: {type(exc).__name__}", time.monotonic()
+                    cache["value"] = None       # the fault's TTL ending rebuilds: an older ok is never served
                     return Fault(cache["fault"])
                 cache["fault"] = None
                 metrics = [_dot(label, rs) for label, rs in groups]

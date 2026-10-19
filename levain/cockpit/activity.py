@@ -10,7 +10,8 @@ The git read is the boundary. A session record's ``cwd`` is one an agent influen
 one an agent writes, ``.git/config`` included, while this read runs unconfined as the operator. So the repository
 is found by walking the tree (no git discovery, which would parse its config): a plain ``.git`` directory owned by
 this uid, or a linked worktree's gitfile naming one (whose shared repository is read once, under its main
-working tree's name). Before git runs, a partial clone or a borrowed object store is refused (``repo_refusal``);
+working tree's name). Before git runs, a partial clone, a borrowed object store, a ``commondir`` or a config
+include is refused (``repo_refusal``);
 git then runs with ``--git-dir``, ``levain.consent.push.git_env`` (no lazy fetch, no transport) and every
 program-naming key overridden on the command line (``NEUTRALISE``). The scan is bounded (``ACTIVITY_REPOS_MAX``
 repos, an ``ACTIVITY_GIT_DEADLINE_S`` deadline, the repositories past it named) and cached for
@@ -188,7 +189,7 @@ def _linked_common(gitfile: Path) -> tuple[Path | None, str | None]:
     """The common git directory a linked worktree's ``.git`` gitfile names, or why it is not read. Accepted only
     as git itself writes it: one line ``gitdir: <absolute path>`` naming ``<common>/worktrees/<name>``, every
     one of those a real (unlinked) directory owned by this uid, whose ``commondir`` file leads back to
-    ``<common>``."""
+    ``<common>``, which names no other repository through a ``commondir`` of its own."""
     line = _one_line(gitfile)
     if line is None or not line.startswith("gitdir: "):
         return None, "its .git file is not one gitdir line you own, not read"
@@ -206,6 +207,9 @@ def _linked_common(gitfile: Path) -> tuple[Path | None, str | None]:
     back = _one_line(wt / "commondir")
     if back is None or os.path.realpath(os.path.join(wt, back)) != str(common):
         return None, "its worktree's commondir does not lead back to its repository, not read"
+    if os.path.lexists(common / "commondir"):
+        # git run on <common> would follow this one too, into a store the refusal never looked at
+        return None, "its repository names another repository (commondir), not read"
     return common, None
 
 
@@ -289,11 +293,17 @@ def _run(argv: list[str], timeout: float) -> tuple[int, str]:
 
 
 def repo_refusal(gitdir: Path, timeout: float = ACTIVITY_GIT_CALL_S) -> str | None:
-    """Why a repository is not read, from its tree and its config file, before any git runs on it: an object
-    store that is not a plain directory, one that borrows objects (a non-empty ``objects/info/alternates`` or
-    ``http-alternates``), a partial clone (an ``objects/pack/*.promisor`` file, ``extensions.partialclone`` or a
-    true ``remote.<name>.promisor`` in ``config`` or ``config.worktree``). The config is read with ``git config
-    --file``, which runs nothing. The message names the reason, never the path."""
+    """Why a repository is not read, from its tree and its config file, before any git runs on it: a
+    ``commondir`` (git would read another repository's config and objects), an object store that is not a plain
+    directory, one that borrows objects (a non-empty ``objects/info/alternates`` or ``http-alternates``), a
+    partial clone (an ``objects/pack/*.promisor`` file, ``extensions.partialclone`` or any
+    ``remote.<name>.promisor``, whatever its value, in ``config`` or ``config.worktree``), or a config that
+    includes another file (``include.path``, ``includeIf.<cond>.path``): read here with ``git config --file``,
+    outside the repository, a ``gitdir:`` or ``onbranch:`` condition is false that the real ``--git-dir`` run
+    finds true, so an include is refused unread rather than evaluated in the wrong context. The config is read
+    with ``git config --file --no-includes``, which runs nothing. The message names the reason, never the path."""
+    if os.path.lexists(gitdir / "commondir"):
+        return "it names another repository (commondir), not read"
     objs = gitdir / "objects"
     try:
         ost = os.lstat(objs)
@@ -326,15 +336,16 @@ def repo_refusal(gitdir: Path, timeout: float = ACTIVITY_GIT_CALL_S) -> str | No
         f = gitdir / name
         if not os.path.lexists(f):
             continue
-        code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--includes", "-z",
-                          "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$"], timeout)
+        code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--no-includes", "-z",
+                          "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor|include\.path|"
+                          r"includeif\..*\.path)$"], timeout)
         if code not in (0, 1):
             return f"its {name} does not parse (git config exited {code}), not read"
-        for item in out.split("\0"):
-            key, _, value = item.partition("\n")
-            key, value = key.lower(), value.strip().lower()
-            if key == "extensions.partialclone" or (key.endswith(".promisor")
-                                                    and value not in ("false", "no", "off", "0")):
+        keys = [item.partition("\n")[0].lower() for item in out.split("\0") if item]
+        if any(k == "include.path" or (k.startswith("includeif.") and k.endswith(".path")) for k in keys):
+            return f"its {name} includes another config file, not read"
+        for key in keys:
+            if key == "extensions.partialclone" or (key.startswith("remote.") and key.endswith(".promisor")):
                 shown = "extensions.partialclone" if key.startswith("extensions.") else "remote.<name>.promisor"
                 return f"a partial clone ({shown} in {name}), not read"
     return None
@@ -403,7 +414,8 @@ def _scan(repos: list[tuple[Path, str]], since: datetime, clock: Callable[[], fl
 
 class _GitCache:
     """The commit scan, rebuilt at most once per ``ACTIVITY_CACHE_S`` for one set of repositories; the lock makes
-    concurrent reads share one rebuild. A read gets copies, so nothing it changes reaches the next read."""
+    concurrent reads share one rebuild. A read gets copies, so nothing it changes reaches the next read, and only
+    the events still inside its own window."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -419,7 +431,9 @@ class _GitCache:
             if fresh or self._key != key or time.monotonic() - self._at > ACTIVITY_CACHE_S:
                 self._got = scan(repos, since)
                 self._key, self._at = key, time.monotonic()
-            return [dict(e) for e in self._got[0]], list(self._got[1]), self._got[2]
+            # a scan is up to ACTIVITY_CACHE_S old: a commit it found inside the window may have left it since
+            kept = [dict(e) for e in self._got[0] if (_parse(e.get("at")) or since) >= since]
+            return kept, list(self._got[1]), self._got[2]
 
 
 # --- the sources ---------------------------------------------------------------------------------------------
@@ -631,9 +645,15 @@ def activity_reader(*, install_root: Path | None, episodic_db: Path,
             return Fault("activity is blind: " + "; ".join(errors))
         events.sort(key=lambda e: (_parse(e["at"]) or start, e["kind"]))
         if len(events) > ACTIVITY_EVENTS_MAX:
-            errors.append(f"{len(events) - ACTIVITY_EVENTS_MAX} older events past the cap of {ACTIVITY_EVENTS_MAX} "
-                          "not shown (the newest are)")
-            events = events[-ACTIVITY_EVENTS_MAX:]
+            # an item still waiting sits at the window's start, the oldest slot: the cut takes the newest of the
+            # rest around it, never it (unless the waiting items alone pass the cap, the newest of them kept)
+            waiting = [e for e in events if "since" in e][-ACTIVITY_EVENTS_MAX:]
+            rest = [e for e in events if "since" not in e]
+            rest = rest[len(rest) - (ACTIVITY_EVENTS_MAX - len(waiting)):] if len(waiting) < ACTIVITY_EVENTS_MAX else []
+            errors.append(f"{len(events) - len(waiting) - len(rest)} older events past the cap of "
+                          f"{ACTIVITY_EVENTS_MAX} not shown (the newest, and every item still waiting, are)")
+            events = waiting + rest
+            events.sort(key=lambda e: (_parse(e["at"]) or start, e["kind"]))
         # the window is its length only: a clock-stamped start/end would change the value on every read, so an
         # idle install would stream panel-changed for ever
         return Read(value={"events": events, "legend": LEGEND, "window": {"hours": ACTIVITY_WINDOW_H},

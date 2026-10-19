@@ -1067,7 +1067,7 @@ def build_default_cockpit(
         exclude = frozenset(exclude)       # read once: a generator would be spent by the first membership test
     except TypeError:
         raise ValueError("exclude is a collection of panel ids") from None
-    bad_ids = sorted(exclude - OPTIONAL_NATIVE)
+    bad_ids = sorted(map(str, exclude - OPTIONAL_NATIVE))      # str: a mixed-type set still sorts
     if bad_ids:
         raise ValueError(f"exclude {bad_ids}: only {sorted(OPTIONAL_NATIVE)} may be left out")
     feeds = tuple((episode_feeds or {}).items())
