@@ -1290,6 +1290,9 @@ class EntitySession:
                 return self._undeterminable_gate_result(nudged=nudged)
             if status:
                 return self._gated_result(nudged=nudged)
+            failed = self._run_failure()
+            if failed is not None:
+                return self._run_failed_result(failed, nudged=nudged)
 
             if self.with_tools and planned_without_acting(self.conversation.state.events):
                 nudged = True
@@ -1306,6 +1309,9 @@ class EntitySession:
                     return self._undeterminable_gate_result(nudged=nudged)
                 if status:
                     return self._gated_result(nudged=nudged)
+                failed = self._run_failure()
+                if failed is not None:
+                    return self._run_failed_result(failed, nudged=nudged)
 
             # CAPTURE ONLY A COMPLETED TURN — never a gated halt. This is the SAME defect the
             # nudge ordering above already paid for: `vagus_run` keys idempotency on the user
@@ -1318,6 +1324,11 @@ class EntitySession:
             # halts and is never resumed captures NOTHING for that turn. Correct — the turn did
             # not happen. An episode asserting "I ran X" for an action a human refused would be
             # memory recording a fiction.
+            #
+            # `capture_turn` only captures; it never runs the conversation. When it did (through
+            # `vagus_run`), its run reset a run that had ended in ERROR to RUNNING with a fresh
+            # iteration budget, and a halt inside that run was reported as an ungated turn with the
+            # held action listed as work that ran.
             self.binding.capture_turn(self.conversation)
         except TurnTimeout as exc:
             # BEFORE the generic handler. `TurnTimeout` derives from `BaseException` (so the agent
@@ -1469,6 +1480,47 @@ class EntitySession:
         except Exception:  # noqa: BLE001 — unreadable: the stop is taken to have ended the turn
             return True
         return False
+
+    def _run_failure(self) -> str | None:
+        """Why the last ``run()`` ended without completing the turn, or ``None`` if it did not fail.
+
+        The SDK's ``run()`` RETURNS, without raising, when it ends a run in ``error`` (the
+        per-run iteration cap) or ``stuck`` (its loop detector); an exception that escapes the
+        agent's step is re-raised instead and is handled by :meth:`_drive`'s ``except``. A run
+        that returns in either state did not complete the turn: it is reported as failed and not
+        captured, and nothing in this turn runs the conversation again, since a further
+        ``run()`` resets either status to running with a fresh iteration budget. The status is
+        matched by value, so this needs no SDK import.
+
+        An unreadable status is not a failure HERE: in a gated session :meth:`_gate_status` has
+        already ended the turn on it, and an ungated session never needed the status before."""
+        try:
+            status = self.conversation.state.execution_status
+        except Exception:  # noqa: BLE001 — see the docstring: the gate check owns "unreadable"
+            return None
+        value = getattr(status, "value", status)
+        if value not in ("error", "stuck"):
+            return None
+        why = "the runtime's loop detector judged the agent stuck" if value == "stuck" else None
+        try:
+            events = list(self.conversation.state.events)
+            start = self._turn_start if self._turn_start is not None else 0
+            for e in reversed(events[start:]):
+                if type(e).__name__ == "ConversationErrorEvent":
+                    why = f"{getattr(e, 'code', '')}: {getattr(e, 'detail', '')}".strip(": ")
+                    break
+        except Exception:  # noqa: BLE001 — the reason is a nicety; the status already decided
+            pass
+        return f"the turn ended in the runtime's {value} state ({why or 'no reason recorded'})"
+
+    def _run_failed_result(self, failure: str, *, nudged: bool) -> TurnResult:
+        """A turn whose run ended in the runtime's error or stuck state: failed, nothing captured."""
+        return TurnResult(
+            reply=None,
+            tool_activity=self._activity_after_fault(),
+            error=f"{failure}; it did not complete and nothing from it was captured.",
+            nudged=nudged,
+        )
 
     def _stopped_result(self, *, nudged: bool) -> TurnResult:
         """A turn ended by :meth:`request_stop`: timed out, nothing captured."""
