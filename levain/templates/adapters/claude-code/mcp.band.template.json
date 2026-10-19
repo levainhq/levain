@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "levain_band": {
+      "type": "stdio",
+      "command": "{{PYTHON}}",
+      "args": ["-P", "-m", "levain.consent.band_mcp", "--agent", "claude_code"]
+    }
+  }
+}

@@ -58,13 +58,13 @@ def test_the_template_carries_no_messaging_keys():
     doc = json.loads(_base())
     assert not any(k in doc for k in KEYS)
     assert "ask" not in doc["permissions"] and "deny" not in doc["permissions"]
-    assert doc["permissions"]["allow"] == ["mcp__anneal_memory"]
+    assert doc["permissions"]["allow"] == ["mcp__anneal_memory", "mcp__levain_band"]
 
 
 def test_renderer_governed_keys():
     doc = json.loads(_apply_messaging(_base(), "governed"))
     assert _msg(doc) == {"inbound": "hold", "isolate": True, "ask": ["SendMessage"], "deny": None}
-    assert doc["permissions"]["allow"] == ["mcp__anneal_memory"]
+    assert doc["permissions"]["allow"] == ["mcp__anneal_memory", "mcp__levain_band"]
 
 
 def test_renderer_off_keys():

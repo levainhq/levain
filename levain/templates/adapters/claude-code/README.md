@@ -28,7 +28,7 @@ post-v1 item.)
 ```
 <partnership-directory>/          <- the Levain install; $CLAUDE_PROJECT_DIR
 ├── CLAUDE.md                     <- from CLAUDE.md.template; @-imports the seed
-├── .mcp.json                     <- from mcp.template.json; registers anneal_memory
+├── .mcp.json                     <- from mcp.template.json + mcp.band.template.json; registers anneal_memory and levain_band (the question band)
 ├── .claude/
 │   └── settings.json             <- from settings.template.json; wires the hooks
 ├── .levain/

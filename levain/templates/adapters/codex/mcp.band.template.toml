@@ -1,0 +1,9 @@
+# Levain — the question band's MCP server (fragment for ~/.codex/config.toml, beside anneal_memory's block)
+#
+# One tool, `ask`: files a question for the operator exactly as `levain ask` does, and returns at once.
+# {{PYTHON}} resolves to the interpreter Levain is installed in; `-P` keeps the directory Codex was started in
+# off sys.path. The server names no install: the question band lives in the machine's consent directory.
+
+[mcp_servers.levain_band]
+command = "{{PYTHON}}"
+args = ["-P", "-m", "levain.consent.band_mcp", "--agent", "codex"]

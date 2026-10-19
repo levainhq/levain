@@ -55,7 +55,7 @@ supported in v1.
 
 ~/.codex/
 ├── hooks.json                    <- from hooks.json.template; wires the hooks globally
-└── config.toml                   <- gains the [mcp_servers.anneal_memory] block from mcp.template.toml
+└── config.toml                   <- gains the [mcp_servers.anneal_memory] block from mcp.template.toml and [mcp_servers.levain_band] (the question band) from mcp.band.template.toml
 ```
 
 ## Template placeholders

@@ -68,7 +68,8 @@ NO_SESSION = "levain-ask"
 # what an agent is told so it asks instead of stopping (the line a template or brief carries)
 AGENT_LINE = ("When you need the operator's judgement and can keep working on something else, run `levain ask "
               "--what \"<the question, one line>\" --option <key>=<label> --option <key>=<label> --rec <key> "
-              "--blocks \"<what waits on the answer>\"` (2-6 options; keys lowercase a-z, 0-9, _ or -) and carry on "
+              "--blocks \"<what waits on the answer>\"` (2-6 options; keys lowercase a-z, 0-9, _ or -), or the "
+              "levain_band `ask` tool with the same four fields, and carry on "
               "with what it does not block; the answer arrives in your context at a later tool call. Do not do what "
               "it blocks until then. If nothing else is unblocked, say so in your reply and end your turn: do not "
               "poll for the answer.")

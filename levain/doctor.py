@@ -2967,8 +2967,32 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
         results.append(_check_mcp_command(
             ".mcp.json anneal_memory", server.get("command"), server.get("args", []), install
         ))
+    servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
+    results.append(_check_band_server(
+        ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
 
     return results
+
+
+BAND_ROW = "levain_band MCP registered"
+
+
+def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
+    """QMCP R-q22: the question band's MCP server is registered as levain writes it. Advisory only (a WARN, never a
+    FAIL): an agent files questions with `levain ask` without it."""
+    from levain.install import BAND_SERVER, _is_levain_launcher
+
+    if not isinstance(server, dict):
+        return CheckResult(BAND_ROW, True, f"missing from {where}: the agent can still file questions with "
+                                           f"`levain ask`, not with the `ask` tool", "levain update", warn=True)
+    if not _is_levain_launcher({"mcp_servers": {BAND_SERVER: server}}, None, server=BAND_SERVER, agent=agent):
+        args = server.get("args")
+        shown = " ".join(str(a) for a in args) if isinstance(args, list) else repr(args)
+        return CheckResult(BAND_ROW, True, f"{where} starts it as `{server.get('command')} {shown}`, not levain's "
+                                           f"launcher (<python> -P -m levain.consent.band_mcp --agent {agent})",
+                           "levain update", warn=True)
+    return CheckResult(BAND_ROW, True, f"{where}: {server.get('command')} -P -m levain.consent.band_mcp "
+                                       f"--agent {agent}")
 
 
 def _codex_takeover_hint(install: Path) -> str:
@@ -3182,6 +3206,9 @@ def _check_codex(install: Path) -> list[CheckResult]:
             "config.toml [mcp_servers.anneal_memory]", server.get("command"),
             server.get("args", []), install,
         ))
+    servers = config.get("mcp_servers")
+    results.append(_check_band_server(
+        "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex"))
 
     return results
 

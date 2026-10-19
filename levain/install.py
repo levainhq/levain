@@ -2001,11 +2001,32 @@ def _claude_code_files(
     # that serves memory is structurally the one levain imports.
     mcp_text = _fill(mcp_text, {"INSTALL_DIR": _string_body(str(install)),
                                 "PYTHON": _string_body(python_path)})
+    mcp_text = _with_band_server(mcp_text, adapter_root, python_path)
     return {
         install / "CLAUDE.md": claude_md,
         install / ".claude" / "settings.json": settings_text,
         install / ".mcp.json": mcp_text,
     }
+
+
+# The question band's MCP server (QMCP R-q20): registered for the operator's agents only. Claude Code's comes from
+# its own fragment, merged into the WORKSPACE .mcp.json rendered here; the hosted template mcp.template.json stays
+# exactly anneal_memory, because host_guard.cc_mcp_config (Levain's own hands' confinement check) asserts that.
+BAND_SERVER = "levain_band"
+_BAND_ARGS = ("-P", "-m", "levain.consent.band_mcp", "--agent")
+
+
+def _with_band_server(mcp_text: str, adapter_root: Path, python_path: str) -> str:
+    """The rendered workspace ``.mcp.json`` text with the ``levain_band`` server from
+    ``mcp.band.template.json`` merged into its ``mcpServers`` (two-space JSON, one trailing newline)."""
+    band_text = _fill((adapter_root / "mcp.band.template.json").read_text(encoding="utf-8"),
+                      {"PYTHON": _string_body(python_path)})
+    try:
+        tree, band_tree = json.loads(mcp_text), json.loads(band_text)
+        tree["mcpServers"].update(band_tree["mcpServers"])
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise InitError(f"the claude-code MCP templates could not be merged: {e}") from e
+    return json.dumps(tree, indent=2, ensure_ascii=False) + "\n"
 
 
 # The consent hook (S1436): `init` and `update` wire Claude Code's and Codex's PermissionRequest hook into the same
@@ -2707,7 +2728,8 @@ def _install_codex(
     codex_home.mkdir(parents=True, exist_ok=True)
     with codex_home_lock(codex_home):
         hooks_text = _codex_hooks_json(adapter_root, python_path, install)
-        _write_codex_pair(codex_home, _codex_fragment(adapter_root, python_path, install), hooks_text, emit)
+        _write_codex_pair(codex_home, _codex_fragment(adapter_root, python_path, install), hooks_text, emit,
+                          band_fragment=_codex_band_fragment(adapter_root, python_path))
         trusted = _trust_codex_hooks(codex_home, hooks_text, emit)
 
     emit("  Codex adapter installed.")
@@ -2839,6 +2861,9 @@ def record_adapter_receipt(
         block = _codex_block_hash(_codex_fragment(codex_root, python_path, install))
         if block is not None:
             extra[CODEX_CONFIG_KEY] = block
+        band_block = _codex_band_block(_codex_band_fragment(codex_root, python_path))
+        if band_block is not None:
+            extra[CODEX_BAND_KEY] = _sha256_text(band_block)
     try:
         _write_adapter_receipt(install, {
             **{_adapter_key(install, target): _sha256_text(text)
@@ -3094,6 +3119,7 @@ def _refresh_adapter(
         if adapter == "codex":
             _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
+            _refresh_codex_band(install, adapter_root, python_path, apply=apply, out=out, lines=lines)
             if apply:
                 # still under the codex home lock: trust only the file levain rendered for this install
                 if not _trust_codex_hooks(_codex_home(), _codex_hooks_json(adapter_root, python_path, install),
@@ -3444,6 +3470,173 @@ def _codex_fragment(adapter_root: Path, python_path: str, install: Path) -> str:
                             "INSTALL_DIR": _string_body(str(install))})
 
 
+CODEX_BAND_KEY = "codex-home/config.toml#levain_band"
+_CODEX_BAND_PENDING = "codex-home/config.toml.levain_band"
+
+
+def _codex_band_fragment(adapter_root: Path, python_path: str) -> str:
+    fragment = (adapter_root / "mcp.band.template.toml").read_text(encoding="utf-8")
+    return _fill(fragment, {"PYTHON": _string_body(python_path)})
+
+
+def _codex_band_block(text: str) -> str | None:
+    """``text``'s ``[mcp_servers.levain_band]`` block, normalised to one trailing newline, or None."""
+    m = _CODEX_BAND_BLOCK_RE.search(text)
+    return None if m is None else m.group(0).rstrip() + "\n"
+
+
+def _without_band_keys(parsed: dict | None) -> dict | None:
+    """`parsed` with the keys levain writes (``command``, ``args``) removed from the levain_band table."""
+    if parsed is None:
+        return None
+    servers = dict(parsed.get("mcp_servers") or {})
+    server = servers.get(BAND_SERVER)
+    if isinstance(server, dict):
+        servers[BAND_SERVER] = {k: v for k, v in server.items() if k not in _LEVAIN_OWNED_CODEX_KEYS}
+    return {**parsed, "mcp_servers": servers}
+
+
+def _codex_band_is_levains(block: str, new_block: str) -> bool:
+    """Whether ``block`` is a band registration levain itself writes: its launcher (R-q21) and nothing the
+    operator added beside it."""
+    old_dict, new_dict = _codex_block_dict(block), _codex_block_dict(new_block)
+    return (_is_levain_launcher(old_dict, None, server=BAND_SERVER, agent="codex")
+            and _without_band_keys(old_dict) == _without_band_keys(new_dict))
+
+
+def _merge_codex_band(path: Path, fragment: str, *, judge: bool,
+                      emit: Callable[[str], None] = print) -> str:
+    """Insert/replace the ``[mcp_servers.levain_band]`` block in codex's config.toml (QMCP R-q20), beside the
+    anneal_memory block, by its own regex. With ``judge`` (init), an existing block that is not levain's own
+    launcher (:func:`_codex_band_is_levains`) is the operator's: it is kept and said so, never replaced. Without it
+    (update, which judged already against the receipt) the block is replaced. A replaced block is copied aside
+    first; the write is atomic, keeps the file's mode and writes through a symlink, as `_merge_codex_config` does.
+    Returns "current", "kept", "added" or "replaced"."""
+    new_block = _codex_band_block(fragment)
+    if new_block is None:
+        return "current"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    old = _CODEX_BAND_BLOCK_RE.search(existing)
+    if old is not None:
+        old_text = old.group(0).rstrip() + "\n"
+        if old_text == new_block:
+            return "current"
+        if judge and not _codex_band_is_levains(old_text, new_block):
+            server = ((_codex_block_dict(new_block) or {}).get("mcp_servers") or {}).get(BAND_SERVER) or {}
+            emit(f"  {path} [mcp_servers.levain_band]: yours is kept (it is not the launcher levain writes). "
+                 f"levain's starts the question band as: {server.get('command')} "
+                 f"{' '.join(str(a) for a in server.get('args') or [])}")
+            return "kept"
+        merged = _CODEX_BAND_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
+    else:
+        merged = existing
+        if merged and not merged.endswith("\n"):
+            merged += "\n"
+        # No blank line straight after the anneal block: its regex runs to the next table header, so a re-init's
+        # replace of that block would eat the blank line and a re-run would not be byte-identical.
+        anneal = _CODEX_MCP_BLOCK_RE.search(merged)
+        if merged and not merged.endswith("\n\n") and not (anneal and anneal.end() == len(merged)):
+            merged += "\n"
+        merged += new_block
+    prior_unparsed = _require_toml(merged, path, existing or None)
+    bak: Path | None = None
+    if old is not None:
+        bak = _timestamped_backup_path(path)
+        try:
+            shutil.copy2(path, bak)
+        except OSError as e:
+            raise InitError(f"could not back up {path} ({e}) before replacing its levain_band block. "
+                            f"Refusing to change it without a copy.") from e
+    if not path.exists():
+        _atomic_write_text(path, merged)
+    else:
+        target = path.resolve()
+        tmp = target.with_name(f"{target.name}.levain-new-{time.time_ns()}")
+        try:
+            tmp.write_text(merged, encoding="utf-8")
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            raise InitError(f"could not write {path} ({e}). Its levain_band block is unchanged.") from e
+    if prior_unparsed is not None:
+        emit(f"  ! {path} did not parse as TOML before levain changed it, and still does not "
+             f"({prior_unparsed}). levain's block is in it; check the file with codex.")
+    if bak is not None:
+        emit(f"  Codex's levain_band registration in {path} was updated; the previous config is copied at {bak}")
+        return "replaced"
+    return "added"
+
+
+def _refresh_codex_band(
+    install: Path,
+    adapter_root: Path,
+    python_path: str,
+    *,
+    apply: bool,
+    out: AdapterRefresh,
+    lines: list[str],
+) -> None:
+    """config.toml's ``[mcp_servers.levain_band]`` block on `levain update` (QMCP R-q20/R-q21), the anneal
+    block's rule: only while codex's anneal_memory registration names THIS install's store (the block is
+    machine-global, and another install owns it otherwise); added when absent; replaced when it is the block levain
+    recorded writing, or (no record) levain's own launcher with nothing of the operator's beside it; otherwise kept,
+    the new block staged under .levain/pending/ and listed once."""
+    config = _codex_home() / "config.toml"
+    try:
+        existing = _read_or_none(config)
+    except _Unreadable:
+        return  # _refresh_codex_config has said so already
+    if not existing:
+        return
+    anneal = _CODEX_MCP_BLOCK_RE.search(existing)
+    ours = _codex_block_store(_codex_fragment(adapter_root, python_path, install))
+    if anneal is None or ours is None or _codex_block_store(anneal.group(0)) != ours:
+        return
+    fragment = _codex_band_fragment(adapter_root, python_path)
+    new_text = _codex_band_block(fragment)
+    if new_text is None:
+        return
+    old_text = _codex_band_block(existing)
+    if old_text == new_text:
+        if apply:
+            _drop_pending(install, _CODEX_BAND_PENDING, lines, out.review)
+        return
+    record = (_read_adapter_receipt(install) or {}).get(CODEX_BAND_KEY)
+    if old_text is None:
+        levains = True
+    elif record is not None:
+        levains = _sha256_text(old_text) == record
+    else:
+        levains = _codex_band_is_levains(old_text, new_text)
+    if not levains:
+        if record == _sha256_text(new_text):
+            return  # already listed once against this version
+        out.review.append(CODEX_BAND_KEY)
+        where = install.joinpath(*PENDING_REL, "codex-home", "config.toml.levain_band")
+        if apply:
+            try:
+                _put_pending(install, _CODEX_BAND_PENDING, new_text.encode("utf-8"))
+                _record_adapter_key(install, CODEX_BAND_KEY, _sha256_text(new_text))
+            except OSError as e:
+                lines.append(f"  {config}: could not stage levain's levain_band block ({e}).")
+                return
+        lines.append(f"  {config} [mcp_servers.levain_band]: yours is kept (it carries settings levain did "
+                     f"not write), and this levain renders it differently, now at {where}. Merge it in. "
+                     f"Listed once.")
+        return
+    out.refreshed.append(f"{config} [mcp_servers.levain_band]")
+    if apply:
+        try:
+            _merge_codex_band(config, fragment, judge=False, emit=lines.append)
+            _record_adapter_key(install, CODEX_BAND_KEY, _sha256_text(new_text))
+            _drop_pending(install, _CODEX_BAND_PENDING, lines, out.review)
+        except (OSError, InitError) as e:
+            out.refreshed.pop()
+            out.review.append(CODEX_BAND_KEY)
+            lines.append(f"  {config}: could not be written ({getattr(e, 'message', None) or e}).")
+
+
 def _splice_codex_block(existing: str, new_block: str) -> str:
     """``existing`` with its ``[mcp_servers.anneal_memory]`` block replaced by ``new_block``,
     or ``new_block`` appended after a blank line when there is none."""
@@ -3609,6 +3802,20 @@ def _levain_render_variant(
             for tree in (x, y, v):
                 tree["mcpServers"]["anneal_memory"].pop("command", None)
                 tree["mcpServers"]["anneal_memory"].pop("args", None)
+            # The band server (QMCP R-q21), the same rule: its launcher is set aside only while it is levain's own
+            # (interpreter + `-P -m levain.consent.band_mcp --agent claude_code`, nothing else). A render from
+            # before the band carries no entry at all: an earlier release's render, so the entry this release
+            # adds is not held against it.
+            if BAND_SERVER in x["mcpServers"]:
+                if not _is_levain_launcher({"mcp_servers": {BAND_SERVER: x["mcpServers"][BAND_SERVER]}}, None,
+                                           server=BAND_SERVER, agent="claude_code"):
+                    return False
+                for tree in (x, y, v):
+                    tree["mcpServers"][BAND_SERVER].pop("command", None)
+                    tree["mcpServers"][BAND_SERVER].pop("args", None)
+            else:
+                for tree in (y, v):
+                    tree["mcpServers"].pop(BAND_SERVER, None)
         except (KeyError, TypeError, AttributeError, ValueError):
             return False
 
@@ -3993,7 +4200,7 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
 
 
 def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
-                     emit: Callable[[str], None]) -> None:
+                     emit: Callable[[str], None], band_fragment: str | None = None) -> None:
     """Write codex's two machine-global files as one unit, under :func:`codex_home_lock`
     held by the caller. Both texts are rendered before either file is touched. config.toml
     goes first, so its parse refusal (``_require_toml``, judged on the exact text written)
@@ -4029,6 +4236,8 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     try:
         try:
             _merge_codex_config(config, fragment, emit=notes.append)
+            if band_fragment is not None:  # the question band's block beside anneal's (QMCP R-q20)
+                _merge_codex_band(config, band_fragment, judge=True, emit=notes.append)
             ours = _file_identity(written)
             _write_codex_hooks(hooks, hooks_text, notes.append)
         except BaseException:
@@ -4958,6 +5167,13 @@ _CODEX_MCP_BLOCK_RE = re.compile(
 )
 
 
+# The `[mcp_servers.levain_band]` table (QMCP R-q20): its own regex, the anneal one's shape, never a
+# generalisation of it, so a change to either block's matching cannot move the other's.
+_CODEX_BAND_BLOCK_RE = re.compile(
+    r"(?ms)^\[mcp_servers\.levain_band\][^\n]*\n(?:(?!^\[)[^\n]*\n?)*",
+)
+
+
 def _codex_block_dict(block: str) -> dict | None:
     """The parsed TOML of a codex `[mcp_servers.anneal_memory]` block, or None if
     it does not parse.
@@ -4993,12 +5209,27 @@ def _without_levain_keys(parsed: dict | None) -> dict | None:
     return {**parsed, "mcp_servers": servers}
 
 
-def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
+def _is_levain_launcher(parsed: dict | None, store: str | None, *, server: str = "anneal_memory",
+                        agent: str | None = None) -> bool:
     """Whether the anneal_memory server table launches `store` exactly as a levain `init`
     wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, the pre-KL-19
     `<python> -P -m anneal_memory --db <store> serve`, or the current
     `<python> -P -m anneal_memory --db <store> serve --session-id levain`. Any other launcher
-    was chosen by someone, and replacing it is replacing their customisation."""
+    was chosen by someone, and replacing it is replacing their customisation.
+
+    With ``server="levain_band"`` (QMCP R-q21) the question band's server instead: a Python interpreter and
+    `-P -m levain.consent.band_mcp --agent <agent>`, nothing else (``agent`` one of the band's agents, and when
+    given, that one). ``store`` is not read for it: the band names no store."""
+    if server == BAND_SERVER:
+        from levain.consent.band import _AGENT_NAMES
+
+        table = ((parsed or {}).get("mcp_servers") or {}).get(BAND_SERVER) or {}
+        command, args = table.get("command"), table.get("args")
+        if not isinstance(command, str) or not isinstance(args, list) or len(args) != len(_BAND_ARGS) + 1:
+            return False
+        return (tuple(args[:-1]) == _BAND_ARGS and args[-1] in _AGENT_NAMES
+                and (agent is None or args[-1] == agent)
+                and _PYTHON_NAME.fullmatch(Path(command).name) is not None)
     if parsed is None or store is None:
         return False
     from levain.manifest import ANNEAL_SESSION_ID
