@@ -76,6 +76,11 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .row.dispatch summary { min-height: var(--hit-min); padding: var(--sp-3) 0; box-sizing: border-box; cursor: pointer;
                         font: 600 13px/1.4 var(--round); color: var(--label); }
 .row.dispatch ul { margin: var(--sp-2) 0 var(--sp-3); padding-left: var(--sp-5); }
+.row.dispatch .bound { margin-top: var(--sp-2); }
+.row.dispatch input.reason { width: 100%; box-sizing: border-box; min-height: var(--hit-min); margin-top: var(--sp-4);
+                             font: 15px/1.4 var(--round); color: inherit; background: var(--card-2);
+                             border: 1px solid var(--hair-2); border-radius: var(--r-md); padding: 10px; }
+.row.dispatch input.reason[hidden] { display: none; }
 .req-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .tool { font: 700 16px/1.25 var(--round); letter-spacing: -.01em; overflow-wrap: anywhere; }
 .tier { font: 600 11px/1 var(--mono); letter-spacing: var(--track-caps); border: 1px solid var(--hair-2); color: var(--label);

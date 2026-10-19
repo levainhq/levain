@@ -7,6 +7,7 @@ own challenge, ``navigator.credentials.get`` and answer reach the job store, whi
 from __future__ import annotations
 
 import base64
+import re
 import shutil
 from pathlib import Path
 
@@ -31,6 +32,8 @@ PROBE = """(() => {
   return { cls: c.className, title: c.querySelector('.title').textContent,
            chips: [...c.querySelectorAll('.chips .chip')].map(x => x.textContent),
            goal: c.querySelector('pre.display').textContent, facts: c.querySelector('.facts').textContent,
+           sent: c.querySelector('.sent').textContent, bound: [...det.querySelectorAll('.bound')].map(x => x.textContent),
+           reason: c.querySelector('input.reason').hidden,
            digest: c.querySelector('.dg-val').title, summary: det.querySelector('summary').textContent, open: det.open,
            paths: [...det.querySelectorAll('li')].map(x => x.textContent),
            buttons: btn.map(b => ({ text: b.textContent, cls: b.className, w: Math.round(b.getBoundingClientRect().width),
@@ -53,10 +56,23 @@ def test_the_card_shows_what_is_signed_and_offers_sign_and_cancel_at_equal_weigh
     got = out["values"][-1]
     assert "row" in got["cls"].split() and "dispatch" in got["cls"].split()
     assert got["chips"][0] == "dispatch" and "claude_code" in got["chips"]
-    assert any(ch.startswith("lapses ") for ch in got["chips"])                 # unsigned: its lease is its expiry
+    # unsigned: "sign by" its lease end, and the contract's expiry, both read as local time to the minute
+    (sign_by,) = [ch for ch in got["chips"] if ch.startswith("sign by ")]
+    (expires,) = [ch for ch in got["chips"] if ch.startswith("contract expires ")]
+    for chip in (sign_by, expires):
+        assert re.search(r"\d:\d\d", chip) and not re.search(r"\d{4}-\d\d-\d\dT|:\d\d\.\d|Z$", chip), chip
     assert got["goal"] == c.goal                                                 # in full, tabs and lines kept
     for fact in ("fix-lint", "R0", "glm-5, kimi-k2 (k=2)", "40 tool calls", "200000 tokens", "150 cents", "black-box"):
         assert fact in got["facts"], fact
+    t = c.template
+    # where the files leave the machine, on the closed card
+    assert got["sent"] == f"sent to {t.provider} via {t.route} \u00b7 executor {t.executor}"
+    bound = "\n".join(got["bound"])
+    for field in (t.content_hash, t.verifier_hash, c.policy_hash, c.base_tree, "codex 0.50.0", "(not signed)",
+                  *t.write_paths, job.filed_at, job.lease_end):
+        assert field in bound, field
+    assert any(line.startswith("history 1 filed") for line in got["bound"])
+    assert got["reason"] is True                                                 # the reason field waits on Cancel
     assert got["digest"] == job.digest
     assert got["open"] is False and f"reads {len(c.read)}" in got["summary"] and f"writes {len(c.write)}" in got["summary"]
     assert any("src/new.py" in p and "new file" in p for p in got["paths"])
@@ -91,14 +107,53 @@ def test_the_page_signs_then_cancels_a_job_with_the_passkey(world, tmp_path: Pat
             {"until": f"/^signed/.test({NOTE}) && {NOTE}"},
             # the card is redrawn signed: Sign is gone, Cancel stays
             {"until": "document.querySelector('article.dispatch') && ![...document.querySelectorAll('article.dispatch .acts button')].some(b => /^Sign/.test(b.textContent)) && 1", "ms": 8000},
-            {"eval": "[...document.querySelectorAll('article.dispatch .acts button')].find(b => /^Cancel/.test(b.textContent)).click() || 1"},
+            # Cancel's first tap opens the optional reason; nothing is asked of the server yet
+            {"eval": CANCEL_TAP},
+            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.value = 'wrong files';"
+                     " i.dispatchEvent(new Event('input')); return !i.hidden; })()"},
+            {"eval": CANCEL_TAP},
             {"until": f"/^cancelled/.test({NOTE}) && {NOTE}"},
         ])
-    signed, cancelled = out["values"][2], out["values"][5]
+    signed, opened, cancelled = out["values"][2], out["values"][5], out["values"][7]
+    assert opened is True, out
     assert isinstance(signed, str) and world["phone"].fp in signed, out
     assert isinstance(cancelled, str) and cancelled.startswith("cancelled"), out
     routes = [p.split(" ", 1)[0] for p in out["posts"]]
     assert routes == [f"/dispatch/{job.id}/challenge", f"/dispatch/{job.id}/answer",
                       f"/dispatch/{job.id}/cancel-challenge", f"/dispatch/{job.id}/cancel"], routes
+    assert '"reason":"wrong files"' in out["posts"][2], out["posts"]     # the typed reason is what is signed
     final = store.get(job.id)
     assert final.state == "cancelled" and final.signer_fp == world["phone"].fp
+
+
+CANCEL_TAP = "[...document.querySelectorAll('article.dispatch .acts button')].find(b => /^Cancel/.test(b.textContent)).click() || 1"
+SIGN_TAP = CANCEL_TAP.replace("^Cancel", "^Sign")
+
+
+@needs_browser
+def test_the_passkey_picker_names_the_act_it_signs(world, tmp_path: Path) -> None:
+    import sqlite3
+
+    from tests.test_dispatch_phone import SoftPasskey
+    from tests.test_phone_server import _enrol
+
+    job = file_job(world)
+    other = SoftPasskey()
+    conn = sqlite3.connect(world["root"] / "cockpit.db", isolation_level=None)
+    _enrol(conn, world["root"], tmp_path / "laptop", world["laptop_fp"],
+           {"op": "enrol", "fingerprint": other.fp, "public_key": other.line, "class": "display-phone", "custody": "passkey"})
+    conn.close()
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": SIGN_TAP},
+            {"eval": NOTE},
+            {"eval": CANCEL_TAP},
+            {"eval": CANCEL_TAP},
+            {"eval": NOTE},
+        ])
+    sign_pick, cancel_pick = out["values"][2], out["values"][5]
+    assert sign_pick.startswith(f"pick a passkey to SIGN job {job.id}"), sign_pick
+    assert cancel_pick.startswith(f"pick a passkey to CANCEL job {job.id}"), cancel_pick
+    assert out["posts"] == []                                   # a pick is asked for before anything is sent

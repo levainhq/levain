@@ -33,7 +33,6 @@ PENDING_CAP = 20
 _ANSWER_KEYS = frozenset({"payload", "authenticator_data", "client_data_json", "signature"})
 _NEED = {"challenge": frozenset({"signer_fp"}), "answer": _ANSWER_KEYS,
          "cancel-challenge": frozenset({"signer_fp", "reason"}), "cancel": _ANSWER_KEYS}
-_TEMPLATE_KEYS = ("id", "tier", "executor", "models", "k", "verifier_id", "verifier_kind")
 
 
 class DispatchRefused(Exception):
@@ -90,41 +89,49 @@ class DispatchPhone:
 
     # --- the listing -----------------------------------------------------------------------------------------------
     def record(self, job: Any, now: str, signers: list[str], signer_note: str) -> dict[str, Any]:
-        """One job as the card shows it (the fields of :func:`levain.dispatch.cli.job_view` a signer reads)."""
+        """One job as the card shows it: every field of :func:`levain.dispatch.cli.job_view` (what ``levain dispatch
+        show`` prints), the filer under ``agent`` and ``session``, plus what the card acts on."""
+        from levain.dispatch.cli import job_view
         from levain.dispatch.jobs import TERMINAL
 
-        c = job.contract
-        t = c.template.to_mapping()
-        read = [e.to_mapping() for e in c.read]
-        write = [e.to_mapping() for e in c.write]
-        return {"id": job.id, "state": job.state, "kind": "dispatch", "agent": job.filer_agent,
-                "session": job.filer_session, "filed_at": job.filed_at, "expires_at": c.expires_at,
-                "lease_end": job.lease_end, "digest": job.digest, "repo": c.repo, "base": c.base, "goal": c.goal,
-                "template": {k: t[k] for k in _TEMPLATE_KEYS}, "budget": dict(c.budget), "grant": list(c.grant),
-                "read": read, "write": write, "read_count": len(read), "write_count": len(write),
-                "can_sign": job.state == "filed" and job.lease_end > now, "can_cancel": job.state not in TERMINAL,
-                "signers": signers, "signer_note": signer_note}
+        v = job_view(job)
+        out = {k: v[k] for k in v if k not in ("filer_agent", "filer_session")}
+        out.update({"kind": "dispatch", "agent": v["filer_agent"], "session": v["filer_session"],
+                    "read_count": len(v["read"]), "write_count": len(v["write"]),
+                    "can_sign": job.state == "filed" and job.lease_end > now, "can_cancel": job.state not in TERMINAL,
+                    "signers": signers, "signer_note": signer_note})
+        return out
 
     def pending(self) -> tuple[list[dict[str, Any]], str | None, int]:
         """``(records, note, overflow)``: every live job, newest first, at most :data:`PENDING_CAP`, the rest counted.
-        No store is ``([], None, 0)``; a store that cannot be read is ``([], why, 0)``, never an empty list alone."""
+        No store is ``([], None, 0)``; a store that cannot be read (a dispatch directory that is a file included) is
+        ``([], why, 0)``, never an empty list alone. A job whose stored row cannot be read is left off and counted in
+        the note; the rest are listed."""
         from levain.cockpit.consent import utc_stamp
         from levain.dispatch import DispatchError
         from levain.dispatch.jobs import TERMINAL
 
-        store = self._store()
-        if store is None:
-            return [], None, 0
         try:
+            store = self._store()
+            if store is None:
+                return [], None, 0
             live = [j for j in store.list() if j.state not in TERMINAL]
             live.sort(key=lambda j: (j.filed_at, j.id), reverse=True)
             shown = live[:PENDING_CAP]
             signers, note = self._signers() if shown else ({}, "")
             now = utc_stamp(self._clock())
-            rows = [self.record(j, now, list(signers), note) for j in shown]
         except (DispatchError, OSError, sqlite3.Error) as exc:
             return [], f"the dispatch store cannot be read: {type(exc).__name__}: {exc}", 0
-        return rows, None, max(len(live) - PENDING_CAP, 0)
+        rows: list[dict[str, Any]] = []
+        bad: list[str] = []
+        for j in shown:
+            try:
+                rows.append(self.record(j, now, list(signers), note))
+            except (DispatchError, ValueError, KeyError, TypeError) as exc:
+                bad.append(f"{j.id} ({type(exc).__name__})")
+        skipped = None if not bad else (f"{len(bad)} dispatch job{'s' if len(bad) != 1 else ''} could not be read "
+                                        f"and {'are' if len(bad) != 1 else 'is'} not shown: {', '.join(bad)}")
+        return rows, skipped, max(len(live) - PENDING_CAP, 0)
 
     # --- the ceremonies --------------------------------------------------------------------------------------------
     def step(self, job_id: str, action: str, req: Any) -> dict[str, Any]:

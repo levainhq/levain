@@ -167,8 +167,9 @@ def test_a_record_carries_what_the_card_shows_and_only_signers_that_cover_t2(wor
     assert r["goal"] == c.goal and "\n" in r["goal"]                          # the goal in full, never cut
     assert r["digest"] == job.digest and r["repo"] == c.repo and r["base"] == c.base
     assert r["filed_at"] == job.filed_at and r["expires_at"] == c.expires_at and r["lease_end"] == job.lease_end
-    assert r["template"] == {"id": "fix-lint", "tier": "R0", "executor": "codex", "models": ["glm-5", "kimi-k2"], "k": 2,
-                             "verifier_id": "pytest-bb", "verifier_kind": "black-box"}
+    assert r["template"] == c.template.to_mapping()
+    assert (r["template"]["id"], r["template"]["executor"], r["template"]["provider"]) == ("fix-lint", "codex",
+                                                                                            "openrouter")
     assert r["budget"] == {"tool_calls": 40, "tokens": 200000, "dollars_cents": 150}
     assert r["grant"] == ["Edit", "Write"]
     assert [e["path"] for e in r["write"]] == ["src/a.py", "src/new.py"] and r["write_count"] == 2
@@ -319,3 +320,76 @@ def test_faults_are_503_and_say_nothing_was_signed(world, monkeypatch) -> None:
     err = refused(dp.step, job.id, "cancel", {"payload": cc["payload"], **world["phone"].assertion(cc["challenge"])})
     assert err.status == 503 and f"job {job.id} is NOT cancelled" in err.message
     assert JobStore(world["qdir"]).get(job.id).state == "filed"
+
+
+# --- fix round 1 -----------------------------------------------------------------------------------------------------
+
+def test_the_record_carries_every_field_the_laptop_render_shows(world) -> None:
+    """What the signature binds is on the card: every field of job_view (the fields render prints) is in the record,
+    under its own name (the filer under the card's ``agent`` and ``session``)."""
+    from levain.dispatch.cli import job_view
+
+    job = file_job(world)
+    (r,) = phone_for(world).pending()[0]
+    view = job_view(JobStore(world["qdir"]).get(job.id))
+    alias = {"filer_agent": "agent", "filer_session": "session"}
+    for k, v in view.items():
+        assert r[alias.get(k, k)] == v, k
+    t = r["template"]
+    assert (t["executor"], t["provider"], t["route"]) == (job.contract.template.executor,
+                                                          job.contract.template.provider, job.contract.template.route)
+
+
+def test_a_dispatch_dir_that_is_a_file_is_a_note_never_a_raise(world, tmp_path: Path) -> None:
+    flat = tmp_path / "flat"
+    flat.write_text("a file, not a directory")
+    dp = DispatchPhone(flat, RP, ORIGIN, lambda: {}, lambda: world["source"])
+    records, note, overflow = dp.pending()
+    assert records == [] and overflow == 0 and note and "cannot be read" in note
+    assert flat.read_text() == "a file, not a directory"
+
+
+def test_one_malformed_stored_row_is_skipped_and_counted(world) -> None:
+    good = file_job(world, write=("src/a.py",))
+    bad = file_job(world, write=("src/new.py",))
+    conn = sqlite3.connect(world["qdir"] / DB_NAME)
+    conn.execute("DROP TRIGGER jobs_frozen")                 # the store is append-only; a damaged file is not
+    conn.execute("UPDATE jobs SET contract = ? WHERE id = ?", ("{not a contract", bad.id))
+    conn.commit()
+    conn.close()
+    records, note, overflow = phone_for(world).pending()
+    assert [r["id"] for r in records] == [good.id] and overflow == 0
+    assert note and "1 dispatch job" in note and "not shown" in note
+
+
+def test_a_lease_that_lapses_between_challenge_and_answer_is_409(world) -> None:
+    from levain.dispatch.jobs import UNSIGNED_LEASE
+
+    job = file_job(world)
+    at = [_now()]
+    dp = DispatchPhone(world["qdir"], RP, ORIGIN,
+                       lambda: {k.fingerprint: k for k in passkey_keys(world["source"](), RP)},
+                       lambda: world["source"], clock=lambda: at[0])
+    c = dp.step(job.id, "challenge", {"signer_fp": world["phone"].fp})
+    at[0] = at[0] + UNSIGNED_LEASE + timedelta(minutes=1)
+    err = refused(dp.step, job.id, "answer", {"payload": c["payload"], **world["phone"].assertion(c["challenge"])})
+    assert (err.status, err.error) == (409, "conflict") and "is failed" in err.message
+    # the lapse lands inside the store's own write (the read before it still saw the job filed): still 409
+    job2 = file_job(world, write=("src/b.py",))
+    at[0] = _now()
+    c = dp.step(job2.id, "challenge", {"signer_fp": world["phone"].fp})
+    real_get = JobStore.get
+    calls = []
+
+    def get_then_lapse(self, job_id):
+        out = real_get(self, job_id)
+        if not calls:
+            at[0] = at[0] + UNSIGNED_LEASE + timedelta(minutes=1)
+        calls.append(job_id)
+        return out
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(JobStore, "get", get_then_lapse)
+        err = refused(dp.step, job2.id, "answer", {"payload": c["payload"], **world["phone"].assertion(c["challenge"])})
+    assert (err.status, err.error) == (409, "conflict") and "nothing was signed" in err.message
+    assert JobStore(world["qdir"]).get(job2.id).state == "failed"

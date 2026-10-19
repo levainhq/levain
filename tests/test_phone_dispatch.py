@@ -143,3 +143,17 @@ def test_a_dispatch_signature_is_never_a_consent_answer_and_a_consent_answer_nev
         srv.server_close()
 
 
+
+
+def test_a_dispatch_dir_that_is_a_file_leaves_the_consent_listing_intact(world, tmp_path: Path) -> None:
+    queue = ConsentQueue(world["qdir"], authority=world["source"])
+    rid = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                     tool_input={"file_path": "/tmp/x.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5),
+                     tier="T2", event_id="dispatch-flat-1").id
+    flat = tmp_path / "flat"
+    flat.write_text("a file, not a directory")
+    with _serve(world["qdir"], flat) as (base, _):
+        status, body = _call(base + "/consent.json")
+    assert status == 200
+    assert [r["id"] for r in body["pending"]] == [rid]
+    assert body["dispatch_pending"] == [] and body["dispatch_overflow"] == 0 and "cannot be read" in body["dispatch_note"]
