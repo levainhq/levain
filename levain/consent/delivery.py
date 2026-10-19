@@ -510,7 +510,7 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     docstring). ``noun`` names the text in the reason (a ruling, a question's answer). Shared by :func:`plan` and the
     question band's delivery. ``named`` (default :func:`session_named_running`) is the last guard before a resume: a
     recorded process that has ended does not mean the SESSION has (an earlier resume, or the operator's own
-    ``codex resume``, runs under a new process), so any running process whose command line names the session id
+    ``codex resume``, runs under a new process), so any running process whose command line resumes the session id
     leaves the text to its next hook."""
     named = named if named is not None else session_named_running
     target = base_session(session)
@@ -546,7 +546,7 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
         return "hook", f"its process {pid} (started {started or 'at a time not recorded'}) may still run; {lands}", \
             (), None
     if named(target) is not False:
-        return "hook", f"a process naming this session may be running (an earlier resume, or one by hand); {lands}", \
+        return "hook", f"a process resuming this session may be running (an earlier resume, or one by hand); {lands}", \
             (), None
     why = resume_refusal(agent, target, meta)
     if why is not None:
@@ -557,19 +557,53 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
 
 
+def _resumes(tokens: list[str], session: str) -> bool:
+    """Whether the argv ``tokens`` resume ``session``: Claude Code's ``--resume <id>``, ``--resume=<id>`` or
+    ``-r <id>``, or Codex's ``resume`` subcommand (``codex resume``, ``codex exec resume``) after a ``codex`` token with
+    ``<id>`` the first UUID after it (the id precedes the prompt, so an id quoted in another resume's prompt does not
+    count). The id counts only as a whole token, never inside another (a path, a ``--session``)."""
+    for i, tok in enumerate(tokens):
+        if tok == f"--resume={session}":
+            return True
+        if tok in ("--resume", "-r") and tokens[i + 1:i + 2] == [session]:
+            return True
+        if tok == "resume" and any(os.path.basename(t) == "codex" for t in tokens[:i]):
+            first = next((t for t in tokens[i + 1:] if _UUID.fullmatch(t)), None)
+            if first is not None and first.lower() == session.lower():
+                return True
+    return False
+
+
 def session_named_running(session: str) -> bool | None:
-    """Whether a running process's command line names ``session`` (a resume of it: ``--resume=<id>``, ``codex exec
-    resume <id>``), ``None`` when the process list cannot be read (read as maybe: no resume)."""
+    """Whether a running process resumes ``session`` (:func:`_resumes`, read from ``ps``'s command lines), ``None``
+    when the process list cannot be read (read as maybe: no resume). A process that only mentions the id (``levain
+    consent rule --session <id>``, its shell, ``tail -f`` of the transcript) does not count, and this process never
+    does. An ancestor that IS a resume of the session counts: the session is then running (a hook of it delivering)."""
+    import shlex
+
     if not session_ok(session):
         return None
     try:
-        got = subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True, timeout=5,
+        got = subprocess.run(["ps", "-axww", "-o", "pid=,args="], capture_output=True, text=True, timeout=5,
                              stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return None
     if got.returncode != 0:
         return None
-    return any(session in line for line in got.stdout.splitlines())
+    me = str(os.getpid())
+    for line in got.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid == me:
+            continue
+        # ps does not quote: a prompt's apostrophe can unbalance shlex, and a quote pair can swallow tokens, so both
+        # readings are tried
+        try:
+            quoted = shlex.split(args)
+        except ValueError:
+            quoted = []
+        if _resumes(quoted, session) or _resumes(args.split(), session):
+            return True
+    return False
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:
