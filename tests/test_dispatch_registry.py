@@ -89,6 +89,9 @@ R0_PATHS = [
     ("src/latest.py", OK),
     # a known false positive, fail-safe at registration: the CamelCase rule is casefolded, so Latest.java reads as *test
     ("src/Latest.java", DENY),
+    # L3 r2 LOWs
+    ("setupTests.tsx", DENY), ("setup.cjs", DENY), ("FooIT.java", DENY), ("FooITCase.kt", DENY),
+    ("src/Commit.java", DENY),
     ("src/a.py", OK), ("src/__init__.py", OK), ("src/testing_utils.py", OK), ("src/contest.py", OK),
     ("lib/latest.py", OK), ("src/x.pyi", OK), ("web/app.tsx", OK), ("lib/mod.rs", OK), ("cmd/main.go", OK),
     ("styles/a.scss", OK), ("docs/x.md", OK), ("README.rst", OK), ("notes.txt", OK), ("LIB/B.PY", OK),
