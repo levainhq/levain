@@ -407,10 +407,14 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
     """What a later resume of this Codex session needs (:meth:`ConsentQueue.file`'s ``resume``): the hook's parent
     process when it is ``codex`` itself (Codex runs the hook command as its own child, measured on 0.162.1), with
     ``-p`` when that process is a ``codex exec`` and ``interactive`` otherwise; the event's cwd; and the CODEX_HOME
-    the session runs under (``None``: the default). Only the fields this queue's resume record accepts are kept."""
+    the session runs under (``None``: the default); and that process's option names, which a resume refuses on
+    (:func:`levain.consent.delivery.codex_unrestored`). Only the fields this
+    queue's resume record accepts are kept."""
     from levain.consent import queue as queue_module
+    from levain.consent.delivery import option_names
 
     pid: int | None = None
+    flags: str | None = None
     invocation = "interactive"
     ppid = os.getppid()
     try:
@@ -422,9 +426,10 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
         pid = ppid
         if args[1:2] == ["exec"]:
             invocation = "-p"
+        flags = option_names(" ".join(args))
     cwd, chome = event.get("cwd"), os.environ.get("CODEX_HOME", "")
     record = {"invocation": invocation, "codex_pid": pid, "cwd": cwd if isinstance(cwd, str) and cwd else None,
-              "config_dir": chome if os.path.isabs(chome) else None}
+              "config_dir": chome if os.path.isabs(chome) else None, "codex_flags": flags}
     keys = getattr(queue_module, "_RESUME_KEYS", frozenset(record))
     return {k: v for k, v in record.items() if k in keys}
 

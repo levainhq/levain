@@ -496,7 +496,9 @@ def ask_resume_meta(agent: str, session: str, *, own: str | None = None) -> dict
         return {"invocation": "-p" if "exec" in words else "interactive",
                 "codex_pid": found[0] if found and not words & {"app-server", "mcp-server"} else None,
                 "cwd": codex_rollout_cwd(Path(config_dir) if config_dir else Path.home() / ".codex", session),
-                "config_dir": config_dir}
+                "config_dir": config_dir,
+                # the options a resume refuses on (delivery.codex_unrestored); never their values
+                "codex_flags": option_names(" ".join(found[1])) if found else None}
     config = env.get("CLAUDE_CONFIG_DIR", "")
     config_dir = config if os.path.isabs(config) else None
     cwd, mode = _claude_facts(config_dir, session)

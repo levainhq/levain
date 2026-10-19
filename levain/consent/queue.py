@@ -154,7 +154,7 @@ SNOOZE_MAX_MINUTES = 7 * 24 * 60
 # how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
 INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
 _RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid",
-                          "claude_started", "claude_flags"})
+                          "claude_started", "claude_flags", "codex_flags"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _ROW_COLUMNS = _FIELDS + ("state", "decided_at", "answer", "signature", "signer_fp", "note", "via")
@@ -679,7 +679,7 @@ class ConsentQueue:
             raise ConsentError(f"resume must be a mapping of {sorted(_RESUME_KEYS)} naming the invocation")
         if resume["invocation"] not in INVOCATIONS:
             raise ConsentError(f"resume invocation must be one of {INVOCATIONS}: {resume['invocation']!r}")
-        for k in ("permission_mode", "cwd", "config_dir", "claude_started", "claude_flags"):
+        for k in ("permission_mode", "cwd", "config_dir", "claude_started", "claude_flags", "codex_flags"):
             if k in resume and resume[k] is not None and not (isinstance(resume[k], str) and resume[k]):
                 raise ConsentError(f"resume {k} must be a non-empty string or None")
         for k in ("codex_pid", "claude_pid"):
@@ -699,7 +699,8 @@ class ConsentQueue:
         session in the store, so filing the same event again raises, at any time. ``resume`` is what a later
         resume of the session needs (``permission_mode``, ``invocation`` one of :data:`INVOCATIONS`,
         ``codex_pid`` / ``claude_pid`` the agent's process, ``claude_started`` / ``claude_flags`` that process's
-        start time and the option names on its command line (never their values) as the OS reported them, ``cwd`` the directory the session was started in,
+        start time and the option names on its command line (never their values) as the OS reported them,
+        ``codex_flags`` the same option names for a Codex process, ``cwd`` the directory the session was started in,
         ``config_dir`` the agent's config directory, ``None`` for its default), written with the request in its transaction and
         read back by :meth:`resume_meta`; unsigned, never authority."""
         meta = self._resume_record(resume)

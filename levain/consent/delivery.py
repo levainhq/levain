@@ -91,6 +91,18 @@ _UNRESTORED = ("--settings", "--mcp-config", "--strict-mcp-config", "--add-dir",
                "--permission-prompt-tool", "--setting-sources")
 # the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
 _BYPASS_FLAG = "--dangerously-skip-permissions"
+# Codex: `codex exec resume` takes no -s and runs under config.toml's sandbox_mode, not the original's [measured:
+# 1019+1, codex-cli 0.162.1: an exec started -s read-only was resumed workspace-write]. So the resume restores the
+# sandbox the session last ran under, read from Codex's own rollout (its last turn_context's sandbox_policy, never
+# the command line as ps shows it, where a prompt's words cannot be told from options), with -c sandbox_mode;
+# --skip-git-repo-check is carried; and any other option on the original command line refuses the resume unless it
+# is on this list of ones that change no confinement, approval or rules (fail closed: an option a later Codex adds
+# is refused until it is judged here). A prompt word that looks like an option refuses the resume, except
+# --skip-git-repo-check, which then skips a check the original already passed by running in that directory.
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+_CODEX_CARRIED = ("--skip-git-repo-check",)
+_CODEX_NEUTRAL = ("--json", "-o", "--output-last-message", "-m", "--model", "-i", "--image", "--color",
+                  "--output-schema", "--strict-config", "--ephemeral", "--no-alt-screen", "-s", "--sandbox")
 # a session id: Claude Code's and Codex's are UUIDs; a subagent's key adds ``#agent:<id>``
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -298,6 +310,41 @@ def unrestored_flags(flags: str, mode: str | None) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def codex_rollout_sandbox(meta: Mapping[str, Any], thread: str) -> str | None:
+    """The sandbox mode the Codex thread last ran under, from its one rollout under the recorded config directory
+    (``<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl``): the ``sandbox_policy`` type of its last
+    ``turn_context`` record, or ``None`` (no single rollout, none recorded, a mode not in :data:`CODEX_SANDBOXES`)."""
+    if not session_ok(thread):
+        return None
+    config = meta.get("config_dir")
+    chome = Path(config) if isinstance(config, str) and os.path.isabs(config) else Path.home() / ".codex"
+    try:
+        found = list((chome / "sessions").glob(f"*/*/*/rollout-*-{thread}.jsonl"))
+        if len(found) != 1:
+            return None
+        mode: str | None = None
+        with found[0].open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"turn_context"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                payload = rec.get("payload") if isinstance(rec, dict) and rec.get("type") == "turn_context" else None
+                policy = payload.get("sandbox_policy") if isinstance(payload, dict) else None
+                mode = policy.get("type") if isinstance(policy, dict) else None
+    except OSError:
+        return None
+    return mode if mode in CODEX_SANDBOXES else None
+
+
+def codex_unrestored(flags: str) -> list[str]:
+    """The options of an original Codex command line (:func:`option_names`) that a resume would not carry over."""
+    ok = (*_CODEX_CARRIED, *_CODEX_NEUTRAL)
+    return list(dict.fromkeys(t.partition("=")[0] for t in flags.split()[1:] if t.partition("=")[0] not in ok))
+
+
 def resume_refusal(agent: str, session: str, meta: Mapping[str, Any]) -> str | None:
     """Why the ended session ``session`` (its resumable id) is not resumed on what was recorded at filing, or
     ``None`` (see the module docstring)."""
@@ -307,6 +354,14 @@ def resume_refusal(agent: str, session: str, meta: Mapping[str, Any]) -> str | N
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         return f"its start directory {cwd!r} is not an existing absolute directory"
     if agent != _CLAUDE:
+        flags = meta.get("codex_flags")
+        if not isinstance(flags, str) or not flags:
+            return "its original command line was not recorded, so what a resume would drop cannot be told"
+        dropped = codex_unrestored(flags)
+        if dropped:
+            return f"it was started with {', '.join(dropped)}, which a resume does not carry over"
+        if codex_rollout_sandbox(meta, session) is None:
+            return "the sandbox it ran under could not be read from its rollout, so a resume could run under a looser one"
         return None
     if not _transcript(meta, session).is_file():
         return "no transcript of it is where Claude Code keeps it for that config directory and start directory"
@@ -338,7 +393,14 @@ def _resume_argv(agent: str, session: str, meta: Mapping[str, Any], env: Mapping
             argv += ["--permission-mode", mode]
         return argv
     exe = _exe("codex", env)
-    return None if exe is None else [exe, "exec", "resume", session]
+    if exe is None:
+        return None
+    sandbox = codex_rollout_sandbox(meta, session)
+    if sandbox is None:
+        return None                       # never resumed under config.toml's sandbox (resume_refusal says why)
+    names = {t.partition("=")[0] for t in str(meta.get("codex_flags") or "").split()}
+    return [exe, "exec", "resume", *(f for f in _CODEX_CARRIED if f in names), "-c", f'sandbox_mode="{sandbox}"',
+            session]
 
 
 def _verified_ruling(queue: ConsentQueue, request_id: str) -> Ruling | None:

@@ -14,6 +14,7 @@ import uuid
 from datetime import timedelta
 
 from levain.consent import delivery
+from levain.consent import delivery as dv
 from levain.consent.adapters.claude_code import GATE_TIMEOUT
 from levain.consent.record import RULING_NAMESPACE, ruling_message
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
@@ -111,3 +112,47 @@ def test_a_resume_that_did_not_start_leaves_its_ruling_deliverable_once_and_an_u
     assert queue.claim_rulings_for("claude_code", other_session) == []
     assert delivery.deliver(queue, other.id, listing=lambda meta: {}, running=gone,
                             launch=failing).route == "unconfirmed" and len(launched) == 1
+
+
+
+# ---- a Codex resume never runs looser than the session did (1019+1, measured: `codex exec resume` takes no -s and
+# runs under config.toml's sandbox_mode, so an exec started -s read-only was resumed workspace-write) -------------
+
+_THREAD = "01a152a3-b935-79e0-aa02-3c71635e0a03"
+
+
+def _rollout(chome, modes, thread=_THREAD):
+    day = chome / "sessions" / "2026" / "10" / "19"
+    day.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps({"type": "session_meta", "payload": {"id": thread, "cwd": "/w"}})]
+    lines += [json.dumps({"type": "turn_context", "payload": {"sandbox_policy": {"type": m}}}) for m in modes]
+    (day / f"rollout-2026-10-19T01-30-24-{thread}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_a_codex_resume_restores_the_sandbox_its_rollout_last_ran_under(tmp_path, monkeypatch):
+    chome = tmp_path / "codex"
+    _rollout(chome, ["workspace-write", "read-only"])
+    monkeypatch.setattr(dv, "_exe", lambda name, env: f"/bin/{name}")
+    meta = {"invocation": "-p", "cwd": str(tmp_path), "config_dir": str(chome),
+            "codex_flags": "codex -s --skip-git-repo-check --json"}
+    assert dv.resume_refusal("codex", _THREAD, meta) is None
+    assert dv._resume_argv("codex", _THREAD, meta, {}) == [
+        "/bin/codex", "exec", "resume", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"', _THREAD]
+
+
+def test_a_codex_resume_is_refused_when_its_sandbox_cannot_be_read_or_an_option_cannot_be_restored(tmp_path,
+                                                                                                    monkeypatch):
+    chome = tmp_path / "codex"
+    monkeypatch.setattr(dv, "_exe", lambda name, env: f"/bin/{name}")
+    base = {"invocation": "-p", "cwd": str(tmp_path), "config_dir": str(chome), "codex_flags": "codex"}
+    assert "could not be read from its rollout" in dv.resume_refusal("codex", _THREAD, base)     # no rollout
+    assert dv._resume_argv("codex", _THREAD, base, {}) is None
+    _rollout(chome, ["a-mode-codex-adds-later"])
+    assert "could not be read from its rollout" in dv.resume_refusal("codex", _THREAD, base)
+    _rollout(chome, ["read-only"])
+    assert dv.resume_refusal("codex", _THREAD, base) is None
+    for flags, named in (("codex -c", "-c"), ("codex --add-dir", "--add-dir"),
+                         ("codex --dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass"),
+                         ("codex --profile", "--profile"), ("codex --some-later-flag", "--some-later-flag")):
+        assert named in dv.resume_refusal("codex", _THREAD, {**base, "codex_flags": flags}), flags
+    assert "not recorded" in dv.resume_refusal("codex", _THREAD, {k: v for k, v in base.items() if k != "codex_flags"})
