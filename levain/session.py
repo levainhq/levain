@@ -139,8 +139,10 @@ Missing ``openhands`` extra, not an initialized entity, a sovereignty refusal, a
 confinement config, a bad ``--model``. Unchanged from ``levain run``'s existing convention."""
 
 EXIT_TURN_FAILED = 3
-"""The turn itself raised. The session is left un-resumable by design: a raised ``run()``
-leaves the SDK conversation in an ERROR state a later turn would resume FROM."""
+"""The turn itself raised, or its ``run()`` returned with the runtime in its error or stuck state
+(the per-run iteration cap, the loop detector). Either way the turn did not complete and nothing
+from it was captured. A later turn calls ``run()`` again, which starts the conversation over from
+that state with a fresh iteration budget: a new turn, checked like any other."""
 
 EXIT_GATED = 4
 """The turn HALTED AT THE EFFERENT GATE with actions awaiting the human (**K3**, ``spore-295``).
@@ -164,9 +166,8 @@ EXIT_TIMEOUT = 5
 
 Its own code, for the same reason :data:`EXIT_GATED` has one: collapsing it into an existing code
 inverts the operator's response. The tempting home is :data:`EXIT_TURN_FAILED` — a timeout does
-arrive as an exception — but ``3`` tells a supervisor *the work raised, the session is
-un-resumable, go read the traceback*, and it is a code that recurs identically on a retry because
-the cause is in the code. A timeout says the opposite: **the ENVIRONMENT stalled** (a hung model
+arrive as an exception — but ``3`` tells a supervisor *the turn failed, go read the error*, and
+it is a code that recurs identically on a retry because the cause is in the code or the task. A timeout says the opposite: **the ENVIRONMENT stalled** (a hung model
 call, a socket with no read timeout), nothing is wrong with the entity or the task, and the next
 scheduled run is free to start and will very likely succeed.
 
@@ -1101,7 +1102,8 @@ class EntitySession:
 
         Never raises for a failed turn: the error is returned in the result, because a driver
         holding a long-lived session (the server) must not lose the session to one bad turn.
-        The conversation IS left un-resumable after an error — see :attr:`EXIT_TURN_FAILED`.
+        A failed turn (raised, or ended in the runtime's error or stuck state) is reported, never
+        resumed silently: see :attr:`EXIT_TURN_FAILED` for what a following turn does.
         """
         if self._closed:
             # A RESULT, not a raise — codex L3, and it caught a real self-contradiction: this
@@ -1503,9 +1505,9 @@ class EntitySession:
             return None
         why = "the runtime's loop detector judged the agent stuck" if value == "stuck" else None
         try:
-            events = list(self.conversation.state.events)
-            start = self._turn_start if self._turn_start is not None else 0
-            for e in reversed(events[start:]):
+            # With no turn start, a scan of the whole log could quote an EARLIER turn's error.
+            events = list(self.conversation.state.events) if self._turn_start is not None else []
+            for e in reversed(events[self._turn_start or 0:]):
                 if type(e).__name__ == "ConversationErrorEvent":
                     why = f"{getattr(e, 'code', '')}: {getattr(e, 'detail', '')}".strip(": ")
                     break

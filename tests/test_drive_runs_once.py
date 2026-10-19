@@ -96,6 +96,9 @@ class _ScriptedConversation:
         elif outcome == "finish":
             self.state.execution_status = ConversationExecutionStatus.FINISHED
             self.state.events.append(_reply("done"))
+        elif outcome == "plan":  # a zero-tool turn that opens with a plan: the driver nudges once
+            self.state.execution_status = ConversationExecutionStatus.FINISHED
+            self.state.events.append(_reply("I'll run the tests now."))
         else:
             raise AssertionError("run() was called past the scripted turn")
 
@@ -169,6 +172,22 @@ def test_a_run_that_ends_STUCK_is_reported_and_never_run_again(tmp_path, store):
 
     assert conv.runs == 1
     assert result.error is not None
+    assert store.captured == []
+
+
+@pytest.mark.parametrize("gate_mode", ["ungated", "gated"])
+def test_a_post_nudge_run_that_ends_in_ERROR_is_reported_and_never_run_again(tmp_path, store, gate_mode):
+    """The second ``run()`` site: the first run stalls on a plan, the driver nudges, and the nudged
+    run hits the iteration cap. Two runs (no third), the error on the result, nothing captured."""
+    conv = _ScriptedConversation(["plan", "error"])
+    sess = _session(tmp_path, conv, gate_mode=gate_mode)
+
+    result = sess.run_turn("create late.txt")
+
+    assert conv.runs == 2, "a third run() would reset ERROR to RUNNING with a fresh iteration budget"
+    assert result.nudged is True
+    assert result.error is not None
+    assert "MaxIterationsReached" in result.error
     assert store.captured == []
 
 
