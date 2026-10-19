@@ -1179,25 +1179,27 @@ def _hook_write(mode):
             "tool_input": {"file_path": "/work/proj/.claude/hooks/x.sh", "content": "#!/bin/sh\n"}}
 
 
-def test_with_no_key_a_hook_write_is_denied_with_the_stop_in_every_mode_but_default(queue, monkeypatch):
+def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_asks(queue, monkeypatch):
     """Q10 D1, the hole as measured (DESIGN R7: bypass, no key, Write .claude/hooks/v.sh -> written): with no
     enrolled key nothing_can_decide answered None and the session's mode ran it. Now every mode where no dialog asks
-    (an absent or unknown mode included) gets the floor's deny with the hard stop, nothing filed, a floor ledger row;
-    default still leaves it to the dialog."""
+    (an absent or unknown mode included) gets the floor's PLAIN deny (L2-2: no hard stop, nothing is undecided),
+    nothing filed, a floor ledger row; default and acceptEdits (L2-3: its protected-path prompt asks) still leave it
+    to the dialog, plan runs nothing."""
     from levain.consent.ledger import Ledger
 
     monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
     settings = cc.AdapterSettings()  # no cockpit: no key can sign T3
     assert cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
-    for mode in ("bypassPermissions", "auto", "acceptEdits", "dontAsk", None, "x"):
+    for mode in ("bypassPermissions", "auto", "dontAsk", None, "x"):
         out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"))
         what = "Write of /work/proj/.claude/hooks/x.sh"
-        assert out["continue"] is False and what in out["stopReason"], mode
+        assert "continue" not in out and "stopReason" not in out, mode
         spec = out["hookSpecificOutput"]
         assert (spec["permissionDecision"], spec["permissionDecisionReason"]) == ("deny", cc.FLOOR_TEXT.format(x=what))
+    assert "LEVAIN_UNCONFINED" not in cc.FLOOR_TEXT and "levain doctor" in cc.FLOOR_TEXT  # L2-5
     assert queue.pending() == []
-    assert cc.gate(_hook_write("default"), queue, settings, home=Path("/home/u")) is None
-    assert cc.gate(_hook_write("plan"), queue, settings, home=Path("/home/u")) is None
+    for mode in ("default", "acceptEdits", "plan"):
+        assert cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u")) is None, mode
     rows = Ledger(Path(queue.directory)).window(cc.AGENT, "sess-1", datetime.now(timezone.utc) - timedelta(days=1))
     assert {(r.phase, r.outcome, (r.stamp_detail or {}).get("decision")) for r in rows} == {
         ("denied_by_gate", "refused", "floor")}
@@ -1215,3 +1217,97 @@ def test_an_unconfined_session_passes_a_hook_write_and_spends_no_ruled_allow(que
     monkeypatch.setenv(cc.UNCONFINED_ENV, "true")
     out = cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and len(taken) == 1
+
+
+def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path, monkeypatch, queue):
+    """L2-1, measured by L2 on Claude Code: a project's ``.claude/settings.json``
+    ``{"env": {"LEVAIN_UNCONFINED": "1"}}`` reaches the hook's environment, so a cloned repository could turn the gate off. The variable counts only when no
+    settings file the session can load sets it (any value), or cannot be ruled out (a file that does not parse);
+    the floor's deny then says it was ignored. The operator's own shell, with no such file, still opens the session."""
+    for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    home, ws = tmp_path / "home", tmp_path / "ws" / "proj"
+    home.mkdir()
+    (ws / "sub").mkdir(parents=True)
+    target = str(ws / ".claude" / "hooks" / "x.sh")
+    ev = {**_hook_write("bypassPermissions"), "cwd": str(ws / "sub"),
+          "tool_input": {"file_path": target, "content": "x"}}
+    settings = cc.AdapterSettings()
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    assert cc.unconfined_state(str(ws / "sub"), home=home) == "on"
+    assert cc.gate(ev, queue, settings, home=home) is None
+    ignored = cc.FLOOR_TEXT.format(x=f"Write of {target}") + cc.UNCONFINED_IGNORED_TEXT
+    for path, body in ((ws / ".claude" / "settings.json", json.dumps({"hooks": {}, "env": {cc.UNCONFINED_ENV: "1"}})),
+                       (ws / ".claude" / "settings.local.json", json.dumps({"env": {cc.UNCONFINED_ENV: "0"}})),
+                       (home / ".claude" / "settings.json", "{not json"),
+                       (tmp_path / "ws" / ".codex" / "config.toml",
+                        f'[shell_environment_policy.set]\n{cc.UNCONFINED_ENV} = "1"\n')):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        assert cc.unconfined_state(str(ws / "sub"), home=home) == "ignored", path
+        out = cc.gate(ev, queue, settings, home=home)
+        assert "continue" not in out and out["hookSpecificOutput"]["permissionDecisionReason"] == ignored, path
+        path.unlink()
+    (ws / ".claude" / "settings.json").write_text(json.dumps({"env": {"OTHER": "1"}}))
+    assert cc.gate(ev, queue, settings, home=home) is None  # an env block that does not set it leaves his word
+    monkeypatch.delenv(cc.UNCONFINED_ENV)
+    assert cc.unconfined_state(str(ws / "sub"), home=home) is None
+    assert queue.pending() == []
+
+
+def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_is_filed(tmp_path, monkeypatch):
+    """L1-4: once an active key can sign T3 the floor never answers: the call is filed for the operator. Also the
+    desk's S1 L3 r1 item: git's executable config (``.git/hooks/*``, ``.git/config``, a linked worktree's
+    ``config.worktree``, a gitfile) is agent config on both adapters, never objects, refs or ``.gitignore``. And
+    L1-7: an unconfined session's T3 dialog gets no decision from the PermissionRequest hook, nothing filed."""
+    from levain.consent.adapters import codex as cx
+
+    for var in (cc.UNCONFINED_ENV, "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    home, codex_dir = Path("/home/u"), Path("/home/u/.codex")
+    for p in (".git/hooks/pre-commit", ".git/config", ".GIT/Config", "sub/.git/hooks/d/x", ".git/config.worktree",
+              ".git/worktrees/wt/config.worktree", ".git/worktrees/wt/hooks/post-checkout", "wt/.git"):
+        assert cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+        patch = {"command": f"*** Begin Patch\n*** Add File: {p}\n+x\n*** End Patch"}
+        assert cx.targets_agent_config("apply_patch", patch, "/work/proj", home=home, codex_dir=codex_dir), p
+    for p in (".git/HEAD", ".git/refs/heads/main", ".git/objects/ab/cd", ".gitignore", ".gitattributes",
+              "src/config", ".git/worktrees/config"):
+        assert not cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    auth.sign_and_append(conn, {"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key,
+                                "class": "laptop-presence", "custody": "passphrase"},
+                         signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                         clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    settings = cc.AdapterSettings(cockpit_data_root=str(root))
+    assert not cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    q = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None))
+    filed = []
+
+    def at_the_ping(*a, **kw):
+        filed.extend(q.pending())
+        raise RuntimeError("stop at the ping")  # the call was filed; the hold is not this test's
+    monkeypatch.setattr(cc, "notify", at_the_ping)
+    ev = {**_hook_write("bypassPermissions"),
+          "tool_input": {"file_path": "/work/proj/.git/hooks/pre-commit", "content": "#!/bin/sh\n"}}
+    out = cc.gate(ev, q, settings, home=home)
+    assert [(r.tool_name, r.tier) for r in filed] == [("Write", cc.AGENT_CONFIG_TIER)]
+    assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith("levain: the gate failed (RuntimeError)")
+    assert cc.gate({**ev, "tool_input": {"file_path": "/work/proj/.git/HEAD", "content": "x"}}, q, settings,
+                   home=home) is None
+
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    calls = []
+    monkeypatch.setattr(q, "file", lambda **kw: calls.append(kw))
+    dialog = {"hook_event_name": "PermissionRequest", "tool_name": "Write", "cwd": "/work/proj",
+              "session_id": "sess-1", "permission_mode": "acceptEdits",
+              "tool_input": {"file_path": "/work/proj/.claude/settings.json", "content": "{}"}}
+    assert cc.decide(dialog, q, settings, home=home) is None and calls == []

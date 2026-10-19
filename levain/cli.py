@@ -210,9 +210,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=["on", "off"],
         default=None,
         help=(
-            "The consent hook (claude-code and codex adapters). `on` (the default) wires levain's "
+            "The consent hooks (claude-code and codex adapters). `on` (the default) wires levain's "
             "PermissionRequest hook, which answers only with a signed answer or a standing grant and otherwise "
-            "lets the agent's own dialog ask you. `off` wires no consent hook, for a session that should run "
+            "lets the agent's own dialog ask you, and its gate on agent config and hook edits, which asks you "
+            "through levain when a key can sign them and otherwise refuses them in any mode where the agent's "
+            "dialog does not ask (`levain doctor` says how to allow them). `off` wires no consent hook, for a "
+            "session that should run "
             "without one. The choice is kept in .levain/config.json, so `levain update` and `init --force` keep "
             "it; give --consent-hook again to change it."
         ),
