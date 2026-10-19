@@ -1183,14 +1183,13 @@ def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_
     """Q10 D1, the hole as measured (DESIGN R7: bypass, no key, Write .claude/hooks/v.sh -> written): with no
     enrolled key nothing_can_decide answered None and the session's mode ran it. Now every mode where no dialog asks
     (an absent or unknown mode included) gets the floor's PLAIN deny (L2-2: no hard stop, nothing is undecided),
-    nothing filed, a floor ledger row; default and acceptEdits (L2-3: its protected-path prompt asks) still leave it
-    to the dialog, plan runs nothing."""
+    nothing filed, a floor ledger row; default still leaves it to the dialog (acceptEdits does not: run 4 C5), plan runs nothing."""
     from levain.consent.ledger import Ledger
 
     monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
     settings = cc.AdapterSettings()  # no cockpit: no key can sign T3
     assert cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
-    for mode in ("bypassPermissions", "auto", "dontAsk", None, "x"):
+    for mode in ("bypassPermissions", "auto", "dontAsk", "acceptEdits", None, "x"):
         out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"))
         what = "Write of /work/proj/.claude/hooks/x.sh"
         assert "continue" not in out and "stopReason" not in out, mode
@@ -1198,7 +1197,11 @@ def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_
         assert (spec["permissionDecision"], spec["permissionDecisionReason"]) == ("deny", cc.FLOOR_TEXT.format(x=what))
     assert "LEVAIN_UNCONFINED" not in cc.FLOOR_TEXT and "levain doctor" in cc.FLOOR_TEXT  # L2-5
     assert queue.pending() == []
-    for mode in ("default", "acceptEdits", "plan"):
+    codex_cfg = {**_hook_write("acceptEdits"),
+                 "tool_input": {"file_path": "/work/proj/.codex/config.toml", "content": "x"}}  # run 4 C5
+    out = cc.gate(codex_cfg, queue, settings, home=Path("/home/u"))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and queue.pending() == []
+    for mode in ("default", "plan"):
         assert cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u")) is None, mode
     rows = Ledger(Path(queue.directory)).window(cc.AGENT, "sess-1", datetime.now(timezone.utc) - timedelta(days=1))
     assert {(r.phase, r.outcome, (r.stamp_detail or {}).get("decision")) for r in rows} == {

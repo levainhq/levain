@@ -1527,8 +1527,8 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
             # the Q10 floor: the PreToolUse gate refuses these outright where no dialog asks (L2-7)
             out.append(CheckResult(f"{label} consent hook", True,
                                    "wired to this install, but no active key can sign an agent config change (T3), "
-                                   "so an agent config or hook edit is refused outright outside default and "
-                                   "acceptEdits mode, and in them left to Claude Code's own dialog, which asks for "
+                                   "so an agent config or hook edit is refused outright outside default mode, "
+                                   "and in it left to Claude Code's own dialog, which asks for "
                                    "the paths Claude Code protects (.claude/, .git/, .mcp.json)",
                                    UNCONFINED_HOW, warn=True))
         else:

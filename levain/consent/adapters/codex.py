@@ -309,7 +309,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # exists): the entry's timeout is the ceiling's (:data:`GATE_TIMEOUT`), and :func:`main` never raises.
 #
 # The T3 floor (Q10 D1) and the unconfined session (D2) are Claude Code's (its gate section): with no enrolled key
-# that can sign a T3 allow, a gated call in any mode but ``default``, ``acceptEdits`` and ``plan`` is denied (a plain
+# that can sign a T3 allow, a gated call in any mode but ``default`` and ``plan`` is denied (a plain
 # deny, per the first bullet), and a session started with ``LEVAIN_UNCONFINED=1`` passes gated calls, its halt still
 # read first, unless a settings file the session can load (Codex's or Claude Code's) sets the variable.
 #
@@ -451,8 +451,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     ``tool_name``, ``cwd``) is denied. Else a gated call (:func:`gate_class`) gets no decision in a session started
     unconfined (:func:`levain.consent.adapters.claude_code.unconfined_state` ``"on"``; no ruled allow is spent, and a
     halt read above still wins); else is run once on a ruled allow; else, when nothing can decide it
-    (:func:`nothing_can_decide` at the gated tier), gets no decision in ``default`` (Codex's approval asks; also
-    ``acceptEdits``, should Codex ever send it) or ``plan``, and in every other mode, an absent or unknown one
+    (:func:`nothing_can_decide` at the gated tier), gets no decision in ``default`` (Codex's approval asks) or ``plan``, and in every other mode, an absent or unknown one
     included, the floor's plain deny (:func:`floor_text`, nothing filed); else,
     when something could decide it and, in ``default`` mode (approvals
     on), only while the operator is away, filed with its hold = D (``gate_hold_seconds``), pinged, held for a
