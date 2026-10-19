@@ -17,16 +17,24 @@ The upload's environment (:func:`publish_env`) is :func:`levain.launch.child_env
 read (``TWINE_USERNAME``, ``TWINE_PASSWORD``, ``TWINE_NON_INTERACTIVE``, ``NODE_AUTH_TOKEN``) and the proxies, with
 every variable that could move the upload elsewhere removed: ``TWINE_REPOSITORY``/``_URL``/``TWINE_CONFIG_FILE``,
 every ``npm_config_*``, ``PYTHON*``, ``LD_*``/``DYLD_*``, ``VIRTUAL_ENV``, and the CA-bundle overrides (a proxy with
-a CA of the caller's choosing could otherwise answer for the index). ``PATH`` is :data:`PUBLISH_PATH`. npm is also
-told the target for the package's scope and an empty default scope on its command line, since a ``@scope:registry``
-or ``scope`` in ``~/.npmrc`` or the tarball's ``publishConfig`` beats ``--registry`` otherwise (npm 11.19.0,
-``pickRegistry``; command-line flags beat ``publishConfig``).
+a CA of the caller's choosing could otherwise answer for the index). ``PATH`` is :data:`PUBLISH_PATH`. An upload to
+a local target gets no proxy at all. npm is also told, on its command line, the target for the package's scope, an
+empty default scope, the dist-tag and access the card shows, ``--dry-run=false`` and ``--strict-ssl=true``, since
+each of those in ``~/.npmrc``, the global npmrc or the tarball's ``publishConfig`` beats the default otherwise (npm
+11.19.0, ``pickRegistry``; command-line flags beat ``publishConfig``). With ``--repository-url`` twine does not read
+``~/.pypirc`` (twine 6.2.0, ``get_repository_from_config``), so :func:`pypi_credentials` reads the username and
+password of the section naming the card's target and hands only those to twine.
 
 Known edges (one line each, not built against):
 
-- with ``--repository-url`` twine does not read ``~/.pypirc`` (twine 6.2.0, ``get_repository_from_config``):
-  PyPI credentials come from ``TWINE_USERNAME``/``TWINE_PASSWORD`` or the keyring.
+- PyPI credentials kept only in the keyring are not found: the publish is refused before it is filed, naming
+  ``TWINE_USERNAME`` / ``TWINE_PASSWORD``.
 - a twine too old for the artifact's Metadata-Version refuses it after the answer; its output is shown, nothing else.
+- one publish names at most :data:`MAX_FILES` files (what the card shows whole): a wheel per platform goes in batches.
+- twine run by levain's interpreter still loads the user's site-packages (``~/.local/lib``), the user's to write (R-k).
+- npm reads its global npmrc (``<prefix>/etc/npmrc``, user-writable under Homebrew) for every setting the command
+  line does not pin, auth and proxies included (R-k).
+- a ``publishConfig`` setting other than the ones pinned above (a proxy, a CA, ``otp``) still reaches npm.
 - npm and twine are found on :data:`PUBLISH_PATH`, whose Homebrew and ``~/.local/bin`` entries are the user's own
   to write: a binary replaced there runs (R-k; this is a path, not a boundary).
 - an npm installed only under a version manager (``~/.nvm``) is not found: refused with "install npm".
@@ -34,12 +42,14 @@ Known edges (one line each, not built against):
 - a TLS-intercepting proxy that needs its own CA bundle fails the upload (the CA overrides are dropped).
 - the re-hash and the tool's read of the copy are two opens: a process of this uid that rewrites the copy between
   them is not caught (R-k).
+- a non-zero twine exit on a multi-file publish is reported unknown (exit 4), even when it failed before the first file.
 - ``levain publish`` removes the snapshot after every run, so an interrupted upload leaves only its journal and receipt lines.
 
 Stdlib only.
 """
 from __future__ import annotations
 
+import configparser
 import email.parser
 import fcntl
 import gzip
@@ -56,6 +66,7 @@ import tarfile
 import time
 import unicodedata
 import zipfile
+import zlib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -65,9 +76,9 @@ from urllib.parse import urlsplit
 from levain.consent.push import TRUSTED_PATH, _fsync_dir, _private_dir, append_line
 from levain.launch import NETWORK, child_env
 
-__all__ = ["DEFAULT_TARGETS", "INDEXES", "MAX_ARTIFACT", "PUBLISH_PATH", "PublishOutcomeUnknown", "PublishRecordIncomplete",
-           "PublishRefused", "PublishResult", "canonical_target", "execute", "publish_argv", "publish_env", "resolve_tool",
-           "snapshot", "target_key"]
+__all__ = ["DEFAULT_TARGETS", "INDEXES", "MAX_ARTIFACT", "MAX_FILES", "PUBLISH_PATH", "PublishOutcomeUnknown",
+           "PublishRecordIncomplete", "PublishRefused", "PublishResult", "canonical_target", "execute", "publish_argv",
+           "publish_env", "pypi_credentials", "resolve_tool", "snapshot", "target_key"]
 
 INDEXES = ("pypi", "npm")
 DEFAULT_TARGETS = {"pypi": "https://upload.pypi.org/legacy/", "npm": "https://registry.npmjs.org/"}
@@ -76,16 +87,24 @@ DEFAULT_TARGETS = {"pypi": "https://upload.pypi.org/legacy/", "npm": "https://re
 MAX_ARTIFACT = 100 * 1024 * 1024
 MAX_UNPACKED = 1024 * 1024 * 1024
 MAX_MEMBERS = 100_000
+# The most files one publish names: what the operator's card shows whole (a wheel per platform is published in batches).
+MAX_FILES = 8
 # The most a METADATA / PKG-INFO / package.json may be.
 MAX_MANIFEST = 1024 * 1024
 # The most an upload may run before it is reported unknown.
 UPLOAD_TIMEOUT = 1800
+# A snapshot directory older than this is a run that was killed (SIGKILL, a crash) and is swept at the next snapshot: the
+# longest live run is the hold ceiling (840 s) + a wait on the per-package lock behind another upload + its own upload.
+SNAP_STALE = 2 * 3600
 # Where twine and npm are looked up, and the PATH their children see: the system's, then Homebrew's and pipx's.
 PUBLISH_PATH = ":".join((TRUSTED_PATH, "/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")))
 # The credential names each tool reads, carried past the allowlist.
 CREDENTIALS = ("TWINE_USERNAME", "TWINE_PASSWORD", "TWINE_NON_INTERACTIVE", "NODE_AUTH_TOKEN")
 # The proxies an upload may need; never the CA-bundle overrides beside them in NETWORK.
 _PROXIES = tuple(n for n in NETWORK if n.upper().endswith("_PROXY"))
+_LOCAL_NO_PROXY = "127.0.0.1,localhost"
+# The section twine reads for a repository named only by its section, when ~/.pypirc gives it no ``repository``.
+_PYPIRC_DEFAULTS = {"pypi": "https://upload.pypi.org/legacy/", "testpypi": "https://test.pypi.org/legacy/"}
 # What could move an upload, dropped even when the allowlist would carry it.
 _REDIRECTS = ("TWINE_REPOSITORY", "TWINE_REPOSITORY_URL", "TWINE_CONFIG_FILE", "VIRTUAL_ENV")
 _REDIRECT_PREFIXES = ("NPM_CONFIG_", "PYTHON", "LD_", "DYLD_")
@@ -98,6 +117,9 @@ _NPM_NAME = re.compile(r"^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*$")
 _PY_NAME = re.compile(r"^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+!_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_NPM_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_NPM_ACCESS = ("default", "public", "restricted")
+_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
 _UNSHOWABLE = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
@@ -129,7 +151,8 @@ class PublishRecordIncomplete(RuntimeError):
 @dataclass(frozen=True)
 class PublishResult:
     """What one answered publish did: ``status`` is ``"published"`` (the tool exited 0), ``"failed"`` (it exited
-    non-zero; ``detail`` is the tail of its output) or ``"unknown"`` (only in a :class:`PublishOutcomeUnknown`)."""
+    non-zero; ``detail`` is the tail of its output) or ``"unknown"`` (only in a :class:`PublishOutcomeUnknown`).
+    ``tag`` and ``access`` are an npm publish's, ``None`` for PyPI."""
 
     ok: bool
     status: str
@@ -140,6 +163,8 @@ class PublishResult:
     files: list[dict[str, Any]]
     exit: int
     detail: str
+    tag: str | None = None
+    access: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -173,14 +198,14 @@ def canonical_target(url: str) -> str:
     host = (parts.hostname or "").lower()
     if "@" in parts.netloc:
         raise PublishRefused("the target may not carry a user name or password (credentials stay in their own files)")
-    if not host or not _HOST.match(host):
+    if not host or not _HOST.fullmatch(host):
         raise PublishRefused(f"the target {url!r} names no plain host")
     if scheme == "http" and host not in _LOCAL:
         raise PublishRefused(f"the target must be https (plain http only to {' / '.join(sorted(_LOCAL))})")
     if scheme not in ("https", "http"):
         raise PublishRefused(f"the target must be https, not {scheme or 'no'} scheme")
     path = parts.path or "/"
-    if not _PATH_OK.match(path) or "/../" in path + "/" or "/./" in path + "/":
+    if not _PATH_OK.fullmatch(path) or "/../" in path + "/" or "/./" in path + "/":
         raise PublishRefused(f"the target path {path!r} is not a plain path")
     hostport = host if port is None or (scheme == "https" and port == 443) else f"{host}:{port}"
     return f"{scheme}://{hostport}{path}"
@@ -193,14 +218,19 @@ def target_key(index: str, target: str, package: str) -> str:
 
 def _check_call(call: Any) -> None:
     """``call`` is a publish request's ``tool_input`` in the shape :func:`snapshot` makes."""
-    ok = (isinstance(call, dict) and set(call) == {"index", "target", "package", "version", "files"}
-          and call["index"] in INDEXES and all(isinstance(call[k], str) for k in ("target", "package", "version"))
+    base = {"index", "target", "package", "version", "files"}
+    ok = (isinstance(call, dict) and call.get("index") in INDEXES
+          and set(call) == (base | {"tag", "access"} if call["index"] == "npm" else base)
+          and all(isinstance(call[k], str) for k in ("target", "package", "version"))
           and isinstance(call["files"], list) and call["files"])
+    if ok and call["index"] == "npm":
+        ok = (isinstance(call["tag"], str) and bool(_NPM_TAG.fullmatch(call["tag"]))
+              and call["access"] in _NPM_ACCESS)
     if ok:
         for f in call["files"]:
             ok = ok and (isinstance(f, dict) and set(f) == {"name", "sha256", "size"} and isinstance(f["name"], str)
-                         and bool(_FILE_NAME.match(f["name"])) and isinstance(f["sha256"], str)
-                         and bool(_SHA256.match(f["sha256"])) and isinstance(f["size"], int)
+                         and bool(_FILE_NAME.fullmatch(f["name"])) and isinstance(f["sha256"], str)
+                         and bool(_SHA256.fullmatch(f["sha256"])) and isinstance(f["size"], int)
                          and not isinstance(f["size"], bool) and 0 <= f["size"] <= MAX_ARTIFACT)
     if not ok or (call["index"] == "npm" and len(call["files"]) != 1):
         raise PublishRefused("the publish request is not in the shape levain files")
@@ -214,11 +244,17 @@ def _check_call(call: Any) -> None:
 # artifact identity (read from the snapshot copy)
 
 
-def _member_problem(name: str) -> str | None:
+def _member_problem(name: str, *, link: bool = False) -> str | None:
+    """Why the archive member path (or, with ``link``, a link's target) is refused, else ``None``. A member path
+    may hold no empty or ``.`` segment: npm, pacote, bsdtar and twine's readers normalise ``a//b`` and ``a/./b``
+    onto ``a/b``, so such a member is a second copy of the one levain read, and the later one is what they take."""
     if not name or "\0" in name or "\\" in name or name.startswith("/"):
         return "an absolute or unreadable member path"
-    if ".." in name.split("/"):
+    parts = name.split("/")
+    if ".." in parts:
         return "a member path that climbs out of the archive"
+    if not link and any(part in ("", ".") for part in parts):
+        return "a member path with an empty or '.' segment (another tool reads it as another member's path)"
     return None
 
 
@@ -246,18 +282,27 @@ def _wheel(path: Path, file_name: str) -> tuple[str, str]:
                 raise PublishRefused(f"{file_name} has more than {MAX_MEMBERS} members")
             meta = []
             for info in infos:
-                if problem := _member_problem(info.filename):
+                # a directory entry ends in one "/"
+                name = info.filename[:-1] if info.filename.endswith("/") else info.filename
+                if problem := _member_problem(name):
                     raise PublishRefused(f"{file_name}: {problem} ({info.filename[:120]!r})")
-                parts = info.filename.split("/")
-                if len(parts) == 2 and parts[0].endswith(".dist-info") and parts[1] == "METADATA":
-                    meta.append(info)
+                if "METADATA" not in name:
+                    continue
+                # twine reads, fewest path segments first, the first member whose path contains METADATA and that
+                # holds a Metadata-Version line (twine 6.2.0, wheel.py): any other such member could be what it sends
+                parts = name.split("/")
+                if not (len(parts) == 2 and parts[0].endswith(".dist-info") and parts[1] == "METADATA"):
+                    raise PublishRefused(f"{file_name}: the member {name[:120]!r} names METADATA outside the one "
+                                         "*.dist-info/METADATA (twine could read it instead)")
+                meta.append(info)
             if len(meta) != 1:
                 raise PublishRefused(f"{file_name} has {len(meta)} top-level *.dist-info/METADATA, not one")
             if meta[0].file_size > MAX_MANIFEST:
                 raise PublishRefused(f"{file_name}: METADATA is over {MAX_MANIFEST} bytes")
             with zf.open(meta[0]) as fh:
                 raw = fh.read(MAX_MANIFEST + 1)
-    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, EOFError, OSError) as exc:
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, EOFError, OSError, zlib.error,
+            RuntimeError) as exc:                      # RuntimeError: an encrypted member
         raise PublishRefused(f"{file_name} is not a readable wheel: {type(exc).__name__}: {exc}") from None
     if len(raw) > MAX_MANIFEST:
         raise PublishRefused(f"{file_name}: METADATA is over {MAX_MANIFEST} bytes")
@@ -298,7 +343,8 @@ def _tar_manifest(path: Path, file_name: str, member_name: str, top: str | None 
                     name = member.name.removeprefix("./")
                     if problem := _member_problem(name):
                         raise PublishRefused(f"{file_name}: {problem} ({member.name[:120]!r})")
-                    if (member.issym() or member.islnk()) and (problem := _member_problem(member.linkname)):
+                    if (member.issym() or member.islnk()) and (problem := _member_problem(member.linkname,
+                                                                                          link=True)):
                         raise PublishRefused(f"{file_name}: a link to {problem} ({member.linkname[:120]!r})")
                     parts = name.rstrip("/").split("/")
                     tops.add(parts[0])
@@ -311,7 +357,7 @@ def _tar_manifest(path: Path, file_name: str, member_name: str, top: str | None 
                         found.setdefault(parts[0], []).append(fh.read(MAX_MANIFEST + 1) if fh is not None else b"")
     except PublishRefused:
         raise
-    except (tarfile.TarError, OSError, EOFError, gzip.BadGzipFile, ValueError) as exc:
+    except (tarfile.TarError, OSError, EOFError, gzip.BadGzipFile, ValueError, zlib.error) as exc:
         raise PublishRefused(f"{file_name} is not a readable gzip tarball: {type(exc).__name__}: {exc}") from None
     if len(tops) != 1:
         raise PublishRefused(f"{file_name} has {len(tops)} top-level entries, not one directory")
@@ -335,7 +381,10 @@ def _sdist(path: Path, file_name: str) -> tuple[str, str]:
     return name, version
 
 
-def _npm(path: Path, file_name: str) -> tuple[str, str]:
+def _npm(path: Path, file_name: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    """(name, version, the dist-tag and access the publish takes) from ``package/package.json``: the tag is
+    ``publishConfig.tag`` (default ``latest``), the access ``publishConfig.access`` (default ``default``, the
+    registry's own). Both are shown and pinned on npm's command line, which beats ``~/.npmrc`` and the manifest."""
     _top, raw = _tar_manifest(path, file_name, "package.json", top="package")
     try:
         manifest = json.loads(raw.decode("utf-8"))
@@ -345,16 +394,30 @@ def _npm(path: Path, file_name: str) -> tuple[str, str]:
     version = manifest.get("version") if isinstance(manifest, dict) else None
     if not isinstance(name, str) or not isinstance(version, str):
         raise PublishRefused(f"package/package.json of {file_name} names no name and version")
-    if len(name) > 214 or not _NPM_NAME.match(name):
+    if len(name) > 214 or not _NPM_NAME.fullmatch(name):
         raise PublishRefused(f"{name[:80]!r} is not an npm package name")
-    return name, version
+    config = manifest.get("publishConfig")
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise PublishRefused(f"the publishConfig of {file_name} is not an object")
+    tag, access = config.get("tag", "latest"), config.get("access")
+    if not isinstance(tag, str) or not _NPM_TAG.fullmatch(tag):
+        raise PublishRefused(f"the publishConfig tag of {file_name} is not a dist-tag levain shows")
+    if access is None:                           # absent or null: the registry's default
+        access = "default"
+    elif access not in ("public", "restricted"):
+        raise PublishRefused(f"the publishConfig access of {file_name} is not public or restricted")
+    return name, version, (("access", access), ("tag", tag))
 
 
-def _identity(index: str, path: Path, file_name: str) -> tuple[str, str]:
+def _identity(index: str, path: Path, file_name: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    """(name, version, the index-specific fields the card shows: npm's tag and access, none for PyPI)."""
+    extra: tuple[tuple[str, str], ...] = ()
     if index == "npm":
         if not file_name.endswith(".tgz"):
             raise PublishRefused(f"{file_name}: an npm publish takes one .tgz (npm pack's output)")
-        name, version = _npm(path, file_name)
+        name, version, extra = _npm(path, file_name)
     elif file_name.endswith(".whl"):
         name, version = _wheel(path, file_name)
     elif file_name.endswith(".tar.gz"):
@@ -363,11 +426,11 @@ def _identity(index: str, path: Path, file_name: str) -> tuple[str, str]:
         raise PublishRefused(f"{file_name}: PyPI takes a .whl or a .tar.gz")
     _showable("package name", name)
     _showable("version", version)
-    if index == "pypi" and not _PY_NAME.match(name):
+    if index == "pypi" and not _PY_NAME.fullmatch(name):
         raise PublishRefused(f"{name[:80]!r} is not a Python project name")
-    if not _VERSION.match(version):
+    if not _VERSION.fullmatch(version):
         raise PublishRefused(f"{version[:80]!r} is not a version levain shows")
-    return name, version
+    return name, version, extra
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -418,26 +481,59 @@ def _copy_in(src: str, dst: Path) -> None:
         os.close(fd)
 
 
+def _sweep(publish_dir: Path) -> None:
+    """Remove the snapshot directories under ``publish_dir`` older than :data:`SNAP_STALE` (a run killed with
+    SIGKILL, or a crash, leaves its copy behind). Best effort: a directory that cannot be read is left."""
+    cutoff = time.time() - SNAP_STALE
+    try:
+        entries = list(os.scandir(publish_dir))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if (entry.name.startswith("snap-") and entry.is_dir(follow_symlinks=False)
+                    and entry.stat(follow_symlinks=False).st_mtime < cutoff):
+                shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.PathLike) -> tuple[dict[str, Any], Path]:
     """Copy ``paths`` into a new ``<levain home>/publish/<id>/`` and read them there: ``(call, snapshot dir)``,
     ``call`` being the request's ``tool_input`` (index, canonical target, package, version, and each file's name,
-    sha256 and size, sorted by name). Every file of one publish names the same project and version. The directory
-    is removed when anything is refused."""
+    sha256 and size, sorted by name; for npm also the dist-tag and access). Every file of one publish names the same
+    project and version. The count and each size are checked before anything is copied; a snapshot directory a killed
+    run left (older than :data:`SNAP_STALE`) is swept first. The directory is removed when anything is refused."""
     if index not in INDEXES:
         raise PublishRefused(f"the index must be one of {INDEXES}")
     canon = canonical_target(target)
     if not paths or (index == "npm" and len(paths) != 1):
         raise PublishRefused("a PyPI publish takes one or more files, an npm publish exactly one tarball")
+    if len(paths) > MAX_FILES:
+        raise PublishRefused(f"one publish takes at most {MAX_FILES} files (what the operator is shown whole); "
+                             "publish the rest in another batch")
     names = [os.path.basename(p) for p in paths]
     for n in names:
-        if not _FILE_NAME.match(n):
+        if not _FILE_NAME.fullmatch(n):
             raise PublishRefused(f"the file name {n[:80]!r} is not plain (letters, digits, . _ + -)")
     if len(set(names)) != len(names):
         raise PublishRefused("two files share a name")
+    for src in paths:
+        try:
+            st = os.lstat(src)
+        except OSError as exc:
+            raise PublishRefused(f"{src}: could not read it: {exc.strerror}") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise PublishRefused(f"{src}: a link is refused (name the file itself)")
+        if not stat.S_ISREG(st.st_mode):
+            raise PublishRefused(f"{src} is not a regular file")
+        if st.st_size > MAX_ARTIFACT:
+            raise PublishRefused(f"{src} is over {MAX_ARTIFACT} bytes")
     home = Path(os.path.abspath(os.fspath(levain_home)))
     if not os.path.isdir(home):
         raise PublishRefused(f"levain home {home} is not a directory")
     _private_dir(home / "publish")
+    _sweep(home / "publish")
     snap = home / "publish" / f"snap-{os.urandom(12).hex()}"
     _private_dir(snap)
     try:
@@ -445,16 +541,19 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
         for src, name in zip(paths, names):
             dst = snap / name
             _copy_in(src, dst)
-            idents.add(_identity(index, dst, name))
+            # the identity is read between two hashes of the copy, so what is shown is what is filed
             digest, size = _sha256(dst)
+            idents.add(_identity(index, dst, name))
+            if _sha256(dst) != (digest, size):
+                raise PublishRefused(f"{name} changed in the snapshot while it was read")
             files.append({"name": name, "sha256": digest, "size": size})
         if len(idents) != 1:
             raise PublishRefused("the files name different projects or versions: "
-                                 + ", ".join(f"{n} {v}" for n, v in sorted(idents)))
+                                 + ", ".join(f"{n} {v}" for n, v, _ in sorted(idents)))
         _fsync_dir(snap)
-        package, version = idents.pop()
+        package, version, extra = idents.pop()
         call = {"index": index, "target": canon, "package": package, "version": version,
-                "files": sorted(files, key=lambda f: f["name"])}
+                "files": sorted(files, key=lambda f: f["name"]), **dict(extra)}
         _check_call(call)
         return call, snap
     except BaseException:
@@ -466,15 +565,77 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
 # the upload
 
 
-def publish_env() -> dict[str, str]:
+def _is_local(target: str) -> bool:
+    return urlsplit(target).hostname in _LOCAL
+
+
+def pypi_credentials(target: str) -> dict[str, str]:
+    """The PyPI credentials the upload to ``target`` gets beyond the environment's own. ``TWINE_PASSWORD`` in the
+    environment wins (with ``TWINE_USERNAME`` beside it): nothing is added. Else the ``~/.pypirc`` section whose
+    ``repository`` is ``target`` (``[pypi]`` / ``[testpypi]`` without one name twine's defaults) gives its
+    ``username`` (unless the environment names one) and ``password``. Only those two are read: the file never
+    chooses the target, and twine is never handed it (with ``--repository-url`` twine ignores it). Raises
+    :class:`PublishRefused` when there is no credential at all, or two sections give the target different ones;
+    the keyring is not consulted. A password is never part of a message."""
+    if os.environ.get("TWINE_PASSWORD"):
+        return {}
+    found: set[tuple[str, str]] = set()
+    path = Path(os.path.expanduser("~")) / ".pypirc"
+    parser = configparser.RawConfigParser()      # twine's own reader: no % interpolation in a password
+    try:
+        parser.read(path, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        parser = configparser.RawConfigParser()  # an unreadable file gives no credential
+    for section in parser.sections():
+        repository = parser.get(section, "repository", fallback=_PYPIRC_DEFAULTS.get(section))
+        password = parser.get(section, "password", fallback="")
+        if section == "distutils" or not repository or not password:
+            continue
+        try:
+            canon = canonical_target(repository.strip())
+        except PublishRefused:
+            continue
+        if canon.rstrip("/") == target.rstrip("/"):
+            found.add((parser.get(section, "username", fallback="").strip(), password))
+    if len(found) > 1:
+        raise PublishRefused(f"two sections of {path} give {target} different credentials; keep one, or set "
+                             "TWINE_USERNAME / TWINE_PASSWORD in the environment")
+    if not found:
+        raise PublishRefused(f"no PyPI credential for {target}: set TWINE_USERNAME=__token__ and "
+                             f"TWINE_PASSWORD=<an API token> in the environment, or give {path} a section whose "
+                             f"repository is {target} with a username and password (the keyring is not consulted)")
+    username, password = found.pop()
+    creds = {"TWINE_PASSWORD": password}
+    if username and not os.environ.get("TWINE_USERNAME"):
+        creds["TWINE_USERNAME"] = username
+    return creds
+
+
+def publish_env(call: dict[str, Any] | None = None) -> dict[str, str]:
     """The upload's environment: the allowlist plus :data:`CREDENTIALS` and the proxy variables, without any
-    variable that could move the upload (see the module docstring), ``PATH`` = :data:`PUBLISH_PATH`."""
+    variable that could move the upload (see the module docstring), ``PATH`` = :data:`PUBLISH_PATH`, colour off.
+    With ``call``: a PyPI upload also gets :func:`pypi_credentials`, and an upload to a local target runs with no
+    proxy at all (``NO_PROXY`` = the loopback names; requests does not bypass a proxy for loopback itself)."""
     env = child_env(*CREDENTIALS, *_PROXIES)
     env = {k: v for k, v in env.items()
            if k not in _REDIRECTS and not k.upper().startswith(_REDIRECT_PREFIXES)}
     env["PATH"] = PUBLISH_PATH
     env["TWINE_NON_INTERACTIVE"] = "1"
+    env["NO_COLOR"] = "1"
+    if call is not None:
+        if call["index"] == "pypi":
+            env.update(pypi_credentials(call["target"]))
+        if _is_local(call["target"]):
+            env = {k: v for k, v in env.items() if not k.upper().endswith("_PROXY")}
+            env["NO_PROXY"] = env["no_proxy"] = _LOCAL_NO_PROXY
     return env
+
+
+def _clean(text: str) -> str:
+    """``text`` without terminal escapes or invisible characters (a tool's coloured output stays readable in the
+    receipt and on the agent's terminal)."""
+    text = _ESCAPES.sub("", text)
+    return "".join(c for c in text if c in "\n\t" or unicodedata.category(c) not in _UNSHOWABLE)
 
 
 def resolve_tool(index: str) -> list[str]:
@@ -500,7 +661,13 @@ def publish_argv(tool: list[str], call: dict[str, Any], snap: Path) -> list[str]
     if call["index"] == "pypi":
         return [*tool, "upload", "--non-interactive", "--disable-progress-bar", "--repository-url", call["target"],
                 *files]
-    argv = [*tool, "publish", files[0], f"--registry={call['target']}", "--scope=", "--ignore-scripts"]
+    # the registry, scope, dist-tag, access, dry-run and TLS check are pinned here: the command line beats
+    # ~/.npmrc, the global npmrc and the tarball's publishConfig (npm 11.19.0)
+    access = "null" if call["access"] == "default" else call["access"]
+    argv = [*tool, "publish", files[0], f"--registry={call['target']}", "--scope=", f"--tag={call['tag']}",
+            f"--access={access}", "--dry-run=false", "--strict-ssl=true", "--ignore-scripts"]
+    if _is_local(call["target"]):
+        argv += ["--proxy=null", "--https-proxy=null", f"--noproxy={_LOCAL_NO_PROXY}"]
     if call["package"].startswith("@"):
         argv.append(f"--{call['package'].split('/', 1)[0]}:registry={call['target']}")
     return argv
@@ -531,10 +698,12 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
     ``<levain home>/publish/``; then the upload runs from the snapshot directory with :func:`publish_env`.
 
     Raises :class:`PublishRefused` for anything refused before the intent line (nothing was uploaded); an ``OSError``
-    before it propagates as itself. After it: an upload that did not report raises :class:`PublishOutcomeUnknown`
-    (a ``KeyboardInterrupt`` / ``SystemExit`` is recorded the same way and re-raised as itself); a non-zero exit is
-    a :class:`PublishResult` with ``ok`` False; a done line or receipt that could not be written raises
-    :class:`PublishRecordIncomplete`. ``resolve`` and ``run`` are injectable for tests."""
+    or an interruption before it propagates as itself, so whatever reaches the caller other than the classes below
+    means nothing was uploaded. After it: an upload that did not report, a ``KeyboardInterrupt`` / ``SystemExit``
+    included, raises :class:`PublishOutcomeUnknown`, and so does a non-zero twine exit for more than one file (the
+    first may have landed before the next failed); any other non-zero exit is a :class:`PublishResult` with ``ok``
+    False; a done line or receipt that could not be written raises :class:`PublishRecordIncomplete`. The tool's
+    output reaches ``detail`` without terminal escapes. ``resolve`` and ``run`` are injectable for tests."""
     _check_call(call)
     snap = Path(os.path.abspath(os.fspath(snap)))
     home = Path(os.path.abspath(os.fspath(levain_home)))
@@ -554,25 +723,34 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
             if _sha256(snap / f["name"]) != (f["sha256"], f["size"]):
                 raise PublishRefused(f"{f['name']} in the snapshot is not the file that was allowed (its bytes changed)")
         argv = publish_argv(resolve(call["index"]), call, snap)
-        env = publish_env()
-        base = {k: call[k] for k in ("index", "target", "package", "version", "files")}
+        env = publish_env(call)
+        base = dict(call)
         append_line(home / "publish" / f"{key}.journal.jsonl", {"state": "intent", "at": time.time(), **base})
         # from here on the index may change: every path reaches the receipt
         try:
             p = run(argv, env=env, cwd=str(snap), stdin=subprocess.DEVNULL, capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=UPLOAD_TIMEOUT)
         except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
-            result = PublishResult(ok=False, status="unknown", exit=-1,
-                                   detail=f"the upload did not report: {type(exc).__name__}: {exc}"[:400], **base)
+            detail = _clean(f"the upload did not report: {type(exc).__name__}: {exc}")[:400]
+            result = PublishResult(ok=False, status="unknown", exit=-1, detail=detail, **base)
             errs = _record(home, key, result, receipt)
-            if not isinstance(exc, Exception):
-                raise
             raise PublishOutcomeUnknown(f"the publish of {call['package']} {call['version']} to {call['target']} may "
                                         f"or may not have landed ({result.detail})"
                                         + (f"; record errors: {'; '.join(errs)}" if errs else ""),
                                         result, errs) from exc
-        tail = ((p.stderr or "").strip() or (p.stdout or "").strip())[-400:]
+        tail = _clean((p.stderr or "").strip() or (p.stdout or "").strip()).strip()[-400:]
         ok = p.returncode == 0
+        if not ok and call["index"] == "pypi" and len(call["files"]) > 1:
+            # twine uploads file by file: the first may be on the index already
+            n = len(call["files"])
+            result = PublishResult(ok=False, status="unknown", exit=p.returncode,
+                                   detail=f"twine exited {p.returncode} part way through {n} files: {tail}"[-400:],
+                                   **base)
+            errs = _record(home, key, result, receipt)
+            raise PublishOutcomeUnknown(f"the publish of {call['package']} {call['version']} to {call['target']} "
+                                        f"failed part way (twine exit {p.returncode}): some files may have landed; "
+                                        f"check the index before publishing again ({tail})"
+                                        + (f"; record errors: {'; '.join(errs)}" if errs else ""), result, errs)
         result = PublishResult(ok=ok, status="published" if ok else "failed", exit=p.returncode,
                                detail="" if ok else tail, **base)
         if errs := _record(home, key, result, receipt):

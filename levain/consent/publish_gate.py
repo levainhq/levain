@@ -79,7 +79,8 @@ EXIT_PUBLISHED, EXIT_NOT_TAKEN, EXIT_UNDECIDED, EXIT_UNKNOWN = 0, 1, 3, 4
 def publish_what(call: dict[str, Any]) -> str:
     """The publish in the words the operator is pinged with."""
     names = ", ".join(f["name"] for f in call["files"])
-    return f"publish of {call['package']} {call['version']} to {call['target']} ({names})"
+    npm = f", dist-tag {call['tag']}, access {call['access']}" if call["index"] == "npm" else ""
+    return f"publish of {call['package']} {call['version']} to {call['target']} ({names}{npm})"
 
 
 def _signable(settings: Any) -> bool:
@@ -139,6 +140,10 @@ def run(args: argparse.Namespace, out: Any = None) -> int:
         print(text, file=out, flush=True)
 
     snap: Path | None = None
+    what = "publish"
+    # installed before the snapshot is taken, so a SIGTERM while copying still removes it (a SIGKILL leaves it for
+    # the next snapshot's sweep)
+    old = _catch_signals()
     try:
         try:
             agent, session = _agent_and_session(args.agent, args.session)
@@ -147,6 +152,8 @@ def run(args: argparse.Namespace, out: Any = None) -> int:
                 raise ValueError("--hold must be a positive number of seconds")
             qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
             target = args.target or publish.DEFAULT_TARGETS[args.index]
+            if args.index == "pypi":     # no credential: refused now, not after the operator's yes
+                publish.pypi_credentials(publish.canonical_target(target))
             call, snap = publish.snapshot(args.index, list(args.files), target, qdir.parent)
             cwd = os.path.dirname(os.path.realpath(args.files[0]))
             if filed_input(SimpleNamespace(tool_name=PUBLISH_TOOL, display=redact_display(PUBLISH_TOOL, call))) != call:
@@ -162,16 +169,13 @@ def run(args: argparse.Namespace, out: Any = None) -> int:
                 "names no cockpit with an active key), so nothing can allow it.")
             return EXIT_NOT_TAKEN
         queue = _queue(qdir, settings)
-        old = _catch_signals()
-        try:
-            return _gated(args, queue, adapter, settings, agent, session, call, cwd, snap, qdir, what, say)
-        except (_Interrupted, KeyboardInterrupt):    # the executor reports its own; this is before it ran
-            say(f"levain publish: interrupted; nothing was published: {what}.")
-            return EXIT_NOT_TAKEN
-        finally:
-            for s, h in old.items():
-                signal.signal(s, h)
+        return _gated(args, queue, adapter, settings, agent, session, call, cwd, snap, qdir, what, say)
+    except (_Interrupted, KeyboardInterrupt):    # the executor reports its own; this is before it ran
+        say(f"levain publish: interrupted; nothing was published: {what}.")
+        return EXIT_NOT_TAKEN
     finally:
+        for s, h in old.items():
+            signal.signal(s, h)
         if snap is not None:
             shutil.rmtree(snap, ignore_errors=True)
 
@@ -258,22 +262,24 @@ def _execute(queue: ConsentQueue, decided: Decision, call: dict[str, Any], snap:
             say(f"levain publish: published {r.package} {r.version} to {r.target}, but its record is incomplete: "
                 f"{errs}")
             return EXIT_PUBLISHED
-        say(f"levain publish: the upload failed (exit {r.exit}): {r.detail}. Its record is incomplete: {errs}")
+        say(f"levain publish: the upload failed (exit {r.exit}): {r.detail}. If it failed after the upload began, "
+            f"the index may already hold it. Its record is incomplete: {errs}")
         return EXIT_NOT_TAKEN
     except (OSError, subprocess.SubprocessError) as exc:   # the executor failed before it uploaded
         say(f"levain publish: allowed, but refused before uploading; nothing was published: "
             f"{type(exc).__name__}: {exc}")
         return EXIT_NOT_TAKEN
     except (_Interrupted, KeyboardInterrupt):
-        say(f"levain publish: interrupted while uploading; the outcome is UNKNOWN (the upload may have started): "
-            f"{what}. Check the index; levain's journal is under {home / 'publish'}.")
-        return EXIT_UNKNOWN
+        # the executor turns an interruption after its intent line into PublishOutcomeUnknown: this one came before
+        say(f"levain publish: interrupted before the upload started; nothing was published: {what}.")
+        return EXIT_NOT_TAKEN
     how = (f"your ruling on gap #{decided.gap}" if decided.via == "ruling"
            else f"a signed answer (key {decided.signer_fp})")
     if result.ok:
         say(f"levain publish: published {result.package} {result.version} to {result.target}, allowed by {how}.")
         return EXIT_PUBLISHED
-    say(f"levain publish: the upload failed (exit {result.exit}): {result.detail}")
+    say(f"levain publish: the upload failed (exit {result.exit}): {result.detail}. If it failed after the upload "
+        f"began, the index may already hold {result.package} {result.version}: check it before publishing again.")
     return EXIT_NOT_TAKEN
 
 
