@@ -463,8 +463,8 @@
      clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
   .scope-wrap, svg.scope { --series-1: oklch(0.78 0.12 200); --series-2: oklch(0.74 0.15 300); }
   svg.scope .ch1 { stroke: var(--series-1); }
-  svg.scope .ch2 { stroke: var(--series-2); }
-  svg.scope .ch3 { stroke: var(--accent); }
+  svg.scope .ch2 { stroke: var(--accent); }
+  svg.scope .ch3 { stroke: var(--series-2); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: var(--sp-2); align-items: center; margin: 0 0 var(--sp-3); }
@@ -488,8 +488,8 @@
   .scope-ch:hover { border-color: var(--line-hot); }
   .scope-ch[aria-pressed="true"] { border-color: currentColor; }
   .scope-ch.ch1 { color: var(--series-1); }
-  .scope-ch.ch2 { color: var(--series-2); }
-  .scope-ch.ch3 { color: var(--accent); }
+  .scope-ch.ch2 { color: var(--accent); }
+  .scope-ch.ch3 { color: var(--series-2); }
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
   .scope-wrap[data-solo="ch1"] svg.scope polyline:not(.ch1),
@@ -1540,6 +1540,10 @@ body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: nowrap; min-width: 0
 body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex-wrap: nowrap; min-width: 0; }
 body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
 body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
+/* a status row in a narrow tile wraps: the value drops under its label (right-aligned) rather than running past the body that clips it; the status word is never cut */
+.w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
+.w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
+.w .op .v { max-width: 100%; overflow-wrap: anywhere; }
 body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
 body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 3px 0 0 var(--accent); }
 body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
@@ -1651,3 +1655,74 @@ body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:pl
 body.ke .deck { min-height: 100vh; display: flex; flex-direction: column; }
 body.ke .deck > main.frame { flex: 1 0 auto; }
 body.ke .deck > * { flex-shrink: 0; }
+
+/* ── the Memory tab (K6): one neocortex card, crystals beside cognition, identity as one list ───────────────────────── */
+body.ke .ck-zgrid > .ck-mem-card, body.ke .ck-zgrid > .ck-mem-row { grid-column: 1 / -1; }
+body.ke .ck-zgrid .ck-mem-card { height: auto; max-height: none; background: var(--card); border: 1px solid var(--hair); }
+body.ke .ck-mem-card > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-mem-card > .phead .ck-count { margin-left: 0; }
+body.ke .ck-mem-meta { font: var(--fw-regular) var(--fs-meta)/1.3 var(--sans); color: var(--label); }
+body.ke .ck-mem-card > .pbody { max-height: none; overflow: visible; }
+body.ke .ck-mem-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: var(--sp-8, 40px); align-items: start; }
+body.ke .ck-mem-cols.ck-mem-one { grid-template-columns: minmax(0, 1fr); }
+body.ke .ck-mem-col { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-zgrid .panel.ck-mem-nest { height: auto; max-height: none; border: 0; border-radius: 0; background: none; overflow: visible; padding: 0; margin: 0; }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest { padding: var(--sp-5) 0 0; margin-top: var(--sp-5); border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+body.ke .ck-zgrid .ck-mem-nest > .phead { padding: 0 0 var(--sp-3); }
+body.ke .ck-zgrid .ck-mem-nest > .phead h2 { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+body.ke .ck-mem-nest > .phead > :not(h2) { display: none; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { padding: 0; max-height: none; overflow: visible; }
+body.ke .ck-mem-nest .edit-trigger-row { margin-top: var(--sp-2); }
+body.ke .ck-mem-list { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-li { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
+body.ke .ck-mem-n { font: var(--fw-bold) var(--fs-meta)/1.5 var(--mono); color: var(--accent); }
+body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-mem-when { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
+body.ke .ck-mem-text { overflow-wrap: anywhere; }
+/* crystals beside cognition */
+body.ke .ck-mem-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: var(--gap); align-items: start; }
+body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height: none; min-width: 0; }
+body.ke .ck-mem-row > .panel > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-zgrid .ck-mem-row .pbody { max-height: none; overflow: visible; }
+body.ke .ck-crys { align-content: start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--sp-8, 40px); }
+body.ke .ck-crys .row { display: flex; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
+body.ke .ck-crys .lvl { color: var(--accent); font: var(--fw-bold) var(--fs-lead)/1 var(--round); min-width: 2rem; }
+body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-crys .clause { flex: none; color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: center; }
+body.ke .ck-mem-cog .scope-box { flex: 1 1 0; min-width: 0; min-height: 0; }
+body.ke .ck-mem-cog .scope-box svg.scope { height: 150px; border: 0; background: none; }
+body.ke .ck-mem-cog .scope-legend { flex: 0 0 auto; flex-direction: column; gap: var(--sp-3); margin: 0; }
+body.ke .ck-mem-cog .scope-ch { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0 var(--sp-2); text-align: left; }
+body.ke .ck-mem-cog .scope-ch::before { content: ""; display: block; width: 10px; height: 2px; background: currentColor; margin-bottom: 2px; }
+body.ke .ck-mem-cog .scope-ch-l { font-weight: var(--fw-bold); color: var(--text); }
+body.ke .ck-mem-cog .scope-ch-v { color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap > .note { display: none; }
+/* identity: one list of rows, each card kept behind its row until Edit opens it */
+body.ke .ck-mem-ident .ck-mem-meta { margin-left: 0; }
+body.ke .ck-mem-ilist { display: flex; flex-direction: column; }
+body.ke .ck-mem-item { border-top: 1px solid var(--hair); }
+body.ke .ck-mem-item:first-child { border-top: 0; }
+body.ke .ck-mem-irow { display: grid; grid-template-columns: minmax(8rem, 15rem) minmax(0, 1fr) auto; gap: var(--sp-6); align-items: center; padding: var(--sp-3) 0; }
+body.ke .ck-mem-il { font-weight: var(--fw-semibold); }
+body.ke .ck-mem-it { color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+body.ke .ck-mem-edit { font: var(--fw-medium) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; min-height: 32px; }
+body.ke .ck-mem-edit:hover { border-color: var(--label); }
+body.ke .ck-zgrid .panel.ck-mem-fold { display: none; }
+body.ke .ck-zgrid .panel.ck-mem-fold.ck-mem-open { display: block; padding-bottom: var(--sp-4); }
+@media (max-width: 720px) {
+  body.ke .ck-mem-cols, body.ke .ck-mem-row, body.ke .ck-crys { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-mem-cog .scope-plot { flex-direction: column; align-items: stretch; }
+  body.ke .ck-mem-cog .scope-box { flex: none; }
+  body.ke .ck-mem-cog .scope-legend { flex-direction: row; flex-wrap: wrap; }
+  body.ke .ck-mem-irow { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-1); }
+  body.ke .ck-mem-it { grid-column: 1 / -1; grid-row: 2; white-space: normal; }
+  body.ke .ck-mem-edit { grid-column: 2; grid-row: 1; }
+}
+/* the retired Health strip: its figures are the Cognition card's header and chart (the Morning glance keeps its own Health tile) */
+body.ke[data-mode="memory"] .ck-widgets { display: none; }
+body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
+body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
