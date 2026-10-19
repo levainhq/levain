@@ -15,6 +15,11 @@ prompt (retries, non-streaming fallback) plus non-essential CONNECTs, so assert 
 uid", never an exact count; give the slot a dummy API key so the vendor sends at all. Point only HTTPS_PROXY at the stub:
 an HTTP_PROXY makes plain-http base-URL calls absolute-form, which 404s here. Bodies: Content-Length only (chunked = 400),
 no Expect: 100-continue, no keep-alive, no streaming response; the real front (3a) owes all of those.
+
+Known edges (L3 r1-r4, 10-19; not built, unreachable for a stub's callers): a client still sending a body more than 1 s or
+past the body cap after a 400/413 can see a reset instead of the status; a malformed request line is refused without a
+drain; on macOS a live stub with a FULL accept backlog can answer a probe with ECONNREFUSED and be taken for stale; a socket
+path that vanishes between the stat and the probe fails startup loudly instead of binding.
 """
 from __future__ import annotations
 
@@ -144,10 +149,13 @@ class Stub:
             if writer.can_write_eof():
                 writer.write_eof()
             deadline = asyncio.get_running_loop().time() + 1.0  # one fixed budget for the whole drain
+            drained = 0
             try:
-                while (left := deadline - asyncio.get_running_loop().time()) > 0:
-                    if not await asyncio.wait_for(reader.read(65536), timeout=left):
+                while drained < _BODY_CAP and (left := deadline - asyncio.get_running_loop().time()) > 0:
+                    chunk = await asyncio.wait_for(reader.read(65536), timeout=left)
+                    if not chunk:
                         break  # EOF: the client sent everything
+                    drained += len(chunk)
             except (asyncio.TimeoutError, OSError):
                 pass
 
