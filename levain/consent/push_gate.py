@@ -38,8 +38,10 @@ Known edges (one line each, not built against):
 - the queue directory, agent and session are the caller's word (``--queue-dir``, ``LEVAIN_HOME``, ``--agent``,
   ``--session``): a caller can name another queue, or another session's id, and take that session's ruled allow
   for the byte-identical push, or halt that session on a request it leaves undecided (R-k).
-- the default hold fits under Claude Code's default Bash timeout of 120 s [that default not measured here]; a
-  shell timeout shorter than the hold withdraws the request on SIGTERM and leaves it pending to expiry on SIGKILL.
+- a shell that stops this command before the hold ends withdraws the request on SIGTERM and leaves it pending to
+  expiry on SIGKILL. Claude Code 2.1.303's Bash timeout sends neither: it moves the command to the background, the
+  hold runs to its end and the agent reads the result when it finishes [measured: B7 S6, 2026-10-18, a 6 s timeout
+  on a 120 s hold; re-run that case on another Claude Code version before relying on it there].
 - an interruption inside the executor before its intent line is still reported unknown (nothing was pushed then).
 - off the main thread no signal can be caught, and a signal inside the filing itself cannot name the request: in
   both cases the request is left to its expiry.
@@ -311,7 +313,7 @@ def _gated(args: argparse.Namespace, queue: ConsentQueue, adapter: Any, settings
         # from here until a verified decision or the undecided mark, any exit withdraws the request
         try:
             say(f"levain push: waiting up to {hold:g} s for the operator to allow the {what} (request {request.id}). "
-                "A shell timeout shorter than that withdraws the request.")
+                "Let it finish: stopping it before then withdraws the request.")
             claude_code.notify(settings, f"levain: {agent} asks to push, up to {hold:g} s: {what} "
                                          f"(request {request.id}).", cwd=qdir)
             got, _why = adapter.hold_for_answer(queue, request, hold + 5.0, tool_input=call, posture=None)
