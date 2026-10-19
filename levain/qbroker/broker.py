@@ -7,7 +7,8 @@ Filing the same sealed request again returns the row already there (before the c
 new rows only); a new row is refused ``queue-busy`` past :data:`PENDING_PER_SESSION` and ``quota-exhausted`` past
 the lifetime quota. ``ANSWER? {cap, request_id}`` reads the answer row for a request this session filed and returns
 ``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it, else ``{pending}`` while nothing is
-there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited``. A verdict is reused
+there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited`` (a REQUEST too, for about one token interval
+after polls drain the bucket: the consent hook treats ``rate-limited`` as pending and retries). A verdict is reused
 while the answer file and the signer snapshot are unchanged, and a resolve for :data:`RESOLVE_TTL` seconds, so a
 serial poll storm costs one verify and one CONTROL round trip; concurrent misses on a cold cache may each make
 the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
@@ -64,6 +65,8 @@ ANSWER_BURST = 40
 # for at most this long after CONTROL revokes it
 RESOLVE_TTL = 2.0
 RESOLVE_CACHE_MAX = 256
+# refusals (a guessed or revoked cap) live in their own small cache, so fresh random caps can never evict a real cap's answer
+REFUSAL_CACHE_MAX = 32
 VERDICT_CACHE_MAX = 1024
 # how far a hook's received_at may sit from the broker's clock: the hook stamps it as it files, so only clock
 # drift and the trip to this socket separate the two
@@ -148,6 +151,7 @@ class Broker:
         self._buckets: dict[int, tuple[float, float]] = {}      # slot -> (tokens, at)
         self._filing: dict[str, threading.Event] = {}          # request_id -> set when its filing ends
         self._resolved: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
+        self._refused: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
         now = utc_stamp(clock())
         for row in store.rows():
@@ -187,9 +191,10 @@ class Broker:
             return "cap-malformed"
         key, now = (slot, digest), self._monotonic()
         with self._mutex:
-            hit = self._resolved.get(key)
-            if hit is not None and hit[0] > now:
-                return hit[1]
+            for cache in (self._resolved, self._refused):
+                hit = cache.get(key)
+                if hit is not None and hit[0] > now:
+                    return hit[1]
         if charge_miss and not self._take_token(slot):
             return "rate-limited"
         try:
@@ -201,10 +206,12 @@ class Broker:
                 {"session": got.session, "kind": got.kind, "run": got.run}) is not None):
             got = "resolve-malformed"
         with self._mutex:
-            self._resolved[key] = (now + self._resolve_ttl, got)
-            self._resolved.move_to_end(key)
-            while len(self._resolved) > RESOLVE_CACHE_MAX:
-                self._resolved.popitem(last=False)
+            cache, limit = ((self._refused, REFUSAL_CACHE_MAX) if isinstance(got, str)
+                            else (self._resolved, RESOLVE_CACHE_MAX))
+            cache[key] = (now + self._resolve_ttl, got)
+            cache.move_to_end(key)
+            while len(cache) > limit:
+                cache.popitem(last=False)
         return got
 
     def _take_token(self, slot: int) -> bool:

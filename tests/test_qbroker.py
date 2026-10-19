@@ -20,7 +20,8 @@ from pathlib import Path
 import pytest
 
 from levain.cockpit.consent import utc_stamp
-from levain.consent.record import ANSWER_NAMESPACE, answer_message, answer_payload, tool_input_digest
+from levain.consent.record import (ANSWER_NAMESPACE, ExternalGateRequest, answer_message, answer_payload,
+                                   tool_input_digest)
 from levain.contracts.canon import canonical_bytes
 from levain.qbroker import wire
 from levain.qbroker.broker import Broker, Resolved
@@ -930,3 +931,37 @@ def test_request_resolve_misses_charge_the_slots_bucket(L, resolver, clock):
     assert req(b, fields=hook_fields("cached"))["ok"] is True         # a cached cap costs no token
     mono["t"] += 0.2                                                   # tokens back: a miss resolves again
     assert req(b, cap="rand-3")["refused"] == "cap-unknown" and len(resolver.calls) == 4
+
+
+def test_fresh_random_caps_never_evict_the_real_cap_from_the_resolve_cache(L, resolver, clock):
+    import levain.qbroker.broker as broker_mod
+    mono = {"t": 100.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"], answer_rate=1e6, answer_burst=10**6)
+    rid = filed(b)                                                             # cap-a resolves and is cached first
+    for n in range(broker_mod.RESOLVE_CACHE_MAX + 8):                          # more refusals than any cache holds
+        assert ask(b, rid, cap=f"junk-{n}")["refused"] == "cap-unknown"
+    before = len(resolver.calls)
+    assert ask(b, rid)["pending"] is True                                      # the real cap is still a hit
+    assert len(resolver.calls) == before
+
+
+def test_a_corrupt_row_during_a_filing_releases_the_flight(L, resolver, clock, monkeypatch):
+    b = make_broker(L, resolver, clock)
+    fields = hook_fields()
+    request = ExternalGateRequest.create(**{k: fields[k] for k in fields})
+    row = {"request": request.fields()}
+    real = b._store.read_request
+
+    def corrupt(request_id):
+        raise ValueError("not a levain-queue-request/1 row")
+
+    monkeypatch.setattr(b._store, "read_request", corrupt)
+    with pytest.raises(ValueError):
+        b._file(row, SESSION_A, request, utc_stamp(NOW))
+    assert b._filing == {}                                                     # the flight was released
+    monkeypatch.setattr(b._store, "read_request", real)
+    done = []
+    t = threading.Thread(target=lambda: done.append(req(b, fields=fields)))
+    t.start()
+    t.join(5)
+    assert not t.is_alive() and done[0]["ok"] is True                          # a later filing neither hangs nor leaks
