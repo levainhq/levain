@@ -9,8 +9,10 @@ the lifetime quota. ``ANSWER? {cap, request_id}`` reads the answer row for a req
 ``{decision}`` only when :func:`levain.qbroker.seam.answer_refusal` accepts it, else ``{pending}`` while nothing is
 there and the hold runs; polls past :data:`ANSWER_RATE` per slot are refused ``rate-limited``. A verdict is reused
 while the answer file and the signer snapshot are unchanged, and a resolve for :data:`RESOLVE_TTL` seconds, so a
-poll storm costs one verify and one CONTROL round trip. No verb accepts an answer, a grant answer
-or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
+serial poll storm costs one verify and one CONTROL round trip; concurrent misses on a cold cache may each make
+the trip, bounded by the slot's rate (a REQUEST whose resolve misses the cache is charged to it too). One filing
+per request id runs at a time, so identical REQUESTs on several connections link one row and charge it once.
+No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``. The cap is hashed on arrival and never logged or
 written. Stdlib only.
 """
 from __future__ import annotations
@@ -51,7 +53,8 @@ QUOTA_PER_RUN = 200
 # requests one session may hold unexpired and unanswered: the quota bounds the disk, this bounds his attention.
 # One past it is refused `queue-busy` until one is answered or its hold ends
 PENDING_PER_SESSION = 4
-# ANSWER? polls a slot may make per second, and the burst it may save up. The consent hooks poll every GATE_POLL
+# ANSWER? polls a slot may make per second, and the burst it may save up (a REQUEST whose resolve misses the
+# cache draws on the same bucket). The consent hooks poll every GATE_POLL
 # (levain.consent.adapters.claude_code, 0.25 s), so a session with PENDING_PER_SESSION rows waiting polls 16 times
 # a second; past the rate a poll is refused `rate-limited`, which a hook must treat as no answer yet (pending, and
 # deny when its hold ends)
@@ -143,6 +146,7 @@ class Broker:
         self._counts: dict[str, int] = {}
         self._pending: dict[str, dict[str, str]] = {}           # session -> {request_id: expires_at}
         self._buckets: dict[int, tuple[float, float]] = {}      # slot -> (tokens, at)
+        self._filing: dict[str, threading.Event] = {}          # request_id -> set when its filing ends
         self._resolved: OrderedDict[tuple[int, str], tuple[float, Resolved | str]] = OrderedDict()
         self._verdicts: OrderedDict[str, tuple[tuple[int, ...], SignersSnapshot | None, str | None]] = OrderedDict()
         now = utc_stamp(clock())
@@ -162,7 +166,8 @@ class Broker:
     def handle(self, slot: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The one answer to ``message`` from the hook on ``slot``'s socket."""
         rid = message.get("id")
-        if message.get("v") != wire.VERSION or type(rid) is not int:
+        v = message.get("v")
+        if type(v) is not int or v != wire.VERSION or type(rid) is not int:
             return wire.refusal(rid if type(rid) is int else None, "frame-malformed")
         op = message.get("op")
         try:
@@ -175,7 +180,8 @@ class Broker:
             return wire.refusal(rid, "broker-error")
         return wire.refusal(rid, "verb-not-allowed")
 
-    def _resolve(self, slot: int, cap: Any) -> Resolved | str:
+    def _resolve(self, slot: int, cap: Any, *, charge_miss: bool = False) -> Resolved | str:
+        """``charge_miss``: a cache miss takes a token from the slot's bucket (REQUEST; ANSWER? took one already)."""
         digest = cap_digest(cap)
         if digest is None:
             return "cap-malformed"
@@ -184,6 +190,8 @@ class Broker:
             hit = self._resolved.get(key)
             if hit is not None and hit[0] > now:
                 return hit[1]
+        if charge_miss and not self._take_token(slot):
+            return "rate-limited"
         try:
             got = self._resolver.queue_resolve(slot_ref(slot), digest)
         except Exception:   # noqa: BLE001 - CONTROL unreachable: the hook fails closed on the refusal
@@ -211,7 +219,7 @@ class Broker:
             return True
 
     def _request(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
-        who = self._resolve(slot, message.get("cap"))
+        who = self._resolve(slot, message.get("cap"), charge_miss=True)
         if isinstance(who, str):
             return wire.refusal(rid, who)
         fields = message.get("request")
@@ -250,6 +258,29 @@ class Broker:
     def _file(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str) -> str | None:
         """Link ``row`` as a new row, charged to its session's pending cap and its quota; ``None`` when this call
         linked it, else the refusal name (``request-exists`` when another connection linked it first)."""
+        # single flight per request id: a second filing waits for the first, then finds its row (or, when that
+        # one failed, files it itself), so only the filing that links a row ever holds its charge
+        while True:
+            with self._mutex:
+                flight = self._filing.get(request.id)
+                if flight is None:
+                    flight = self._filing[request.id] = threading.Event()
+                    break
+            flight.wait()
+            if self._store.read_request(request.id) is not None:
+                return "request-exists"
+        try:
+            # the row may have been linked between the caller's replay check and this flight
+            if self._store.read_request(request.id) is not None:
+                return "request-exists"
+            return self._file_new(row, who, request, now)
+        finally:
+            with self._mutex:
+                del self._filing[request.id]
+            flight.set()
+
+    def _file_new(self, row: dict[str, Any], who: Resolved, request: ExternalGateRequest, now: str) -> str | None:
+        """:meth:`_file` inside its flight: no other filing of ``request.id`` runs, and its row is not linked."""
         with self._mutex:
             held = dict(self._pending.get(who.session, {}))
         # pending = unexpired with no answer file: once the operator has written one, the row has had his
@@ -269,13 +300,22 @@ class Broker:
         linked = False
         try:
             linked = self._store.write_request(row)
+        except BaseException:
+            # the link can land before the directory fsync raises: a row on disk keeps its charge
+            linked = self._linked(row)
+            raise
         finally:
-            if not linked:                 # another connection filed it first, or the write failed: no charge
+            if not linked:                 # another process filed it first, or the write failed: no charge
                 with self._mutex:
                     self._counts[key] -= 1
-                    if self._pending.get(who.session, {}).get(request.id) == request.expires_at:
-                        del self._pending[who.session][request.id]
+                    self._pending.get(who.session, {}).pop(request.id, None)
         return None if linked else "request-exists"
+
+    def _linked(self, row: dict[str, Any]) -> bool:
+        try:
+            return self._store.read_request(row["request"]["id"]) == row
+        except (ValueError, OSError):
+            return False
 
     def _answer(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
         if not self._take_token(slot):

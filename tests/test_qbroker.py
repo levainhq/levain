@@ -27,7 +27,7 @@ from levain.qbroker.broker import Broker, Resolved
 from levain.qbroker.control import ControlResolver
 from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.server import SlotListener, peer_uid
-from levain.qbroker.signers import SignersSource
+from levain.qbroker.signers import RETRY_FLOOR, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, QueueStore
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
@@ -601,8 +601,8 @@ def test_a_cached_resolve_expires_and_refusals_are_cached_too(L, resolver, clock
 def test_answer_polls_past_the_slots_rate_are_refused_rate_limited(L, resolver, clock):
     mono = {"t": 100.0}
     b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"], answer_rate=10.0, answer_burst=5)
-    rid = filed(b)
-    assert [ask(b, rid).get("pending") for _ in range(5)] == [True] * 5
+    rid = filed(b)                                                             # its resolve miss: one token
+    assert [ask(b, rid).get("pending") for _ in range(4)] == [True] * 4
     assert ask(b, rid)["refused"] == "rate-limited"
     assert req(b, fields=hook_fields("other"))["ok"] is True                  # REQUEST is not ANSWER?
     assert ask(b, rid, slot=2, cap="cap-two")["refused"] == "no-such-request"  # slot 2 has its own bucket
@@ -681,9 +681,33 @@ def test_a_verifier_unavailable_reload_retries_on_the_next_poll(L, monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(signers_mod, "verify_link_sig", flaky)
-    src = SignersSource(L / "policy", L / "routes" / "trust.pub")
+    mono = {"t": 100.0}
+    src = SignersSource(L / "policy", L / "routes" / "trust.pub", monotonic=lambda: mono["t"])
     assert src.current() is None
+    mono["t"] += RETRY_FLOOR
     assert src.current() is not None and src.problem is None          # same files, verified this time
+
+
+def test_an_unavailable_verifier_is_retried_at_most_once_per_floor(L, monkeypatch):
+    """L3 r1 (e): while ssh-keygen keeps failing, polls inside the floor do not re-run it under the mutex."""
+    import levain.qbroker.signers as signers_mod
+    from levain.authority import VerifierUnavailable
+    tries = []
+
+    def down(*a, **kw):
+        tries.append(1)
+        raise VerifierUnavailable("ssh-keygen did not run")
+
+    monkeypatch.setattr(signers_mod, "verify_link_sig", down)
+    mono = {"t": 100.0}
+    src = SignersSource(L / "policy", L / "routes" / "trust.pub", monotonic=lambda: mono["t"])
+    for _ in range(50):
+        assert src.current() is None
+    assert len(tries) == 1
+    mono["t"] += RETRY_FLOOR / 2
+    assert src.current() is None and len(tries) == 1
+    mono["t"] += RETRY_FLOOR
+    assert src.current() is None and len(tries) == 2
 
 
 def test_control_ok_zero_or_a_true_id_is_refused(run_dir):
@@ -799,3 +823,110 @@ def test_a_resolved_run_whose_contract_digest_is_not_the_sha256_form_is_refused(
     got = req(make_broker(L, resolver, clock), slot=3, cap="cap-bad")
     assert got["ok"] is False and got["refused"] == "resolve-malformed"
     assert list((L / "queue" / "requests").glob("pend-*")) == []
+
+
+# --- fix round 2 -----------------------------------------------------------------------------------------------
+
+def _race_first_reads(monkeypatch, parties):
+    """Hold every thread's first read_request until all ``parties`` have made it: each saw no row, so each goes on
+    to file a new one (the window between the replay check and the link, forced open)."""
+    barrier, seen = threading.Barrier(parties), threading.local()
+    real = QueueStore.read_request
+
+    def gated(self, request_id):
+        got = real(self, request_id)
+        if not getattr(seen, "once", False):
+            seen.once = True
+            barrier.wait(timeout=10)
+        return got
+
+    monkeypatch.setattr(QueueStore, "read_request", gated)
+
+
+def _together(n, fn):
+    out, threads = [None] * n, []
+    for i in range(n):
+        def run(i=i):
+            out[i] = fn(i)
+        threads.append(threading.Thread(target=run))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    return out
+
+
+@pytest.mark.parametrize("n", [2, 8])
+def test_concurrent_identical_filings_leave_one_row_one_charge_one_pending(L, resolver, clock, monkeypatch, n):
+    """L3 r1 (a): the loser's rollback must not delete the winner's pending entry, or a looping slot holds more
+    than PENDING_PER_SESSION live rows."""
+    b = make_broker(L, resolver, clock)
+    req(b, cap="cap-a", fields=hook_fields("warm"))                   # resolve cached, one row pending
+    _race_first_reads(monkeypatch, n)
+    got = _together(n, lambda i: req(b))
+    monkeypatch.undo()
+    assert all(g["ok"] is True for g in got), got
+    rid = got[0]["request_id"]
+    assert {g["request_id"] for g in got} == {rid}
+    assert len(list((L / "queue" / "requests").glob(f"{rid}.json"))) == 1
+    assert b._counts["session:sess-a"] == 2                            # warm + the race's one row
+    assert rid in b._pending["sess-a"] and len(b._pending["sess-a"]) == 2
+    for i in range(2):                                                 # 2 pending + 2 = the cap of 4
+        assert req(b, fields=hook_fields(f"after{i}"))["ok"] is True
+    assert req(b, fields=hook_fields("over"))["refused"] == "queue-busy"
+    assert len(list((L / "queue" / "requests").glob("pend-*.json"))) == 4
+
+
+def test_a_burst_of_distinct_filings_never_passes_the_pending_cap(L, resolver, clock, monkeypatch):
+    b = make_broker(L, resolver, clock)
+    req(b, fields=hook_fields("warm"))
+    _race_first_reads(monkeypatch, 12)
+    got = _together(12, lambda i: req(b, fields=hook_fields(f"burst{i}")))
+    monkeypatch.undo()
+    assert sum(g["ok"] is True for g in got) == 3
+    assert {g["refused"] for g in got if g["ok"] is False} == {"queue-busy"}
+    assert len(list((L / "queue" / "requests").glob("pend-*.json"))) == 4
+    assert b._counts["session:sess-a"] == 4 and len(b._pending["sess-a"]) == 4
+
+
+@pytest.mark.parametrize("v", [True, 1.0])
+def test_a_version_that_only_equals_one_is_refused(broker, v):
+    """L3 r1 (b): True == 1 == 1.0 in Python; the frame's v is the int 1 or it is malformed."""
+    got = broker.handle(1, {"v": v, "op": "REQUEST", "id": 5, "cap": "cap-a", "request": hook_fields()})
+    assert got["ok"] is False and got["refused"] == "frame-malformed"
+
+
+def test_a_row_linked_before_the_dir_fsync_failed_keeps_its_charge(L, resolver, clock, monkeypatch):
+    """L3 r1 (c): os.link landed, then the directory fsync raised; the row exists, so the charge stays."""
+    import errno as _errno
+    import levain.qbroker.store as store_mod
+    b = make_broker(L, resolver, clock, quota=1)
+    fails = [1]
+    real = store_mod._fsync_dir
+
+    def flaky(path):
+        if fails:
+            fails.pop()
+            raise OSError(_errno.EIO, "I/O error")
+        return real(path)
+
+    monkeypatch.setattr(store_mod, "_fsync_dir", flaky)
+    assert req(b)["refused"] == "broker-error"
+    assert len(list((L / "queue" / "requests").glob("pend-*.json"))) == 1
+    assert req(b)["ok"] is True                                        # the replay returns the row
+    assert req(b, fields=hook_fields("second"))["refused"] == "quota-exhausted"
+
+
+def test_request_resolve_misses_charge_the_slots_bucket(L, resolver, clock):
+    """L3 r1 (d): fresh random caps on REQUEST cannot hammer CONTROL or churn the resolve cache past the rate."""
+    mono = {"t": 100.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"], answer_rate=10.0, answer_burst=3)
+    filed(b)                                                           # cap-a: a miss, one token
+    assert req(b, cap="rand-1")["refused"] == "cap-unknown"
+    assert req(b, cap="rand-2")["refused"] == "cap-unknown"
+    assert req(b, cap="rand-3")["refused"] == "rate-limited"
+    assert len(resolver.calls) == 3
+    assert req(b, fields=hook_fields("cached"))["ok"] is True         # a cached cap costs no token
+    mono["t"] += 0.2                                                   # tokens back: a miss resolves again
+    assert req(b, cap="rand-3")["refused"] == "cap-unknown" and len(resolver.calls) == 4

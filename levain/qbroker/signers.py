@@ -6,7 +6,8 @@ by the consent authority's own rules: a class it ranks, a custody ``custody_prob
 type); ``allowed_signers.json.sig`` is an SSHSIG over its bytes by the dispatch trust root (``L/routes/trust.pub``)
 in its own namespace, :data:`SIGNERS_NAMESPACE` (never a config item's). :class:`SignersSource` re-verifies the pair whenever any of the three files changes or the last try could
 not run the verifier, and accepts a generation only when it is strictly greater than the last it accepted (the same
-bytes read again are not a change). While the pair is missing, unverifiable or a rollback, :meth:`SignersSource.current` returns ``None`` and
+bytes read again are not a change); a verifier that could not run is tried again at most once per
+:data:`RETRY_FLOOR` seconds, so a failing ``ssh-keygen`` does not hold every slot's poll behind it. While the pair is missing, unverifiable or a rollback, :meth:`SignersSource.current` returns ``None`` and
 every answer is refused (fail closed).
 
 The high-water generation lives in this process only: a restarted broker accepts any validly signed generation,
@@ -18,6 +19,8 @@ from __future__ import annotations
 import os
 import stat
 import threading
+import time
+from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +32,7 @@ from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.contracts.keys import fingerprint_line
 
-__all__ = ["SIGNERS_FORMAT", "SIGNERS_NAMESPACE", "AllowedSigner", "SignersSnapshot",
+__all__ = ["RETRY_FLOOR", "SIGNERS_FORMAT", "SIGNERS_NAMESPACE", "AllowedSigner", "SignersSnapshot",
            "SignersSource", "load"]
 
 SIGNERS_NAMESPACE = "levain-allowed-signers"
@@ -39,6 +42,8 @@ _KEYS = frozenset({"format", "generation", "issued_at", "signers"})
 _SIGNER_KEYS = frozenset({"principal", "key_type", "key_b64", "key_class", "custody", "namespaces"})
 # a signers file is a handful of public keys; a signature is under a kilobyte (a passkey's, a few)
 _MAX_FILE = 256 * 1024
+# seconds between tries of a verifier that could not run (every answer is refused until one runs)
+RETRY_FLOOR = 1.0
 
 
 class SignersError(Exception):
@@ -166,12 +171,14 @@ def _identity(paths: tuple[Path, ...]) -> tuple[Any, ...]:
 class SignersSource:
     """The broker's view of the snapshot: :meth:`current` is the verified snapshot or ``None``."""
 
-    def __init__(self, policy_dir: Path | str, trust_pub: Path | str, *, ssh_keygen: Path | str | None = None
-                 ) -> None:
+    def __init__(self, policy_dir: Path | str, trust_pub: Path | str, *, ssh_keygen: Path | str | None = None,
+                 monotonic: Callable[[], float] = time.monotonic, retry_floor: float = RETRY_FLOOR) -> None:
         self._policy = Path(policy_dir)
         self._trust = Path(trust_pub)
         self._paths = (self._policy / "allowed_signers.json", self._policy / "allowed_signers.json.sig", self._trust)
         self._ssh_keygen = ssh_keygen
+        self._monotonic, self._retry_floor = monotonic, retry_floor
+        self._retry_at: float | None = None             # set while the verifier could not run
         self._mutex = threading.Lock()
         self._seen: tuple[Any, ...] | None = None
         self._snapshot: SignersSnapshot | None = None
@@ -200,8 +207,12 @@ class SignersSource:
 
     def current(self) -> SignersSnapshot | None:
         with self._mutex:
+            if self._retry_at is not None and self._monotonic() < self._retry_at:
+                return self._snapshot
             seen = _identity(self._paths)
             if seen != self._seen:
-                # files the verifier could not judge are not recorded as seen: the next call tries them again
-                self._seen = seen if self._reload() else None
+                # files the verifier could not judge are not recorded as seen: a call past the floor tries again
+                ran = self._reload()
+                self._seen = seen if ran else None
+                self._retry_at = None if ran else self._monotonic() + self._retry_floor
             return self._snapshot
