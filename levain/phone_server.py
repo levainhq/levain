@@ -1,7 +1,7 @@
 """levain.phone_server — the phone port: answer consent requests with a passkey from a phone (Q6b).
 
 ``levain consent phone`` runs this. It is its OWN loopback listener, separate from the cockpit (``levain serve``), and
-it serves exactly five things:
+it serves only these:
 
   - a static page (``/``, ``/phone.js``, ``/phone.css``) that carries no data;
   - ``GET /consent.json``: the pending consent requests and, for each, the passkey keys enrolled to answer it on
@@ -13,7 +13,10 @@ it serves exactly five things:
     request (``levain consent rule``), signed in the ruling namespace, never an answer's; once it verifies, the
     ruling is delivered to its session (:mod:`levain.consent.delivery`), on its own thread;
   - ``POST /passkey/key-line``: a new passkey's OpenSSH public key and the laptop commands that enrol it (a passkey
-    never enrols itself: enrolment is signed by a laptop-presence key).
+    never enrols itself: enrolment is signed by a laptop-presence key);
+  - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
+    passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
+    as ``sign_pending`` (:mod:`levain.consent.sign`).
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
 token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
@@ -57,6 +60,8 @@ _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _KEY_LINE = "/passkey/key-line"
+_SIGN_PREFIX = "/sign/"
+_SIGN_ACTIONS = ("challenge", "answer", "deny")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
@@ -83,6 +88,16 @@ def _consent_route(route: str) -> "tuple[str, str] | None":
     quoted, sep, action = route[len(_CONSENT_PREFIX):].partition("/")
     rid = unquote(quoted)          # the page sends encodeURIComponent(id); an id carries ':'
     if not sep or _CONSENT_ID.fullmatch(rid) is None or action not in _ACTIONS:
+        return None
+    return rid, action
+
+
+def _sign_route(route: str) -> "tuple[str, str] | None":
+    """``(request_id, action)`` for ``/sign/<id>/<action>``, else None."""
+    if not route.startswith(_SIGN_PREFIX):
+        return None
+    rid, sep, action = route[len(_SIGN_PREFIX):].partition("/")
+    if not sep or re.fullmatch(r"[A-Za-z0-9_-]{8,64}", rid) is None or action not in _SIGN_ACTIONS:
         return None
     return rid, action
 
@@ -141,7 +156,8 @@ class _PhoneHandler(GuardedHandler):
             return
         route = self.path.split("?", 1)[0]
         consent = _consent_route(route)
-        if consent is None and route != _KEY_LINE:
+        sign = _sign_route(route)
+        if consent is None and sign is None and route != _KEY_LINE:
             self._reject(404, "not_found", "no such route")
             return
         if not self._token_ok():
@@ -160,13 +176,15 @@ class _PhoneHandler(GuardedHandler):
             return
         # an answer carries a signature the person just made with Face ID: it waits a moment for a slot rather than
         # throw that ceremony away; everything else answers busy at once
-        waits = consent is not None and consent[1] in ("answer", "rule")
+        waits = (consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
         try:
             if consent is not None:
                 result = self.server.answer_step(consent[0], consent[1], req)
+            elif sign is not None:
+                result = self.server.sign_step(sign[0], sign[1], req)
             else:
                 result = self.server.key_line(req)
         except PhoneError as exc:
@@ -187,8 +205,12 @@ class _PhoneHandler(GuardedHandler):
 class _PhoneServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], *, queue_dir: Path, rp_id: str, token: str) -> None:
+    def __init__(self, address: tuple[str, int], *, queue_dir: Path, rp_id: str, token: str,
+                 sign_namespaces: "tuple[str, ...]" = ()) -> None:
         from levain.authority import ReplayCache
+        from levain.consent.sign import Signer
+
+        signer = Signer(queue_dir, sign_namespaces, rp_id, self._sign_keys)    # refuses a bad namespace before binding
 
         super().__init__(address, _PhoneHandler)
         self.queue_dir = queue_dir
@@ -199,6 +221,7 @@ class _PhoneServer(ThreadingHTTPServer):
         # one replay cache for every request this server answers: a replay re-verifies only the links past what it
         # already holds, so a page that asks again costs one ssh-keygen run per new link, not one per link
         self.replay_cache = ReplayCache()
+        self.signer = signer
 
     # -- what the routes do (here, not on the handler, so tests can drive them without a socket) --------------
 
@@ -265,8 +288,48 @@ class _PhoneServer(ThreadingHTTPServer):
             body["cut"] = filed_input(entry.request) is UNSHOWN
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             undecided.append(body)
+        sign_pending, sign_note = [], ""
+        if self.signer.namespaces:
+            from levain.consent.sign import SignRefused
+
+            try:
+                sign_signers = list(self._sign_keys())
+            except SignRefused as exc:
+                sign_signers, sign_note = [], str(exc)
+            if not sign_signers and not sign_note:
+                sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
+            sign_pending = self.signer.listing(sign_signers)
         return {"rp_id": self.rp_id, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
-                "enrolled": self._enrolled(memo)}
+                "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note}
+
+    def _sign_keys(self) -> "dict[str, Any]":
+        """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
+        verifies against): what may sign a sign request. A laptop key never does."""
+        from levain.authority import AuthorityError
+        from levain.consent.answering import hook_roots, passkey_keys
+        from levain.consent.sign import SignRefused
+
+        roots = hook_roots(self.queue_dir)
+        if not roots:
+            raise SignRefused("no consent hook names a cockpit, so no passkey can sign here", 503)
+        if len(roots) > 1:
+            raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
+                              "answer: nothing is signed", 503)
+        try:
+            return {k.fingerprint: k for k in passkey_keys(self._source(roots[0])(), self.rp_id)}
+        except (AuthorityError, OSError, sqlite3.Error) as exc:
+            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+
+    def sign_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``/sign/<id>/challenge``, ``answer`` and ``deny`` (:class:`levain.consent.sign.Signer`)."""
+        from levain.consent.sign import SignRefused
+
+        try:
+            return getattr(self.signer, action)(request_id, req)
+        except SignRefused as exc:
+            word = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}.get(exc.status,
+                                                                                                   "sign_refused")
+            raise PhoneError(exc.status, word, str(exc)) from None
 
     def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
         """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol
@@ -450,7 +513,7 @@ class _PhoneServer(ThreadingHTTPServer):
 
 
 def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", port: int = DEFAULT_PHONE_PORT,
-                      token: str | None = None) -> _PhoneServer:
+                      token: str | None = None, sign_namespaces: "tuple[str, ...]" = ()) -> _PhoneServer:
     """A bound (not yet serving) phone port over the consent queue at ``queue_dir``, answering for the https name
     ``rp_id``. Loopback only: the proxy in front of it is what reaches the phone."""
     from levain.consent.passkey import is_host_name
@@ -461,7 +524,8 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
         raise ValueError(f"refusing {str(rp_id)[:80]!r}: the https name must be a lowercase DNS name a proxy serves "
                          "this port on (no scheme, port or path, not an address); `localhost` answers from this "
                          "machine's own browser")
-    return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32))
+    return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32),
+                        sign_namespaces=tuple(sign_namespaces))
 
 
 def _is_loopback_address(host: str) -> bool:
@@ -506,7 +570,8 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
     return None, why
 
 
-def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int) -> int:
+def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int,
+                     sign_namespaces: "tuple[str, ...]" = ()) -> int:
     """``levain consent phone``: serve the phone port until interrupted."""
     if name is None:
         if not tailscale:
@@ -517,7 +582,7 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
             print(f"--tailscale: {why}", file=sys.stderr)
             return 2
     try:
-        httpd = make_phone_server(queue_dir, name, port=port)
+        httpd = make_phone_server(queue_dir, name, port=port, sign_namespaces=sign_namespaces)
     except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -525,6 +590,10 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
     print(f"levain phone port on http://127.0.0.1:{bound}/ for https://{name}/ (consent queue {queue_dir})", flush=True)
     print(f"  put it on https: tailscale serve --bg --https=443 http://127.0.0.1:{bound}   (stop: tailscale serve reset)"
           if tailscale else f"  point your https proxy for {name} at http://127.0.0.1:{bound}", flush=True)
+    if sign_namespaces:
+        from levain.consent.sign import sign_dir
+
+        print(f"  signs requests in {sign_dir(queue_dir)} in namespace(s) {', '.join(sign_namespaces)}", flush=True)
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
     print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
     try:
