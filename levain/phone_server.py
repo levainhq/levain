@@ -16,7 +16,7 @@ it serves only these:
     never enrols itself: enrolment is signed by a laptop-presence key);
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
-    as ``sign_pending`` (:mod:`levain.consent.sign`).
+    as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
 token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
@@ -221,6 +221,10 @@ class _PhoneServer(ThreadingHTTPServer):
         # one replay cache for every request this server answers: a replay re-verifies only the links past what it
         # already holds, so a page that asks again costs one ssh-keygen run per new link, not one per link
         self.replay_cache = ReplayCache()
+        # on localhost a passkey's page must be this port's own origin exactly: another program on this machine can
+        # serve a page on localhost under another port (on an https name the proxy's origin carries no port)
+        self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
+        signer.page_origin = self.page_origin
         self.signer = signer
 
     # -- what the routes do (here, not on the handler, so tests can drive them without a socket) --------------
@@ -288,7 +292,7 @@ class _PhoneServer(ThreadingHTTPServer):
             body["cut"] = filed_input(entry.request) is UNSHOWN
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             undecided.append(body)
-        sign_pending, sign_note = [], ""
+        sign_pending, sign_note, sign_overflow = [], "", 0
         if self.signer.namespaces:
             from levain.consent.sign import SignRefused
 
@@ -298,9 +302,11 @@ class _PhoneServer(ThreadingHTTPServer):
                 sign_signers, sign_note = [], str(exc)
             if not sign_signers and not sign_note:
                 sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
-            sign_pending = self.signer.listing(sign_signers)
+            page = self.signer.page(sign_signers)
+            sign_pending, sign_overflow = page["rows"], page["overflow"]
         return {"rp_id": self.rp_id, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
-                "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note}
+                "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
+                "sign_overflow": sign_overflow}
 
     def _sign_keys(self) -> "dict[str, Any]":
         """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
@@ -390,7 +396,7 @@ class _PhoneServer(ThreadingHTTPServer):
                                                     f"{self.rp_id}")
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
-                                  b64url_decode(req["signature"], "signature"))
+                                  b64url_decode(req["signature"], "signature"), page_origin=self.page_origin)
             decided = ConsentQueue(self.queue_dir, authority=source).answer(request_id, payload, signature)
         except (AnswerRefused, PasskeyError, ConsentError) as exc:
             raise PhoneError(422, "answer_refused", str(exc)) from None
@@ -450,7 +456,8 @@ class _PhoneServer(ThreadingHTTPServer):
                                                     f"{self.rp_id}")
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
-                                  b64url_decode(req["signature"], "signature"), namespace=RULING_NAMESPACE)
+                                  b64url_decode(req["signature"], "signature"), namespace=RULING_NAMESPACE,
+                                  page_origin=self.page_origin)
             ruled = queue.answer_late(request_id, payload, signature)
         except (AnswerRefused, PasskeyError, ConsentError) as exc:
             raise PhoneError(422, "answer_refused", str(exc)) from None

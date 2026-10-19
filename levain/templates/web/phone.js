@@ -55,7 +55,8 @@
     // statements a caller filed for this phone's passkey to sign (`levain consent phone --sign-namespace`)
     const signs = Array.isArray(data.sign_pending) ? data.sign_pending : [];
     const waiting = rows.length + gaps.length + signs.length;
-    $("status").textContent = (waiting ? waiting + " waiting on you" : "nothing is waiting on you") + (last ? " \u00b7 last: " + last : "");
+    const unread = Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "";
+    $("status").textContent = (waiting ? waiting + " waiting on you" : "nothing is waiting on you") + unread + (last ? " \u00b7 last: " + last : "");
     list.replaceChildren(...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
                          ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
@@ -156,9 +157,10 @@
   }
 
   // a sign request: the whole message is shown as text (never HTML) and is exactly what the passkey signs (the
-  // challenge sends back the sha256 of the file this card was built from, so a file changed since is refused); a
-  // request the server refused (a character that can show differently from its bytes, a malformed file) shows only
-  // why, and can be denied
+  // challenge and the deny send back the sha256 of the file this card was built from, so a file changed since is
+  // refused); a request the server refused (a character that can show differently from its bytes, a malformed file)
+  // shows only why, and can be denied. A note kept across redraws belongs to the version it was made on: a changed
+  // file drops it, and what the server says of the request now (refused, no passkey) is shown, never kept
   function signCard(r, signNote) {
     const card = el("article", "req sign");
     const head = el("div", "req-head");
@@ -167,11 +169,13 @@
     card.appendChild(head);
     const note = el("div", "note");
     const key = "sign\u0000" + r.id;   // never a consent id
-    const say = (text, kind) => { notes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
-    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
-    if (r.refused) {
-      if (!notes.has(key)) say("not signable: " + r.refused, "bad");
-    } else {
+    const show = (text, kind) => { note.textContent = text; note.className = "note " + (kind || ""); };
+    const say = (text, kind) => { notes.set(key, [text, kind || "", r.sha256 || ""]); show(text, kind); };
+    if (notes.has(key) && notes.get(key)[2] !== (r.sha256 || "")) notes.delete(key);
+    const kept = notes.get(key);
+    if (r.refused) show("not signable: " + r.refused, "bad");
+    else if (kept) show(kept[0], kept[1]);
+    if (!r.refused) {
       if (r.requester) card.appendChild(el("div", "where", "from " + r.requester));
       card.appendChild(el("pre", "display", typeof r.message === "string" ? r.message : ""));
       if (r.expires_at) card.appendChild(el("div", "where", "until " + r.expires_at));
@@ -179,11 +183,11 @@
     const actions = el("div", "actions");
     const signers = Array.isArray(r.signers) ? r.signers : [];
     if (!r.refused) {
-      if (!signers.length && !notes.has(key)) say(signNote || "no passkey is enrolled for this name");
+      if (!signers.length && !kept) show(signNote || "no passkey is enrolled for this name");
       const b = el("button", "allow", "sign with Face ID");
       b.type = "button";
       b.disabled = !usable || !signers.length;
-      b.addEventListener("click", () => signWith(r, signers, say, actions));
+      b.addEventListener("click", () => signWith(r, signers, say, show, actions));
       actions.appendChild(b);
     }
     const d = el("button", "deny", "deny");
@@ -194,13 +198,13 @@
     return card;
   }
 
-  function signWith(r, signers, say, actions) {
+  function signWith(r, signers, say, show, actions) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
     if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say);
     if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say);
     const choices = known.length ? known : signers;
-    say("more than one passkey is enrolled for this name; pick the one this phone holds:");
+    show("more than one passkey is enrolled for this name; pick the one this phone holds:");
     for (const old of actions.querySelectorAll(".pick")) old.remove();
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
@@ -220,17 +224,22 @@
       say("confirm with your passkey to sign…");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
       if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
-      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + "answer", {
-        authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
-        signature: b64u(cred.response.signature) }))
-        .then((a) => {
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => {
+        say("verifying the signature…");
+        return call("POST", base + "answer", {
+          authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
+          signature: b64u(cred.response.signature) }).then((a) => {
+          // the passkey signed: once the answer is sent, only the server's own refusal says nothing was signed; no
+          // reply (the connection dropped) or an internal error may follow a signature the server already wrote
+          if (!a.ok && (a.status === 0 || a.status === 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (r.title || r.id);
           say("signed · by " + a.body.signer_fp + " in " + a.body.namespace, "ok");
-        }, (e) => {
-          if (rawId && e && e.name === "NotAllowedError") forget(fp);
-          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
         });
+      }, (e) => {
+        if (rawId && e && e.name === "NotAllowedError") forget(fp);
+        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed", "bad");
+      });
     }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
@@ -238,11 +247,12 @@
   function signDeny(r, say) {
     if (busy) return;
     busy++;
-    call("POST", "/sign/" + encodeURIComponent(r.id) + "/deny", {}).then((a) => {
+    call("POST", "/sign/" + encodeURIComponent(r.id) + "/deny", { request_sha256: r.sha256 || "" }).then((a) => {
       if (!a.ok) return say("not denied: " + why(a), "bad");
       last = "denied " + (r.title || r.id);
       say("denied", "ok");
-    }).finally(() => { busy--; setTimeout(load, 1500); });
+    }).catch((e) => say("the deny failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
+      .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
   // enrolment: the created credential is kept, so a failed key-line call retries only that call, never makes another
