@@ -76,7 +76,11 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     assert queue.withdraw(request.id)
     file("ran", "Bash", {"command": "echo ran"})
     assert queue.record_ran(agent="claude_code", agent_session_id="sess-ran", tool_name="Bash",
-                            tool_input={"command": "echo ran"}, event="post")[1] in ("ran", "ran_unasked")
+                            tool_input={"command": "echo ran"}, event="post")[1] == "ran"      # answered while held
+    request = file("ran_unasked", "Bash", {"command": "echo unasked"})
+    assert queue.withdraw(request.id)
+    assert queue.record_ran(agent="claude_code", agent_session_id="sess-ran_unasked", tool_name="Bash",
+                            tool_input={"command": "echo unasked"}, event="post")[1] == "ran_unasked"
     request = file("did_not_run", "Bash", {"command": "echo no"})
     assert queue.withdraw(request.id)
     assert queue.close_unrun(agent="claude_code", agent_session_id="sess-did_not_run", event="stop") == [request.id]
@@ -125,7 +129,7 @@ def test_every_terminal_row_is_one_receipt_in_seq_order_and_pending_is_not_expor
     # an undecided request that was ruled has two rows, so two receipts
     assert len([1 for r in terminal if r[1] == "undecided"]) == 3
     assert exported.report.receipts == len(terminal) == len(exported.receipts)
-    assert exported.report.by_state == {"allowed": 3, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 3}
+    assert exported.report.by_state == {"allowed": 3, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 4}
     assert exported.report.pending_skipped == len(rows) - len(terminal)
 
 
@@ -233,12 +237,55 @@ def test_withdrawn_and_dialog_outcomes(scratch):
     did_not_run = _row(scratch, "did_not_run", "withdrawn")
     assert did_not_run["execution"]["status"] == "blocked" and "refusal" not in did_not_run
     assert did_not_run["provenance"]["execution.status"] == "observed"
-    # a tool the agent's own dialog ran is kept on the queue's mapping and counted, never made a success without
-    # the approval block the schema then requires
-    ran = _row(scratch, "ran", "withdrawn")
-    assert ran["execution"]["status"] == "blocked" and "approval" not in ran
     _, _, exported = scratch
-    assert (exported.report.dialog_ran, exported.report.dialog_did_not_run) == (1, 1)
+    assert (exported.report.dialog_ran, exported.report.dialog_ran_unasked,
+            exported.report.dialog_did_not_run) == (1, 1, 1)
+
+
+def _outcome_time(scratch, name):
+    queue, ids, _ = scratch
+    conn = sqlite3.connect(queue.path)
+    try:
+        return conn.execute("SELECT closed_at FROM dialog_outcomes WHERE request_id = ?", (ids[name],)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_ran_outcome_is_a_success_with_an_unsigned_native_dialog_approval(scratch):
+    ran = _row(scratch, "ran", "withdrawn")
+    at = _outcome_time(scratch, "ran")
+    assert ran["policy"]["decision"] == "require-approval" and "refusal" not in ran
+    assert ran["execution"]["status"] == "success" and ran["execution"]["completed_at"] == at
+    approval = ran["approval"]
+    assert approval["approver"] == {"id": "native-dialog:operator", "role": "operator"}
+    assert approval["approved_at"] == at
+    context = json.loads(approval["context"])
+    assert context["via"] == "native-dialog" and context["signed"] is False
+    assert context["request_id"] == scratch[1]["ran"] and context["queue"] == scratch[0].queue_id
+    assert ran["provenance"]["approval.approver.id"] == "inferred"
+    assert ran["provenance"]["execution.status"] == "inferred"
+    # the spec's conditional (success under require-approval needs an approval) holds, and the schema accepts it
+    assert not ab_validate(ran)
+
+
+def test_a_ran_unasked_outcome_is_an_allow_under_the_agents_own_permissions_with_no_approval(scratch):
+    unasked = _row(scratch, "ran_unasked", "withdrawn")
+    assert unasked["policy"] == {"name": "claude-code.native-permissions", "version": "unknown", "decision": "allow"}
+    assert unasked["execution"]["status"] == "success" and "approval" not in unasked and "refusal" not in unasked
+    assert unasked["execution"]["completed_at"] == _outcome_time(scratch, "ran_unasked")
+    assert unasked["provenance"]["policy.name"] == "inferred" and unasked["provenance"]["policy.version"] == "synthesized"
+    assert ("claude-code.native-permissions", "unknown") in scratch[2].policy_store()
+    assert not ab_validate(unasked)
+
+
+def ab_validate(receipt):
+    """The spec's own validator when it is installed (the S1 venv); otherwise the schema rule the exporter relies on."""
+    try:
+        from agentboundary import validate_receipt
+    except ImportError:
+        needs = receipt["policy"]["decision"] == "require-approval" and receipt["execution"]["status"] == "success"
+        return [] if not needs or "approval" in receipt else ["success under require-approval needs an approval"]
+    return validate_receipt(receipt)
 
 
 def test_refusal_and_decision_are_always_consistent_and_approval_follows_the_schema_rule(scratch):
@@ -300,7 +347,8 @@ def test_export_never_writes_the_store(tmp_path):
 def test_the_default_policy_version_is_the_running_levain(scratch):
     from levain import __version__
     queue, _, _ = scratch
-    assert {r["policy"]["version"] for r in ab.export(queue.directory).receipts} == {__version__}
+    assert {r["policy"]["version"] for r in ab.export(queue.directory).receipts
+            if not r["policy"]["name"].endswith(".native-permissions")} == {__version__}
 
 
 def test_a_store_that_is_not_a_queue_is_refused(tmp_path):

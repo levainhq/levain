@@ -26,8 +26,15 @@ What each queue state becomes (``policy.decision`` / ``execution.status`` / ``re
   success / none, with the ``approval`` block · denied: require-approval / blocked / deny ``operator-denied``, the
   approval block present (the spec's refusal rule 3) · expired: require-approval / blocked / expired
   ``approval-window-elapsed`` · undecided and withdrawn: require-approval / blocked / require-approval with the reason
-  ``undecided`` or ``withdrawn``. A request left to the agent's own dialog that never ran (``did_not_run``) is
-  blocked with no refusal.
+  ``undecided`` or ``withdrawn``. A request left to the agent's own dialog gets its ``dialog_outcomes`` row mapped
+  over the queue's state, because the queue's state then describes a request the agent answered, not levain, and
+  ``blocked`` for a tool that ran would be a false record:
+  ``did_not_run``: blocked with no refusal · ``ran`` (a yes in the agent's dialog, unsigned): require-approval /
+  success, with an ``approval`` block whose approver is ``native-dialog:operator`` (provenance inferred),
+  ``approved_at`` the outcome's own ``closed_at`` and a context of ``via: native-dialog, signed: false``, so it is
+  never read as levain's signed answer · ``ran_unasked`` (the agent's own standing permission): policy
+  ``<framework>.native-permissions`` version ``unknown`` (inferred / synthesized), allow / success, no approval. For
+  both ``completed_at`` is the outcome's ``closed_at``, the moment the tool ran as levain learned it.
 
 Known edges (each stated, none built against):
   - NO signature and NO COSE envelope. The spec's envelope is Ed25519 only, while an operator key may be a security
@@ -45,10 +52,6 @@ Known edges (each stated, none built against):
     stored ``cwd`` in its byte form, never in its characters;
   - ``approval.approved_at`` and ``execution.completed_at`` are the same instant (the queue stamps one moment for a
     decision), so ``approved_at`` equals, and does not precede, ``completed_at``;
-  - an unsigned request outcome of ``ran`` or ``ran_unasked`` (the agent's own dialog ran the tool) is not mapped to
-    ``execution.status = success``: the schema then requires an ``approval`` block, and levain holds no approval for
-    a call its own dialog answered. Those receipts keep the queue's state mapping and are counted in the report
-    (``dialog_ran``), so the gap is visible, not smoothed;
   - ``actor.id`` carries the session id and ``resource_id`` the working directory because the closed schema has no
     field for either; a reader of an exported receipt learns both;
   - ``completed_at`` is the decision time or, for a state with no decision, the receipt's own stamp: AgentBoundary
@@ -96,7 +99,7 @@ _CONDITIONAL_PATHS = ("actor.display_name", "agent.model_version", "tool.version
                       "refusal.reason_code")
 
 _SQL = ("SELECT r.seq, r.request_id, r.state, r.created_at, q.id, q.agent, q.agent_session_id, q.tool_name, "
-        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, {outcome} "
+        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, {outcome}, {closed} "
         "FROM receipts r LEFT JOIN requests q ON q.id = r.request_id {join} ORDER BY r.seq")
 _REQUEST_TEXT = (4, 5, 6, 7, 8, 9, 10, 11)     # the request columns every exported row must hold as text
 
@@ -109,8 +112,8 @@ class ExportError(ValueError):
 class Report:
     """What an export did. ``by_state``: exported receipts per receipt-row state. ``pending_skipped``: ``pending``
     rows not exported. ``synthesized_arguments_hash``: receipts whose ``arguments_hash`` is a ``json:`` digest, not a
-    JCS hash (the spec's verifier given the arguments would flag them). ``dialog_ran``: exported receipts of
-    requests whose agent dialog ran the tool, kept on the queue's state mapping (see the module's known edges).
+    JCS hash (the spec's verifier given the arguments would flag them). ``dialog_ran`` / ``dialog_ran_unasked``:
+    receipts whose queue-state mapping a ``ran`` / ``ran_unasked`` dialog outcome overrode.
     ``dialog_did_not_run``: receipts mapped ``blocked`` with no refusal for that outcome. ``nfc_normalised``:
     receipts whose own strings were changed by NFC."""
     receipts: int
@@ -118,6 +121,7 @@ class Report:
     pending_skipped: int
     synthesized_arguments_hash: int
     dialog_ran: int
+    dialog_ran_unasked: int
     dialog_did_not_run: int
     nfc_normalised: int
 
@@ -221,9 +225,9 @@ def _read(queue_dir: Path) -> tuple[str, list[tuple[Any, ...]]]:
             if not isinstance(meta.get("queue_id"), str) or not meta["queue_id"]:
                 raise ExportError("the store has no queue_id")
             if "dialog_outcomes" in have:
-                sql = _SQL.format(outcome="d.outcome", join="LEFT JOIN dialog_outcomes d ON d.request_id = q.id")
+                sql = _SQL.format(outcome="d.outcome", closed="d.closed_at", join="LEFT JOIN dialog_outcomes d ON d.request_id = q.id")
             else:
-                sql = _SQL.format(outcome="NULL", join="")
+                sql = _SQL.format(outcome="NULL", closed="NULL", join="")
             rows = conn.execute(sql).fetchall()
         except sqlite3.Error as exc:
             raise ExportError(f"the store cannot be read: {exc}") from None
@@ -251,7 +255,7 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
          ) -> tuple[dict[str, Any], dict[str, str]]:
     """The receipt (without ``prior_receipt``, ``provenance``, score and hash) and its provenance entries."""
     (seq, _rid, rstate, created, _qid, agent, session, tool, digest, cwd, tier, qstate, decided, signer, via,
-     outcome) = row
+     outcome, outcome_at) = row
     framework = _FRAMEWORKS.get(agent, agent.replace("_", "-"))
     prov: dict[str, str] = {
         "receipt_id": "inferred", "issued_at": "observed", "actor.type": "inferred", "actor.id": "observed",
@@ -309,7 +313,28 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
         prov["execution.status"] = "observed"
         counters["dialog_did_not_run"] += 1
     elif rstate in ("withdrawn", "expired") and outcome in ("ran", "ran_unasked"):
-        counters["dialog_ran"] += 1
+        # the agent's own dialog or standing permission ran the tool: the queue's state describes a request levain
+        # did not decide, so the outcome row overrides it (a receipt of `blocked` for a tool that ran is a false record)
+        if type(outcome_at) is not str:
+            raise ExportError(f"receipt {seq}: its dialog outcome has no time")
+        refusal = None
+        status = "success"
+        completed = outcome_at
+        prov["execution.completed_at"] = "inferred"
+        prov["execution.status"] = "inferred"
+        if outcome == "ran":
+            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": outcome_at,
+                        "context": json.dumps({"queue": queue_id, "request_id": row[1], "via": "native-dialog",
+                                               "signed": False}, sort_keys=True, separators=(",", ":"))}
+            prov.update({"approval.approver.id": "inferred", "approval.approver.role": "synthesized",
+                         "approval.approved_at": "observed", "approval.context": "inferred"})
+            decision = "require-approval"
+            counters["dialog_ran"] += 1
+        else:
+            name, version = f"{framework}.native-permissions", _UNKNOWN
+            decision = "allow"
+            prov["policy.name"], prov["policy.version"] = "inferred", "synthesized"
+            counters["dialog_ran_unasked"] += 1
     receipt: dict[str, Any] = {
         "version": AB_VERSION,
         "receipt_id": str(uuid.uuid5(LEVAIN_AB_NS, f"{queue_id}:{seq}")),
@@ -339,7 +364,8 @@ def export(queue_dir: Path | str, *, levain_version: str | None = None) -> Expor
     if not isinstance(version, str) or not version:
         raise ExportError("levain_version must be a non-empty string")
     queue_id, rows = _read(Path(queue_dir))
-    counters = {"synthesized_arguments_hash": 0, "dialog_ran": 0, "dialog_did_not_run": 0}
+    counters = {"synthesized_arguments_hash": 0, "dialog_ran": 0, "dialog_ran_unasked": 0,
+                "dialog_did_not_run": 0}
     by_state: dict[str, int] = {}
     receipts: list[dict[str, Any]] = []
     pending = normalised = 0
