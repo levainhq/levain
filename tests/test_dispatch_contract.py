@@ -616,3 +616,23 @@ def test_the_budget_is_read_only_and_never_shared(repo):
     again = dataclasses.replace(c, budget=mine)
     mine["tokens"] = 1
     assert again.digest == digest and again.budget["tokens"] != 1
+
+
+def test_git_that_cannot_run_is_never_reported_as_a_bad_base(repo, monkeypatch):
+    # L3 r4 (codex MED): a git timeout while verifying base must not read as "base is not a commit"
+    import subprocess as sp
+
+    from levain.dispatch import contract as c
+    path, base = repo
+    real = sp.run
+
+    def flaky(argv, *a, **kw):
+        if "--verify" in argv and any(str(x).endswith("^{commit}") for x in argv):
+            raise sp.TimeoutExpired(argv, 1)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(c.subprocess, "run", flaky)
+    with pytest.raises(ContractRefused) as got:
+        resolve(submission(path, base))
+    assert "git could not run" in str(got.value)
+    assert "is not a commit" not in str(got.value)

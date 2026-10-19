@@ -88,6 +88,11 @@ def _refuse(message: str) -> ContractRefused:
     return ContractRefused(message)
 
 
+class _GitUnavailable(ContractRefused):
+    """git could not run at all (it timed out or could not start): a fault on this machine, not in the submission, so
+    a caller that reads input faults from a refusal must never report it as one."""
+
+
 def _text_problem(text: str, what: str) -> str | None:
     # prose (a goal): what is signed must show as what it is; newline, tab and the plain space are prose
     for ch in text:
@@ -258,7 +263,8 @@ def _git(repo: str, *args: str) -> bytes:
         cp = subprocess.run(["git", "--no-replace-objects", "-C", repo, *args], capture_output=True,
                             timeout=GIT_TIMEOUT, env=git_env(), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _refuse(f"git could not run in {repo} ({type(exc).__name__})") from None
+        raise _GitUnavailable(f"git could not run in {repo} ({type(exc).__name__}); nothing in the contract was "
+                              "judged, so the same submission may be filed again") from None
     if cp.returncode != 0:
         detail = (cp.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         raise _refuse(f"git {args[0]} failed in {repo}: {detail[-1][:200] if detail else cp.returncode}")
@@ -299,6 +305,8 @@ def _resolve_base(repo: str, base: Any) -> tuple[str, str]:
         raise _refuse("base must be a full 40-hex commit sha (lowercase)")
     try:
         got = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode("ascii").strip()
+    except _GitUnavailable:
+        raise
     except ContractRefused:
         # git's own stderr is not a planner's message: the sha names no commit here (absent, or a blob or tree)
         raise _refuse(f"base {base} is not a commit in {repo}") from None
