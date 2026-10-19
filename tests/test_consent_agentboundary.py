@@ -83,6 +83,7 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     request = file("withdrawn", "Bash", {"command": "ls"})
     assert queue.withdraw(request.id)
     file("ran", "Bash", {"command": "echo ran"})
+    clock.now += timedelta(seconds=2)                      # the operator answers the dialog after it opened
     assert queue.record_ran(agent="claude_code", agent_session_id="sess-ran", tool_name="Bash",
                             tool_input={"command": "echo ran"}, event="post")[1] == "ran"      # answered while held
     request = file("ran_unasked", "Bash", {"command": "echo unasked"})
@@ -302,7 +303,13 @@ def test_a_ran_outcome_is_a_success_with_an_unsigned_native_dialog_approval(scra
     assert ran["execution"]["status"] == "success" and ran["execution"]["completed_at"] == at
     approval = ran["approval"]
     assert approval["approver"] == {"id": "native-dialog:operator", "role": "operator"}
-    assert approval["approved_at"] == ran["issued_at"] <= at          # the moment the dialog opened: a lower bound
+    conn = sqlite3.connect(scratch[0].path)
+    try:
+        received = conn.execute("SELECT received_at FROM requests WHERE id = ?", (scratch[1]["ran"],)).fetchone()[0]
+    finally:
+        conn.close()
+    assert approval["approved_at"] == received < at          # no approval precedes the request: a lower bound
+    assert approval["approved_at"] < ran["execution"]["completed_at"]
     assert ran["provenance"]["approval.approved_at"] == "synthesized"
     context = json.loads(approval["context"])
     assert context["via"] == "native-dialog" and context["signed"] is False

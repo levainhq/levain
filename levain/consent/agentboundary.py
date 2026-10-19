@@ -34,8 +34,8 @@ What each queue state becomes (``policy.decision`` / ``execution.status`` / ``re
   the queue's state, because the queue's state then describes a request the agent answered, not levain, and
   ``blocked`` for a tool that ran would be a false record: ``did_not_run``: blocked with no refusal · ``ran`` (a yes
   in the agent's dialog, unsigned): require-approval / success, with an ``approval`` block whose approver is
-  ``native-dialog:operator`` (provenance inferred), ``approved_at`` the withdrawn or expired row's own stamp (the
-  moment the dialog opened, a lower bound, ``synthesized``) and a context of ``via: native-dialog, signed: false``,
+  ``native-dialog:operator`` (provenance inferred), ``approved_at`` the request's ``received_at`` (no
+  approval can precede the request, and the dialog's answer is not recorded: a lower bound, ``synthesized``) and a context of ``via: native-dialog, signed: false``,
   so it is never read as levain's signed answer · ``ran_unasked`` (the agent's own standing permission): policy
   ``<framework>.native-permissions`` version ``unknown`` (inferred / synthesized), allow / success, no approval. For
   both ``completed_at`` is the outcome's ``closed_at``, the moment the tool ran as levain learned it.
@@ -121,9 +121,10 @@ _CONDITIONAL_PATHS = ("actor.display_name", "agent.model_version", "tool.version
                       "refusal.reason_code")
 
 _SQL = ("SELECT r.seq, r.request_id, r.state, r.created_at, q.id, q.agent, q.agent_session_id, q.tool_name, "
-        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, q.answer, {outcome}, {closed} "
+        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, q.answer, q.received_at, "
+        "{outcome}, {closed} "
         "FROM receipts r LEFT JOIN requests q ON q.id = r.request_id {join} ORDER BY r.seq")
-_REQUEST_TEXT = (4, 5, 6, 7, 8, 9, 10, 11)     # the request columns every exported row must hold as text
+_REQUEST_TEXT = (4, 5, 6, 7, 8, 9, 10, 11, 16)     # the request columns every exported row must hold as text
 
 
 class ExportError(ValueError):
@@ -305,7 +306,7 @@ def _map(queue_id: str, row: tuple[Any, ...], outcome: str | None, counters: dic
     """The receipt (without ``prior_receipt``, ``provenance``, score and hash) and its provenance entries.
     ``outcome`` is the row's dialog outcome when it counts (:func:`_counted_outcome`), else ``None``."""
     (seq, _rid, rstate, created, _qid, agent, session, tool, digest, cwd, tier, qstate, decided, signer, via, answer,
-     _outcome, outcome_at) = row
+     received, _outcome, outcome_at) = row
     framework = _FRAMEWORKS.get(agent, agent.replace("_", "-"))
     prov: dict[str, str] = {
         "receipt_id": "inferred", "issued_at": "observed", "actor.type": "inferred", "actor.id": "observed",
@@ -377,7 +378,7 @@ def _map(queue_id: str, row: tuple[Any, ...], outcome: str | None, counters: dic
         status = "success"
         completed = outcome_at
         if outcome == "ran":
-            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": created,
+            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": received,
                         "context": json.dumps({"queue": queue_id, "request_id": row[1], "via": "native-dialog",
                                                "signed": False}, sort_keys=True, separators=(",", ":"))}
             prov.update({"approval.approver.id": "inferred", "approval.approver.role": "synthesized",
