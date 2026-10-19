@@ -37,8 +37,10 @@ class ControlResolver:
             sock.connect(self._path)
             wire.write_frame(sock, {"v": wire.VERSION, "op": "QUEUE-RESOLVE", "id": rid, "slot": dict(slot),
                                     "cap_digest": cap_digest})
-            got = wire.read_frame(sock)
-        if not isinstance(got, dict) or got.get("id") != rid or got.get("ok") not in (True, False):
+            got = wire.read_frame(sock, timeout=self._timeout)
+        # exact types: 0 == False and True == 1 in Python, and neither is CONTROL's answer
+        if not isinstance(got, dict) or type(got.get("id")) is not int or got["id"] != rid \
+                or type(got.get("ok")) is not bool:
             return "resolve-malformed"
         if got["ok"] is False:
             name = got.get("refused")

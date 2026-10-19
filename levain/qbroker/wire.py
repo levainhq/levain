@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
 from typing import Any
 
 from levain.contracts.canon import canonical_bytes, parse
@@ -36,14 +37,28 @@ def encode(message: dict[str, Any]) -> bytes:
     return _LEN.pack(len(body)) + body
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
-    """``n`` bytes, or ``None`` at a clean EOF before the first byte; a short read after it is a FrameError."""
+def _recv_exact(sock: socket.socket, n: int, deadline: float | None, started: bool) -> bytes | None:
+    """``n`` bytes, or ``None`` at a clean EOF before the first byte; a short read after it is a FrameError.
+    Past ``deadline`` (a :func:`time.monotonic` instant) the read is a ``frame-timeout`` FrameError once any byte
+    of the frame has arrived (``started``, or a byte in this call), and :class:`TimeoutError` before that."""
     chunks: list[bytes] = []
     got = 0
     while got < n:
-        chunk = sock.recv(n - got)
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                if started or got:
+                    raise FrameError("frame-timeout")
+                raise TimeoutError("no frame before the deadline")
+            sock.settimeout(left)
+        try:
+            chunk = sock.recv(n - got)
+        except TimeoutError:
+            if deadline is not None and (started or got):
+                raise FrameError("frame-timeout") from None
+            raise
         if not chunk:
-            if got == 0:
+            if got == 0 and not started:
                 return None
             raise FrameError("frame-truncated")
         chunks.append(chunk)
@@ -51,15 +66,18 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def read_frame(sock: socket.socket) -> dict[str, Any] | None:
-    """The next message, or ``None`` at EOF. The length is checked before a byte of the body is read."""
-    head = _recv_exact(sock, _LEN.size)
+def read_frame(sock: socket.socket, *, timeout: float | None = None) -> dict[str, Any] | None:
+    """The next message, or ``None`` at EOF. The length is checked before a byte of the body is read. With
+    ``timeout``, the whole frame must arrive within that many seconds of this call, however it is dripped in:
+    :class:`TimeoutError` when nothing came, a ``frame-timeout`` FrameError when part of it did."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    head = _recv_exact(sock, _LEN.size, deadline, False)
     if head is None:
         return None
     (n,) = _LEN.unpack(head)
     if n > MAX_FRAME:
         raise FrameError("frame-too-large")
-    body = _recv_exact(sock, n) if n else b""
+    body = _recv_exact(sock, n, deadline, True) if n else b""
     if body is None:
         raise FrameError("frame-truncated")
     try:

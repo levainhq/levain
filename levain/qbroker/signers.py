@@ -3,8 +3,9 @@
 ``L/policy/allowed_signers.json`` is the canonical ``levain-allowed-signers/1`` record ``{generation, issued_at,
 signers: [{principal, key_type, key_b64, namespaces}]}``; ``allowed_signers.json.sig`` is an SSHSIG over its bytes
 by the dispatch trust root (``L/routes/trust.pub``) in :data:`CONFIG_NAMESPACE`. :class:`SignersSource` re-verifies
-the pair whenever any of the three files changes, and accepts a generation only when it is strictly greater than
-the last it accepted (the same bytes read again are not a change). While the pair is missing, unverifiable or a
+the pair whenever any of the three files changes or the last try could not run the verifier, and accepts a
+generation only when it is strictly greater than the last it accepted (the same bytes read again are not a
+change). While the pair is missing, unverifiable or a
 rollback, :meth:`SignersSource.current` returns ``None`` and every answer is refused (fail closed).
 
 The high-water generation lives in this process only: a restarted broker accepts any validly signed generation,
@@ -157,25 +158,30 @@ class SignersSource:
         self._accepted: SignersSnapshot | None = None   # the last snapshot accepted, kept past a refusal
         self.problem: str | None = "not loaded"
 
-    def _reload(self) -> None:
+    def _reload(self) -> bool:
+        """Re-read the pair; ``False`` when the verifier could not run, so nothing was decided about these files."""
         try:
             snap = load(self._policy, self._trust, ssh_keygen=self._ssh_keygen)
-        except (SignersError, VerifierUnavailable) as exc:
+        except VerifierUnavailable as exc:
             self._snapshot, self.problem = None, str(exc)
-            return
+            return False
+        except SignersError as exc:
+            self._snapshot, self.problem = None, str(exc)
+            return True
         last = self._accepted
         if last is not None and snap != last and snap.generation <= last.generation:
             self._snapshot = None
             self.problem = (f"signers generation {snap.generation} is not above the accepted generation "
                             f"{last.generation}")
-            return
+            return True
         self._snapshot = self._accepted = snap
         self.problem = None
+        return True
 
     def current(self) -> SignersSnapshot | None:
         with self._mutex:
             seen = _identity(self._paths)
             if seen != self._seen:
-                self._reload()
-                self._seen = seen
+                # files the verifier could not judge are not recorded as seen: the next call tries them again
+                self._seen = seen if self._reload() else None
             return self._snapshot

@@ -1,12 +1,13 @@
 """``python -I -m levain.qbroker``: run the queue broker as ``_levain_qbroker`` (CONTRACT c3 §1.3).
 
-Serves ``R/qb/slot<n>/q.sock`` for every ``--slot``, each accepting only the uid of ``_levain_s<n>``; resolves caps
-through ``R/control/control.sock``; reads rows under ``L/queue/`` and the answer-signer snapshot under
-``L/policy/`` (verified by ``L/routes/trust.pub``). Runs until SIGTERM or SIGINT.
+Serves ``R/qb/slot<n>/q.sock`` for every ``--slot``, each accepting only the uid of ``_levain_s<n>`` and served only
+when the socket is in group ``_levain_s<n>``; resolves caps through ``R/control/control.sock``; reads rows under
+``L/queue/`` and the answer-signer snapshot under ``L/policy/`` (verified by ``L/routes/trust.pub``). Runs until SIGTERM or SIGINT.
 """
 from __future__ import annotations
 
 import argparse
+import grp
 import logging
 import pwd
 import signal
@@ -36,7 +37,8 @@ def main(argv: list[str] | None = None) -> int:
                     SignersSource(store_root / "policy", store_root / "routes" / "trust.pub"))
     listeners = []
     for slot in sorted(set(args.slot)):
-        listener = SlotListener(broker, slot, socket_path(run_dir, slot), pwd.getpwnam(f"_levain_s{slot}").pw_uid)
+        listener = SlotListener(broker, slot, socket_path(run_dir, slot), pwd.getpwnam(f"_levain_s{slot}").pw_uid,
+                                expected_gid=grp.getgrnam(f"_levain_s{slot}").gr_gid)
         listener.start()
         listeners.append(listener)
     done = threading.Event()

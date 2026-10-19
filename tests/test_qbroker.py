@@ -386,6 +386,20 @@ def run_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def bound_gid(d: Path) -> int:
+    """The group a node made in ``d`` takes (the directory's on macOS, the process's on Linux)."""
+    probe = Path(tempfile.mkstemp(dir=d)[1])
+    try:
+        return probe.stat().st_gid
+    finally:
+        probe.unlink()
+
+
+def listen(b, run_dir: Path, uid: int, **kw) -> SlotListener:
+    kw.setdefault("expected_gid", bound_gid(run_dir / "s1"))
+    return SlotListener(b, 1, run_dir / "s1" / "q.sock", uid, **kw)
+
+
 def connect(path: Path) -> socket.socket:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(10)
@@ -394,7 +408,7 @@ def connect(path: Path) -> socket.socket:
 
 
 def test_a_request_and_its_answer_over_a_real_socket(L, broker, keys, run_dir):
-    lst = SlotListener(broker, 1, run_dir / "s1" / "q.sock", os.getuid())   # the real LOCAL_PEERCRED / SO_PEERCRED
+    lst = listen(broker, run_dir, os.getuid())   # the real LOCAL_PEERCRED / SO_PEERCRED
     lst.start()
     try:
         assert oct((run_dir / "s1" / "q.sock").stat().st_mode & 0o777) == "0o660"
@@ -419,7 +433,7 @@ def test_a_real_peer_with_the_wrong_uid_is_refused_before_the_body_is_read(L, re
 
     spy = Spy(QueueStore(L / "queue"), resolver, SignersSource(L / "policy", L / "routes" / "trust.pub"),
               clock=clock["fn"])
-    lst = SlotListener(spy, 1, run_dir / "s1" / "q.sock", os.getuid() + 1)
+    lst = listen(spy, run_dir, os.getuid() + 1)
     lst.start()
     try:
         with connect(lst.path) as s:
@@ -448,7 +462,7 @@ def test_peer_uid_reads_the_kernels_answer(run_dir):
 
 
 def test_an_oversize_frame_is_refused_unread(broker, run_dir):
-    lst = SlotListener(broker, 1, run_dir / "s1" / "q.sock", os.getuid(), peer_uid=lambda _s: os.getuid())
+    lst = listen(broker, run_dir, os.getuid(), peer_uid=lambda _s: os.getuid())
     lst.start()
     try:
         with connect(lst.path) as s:
@@ -462,7 +476,7 @@ def test_an_oversize_frame_is_refused_unread(broker, run_dir):
 
 
 def test_a_non_canonical_frame_is_refused(broker, run_dir):
-    lst = SlotListener(broker, 1, run_dir / "s1" / "q.sock", os.getuid(), peer_uid=lambda _s: os.getuid())
+    lst = listen(broker, run_dir, os.getuid(), peer_uid=lambda _s: os.getuid())
     lst.start()
     try:
         with connect(lst.path) as s:
@@ -474,7 +488,7 @@ def test_a_non_canonical_frame_is_refused(broker, run_dir):
 
 
 def test_connections_past_the_bound_are_closed_at_once(broker, run_dir):
-    lst = SlotListener(broker, 1, run_dir / "s1" / "q.sock", os.getuid(), max_connections=1)
+    lst = listen(broker, run_dir, os.getuid(), max_connections=1)
     lst.start()
     try:
         held = connect(lst.path)
@@ -520,3 +534,213 @@ def test_an_unreachable_control_fails_closed(L, clock, run_dir):
     b = make_broker(L, ControlResolver(run_dir / "absent.sock"), clock)
     got = req(b)
     assert got["ok"] is False and got["refused"] == "control-unavailable"
+
+
+# --- fix round 1 -----------------------------------------------------------------------------------------------
+
+def test_a_poll_storm_costs_one_verify_and_one_resolve(L, broker, resolver, keys, monkeypatch):
+    import levain.qbroker.broker as broker_mod
+    verifies = []
+    real = broker_mod.answer_refusal
+
+    def counted(*a, **kw):
+        verifies.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker_mod, "answer_refusal", counted)
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"])
+    for _ in range(30):
+        assert ask(broker, rid)["decision"] == "allow"
+    assert len(verifies) == 1 and len(resolver.calls) == 1
+    write_answer(L, rid, keys["operator"], decision="deny")          # a new answer file: verified again
+    assert ask(broker, rid)["decision"] == "deny" and len(verifies) == 2
+    write_signers(L, keys, 2, [keys["stranger"].signer()])           # a new snapshot: verified again, refused
+    assert ask(broker, rid)["refused"] == "answer-refused" and len(verifies) == 3
+
+
+def test_a_cached_resolve_expires_and_refusals_are_cached_too(L, resolver, clock):
+    mono = {"t": 100.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    rid = filed(b)
+    assert ask(b, rid, cap="cap-x")["refused"] == "cap-unknown"
+    assert ask(b, rid, cap="cap-x")["refused"] == "cap-unknown"
+    ask(b, rid)
+    assert len(resolver.calls) == 2                                   # cap-a once, cap-x once
+    mono["t"] += 60
+    ask(b, rid)
+    assert len(resolver.calls) == 3
+
+
+def test_answer_polls_past_the_slots_rate_are_refused_rate_limited(L, resolver, clock):
+    mono = {"t": 100.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"], answer_rate=10.0, answer_burst=5)
+    rid = filed(b)
+    assert [ask(b, rid).get("pending") for _ in range(5)] == [True] * 5
+    assert ask(b, rid)["refused"] == "rate-limited"
+    assert req(b, fields=hook_fields("other"))["ok"] is True                  # REQUEST is not ANSWER?
+    assert ask(b, rid, slot=2, cap="cap-two")["refused"] == "no-such-request"  # slot 2 has its own bucket
+    mono["t"] += 0.2                                                           # two tokens back
+    assert ask(b, rid)["pending"] is True and ask(b, rid)["pending"] is True
+    assert ask(b, rid)["refused"] == "rate-limited"
+
+
+def test_a_fifth_unexpired_pending_row_is_refused_queue_busy(L, broker, keys, clock):
+    rids = [filed(broker, fields=hook_fields(f"p{i}")) for i in range(4)]
+    got = req(broker, fields=hook_fields("p4"))
+    assert got["ok"] is False and got["refused"] == "queue-busy"
+    assert len(list((L / "queue" / "requests").glob("pend-*.json"))) == 4
+    assert req(broker, cap="cap-a2", fields=hook_fields("b0"))["ok"] is True   # another session: its own four
+    assert req(broker, fields=hook_fields("p0"))["ok"] is True        # a replay is not a new row
+    write_answer(L, rids[0], keys["operator"])                                 # answered: no longer pending
+    assert req(broker, fields=hook_fields("p4"))["ok"] is True
+    clock["now"] = NOW + timedelta(minutes=5)                                  # every hold has ended
+    for i in range(4):
+        assert req(broker, fields=hook_fields(f"n{i}", at=clock["now"]))["ok"] is True
+
+
+def test_a_restarted_broker_counts_pending_rows_on_disk(L, resolver, clock):
+    b = make_broker(L, resolver, clock)
+    for i in range(4):
+        filed(b, fields=hook_fields(f"p{i}"))
+    assert req(make_broker(L, resolver, clock), fields=hook_fields("p4"))["refused"] == "queue-busy"
+
+
+def test_a_failed_write_leaves_the_quota_and_pending_count_unchanged(L, resolver, clock, monkeypatch):
+    import errno as _errno
+    b = make_broker(L, resolver, clock, quota=1)
+    real = QueueStore.write_request
+    fails = [1]
+
+    def full(self, row):
+        if fails:
+            fails.pop()
+            raise OSError(_errno.ENOSPC, "No space left on device")
+        return real(self, row)
+
+    monkeypatch.setattr(QueueStore, "write_request", full)
+    assert req(b)["refused"] == "broker-error"
+    assert req(b)["ok"] is True
+
+
+def test_a_replay_after_the_clock_window_returns_the_existing_row(L, broker, clock):
+    rid = filed(broker)
+    clock["now"] = NOW + timedelta(minutes=3)                         # past RECEIVED_SKEW, inside the hold
+    got = req(broker)
+    assert got["ok"] is True and got["request_id"] == rid
+    clock["now"] = NOW + timedelta(minutes=6)                         # a NEW row would still be refused
+    assert req(broker, fields=hook_fields("late"))["refused"] == "request-clock"
+
+
+def test_a_stored_row_without_a_run_id_does_not_stop_startup(L, resolver, clock):
+    rid = filed(make_broker(L, resolver, clock))
+    path = L / "queue" / "requests" / f"{rid}.json"
+    row = row_of(L, rid)
+    row["run"] = {"job_id": "j"}
+    path.unlink()
+    path.write_bytes(canonical_bytes(row))
+    b = make_broker(L, resolver, clock)
+    assert req(b, fields=hook_fields("after"))["ok"] is True
+
+
+def test_a_verifier_unavailable_reload_retries_on_the_next_poll(L, monkeypatch):
+    import levain.qbroker.signers as signers_mod
+    from levain.authority import VerifierUnavailable
+    real, fails = signers_mod.verify_link_sig, [1]
+
+    def flaky(*a, **kw):
+        if fails:
+            fails.pop()
+            raise VerifierUnavailable("ssh-keygen did not run")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(signers_mod, "verify_link_sig", flaky)
+    src = SignersSource(L / "policy", L / "routes" / "trust.pub")
+    assert src.current() is None
+    assert src.current() is not None and src.problem is None          # same files, verified this time
+
+
+def test_control_ok_zero_or_a_true_id_is_refused(run_dir):
+    path = run_dir / "c.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(4)
+
+    def control():
+        for shape in ("ok0", "idtrue"):
+            conn, _ = srv.accept()
+            with conn:
+                msg = wire.read_frame(conn)
+                if shape == "ok0":
+                    wire.write_frame(conn, {"id": msg["id"], "ok": 0, "session": "s9", "kind": "interactive"})
+                else:
+                    wire.write_frame(conn, {"id": True, "ok": True, "session": "s9", "kind": "interactive"})
+
+    t = threading.Thread(target=control, daemon=True)
+    t.start()
+    try:
+        r = ControlResolver(path)
+        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"   # id 1
+        r2 = ControlResolver(path)
+        assert r2.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"  # id 1 vs True
+    finally:
+        t.join(timeout=10)
+        srv.close()
+
+
+def test_an_accept_error_does_not_stop_the_listener(broker, run_dir, monkeypatch):
+    import errno as _errno
+    real, fails = socket.socket.accept, [1]
+
+    def flaky(self):
+        if fails:
+            fails.pop()
+            raise OSError(_errno.EMFILE, "Too many open files")
+        return real(self)
+
+    monkeypatch.setattr(socket.socket, "accept", flaky)
+    lst = listen(broker, run_dir, os.getuid(), peer_uid=lambda _s: os.getuid())
+    lst.start()
+    try:
+        with connect(lst.path) as s:
+            wire.write_frame(s, {"v": 1, "op": "NOPE", "id": 1})
+            assert wire.read_frame(s)["refused"] == "verb-not-allowed"
+        assert not fails
+    finally:
+        lst.stop()
+    assert not lst.path.exists()                                       # stop() unlinks q.sock
+
+
+def test_a_socket_in_the_wrong_group_refuses_to_serve(broker, run_dir):
+    gid = bound_gid(run_dir / "s1")
+    lst = listen(broker, run_dir, os.getuid(), expected_gid=gid + 1)
+    with pytest.raises(PermissionError):
+        lst.start()
+    assert not (run_dir / "s1" / "q.sock").exists()
+
+
+def test_a_drip_fed_frame_hits_its_deadline(broker, run_dir):
+    import time
+    lst = listen(broker, run_dir, os.getuid(), peer_uid=lambda _s: os.getuid(), idle_timeout=0.3)
+    lst.start()
+    try:
+        frame = wire.encode({"v": 1, "op": "NOPE", "id": 1})
+        with connect(lst.path) as s:
+            closed = False
+            try:
+                for byte in frame[:12]:            # one byte every 0.1s: each recv inside 0.3s, the frame not
+                    s.sendall(bytes([byte]))
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                closed = True
+            if not closed:
+                s.setblocking(False)
+                try:
+                    got = s.recv(4096)             # the server already answered or closed: never still waiting
+                except BlockingIOError:
+                    got = None
+                except ConnectionResetError:
+                    got = b""
+                assert got is not None and b"verb-not-allowed" not in got
+    finally:
+        lst.stop()

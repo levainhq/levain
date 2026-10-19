@@ -38,6 +38,12 @@ def valid_request_id(value: Any) -> bool:
 def _read_untrusted(path: Path) -> bytes | None:
     """The bytes of a regular file of at most :data:`ROW_MAX`, or ``None`` when there is no file; ``ValueError``
     for anything else at that name (a symlink, a FIFO, an oversize file)."""
+    got = _read_untrusted_stamped(path)
+    return None if got is None else got[0]
+
+
+def _read_untrusted_stamped(path: Path) -> tuple[bytes, tuple[int, ...]] | None:
+    """:func:`_read_untrusted`, with the file's identity (dev, ino, size, mtime, ctime) from the fd it was read on."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -54,7 +60,7 @@ def _read_untrusted(path: Path) -> bytes | None:
             data = fh.read(ROW_MAX + 1)
         if len(data) > ROW_MAX:
             raise ValueError(f"{path.name} grew past {ROW_MAX} bytes")
-        return data
+        return data, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     finally:
         os.close(fd)
 
@@ -146,10 +152,23 @@ class QueueStore:
 
     def read_answer(self, request_id: str) -> dict[str, Any] | None:
         """The answer row as parsed JSON, ``None`` when there is none; ``ValueError`` for a file that is not one."""
+        got = self.read_answer_stamped(request_id)
+        return None if got is None else got[0]
+
+    def read_answer_stamped(self, request_id: str) -> tuple[dict[str, Any], tuple[int, ...]] | None:
+        """:meth:`read_answer` with the identity of the file it parsed, taken from the fd it read."""
         if not valid_request_id(request_id):
             raise ValueError("not a request id")
-        data = _read_untrusted(self.answers / f"{request_id}.json")
-        return None if data is None else _parsed(data)
+        got = _read_untrusted_stamped(self.answers / f"{request_id}.json")
+        return None if got is None else (_parsed(got[0]), got[1])
+
+    def has_answer(self, request_id: str) -> bool:
+        """Whether anything is at the answer row's name (whatever it holds)."""
+        try:
+            os.lstat(self.answers / f"{request_id}.json")
+        except FileNotFoundError:
+            return False
+        return True
 
     def rows(self) -> list[dict[str, Any]]:
         """Every readable request row (the quota's count at start); an unreadable one is skipped."""
