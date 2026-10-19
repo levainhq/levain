@@ -164,14 +164,33 @@ def vagus_run(
     so the default must PERSIST (unlike the condenser's ``stub`` default, a stub capture would
     no-op into memory and silently vanish). ``session_id`` groups the run's episodes (defaults
     to the conversation id).
+
+    For a host that only runs and captures. A driver that checks the gate or the runtime's status
+    after ``run()`` must not use this: it runs the conversation again, unchecked. Such a driver
+    runs the conversation itself and calls :func:`capture_completed_turn`.
     """
     f = firing if firing is not None else build_firing(firing_kind)
     conversation.run()
+    capture_completed_turn(conversation, f, session_id=session_id)
+
+
+def capture_completed_turn(
+    conversation,
+    firing: FiringContract,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """CAPTURE the latest turn as it stands, without running the conversation.
+
+    The caller has already run the turn and decided it completed (not held at the gate, not ended
+    in the runtime's error state). ``session_id`` groups the episodes (defaults to the conversation
+    id). Idempotent per user turn, like :func:`vagus_run`.
+    """
     events = conversation.state.events
 
     # Idempotency: structurally refuse to double-write a turn already captured (a memory-substrate
     # write — ``structural_invariants_beat_discipline``, not a once-per-turn contract handed to the
-    # caller). Two ``vagus_run`` calls with no new user turn share a marker → the second no-ops.
+    # caller). Two captures with no new user turn share a marker → the second no-ops.
     marker = _turn_marker(events)
     if marker is not None and marker == _get_marker(conversation):
         return
@@ -179,7 +198,7 @@ def vagus_run(
     content = render_turn(events)
     if not content:
         return
-    written = f.capture(
+    written = firing.capture(
         CaptureRequest(
             content=content,
             episode_type="observation",
@@ -189,6 +208,6 @@ def vagus_run(
     )
     # Mark the turn captured ONLY on a confirmed write. capture() fail-soft-swallows write errors
     # (logs, never raises) and returns False — so a transient DB/audit failure leaves the marker
-    # unset and the turn RETRYABLE on the next vagus_run, instead of being silently lost.
+    # unset and the turn RETRYABLE on the next capture, instead of being silently lost.
     if written:
         _set_marker(conversation, marker)
