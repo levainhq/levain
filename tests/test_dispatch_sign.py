@@ -1,5 +1,5 @@
 """The operator's one signature over a filed contract's digest: its own namespace, the job's fields, the signer checks
-in the consent queue's order. Keys are real ssh-keygen keys enrolled in a real signed authority log (the consent
+in the consent queue's order (as the module intends; this file pins it). Keys are real ssh-keygen keys enrolled in a real signed authority log (the consent
 queue tests' ``Key`` and ``Log``), and the job is a real filed job over a real git repo."""
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from levain.consent.passkey import public_key_line, to_sshsig
 from levain.dispatch import sign as dsign
 from levain.dispatch.jobs import UNSIGNED_LEASE, JobStore
 from tests.test_consent_queue import Key, Log
-from tests.test_dispatch_contract import NOW, make_repo, resolve, submission
+from tests.test_dispatch_contract import NOW, POLICY, make_repo, registry, submission
 
 NS = dsign.DISPATCH_SIGN_NAMESPACE
 _FIX = json.loads((Path(__file__).parent / "fixtures" / "passkey_assertion_virtual.json").read_text(encoding="utf-8"))
@@ -79,7 +79,7 @@ def store(tmp_path):
 @pytest.fixture
 def job(store, repo):
     path, base = repo
-    j, _cap = store.file(resolve(submission(path, base)), filer_session="sess-1")
+    j, _cap = store.file(submission(path, base), resolve_template=registry(), policy=POLICY, filer_session="sess-1")
     return j
 
 
@@ -95,14 +95,16 @@ def test_a_display_phone_and_a_laptop_key_sign(job, keys, snapshot):
         assert dsign.refusal(payload, sig, snapshot, job) is None, name
 
 
-def test_the_payload_is_exactly_the_six_fields(job, keys):
+def test_the_payload_is_exactly_the_seven_fields(job, keys):
     payload = dsign.sign_payload(job, signer_fp=keys["phone"].fp, signed_at=NOW)
     assert set(payload) == dsign.PAYLOAD_KEYS and payload["format"] == "levain-dispatch-sign/1"
     assert payload["digest"] == job.digest and payload["expires_at"] == job.expires_at
+    assert payload["store_id"] == job.store_id
 
 
 @pytest.mark.parametrize("over, match", [
     ({"format": "levain-dispatch-sign/2"}, "format"),
+    ({"store_id": "0" * 32}, "another dispatch store"),
     ({"job_id": "dj-" + "0" * 32}, "another job"),
     ({"digest": "sha256:" + "0" * 64}, "another contract digest"),
     ({"expires_at": utc_stamp(NOW + timedelta(hours=1))}, "another expiry"),

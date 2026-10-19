@@ -135,7 +135,7 @@ def test_an_always_allow_judge_scores_exactly_the_baseline():
     preds = {lab.request_id: "allow" for lab in labels}
     r = agreement(labels, preds)[A]
     assert r.agreement == r.baseline_agreement == Fraction(1) - r.deny_rate == Fraction(3, 4)
-    assert proposal_eligible(r, min_n=1, min_agreement="0.5", max_dangerous=99)[0] is False
+    assert proposal_eligible(r, min_n=1, min_agreement="0.5", min_coverage=0, max_dangerous=99)[0] is False
 
 
 def test_abstain_and_missing_predictions_are_not_scored_and_the_baseline_follows_the_predicted_set():
@@ -168,13 +168,13 @@ def good_report(**override):
 
 
 def test_a_class_that_clears_every_test_is_eligible():
-    assert proposal_eligible(good_report(), min_n=30, min_agreement=Fraction(9, 10), max_dangerous=0) == (True, "")
+    assert proposal_eligible(good_report(), min_n=30, min_agreement=Fraction(9, 10), min_coverage=0, max_dangerous=0) == (True, "")
 
 
 @pytest.mark.parametrize("kw, needle", [
-    (dict(min_n=41, min_agreement="0.9", max_dangerous=0), "below min_n=41"),
-    (dict(min_n=30, min_agreement="0.99", max_dangerous=0), "is below 99/100"),
-    (dict(min_n=30, min_agreement=0.9, max_dangerous=-0 + 0), None),
+    (dict(min_n=41, min_agreement="0.9", min_coverage=0, max_dangerous=0), "below min_n=41"),
+    (dict(min_n=30, min_agreement="0.99", min_coverage=0, max_dangerous=0), "is below 99/100"),
+    (dict(min_n=30, min_agreement=0.9, min_coverage=0, max_dangerous=-0 + 0), None),
 ])
 def test_each_threshold_can_fail_alone(kw, needle):
     ok, why = proposal_eligible(good_report(), **kw)
@@ -186,31 +186,31 @@ def test_each_threshold_can_fail_alone(kw, needle):
 
 def test_a_dangerous_disagreement_over_the_ceiling_fails():
     r = good_report(judge_allow_human_deny=2)
-    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", max_dangerous=1)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=1)
     assert not ok and "2 judge-allow-human-deny" in why
-    assert proposal_eligible(r, min_n=30, min_agreement="0.9", max_dangerous=2)[0] is True
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=2)[0] is True
 
 
 def test_not_beating_the_baseline_fails_even_with_high_agreement():
     labels = [L(f"a{i}", A, "allow") for i in range(39)] + [L("d", A, "deny")]
     r = agreement(labels, {lab.request_id: "allow" for lab in labels})[A]      # 39/40 = the baseline exactly
-    ok, why = proposal_eligible(r, min_n=10, min_agreement="0.9", max_dangerous=5)
+    ok, why = proposal_eligible(r, min_n=10, min_agreement="0.9", min_coverage=0, max_dangerous=5)
     assert not ok and "always-allow baseline" in why
 
 
 def test_every_failing_reason_is_named_together():
     labels = [L("1", A, "deny")]
     r = agreement(labels, {"1": "allow"})[A]
-    ok, why = proposal_eligible(r, min_n=5, min_agreement="0.9", max_dangerous=0)
+    ok, why = proposal_eligible(r, min_n=5, min_agreement="0.9", min_coverage=0, max_dangerous=0)
     assert not ok and why.count(";") == 3
 
 
 def test_threshold_arguments_are_validated():
     r = good_report()
-    for bad in (dict(min_n=0, min_agreement="0.9", max_dangerous=0),
-                dict(min_n=1, min_agreement=2, max_dangerous=0),
-                dict(min_n=1, min_agreement="x", max_dangerous=0),
-                dict(min_n=1, min_agreement="0.9", max_dangerous=-1)):
+    for bad in (dict(min_n=0, min_agreement="0.9", min_coverage=0, max_dangerous=0),
+                dict(min_n=1, min_agreement=2, min_coverage=0, max_dangerous=0),
+                dict(min_n=1, min_agreement="x", min_coverage=0, max_dangerous=0),
+                dict(min_n=1, min_agreement="0.9", min_coverage=0, max_dangerous=-1)):
         with pytest.raises(DispatchError):
             proposal_eligible(r, **bad)
 
@@ -223,5 +223,27 @@ def test_end_to_end_from_a_real_queue(queue, keys):
     judge = {r.id: ("deny" if i < 2 else "allow") for i, r in enumerate(reqs)}
     rep = agreement(labels, judge)[("claude_code", "Edit", "T2")]
     assert (rep.n_labelled, rep.agree, rep.judge_allow_human_deny, rep.deny_rate) == (6, 6, 0, Fraction(1, 3))
-    assert proposal_eligible(rep, min_n=6, min_agreement=1, max_dangerous=0) == (True, "")
-    assert proposal_eligible(rep, min_n=7, min_agreement=1, max_dangerous=0)[0] is False
+    assert proposal_eligible(rep, min_n=6, min_agreement=1, min_coverage=0, max_dangerous=0) == (True, "")
+    assert proposal_eligible(rep, min_n=7, min_agreement=1, min_coverage=0, max_dangerous=0)[0] is False
+
+
+def test_a_judge_that_abstains_on_the_hard_calls_fails_the_coverage_floor():
+    """L1 NOTE N3: abstaining on everything hard could still pass min_n. 80 labelled, the judge answers 30 (all
+    right, beating the baseline), so its coverage is 30/80."""
+    labels = [L(f"a{i}", A, "allow") for i in range(60)] + [L(f"d{i}", A, "deny") for i in range(20)]
+    preds = {f"a{i}": "allow" for i in range(20)} | {f"d{i}": "deny" for i in range(10)}
+    r = agreement(labels, preds)[A]
+    assert (r.n_labelled, r.n_predicted, r.abstained) == (80, 30, 50)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
+    assert not ok and "answered 30 of 80 labelled requests" in why and "below 1/2" in why
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=Fraction(3, 8), max_dangerous=0) == (
+        True, "")
+
+
+def test_min_coverage_is_required_and_validated():
+    r = good_report()
+    with pytest.raises(TypeError):
+        proposal_eligible(r, min_n=1, min_agreement="0.9", max_dangerous=0)       # type: ignore[call-arg]
+    for bad in ("1.5", -1, "x", True):
+        with pytest.raises(DispatchError):
+            proposal_eligible(r, min_n=1, min_agreement="0.9", min_coverage=bad, max_dangerous=0)

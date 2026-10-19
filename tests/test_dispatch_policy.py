@@ -2,11 +2,13 @@
 matcher (``*`` never crosses ``/``, ``**`` may), and a content hash a contract binds."""
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match
 
-POLICY = {"never": ["work/**", ".env*", "**/*.pem", "**/*.key"],
+POLICY = {"never": ["work/**", "**/.env*", "**/*.pem", "**/*.key"],
           "providers": {"anthropic": {"read": ["**"]},
                         "openrouter": {"read": ["levain/**", "games/**"]},
                         "ollama-cloud": {"read": ["levain/**"]}}}
@@ -23,7 +25,9 @@ def policy():
     ("src/*.py", "src/a.py", True),
     ("src/*.py", "src/sub/a.py", False),
     ("src/**", "src/sub/deep/a.py", True),
-    ("src/**", "src", True),                        # ** matches zero components
+    ("src/**", "src", False),                       # a trailing ** needs one more component
+    ("src/**", "src/a", True),
+    ("**", "a", True),
     ("src/**", "srcx/a.py", False),
     ("**/*.pem", "a.pem", True),
     ("**/*.pem", "x/y/z.pem", True),
@@ -81,7 +85,7 @@ def test_malformed_sets_refuse(policy, read):
     ({"never": []}, "exactly"),
     ([], "exactly"),
     ({"never": "work/**", "providers": {}}, "list of patterns"),
-    ({"never": ["~/ClientData/**"], "providers": {}}, "home path"),
+    ({"never": ["~/private/**"], "providers": {}}, "home path"),
     ({"never": ["/etc/**"], "providers": {}}, "absolute"),
     ({"never": ["src/[ab].py"], "providers": {}}, "character class"),
     ({"never": ["src/a**"], "providers": {}}, "stands alone"),
@@ -115,3 +119,55 @@ def test_content_hash_is_order_independent_and_binds_every_pattern():
 def test_an_empty_allowlist_admits_nothing():
     p = ProviderPolicy.from_mapping({"never": [], "providers": {"x": {"read": []}}})
     assert "outside" in p.refusal("x", ["a.py"], [])
+
+
+# --- fix round 1 (L1/L2 slice a) -----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pattern", [".env*", "secrets.json", "*.pem"])
+def test_a_slashless_never_pattern_is_refused_naming_its_any_depth_form(pattern):
+    """L2 M1, the reviewer's probe_a: ``.env*`` anchored at the root let ``app/.env`` through."""
+    with pytest.raises(PolicyError, match=re.escape(f"'**/{pattern}'")):
+        ProviderPolicy.from_mapping({"never": [pattern], "providers": {"anthropic": {"read": ["**"]}}})
+
+
+def test_the_any_depth_never_form_refuses_a_nested_file(policy):
+    assert "NEVER" in policy.refusal("anthropic", ["app/.env"], [])
+    assert "NEVER" in policy.refusal("anthropic", [".env.production"], [])
+
+
+def test_a_provider_read_pattern_stays_anchored_at_the_root():
+    p = ProviderPolicy.from_mapping({"never": [], "providers": {"x": {"read": ["README"]}}})
+    assert p.refusal("x", ["README"], []) is None
+    assert "outside" in p.refusal("x", ["docs/README"], [])
+
+
+@pytest.mark.parametrize("path", ["keys/server.PEM", "Work/client.txt", "WORK/x", "app/.ENV", "deploy/id.Key"])
+def test_never_matching_ignores_case(policy, path):
+    """L2 M2 / L1 L9, the reviewers' probes: a case-insensitive disk holds these as the NEVER files they are."""
+    assert "NEVER" in policy.refusal("anthropic", [path], [])
+    assert "NEVER" in policy.refusal("anthropic", ["levain/a.py"], [path])
+
+
+def test_a_read_allowlist_still_matches_case_exactly(policy):
+    assert "outside" in policy.refusal("openrouter", ["Levain/a.py"], [])
+
+
+def test_a_trailing_double_star_does_not_admit_a_file_of_that_name(policy):
+    """L2 L5 / L1 L10: ``levain/**`` admitted a top-level FILE named ``levain``."""
+    assert match("levain/**", "levain") is False
+    assert "outside" in policy.refusal("openrouter", ["levain"], [])
+    assert policy.refusal("openrouter", ["levain/x"], []) is None
+
+
+@pytest.mark.parametrize("bad", ["docs/x.md\nwork/client.txt", "a\tb", "a\rb", "a b", "a b", "a‮b"])
+def test_a_control_character_or_odd_space_refuses_a_path_and_a_pattern(policy, bad):
+    """L1 MED2 / L2 L1: one path shown as two lines on the signing surface."""
+    assert "U+" in policy.refusal("anthropic", [bad], [])
+    with pytest.raises(PolicyError, match="U\\+"):
+        ProviderPolicy.from_mapping({"never": ["work/" + bad], "providers": {}})
+    with pytest.raises(PolicyError, match="U\\+"):
+        ProviderPolicy.from_mapping({"never": [], "providers": {"x": {"read": [bad]}}})
+
+
+def test_a_plain_space_is_a_path_character(policy):
+    assert policy.refusal("anthropic", ["docs/a b.md"], []) is None

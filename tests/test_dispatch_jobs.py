@@ -16,7 +16,7 @@ from levain.dispatch.jobs import (
     CAUSES, EDGES, STATES, TERMINAL, UNSIGNED_LEASE, CapabilityRefused, JobStore, JobStoreError, SignatureRefused,
     TransitionRefused,
 )
-from tests.test_dispatch_contract import NOW, make_repo, resolve, submission
+from tests.test_dispatch_contract import NOW, POLICY, WRITE_SET, make_repo, registry, resolve, submission, template
 from tests.test_dispatch_sign import Clock, keys, log, snapshot  # noqa: F401  (module fixtures)
 
 NS = dsign.DISPATCH_SIGN_NAMESPACE
@@ -63,9 +63,10 @@ def store(tmp_path, clock):
     return new_store(tmp_path, clock)
 
 
-def file_job(store, repo, *, session="sess-1", idem_key=None, **over):
+def file_job(store, repo, *, session="sess-1", idem_key=None, resolver=None, policy=POLICY, **over):
     path, base = repo
-    return store.file(resolve(submission(path, base, **over)), filer_session=session, idem_key=idem_key)
+    return store.file(submission(path, base, **over), resolve_template=resolver or registry(), policy=policy,
+                      filer_session=session, idem_key=idem_key)
 
 
 def at_state(store, repo, state):
@@ -100,9 +101,11 @@ def test_idempotent_filing_returns_the_same_job_and_no_capability(store, repo):
     assert len(store.list()) == 1
 
 
-def test_file_refuses_what_is_not_a_resolved_contract(store, repo):
-    with pytest.raises(ContractRefused, match="ResolvedContract"):
-        store.file(submission(*repo), filer_session="s")
+def test_file_refuses_bad_labels_and_a_non_submission(store, repo):
+    with pytest.raises(ContractRefused, match="a contract is exactly"):
+        store.file(resolve(submission(*repo)), resolve_template=registry(), policy=POLICY, filer_session="s")
+    with pytest.raises(TypeError):
+        store.file(submission(*repo), filer_session="s")              # type: ignore[call-arg]
     with pytest.raises(DispatchError, match="filer_session"):
         file_job(store, repo, session="")
     with pytest.raises(DispatchError, match="idem_key"):
@@ -110,10 +113,9 @@ def test_file_refuses_what_is_not_a_resolved_contract(store, repo):
 
 
 def test_an_expired_contract_is_not_filed(store, repo, clock):
-    contract = resolve(submission(*repo, expires_at=utc_stamp(NOW + timedelta(minutes=5))))
     clock.now = NOW + timedelta(minutes=5)
-    with pytest.raises(ContractRefused, match="expired"):
-        store.file(contract, filer_session="s")
+    with pytest.raises(ContractRefused, match="not in the future"):
+        file_job(store, repo, expires_at=utc_stamp(NOW + timedelta(minutes=5)))
 
 
 # --- one live contract per write file ------------------------------------------------------------------------------
@@ -164,7 +166,8 @@ def test_an_unsigned_job_lapses_after_the_unsigned_lease(store, repo, clock):
 def test_the_unsigned_lease_never_outlives_the_expiry(store, repo, clock):
     job, _ = file_job(store, repo, expires_at=utc_stamp(NOW + timedelta(minutes=10)))
     assert job.unsigned_until == utc_stamp(NOW + timedelta(minutes=10))
-    assert store.sweep(NOW + timedelta(minutes=10)) == [job.id]
+    clock.now = NOW + timedelta(minutes=10)
+    assert store.sweep() == [job.id]
 
 
 @pytest.mark.parametrize("state", ["signed", "queued", "running", "verifying", "verified", "recommended"])
@@ -386,3 +389,118 @@ def test_a_naive_clock_is_refused(tmp_path, repo):
     store = new_store(tmp_path, lambda: NOW.replace(tzinfo=None))
     with pytest.raises(Exception, match="naive"):
         store.list()
+
+
+# --- fix round 1 (L1/L2 slice a) -----------------------------------------------------------------------------------
+
+_SEED = ("INSERT INTO jobs (id, digest, contract, filed_at, filer_session, capability_sha256, idem_key, repo, "
+         "expires_at, unsigned_until) VALUES (?, ?, 'c', 't', 's', 'cap', ?, '/r', 'e', 'u')")
+
+
+def test_insert_or_replace_through_the_session_idem_key_is_refused(store):
+    """L1 MED1, the reviewer's probe1: a new id with an existing (filer_session, idem_key) silently deleted the old
+    row through the UNIQUE key, without firing the delete trigger."""
+    store.list()                                                              # the schema exists
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute(_SEED, ("dj-a", "d", "k"))
+        with pytest.raises(sqlite3.IntegrityError, match="never replaced"):
+            conn.execute(_SEED.replace("INSERT", "INSERT OR REPLACE"), ("dj-b", "EVIL", "k"))
+        assert conn.execute("SELECT id, digest FROM jobs").fetchall() == [("dj-a", "d")]
+        conn.execute(_SEED, ("dj-c", "d", None))                              # a null idem_key never collides
+        conn.execute(_SEED, ("dj-d", "d", None))
+    finally:
+        conn.close()
+
+
+def test_the_meta_table_is_append_only(store):
+    store.list()
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        for sql in ("UPDATE meta SET value = 'x'", "DELETE FROM meta",
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('store_id', 'other')",
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('format', 'other')"):
+            with pytest.raises(sqlite3.IntegrityError, match="store metadata is written once"):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_the_stores_own_connections_enforce_foreign_keys(store):
+    store.list()
+    conn = store._connect()
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            conn.execute("INSERT INTO transitions VALUES ('dj-zzz', 1, 'filed', 'filed', 't', '')")
+    finally:
+        conn.close()
+
+
+def test_file_takes_a_submission_and_resolves_it_itself(store, repo):
+    """L2 M4 / L1 MED3, the reviewers' probe2: a hand-built ResolvedContract with a 10-year expiry was filed. There
+    is no public way to file a ResolvedContract object now."""
+    import dataclasses
+
+    from levain.cockpit.consent import utc_stamp as stamp
+    good = resolve(submission(*repo))
+    far = dataclasses.replace(good, expires_at=stamp(NOW + timedelta(days=3650)))
+    with pytest.raises(ContractRefused, match="a contract is exactly"):
+        store.file(far, resolve_template=registry(), policy=POLICY, filer_session="s")
+    with pytest.raises(ContractRefused, match="never open-ended"):
+        file_job(store, repo, expires_at=stamp(NOW + timedelta(days=3650)))
+    with pytest.raises(ContractRefused, match="data boundary"):
+        file_job(store, repo, read=["work/client.txt"])
+    assert store.list() == []
+
+
+def test_overlap_compares_paths_without_case(store, repo):
+    """L1 L6: two NEW files differing only in case are one file on a case-insensitive disk."""
+    wide = registry(template(write_paths=WRITE_SET | {"src/New.py"}))
+    one, _ = file_job(store, repo, write=["src/new.py"])
+    with pytest.raises(ContractRefused, match=f"live job {one.id} already writes src/new.py"):
+        file_job(store, repo, write=["src/New.py"], resolver=wide)
+
+
+def test_an_idempotent_replay_after_expiry_returns_the_same_job(store, repo, clock):
+    """L1 L2: the replay was refused 'expired' instead of returning the job it filed."""
+    job, cap = file_job(store, repo, idem_key="k1", expires_at=utc_stamp(NOW + timedelta(minutes=5)))
+    clock.now = NOW + timedelta(minutes=6)
+    again, cap2 = file_job(store, repo, idem_key="k1", expires_at=utc_stamp(NOW + timedelta(minutes=5)))
+    assert again.id == job.id and cap2 is None and cap is not None and again.state == "failed"
+    with pytest.raises(ContractRefused, match="another contract digest"):
+        file_job(store, repo, idem_key="k1", expires_at=utc_stamp(NOW + timedelta(minutes=5)), goal="other")
+
+
+def test_a_sweep_is_committed_even_when_the_operation_raises(store, repo, clock):
+    """L1 L3: the sweep ran inside the operation's transaction, so a raised operation rolled the lapse back."""
+    job, cap = file_job(store, repo)
+    clock.now = NOW + UNSIGNED_LEASE
+    with pytest.raises(CapabilityRefused):
+        store.cancel_by_planner(job.id, cap + "x")
+    with sqlite3.connect(store.path) as conn:                                  # read raw: no store call sweeps it
+        rows = conn.execute("SELECT to_state, cause, at FROM transitions WHERE job_id = ? ORDER BY seq",
+                            (job.id,)).fetchall()
+    assert rows[-1] == ("failed", "lease_lapsed", utc_stamp(NOW + UNSIGNED_LEASE))
+
+
+def test_sweep_takes_no_caller_time(store):
+    with pytest.raises(TypeError):
+        store.sweep(NOW + timedelta(days=365))                               # type: ignore[call-arg]
+
+
+def test_each_store_has_its_own_store_id_and_a_signature_binds_it(tmp_path, clock, repo, keys, snapshot):
+    """L2 L2: a signature names the store it was made for; one from another store is refused."""
+    import dataclasses
+    a, b = new_store(tmp_path, clock, "a"), new_store(tmp_path, clock, "b")
+    job_a, _ = file_job(a, repo)
+    job_b, _ = file_job(b, repo)
+    assert job_a.store_id != job_b.store_id and len(job_a.store_id) == 32
+    assert a.get(job_a.id).store_id == job_a.store_id                       # stable across connections
+    assert JobStore(a.directory, clock=clock).list()[0].store_id == job_a.store_id
+    payload, sig = signed(job_a, keys["phone"])
+    assert payload["store_id"] == job_a.store_id
+    assert dsign.refusal(payload, sig, snapshot, job_a) is None
+    # the same job id, digest and expiry in another store (a restored or copied store's twin): refused by store
+    twin = dataclasses.replace(job_a, store_id=job_b.store_id)
+    assert dsign.refusal(payload, sig, snapshot, twin) == "the signature is for another dispatch store"

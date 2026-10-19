@@ -9,8 +9,11 @@ digest, once.
 Every path resolves FROM GIT AT ``base``, never from the working tree, so what the human is shown is what the executor
 and the verifier will see: a read path must be a regular file at base (a symlink, a submodule or a missing path refuses
 the contract) and its blob is bound; a write path is either a regular file at base (its blob bound) or a NEW file whose
-every ancestor is a plain directory or absent at base. Git runs with an argv list and a scrubbed ``GIT_*``
-environment, never a shell, and its listing is read once, whole, so no pathspec rule shapes the answer.
+every ancestor is a plain directory or absent at base. Git runs with an argv list and :func:`git_env`, never a
+shell: every inherited ``GIT_*`` variable scrubbed, replace objects and graft files off, so ``base`` names its own
+tree and no ref or graft can swap another in. The contract binds that tree's sha (``base_tree``) beside ``base``, so
+the stages that later build and check a worktree compare one sha, with the same :func:`git_env`. The listing is read
+once, whole, so no pathspec rule shapes the answer.
 
 The template is resolved through an interface (``resolve_template``): tier, executor, the distinct model list, ``k``
 and the verifier come FROM the template, never from the planner, since a model does not choose its own gate
@@ -41,11 +44,11 @@ from levain.contracts import ContractError
 from levain.contracts.canon import canonical, canonical_bytes, parse
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.dispatch import ContractRefused
-from levain.dispatch.policy import ProviderPolicy
+from levain.dispatch.policy import ProviderPolicy, path_text_problem
 
 __all__ = [
     "BUDGET_KEYS", "FORMAT", "GOAL_MAX_BYTES", "GRANTABLE", "MAX_LIFETIME", "NEW", "PathEntry", "ResolvedContract",
-    "ResolvedTemplate", "SUBMISSION_KEYS", "parse_contract", "resolve_contract",
+    "ResolvedTemplate", "SUBMISSION_KEYS", "git_env", "parse_contract", "resolve_contract",
 ]
 
 FORMAT = "levain-dispatch-contract/1"
@@ -71,8 +74,11 @@ _VERIFIER_KINDS = ("black-box", "in-process")
 _GLOB = frozenset("*?[")
 # tool class names that are a shell under another name; refused with the Bash message, not the unknown-class one
 _SHELLISH = re.compile(r"(?i).*(bash|shell|zsh|exec|terminal|command|powershell|cmd|^sh$|^run$).*")
-# levain.consent.sign._text_problem's categories: control, format, surrogate, separators, private use, unassigned
+# what can show differently from what is signed: control, format, surrogate, separators, private use, unassigned
+# (the categories the consent path's text rule refuses, mirrored here)
 _UNSHOWABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
+# a path under /dev/null cannot exist (/dev/null is not a directory), so git reads no graft file through it
+_NO_GRAFT_FILE = "/dev/null/levain-dispatch-no-grafts"
 
 
 def _refuse(message: str) -> ContractRefused:
@@ -80,7 +86,7 @@ def _refuse(message: str) -> ContractRefused:
 
 
 def _text_problem(text: str, what: str) -> str | None:
-    # copied from levain.consent.sign._text_problem: what is signed must show as what it is
+    # prose (a goal): what is signed must show as what it is; newline, tab and the plain space are prose
     for ch in text:
         if ch in "\n\t ":
             continue
@@ -183,7 +189,7 @@ def _path_problem(p: Any) -> str | None:
         return f"path {p[:80]!r} reaches into .git, which is never a contract file"
     if unicodedata.normalize("NFC", p) != p:
         return f"path {p[:80]!r} is not in Unicode NFC (a case- or form-insensitive disk would merge it)"
-    problem = _text_problem(p, "path")
+    problem = path_text_problem(p)
     return None if problem is None else f"{problem} ({p[:80]!r})"
 
 
@@ -220,17 +226,21 @@ class PathEntry:
 
 # --- git -----------------------------------------------------------------------------------------------------------
 
-def _git_env() -> dict[str, str]:
-    # no GIT_* variable may redirect the repository, its object store or its index
+def git_env() -> dict[str, str]:
+    """The environment every dispatch git call runs with (resolution here; materialising and verifying a worktree
+    later): no inherited ``GIT_*`` variable may redirect the repository, its object store or its index; replace
+    objects are off (a ``refs/replace/`` entry would swap the tree a commit sha names) and the graft file is a path
+    that cannot exist (a graft rewrites a commit's parents)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"})
+    env.update({"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": _NO_GRAFT_FILE})
     return env
 
 
 def _git(repo: str, *args: str) -> bytes:
     try:
-        cp = subprocess.run(["git", "-C", repo, *args], capture_output=True, timeout=GIT_TIMEOUT, env=_git_env(),
-                            stdin=subprocess.DEVNULL)
+        cp = subprocess.run(["git", "--no-replace-objects", "-C", repo, *args], capture_output=True,
+                            timeout=GIT_TIMEOUT, env=git_env(), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise _refuse(f"git could not run in {repo} ({type(exc).__name__})") from None
     if cp.returncode != 0:
@@ -239,10 +249,11 @@ def _git(repo: str, *args: str) -> bytes:
     return cp.stdout
 
 
-def _tree_at(repo: str, base: str) -> dict[str, tuple[str, str, str]]:
-    """Every entry of ``base``'s tree, trees included: path -> (mode, type, sha). One listing, no pathspec."""
+def _tree_at(repo: str, tree: str) -> dict[str, tuple[str, str, str]]:
+    """Every entry of the tree ``tree`` (base's, by sha), trees included: path -> (mode, type, sha). One listing, no
+    pathspec."""
     out: dict[str, tuple[str, str, str]] = {}
-    for record in _git(repo, "ls-tree", "-r", "-t", "-z", "--full-tree", base).split(b"\x00"):
+    for record in _git(repo, "ls-tree", "-r", "-t", "-z", "--full-tree", tree).split(b"\x00"):
         if not record:
             continue
         meta, _, raw_path = record.partition(b"\t")
@@ -266,13 +277,17 @@ def _resolve_repo(repo: Any) -> str:
     return repo
 
 
-def _resolve_base(repo: str, base: Any) -> str:
+def _resolve_base(repo: str, base: Any) -> tuple[str, str]:
+    """``(base, its tree's sha)``, both read under :func:`git_env`."""
     if not isinstance(base, str) or _SHA1.fullmatch(base) is None:
         raise _refuse("base must be a full 40-hex commit sha (lowercase)")
     got = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode("ascii").strip()
     if got != base:
         raise _refuse(f"base {base} does not resolve to that commit (got {got[:40]})")
-    return base
+    tree = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{tree}}").decode("ascii").strip()
+    if _SHA1.fullmatch(tree) is None:
+        raise _refuse(f"base {base}'s tree did not resolve to a sha (got {tree[:40]!r})")
+    return base, tree
 
 
 def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
@@ -334,6 +349,7 @@ class ResolvedContract:
     goal: str
     repo: str
     base: str
+    base_tree: str
     read: tuple[PathEntry, ...]
     write: tuple[PathEntry, ...]
     budget: Mapping[str, int]
@@ -345,7 +361,7 @@ class ResolvedContract:
 
     def to_mapping(self) -> dict[str, Any]:
         return {"format": self.format, "goal": self.goal, "repo": self.repo, "base": self.base,
-                "read": [e.to_mapping() for e in self.read], "write": [e.to_mapping() for e in self.write],
+                "base_tree": self.base_tree, "read": [e.to_mapping() for e in self.read], "write": [e.to_mapping() for e in self.write],
                 "budget": dict(self.budget), "grant": list(self.grant), "expires_at": self.expires_at,
                 "template": self.template.to_mapping(), "policy_hash": self.policy_hash}
 
@@ -454,15 +470,15 @@ def resolve_contract(submission: Any, *, resolve_template: Callable[[str], Resol
     if problem is not None:
         raise _refuse(f"data boundary: {problem}")
     repo = _resolve_repo(submission["repo"])
-    base = _resolve_base(repo, submission["base"])
-    reads, writes = _resolve_paths(_tree_at(repo, base), read, write)
-    return ResolvedContract(goal=goal, repo=repo, base=base, read=reads, write=writes, budget=budget, grant=grant,
+    base, base_tree = _resolve_base(repo, submission["base"])
+    reads, writes = _resolve_paths(_tree_at(repo, base_tree), read, write)
+    return ResolvedContract(goal=goal, repo=repo, base=base, base_tree=base_tree, read=reads, write=writes, budget=budget, grant=grant,
                             expires_at=expires_at, template=template, policy_hash=policy.content_hash())
 
 
 # --- parse ---------------------------------------------------------------------------------------------------------
 
-_CONTRACT_KEYS = frozenset({"format", "goal", "repo", "base", "read", "write", "budget", "grant", "expires_at",
+_CONTRACT_KEYS = frozenset({"format", "goal", "repo", "base", "base_tree", "read", "write", "budget", "grant", "expires_at",
                             "template", "policy_hash"})
 _TEMPLATE_KEYS = frozenset({"id", "content_hash", "tier", "executor", "models", "k", "verifier_id", "verifier_hash",
                             "verifier_kind", "write_paths", "provider", "route", "tool_versions"})
@@ -478,6 +494,8 @@ def _entries(raw: Any, what: str, *, allow_new: bool) -> tuple[PathEntry, ...]:
         problem = _path_problem(e["path"])
         if problem is not None:
             raise _refuse(f"{what}: {problem}")
+        if not isinstance(e["mode"], str):
+            raise _refuse(f"{what}: a mode is text")
         if e["mode"] == NEW and allow_new:
             if e["blob"] != NEW:
                 raise _refuse(f"{what}: a new file's blob is {NEW!r}")
@@ -488,7 +506,19 @@ def _entries(raw: Any, what: str, *, allow_new: bool) -> tuple[PathEntry, ...]:
 
 
 def parse_contract(text: str | bytes) -> ResolvedContract:
-    """The contract ``text`` holds, refused unless ``text`` is exactly its canonical form (byte for byte)."""
+    """The contract ``text`` holds, refused unless ``text`` is exactly its canonical form (byte for byte). Anything
+    that goes wrong while parsing or checking it is :class:`ContractRefused`, never another exception."""
+    try:
+        return _parse_contract(text)
+    except ContractRefused:
+        raise
+    except Exception as exc:  # noqa: BLE001 - stored text is input: any failure on it is a refusal
+        raise _refuse(f"the contract text is not a dispatch contract ({type(exc).__name__})") from None
+
+
+def _parse_contract(text: str | bytes) -> ResolvedContract:
+    if not isinstance(text, (str, bytes)):
+        raise _refuse("the contract text is text or bytes")
     data = text.encode("utf-8") if isinstance(text, str) else text
     try:
         obj = parse(data)
@@ -523,6 +553,8 @@ def parse_contract(text: str | bytes) -> ResolvedContract:
         raise _refuse("repo is an absolute path in its normal form")
     if not isinstance(obj["base"], str) or _SHA1.fullmatch(obj["base"]) is None:
         raise _refuse("base is a 40-hex commit sha")
+    if not isinstance(obj["base_tree"], str) or _SHA1.fullmatch(obj["base_tree"]) is None:
+        raise _refuse("base_tree is a 40-hex tree sha")
     if not isinstance(obj["policy_hash"], str) or _SHA256_DIGEST.fullmatch(obj["policy_hash"]) is None:
         raise _refuse("policy_hash is sha256:<64 hex>")
     try:
@@ -539,7 +571,7 @@ def parse_contract(text: str | bytes) -> ResolvedContract:
             raise _refuse(f"{what} entries must be sorted, each path once")
     if not {e.path for e in writes} <= template.write_paths:
         raise _refuse("a write path is outside the template's write set")
-    contract = ResolvedContract(goal=goal, repo=obj["repo"], base=obj["base"], read=reads, write=writes,
+    contract = ResolvedContract(goal=goal, repo=obj["repo"], base=obj["base"], base_tree=obj["base_tree"], read=reads, write=writes,
                                 budget=_budget(obj["budget"]), grant=_grant(obj["grant"]),
                                 expires_at=obj["expires_at"], template=template, policy_hash=obj["policy_hash"])
     if canonical_bytes(contract.to_mapping()) != data:

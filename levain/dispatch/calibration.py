@@ -5,8 +5,8 @@ nothing built on it, turns a judge's word into a decision. What this module does
 agrees with the operator's own signed record, per action class, so that a grant PROPOSAL on the M17 card can rest on a
 stated N and not on a feeling.
 
-Labels are read from the consent queue through its public read-only reader, :func:`levain.consent.listing.read_listing`
-(``mode=ro``, seals re-checked, nothing created or swept). One label per decided request:
+Labels are read from the consent queue through its public reader, :func:`levain.consent.listing.read_listing`, chosen
+because it is meant to read the queue without writing it; this module writes nothing. One label per decided request:
 
 * ``allow`` / ``deny``: the request's state is allowed or denied, decided by a SIGNED act: an answer (``via`` signature)
   or a late ruling (``via`` ruling). The operator's judgment, on that one call.
@@ -199,12 +199,14 @@ def _fraction(name: str, value: object) -> Fraction:
 
 
 def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fraction | int | float | str,
-                      max_dangerous: int) -> tuple[bool, str]:
+                      min_coverage: Fraction | int | float | str, max_dangerous: int) -> tuple[bool, str]:
     """Whether a class's measured agreement is enough for the M17 card to PROPOSE a grant for that class:
     ``(True, "")``, or ``(False, reason)`` naming every test that failed. All must hold: at least ``min_n`` predicted
-    requests, agreement over those at least ``min_agreement``, at most ``max_dangerous`` judge-allow-human-deny
-    disagreements, and agreement strictly above the always-allow baseline (a judge that merely says allow scores
-    the same without reading anything).
+    requests, agreement over those at least ``min_agreement``, coverage (predicted over labelled: how much of his
+    record the judge was willing to answer) at least ``min_coverage``, at most ``max_dangerous``
+    judge-allow-human-deny disagreements, and agreement strictly above the always-allow baseline (a judge that merely
+    says allow scores the same without reading anything). The coverage floor is required: without it a judge that
+    abstains on every hard call can pass on the easy ones.
 
     This PROPOSES only. It signs nothing and grants nothing: the operator signs any grant, with the report and
     :data:`CAVEAT` in front of him, and a ``True`` here is only the card's permission to show the offer."""
@@ -213,9 +215,16 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
     floor = _fraction("min_agreement", min_agreement)
     if not 0 <= floor <= 1:
         raise DispatchError("min_agreement must be between 0 and 1")
+    coverage_floor = _fraction("min_coverage", min_coverage)
+    if not 0 <= coverage_floor <= 1:
+        raise DispatchError("min_coverage must be between 0 and 1")
     why: list[str] = []
     if report.n_predicted < min_n:
         why.append(f"only {report.n_predicted} predicted requests, below min_n={min_n}")
+    coverage = Fraction(report.n_predicted, report.n_labelled) if report.n_labelled else None
+    if coverage is None or coverage < coverage_floor:
+        why.append(f"the judge answered {report.n_predicted} of {report.n_labelled} labelled requests, coverage "
+                   f"below {coverage_floor}")
     got = report.agreement
     if got is None or got < floor:
         shown = "no agreement measurable" if got is None else f"agreement {got} is below {floor}"

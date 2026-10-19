@@ -1,7 +1,9 @@
 """levain.dispatch.jobs — the dispatch job: a durable state machine whose every transition names its cause.
 
-A planner files a resolved contract (:meth:`JobStore.file`) and gets back the job and, once, a JOB CAPABILITY: a
-random token only the filing session holds, of which the store keeps the SHA-256 alone. The operator signs the
+A planner files a contract SUBMISSION (:meth:`JobStore.file`); the store resolves it itself, through
+:func:`levain.dispatch.contract.resolve_contract` with the template resolver and the provider policy it is handed,
+so no caller can file a contract object it built by hand. The planner gets back the job and, once, a JOB
+CAPABILITY: a random token only the filing session holds, of which the store keeps the SHA-256 alone. The operator signs the
 contract's digest (:meth:`JobStore.sign`); from there the job is queued for a slot, run, verified, perhaps
 RECOMMENDED by the planner (:meth:`JobStore.recommend`, advisory: it confers no authority), authorised by a human
 signature or a human-signed adoption rule, and adopted. It fails on what the service itself observes (a lapsed
@@ -14,15 +16,20 @@ writers can never both move a job from one state. Most causes have no public met
 adoption are later slices); the table names them all.
 
 Every filed job holds a LEASE: an unsigned contract lapses :data:`UNSIGNED_LEASE` after filing (or at its expiry, if
-sooner), a signed one at the expiry its digest binds. Every read and every write first sweeps (:meth:`JobStore.sweep`):
-a job past its lease that is not yet authorised moves to ``failed`` with cause ``lease_lapsed``. One live contract per
-write file: filing is refused while a live job (not terminal, lease not lapsed) in the same repo writes a file in
-common, so an abandoned or runaway planner cannot hold a file past its lease.
+sooner), a signed one at the expiry its digest binds. Every read and every write first sweeps (:meth:`JobStore.sweep`)
+at the store's own clock: a job past its lease that is not yet authorised moves to ``failed`` with cause
+``lease_lapsed``. The sweep commits in its own write transaction before the operation's, so an operation that is then
+refused does not roll the lapse back; the operation's transaction sweeps again, so what it checks is current. One
+live contract per write file: filing is refused while a live job (not terminal, lease not lapsed) in the same repo
+writes a file in common, compared without case (a case-insensitive disk holds ``A.py`` and ``a.py`` as one file), so
+an abandoned or runaway planner cannot hold a file past its lease.
 
 The store is ``<directory>/dispatch.db``, ``<levain home>/dispatch`` by default, in a directory that is the
 operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse UPDATE, DELETE and an
-INSERT OR REPLACE): a job, its transitions and its one signature are rows written once, and a job's state is its
-latest transition. Known edge: until S1 places the control principal (design §8), the store is an operator-uid file,
+INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature and the store's own
+metadata are rows written once, and a job's state is its latest transition. Every connection the store opens turns
+foreign keys on. At creation the store draws a random ``store_id``, which every contract signature binds, so a
+signature made for a job in one store is refused by another. Known edge: until S1 places the control principal (design §8), the store is an operator-uid file,
 so any process of that uid can write it; no executor exists in this slice, so no run rests on it. Stdlib only.
 """
 from __future__ import annotations
@@ -45,11 +52,12 @@ from typing import Any
 from levain.authority import AuthorityError
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
-from levain.cockpit.consent import ConsentError, utc_stamp
+from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import AuthoritySource
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import sign as dsign
-from levain.dispatch.contract import ResolvedContract, parse_contract
+from levain.dispatch.contract import ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract
+from levain.dispatch.policy import ProviderPolicy
 
 __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused", "Job",
@@ -67,6 +75,7 @@ _SESSION_MAX = 256
 _IDEM_MAX = 128
 _EVIDENCE_MAX = 4000
 _JOB_ID = re.compile(r"dj-[0-9a-f]{32}")
+_STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
           "failed", "cancelled")
@@ -142,6 +151,7 @@ class Job:
     unsigned_until: str
     history: tuple[Transition, ...]
     signer_fp: str | None
+    store_id: str
 
     @property
     def state(self) -> str:
@@ -162,14 +172,14 @@ class Job:
 
 
 def default_dispatch_dir() -> Path:
-    """``<levain home>/dispatch``: ``$LEVAIN_HOME/dispatch`` if set, else ``~/.levain/dispatch``, made absolute (as
-    ``levain.consent.queue.default_queue_dir`` does for the consent store)."""
+    """``<levain home>/dispatch``: ``$LEVAIN_HOME/dispatch`` if set, else ``~/.levain/dispatch``, made absolute (the
+    rule the consent store's default directory is meant to follow too)."""
     home = os.environ.get("LEVAIN_HOME")
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "dispatch").resolve()
 
 
 def _append_only(table: str, message: str) -> tuple[str, str]:
-    # as levain.consent.questions: UPDATE and DELETE refused on the table
+    # UPDATE and DELETE refused on the table (the consent store's append-only shape, mirrored)
     return (f"CREATE TRIGGER IF NOT EXISTS {table}_frozen BEFORE UPDATE ON {table} "
             f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
             f"CREATE TRIGGER IF NOT EXISTS {table}_kept BEFORE DELETE ON {table} "
@@ -191,15 +201,22 @@ _SCHEMA = (
     *_append_only("jobs", "a job is written once"),
     *_append_only("transitions", "transitions are append-only"),
     *_append_only("signatures", "a signature is written once"),
-    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row that reuses a key or
-    # an explicit rowid (as levain.consent.questions does)
+    *_append_only("meta", "store metadata is written once"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row that reuses ANY key the
+    # table has (its primary key, every UNIQUE, an explicit rowid). jobs: id, (filer_session, idem_key) when the
+    # idem_key is not null (a null idem_key never collides under UNIQUE), rowid.
     "CREATE TRIGGER IF NOT EXISTS jobs_no_replace BEFORE INSERT ON jobs "
-    "WHEN EXISTS (SELECT 1 FROM jobs WHERE id = NEW.id OR rowid = NEW.rowid) "
+    "WHEN EXISTS (SELECT 1 FROM jobs WHERE id = NEW.id OR rowid = NEW.rowid OR (NEW.idem_key IS NOT NULL AND "
+    "filer_session = NEW.filer_session AND idem_key = NEW.idem_key)) "
     "BEGIN SELECT RAISE(ABORT, 'a job is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS meta_no_replace BEFORE INSERT ON meta "
+    "WHEN EXISTS (SELECT 1 FROM meta WHERE key = NEW.key OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'store metadata is written once'); END",
     "CREATE TRIGGER IF NOT EXISTS signatures_no_replace BEFORE INSERT ON signatures "
     "WHEN EXISTS (SELECT 1 FROM signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a signature is never replaced'); END",
-    # a transition is the next seq of its job, never a gap and never a replacement
+    # a transition is the next seq of its job, never a gap and never a replacement: an existing (job_id, seq) is at
+    # most the max, so it is never max + 1
     "CREATE TRIGGER IF NOT EXISTS transitions_next BEFORE INSERT ON transitions "
     "WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM transitions WHERE job_id = NEW.job_id), 0) + 1 "
     "OR EXISTS (SELECT 1 FROM transitions WHERE rowid = NEW.rowid) "
@@ -246,7 +263,7 @@ class JobStore:
 
     # --- store ---------------------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
-        # levain.consent.questions' directory rule: the operator's alone, never through a symlink
+        # the directory is the operator's alone, never through a symlink (the consent store's rule, mirrored)
         if not self.directory.exists():
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)   # the umask can only narrow it
         st = os.lstat(self.directory)
@@ -266,6 +283,7 @@ class JobStore:
             self._check_directory()
         conn = open_durable(self.path)
         try:
+            conn.execute("PRAGMA foreign_keys = ON")
             if not self._ready:
                 os.chmod(self.path, 0o600)
                 self._ensure_schema(conn)
@@ -290,6 +308,8 @@ class JobStore:
                 conn.execute(stmt)
             if row is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (FORMAT,))
+            if conn.execute("SELECT 1 FROM meta WHERE key = 'store_id'").fetchone() is None:
+                conn.execute("INSERT INTO meta (key, value) VALUES ('store_id', ?)", (secrets.token_hex(16),))
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
@@ -300,9 +320,27 @@ class JobStore:
         with write_transaction(self._connect) as conn:
             yield conn
 
+    @contextmanager
+    def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
+        """The sweep committed in its own write transaction, then the operation's write transaction (swept again, at
+        the same stamp, so what it reads is current) and the stamp both use."""
+        stamp = utc_stamp(_now_utc(self._clock))
+        with self._write() as conn:
+            self._sweep(conn, stamp)
+        with self._write() as conn:
+            self._sweep(conn, stamp)
+            yield conn, stamp
+
     # --- reading, inside a transaction ---------------------------------------------------------------------------
     @staticmethod
-    def _load(conn: sqlite3.Connection, job_id: str) -> Job | None:
+    def _store_id(conn: sqlite3.Connection) -> str:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+        if row is None or not isinstance(row[0], str) or _STORE_ID.fullmatch(row[0]) is None:
+            raise JobStoreError("the dispatch store has no valid store_id")
+        return row[0]
+
+    @classmethod
+    def _load(cls, conn: sqlite3.Connection, job_id: str) -> Job | None:
         row = conn.execute(f"SELECT {_JOB_COLS} FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             return None
@@ -311,7 +349,7 @@ class JobStore:
         signer = conn.execute("SELECT signer_fp FROM signatures WHERE job_id = ?", (job_id,)).fetchone()
         return Job(id=row[0], digest=row[1], contract_text=row[2], filed_at=row[3], filer_session=row[4],
                    idem_key=row[5], repo=row[6], expires_at=row[7], unsigned_until=row[8], history=history,
-                   signer_fp=None if signer is None else signer[0])
+                   signer_fp=None if signer is None else signer[0], store_id=cls._store_id(conn))
 
     def _must_load(self, conn: sqlite3.Connection, job_id: Any) -> Job:
         job = self._load(conn, job_id) if isinstance(job_id, str) and _JOB_ID.fullmatch(job_id) else None
@@ -353,35 +391,43 @@ class JobStore:
         return [r[0] for r in rows]
 
     # --- the public operations -----------------------------------------------------------------------------------
-    def sweep(self, now: datetime | None = None) -> list[str]:
-        """Fail every lapsed job not yet authorised (cause ``lease_lapsed``); returns their ids."""
-        stamp = utc_stamp(_now_utc(self._clock) if now is None else _now_utc(lambda: now))
+    def sweep(self) -> list[str]:
+        """Fail every lapsed job not yet authorised (cause ``lease_lapsed``) at the store's own clock; returns their
+        ids. It takes no caller time: a time ahead of the clock would fail live jobs, and a failure is final."""
+        stamp = utc_stamp(_now_utc(self._clock))
         with self._write() as conn:
             return self._sweep(conn, stamp)
 
-    def file(self, contract: ResolvedContract, *, filer_session: str,
-             idem_key: str | None = None) -> tuple[Job, str | None]:
-        """File ``contract`` for the planner session ``filer_session``; returns the job and its capability.
+    def _idem_row(self, filer_session: str, idem_key: str) -> tuple[str, str, str] | None:
+        with self._write() as conn:
+            row = conn.execute("SELECT id, digest, filed_at FROM jobs WHERE filer_session = ? AND idem_key = ?",
+                               (filer_session, idem_key)).fetchone()
+        return None if row is None else (row[0], row[1], row[2])
+
+    def file(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
+             policy: ProviderPolicy, filer_session: str, idem_key: str | None = None) -> tuple[Job, str | None]:
+        """Resolve the planner's contract ``submission`` (:func:`levain.dispatch.contract.resolve_contract`, with
+        ``resolve_template`` and ``policy``, at the store's clock) and file it for the planner session
+        ``filer_session``; returns the job and its capability. Every refusal resolution makes is raised here, and
+        nothing is filed.
 
         A repeat with the same ``(filer_session, idem_key)`` and the same digest returns the SAME job and no
         capability: it was returned once, to that session, and the store keeps only its hash, so a replayed call
-        never mints a second token for one job. The same key with another digest is refused. Filing is refused while
-        another live job in the same repo writes a file in common."""
-        if not isinstance(contract, ResolvedContract):
-            raise ContractRefused("file takes a ResolvedContract from resolve_contract")
+        never mints a second token for one job. The key is looked up BEFORE the expiry is judged: a replay is
+        resolved at its job's own filing time, so a replay after the contract expired still returns that job (in
+        whatever state it is now). The same key with another digest is refused. Filing is refused while another live
+        job in the same repo writes a file in common, compared without case."""
         filer_session = _label("filer_session", filer_session, _SESSION_MAX)
         if idem_key is not None:
             idem_key = _label("idem_key", idem_key, _IDEM_MAX)
-        text = contract.canonical()
+        now = _now_utc(self._clock)
+        prior = self._idem_row(filer_session, idem_key) if idem_key is not None else None
+        when = now if prior is None else parse_stamp(prior[2])
+        resolved = resolve_contract(submission, resolve_template=resolve_template, policy=policy, now=when)
+        text = resolved.canonical()
         parsed = parse_contract(text)      # what is stored must read back as this contract, digest and all
         digest = parsed.digest
-        now = _now_utc(self._clock)
-        stamp = utc_stamp(now)
-        if parsed.expires_at <= stamp:
-            raise ContractRefused("the contract has expired; resolve it again")
-        unsigned_until = min(utc_stamp(now + UNSIGNED_LEASE), parsed.expires_at)
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, stamp):
             if idem_key is not None:
                 row = conn.execute("SELECT id, digest FROM jobs WHERE filer_session = ? AND idem_key = ?",
                                    (filer_session, idem_key)).fetchone()
@@ -392,13 +438,20 @@ class JobStore:
                     job = self._load(conn, row[0])
                     assert job is not None
                     return job, None
-            mine = parsed.write_paths
+                if prior is not None:
+                    # the row read before resolving is gone: the store is append-only, so this is not a replay
+                    raise JobStoreError(f"job {prior[0]} vanished from an append-only store")
+            if parsed.expires_at <= stamp:
+                raise ContractRefused("the contract has expired; resolve it again")
+            unsigned_until = min(utc_stamp(now + UNSIGNED_LEASE), parsed.expires_at)
+            mine = {p.casefold(): p for p in parsed.write_paths}
             live = conn.execute(
                 f"SELECT j.id, j.contract FROM jobs j JOIN ({_CURRENT}) c ON c.job_id = j.id "
                 f"WHERE j.repo = ? AND c.to_state NOT IN ({','.join('?' * len(TERMINAL))}) ORDER BY j.id",
                 (parsed.repo, *sorted(TERMINAL))).fetchall()
             for other_id, other_text in live:
-                common = sorted(mine & parse_contract(other_text).write_paths)
+                theirs = {p.casefold(): p for p in parse_contract(other_text).write_paths}
+                common = sorted(theirs[k] for k in mine.keys() & theirs.keys())
                 if common:
                     raise ContractRefused(f"live job {other_id} already writes {common[0]}; one live contract per "
                                           "write file")
@@ -426,9 +479,7 @@ class JobStore:
             snapshot = authority()
         except AuthorityError as exc:
             raise SignatureRefused(f"the authority log could not be read: {exc}") from None
-        stamp = utc_stamp(_now_utc(self._clock))
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state != _FILED:
                 raise SignatureRefused(f"job {job.id} is {job.state}, not filed; a contract is signed once")
@@ -447,9 +498,7 @@ class JobStore:
         return out
 
     def _planner(self, job_id: Any, capability: Any, to_state: str, cause: str) -> Job:
-        stamp = utc_stamp(_now_utc(self._clock))
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             stored = conn.execute("SELECT capability_sha256 FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
             given = _capability_sha(capability) if isinstance(capability, str) else ""
@@ -472,18 +521,14 @@ class JobStore:
 
     def get(self, job_id: str) -> Job | None:
         """The job ``job_id`` after a sweep, or ``None``."""
-        stamp = utc_stamp(_now_utc(self._clock))
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, _stamp):
             if not isinstance(job_id, str) or _JOB_ID.fullmatch(job_id) is None:
                 return None
             return self._load(conn, job_id)
 
     def list(self, *, repo: str | None = None) -> list[Job]:
         """Every job after a sweep, oldest filing first; ``repo`` narrows to one repository."""
-        stamp = utc_stamp(_now_utc(self._clock))
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, _stamp):
             ids = [r[0] for r in conn.execute(
                 "SELECT id FROM jobs WHERE (? IS NULL OR repo = ?) ORDER BY filed_at, id", (repo, repo))]
             return [job for job in (self._load(conn, i) for i in ids) if job is not None]
@@ -491,9 +536,7 @@ class JobStore:
     def _transition(self, job_id: str, to_state: str, cause: str, *, evidence: str = "") -> Job:
         """Any edge of :data:`EDGES`, for the slices that own its cause (runs, the verifier, adoption) and for the
         tests that walk the table; no public caller exists in this slice."""
-        stamp = utc_stamp(_now_utc(self._clock))
-        with self._write() as conn:
-            self._sweep(conn, stamp)
+        with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             self._apply(conn, job.id, to_state, cause, stamp, evidence)
             out = self._load(conn, job.id)

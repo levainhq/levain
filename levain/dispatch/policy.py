@@ -7,11 +7,20 @@ and a contract touching any refused path refused WHOLE, never trimmed to what wo
 
 Patterns are globs over the repo-relative POSIX path, matched by this module's own small matcher (never ``fnmatch``,
 whose ``*`` crosses ``/``): ``*`` matches any run of characters inside one path component, ``?`` one character inside
-a component, and ``**`` as a whole component matches zero or more components. ``*`` and ``?`` match a leading dot, so
-``**/*.pem`` covers ``.hidden.pem``. Character classes (``[``) are refused at load rather than half-supported. A
-pattern beginning ``~`` or ``/`` is refused at load: every set the policy judges is repo-relative, so a home or
-absolute pattern (the design's ``~/ClientData/**``) could never match one; such data is outside any repo by
+a component, and ``**`` as a whole component matches zero or more components, except as the LAST component, where it
+matches one or more (``docs/**`` covers every file under ``docs/``, never a file named ``docs``). ``*`` and ``?`` match
+a leading dot, so ``**/*.pem`` covers ``.hidden.pem``. Character classes (``[``) are refused at load rather than
+half-supported. A pattern beginning ``~`` or ``/`` is refused at load: every set the policy judges is repo-relative,
+so a home or absolute pattern (such as ``~/private/**``) could never match one; such data is outside any repo by
 construction, and stays out because the executor's worktree is built from the read set alone.
+
+Every pattern is anchored at the repo root: ``src/*.py`` names ``src/a.py`` and never ``lib/src/a.py``. That is the
+meaning a provider's read allowlist keeps, so ``README`` admits the top-level file alone. A NEVER pattern with no ``/``
+is refused at load, the message naming its ``**/<pattern>`` form: gitignore's habit reads ``.env*`` as "at any depth",
+and a NEVER list written that way would leak ``app/.env``. NEVER matching casefolds both the pattern and the path,
+since a case-insensitive disk holds ``server.PEM`` as the same kind of file as ``server.pem``; casefolding NEVER only
+adds refusals. The read allowlists match exactly. A pattern or a path holding any control character (newline and tab
+included) or any space other than U+0020 is refused.
 
 The policy is dispatch CONTROL STATE (design §3.2): the intent is that it lives in a signed, generation-checked store
 the control principal owns, which agent sessions can read and never write. That store is a later slice (F3); here the
@@ -22,23 +31,40 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from levain.contracts.canon import canonical_bytes
 
-__all__ = ["FORMAT", "PolicyError", "ProviderPolicy", "match"]
+__all__ = ["FORMAT", "PolicyError", "ProviderPolicy", "match", "path_text_problem"]
 
 FORMAT = "levain-dispatch-policy/1"
 _PROVIDER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _PATTERN_MAX = 512
 _PATTERNS_MAX = 256
 _PROVIDERS_MAX = 64
+# control, format, surrogate, line/paragraph separators, private use, unassigned: can show differently from itself
+_UNSHOWABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 
 
 class PolicyError(ValueError):
     """A provider policy that cannot be loaded: the message names the field."""
+
+
+def path_text_problem(text: str, what: str = "path") -> str | None:
+    """Why ``text`` (a path or a pattern) holds a character that cannot show as itself: any control character,
+    newline and tab included, any format, separator, surrogate, private-use or unassigned code point, and any space
+    but U+0020. ``None`` when every character shows as what it is. One rule for contract paths and policy patterns."""
+    for ch in text:
+        if ch == " ":
+            continue
+        category = unicodedata.category(ch)
+        if category in _UNSHOWABLE or category == "Zs":
+            return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
+                    "from what is signed")
+    return None
 
 
 def _pattern_problem(pattern: Any) -> str | None:
@@ -46,6 +72,9 @@ def _pattern_problem(pattern: Any) -> str | None:
         return "a pattern is a non-empty string"
     if len(pattern) > _PATTERN_MAX:
         return f"a pattern is at most {_PATTERN_MAX} characters"
+    problem = path_text_problem(pattern, "pattern")
+    if problem is not None:
+        return f"{problem} ({pattern[:80]!r})"
     if pattern.startswith("~"):
         return (f"pattern {pattern!r} is a home path; the policy judges repo-relative paths, so it could never "
                 "match (data outside the repo never enters the executor's worktree)")
@@ -76,9 +105,15 @@ def match(pattern: str, path: str) -> bool:
     regexes = [None if p == "**" else _component_regex(p) for p in pats]
     # reach[j] is True when pattern components [0, i) can consume path components [0, j)
     reach = [True] + [False] * len(parts)
+    last = len(regexes) - 1
     for i, rx in enumerate(regexes):
         nxt = [False] * (len(parts) + 1)
-        if rx is None:                       # ** : zero or more components
+        if rx is None and i == last:         # a trailing ** : one or more components
+            seen = False
+            for j in range(len(parts) + 1):
+                nxt[j] = seen
+                seen = seen or reach[j]
+        elif rx is None:                     # ** : zero or more components
             seen = False
             for j in range(len(parts) + 1):
                 seen = seen or reach[j]
@@ -112,7 +147,8 @@ def _path_problem(path: Any) -> str | None:
         return "a path is a non-empty string with no NUL"
     if path.startswith("/") or any(p in ("", ".", "..") for p in path.split("/")):
         return f"path {path[:80]!r} is not a normalised repo-relative path"
-    return None
+    problem = path_text_problem(path)
+    return None if problem is None else f"{problem} ({path[:80]!r})"
 
 
 @dataclass(frozen=True)
@@ -128,6 +164,10 @@ class ProviderPolicy:
         if not isinstance(d, Mapping) or set(d) != {"never", "providers"}:
             raise PolicyError('a provider policy is exactly {"never": [...], "providers": {...}}')
         never = _patterns(d["never"], "never")
+        for p in never:
+            if "/" not in p:
+                raise PolicyError(f"never: pattern {p!r} has no '/', so it is anchored at the repo root and would miss "
+                                  f"the same name deeper down; write '**/{p}' to refuse it at any depth")
         raw = d["providers"]
         if not isinstance(raw, Mapping) or len(raw) > _PROVIDERS_MAX:
             raise PolicyError(f"providers must be a mapping of at most {_PROVIDERS_MAX} providers")
@@ -164,8 +204,9 @@ class ProviderPolicy:
             if problem is not None:
                 return problem
         for path in read_l + write_l:
+            folded = path.casefold()
             for pattern in self.never:
-                if match(pattern, path):
+                if match(pattern.casefold(), folded):
                     return f"{path} is on the NEVER list ({pattern}); the contract is refused whole"
         if not isinstance(provider, str) or provider not in self.providers:
             return f"provider {provider!r} is not in the provider policy; an unknown provider gets nothing"

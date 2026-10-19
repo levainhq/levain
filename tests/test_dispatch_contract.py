@@ -84,8 +84,8 @@ def registry(*templates: ResolvedTemplate):
 
 
 POLICY = ProviderPolicy.from_mapping({
-    "never": ["work/**", ".env*", "**/*.pem"],
-    "providers": {"openrouter": {"read": ["src/**", "docs/**", "README", "srclink/**", "vendor/**", "README/**"]},
+    "never": ["work/**", "**/.env*", "**/*.pem"],
+    "providers": {"openrouter": {"read": ["src", "src/**", "docs/**", "README", "srclink/**", "vendor/**", "README/**"]},
                   "anthropic": {"read": ["**"]}},
 })
 
@@ -461,3 +461,70 @@ def test_resolved_contract_is_frozen(repo):
     c = resolve(submission(path, base))
     with pytest.raises(dataclasses.FrozenInstanceError):
         c.goal = "other"                                              # type: ignore[misc]
+
+
+# --- fix round 1 (L1/L2 slice a) -----------------------------------------------------------------------------------
+
+def test_a_replace_ref_never_changes_what_base_binds(tmp_path):
+    """L2 H1, the reviewer's probe: ``git replace <base> <decoy>`` must not swap the tree the contract binds."""
+    path, base = make_repo(tmp_path)
+    true_blob = git(path, "rev-parse", f"{base}:src/b.py")
+    true_tree = git(path, "rev-parse", f"{base}^{{tree}}")
+    (path / "src/b.py").write_text("b = 'DECOY'\n")
+    git(path, "add", "src/b.py")
+    git(path, "commit", "-q", "-m", "decoy")
+    decoy = git(path, "rev-parse", "HEAD")
+    git(path, "replace", base, decoy)
+    assert git(path, "rev-parse", f"{base}:src/b.py") != true_blob          # plain git now shows the decoy
+    c = resolve(submission(path, base, read=["src/b.py"], write=["src/a.py"]))
+    assert c.base == base and c.read[0].blob == true_blob and c.base_tree == true_tree
+    assert json.loads(c.canonical())["base_tree"] == true_tree
+
+
+def test_git_env_turns_off_replace_objects_and_grafts(monkeypatch):
+    from levain.dispatch.contract import git_env
+    monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
+    monkeypatch.setenv("GIT_GRAFT_FILE", "/tmp/grafts")
+    env = git_env()
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert not os.path.exists(env["GIT_GRAFT_FILE"]) and env["GIT_GRAFT_FILE"] != "/tmp/grafts"
+    assert not {k for k in env if k.startswith("GIT_")} - {"GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE",
+                                                         "GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM"}
+
+
+def test_tampering_base_tree_changes_the_digest(repo):
+    path, base = repo
+    c = resolve(submission(path, base))
+    m = json.loads(c.canonical())
+    m["base_tree"] = "0" * 40
+    assert parse_contract(canonical(m)).digest != c.digest
+    m["base_tree"] = "main"
+    with pytest.raises(ContractRefused, match="base_tree"):
+        parse_contract(canonical(m))
+
+
+@pytest.mark.parametrize("p, code", [
+    ("src/a\nb.py", "000A"), ("src/a\tb.py", "0009"), ("src/a\rb.py", "000D"), ("x/\n/y", "000A"),
+    ("src/a b.py", "00A0"), ("src/a b.py", "2003"), ("src/a　b.py", "3000"),
+])
+def test_a_path_refuses_every_control_character_and_every_other_space(repo, p, code):
+    """L1 MED2 / L2 L1, the reviewer's probe3: a newline or tab inside a path is refused like any control."""
+    refused(repo, f"U\\+{code}", read=[p])
+    refused(repo, f"U\\+{code}", write=[p])
+
+
+def test_a_plain_space_in_a_path_is_still_a_path(repo):
+    refused(repo, "src/a b.py does not exist at base", read=["src/a b.py"])     # shape passed, git answered
+
+
+def test_parse_refuses_anything_malformed_as_contract_refused(repo):
+    """L1 LOW1, the reviewer's probe2: an unhashable mode is a refusal, never a raw TypeError."""
+    path, base = repo
+    m = json.loads(resolve(submission(path, base)).canonical())
+    m["read"][0]["mode"] = []
+    with pytest.raises(ContractRefused):
+        parse_contract(canonical(m))
+    m = json.loads(resolve(submission(path, base)).canonical())
+    m["write"][0]["mode"] = {"a": 1}
+    with pytest.raises(ContractRefused):
+        parse_contract(canonical(m))
