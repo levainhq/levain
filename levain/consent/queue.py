@@ -540,7 +540,11 @@ def answer_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, si
     never the apply): an answer in the format from before the chaining is checked as that format, every
     check but the head's, since it has none. ``authority`` is an :class:`AuthoritySnapshot` or any object whose
     ``key(fingerprint)`` returns ``None`` or a key with ``public_key``, ``fingerprint``, ``active``, ``key_class`` and
-    ``custody``; ``ssh_keygen`` is the verifier binary (default: levain's own resolution)."""
+    ``custody``; ``ssh_keygen`` is the verifier binary (default: levain's own resolution). Every check, and the
+    bytes the signature is verified over, read one plain-dict copy of ``payload`` taken first; a caller stores what
+    it parsed, never a mapping that can change after this returns."""
+    if isinstance(payload, Mapping):
+        payload = dict(payload)
     unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
     if unchained and not unchained_ok:
         return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
@@ -583,7 +587,11 @@ def signer_refusal(request: ExternalGateRequest | None, payload: Mapping[str, An
                    ssh_keygen: Path | str | None = None) -> str | None:
     """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
     ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
-    ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
+    ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``. Like
+    :func:`answer_refusal`, it reads one plain-dict copy of ``payload`` taken first."""
+    if not isinstance(payload, Mapping) or "decision" not in payload or "signer_fp" not in payload:
+        return f"the {noun} names no decision or no signer"
+    payload = dict(payload)
     decision = payload["decision"]
     signer_fp = payload["signer_fp"]
     key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
