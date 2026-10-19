@@ -82,6 +82,13 @@ R0_PATHS = [
     # head round 1b: a test file in any language, pip's lockfile class, and rc only as a dotfile (not arc.py)
     ("src/test_x.js", DENY), ("test_x.ts", DENY), ("requirements.txt", DENY), ("requirements-dev.txt", DENY),
     ("constraints.txt", DENY), ("src/arc.py", OK), ("src/orc.ts", OK), ("src.py", OK),
+    # L3 r1: CamelCase test classes and JS test/build tooling
+    ("src/FooTest.java", DENY), ("FooTests.cs", DENY), ("FooSpec.scala", DENY), ("FooTest.php", DENY),
+    ("FooTests.swift", DENY), ("TestFoo.kt", DENY), ("FooTestCase.php", DENY), ("jest.setup.js", DENY),
+    ("setupTests.js", DENY), ("karma.conf.js", DENY), ("gulpfile.js", DENY), ("Gruntfile.js", DENY),
+    ("src/latest.py", OK),
+    # a known false positive, fail-safe at registration: the CamelCase rule is casefolded, so Latest.java reads as *test
+    ("src/Latest.java", DENY),
     ("src/a.py", OK), ("src/__init__.py", OK), ("src/testing_utils.py", OK), ("src/contest.py", OK),
     ("lib/latest.py", OK), ("src/x.pyi", OK), ("web/app.tsx", OK), ("lib/mod.rs", OK), ("cmd/main.go", OK),
     ("styles/a.scss", OK), ("docs/x.md", OK), ("README.rst", OK), ("notes.txt", OK), ("LIB/B.PY", OK),

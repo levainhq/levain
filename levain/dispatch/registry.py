@@ -100,6 +100,12 @@ EXECUTION_BEARING_FILES: tuple[str, ...] = (
     "sitecustomize.py", "usercustomize.py", "*.pth", ".envrc", ".*rc", ".*rc.*",
     "agents.md", "claude.md", "claude.local.md", "gemini.md", ".mcp.json",
     "*.lock", "package-lock.json", "poetry.lock", "uv.lock", "requirements*.txt", "constraints*.txt",
+    # JS tooling a test or build run loads without the word "config" in its name
+    "*.setup.*", "setup*.js", "setup*.ts", "*.conf.*", "gulpfile.*", "gruntfile.*",
+    # test classes named in CamelCase (JUnit, NUnit, ScalaTest, PHPUnit, XCTest): scoped to those languages'
+    # extensions, so a Python module like latest.py stays source
+    *(f"{shape}.{ext}" for ext in ("java", "kt", "scala", "cs", "php", "swift", "m")
+      for shape in ("*test", "*tests", "*spec", "test*", "*testcase")),
 )
 EXECUTION_BEARING_DIRS: tuple[str, ...] = (
     "tests", "test", "testing", "__tests__", "spec", "e2e",

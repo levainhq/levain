@@ -54,6 +54,11 @@ before the newest fails the walk on read, and an old item cannot be re-signed in
 - A template's provider and route are not cross-checked against the active provider policy or route map, and a
   store whose generation reaches :data:`levain.contracts.grammar.JSON_INT_MAX` accepts nothing more (only the
   operator signs generations).
+- The no-symlink check on ``control.db`` is a pathname check before open, so a same-uid process can race a symlink
+  in between; it is the same uid that can already rewrite the file, so the race adds no reach. Every read runs
+  ``ssh-keygen`` once per configuration kind present (cost, not safety).
+- The R0 CamelCase test rule is casefolded, so a source file whose name ends in ``test`` (``Latest.java``) is refused
+  at registration: a visible, fail-safe false positive.
 - The signing tool, when it is built, shows the item before the touch: kind, generation, store id, and its
   difference from the active configuration.
 Nothing executes on this configuration in this slice. Stdlib only.
@@ -354,6 +359,10 @@ class ControlStore:
         latest item of each kind against the pinned key; raises :class:`ControlStateUnavailable` on anything that
         does not hold."""
         meta = _meta(conn)
+        # the root is judged before any row, so an empty store under a revoked or ineligible root refuses too
+        root = _root_problem(snapshot, meta["trust_root"])
+        if root is not None:
+            raise ControlStateUnavailable(f"the pinned trust root cannot vouch for configuration: {root}")
         prev = ""
         latest: dict[str, tuple[ConfigItem, Any]] = {}
         expected = 0

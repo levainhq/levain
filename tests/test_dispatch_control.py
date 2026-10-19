@@ -468,6 +468,22 @@ def test_a_revoked_root_fails_every_read_closed(tmp_path, tmp_path_factory):
         accept(store, lg, ks, "verifiers", 2, VERIFIERS, key="root", prev=head)
 
 
+def test_an_empty_store_under_a_revoked_root_reads_closed(tmp_path, tmp_path_factory):
+    # L3 r1 (codex): with no item stored, no signature is checked, so the root itself must be judged first
+    ks = {n: Key(tmp_path_factory.mktemp("empty-revoke-keys"), n) for n in ("laptop", "root")}
+    lg = Log(tmp_path_factory.mktemp("empty-revoke-auth"), ks)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("root", "laptop-presence")
+    d = _dir(tmp_path)
+    ctl.ControlStore.init(d, ks["root"].fp, authority=lg.source)
+    store = ctl.ControlStore(d, authority=lg.source, clock=Clock(NOW))
+    assert store.active() == {} and store.generation() == 0
+    lg.revoke("root")
+    for read in (store.active, store.head, store.generation):
+        with pytest.raises(ctl.ControlStateUnavailable, match="revoked"):
+            read()
+
+
 # --- append-only and fail-closed -----------------------------------------------------------------------------------
 
 def _raw(cdir):
