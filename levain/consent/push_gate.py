@@ -331,7 +331,8 @@ def _gated(args: argparse.Namespace, queue: ConsentQueue, adapter: Any, settings
                 "Let it finish: stopping it before then withdraws the request, or on a kill leaves it pending to "
                 "its expiry.")
             claude_code.notify(settings, f"levain: {agent} asks to push, up to {hold:g} s: {what} "
-                                         f"(request {request.id}).", cwd=qdir)
+                                         f"(request {request.id}).", cwd=qdir, kind="push",
+                               ref=f"request:{request.id}")
             got, _why = adapter.hold_for_answer(queue, request, hold + 5.0, tool_input=call, posture=None)
             marked = None if got is not None else queue.mark_undecided(request.id, halt=True, tool_input=call)
         except BaseException as exc:
