@@ -40,7 +40,7 @@ def test_a_phone_with_pings_on_gets_the_gate_ping_with_its_ref(tmp_path, monkeyp
     assert claude_code.notify(claude_code.AdapterSettings(), "levain: claude waits on you: Bash (request r1).",
                               cwd=tmp_path, ref="request:r1") is True
     assert calls == [{"kind": "consent", "ref": "request:r1", "title": "levain",
-                      "body": "claude waits on you: Bash (request r1)."}]
+                      "body": "claude waits on you: Bash (request r1).", "url": "/?view=needs"}]
 
 
 def test_a_ruling_ping_reaches_the_phone_without_a_notify_command(tmp_path, monkeypatch):

@@ -1135,7 +1135,7 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
 
             if live(cwd):
                 body = message[len("levain: "):] if message.startswith("levain: ") else message
-                pushed = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body)
+                pushed = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body, url="/?view=needs")
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
             pushed = False
     return started or pushed

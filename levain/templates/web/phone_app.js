@@ -4,6 +4,8 @@
 (function () {
   "use strict";
   const TOKEN_KEY = "levain-phone-token", DEVICE_KEY = "levain-device-token";
+  // a ping's tap opens /?view=needs: read once here, before the boot below rewrites the address
+  const askedView = new URLSearchParams(location.search).get("view");
   const store = {
     get(area, k) { try { return window[area].getItem(k); } catch (e) { return null; } },
     set(area, k, v) { try { window[area].setItem(k, v); return true; } catch (e) { return false; } },
@@ -117,7 +119,8 @@
   }
 
   // ---- tabs -----------------------------------------------------------------------------------------------------
-  let view = store.get("sessionStorage", "levain-view") || "needs";
+  let view = askedView || store.get("sessionStorage", "levain-view") || "needs";
+  if (askedView) { try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) { /* the address stays */ } }
   if (!["needs", "board", "notes"].includes(view)) view = "needs";
   function show(v) {
     view = v; store.set("sessionStorage", "levain-view", v);
