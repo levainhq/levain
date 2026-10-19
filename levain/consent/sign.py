@@ -89,7 +89,7 @@ SIGN_DIR = "sign"
 MESSAGE_MAX = 8 * 1024             # bytes of UTF-8: a statement a person reads whole on a phone
 _TEXT_MAX = 200                    # characters of a title or a requester
 _FILE_MAX = 64 * 1024              # a request file past this is not read
-LIST_MAX = 50                      # request files one listing reads; past it the page shows how many were left
+LIST_MAX = 50                      # open requests one listing shows; past it the page shows how many were left
 _SCAN_MAX = 4096                   # directory entries one listing looks at
 _ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9.-]{2,63}")
@@ -396,9 +396,10 @@ class Signer:
                 break
             read += 1
             try:
+                if state_of(self.queue_dir, rid) != "open":   # a decided request is never parsed again
+                    continue
                 request = read_request(self.queue_dir, rid)
-                if (not self._ours(request) or (request.expires_at is not None and request.expires_at <= now)
-                        or state_of(self.queue_dir, rid) != "open"):
+                if not self._ours(request) or (request.expires_at is not None and request.expires_at <= now):
                     continue
             except SignRefused:
                 continue                      # gone since the directory was read

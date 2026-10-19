@@ -229,9 +229,9 @@
         return call("POST", base + "answer", {
           authenticator_data: b64u(cred.response.authenticatorData), client_data_json: b64u(cred.response.clientDataJSON),
           signature: b64u(cred.response.signature) }).then((a) => {
-          // the passkey signed: once the answer is sent, only the server's own refusal says nothing was signed; no
-          // reply (the connection dropped) or an internal error may follow a signature the server already wrote
-          if (!a.ok && (a.status === 0 || a.status === 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
+          // the passkey signed: once the answer is sent, only the server's own refusal (a 4xx) says nothing was
+          // signed; no reply, a proxy error or any 5xx may follow a signature the server already wrote
+          if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (r.title || r.id);
           say("signed · by " + a.body.signer_fp + " in " + a.body.namespace, "ok");
