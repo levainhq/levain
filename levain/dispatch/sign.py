@@ -19,8 +19,8 @@ apply_patch over the exact write set, for at most a day) reaches only a throwawa
 read set, and confers nothing on the operator's own tree. Adoption into his tree needs its own human signature, which
 the adoption slice is to hold to the highest consent tier of the paths it writes, so a path whose consent tier is T3
 is never adopted on a phone signature. Should a contract's grant ever reach the operator's tree directly,
-T2 stops being the right tier. Untested: no test yet produces a VALID passkey (WebAuthn) signature over a dispatch
-payload; the passkey path is exercised only by its refusals.
+T2 stops being the right tier. A VALID passkey (WebAuthn) signature over a dispatch payload is made in
+tests/test_dispatch_phone.py by a software P-256 authenticator and verified by ssh-keygen; no real phone's has been.
 
 THE HUMAN CANCEL. A cancel is the operator's own signed item with its own payload (:func:`cancel_payload`, format
 :data:`CANCEL_FORMAT`) in its own namespace (:data:`DISPATCH_CANCEL_NAMESPACE`), so a contract signature can never be
