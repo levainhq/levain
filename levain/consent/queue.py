@@ -317,7 +317,17 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'away leaves are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS away_leaves_kept BEFORE DELETE ON away_leaves "
     "BEGIN SELECT RAISE(ABORT, 'away leaves are append-only'); END",
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger, and the marks are ordered by rowid:
+    # refuse a new row that reuses an id or an explicit rowid (one not given reads as -1 here, never a real row)
+    "CREATE TRIGGER IF NOT EXISTS away_marks_no_replace BEFORE INSERT ON away_marks "
+    "WHEN EXISTS (SELECT 1 FROM away_marks WHERE id = NEW.id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an away mark id is never reused'); END",
+    "CREATE TRIGGER IF NOT EXISTS away_leaves_no_replace BEFORE INSERT ON away_leaves "
+    "WHEN EXISTS (SELECT 1 FROM away_leaves WHERE mark_id = NEW.mark_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an away leave is never replaced'); END",
 )
+# what an away mark is read from (:meth:`ConsentQueue.away_mark`)
+_AWAY_TABLES = frozenset({"meta", "away_marks", "away_leaves"})
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
 
@@ -603,6 +613,28 @@ class ConsentQueue:
     def _read(self) -> Iterator[sqlite3.Connection]:
         with read_transaction(self._connect) as conn:
             yield conn
+
+    @contextmanager
+    def _read_as_is(self, tables: frozenset[str]) -> Iterator[sqlite3.Connection | None]:
+        """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
+        (no write lock, no sync). ``None`` when it lacks any of ``tables``; raises when it is another format."""
+        self._check_directory()
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0,
+                               isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("BEGIN")
+            if not tables <= {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}:
+                conn.execute("COMMIT")
+                yield None
+                return
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+            if row is None or row[0] != STORE_FORMAT:
+                raise QueueStoreError(f"store format {None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+            yield conn
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
 
     @property
     def queue_id(self) -> str:
@@ -1261,7 +1293,8 @@ class ConsentQueue:
 
     @staticmethod
     def _latest_mark(conn: sqlite3.Connection, agent: str) -> tuple[Any, ...] | None:
-        # latest by rowid: a raw writer can only add a mark (more away), never a leave that verifies for one
+        # latest by rowid: the triggers refuse an UPDATE, a DELETE and an INSERT that reuses an id or a rowid, so a
+        # writer that leaves them in place can only add a mark (more away); one that drops them is the same-uid edge
         return conn.execute("SELECT m.id, m.set_at, l.left_at, l.payload, l.signature, l.signer_fp FROM away_marks m "
                             "LEFT JOIN away_leaves l ON l.mark_id = m.id WHERE m.agent = ? ORDER BY m.rowid DESC "
                             "LIMIT 1", (agent,)).fetchone()
@@ -1330,12 +1363,17 @@ class ConsentQueue:
             return "the leave row's left_at is not a timestamp"
         return "the leave was signed after the queue recorded it" if late else None
 
-    def away_mark(self, agent: str) -> AwayMark | None:
+    def away_mark(self, agent: str, *, as_is: bool = False) -> AwayMark | None:
         """``agent``'s latest away mark, or ``None`` when it never had one. A stored leave counts (``left``) only
         when it re-verifies now (:meth:`_stored_leave_refusal`): a leave by a key revoked since, or a changed row,
-        leaves the mark standing. Raises when the store cannot be read (the hook takes that as away)."""
+        leaves the mark standing. With ``as_is`` (a reader that holds no queue of its own) the store is read as it
+        stands and never written: one without the away tables has no mark. Raises when the store cannot be read
+        (the hook takes that as away)."""
         self._check_agent(agent)
-        with self._read() as conn:
+        reading = self._read_as_is(_AWAY_TABLES) if as_is and not self._ready else self._read()
+        with reading as conn:
+            if conn is None:
+                return None
             row = self._latest_mark(conn, agent)
             queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
         if row is None:

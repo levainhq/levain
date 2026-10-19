@@ -107,8 +107,10 @@ class AdapterSettings:
     explicit_off: bool = False
     away_idle_seconds: float = IDLE_THRESHOLD
     legacy: bool = False
-    # away mode stands by the operator's away mark in the queue store (:func:`with_away_mark`), not by the file alone
+    # away mode stands by the operator's away mark in the queue store (:func:`with_away_mark`), not by the file alone;
+    # away_unreadable: the store could not be read, so it is held as such a mark
     away_marked: bool = False
+    away_unreadable: bool = False
     # the PreToolUse gate (Q14 B2): its hold D; the notify command it pings the operator with (R-f: an argv, the
     # message appended as its last argument; None = no ping); the phone page's link the ping carries
     gate_hold_seconds: float = DEFAULT_GATE_HOLD
@@ -484,44 +486,50 @@ def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | 
     return hold_seconds(settings, agent, source) if away else 0.0
 
 
-def away_mark_of(queue_dir: Path, settings: AdapterSettings, agent: str) -> AwayMark | None:
+def away_mark_of(queue_dir: Path, settings: AdapterSettings, agent: str, *, queue: Any = None) -> AwayMark | None:
     """``agent``'s latest away mark in the queue store at ``queue_dir``, its leave re-verified against the authority
-    ``settings`` name (:meth:`ConsentQueue.away_mark`); ``None`` when there is no store or no mark. Raises when the
-    store cannot be read."""
+    ``settings`` name (:meth:`ConsentQueue.away_mark`); ``None`` when there is no store or no mark. Read through
+    ``queue`` when it is a :class:`ConsentQueue` (the hook's own, whose schema is checked once), else from the store
+    as it is, never written (no away tables: no mark). Raises when the store cannot be read."""
     if not os.path.lexists(Path(queue_dir) / DB_NAME):
         return None
-    return _queue_for(Path(queue_dir), settings).away_mark(agent)
+    if isinstance(queue, ConsentQueue):
+        return queue.away_mark(agent)
+    return _queue_for(Path(queue_dir), settings).away_mark(agent, as_is=True)
 
 
-def with_away_mark(settings: AdapterSettings, queue_dir: Path, agent: str) -> AdapterSettings:
+def with_away_mark(settings: AdapterSettings, queue_dir: Path, agent: str, *, queue: Any = None) -> AdapterSettings:
     """``settings`` as the hook acts on them: when ``agent``'s latest away mark has no leave that verifies
-    (:func:`away_mark_of`), away mode is on by the operator's word whatever the file says (``away_marked``), holding
-    the file's hold when it is above zero, else the agent's :data:`DEFAULT_HOLDS`. A store that cannot be read
-    counts as such a mark: the read fails toward holding, never toward off. An ``agent`` that is not one of
-    :data:`DEFAULT_HOLDS` has no marks."""
+    (:func:`away_mark_of`, through ``queue`` when given), away mode is on by the operator's word whatever the file
+    says (``away_marked``), holding the file's hold when it is above zero, else the agent's :data:`DEFAULT_HOLDS`.
+    A store that cannot be read counts as such a mark (``away_unreadable`` too): the read fails toward holding,
+    never toward off. An ``agent`` that is not one of :data:`DEFAULT_HOLDS` has no marks."""
     if agent not in DEFAULT_HOLDS:
         return settings
+    unreadable = False
     try:
-        mark = away_mark_of(queue_dir, settings, agent)
+        mark = away_mark_of(queue_dir, settings, agent, queue=queue)
     except Exception:  # noqa: BLE001 - an unreadable store is held, never read as away off
-        mark = AwayMark(id="", agent=agent, set_at="", left=False)
+        mark, unreadable = AwayMark(id="", agent=agent, set_at="", left=False), True
     if mark is None or mark.left:
         return settings
     hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[agent]
     return replace(settings, away_mode=True, explicit_off=False, legacy=False, away_marked=True,
-                   away_hold_seconds=hold)
+                   away_unreadable=unreadable, away_hold_seconds=hold)
 
 
-def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None = None
+def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None = None, queue: Any = None
                     ) -> Callable[[], tuple[bool, str, str]]:
     """The recheck a hook entry point holds with: :func:`effective_away` of a fresh read of the settings file at
     ``path``, or of ``started`` (what the hold started with) when that read fails, with the away mark of ``agent``
-    (default: the file's name without ``.json``) read again from the store beside it (:func:`with_away_mark`)."""
+    (default: the file's name without ``.json``) read again from the store beside it (:func:`with_away_mark`,
+    through the hook's ``queue`` when given, so a recheck tick takes no write lock)."""
     agent = agent if agent is not None else path.stem
 
     def recheck() -> tuple[bool, str, str]:
         fresh = try_read_settings_file(path)
-        return effective_away(with_away_mark(fresh if fresh is not None else started, path.parent, agent))
+        return effective_away(with_away_mark(fresh if fresh is not None else started, path.parent, agent,
+                                             queue=queue))
     return recheck
 
 
@@ -925,7 +933,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
-        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings)
+        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep,
                      still_away=still_away)
     try:
@@ -1059,13 +1067,15 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         parser.add_argument("--max-hold", type=float, default=DEFAULT_MAX_HOLD)
         args = parser.parse_args(argv)
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
-        settings = with_away_mark(load_settings(queue_dir), queue_dir, AGENT)
+        settings = load_settings(queue_dir)
+        queue = _queue_for(queue_dir, settings)   # one queue: the away mark, the hold and every recheck read it
+        settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
         event = json.loads(stdin.read())
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-            out = gate(event, _queue_for(queue_dir, settings), settings)
+            out = gate(event, queue, settings)
         else:
-            out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
+            out = decide(event, queue, settings, max_hold=args.max_hold,
+                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

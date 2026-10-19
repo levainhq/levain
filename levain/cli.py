@@ -2082,9 +2082,12 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                     "away mode turns off (your input, or `off`), leaving the agent's own dialog to ask. `on` refuses "
                     "when no enrolled key in the install's cockpit could sign an answer. `on` also records an away "
                     "mark in the consent queue store, which the hook reads as well as the settings file: leaving it "
-                    "(`off` or `auto`) takes a signature by an enrolled key (--signing-key), so neither this command "
-                    "nor an edit of the settings file turns it off unsigned (a process running as you that rewrites "
-                    "the store itself is beyond what levain stops without OS confinement). Input-idle away needs no signature to end: your input ends it. Changes only "
+                    "(`off` or `auto`) takes a leave signed by a key enrolled in the install's cockpit "
+                    "(--signing-key), and rewriting the away words in the settings file does not end it. Revoking the "
+                    "key that signed a leave puts away mode back on. A process running as you is beyond what levain "
+                    "stops without OS confinement: it can rewrite the store, or point the settings file's "
+                    "cockpit_data_root at a cockpit holding its own key (doctor warns on a foreign cockpit). "
+                    "Input-idle away needs no signature to end: your input ends it. Changes only "
                     "away_mode, away_word, away_hold_seconds and away_idle_seconds in <queue dir>/claude_code.json "
                     "and codex.json; grants nothing (every answer still verifies as a signature). `show` says which "
                     "source decides now.")
@@ -2129,6 +2132,20 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     except (OSError, ValueError, QueueStoreError) as e:
         print(f"levain consent away: {e}", file=sys.stderr)
         return 1
+    if args.action in ("off", "auto") and args.signing_key is None:
+        # refused before any agent changes, so `--agent all` never leaves one off and another still marked
+        marked = []
+        for agent in agents:
+            try:
+                if away.read(qdir, agent) is not None and away.settings(qdir, agent).away_marked:
+                    marked.append(agent)
+            except (OSError, ValueError, QueueStoreError):
+                pass   # the loop below reports it
+        if marked:
+            print(f"levain consent away: away mode was set by `levain consent away on` for {', '.join(marked)}, "
+                  "and leaving it takes a signature: run it again with --signing-key <an enrolled key>; no agent "
+                  "was changed", file=sys.stderr)
+            return 1
     rc, seen = 0, 0
     for agent in agents:
         try:
@@ -2162,7 +2179,9 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
         reason = away.why_unanswerable(got)
         if on:
             hold = min(hold_seconds(got, agent, source), away.MAX_HOLD)
-            line = f"{agent}: away mode ON{' (signed to leave)' if got.away_marked else ''}, holds up to {hold:g}s"
+            state = (" (consent store unreadable: held as away)" if got.away_unreadable else
+                     " (signed to leave)" if got.away_marked else "")
+            line = f"{agent}: away mode ON{state}, holds up to {hold:g}s"
             line += " (Claude Code's own dialog shows meanwhile)" if agent == "claude_code" else \
                 " (Codex shows no dialog until the hold ends)"
         else:
@@ -2178,7 +2197,7 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                 if mark is not None and mark.leave_by is not None and mark.leave_refusal is not None:
                     line += (f"; a leave signed by {mark.leave_by} does not verify ({mark.leave_refusal}), so the "
                              "mark stands")
-            line += "; `levain consent away off --signing-key <key>` leaves it"
+                line += "; `levain consent away off --signing-key <key>` leaves it"
         elif source == "word" and not (got.legacy and not on):  # a legacy off's reason already names the command
             line += "; `levain consent away auto` hands it back to input idle"
         elif source == "idle" and not on:

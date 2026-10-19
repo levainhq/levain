@@ -17,7 +17,8 @@ mode grants nothing: every answer still verifies as a signature against the auth
 and the hooks read away mode there too (:func:`levain.consent.adapters.claude_code.with_away_mark`): the file is
 one any process of the operator's can write, so leaving a marked away mode (``off`` or ``auto``) takes a leave
 signed by an enrolled key in :data:`~levain.consent.record.AWAY_NAMESPACE`, stored before the file is written (the
-store is the truth; the word follows). Input-idle away has no mark: the operator's input still ends it.
+store is the truth; the word follows). Revoking the key that signed a leave puts away mode back on (the leave is
+re-verified on every read). Input-idle away has no mark: the operator's input still ends it.
 """
 from __future__ import annotations
 

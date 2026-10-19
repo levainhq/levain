@@ -113,6 +113,52 @@ def test_a_hand_rewritten_off_does_not_end_a_marked_away_for_the_hook(qdir, tmp_
     assert cc.still_away_from(path, cc.load_settings(qdir))()[0] is True
 
 
+
+
+def test_a_hand_rewritten_off_does_not_end_a_marked_away_for_the_codex_hook(qdir, tmp_path):
+    """AWAY-SIGN L1 #8, reproduced with the away-mark read taken out of the Codex hook's main: after `away on`, the
+    settings file rewritten by hand to away_word off let a gated Codex PreToolUse pass unheld. It holds now."""
+    assert main(["consent", "away", "on", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cx.SETTINGS_NAME
+    path.write_text(json.dumps({**json.loads(path.read_text()), "away_word": "off", "away_mode": False,
+                                "away_hold_seconds": 0, "gate_hold_seconds": 0.5}))
+    ws = tmp_path / "ws"
+    (ws / ".codex").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "S-cx", "turn_id": "t1", "transcript_path": None,
+             "cwd": str(ws), "model": "m", "permission_mode": "default", "tool_name": "apply_patch",
+             "tool_input": {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+             "tool_use_id": "call-cx"}
+    out = io.StringIO()
+    assert cx.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
+    assert "UNDECIDED" in out.getvalue()                       # held to D and marked undecided, never passed
+
+
+def test_a_replaced_mark_row_never_re_latests_a_left_mark(qdir):
+    """AWAY-SIGN L1 #1, reproduced on the code before it: after on / signed off / on again and the settings
+    file rewritten to off, a raw `INSERT OR REPLACE` of the first (left) mark's id re-ordered it latest, and its stored leave read the agent as
+    not away; so did a REPLACE onto the standing mark's rowid with another agent's row. Both are refused now."""
+    key = str(_key(qdir))
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", key,
+                 "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cc.SETTINGS_NAME
+    path.write_text(json.dumps({**json.loads(path.read_text()), "away_word": "off", "away_mode": False}))
+    conn = sqlite3.connect(qdir / "queue.db", isolation_level=None)
+    (first, first_at), (standing,) = (conn.execute("SELECT id, set_at FROM away_marks ORDER BY rowid").fetchone(),
+                                      conn.execute("SELECT rowid FROM away_marks ORDER BY rowid DESC").fetchone())
+    for stmt, args in (("INSERT OR REPLACE INTO away_marks (id, agent, set_at) VALUES (?, ?, ?)",
+                        (first, "claude_code", first_at)),
+                       ("INSERT OR REPLACE INTO away_marks (rowid, id, agent, set_at) VALUES (?, ?, ?, ?)",
+                        (standing, "am-other", "codex", first_at))):
+        try:
+            conn.execute(stmt, args)
+        except sqlite3.IntegrityError:
+            pass
+        assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+    conn.close()
+
+
 def test_on_without_hold_uses_the_default_and_show_writes_nothing(qdir, capsys):
     before = (qdir / cc.SETTINGS_NAME).read_bytes()
     assert main(["consent", "away", "--queue-dir", str(qdir)]) == 0
