@@ -394,11 +394,16 @@
     btn.disabled = true;
     busy++;
     const rand = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return a; };
+    // the passkey's user name carries when it was made (this phone's local time, to the minute), so the phone's
+    // password list tells one levain passkey from another; the key's fingerprint does not exist until it is made
+    const pad = (n) => String(n).padStart(2, "0"), now = new Date();
+    const name = "levain " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate())
+      + " " + pad(now.getHours()) + ":" + pad(now.getMinutes());
     const create = made ? Promise.resolve(made) : navigator.credentials.create({ publicKey: {
-      rp: { id: rpId, name: "levain" }, user: { id: rand(16), name: "levain operator", displayName: "levain operator" },
+      rp: { id: rpId, name: "levain" }, user: { id: rand(16), name: name, displayName: name },
       challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
       authenticatorSelection: { residentKey: "required", userVerification: "required" } } })
-      .then((cred) => { setMade({ rawId: b64u(cred.rawId), spki: b64u(cred.response.getPublicKey()) }); return made; });
+      .then((cred) => { setMade({ rawId: b64u(cred.rawId), spki: b64u(cred.response.getPublicKey()), name: name }); return made; });
     create.then((c) => call("POST", "/passkey/key-line", { spki: c.spki }).then((r) => {
       if (!r.ok) {
         btn.disabled = false;
@@ -410,7 +415,8 @@
       }
       remember(r.body.fingerprint, c.rawId);
       setMade(null);
-      note.textContent = "passkey made (" + r.body.fingerprint + "). On the laptop, run these to enrol it"
+      note.textContent = "passkey made (" + r.body.fingerprint + (c.name ? ", named \"" + c.name + "\" in this phone's passwords" : "")
+        + "). On the laptop, run these to enrol it"
         + " (a passkey cannot enrol itself), then refresh:" + (r.body.note ? " " + r.body.note : "");
       out.replaceChildren(...(r.body.commands || []).map((cmd) => {
         const line = el("div", "cmd"), code = el("code", null, cmd), copy = el("button", "quiet", "copy");
