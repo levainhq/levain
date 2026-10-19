@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.9] — 2026-10-19
+
 ### Fixed
 - **The confined shell starts again on a machine where Claude Code has run.** In 0.11.7 and 0.11.8 levain refused to give a session its shell when any file under `~/.claude` or `~/.codex` had a second hard link, and Claude Code's own file-history backups have them, so the shell was unavailable to almost every Claude Code user, on macOS and on Linux. The check now covers what those tools load as configuration: the files directly in `~/.claude` and `~/.codex` (and in `CLAUDE_CONFIG_DIR` / `CODEX_HOME` when they are set), the hooks, agents, commands, prompts, skills, plugins, rules, output-styles, scripts and bin directories under them, and Claude Code's project memory. A second hard link to one of those still refuses the shell, naming the file.
 - **`sudo levain setup-isolation` on Linux refuses before it changes anything when `setfacl` is missing** (install the `acl` package), in a dry run too. Before, it stopped part way and left a user behind, and `--undo` crashed the same way; `--undo` now stops and names the package. Repairing an existing setup does not need it.
@@ -14,10 +16,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The two limits tracked for 1.0 are closed, and their lines are removed from the 0.9.1 and 0.11.4 notes.** Files a confined session writes in your home no longer run outside it later (0.11.4): measured in a macOS 26.6 VM and a Linux 7.2 VM on 2026-10-19, every planted shell startup file, git config, `~/bin` / `~/.local/bin` program, user service, autostart entry and agent config or hook was refused, and your own shell and git started as before. Bash can no longer reach your gpg-agent (0.9.1): on macOS, measured in the same VM, no confined session reached the agent or made it run a program, including through a gnupg home set inside the shell; on Linux this holds where the Landlock tier described in 0.11.4 enforces it, and under `levain setup-isolation` on any kernel (measured on Ubuntu with kernel 6.8 on 2026-10-19).
 
 ### Changed
+- **Each passkey the phone page makes is named for when it was made.** The name (and display name) is `levain YYYY-MM-DD HH:MM:SS xxxx`: the phone's local time and the first four hex digits of the passkey's random user id, so a phone's password list can tell one levain passkey from another. The page's "passkey made" note shows the name beside the key's fingerprint. Passkeys made before this keep the name they were made with, "levain operator".
 - **On Linux, the confined shell can no longer leave files that run outside it later.** Inside bash these are read-only: `~/bin`, `~/.local/bin`, user systemd units (`~/.config/systemd`, `~/.local/share/systemd`), `~/.config/environment.d`, autostart entries (`~/.config/autostart`), `~/.bashrc.d`, fish and zsh configuration (`~/.config/fish`, `~/.config/zsh`), KDE's `~/.config/plasma-workspace/env`, `~/.claude`, `~/.codex`, and the workspace's own `.claude` and `.codex`. One that does not exist yet is created empty first, so bash cannot create it either. When the agents' configuration resolves through a symlink in a directory bash can write, that directory is read-only too; when that directory is the workspace or one above it, the shell is refused, naming the link. Measured in a Linux 7.2 VM: every planted file that landed before this change is refused, in both cases where its directory did and did not exist.
 - **On macOS, `~/.config/zsh` joins the shell startup files bash cannot write**, and an absolute `CLAUDE_CONFIG_DIR` or `CODEX_HOME` in levain's environment is protected as `~/.claude` and `~/.codex` are.
 - **`levain setup-isolation` now creates the hands workspace's `.claude` and `.codex`**, owned by the hands user, so bash can be given them read-only. On Linux, an entity set up before this refuses bash until you run `sudo levain setup-isolation` again for it; that repairs it in place.
 - **On macOS a confined entity can no longer list other processes' command lines with `pgrep -fl`.** `pgrep` and `pkill` read every process's command line from a system daemon (`sysmond`) that answers for any user, so a secret passed on another program's command line was visible to the entity's shell. The sandbox profile now denies that daemon. The cost: inside the entity's shell, `pgrep` and `pkill` stop working entirely, by name too; use `kill <pid>`, which is unaffected, as is Python's `psutil`. `ps` and `top` were already unavailable there. Measured 2026-10-07 on macOS 26.6.2.
+
+### Known edges
+- Two passkeys made in the same second share a name only when their random user ids share their first two bytes.
+- Not yet seen in an iPhone's Settings > Passwords: the run was headless Chrome with a virtual authenticator.
 
 ## [0.11.8] — 2026-10-19
 
