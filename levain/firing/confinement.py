@@ -6879,9 +6879,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             # A hands workspace (owned by the hands user; this process has read access only): bash
             # could create the agents' directory here and this process cannot pre-create it.
             # `levain setup-isolation` makes the workspace's two; an install from before that has neither.
-            # Deeper in the workspace (a CODEX_HOME or CLAUDE_CONFIG_DIR there) setup makes nothing.
+            # Anything else there (a CODEX_HOME or CLAUDE_CONFIG_DIR in the workspace) setup makes nothing.
             remedy = ("Run `sudo levain setup-isolation` once more for this entity: it creates the "
-                      "workspace's .claude and .codex for bash to find." if anc == ws_real else
+                      "workspace's .claude and .codex for bash to find."
+                      if real in (ws_real / ".claude", ws_real / ".codex") else
                       f"Create {real} first (as the workspace's owner), or point CODEX_HOME / "
                       "CLAUDE_CONFIG_DIR outside the workspace.")
             raise ConfinementError(

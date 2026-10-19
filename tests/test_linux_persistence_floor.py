@@ -8,6 +8,7 @@ patching ``platform.system``, which is what the policy code consults.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,7 @@ def test_a_persistence_subtree_that_is_a_symlink_has_its_parent_bound_read_only(
     assert str(home / ".config") in ro and str(home / "dotfiles" / "fish") in ro
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write a 0555 directory")
 def test_an_absent_agent_dir_in_a_workspace_this_process_cannot_write_refuses_bash(home: Path) -> None:
     # L1 r1 MEDIUM, the hands case: the workspace is the hands user's (operator: read only), so the
     # plan can neither create its .claude nor leave it creatable.
@@ -299,6 +301,7 @@ def test_a_link_hop_inside_a_workspace_outside_home_has_its_parent_bound_read_on
     assert str(ws) not in ro          # the workspace itself stays writable
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write a 0555 directory")
 def test_an_absent_tree_under_a_workspace_subdir_this_process_cannot_write_refuses_bash(
         home: Path, monkeypatch) -> None:
     # L3 r2 (gemini HIGH, part 2): the nearest existing ancestor is a hands-owned subdirectory of
