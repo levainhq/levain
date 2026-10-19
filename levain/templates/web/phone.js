@@ -453,6 +453,8 @@
   }
 
   const reasons = new Map();  // job id -> the cancel reason being typed, kept across redraws (open while present)
+  let reasonTimer = 0;        // the redraw scheduled when the reason box loses focus
+  let pressing = false;       // an action button on a dispatch card is held down
 
   // a dispatch job (levain.dispatch.phone): built with the phone app's card markup (row, title, chips, acts) so one
   // restyle covers both. It shows what the passkey signs: the contract's goal in full (exactly what the executor is
@@ -527,13 +529,17 @@
     reasonBox.value = reasons.get(r.id) || "";
     reasonBox.addEventListener("input", () => reasons.set(r.id, reasonBox.value));
     // load() holds still while the box has focus; leaving it redraws, after a beat so a tap on a button is not eaten
-    reasonBox.addEventListener("blur", () => setTimeout(load, 600));
+    // the timer is kept: any tap on an action cancels it, so a redraw never lands on the card being acted on
+    reasonBox.addEventListener("blur", () => { clearTimeout(reasonTimer); reasonTimer = setTimeout(load, 600); });
     const offer = (label, cancel) => {
       const btn = el("button", "dact", label);
       btn.type = "button";
+      btn.addEventListener("pointerdown", () => { clearTimeout(reasonTimer); pressing = true; });
+      for (const ev of ["pointerup", "pointercancel"]) btn.addEventListener(ev, () => { pressing = false; });
       btn.disabled = !usable || !signers.length;
       const what = (cancel ? "to CANCEL job " : "to SIGN job ") + r.id;
       btn.addEventListener("click", () => {
+        clearTimeout(reasonTimer);
         if (cancel && reasonBox.hidden) { reasonBox.hidden = false; reasons.set(r.id, reasonBox.value); reasonBox.focus(); return; }
         start(r, null, signers, say, acts, false, (fp, rawId) => dispatchRun(r, fp, rawId, say, cancel, cancel ? reasonBox.value : ""), what);
       });
@@ -631,6 +637,8 @@
     // a redraw would wipe words being typed into a question's box or a cancel's reason (and dismiss the keyboard)
     if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return;
     if (document.activeElement && document.activeElement.matches("input.reason")) return;
+    // a redraw would remove the passkey picker a dispatch card is waiting on, or detach the button being held
+    if (pressing || document.querySelector("article.dispatch .pick")) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
     call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
   }

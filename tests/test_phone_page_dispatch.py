@@ -221,3 +221,58 @@ def test_leaving_the_reason_box_redraws_the_card(world, tmp_path: Path) -> None:
             {"until": "window.__gets >= 1 && window.__gets", "ms": 4000},
         ])
     assert out["values"][5] >= 1, out
+
+
+# --- fix round 3 -----------------------------------------------------------------------------------------------------
+
+@needs_browser
+def test_a_template_and_budget_absent_entirely_draw_question_marks_never_a_throw(world, tmp_path: Path) -> None:
+    file_job(world)
+    strip = """(() => { const f = window.fetch; window.fetch = (u, o) => f(u, o).then(r => !String(u).includes('consent.json') ? r :
+      r.json().then(j => { for (const d of j.dispatch_pending) { delete d.template; delete d.budget; }
+        return new Response(JSON.stringify(j), { status: 200 }); })); document.getElementById('refresh').click(); return 1; })()"""
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": strip},
+            {"until": CARD + ".querySelector('.facts').textContent.includes('?') && " + CARD + ".textContent"},
+        ])
+    text = out["values"][2]
+    assert isinstance(text, str), out
+    assert "undefined" not in text and "NaN" not in text, text
+
+
+@needs_browser
+def test_the_reason_boxs_redraw_never_removes_a_live_picker(world, tmp_path: Path) -> None:
+    import sqlite3
+
+    from tests.test_dispatch_phone import SoftPasskey
+    from tests.test_phone_server import _enrol
+
+    job = file_job(world)
+    other = SoftPasskey()
+    conn = sqlite3.connect(world["root"] / "cockpit.db", isolation_level=None)
+    _enrol(conn, world["root"], tmp_path / "laptop", world["laptop_fp"],
+           {"op": "enrol", "fingerprint": other.fp, "public_key": other.line, "class": "display-phone", "custody": "passkey"})
+    conn.close()
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            _authenticator(world["phone"]),
+            {"until": CARD + " && 1"},
+            {"eval": CANCEL_TAP},                                           # opens the reason box
+            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.focus(); i.value = 'wrong files';"
+                     " i.dispatchEvent(new Event('input')); return 1; })()"},
+            # a real tap: the blur fires first (the box loses focus), then the click opens the picker
+            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.blur(); i.dispatchEvent(new Event('blur'));"
+                     " return 1; })()"},
+            {"eval": CANCEL_TAP},
+            {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('article.dispatch .pick').length), 1200))"},
+            {"eval": "(() => { const ps = [...document.querySelectorAll('article.dispatch .pick')]; if (!ps.length) return 'no picker';"
+                     " ps.find(x => x.textContent.startsWith('" + world["phone"].fp[:18] + "')).click(); return 1; })()"},
+            {"until": f"/^cancelled/.test({NOTE}) && {NOTE}", "ms": 8000},
+        ])
+    assert out["values"][5] >= 1, out                                       # the picker is still there after the beat
+    assert out["values"][7].startswith("cancelled"), out
+    assert JobStore(world["qdir"]).get(job.id).state == "cancelled"

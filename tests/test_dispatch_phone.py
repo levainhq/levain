@@ -421,3 +421,24 @@ def test_a_signer_lookup_that_hits_the_authority_or_the_disk_is_a_note_never_a_r
 
         (r,) = phone_for(world, keys=broken).pending()[0]
         assert r["signers"] == [] and str(exc) in r["signer_note"]
+
+
+# --- fix round 3 -----------------------------------------------------------------------------------------------------
+
+def test_a_mixed_type_filed_at_cannot_escape_the_sort(world, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    jobs = [SimpleNamespace(id="a", state="filed", filed_at=1), SimpleNamespace(id="b", state="filed", filed_at="x")]
+    monkeypatch.setattr(DispatchPhone, "_store", lambda self: SimpleNamespace(list=lambda: jobs))
+    records, note, overflow = phone_for(world).pending()           # the rows fail to render; the listing does not raise
+    assert records == [] and note and "not shown" in note
+
+
+def test_a_signer_fault_outside_the_known_ones_is_not_called_a_store_fault(world) -> None:
+    file_job(world)
+
+    def broken():
+        raise sqlite3.OperationalError("keys db")
+
+    with pytest.raises(sqlite3.OperationalError):                   # not rewritten as "the dispatch store cannot be read"
+        phone_for(world, keys=broken).pending()

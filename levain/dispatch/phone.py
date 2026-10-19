@@ -126,15 +126,12 @@ class DispatchPhone:
         for j in jobs:
             try:
                 if j.state not in TERMINAL:
-                    live.append((j.filed_at, j.id, j))
+                    live.append((str(j.filed_at), str(j.id), j))
             except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
                 bad.append(f"{getattr(j, 'id', '?')} ({type(exc).__name__})")
         live = [j for _f, _i, j in sorted(live, key=lambda t: (t[0], t[1]), reverse=True)]
         shown = live[:PENDING_CAP]
-        try:
-            signers, note = self._signers() if shown else ({}, "")
-        except (DispatchError, OSError, sqlite3.Error) as exc:
-            return [], f"the dispatch store cannot be read: {type(exc).__name__}: {exc}", 0
+        signers, note = self._signers() if shown else ({}, "")
         rows: list[dict[str, Any]] = []
         for j in shown:
             try:
