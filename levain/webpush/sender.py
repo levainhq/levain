@@ -82,7 +82,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> urllib.request.Request | None:
+_TRANSIENT = object()   # _prepare: no request this time, and nothing wrong with the subscription
+
+
+def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "urllib.request.Request | object | None":
     """The request for one subscription, or None when its endpoint is not a known push service or its keys fail.
     Runs in the sending thread (it touches the store for the VAPID token); the pool only does the network."""
     from levain.webpush.routes import valid_endpoint
@@ -92,10 +95,14 @@ def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> urll
         return None
     try:
         body = ece.encrypt(data, ece.b64d(sub["p256dh"]), ece.b64d(sub["auth"]))
-        headers = {**vapid.authorization(queue_dir, endpoint), "TTL": TTL, "Urgency": "high",
-                   "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream"}
     except Exception:   # noqa: BLE001 - bad keys: recorded as status 0, never raised at the gate
         return None
+    try:
+        auth = vapid.authorization(queue_dir, endpoint)
+    except Exception:   # noqa: BLE001 - the store, not the subscription: status 0, the subscription stays live
+        return _TRANSIENT
+    headers = {**auth, "TTL": TTL, "Urgency": "high",
+               "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream"}
     if topic:
         headers["Topic"] = topic
     return urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
@@ -129,7 +136,8 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
 
     # one daemon thread per live subscription (the store caps them at MAX_SUBSCRIPTIONS), so every send starts
     # at once and an unfinished one never holds the process past the budget
-    workers = [threading.Thread(target=work, args=(sub["id"], r), daemon=True) for sub, r in reqs if r is not None]
+    workers = [threading.Thread(target=work, args=(sub["id"], r), daemon=True) for sub, r in reqs
+               if isinstance(r, urllib.request.Request)]
     deadline = time.monotonic() + WALL_BUDGET
     for t in workers:
         t.start()
@@ -140,6 +148,8 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     for sub, r in reqs:
         if r is None:   # bad stored keys or an endpoint off the allowlist: no later ping fares better
             status, retire = 0, True
+        elif r is _TRANSIENT:
+            status, retire = 0, False
         else:
             status = answered.get(sub["id"], UNKNOWN)
             retire = status in (404, 410)
