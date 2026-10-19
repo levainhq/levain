@@ -572,16 +572,18 @@ def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hou
     for c in rows:
         if c.agent == "claude_code" and c.source_path and c.tool_use_id:
             by_path.setdefault(c.source_path, []).append(c.tool_use_id)
-    scans = {path: _stamps.claude_scan(path, ids) for path, ids in by_path.items()}
+    # each source is read on first need, after the deadline check, so a family of many transcripts stops at its budget
+    scans: dict[str, Any] = {}
     policies: dict[str, Mapping[str, Mapping[str, Any]] | None] = {}
-    for c in rows:
-        if c.agent == "codex" and c.source_path and c.source_path not in policies \
+    for i, c in enumerate(rows):
+        if deadline is not None and time.monotonic() >= deadline:
+            out["still_pending"] += len(rows) - i
+            break
+        if c.agent == "claude_code" and c.source_path in by_path and c.source_path not in scans:
+            scans[c.source_path] = _stamps.claude_scan(c.source_path, by_path[c.source_path])
+        elif c.agent == "codex" and c.source_path and c.source_path not in policies \
                 and (c.turn_id is not None or codex_last_turn) and os.path.isfile(c.source_path):
             policies[c.source_path] = _stamps.codex_turn_policies(c.source_path)
-    for c in rows:
-        if deadline is not None and time.monotonic() >= deadline:
-            out["still_pending"] += 1
-            continue
         if c.agent == "claude_code":
             res = _claude_resolution(c, scans)
         else:
