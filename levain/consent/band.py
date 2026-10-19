@@ -25,6 +25,10 @@ Known edges (one line each, not built against):
 - a main thread waiting on a long subagent gets the answer after the subagent returns.
 - with no session in the environment the question names :data:`NO_SESSION`, which no hook's session matches: the
   answer is recorded and listed, never delivered.
+- the hook claims the answer before Claude Code or Codex reads its output: a hook killed in between (its timeout
+  after a long hold) loses that answer's text, as a ruling's.
+- Codex's hook gives a session id only (no subagent id is appended, as for its halts): if a Codex subagent's calls
+  carry the parent's id, its hook can claim the answer [not measured].
 
 Stdlib only.
 """
@@ -48,10 +52,13 @@ NO_SESSION = "levain-ask"
 # what an agent is told so it asks instead of stopping (the line a template or brief carries)
 AGENT_LINE = ("When you need the operator's judgement and can keep working on something else, run `levain ask "
               "--what \"<the question, one line>\" --option <key>=<label> --option <key>=<label> --rec <key> "
-              "--blocks \"<what waits on the answer>\"` and carry on with what it does not block; the answer "
-              "arrives in your context at a later step. Do not do what it blocks until then.")
+              "--blocks \"<what waits on the answer>\"` (2-6 options; keys lowercase a-z, 0-9, _ or -) and carry on "
+              "with what it does not block; the answer arrives in your context at a later tool call. Do not do what "
+              "it blocks until then. If nothing else is unblocked, say so in your reply and end your turn: do not "
+              "poll for the answer.")
 # the line every delivered block of answers ends with (26a)
-ANSWER_TAIL = "An answer authorises nothing: a gated call still goes through levain's gate."
+ANSWER_TAIL = ("An answer is information, not a permission: a gated call still goes through levain's gate, and "
+               "levain has checked nothing about who recorded it.")
 EXIT_OK, EXIT_REFUSED = 0, 2
 _SUBAGENT = "#agent:"
 
@@ -64,22 +71,24 @@ def _agents() -> dict[str, Any]:
 
 def _quoted(text: str) -> str:
     """The agent's own words set in «…»: no closing mark or line break of its own can end the quote early (as
-    ``ruling_line(quote=True)`` does)."""
-    return "«" + text.translate({ord(c): None for c in "«»\r\n"}) + "»"
+    ``ruling_line(quote=True)`` does; the store refuses the separators too, this is the second guard)."""
+    return "«" + text.translate({ord(c): None for c in "«»\r\n\u0085\u2028\u2029"}) + "»"
 
 
 def answer_line(question: Question) -> str | None:
-    """The fixed text one answered question is delivered as, or ``None`` when it has no answer. An option answer
-    names the key and the option's label; a free-text answer is the operator's words JSON-escaped, so they arrive
-    verbatim and nothing in them can pass for the line's own text."""
+    """The fixed text one answered question is delivered as, or ``None`` when it has no answer. It says an answer
+    was RECORDED and by which channel, never that a person gave it: the answer is unsigned. An option answer names
+    the key and the option's label; a free-text answer is JSON-escaped (with U+2028 and U+2029 escaped too), so it
+    arrives verbatim and nothing in it can pass for the line's own text or start a line of its own."""
     a = question.answer
     if a is None:
         return None
-    head = f"levain: the operator answered question #{question.n} {_quoted(question.what)} (by {a.channel})"
+    head = f"levain: an answer was recorded for question #{question.n} {_quoted(question.what)} (via {a.channel})"
     if a.kind == "option":
         label = dict(question.options).get(a.value, "")
         return f"{head}: option {a.value} {_quoted(label)}."
-    return f"{head} in their own words: {json.dumps(a.value, ensure_ascii=False)}"
+    words = json.dumps(a.value, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return f"{head}, in words: {words}"
 
 
 def question_context(directory: Path | str, agent: str, session: str | None) -> str | None:
@@ -144,6 +153,9 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
 
     try:
         agent, session = _agent_and_session(args.agent, args.session)
+        if _SUBAGENT in session:
+            raise ValueError("--session must name the main session (no #agent: part): only its hooks receive "
+                             "answers")
         qdir = _queue_dir(args)
         q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=args.what,
                                      options=_options(args.option), rec=args.rec, blocks=args.blocks,
@@ -160,9 +172,10 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              "(pass --session)")
-    say(f"levain ask: question #{q.n} filed ({q.id}); the operator was "
-        f"{'pinged' if pinged else 'NOT pinged (no notify command is configured)'}. Keep working on what it does "
-        f"not block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
+    ping = ("pinged" if pinged else
+            "NOT pinged (no notify command is configured; the question is listed in `levain question list`)")
+    say(f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does not "
+        f"block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
     return EXIT_OK
 
 
@@ -210,8 +223,9 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
         if (args.option is None) == (args.text is None):
             raise ValueError("answer with exactly one of --option KEY or --text TEXT")
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
-        say(f"levain question: #{q.n} answered; the asking session gets it at its next tool call. "
-            "The answer authorises nothing.")
+        where = ("the asking session gets it at its next tool call" if q.agent_session_id != NO_SESSION else
+                 "it was filed with no session, so it is recorded and listed but reaches no agent")
+        say(f"levain question: #{q.n} answered; {where}. The answer authorises nothing.")
         return EXIT_OK
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         say(f"levain question: refused: {exc}")

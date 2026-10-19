@@ -42,15 +42,15 @@ def test_answer_line_option_and_free_text(tmp_path):
     q = _file(store, what="merge «it»» now?")
     store.answer(q.id, option="b", channel="cli")
     line = band.answer_line(store.get(q.id))
-    assert line == ("levain: the operator answered question #1 «merge it now?» (by cli): option b «wait for the "
+    assert line == ("levain: an answer was recorded for question #1 «merge it now?» (via cli): option b «wait for the "
                     "run».")
     q2 = _file(store)
     words = 'no — "wait"\nthen merge'
     store.answer(q2.id, text=words, channel="phone")
     line2 = band.answer_line(store.get(q2.id))
-    assert line2.startswith("levain: the operator answered question #2 «merge the branch?» (by phone) in their own "
+    assert line2.startswith("levain: an answer was recorded for question #2 «merge the branch?» (via phone), in "
                             "words: ")
-    assert json.loads(line2.split("own words: ", 1)[1]) == words      # verbatim, and nothing in it ends the line
+    assert json.loads(line2.split("in words: ", 1)[1]) == words      # verbatim, and nothing in it ends the line
     assert "\n" not in line2
     assert band.answer_line(_file(store)) is None
 
@@ -182,3 +182,101 @@ def test_a_broken_question_store_never_changes_the_gate(queue, monkeypatch):
 
     monkeypatch.setattr(band, "question_context", boom)
     assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+
+
+def test_question_context_reads_an_empty_or_unset_store_as_none(tmp_path):
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    assert band.question_context(qdir, "claude_code", SESSION) is None
+    assert not (qdir / "questions.db").exists()
+    (qdir / "questions.db").write_bytes(b"")                  # a filer mid-creation
+    assert band.question_context(qdir, "claude_code", SESSION) is None
+    assert (qdir / "questions.db").stat().st_size == 0           # the hook wrote nothing into it
+
+
+def test_a_held_lock_never_holds_the_hook_long(tmp_path):
+    """L1 r0 #1: the hook's claim waits at most HOOK_BUSY_MS on another writer, then leaves the answer for its next
+    hook; with nothing due it takes no lock at all."""
+    import sqlite3
+    import time
+
+    from levain.consent.questions import HOOK_BUSY_MS
+
+    qdir = tmp_path / "consent"
+    store = QuestionStore(qdir)
+    q = _file(store)
+    other = _file(store, session="other-session")
+    holder = sqlite3.connect(qdir / "questions.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        assert band.question_context(qdir, "claude_code", SESSION) is None      # nothing due: no wait
+        assert time.monotonic() - t0 < 0.5
+        holder.execute("COMMIT")
+        store.answer(q.id, option="a", channel="cli")
+        store.answer(other.id, option="b", channel="cli")
+        holder.execute("BEGIN IMMEDIATE")
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError):                           # due, but locked: refused
+            band.question_context(qdir, "claude_code", SESSION)                 # (the gate reads it as none)
+        assert time.monotonic() - t0 < HOOK_BUSY_MS / 1000 + 1.5
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert "question #1" in band.question_context(qdir, "claude_code", SESSION)  # still deliverable
+
+
+def test_ask_refuses_a_subagent_session(tmp_path, monkeypatch):
+    code, out = _run(["ask", "--session", f"{SESSION}#agent:x", "--agent", "claude_code", "--what", "q?", "--option",
+                      "a=x", "--option", "b=y", "--rec", "a", "--blocks", "z", "--queue-dir", str(tmp_path / "c")],
+                     monkeypatch)
+    assert code == 2 and "main session" in out
+
+
+def test_answering_a_sessionless_question_says_it_reaches_no_agent(tmp_path, monkeypatch):
+    qdir = tmp_path / "consent"
+    _file(QuestionStore(qdir), session=band.NO_SESSION)
+    code, out = _run(["question", "answer", "1", "--option", "a", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 0 and "reaches no agent" in out
+
+
+def test_rulings_and_answers_ride_together_and_a_decision_is_kept(queue, monkeypatch):
+    store = QuestionStore(queue.directory)
+    store.answer(_file(store).id, option="a", channel="cli")
+    monkeypatch.setattr(cc, "ruling_context", lambda q, s: "RULING LINE")
+    deny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": "no"}}
+    monkeypatch.setattr(cc, "_gate_call", lambda *a, **k: json.loads(json.dumps(deny)))
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny" and spec["permissionDecisionReason"] == "no"
+    lines = spec["additionalContext"].splitlines()
+    assert lines[0] == "RULING LINE" and "question #1" in lines[1] and lines[-1] == band.ANSWER_TAIL
+
+
+def test_a_broken_question_store_keeps_the_rulings(queue, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("store gone")
+
+    monkeypatch.setattr(band, "question_context", boom)
+    monkeypatch.setattr(cc, "ruling_context", lambda q, s: "RULING LINE")
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert out["hookSpecificOutput"]["additionalContext"] == "RULING LINE"
+    monkeypatch.setattr(cx, "ruling_context", lambda q, s: "RULING LINE")
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    assert out["hookSpecificOutput"]["additionalContext"] == "RULING LINE"
+
+
+def test_codex_appends_answers_after_its_own_allow_line(queue, monkeypatch):
+    store = QuestionStore(queue.directory)
+    store.answer(_file(store, agent="codex").id, option="b", channel="cli")
+    allow = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                    "additionalContext": "levain: this call is allowed by a grant."}}
+    monkeypatch.setattr(cx, "_gate_call", lambda *a, **k: json.loads(json.dumps(allow)))
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    lines = out["hookSpecificOutput"]["additionalContext"].splitlines()
+    assert lines[0] == "levain: this call is allowed by a grant." and "question #1" in lines[1]

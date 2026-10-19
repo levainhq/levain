@@ -964,7 +964,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     context = "\n".join(c for c in (context, answers) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
-        out["hookSpecificOutput"]["additionalContext"] = context
+        spec = out["hookSpecificOutput"]
+        spec["additionalContext"] = f"{spec['additionalContext']}\n{context}" if spec.get("additionalContext") \
+            else context
     return out
 
 

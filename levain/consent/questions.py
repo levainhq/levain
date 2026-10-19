@@ -29,9 +29,10 @@ question carries no authority, so it stays out of the signed store whose trigger
 to guard consent. A bug or a raw write here can never touch a decision there, and the queue's format and
 migrations stay about consent alone.
 
-The directory is the operator's alone (0700, refused otherwise), as the queue's. A hook calls the reading and
-claiming methods on every tool call, so they never create the store: with no ``questions.db`` they answer empty.
-Stdlib only.
+The directory is the operator's alone (0700, refused otherwise), as the queue's. A hook claims on every tool call,
+so the claim first reads the store READ-ONLY (:meth:`QuestionStore._peek`: never created or set up, an empty file
+read as no store) and takes the write lock only when an answer is due, waiting at most :data:`HOOK_BUSY_MS` on
+another writer; the other reads answer empty with no ``questions.db`` and never create it. Stdlib only.
 """
 from __future__ import annotations
 
@@ -66,6 +67,9 @@ _WHAT_MAX = 1000
 _LABEL_MAX = 200
 _BLOCKS_MAX = 300
 _TEXT_MAX = 4000
+# how long the hook's reads and its claim wait on a lock another writer holds: past it the answers wait for the
+# session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is not this)
+HOOK_BUSY_MS = 2000
 
 
 class QuestionStoreError(RuntimeError):
@@ -139,6 +143,9 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS answer_deliveries_no_replace BEFORE INSERT ON answer_deliveries "
     "WHEN EXISTS (SELECT 1 FROM answer_deliveries WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a delivery is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS answer_resume_steps_no_replace BEFORE INSERT ON answer_resume_steps "
+    "WHEN EXISTS (SELECT 1 FROM answer_resume_steps WHERE seq = NEW.seq) "
+    "BEGIN SELECT RAISE(ABORT, 'a resume step is never replaced'); END",
 )
 
 _Q_COLS = "q.n, q.id, q.agent, q.agent_session_id, q.what, q.options, q.rec, q.blocks, q.cwd, q.filed_at"
@@ -159,7 +166,9 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
 
 
 def _has_control(text: str) -> bool:
-    return any(unicodedata.category(c).startswith("C") for c in text)
+    # control and format characters, and the line and paragraph separators (U+2028, U+2029), which a model or a
+    # renderer can read as a line break: a one-line field carries none of them
+    return any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in text)
 
 
 def _line(name: str, value: Any, low: int, high: int) -> str:
@@ -234,7 +243,7 @@ class QuestionStore:
             raise QuestionStoreError(f"question store directory {self.directory} is reachable by group or others "
                                      f"(mode {st.st_mode & 0o777:o}); it must be 0700")
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, busy_ms: int | None = None) -> sqlite3.Connection:
         if self._ready:
             if not self.path.exists():
                 raise QuestionStoreError(f"question store {self.path} has disappeared")
@@ -242,6 +251,8 @@ class QuestionStore:
             self._check_directory()
         conn = open_durable(self.path)
         try:
+            if busy_ms is not None:
+                conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
             if not self._ready:
                 os.chmod(self.path, 0o600)
                 self._ensure_schema(conn)
@@ -274,8 +285,8 @@ class QuestionStore:
             raise
 
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
-        with write_transaction(self._connect) as conn:
+    def _write(self, busy_ms: int | None = None) -> Iterator[sqlite3.Connection]:
+        with write_transaction(lambda: self._connect(busy_ms)) as conn:
             yield conn
 
     @contextmanager
@@ -286,6 +297,38 @@ class QuestionStore:
     def _exists(self) -> bool:
         """Whether there is a store to read: a hook's reads never create one."""
         return self.path.exists()
+
+    @contextmanager
+    def _peek(self) -> Iterator[sqlite3.Connection | None]:
+        """The hook's read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
+        creates, sets up or writes the store, so a tool call with nothing to deliver takes no write lock. ``None``
+        when there is no store yet (no file, an empty one, or one a filer has not set up); a store of another
+        format raises :class:`QuestionStoreError`."""
+        try:
+            empty = self.path.stat().st_size == 0
+        except FileNotFoundError:
+            empty = True
+        if empty:
+            yield None
+            return
+        self._check_directory()
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=HOOK_BUSY_MS / 1000,
+                               isolation_level=None)
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {HOOK_BUSY_MS}")
+            conn.execute("BEGIN")
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
+            if row is None and not have - {"meta"}:
+                conn.execute("COMMIT")
+                yield None
+                return
+            if row is None or row[0] != FORMAT or "answer_resume_steps" not in have:
+                raise QuestionStoreError(f"{self.path} is not a question store of format {FORMAT!r}")
+            yield conn
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
 
     @property
     def store_id(self) -> str:
@@ -372,8 +415,9 @@ class QuestionStore:
             raise ConsentError("answer with exactly one of an option key or free text")
         if channel not in ANSWER_CHANNELS:
             raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
-        if text is not None and (not isinstance(text, str) or not 1 <= len(text) <= _TEXT_MAX or "\x00" in text):
-            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, with no NUL")
+        if text is not None and (not isinstance(text, str) or not text.strip() or len(text) > _TEXT_MAX
+                                 or "\x00" in text):
+            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, not only whitespace, with no NUL")
         if option is not None and not isinstance(option, str):
             raise ConsentError("option must be a key")
         with self._write() as conn:
@@ -407,23 +451,20 @@ class QuestionStore:
         return self._claim(agent, agent_session_id, step="launching")
 
     def _claim(self, agent: str, agent_session_id: str, *, step: str | None) -> list[Question]:
-        if not self._exists():
-            return []
         key = (agent, agent_session_id)
         sql = (f"{_SELECT} WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
                + _DELIVERABLE + " ORDER BY a.rowid")
-        with self._read() as conn:
-            if not conn.execute(sql, key).fetchall():
+        with self._peek() as conn:                            # read-only: no write lock when nothing is due
+            if conn is None or not conn.execute(sql, key).fetchall():
                 return []
         out: list[Question] = []
-        with self._write() as conn:
+        with self._write(busy_ms=HOOK_BUSY_MS) as conn:
             stamp = utc_stamp(_now_utc(self._clock))
-            for row in conn.execute(sql, key).fetchall():      # re-read under the lock: a concurrent claimer won
+            for row in conn.execute(sql, key).fetchall():      # re-read under the lock: what a claimer before us left
                 q = self._question_of(row)
                 if conn.execute("SELECT 1 FROM answer_deliveries WHERE question_id = ?", (q.id,)).fetchone() is None:
-                    if conn.execute("INSERT OR IGNORE INTO answer_deliveries (question_id, agent_session_id, "
-                                    "delivered_at) VALUES (?, ?, ?)", (q.id, agent_session_id, stamp)).rowcount != 1:
-                        continue                              # another claimer delivered it first
+                    conn.execute("INSERT INTO answer_deliveries (question_id, agent_session_id, delivered_at) "
+                                 "VALUES (?, ?, ?)", (q.id, agent_session_id, stamp))
                     if step is not None:
                         self._insert_step(conn, q.id, agent_session_id, step, stamp)
                 else:
@@ -451,14 +492,15 @@ class QuestionStore:
                       cwd: str, detail: str | None = None) -> None:
         """Record what became of the resume that leased these answers (:meth:`lease_answers_for`): ``started``
         (confirmed: the texts are delivered) or ``failed`` (deliverable again), with what was run. Only a question
-        whose latest step is still ``launching`` is settled. Unsigned."""
+        whose latest step is still ``launching``, leased for this same session, is settled. Unsigned."""
         if outcome not in ("started", "failed"):
             raise ConsentError(f"outcome must be started or failed: {outcome!r}")
         with self._write() as conn:
             stamp = utc_stamp(_now_utc(self._clock))
             for qid in question_ids:
-                last = self._last_step(conn, qid)
-                if last is not None and last[0] == "launching":
+                last = conn.execute("SELECT outcome, agent_session_id FROM answer_resume_steps WHERE question_id = ? "
+                                    "ORDER BY seq DESC LIMIT 1", (qid,)).fetchone()
+                if last is not None and last[0] == "launching" and last[1] == agent_session_id:
                     self._insert_step(conn, qid, agent_session_id, outcome, stamp, argv, cwd, detail)
 
     def delivery_state(self, ref: Any) -> tuple[str, str | None]:

@@ -356,3 +356,36 @@ def test_other_format_refused(tmp_path):
         c.execute("INSERT INTO meta VALUES ('format', 'levain-questions/9')")
     with pytest.raises(QuestionStoreError, match="levain-questions/9"):
         ask(QuestionStore(d))
+
+
+def test_l1_whitespace_only_text_is_refused_and_text_is_kept_unstripped(tmp_path):
+    from levain.cockpit.consent import ConsentError
+    from levain.consent.questions import QuestionStore
+
+    s = QuestionStore(tmp_path / "c")
+    q = s.file(agent="codex", agent_session_id="s", what="w?", options=[("a", "x"), ("b", "y")], rec="a",
+               blocks="z", cwd="/w")
+    with pytest.raises(ConsentError):
+        s.answer(q.id, text="   \n ", channel="cli")
+    assert s.answer(q.id, text="  go  ", channel="cli").value == "  go  "
+
+
+def test_l1_a_resume_step_is_never_replaced_and_settle_is_for_the_leasing_session(tmp_path):
+    import sqlite3
+
+    from levain.consent.questions import QuestionStore
+
+    s = QuestionStore(tmp_path / "c")
+    q = s.file(agent="codex", agent_session_id="s", what="w?", options=[("a", "x"), ("b", "y")], rec="a",
+               blocks="z", cwd="/w")
+    s.answer(q.id, option="a", channel="cli")
+    assert [x.id for x in s.lease_answers_for("codex", "s")] == [q.id]
+    s.settle_resume([q.id], agent_session_id="someone-else", outcome="started", argv=["x"], cwd="/w")
+    assert s.delivery_state(q.id)[0] == "unconfirmed"
+    conn = sqlite3.connect(s.path)
+    with pytest.raises(sqlite3.DatabaseError):
+        conn.execute("INSERT OR REPLACE INTO answer_resume_steps (seq, question_id, agent_session_id, outcome, "
+                     "created_at) VALUES (1, ?, 's', 'started', 'x')", (q.id,))
+    conn.close()
+    s.settle_resume([q.id], agent_session_id="s", outcome="started", argv=["x"], cwd="/w")
+    assert s.delivery_state(q.id)[0] == "delivered"
