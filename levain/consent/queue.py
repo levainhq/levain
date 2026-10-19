@@ -589,9 +589,11 @@ def signer_refusal(request: ExternalGateRequest | None, payload: Mapping[str, An
     ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
     ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``. Like
     :func:`answer_refusal`, it reads one plain-dict copy of ``payload`` taken first."""
-    if not isinstance(payload, Mapping) or "decision" not in payload or "signer_fp" not in payload:
-        return f"the {noun} names no decision or no signer"
+    if not isinstance(payload, Mapping):
+        return f"the {noun} is not a record"
     payload = dict(payload)
+    if "decision" not in payload or "signer_fp" not in payload:
+        return f"the {noun} names no decision or no signer"
     decision = payload["decision"]
     signer_fp = payload["signer_fp"]
     key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
@@ -1562,6 +1564,7 @@ class ConsentQueue:
         :data:`~levain.consent.record.AWAY_NAMESPACE`), its mark must still be the agent's latest with no leave
         stored, and its ``signed_at`` no later than the queue's clock read under the write lock plus
         :data:`RULING_SKEW`."""
+        payload = _detached(payload)        # read once, as answer() and answer_late() do: checked = applied
         agent = payload.get("agent") if isinstance(payload, Mapping) else None
         if agent not in AGENTS:
             raise AnswerRefused("the leave names no known agent")
