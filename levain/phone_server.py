@@ -384,11 +384,10 @@ class _PhoneServer(ThreadingHTTPServer):
         refused ruling records no answer. One delivery runs, the answer's (a resume of an ended session carries it);
         the ruling's text reaches the session at its next hook (or ``levain consent deliver``): the tap starts one
         resume at most."""
-        from levain.cockpit.consent import ConsentError
-        from levain.consent.questions import QuestionStore, QuestionStoreError
-
         from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.cockpit.consent import ConsentError
         from levain.consent.queue import QueueStoreError
+        from levain.consent.questions import QuestionStore, QuestionStoreError
 
         need = {"option", "payload", "authenticator_data", "client_data_json", "signature"}
         if not isinstance(req, dict) or set(req) != need or not isinstance(req["option"], str):

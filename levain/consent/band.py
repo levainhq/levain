@@ -339,11 +339,15 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         return None, (f"levain ask: the question was NOT filed ({exc}), but the consent request {link.request_id} "
                       f"(gap {gap}) for the {push_words} was filed undecided before it; it moves only on a ruling "
                       "the operator signs. Ask again without --would-push, or tell the operator.")
+    # the linked push's state now, read before the ping: one ruled while the question waited on its store's lock
+    # is never announced as a one-tap option
+    state = None if link is None else _push_state(agent, qdir, link.request_id)
+    tappable = link is not None and state in ("undecided", "unknown")
     adapter = _agents()[agent]
     send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
     try:
         ping_text = _ping_text(agent, q, qdir)
-        if link is not None:
+        if tappable:
             ping_text += f"\nOption {link.option} also allows, with one passkey tap on the phone page: the {push_words}."
         pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
@@ -360,19 +364,19 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
 
         # the call as filed (the repository's real path, the canonical remote): the push names the same call
         # from whatever directory the agent runs it in
-        repo, remote, branch = call["repo"], call["remote"], call["branch"]
-        state = _push_state(agent, qdir, link.request_id)
-        if state not in ("undecided", "unknown"):              # ruled while the question waited on its store's lock
+        command = (f"`levain push --repo {shlex.quote(call['repo'])} --remote {shlex.quote(call['remote'])} "
+                   f"--branch {shlex.quote(call['branch'])}`")
+        if not tappable:
             text += (f" Option {link.option} leads to the {push_words}: its consent request {link.request_id} is "
-                     f"already {state}; the option's one tap no longer rules it. Run `levain push` only if the "
-                     "operator's answer says to; it asks if nothing allows it.")
+                     f"already {state}; the option's one tap no longer rules it. Run {command} from this same "
+                     "session only if the operator's answer says to; it asks if nothing allows it.")
             return q, text
         text += (f" Option {link.option} leads to the {push_words}: levain filed it as consent request "
                  f"{link.request_id}, undecided (gap {gap}). If the operator picks that option on the phone page "
                  "with a passkey, that same tap signs a ruling that allows the push (with no passkey enrolled the "
-                 "operator rules it with `levain consent rule`); then, from this same session, run "
-                 f"`levain push --repo {shlex.quote(repo)} --remote {shlex.quote(remote)} --branch {shlex.quote(branch)}` and it runs "
-                 f"once without asking again. A new commit on {branch} before then is a different push, which asks.")
+                 f"operator rules it with `levain consent rule`); then, from this same session, run {command} and "
+                 f"it runs once without asking again. A new commit on {call['branch']} before then is a different "
+                 "push, which asks.")
     return q, text
 
 
