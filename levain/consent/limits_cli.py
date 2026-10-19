@@ -398,7 +398,7 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
                        running=running if running is not None else dv.process_running,
                        launch=launch if launch is not None else dv._launch)
     except KeyboardInterrupt:
-        say("levain limits: extended; the resume was interrupted before it started: check the session before resuming "
+        say("levain limits: extended; the resume was interrupted: check whether the session started before resuming "
             "it by hand.")
         return 130
     except Exception as exc:  # noqa: BLE001 - the halt is lifted already: say so, never a traceback
@@ -420,7 +420,12 @@ def run(args: argparse.Namespace, out: Any = None) -> int:
     if sub == "unset":
         return _cmd_unset(args, say)
     if sub == "extend":
-        return _cmd_extend(args, say)
+        try:
+            return _cmd_extend(args, say)
+        except KeyboardInterrupt:  # the bound for every window the inner handlers do not name: never a traceback
+            say("levain limits: interrupted; `levain limits show` says whether the session is still halted, and "
+                "`levain consent pending` whether a request was filed.")
+            return 130
     say("levain limits: choose show, set, unset or extend; options of `limits` itself come before the command: "
         "`levain limits --queue-dir D <cmd>`")
     return 2
