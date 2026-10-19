@@ -98,6 +98,10 @@ _ROWS = [
     ("git push -uf origin main", ["force-push"], []),                                                # H9
     ("git push origin +main", ["force-push"], []),
     ("git push -u origin main", [], ["force"]),
+    ("command -v git push --force", [], ["force"]),                                                  # L3 r2: a name lookup
+    ("command -pv rm -rf /", [], ["rm"]),
+    ("command -p git push --force", ["force-push"], []),
+    ("command -- git push --force", ["force-push"], []),
 ]
 
 
@@ -105,7 +109,6 @@ _ROWS = [
 def test_shell_hints_name_the_shapes_and_say_nothing_of_a_plain_command(row: tuple) -> None:
     command, wanted, absent, *cwd = row
     cwd = cwd[0] if cwd else "/w"
-    print(f"PROBE {command!r} @ {cwd!r} -> {shell_hints(command, cwd)}")
     got = " | ".join(shell_hints(command, cwd))
     for w in wanted:
         assert w in got, (command, got)
@@ -141,6 +144,8 @@ def test_no_decision_path_imports_the_hints() -> None:
     assert users == {"cockpit/hintview.py", "consent/listing.py"}, sorted(users)
     # hintview reaches hints; listing reaches hintview only
     assert "levain.consent.hints" not in (ROOT / "consent" / "listing.py").read_text(encoding="utf-8")
+    # the display guard sits outside the hints: the engine and display_safe reach neither (they are not in `users`)
+    assert not {"cockpit/engine.py", "cockpit/display_safe.py"} & users
     # the view: a shell request always carries a hint block, others none; a list command and a cut display are read
     ask = lambda tool, display="x", cwd="/w": SimpleNamespace(tool_name=tool, display=display, cwd=cwd)  # noqa: E731
     assert hints_for(ask("Bash"), {"command": "ls"}, False) == [NONE_HINT]
@@ -199,7 +204,7 @@ def test_the_phone_page_shows_both_digests_and_the_hint_and_escapes_the_command(
         assert next(x for x in data["pending"] if x["id"] == plain.id)["hints"] == [NONE_HINT]
         mk = next(x for x in data["pending"] if x["id"] == marked.id)                                 # H7: tool is marked too
         assert mk["tool"] == "Wr⟨U+202E⟩ite" and "‮" not in json.dumps(mk, ensure_ascii=False), mk
-        assert listing.entry_body.__name__ == "lacking"
+        assert listing.entry_body.__name__ == "lacking"      # phone_server imports entry_body inside the handler, so this patch is what it calls
         out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
             {"emulate": {"w": 430, "h": 932, "dpr": 2, "mobile": True}},
             {"until": "document.querySelector('article.req .dg') && document.querySelector('.leads .dg') && 1"},

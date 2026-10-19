@@ -222,6 +222,16 @@ def _redirect_len(rest: list[str]) -> int:
     return 0
 
 
+def _inspects_only(rest: list[str]) -> bool:
+    """``command`` with -v or -V among its leading options (``-v``, ``-pv``, ``-V``): a name lookup, not a call."""
+    for w in rest[1:]:
+        if w == "--" or not w.startswith("-") or w == "-":
+            return False
+        if not w.startswith("--") and ("v" in w[1:] or "V" in w[1:]):
+            return True
+    return False
+
+
 def _command_start(st: list[str], add) -> list[str]:  # noqa: ANN001
     """The stage from its command word on: leading ``VAR=`` words, compound keywords, redirects, ``sudo`` and wrappers are
     read past (``add`` gets their hints); what follows keeps its own flags."""
@@ -242,6 +252,8 @@ def _command_start(st: list[str], add) -> list[str]:  # noqa: ANN001
             while k < len(rest) and rest[k].startswith("-"):
                 k += 2 if rest[k] in _SUDO_ARG_FLAGS else 1
             rest = rest[k:]
+        elif base == "command" and _inspects_only(rest):
+            return []       # `command -v X` / `-V X` only look names up: nothing after it is run
         elif base in _WRAPPERS:
             rest = _skip_wrapper(base, rest)
         else:
