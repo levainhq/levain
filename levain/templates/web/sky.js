@@ -24,7 +24,10 @@
 
   var FLY = 600, LIFE = 750;        // ms to land / ms until gone
   var PACK_GAP_MS = 6 * 60000;      // two sessions closer than this never share a track
-  var NOW_AT = 0.85;                // where "now" sits across the plot
+  var NOW_AT = 0.85;                // where "now" sits across the plot (flow's feed keeps it)
+  var NOW_AT_LEV = 0.96;            // a Levain feed has no future to leave room for: "now" sits near the right edge
+  var MAX_TRACKS = 8;               // session tracks shown; further overlapping sessions share the last one
+  var MAX_WAITING_ARIA = 5;         // waiting items the canvas's aria-label names before "and N more"
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
   // A repo's hue slot, shared with the row tags in cockpit_view.js. The repos are the install's own: the names its data
@@ -139,8 +142,8 @@
       if (e.kind === 'session') return e.t <= nowMs && sessEnd(e, nowMs) >= start;
       return e.t >= start && e.t <= nowMs;
     });
-    var lev = inWin.some(isLev);
-    var repos = {};
+    var lev = !!opts.lev || inWin.some(isLev);   // opts.lev: a mount that has shown Levain lanes keeps them as events age out
+    var repos = Object.create(null);
     inWin.forEach(function (e) { if (e.repo && (e.kind === 'commit' || e.kind === 'review')) repos[e.repo] = (repos[e.repo] || 0) + 1; });
     var names = Object.keys(repos);
     var single = lev || strip ? '' : opts.single || (names.length <= 1 && !opts.pinnedRows.length ? (names[0] || '') : '');
@@ -158,8 +161,8 @@
       var main = opts.pinnedRows.length ? opts.pinnedRows.slice()
         : names.sort(function (a, b) { return repos[b] - repos[a] || (a < b ? -1 : 1); }).slice(0, opts.topRows);
       rows = main.map(function (r) { return { id: 'r:' + r, label: r }; });
-      var mainSet = {}; main.forEach(function (r) { mainSet[r] = 1; });
-      var foldedSet = {};
+      var mainSet = Object.create(null); main.forEach(function (r) { mainSet[r] = 1; });
+      var foldedSet = Object.create(null);
       inWin.forEach(function (e) {
         if (e.kind !== 'commit' && e.kind !== 'review') return;
         if (e.repo && mainSet[e.repo]) return;
@@ -177,39 +180,47 @@
         return e.repo && mainSet[e.repo] ? 'r:' + e.repo : 'other';
       };
     }
-    // a phone drops the rows nothing landed on (memory and decisions are the ones that can be empty) and shortens their names;
-    // if nothing landed anywhere the rows stay, so the plot is never a bare frame
+    // a phone (compact) or the strip keeps only the rows an event landed on, and compact shortens the names of memory and
+    // decisions; if nothing landed anywhere the rows stay, so the plot is never a bare frame
     if (opts.compact || strip) {
-      var used = {};
+      var used = Object.create(null);
       inWin.forEach(function (e) { if (!offView(e, single)) used[rowOf(e)] = 1; });
       var kept = rows.filter(function (r) { return used[r.id]; });
       if (kept.length) rows = kept;
       if (opts.compact) rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
     }
+    var waiting = [];
     var counts = { commit: 0, review: 0, failed: 0, memory: 0, sessions: 0, decisions: 0, questions: 0, waiting: 0 };
     inWin.forEach(function (e) {
       if (offView(e, single)) return;
       if (e.kind === 'commit') counts.commit++;
       else if (e.kind === 'review') { counts.review++; if (!e.ok) counts.failed++; }
       else if (e.kind === 'session') counts.sessions++;
-      else if (e.kind === 'question') { counts.questions++; if (e.out === 'open') counts.waiting++; }
-      else if (e.kind === 'decision') { counts.decisions++; if (e.out === 'waiting') counts.waiting++; }
+      else if (e.kind === 'question') { counts.questions++; if (e.out === 'open') { counts.waiting++; waiting.push(e); } }
+      else if (e.kind === 'decision') { counts.decisions++; if (e.out === 'waiting') { counts.waiting++; waiting.push(e); } }
       else counts.memory++;
     });
-    // sessions are packed into tracks: a bar starting within PACK_GAP_MS of a track's last end takes the next track
-    var ends = [];
+    // sessions are packed into tracks: a bar starting within PACK_GAP_MS of a track's last end takes the next track; past
+    // MAX_TRACKS the rest share the last one (`overflow` counts them). The track lives in the model, never on the event.
+    var ends = [], trackOf = new Map(), overflow = 0;
     inWin.filter(function (e) { return e.kind === 'session'; }).sort(function (a, b) { return a.t - b.t; }).forEach(function (e) {
       var i = 0;
       while (i < ends.length && e.t < ends[i] + PACK_GAP_MS) i++;
-      ends[i] = sessEnd(e, nowMs); e.track = i;
+      if (i >= MAX_TRACKS) { i = MAX_TRACKS - 1; overflow++; }
+      ends[i] = Math.max(ends[i] || 0, sessEnd(e, nowMs)); trackOf.set(e, i);
     });
     return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.length, tracks: ends.length,
+      trackOf: trackOf, overflow: overflow, waiting: waiting,
       hasDecisions: inWin.some(function (e) { return e.kind === 'decision'; }) };
   }
 
   // The hover text for one mark: "commit · ledgerline · 09:41"; a labelled event reads "decision · <label> · waiting · 13:20".
-  function eventTip(e) {
-    if (e.kind === 'session') return 'session · ' + (e.agent || 'agent') + (e.repo ? ' · ' + e.repo : '') + ' · ' + hhmm(e.t) + '–' + (e.out === 'live' ? 'now' : e.t2 == null ? hhmm(e.t) : hhmm(e.t2));
+  // A session's end reads as the bar is drawn: never before its start, and with `nowMs` given never past now.
+  function eventTip(e, nowMs) {
+    if (e.kind === 'session') {
+      var end = e.out === 'live' ? 'now' : hhmm(nowMs == null ? Math.max(e.t2 == null ? e.t : e.t2, e.t) : sessEnd(e, nowMs));
+      return 'session · ' + (e.agent || 'agent') + (e.repo ? ' · ' + e.repo : '') + ' · ' + hhmm(e.t) + '–' + end;
+    }
     if (e.label != null) return (e.kind === 'memory' ? 'memory write' : e.kind) + ' · ' + e.label + (e.out && e.out !== 'ok' ? ' · ' + e.out : '') + ' · ' + hhmm(e.t);
     if (e.out === 'failed' && e.kind !== 'review') return e.kind + (e.repo ? ' · ' + e.repo : '') + ' · failed · ' + hhmm(e.t);
     return e.kind + (e.repo ? ' · ' + e.repo : '') + (e.agent ? ' · ' + e.agent : '') + (e.kind === 'review' ? (e.ok ? ' · ok' : ' · failed') : '') + ' · ' + hhmm(e.t);
@@ -233,8 +244,10 @@
     item('width:2px;height:11px;border-radius:1px;background:var(--info,#5aa9ff)', 'memory write');
     item(dia + 'background:var(--ok,#3ecf8e)', 'decision');
     item('width:6px;height:6px;border-radius:50%;background:var(--violet,#b48cff)', 'question');
-    item(dia + 'background:var(--accent,#ff8a3d)', 'waiting on you');
-    item('width:7px;height:7px;border-radius:50%;border:1.6px solid var(--bad,#e5484d)', 'failed or denied');
+    item('width:6px;height:6px;border-radius:50%;background:var(--violet,#b48cff);outline:1.5px solid var(--accent,#ff8a3d);outline-offset:1.5px', 'open question');
+    item(dia + 'background:var(--accent,#ff8a3d);box-shadow:0 0 0 1.5px var(--base,#060912),0 0 0 3px var(--accent,#ff8a3d)', 'waiting on you');
+    item(dia + 'border:1.6px solid var(--bad,#e5484d);background:transparent', 'denied');
+    item('width:7px;height:7px;border-radius:50%;border:1.6px solid var(--bad,#e5484d)', 'failed');
     item('width:7px;height:7px;border-radius:50%;border:1.4px dashed var(--meta,#7d889c)', 'review: when DISPATCH lands', '.8');
     return box;
   }
@@ -256,7 +269,7 @@
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
     // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
-    if (strip) bar.hidden = true;   // the phone's strip is a glance: no summary line, no toggle
+    if (strip) bar.style.display = 'none';   // the phone's strip is a glance: no summary line, no toggle (inline: .sky-bar's display would beat `hidden`)
     if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
@@ -274,8 +287,9 @@
     host.appendChild(root);
 
     var g = cv.getContext('2d');
-    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = strip ? 6 : GUTTER_MIN, rowBase = ROW_H_MIN, sumW = 1, wOf = {}, cumOf = {};
+    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = strip ? 6 : GUTTER_MIN, rowBase = ROW_H_MIN, sumW = 1, wOf = Object.create(null), cumOf = Object.create(null), nowAt = NOW_AT;
     var events = [], model = null, meteors = [], feed = { seen: {}, loaded: false }, raf = 0, timer = 0, ro = null, dead = false, hits = [];
+    var themeObs = null, scheme = null;
 
     function css(name, fallback) {
       var v = getComputedStyle(root).getPropertyValue(name).trim();
@@ -301,7 +315,7 @@
     if (reduce && reduce.addEventListener) reduce.addEventListener('change', onReduce);
     setToggle();
 
-    var xOf = function (t, now) { var span = opts.windowHours * 3600000 / NOW_AT; return gutter + (W - gutter - padR) * ((t - (now - opts.windowHours * 3600000)) / span); };
+    var xOf = function (t, now) { var span = opts.windowHours * 3600000 / nowAt; return gutter + (W - gutter - padR) * ((t - (now - opts.windowHours * 3600000)) / span); };
     // each row has a weight (1 = a plain row; the sessions row grows with its tracks), so the plain rows are spaced as ever
     var rowY = function (id) {
       if (!(id in wOf)) return padT;
@@ -326,6 +340,7 @@
       var r = cv.getBoundingClientRect();
       W = r.width; H = r.height;
       if (!W) return;
+      DPR = Math.min(2, window.devicePixelRatio || 1);
       cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
       draw(); drawAxis();
     }
@@ -335,8 +350,10 @@
       var hw = host.getBoundingClientRect().width, narrow = !strip && hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
       opts.compact = narrow;
       model = buildModel(events, opts, now);
+      if (model.lev) opts.lev = true;   // latch: once the lanes are Levain's they stay so, however the window ages
+      nowAt = model.lev || strip ? NOW_AT_LEV : NOW_AT;
       rowBase = size === 'large' ? 44 : strip ? 18 : narrow ? 48 : ROW_H_MIN;
-      sumW = 0; wOf = {}; cumOf = {};
+      sumW = 0; wOf = Object.create(null); cumOf = Object.create(null);
       model.rows.forEach(function (r) {
         var w = 1;
         if (r.id === 'sessions' && model.tracks) w = Math.max(1, (model.tracks * (trackH + trackGap) + (strip ? 4 : size === 'large' ? 16 : 10)) / rowBase);
@@ -348,14 +365,23 @@
       var c = model.counts, lev = model.lev;
       var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + (lev ? c.sessions + ' sessions, ' + c.decisions + ' decisions, ' + c.memory + ' memory writes, ' + c.questions + ' questions, ' + c.waiting + ' waiting on you'
         : c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes');
-      var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
-      var txt = function (x) { return document.createTextNode(x); };
-      if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));
-      else summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
-      cv.setAttribute('aria-label', line + '. ' + (value && value.legend ? value.legend : ''));
+      if (!strip) {   // the strip has no summary bar, so none is built
+        var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
+        var txt = function (x) { return document.createTextNode(x); };
+        if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));
+        else summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
+      }
+      // the canvas is the only place the marks live, so its label names what is waiting on the reader
+      var wl = model.waiting.slice().sort(function (a, b) { return a.t - b.t; }), more = '';
+      if (wl.length) {
+        more = ' Waiting on you: ' + wl.slice(0, MAX_WAITING_ARIA).map(function (e) { return e.kind + ' ' + (e.label || e.repo || 'unlabelled') + ' at ' + hhmm(e.t); }).join('; ')
+          + (wl.length > MAX_WAITING_ARIA ? '; and ' + (wl.length - MAX_WAITING_ARIA) + ' more' : '') + '. Details in Needs you.';
+      }
+      cv.setAttribute('aria-label', line + '.' + more + ' ' + (value && value.legend ? value.legend : ''));
       if (showLegend && lev) legend.replaceChildren(legendNode());
       else legend.textContent = showLegend && value && value.legend ? value.legend : '';
       var r = cv.getBoundingClientRect(); W = r.width; H = r.height;
+      DPR = Math.min(2, window.devicePixelRatio || 1);
       if (W) { measureGutter(); cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); }
     }
 
@@ -400,12 +426,22 @@
         g.beginPath(); g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.arc(x + w - r, y + r, r, -Math.PI / 2, Math.PI / 2);
         g.lineTo(x + r, y + h); g.arc(x + r, y + r, r, Math.PI / 2, Math.PI * 1.5); g.closePath();
       }
+      var late = [];   // the marks that want the reader, drawn after the rest so a crowd never buries them
+      function drawWaiting(x, y, h) {
+        g.globalAlpha = 0.22; g.fillStyle = P.accent; diamond(x, y, h + 4); g.fill();   // orange is spent only on "waiting on you"
+        g.globalAlpha = 1; g.fillStyle = P.accent; diamond(x, y, h); g.fill();
+        g.strokeStyle = P.accent; g.lineWidth = 1.4; diamond(x, y, h + 3.5); g.stroke();   // the ring is the shape cue: allowed is the plain diamond
+      }
+      function drawOpenQuestion(x, y) {
+        g.globalAlpha = 1; g.fillStyle = P.violet; g.beginPath(); g.arc(x, y, R * 0.95, 0, 7); g.fill();
+        g.strokeStyle = P.accent; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, R * 0.95 + 3, 0, 7); g.stroke();
+      }
       events.forEach(function (e) {
         if (e.kind === 'session') {
           if (!('sessions' in wOf) || e.t > now) return;
           var sEnd = sessEnd(e, now); if (sEnd < model.start) return;
           var x1 = Math.max(gutter, xOf(Math.max(e.t, model.start), now)), x2 = Math.max(x1 + 3, xOf(sEnd, now));
-          var top = rowY('sessions') - rowPx('sessions') / 2 + (strip ? 2 : size === 'large' ? 8 : 5), yy = top + (e.track || 0) * (trackH + trackGap);
+          var top = rowY('sessions') - rowPx('sessions') / 2 + (strip ? 2 : size === 'large' ? 8 : 5), yy = top + (model.trackOf.get(e) || 0) * (trackH + trackGap);
           g.globalAlpha = e.out === 'live' ? 0.85 : 0.5; g.fillStyle = e.out === 'live' ? P.ok : P.label;
           pill(x1, yy, x2 - x1, trackH); g.fill(); g.globalAlpha = 1;
           hits.push({ e: e, x: x1, x2: x2, y: yy + trackH / 2 });
@@ -433,16 +469,14 @@
         else if (e.kind === 'decision') {
           g.globalAlpha = 1;
           var h = R + (lev ? 1.5 : 0);
-          if (e.out === 'waiting') {   // orange is spent only on "waiting on you"
-            g.globalAlpha = 0.22; g.fillStyle = P.accent; diamond(x, y, h + 4); g.fill(); g.globalAlpha = 1;
-            g.fillStyle = P.accent; diamond(x, y, h); g.fill();
-          } else if (e.out === 'denied') { g.fillStyle = P.base; g.strokeStyle = P.bad; g.lineWidth = 1.6; diamond(x, y, h); g.fill(); g.stroke(); }
+          if (e.out === 'waiting') late.push(function () { drawWaiting(x, y, h); });
+          else if (e.out === 'denied') { g.fillStyle = P.base; g.strokeStyle = P.bad; g.lineWidth = 1.6; diamond(x, y, h); g.fill(); g.stroke(); }
           else if (e.out === 'allowed') { g.fillStyle = P.ok; diamond(x, y, h); g.fill(); }
           else { g.fillStyle = P.contrast; diamond(x, y, h); g.fill(); }
         }
         else if (e.kind === 'question') {
-          g.globalAlpha = 1; g.fillStyle = P.violet; g.beginPath(); g.arc(x, y, R * 0.95, 0, 7); g.fill();
-          if (e.out === 'open') { g.strokeStyle = P.accent; g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, R * 0.95 + 3, 0, 7); g.stroke(); }
+          if (e.out === 'open') late.push(function () { drawOpenQuestion(x, y); });
+          else { g.globalAlpha = 1; g.fillStyle = P.violet; g.beginPath(); g.arc(x, y, R * 0.95, 0, 7); g.fill(); }
         }
         else if (lev) {   // a memory write: a blue tick
           var th = (strip ? 10 : size === 'large' ? 18 : 12);
@@ -452,12 +486,12 @@
         g.globalAlpha = 1;
         hits.push({ e: e, x: x, y: y });
       });
+      if (late.length) { late.forEach(function (f) { f(); }); g.globalAlpha = 1; }
       if (!model.lev && !strip && !model.empty && !model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
       if (model.empty) {   // the lanes stay (a bare frame reads as broken) and one line says why they are bare
-        var msg = 'Nothing yet in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
-        g.font = FONT_MONO; g.textAlign = 'center'; var mw = g.measureText(msg).width;
-        g.fillStyle = P.base; g.globalAlpha = 0.85; g.fillRect(mx - mw / 2 - 8, my - 10, mw + 16, 20); g.globalAlpha = 1;
-        g.fillStyle = P.meta; g.fillText(msg, mx, my + 4);
+        var msg = strip ? 'Nothing yet' : 'Nothing yet in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
+        g.font = FONT_MONO; g.textAlign = 'center';
+        g.globalAlpha = 1; g.fillStyle = P.label; g.fillText(msg, mx, my + 4);   // text only: no box over the grid
       }
       var grad = g.createLinearGradient(0, padT - 10, 0, H);
       grad.addColorStop(0, 'transparent'); grad.addColorStop(0.25, P.accent); grad.addColorStop(1, P.accent);
@@ -518,7 +552,9 @@
         if (r.noRepo) lines.push(r.noRepo + (r.noRepo === 1 ? ' review' : ' reviews') + ' with no repo recorded');
         return lines.join('\n');
       }
-      return eventTip(h.e);
+      var t = eventTip(h.e, clock());
+      if (h.e.kind === 'session' && model.overflow && model.trackOf.get(h.e) === MAX_TRACKS - 1) t += ' · track shared with ' + model.overflow + ' more';
+      return t;
     }
     cv.addEventListener('mousemove', function (ev) {
       if (strip) return;   // the strip is a glance: no tooltip
@@ -553,6 +589,15 @@
     if (typeof ResizeObserver === 'function') { ro = new ResizeObserver(function () { if (!dead) { rebuild(); draw(); drawAxis(); } }); ro.observe(plot); }
     else window.addEventListener('resize', resize);
 
+    // the canvas holds resolved colours, so a theme switch (the html[data-theme] attribute, or the OS scheme) repaints it
+    function repaint() { if (!dead) draw(); }
+    if (typeof MutationObserver === 'function' && document.documentElement) {
+      themeObs = new MutationObserver(repaint);
+      themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+    scheme = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    if (scheme && scheme.addEventListener) scheme.addEventListener('change', repaint);
+
     update(value);
 
     return {
@@ -562,6 +607,8 @@
         if (raf) { cancelAnimationFrame(raf); stats.pending--; raf = 0; }
         clearInterval(timer); if (ro) ro.disconnect(); else window.removeEventListener('resize', resize);
         if (reduce && reduce.removeEventListener) reduce.removeEventListener('change', onReduce);
+        if (themeObs) themeObs.disconnect();
+        if (scheme && scheme.removeEventListener) scheme.removeEventListener('change', repaint);
         root.remove();
         if (o.toggleHost) toggle.remove();
       },
