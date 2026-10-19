@@ -394,13 +394,15 @@
     btn.disabled = true;
     busy++;
     const rand = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return a; };
-    // the passkey's user name carries when it was made (this phone's local time, to the second), so the phone's
-    // password list tells one levain passkey from another; the key's fingerprint does not exist until it is made
-    const pad = (n) => String(n).padStart(2, "0"), now = new Date();
+    // the passkey's user name carries when it was made (this phone's local time, to the second) and the head of its
+    // random user id, so the phone's password list tells one levain passkey from another even when two share a
+    // second; the key's fingerprint does not exist until it is made
+    const pad = (n) => String(n).padStart(2, "0"), now = new Date(), uid = rand(16);
     const name = "levain " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate())
-      + " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
+      + " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds())
+      + " " + Array.from(uid.slice(0, 2), (b) => b.toString(16).padStart(2, "0")).join("");
     const create = made ? Promise.resolve(made) : navigator.credentials.create({ publicKey: {
-      rp: { id: rpId, name: "levain" }, user: { id: rand(16), name: name, displayName: name },
+      rp: { id: rpId, name: "levain" }, user: { id: uid, name: name, displayName: name },
       challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
       authenticatorSelection: { residentKey: "required", userVerification: "required" } } })
       .then((cred) => { setMade({ rawId: b64u(cred.rawId), spki: b64u(cred.response.getPublicKey()), name: name }); return made; });
