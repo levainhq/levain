@@ -71,9 +71,25 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.policy import grant_refusal
 from levain.consent.record import (
-    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, ExternalGateRequest, answer_message,
-    answer_payload, grant_answer_payload, redact_display, tool_input_digest,
+    ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, ExternalGateRequest, answer_message,
+    grant_answer_payload, redact_display, tool_input_digest,
 )
+from levain.consent.record import _need
+
+# frozen with the /3 code (the test harness, not part of d430b804): the answer format and record of that time,
+# before Q11 chained the receipts, so the store this code writes holds what a real /3 store holds
+ANSWER_FORMAT = "levain-consent-answer/1"
+
+
+def answer_payload(*, queue_id: str, request: ExternalGateRequest, decision: str, signer_fp: str,
+                   signed_at: str) -> dict[str, str]:
+    if decision not in DECISIONS:
+        raise ConsentError(f"decision must be one of {DECISIONS}: {decision!r}")
+    parse_stamp(signed_at)
+    return {"format": ANSWER_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
+            "request_digest": request.digest, "decision": decision, "expires_at": request.expires_at,
+            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
+
 
 __all__ = ["DB_NAME", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue",
            "Decision", "QueueStoreError", "authority_source", "default_queue_dir"]

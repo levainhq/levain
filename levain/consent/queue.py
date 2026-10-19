@@ -8,8 +8,9 @@ one of these ends it or moves it on:
     tool input it was filed for and the posture the agent reported. The row says it was answered by a grant
     (``via``) and stores which grant and the authority link that created or last renewed it;
   - ``allowed`` / ``denied``: an answer that VERIFIES (:meth:`ConsentQueue.answer`): a record binding this
-    queue, the request's id, its digest, its expiry, the decision and when it was signed (before the expiry),
-    signed in :data:`~levain.consent.record.ANSWER_NAMESPACE` by a key the replayed authority log holds unrevoked, of a
+    queue, the request's id, its digest, its expiry, the decision, when it was signed (before the expiry) and the
+    head of the queue's receipt log when it was built (see the receipts paragraph below), signed in
+    :data:`~levain.consent.record.ANSWER_NAMESPACE` by a key the replayed authority log holds unrevoked, of a
     class that covers the request's tier for an allow. A delivered "yes" that does not verify is no
     decision, never an allow (the 10-08 rule): the request stays pending;
   - ``expired``: its ``expires_at`` passed with no verified answer. Silence is NO decision: the hook outputs
@@ -19,7 +20,7 @@ one of these ends it or moves it on:
     action was NOT taken. The request is given a gap number, unique and never reused within its agent and
     session. It is the one state that is not terminal, with exactly one way out: a late RULING that verifies
     (:meth:`ConsentQueue.answer_late`), a record binding this queue, the request, its digest, its gap number,
-    the decision and when it was signed, in :data:`~levain.consent.record.RULING_NAMESPACE` (never an answer's
+    the decision, when it was signed and the receipt log's head, in :data:`~levain.consent.record.RULING_NAMESPACE` (never an answer's
     namespace, so neither verifies as the other), checked against the authority log exactly as an answer is,
     and signed no later than the queue's clock (read under the lock) plus :data:`RULING_SKEW`. Only the LATEST ruling on an identical call (agent, session, tool and
     input digest; the working directory is shown, never keyed, since a resumed session starts in its project
@@ -73,6 +74,16 @@ append-only tables beside the request row, which they never change. Every transi
 (built by :mod:`levain.autonomic.receipt`) in the same transaction, so a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
 its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
 
+The receipts are also a Merkle log, computed from the rows and never stored (:mod:`levain.consent.receipt_log`,
+Q11): every answer and ruling record the queue hands a signer (:meth:`ConsentQueue.answer_payload`,
+:meth:`ConsentQueue.ruling_payload`) carries ``receipts_head``, the log's head as a read of the receipts found it,
+and the queue applies a signed one only when that head is still the head of its size over its receipts, checked
+in the write transaction that applies it. So each signature attests every receipt before it under the signer's own
+key, and a later rewrite of them (triggers dropped) refuses the next answer and fails
+``levain consent receipts verify``. A record in the format from before the chaining (``.../1``) is refused when
+applied and when delivered: the request is answered again. Delivery checks the head's shape, never the log (that
+is the apply's and the verifier's).
+
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
 operator's alone (0700, refused otherwise). A store of the previous format (:data:`PRIOR_FORMAT`) is migrated
@@ -114,10 +125,13 @@ from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.policy import grant_refusal
+from levain.consent.receipt_log import head as receipts_head
+from levain.consent.receipt_log import head_problem, head_refusal
 from levain.consent.record import (
-    AGENTS, ANSWER_FORMAT, ANSWER_NAMESPACE, AWAY_LEAVE_FORMAT, AWAY_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT,
-    RULING_FORMAT, RULING_NAMESPACE, ExternalGateRequest, answer_message, answer_payload, away_leave_message,
-    away_leave_payload, grant_answer_payload, redact_display, ruling_message, ruling_payload, tool_input_digest,
+    AGENTS, ANSWER_FORMAT, ANSWER_FORMAT_UNCHAINED, ANSWER_NAMESPACE, AWAY_LEAVE_FORMAT, AWAY_NAMESPACE, DECISIONS,
+    GRANT_ANSWER_FORMAT, RULING_FORMAT, RULING_FORMAT_UNCHAINED, RULING_NAMESPACE, ExternalGateRequest,
+    answer_message, answer_payload, away_leave_message, away_leave_payload, grant_answer_payload, redact_display,
+    ruling_message, ruling_payload, tool_input_digest,
 )
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
@@ -132,11 +146,11 @@ PRIOR_FORMAT = "levain-consent-queue/3"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn", "undecided")
 TERMINAL: frozenset[str] = frozenset({"allowed", "denied", "expired", "withdrawn"})
 _ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
-                          "signer_fp", "signed_at"})
+                          "signer_fp", "signed_at", "receipts_head"})
 _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
-                          "signed_at"})
+                          "signed_at", "receipts_head"})
 _LEAVE_KEYS = frozenset({"format", "queue_id", "mark_id", "agent", "decision", "signer_fp", "signed_at"})
 # how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
 VIA: tuple[str, ...] = ("signature", "grant", "ruling")
@@ -1165,11 +1179,19 @@ class ConsentQueue:
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
                  authority: AuthoritySnapshot) -> str | None:
         """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
-        verifies. The one check an answer passes to be stored AND again every time it is delivered."""
+        verifies. The one check an answer passes to be stored AND again every time it is delivered; applying it
+        also checks its ``receipts_head`` against the log (:func:`~levain.consent.receipt_log.head_refusal`, in
+        :meth:`answer`'s write transaction), which this does not."""
+        if isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED:
+            return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
+                    "chained: it covers no receipts head; answer the request again")
         if not isinstance(payload, Mapping) or set(payload) != _ANSWER_KEYS:
             return "the answer is not an answer record"
         if payload["format"] != ANSWER_FORMAT:
             return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
+        problem = head_problem(payload["receipts_head"])
+        if problem is not None:
+            return f"the answer's {problem}"
         if payload["queue_id"] != queue_id:
             return "the answer names another queue"
         if payload["request_id"] != request.id:
@@ -1236,11 +1258,18 @@ class ConsentQueue:
                         signature: Any, authority: AuthoritySnapshot) -> str | None:
         """Why ``payload``/``signature`` is not a ruling on ``request`` (gap number and the time it went undecided
         in ``gap``) under ``authority``; ``None`` when it verifies. Checked when it is applied and again every time
-        it is delivered or taken."""
+        it is delivered or taken; applying it also checks its ``receipts_head`` against the log (in
+        :meth:`answer_late`'s write transaction), which this does not."""
+        if isinstance(payload, Mapping) and payload.get("format") == RULING_FORMAT_UNCHAINED:
+            return (f"the ruling is in format {RULING_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
+                    "chained: it covers no receipts head; rule on the request again")
         if not isinstance(payload, Mapping) or set(payload) != _RULING_KEYS:
             return "the ruling is not a ruling record"
         if payload["format"] != RULING_FORMAT:
             return f"ruling format {payload['format']!r} is not {RULING_FORMAT!r}"
+        problem = head_problem(payload["receipts_head"])
+        if problem is not None:
+            return f"the ruling's {problem}"
         if payload["queue_id"] != queue_id:
             return "the ruling names another queue"
         if payload["request_id"] != request.id:
@@ -1264,7 +1293,9 @@ class ConsentQueue:
     def answer(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
         was: an answer after ``expires_at`` is refused, and the request stays pending until its grace ends). The answer is verified against a fresh
-        replay from the queue's authority source."""
+        replay from the queue's authority source, and its ``receipts_head`` must be the head of its size over the
+        receipts as they stand inside the write transaction that applies it ("the receipts changed under this
+        answer" otherwise)."""
         got = self.get(request_id)                         # expires it first if it is due (UNDECIDED_GRACE)
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
@@ -1285,17 +1316,23 @@ class ConsentQueue:
             current, now_state, stamp = self._settle(conn, request_id)
             if now_state == "pending" and request.expires_at <= stamp:
                 now_state = "expired"                # the hold ended: only the hook's undecided mark applies
-            moved = current is not None and now_state == "pending" and self._transition(
+            stale = None
+            if current is not None and now_state == "pending":
+                stale = head_refusal(conn, payload["receipts_head"], noun="answer")
+            moved = stale is None and current is not None and now_state == "pending" and self._transition(
                 conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
                 signature=signature, signer_fp=payload["signer_fp"], via="signature")
+        if stale is not None:
+            raise AnswerRefused(stale)
         if not moved:
             raise AnswerRefused(f"request {request_id} is already {now_state or 'gone'}")
         return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
                         request_digest=request.digest)
 
     def answer_payload(self, request_id: str, decision: str, signer_fp: str) -> dict[str, str]:
-        """The record to sign to answer ``request_id``, ``signed_at`` now by the queue's clock (what the
-        cockpit shows a signer). Raises :class:`AnswerRefused` when there is no sealed pending request."""
+        """The record to sign to answer ``request_id``, ``signed_at`` now by the queue's clock, ``receipts_head``
+        the head of every receipt in one read of them (what every signer signs: the CLI, the phone page). Raises
+        :class:`AnswerRefused` when there is no sealed pending request."""
         got = self.get(request_id)
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
@@ -1304,8 +1341,10 @@ class ConsentQueue:
             raise AnswerRefused(f"request {request_id} is already {state}")
         if request.expires_at <= utc_stamp(_now_utc(self._clock)):
             raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
+        with self._read() as conn:
+            head = receipts_head(conn)
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
-                              signed_at=utc_stamp(_now_utc(self._clock)))
+                              signed_at=utc_stamp(_now_utc(self._clock)), receipts_head=head)
 
     # --- away marks ------------------------------------------------------------------------------------
     @staticmethod
@@ -1486,18 +1525,22 @@ class ConsentQueue:
         return request, gap, queue_id
 
     def ruling_payload(self, request_id: str, decision: str, signer_fp: str) -> dict[str, Any]:
-        """The record to sign to rule on the undecided ``request_id``, ``signed_at`` now by the queue's clock.
-        Raises :class:`AnswerRefused` when there is no sealed undecided request."""
+        """The record to sign to rule on the undecided ``request_id``, ``signed_at`` now by the queue's clock,
+        ``receipts_head`` the head of every receipt in one read of them. Raises :class:`AnswerRefused` when there
+        is no sealed undecided request."""
         request, gap, queue_id = self._undecided(request_id)
+        with self._read() as conn:
+            head = receipts_head(conn)
         return ruling_payload(queue_id=queue_id, request=request, gap=gap[0], decision=decision,
-                              signer_fp=signer_fp, signed_at=utc_stamp(_now_utc(self._clock)))
+                              signer_fp=signer_fp, signed_at=utc_stamp(_now_utc(self._clock)), receipts_head=head)
 
     def answer_late(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Ruling:
         """Apply a signed late ruling to the undecided ``request_id``, or raise :class:`AnswerRefused` (the request
         stays undecided). The ruling is verified against a fresh replay from the queue's authority source exactly
         as :meth:`answer` verifies an answer (the signer enrolled and unrevoked, of a class covering the tier for
         an allow), in :data:`~levain.consent.record.RULING_NAMESPACE`, and its ``signed_at`` must be no later than
-        the queue's clock read under the write lock plus :data:`RULING_SKEW`. The move to ``allowed``/``denied``,
+        the queue's clock read under the write lock plus :data:`RULING_SKEW`, and its ``receipts_head`` must be the
+        head of its size over the receipts as they stand under that lock. The move to ``allowed``/``denied``,
         its receipt and the release of a halt on this request are one transaction. Returns the :class:`Ruling`
         (information: applying a ruling delivers nothing; a ruled allow reaches the agent only through
         :meth:`take_ruled_allow`)."""
@@ -1511,11 +1554,14 @@ class ConsentQueue:
         decision = payload["decision"]
         message = ruling_message(dict(payload))
         early = False
+        stale = None
         with self._write() as conn:
             now = _now_utc(self._clock)
             stamp = utc_stamp(now)
             if parse_stamp(payload["signed_at"]) > now + RULING_SKEW:
                 early, moved = True, False
+            elif (stale := head_refusal(conn, payload["receipts_head"], noun="ruling")) is not None:
+                moved = False
             else:
                 moved = self._transition(conn, request, _STATE_OF[decision], stamp=stamp,
                                          answer=message.decode("utf-8"), signature=signature,
@@ -1524,6 +1570,8 @@ class ConsentQueue:
             if moved:
                 conn.execute("INSERT INTO halt_releases (request_id, released_at, by_request_id) "
                              "SELECT request_id, ?, request_id FROM halts WHERE request_id = ?", (stamp, request.id))
+        if stale is not None:
+            raise AnswerRefused(stale)
         if early:
             raise AnswerRefused(f"the ruling's signed_at {payload['signed_at']} is later than the queue's clock "
                                 f"{stamp} plus {int(RULING_SKEW.total_seconds())} s")

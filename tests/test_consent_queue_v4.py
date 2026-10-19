@@ -7,6 +7,7 @@ The /3 store is built by the /3 code itself: ``tests/fixtures/consent_queue_v3_d
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sqlite3
 import sys
@@ -299,7 +300,7 @@ def test_a_ruling_signature_never_verifies_as_an_answer(queue, keys):
     ({"request_digest": "0" * 64}, "another version"),
     ({"queue_id": "cq-other"}, "another queue"),
     ({"signed_at": utc_stamp(NOW - timedelta(seconds=1))}, "before the request went undecided"),
-    ({"format": "levain-consent-ruling/2"}, "ruling format"),
+    ({"format": "levain-consent-ruling/3"}, "ruling format"),
     ({"decision": "maybe"}, "is not one of"),
 ])
 def test_a_ruling_binds_its_request_gap_and_time(queue, keys, override, why):
@@ -370,7 +371,7 @@ def test_the_record_helpers_refuse_a_bad_gap():
     for gap in (0, True, "1", 1.0):
         with pytest.raises(ConsentError):
             ruling_payload(queue_id="cq-1", request=r, gap=gap, decision="allow", signer_fp="fp",
-                           signed_at=utc_stamp(NOW))
+                           signed_at=utc_stamp(NOW), receipts_head={"size": 0, "root": hashlib.sha256().hexdigest()})
 
 
 # --- a ruled allow pre-authorises the call once ----------------------------------------------------------------
@@ -565,8 +566,10 @@ def test_a_v3_store_built_by_the_v3_code_migrates_in_place_row_for_row(tmp_path,
     after, meta_after = _dump(d / "queue.db")
     assert after == before                                  # every row, with its rowid / seq, unchanged
     assert meta_after == {**meta_before, "format": STORE_FORMAT}
-    assert new.decision(allowed.id).decision == "allow"     # a /3 signed answer still delivers
-    assert new.decision(denied.id).decision == "deny"
+    # an answer the /3 code applied is in the format from before the receipts were chained (Q11): it no longer
+    # delivers (no decision: the native dialog stands), and the verifier lists it as signed before chaining
+    assert new.get(allowed.id)[1] == "allowed" and new.decision(allowed.id) is None
+    assert new.get(denied.id)[1] == "denied" and new.decision(denied.id) is None
     assert new.get(expiring.id)[1] == "expired"
     assert new.dialog_outcome(late.id) == ("ran", utc_stamp(NOW))
     # the /4 machinery works on the migrated store, its triggers rebuilt
@@ -597,7 +600,7 @@ def test_a_failed_migration_leaves_the_v3_store_as_it_was(tmp_path, keys, monkey
         ConsentQueue(d, authority=log.source).pending()
     assert _dump(d / "queue.db") == before
     monkeypatch.undo()
-    assert ConsentQueue(d, authority=log.source, clock=Clock(NOW)).decision(r.id).decision == "allow"
+    assert ConsentQueue(d, authority=log.source, clock=Clock(NOW)).get(r.id)[1] == "allowed"   # migrated, readable
 
 
 def test_another_format_is_still_refused(tmp_path, authority):
