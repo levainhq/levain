@@ -63,7 +63,7 @@ _STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
 _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
-_QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/answer")
+_QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
@@ -182,7 +182,8 @@ class _PhoneHandler(GuardedHandler):
             return
         # an answer carries a signature the person just made with a passkey: it waits a moment for a slot rather than
         # throw that ceremony away; everything else answers busy at once
-        waits = (consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
+        waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
+                 or (question is not None and question.group(2) == "rule"))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -191,6 +192,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.answer_step(consent[0], consent[1], req)
             elif sign is not None:
                 result = self.server.sign_step(sign[0], sign[1], req)
+            elif question is not None and question.group(2) == "rule":
+                result = self.server.question_rule(int(question.group(1)), req)
             elif question is not None:
                 result = self.server.question_answer(int(question.group(1)), req)
             else:
@@ -289,6 +292,9 @@ class _PhoneServer(ThreadingHTTPServer):
             body.pop("answer_deny", None)
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
             rows.append(body)
+        questions, questions_overflow, questions_note = self._questions()
+        # a request filed for an open question's option (Q-3) is shown inside that question, signed from there
+        linked = {row["link"]["request_id"]: row for row in questions if row.get("link")}
         undecided = []
         for entry in listing.undecided:
             body = entry_body(entry)
@@ -299,6 +305,9 @@ class _PhoneServer(ThreadingHTTPServer):
             # a display cut at its limit: only a deny is signed for it (the page offers no allow)
             body["cut"] = filed_input(entry.request) is UNSHOWN
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
+            if entry.request.id in linked:
+                linked[entry.request.id]["link"]["card"] = body
+                continue
             undecided.append(body)
         sign_pending, sign_note, sign_overflow = [], "", 0
         if self.signer.namespaces:
@@ -312,7 +321,6 @@ class _PhoneServer(ThreadingHTTPServer):
                 sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
-        questions, questions_overflow, questions_note = self._questions()
         return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
                 "questions_note": questions_note,
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
@@ -332,7 +340,12 @@ class _PhoneServer(ThreadingHTTPServer):
             return [], 0, f"{type(exc).__name__}: {exc}"
         rows = [{"n": q.n, "id": q.id, "agent": q.agent, "what": q.what,
                  "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
-                 "filed_at": q.filed_at} for q in open_[:PENDING_CAP]]
+                 "filed_at": q.filed_at,
+                 # the push an option leads to; ``card`` (the undecided request, as the undecided list shows it) is
+                 # added by the listing only while that request is undecided
+                 "link": None if q.link is None else {"option": q.link.option, "kind": q.link.kind,
+                                                      "request_id": q.link.request_id, "card": None}}
+                for q in open_[:PENDING_CAP]]
         return rows, max(len(open_) - PENDING_CAP, 0), ""
 
     def question_answer(self, n: int, req: Any) -> dict[str, Any]:
@@ -358,6 +371,48 @@ class _PhoneServer(ThreadingHTTPServer):
         except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             raise PhoneError(503, "unavailable", f"the question store cannot answer now: {exc}") from None
         return {"answered": q.n, "delivery": {"route": "pending", "reason": "delivery is running"},
+                _AWAIT: self._deliver_answer_later(store, q.id)}
+
+    def question_rule(self, n: int, req: Any) -> dict[str, Any]:
+        """``POST /question/<n>/rule`` ({option, payload, authenticator_data, client_data_json, signature}): the ONE
+        tap on an option tied to a push (Q-3). Two records, in this order: the late ruling ALLOW signed on the linked
+        consent request, applied by exactly :meth:`rule_step` (the queue verifies it as any ruling), and only once it
+        verified, the answer (unsigned, words only). The ruling is the only authority here; the answer never is. A
+        refused ruling records no answer. One delivery runs, the answer's (a resume of an ended session carries it);
+        the ruling's text reaches the session at its next hook (or ``levain consent deliver``): the tap starts one
+        resume at most."""
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.questions import QuestionStore, QuestionStoreError
+
+        need = {"option", "payload", "authenticator_data", "client_data_json", "signature"}
+        if not isinstance(req, dict) or set(req) != need or not isinstance(req["option"], str):
+            raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
+        store = QuestionStore(self.queue_dir)
+        try:
+            q = store.get(n)
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the question store cannot answer now: {exc}") from None
+        if q is None:
+            raise PhoneError(404, "not_found", f"no question #{n}")
+        if q.answer is not None:
+            raise PhoneError(409, "conflict", f"question #{n} was already answered")
+        link = q.link
+        if link is None or req["option"] != link.option:
+            raise PhoneError(422, "answer_refused", f"option {req['option'][:20]!r} of question #{n} leads to no push: "
+                                                    "answer it without a passkey")
+        payload = req["payload"]
+        if (not isinstance(payload, dict) or payload.get("request_id") != link.request_id
+                or payload.get("queue_id") != link.queue_id or payload.get("decision") != "allow"):
+            raise PhoneError(422, "answer_refused", f"the ruling is not an allow of the push question #{n} leads to")
+        ruled = self.rule_step(link.request_id, "rule", {k: req[k] for k in need - {"option"}}, deliver=False)
+        try:
+            store.answer(q.id, option=link.option, channel="phone")
+        except (ConsentError, QuestionStoreError, OSError, sqlite3.Error) as exc:
+            return {"ruling": ruled, "answered": None,
+                    "answer_note": f"the push is allowed (ruled), but the answer was not recorded: {exc}",
+                    "delivery": {"route": "hook", "reason": "the ruling reaches the session at its next step"}}
+        return {"ruling": ruled, "answered": q.n, "decision": ruled["decision"], "signer_fp": ruled["signer_fp"],
+                "delivery": {"route": "pending", "reason": "delivery is running"},
                 _AWAIT: self._deliver_answer_later(store, q.id)}
 
     def _deliver_answer_later(self, store: Any, question_id: str) -> Any:
@@ -484,10 +539,11 @@ class _PhoneServer(ThreadingHTTPServer):
         return {"request_id": decided.request_id, "decision": decided.decision, "signer_fp": decided.signer_fp,
                 "decided_at": decided.decided_at}
 
-    def rule_step(self, request_id: str, action: str, req: Any) -> dict[str, Any]:
+    def rule_step(self, request_id: str, action: str, req: Any, *, deliver: bool = True) -> dict[str, Any]:
         """``rule-challenge`` ({decision, signer_fp}) -> the ruling record and its WebAuthn challenge, in the ruling
         namespace; ``rule`` ({payload, authenticator_data, client_data_json, signature}) -> the queue's verdict on the
-        ruling (:meth:`ConsentQueue.answer_late`: only an undecided request takes one), then its delivery."""
+        ruling (:meth:`ConsentQueue.answer_late`: only an undecided request takes one), then its delivery (with
+        ``deliver`` false none is started: the ruling's text then reaches the session at its next hook)."""
         from levain.authority import AuthorityError, VerifierUnavailable
         from levain.cockpit.consent import ConsentError
         from levain.consent.answering import answer_root, passkey_keys, refuse_cut_display
@@ -542,9 +598,11 @@ class _PhoneServer(ThreadingHTTPServer):
             raise PhoneError(422, "answer_refused", str(exc)) from None
         except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
             raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
-        return {"request_id": ruled.request_id, "decision": ruled.ruling, "signer_fp": ruled.signer_fp,
-                "decided_at": ruled.decided_at, "gap": ruled.gap,
-                "delivery": {"route": "pending", "reason": "delivery is running"},
+        out = {"request_id": ruled.request_id, "decision": ruled.ruling, "signer_fp": ruled.signer_fp,
+               "decided_at": ruled.decided_at, "gap": ruled.gap}
+        if not deliver:
+            return out
+        return {**out, "delivery": {"route": "pending", "reason": "delivery is running"},
                 _AWAIT: self._deliver_later(queue, ruled.request_id, request.agent)}
 
     def _deliver_later(self, queue: Any, request_id: str, agent: str) -> Any:

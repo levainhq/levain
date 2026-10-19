@@ -111,12 +111,29 @@
       }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); " + (words.value.trim() ? "your words are kept: " : "") + "answer again, and if it was already recorded the page says so", "bad"); })
         .finally(() => { busy--; setTimeout(load, 1500); });
     };
+    // an option tied to a push (Q-3): its one tap signs a late ruling ALLOW on that exact push with the passkey,
+    // and only once that verifies does the server record the answer. The answer itself still authorises nothing
+    const link = q.link && typeof q.link === "object" ? q.link : null;
+    const push = link && link.card && typeof link.card === "object" ? link.card : null;
+    const signers = push && Array.isArray(push.signers) ? push.signers : [];
+    const signable = !!push && usable && signers.length > 0 && !push.cut && push.tier !== "T3";
     for (const o of (Array.isArray(q.options) ? q.options : [])) {
-      const b = el("button", o.key === q.rec ? "allow" : "quiet", o.label + " (" + o.key + ")" + (o.key === q.rec ? " (rec)" : ""));
+      const tied = !!link && o.key === link.option;
+      const b = el("button", o.key === q.rec ? "allow" : "quiet", o.label + " (" + o.key + ")" + (o.key === q.rec ? " (rec)" : "")
+                   + (tied && signable ? " \u00b7 allow the push with passkey" : ""));
       b.type = "button";
-      b.addEventListener("click", () => send({ option: o.key }));
+      if (tied && signable) b.addEventListener("click", () => start(push, "allow", signers, say, actions, true,
+                                                                     (fp, rawId) => askRule(q, push, fp, rawId, say, buttons, words)));
+      else b.addEventListener("click", () => send({ option: o.key }));
       buttons.push(b);
       actions.appendChild(b);
+    }
+    const leads = el("pre", "display", link && push ? "option " + link.option + " leads to: " + (push.display || "") : "");
+    leads.hidden = !(link && push);
+    if (link && !signable && !notes.has(key)) {
+      say(push ? (push.signer_note || "this phone cannot sign a ruling on this push") + "; answering option " + link.option
+                 + " allows nothing: the push asks when it runs"
+               : "option " + link.option + "'s push is not undecided now: answering it allows nothing");
     }
     const words = el("textarea", "words");
     words.rows = 2;
@@ -128,7 +145,7 @@
     buttons.push(go);
     const sendRow = el("div", "actions");
     sendRow.appendChild(go);
-    card.append(actions, words, sendRow, note);
+    card.append(leads, actions, words, sendRow, note);
     return card;
   }
 
@@ -164,12 +181,13 @@
     return card;
   }
 
-  function start(r, decision, signers, say, actions, ruling) {
+  function start(r, decision, signers, say, actions, ruling, go) {
+    const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
     // exactly one passkey this browser made is enrolled: use it, and ask the OS for that credential
-    if (known.length === 1) return answer(r, decision, known[0], local[known[0]], say, ruling);
-    if (!known.length && signers.length === 1) return answer(r, decision, signers[0], null, say, ruling);
+    if (known.length === 1) return run(known[0], local[known[0]]);
+    if (!known.length && signers.length === 1) return run(signers[0], null);
     // otherwise the person picks: among this browser's own when it made several (a deleted one is forgotten when
     // the OS refuses it), else among every enrolled one (the OS then offers every passkey for this name, and a
     // pick of another device's key is refused at verify)
@@ -179,9 +197,44 @@
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => answer(r, decision, fp, known.length ? local[fp] : null, say, ruling));
+      p.addEventListener("click", () => run(fp, known.length ? local[fp] : null));
       actions.appendChild(p);
     }
+  }
+
+  // the one tap on a question's push option: the ruling's challenge for the linked request, the passkey, then the
+  // question's own route, which applies the ruling and only then records the answer
+  function askRule(q, card, fp, rawId, say, buttons, words) {
+    if (busy) return;
+    busy++;
+    buttons.forEach((b) => { b.disabled = true; });
+    words.disabled = true;
+    const again = () => { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; };
+    say("asking for the ruling to sign\u2026");
+    call("POST", "/consent/" + encodeURIComponent(card.id) + "/rule-challenge", { decision: "allow", signer_fp: fp }).then((c) => {
+      if (!c.ok) { again(); return say(why(c), "bad"); }
+      say("confirm with your passkey to answer and allow the push\u2026");
+      const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", "/question/" + encodeURIComponent(q.n) + "/rule", {
+        option: q.link.option, payload: c.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+        client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }))
+        .then((a) => {
+          // a sent signature: only the server's own refusal (a 4xx) says nothing was ruled
+          if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where it stands", "bad");
+          if (!a.ok) { again(); return say("not answered, nothing allowed: " + why(a), "bad"); }
+          last = "answered question #" + q.n + " and allowed its push";
+          const d = a.body.delivery || {};
+          const head = a.body.answered ? "answered and ruled the push allowed" : "the push is ruled allowed; " + (a.body.answer_note || "");
+          say(head + " \u00b7 signed by " + ((a.body.ruling || {}).signer_fp || "") + " \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""),
+              a.body.answered && d.route !== "failed" && d.route !== "none" ? "ok" : "bad");
+        }, (e) => {
+          if (rawId && e && e.name === "NotAllowedError") forget(fp);
+          again();
+          say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was answered or allowed", "bad");
+        });
+    }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
+      .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
   function answer(r, decision, fp, rawId, say, ruling) {

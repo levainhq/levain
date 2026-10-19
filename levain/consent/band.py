@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.consent import ConsentError
-from levain.consent.questions import Question, QuestionStore, QuestionStoreError
+from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
            "deliver_answer", "deliver_answers", "file_question", "question_context", "run_ask", "run_question",
@@ -217,34 +217,91 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 
+def _file_push_request(agent: str, session: str, option: str, push: tuple[str, str, str], qdir: Path
+                       ) -> tuple[Link, str, str, dict[str, str]]:
+    """File the consent request for the push an option leads to (Q-3, ``--would-push``), undecided at once, and
+    return its link with the push in the operator's words, its gap label and the call filed. The call is derived by
+    :func:`levain.consent.push_gate.push_call`, the one derivation ``levain push`` itself runs, so the push run later
+    from this session takes a ruling signed on this request while the branch tip is unchanged. Never a halt: nothing
+    was refused to the agent. Raises ``ValueError`` (and what ``push_call`` raises) for a push that cannot be filed."""
+    from datetime import timedelta
+
+    from levain.consent import push_gate
+    from levain.consent.queue import gap_label
+
+    if session == NO_SESSION:
+        raise ValueError("--would-push needs the session the push will run from, and none was found: pass --session")
+    call = push_gate.push_call(*push)
+    settings = _agents()[agent].load_settings(qdir)
+    if not push_gate._signable(settings):
+        raise ValueError(f"no enrolled key can rule on the push (the queue's {_agents()[agent].SETTINGS_NAME} names "
+                         "no cockpit with an active key)")
+    queue = push_gate._queue(qdir, settings)
+    request = queue.file(agent=agent, agent_session_id=session, tool_name=push_gate.PUSH_TOOL, tool_input=call,
+                         cwd=call["repo"], hold=timedelta(seconds=1), tier=push_gate.PUSH_TIER)
+    marked = queue.mark_undecided(request.id, halt=False,
+                                  note=f"filed undecided by levain ask: the push option {option} of a question leads to")
+    if marked.state != "undecided" or marked.gap is None:
+        raise ValueError(f"the push request {request.id} could not be made undecided ({marked.reason})")
+    return (Link(option, "push", request.id, queue.queue_id), push_gate.push_what(call),
+            gap_label(marked.gap, session), call)
+
+
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
                   qdir: Path, *, no_session_hint: str = "(pass --session)",
-                  session_source: str = "--session", own_session: bool = False) -> tuple[Question | None, str]:
+                  session_source: str = "--session", own_session: bool = False,
+                  would_push: tuple[str, tuple[str, str, str]] | None = None) -> tuple[Question | None, str]:
     """File one question, ping, and say so: the one path under ``levain ask`` and the ``ask`` MCP tool, so the
     refusals, the ping, the resume meta and the wording are the same for both. Returns the question (``None`` when
     it was refused or could not be written) and the text the caller shows the agent; ``no_session_hint`` is what
     that text says to do when the question names no session, and ``session_source`` what a refusal names as the
     session's source (the MCP door has no ``--session`` flag). ``own_session`` says the session is the caller's own
     though its environment does not name it (the MCP door's per-call ``_meta``, which the agent's client writes and
-    the model cannot), so the resume meta is recorded for it."""
+    the model cannot), so the resume meta is recorded for it. ``would_push`` = (option key, (repo, remote, branch)):
+    that option leads to that ``levain push``, whose consent request is filed undecided FIRST
+    (:func:`_file_push_request`) and linked to the question in the question's own transaction; only a late ruling
+    signed on that request ever allows the push, never the answer."""
+    import subprocess
+
+    link: Link | None = None
     try:
         if _SUBAGENT in session:
             raise ValueError(f"{session_source} must name the main session (no #agent: part): only its hooks "
                              "receive answers")
+        if would_push is not None and would_push[0] not in {k for k, _ in options}:
+            raise ValueError(f"--would-push names {would_push[0]!r}, which is not one of the options")
         try:
             resume = ask_resume_meta(agent, session, own=session if own_session else None)
         except Exception:  # noqa: BLE001 - no resume record: the answer then waits for the session's next hook
             resume = None
-        q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
-                                     blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume)
-    except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
+        if would_push is not None:
+            # validated here before the push request is filed, so a malformed question files nothing at all
+            QuestionStore.check(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
+                                blocks=blocks, cwd=os.path.abspath(os.getcwd()))
+            link, push_words, gap, call = _file_push_request(agent, session, would_push[0], would_push[1], qdir)
+    except (ValueError, ConsentError, QuestionStoreError, OSError, subprocess.SubprocessError) as exc:
         return None, f"levain ask: refused, nothing was filed: {exc}"
     except sqlite3.Error as exc:                     # a store locked past its wait, or damaged: the write rolled back
-        return None, f"levain ask: the question store could not be written, so nothing was filed ({exc}); try again"
+        return None, f"levain ask: a store could not be written, so nothing was filed ({exc}); try again"
+    try:
+        q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
+                                     blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume, link=link)
+    except (ValueError, ConsentError, QuestionStoreError, OSError, sqlite3.Error) as exc:
+        if link is None:
+            if isinstance(exc, sqlite3.Error):       # a store locked past its wait, or damaged: rolled back
+                return None, (f"levain ask: the question store could not be written, so nothing was filed ({exc}); "
+                              "try again")
+            return None, f"levain ask: refused, nothing was filed: {exc}"
+        return None, (f"levain ask: the question was NOT filed ({exc}), but the consent request {link.request_id} "
+                      f"(gap {gap}) for the {push_words} was filed undecided before it; it moves only on a ruling "
+                      "the operator signs. Ask again without --would-push, or tell the operator.")
     adapter = _agents()[agent]
     send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
     try:
-        pinged = send(adapter.load_settings(qdir), _ping_text(agent, q, qdir), cwd=qdir)
+        ping_text = _ping_text(agent, q, qdir)
+        if link is not None:
+            ping_text += f"\nOption {link.option} also allows, with one Face ID on the phone page: the {push_words}."
+        pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
         pinged = False
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
@@ -252,8 +309,20 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
              + no_session_hint)
     ping = ("pinged" if pinged else
             "NOT pinged (no notify command is configured; the question is listed in `levain question list`)")
-    return q, (f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does "
-               f"not block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
+    text = (f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does "
+            f"not block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
+    if link is not None:
+        import shlex
+
+        # the call as filed (the repository's real path, the canonical remote): the push names the same call
+        # from whatever directory the agent runs it in
+        repo, remote, branch = call["repo"], call["remote"], call["branch"]
+        text += (f" Option {link.option} leads to the {push_words}: levain filed it as consent request "
+                 f"{link.request_id}, undecided (gap {gap}). If the operator picks that option on the phone with "
+                 "Face ID, that same tap signs a ruling that allows the push; then, from this same session, run "
+                 f"`levain push --repo {shlex.quote(repo)} --remote {shlex.quote(remote)} --branch {shlex.quote(branch)}` and it runs "
+                 f"once without asking again. A new commit on {branch} before then is a different push, which asks.")
+    return q, text
 
 
 def run_ask(args: argparse.Namespace, out: Any = None) -> int:
@@ -263,10 +332,17 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
         agent, session = _agent_and_session(args.agent, args.session)
         qdir = _queue_dir(args)
         options = _options(args.option)
+        push = (args.repo, args.remote, args.branch)
+        if args.would_push is None and any(v is not None for v in push):
+            raise ValueError("--repo, --remote and --branch go with --would-push KEY")
+        if args.would_push is not None and (args.remote is None or args.branch is None):
+            raise ValueError("--would-push KEY needs --remote and --branch (and --repo, default the current directory)")
+        would_push = None if args.would_push is None else (args.would_push, (args.repo or ".", args.remote,
+                                                                              args.branch))
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         print(f"levain ask: refused, nothing was filed: {exc}", file=out, flush=True)
         return EXIT_REFUSED
-    q, text = file_question(agent, session, args.what, options, args.rec, args.blocks, qdir)
+    q, text = file_question(agent, session, args.what, options, args.rec, args.blocks, qdir, would_push=would_push)
     print(text, file=out, flush=True)
     return EXIT_OK if q is not None else EXIT_REFUSED
 
@@ -276,11 +352,16 @@ def _row(q: Question) -> dict[str, Any]:
             "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
             "cwd": q.cwd, "filed_at": q.filed_at,
             "answer": None if q.answer is None else {"kind": q.answer.kind, "value": q.answer.value,
-                                                     "channel": q.answer.channel, "at": q.answer.answered_at}}
+                                                     "channel": q.answer.channel, "at": q.answer.answered_at},
+            "link": None if q.link is None else {"option": q.link.option, "kind": q.link.kind,
+                                                 "request_id": q.link.request_id}}
 
 
 def _show(q: Question) -> str:
-    opts = "\n".join(f"    {k}) {label}{'  <- rec' if k == q.rec else ''}" for k, label in q.options)
+    linked = q.link.option if q.link is not None else None
+    opts = "\n".join(f"    {k}) {label}{'  <- rec' if k == q.rec else ''}"
+                     f"{f'  (leads to the push of consent request {q.link.request_id})' if k == linked else ''}"
+                     for k, label in q.options)
     state = ("open" if q.answer is None else
              f"answered {q.answer.answered_at} by {q.answer.channel}: "
              + (f"option {q.answer.value}" if q.answer.kind == "option" else json.dumps(q.answer.value,
@@ -323,6 +404,10 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
             raise ValueError("answer with exactly one of --option KEY or --text TEXT")
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
         say(f"levain question: #{q.n} answered. The answer authorises nothing.")
+        if q.link is not None and args.option == q.link.option:
+            say(f"levain question: option {q.link.option} leads to a push whose consent request {q.link.request_id} "
+                "is still UNDECIDED: this answer did not allow it. To allow it, sign a ruling: `levain consent rule` "
+                "lists it with its gap.")
         if args.deliver:
             try:
                 d = deliver_answer(store, q.id)
@@ -356,6 +441,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--session", default=None,
                    help="The agent session the answer goes to (default: from the agent's environment).")
     a.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
+    a.add_argument("--would-push", dest="would_push", default=None, metavar="KEY",
+                   help="Option KEY leads to `levain push --repo --remote --branch` (given below): levain files that "
+                        "exact push as an undecided consent request tied to the option, so the operator's pick of "
+                        "it on the phone, with Face ID, also allows that one push. The answer itself allows nothing.")
+    a.add_argument("--repo", default=None, help="With --would-push: the repository (default: the current directory).")
+    a.add_argument("--remote", default=None, help="With --would-push: the remote URL, as `levain push` takes it.")
+    a.add_argument("--branch", default=None, help="With --would-push: the branch, as `levain push` takes it.")
     a.set_defaults(func=run_ask)
 
     q = subparsers.add_parser("question", help="List, show or answer the agents' questions (the question band).")

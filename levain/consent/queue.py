@@ -1030,7 +1030,7 @@ class ConsentQueue:
 
     # --- the deadline: undecided, gaps, halts, snoozes -------------------------------------------------
     def mark_undecided(self, request_id: str, *, halt: bool = False, tool_input: Any = None,
-                       posture: str | None = None) -> Marked:
+                       posture: str | None = None, note: str | None = None) -> Marked:
         """The hook's hold ended with no verified decision: move the pending request to ``undecided`` and give it
         the next gap number of its agent and session, with its receipt, and, when ``halt`` (the irreversible /
         agent-config tier), the session's halt on it (:meth:`is_halted`), all in ONE write transaction (the clock
@@ -1043,7 +1043,8 @@ class ConsentQueue:
         halted on it, and, for a request decided before this call, what decided it (a re-verified
         :class:`Decision` for a signed or grant answer, ``tool_input`` / ``posture`` passed to :meth:`decision`;
         a :class:`Ruling`, information only, for a late ruling). A request already undecided keeps its gap (a
-        retry of the hook) and gains the halt when ``halt``."""
+        retry of the hook) and gains the halt when ``halt``. ``note`` replaces the receipt's words for a request
+        that was never held (``levain ask --would-push`` files one undecided at once)."""
         decided: str | None = None
         with self._write() as conn:
             request, state, stamp = self._settle(conn, request_id, expire=False)
@@ -1065,7 +1066,7 @@ class ConsentQueue:
                                     (request.agent, request.agent_session_id)).fetchone()[0]
                 gap = (last if type(last) is int else 0) + 1
                 if not self._transition(conn, request, "undecided", stamp=stamp,
-                                        note="the hold ended with no verified decision"):
+                                        note=note or "the hold ended with no verified decision"):
                     return Marked(state, None, "the request moved while it was being marked")
                 conn.execute("INSERT INTO gaps (request_id, agent, agent_session_id, gap, created_at) "
                              "VALUES (?, ?, ?, ?, ?)", (request.id, request.agent, request.agent_session_id, gap,

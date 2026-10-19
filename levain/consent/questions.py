@@ -54,7 +54,7 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.queue import default_queue_dir
 from levain.consent.record import AGENTS
 
-__all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "Answer", "Question", "QuestionStore", "QuestionStoreError"]
+__all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "Answer", "Link", "Question", "QuestionStore", "QuestionStoreError"]
 
 DB_NAME = "questions.db"
 FORMAT = "levain-questions/1"
@@ -99,6 +99,18 @@ class Question:
     cwd: str
     filed_at: str
     answer: Answer | None
+    link: Link | None = None
+
+
+@dataclass(frozen=True)
+class Link:
+    """An option of a question tied to the consent request levain filed, undecided, for the call that option leads
+    to (``levain ask --would-push``): an id, never authority. Only a late ruling signed on that request allows the
+    call; answering the option allows nothing."""
+    option: str
+    kind: str          # 'push': the request is a ``levain push`` of exactly the call levain derived
+    request_id: str
+    queue_id: str
 
 
 def _append_only(table: str, message: str) -> tuple[str, str]:
@@ -129,7 +141,16 @@ _SCHEMA = (
     "outcome TEXT NOT NULL CHECK (outcome IN ('launching','started','failed','hook')), argv TEXT, cwd TEXT, "
     "detail TEXT, created_at TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS answer_resume_steps_question ON answer_resume_steps (question_id, seq)",
+    # an option tied to the consent request filed for its call (Q-3), written with the question; a store set up
+    # before it has no such table, and a reader then sees no links
+    "CREATE TABLE IF NOT EXISTS question_links (question_id TEXT PRIMARY KEY REFERENCES questions(id), "
+    "option TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('push')), request_id TEXT NOT NULL, "
+    "queue_id TEXT NOT NULL, created_at TEXT NOT NULL)",
     *_append_only("questions", "questions are append-only"),
+    *_append_only("question_links", "a question link is written once"),
+    "CREATE TRIGGER IF NOT EXISTS question_links_no_replace BEFORE INSERT ON question_links "
+    "WHEN EXISTS (SELECT 1 FROM question_links WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a link is never replaced'); END",
     *_append_only("answers", "an answer is written once"),
     *_append_only("answer_deliveries", "an answer is delivered once"),
     *_append_only("answer_resume_steps", "answer resume steps are append-only"),
@@ -151,12 +172,24 @@ _SCHEMA = (
 
 _Q_COLS = "q.n, q.id, q.agent, q.agent_session_id, q.what, q.options, q.rec, q.blocks, q.cwd, q.filed_at"
 _A_COLS = "a.question_id, a.kind, a.value, a.channel, a.answered_at"
-_SELECT = f"SELECT {_Q_COLS}, {_A_COLS} FROM questions q LEFT JOIN answers a ON a.question_id = q.id"
+_L_COLS = "l.option, l.kind, l.request_id, l.queue_id"
+_SELECT = (f"SELECT {_Q_COLS}, {_A_COLS}, {_L_COLS} FROM questions q LEFT JOIN answers a ON a.question_id = q.id "
+           "LEFT JOIN question_links l ON l.question_id = q.id")
+# the same, for a store set up before ``question_links`` existed (read-only readers never add it)
+_SELECT_UNLINKED = (f"SELECT {_Q_COLS}, {_A_COLS}, NULL, NULL, NULL, NULL FROM questions q "
+                    "LEFT JOIN answers a ON a.question_id = q.id")
 # the latest resume step of an answered question ``q`` (NULL when it is unclaimed or a hook claimed it)
 _LAST_STEP = ("(SELECT e.outcome FROM answer_resume_steps e WHERE e.question_id = q.id ORDER BY e.seq DESC LIMIT 1)")
 # an answer whose text has not reached its session: never claimed, or claimed for a resume that failed
 _DELIVERABLE = ("(NOT EXISTS (SELECT 1 FROM answer_deliveries d WHERE d.question_id = q.id) OR "
                 + _LAST_STEP + " = 'failed')")
+
+
+def _select(conn: sqlite3.Connection) -> str:
+    """The question query for this store: with its links, or with none when its ``question_links`` table was never
+    set up (a store only a levain before Q-3 wrote, read by a reader that never writes)."""
+    have = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'question_links'").fetchone()
+    return _SELECT if have is not None else _SELECT_UNLINKED
 
 
 def _now_utc(clock: Callable[[], datetime]) -> datetime:
@@ -332,21 +365,23 @@ class QuestionStore:
     def _question_of(row: tuple[Any, ...]) -> Question:
         options = tuple((o["key"], o["label"]) for o in json.loads(row[5]))
         answer = None if row[10] is None else Answer(row[10], row[11], row[12], row[13], row[14])
-        return Question(row[0], row[1], row[2], row[3], row[4], options, row[6], row[7], row[8], row[9], answer)
+        link = None if row[15] is None else Link(row[15], row[16], row[17], row[18])
+        return Question(row[0], row[1], row[2], row[3], row[4], options, row[6], row[7], row[8], row[9], answer, link)
 
     @staticmethod
     def _by_ref(conn: sqlite3.Connection, ref: Any) -> Question | None:
         parsed = _parse_ref(ref)
         if parsed is None:
             return None
-        row = conn.execute(f"{_SELECT} WHERE q.{parsed[0]} = ?", (parsed[1],)).fetchone()
+        row = conn.execute(f"{_select(conn)} WHERE q.{parsed[0]} = ?", (parsed[1],)).fetchone()
         return None if row is None else QuestionStore._question_of(row)
 
     # --- filing and reading --------------------------------------------------------------------------
-    def file(self, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
-             resume: dict[str, Any] | None = None) -> Question:
-        """File a question, refusing anything malformed with nothing written. ``resume`` is what a later resume of
-        the agent's session needs, stored as given: unsigned, never authority."""
+    @staticmethod
+    def check(*, agent: str, agent_session_id: str, what: Any, options: Any, rec: Any, blocks: Any, cwd: Any
+              ) -> tuple[str, list[dict[str, str]], str]:
+        """:meth:`file`'s refusals, run alone (``levain ask`` runs them before it files anything else): raises
+        :class:`ConsentError`, else the cleaned ``what``, options and ``blocks``."""
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
@@ -358,13 +393,29 @@ class QuestionStore:
         opts = _options_of(options)
         if not isinstance(rec, str) or rec not in {o["key"] for o in opts}:
             raise ConsentError("rec is required and must be one of the option keys")
-        blocks = _line("blocks", blocks, 1, _BLOCKS_MAX)
+        return what, opts, _line("blocks", blocks, 1, _BLOCKS_MAX)
+
+    def file(self, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
+             resume: dict[str, Any] | None = None, link: Link | None = None) -> Question:
+        """File a question, refusing anything malformed with nothing written. ``resume`` is what a later resume of
+        the agent's session needs, stored as given: unsigned, never authority. ``link`` ties one of its options to
+        the consent request already filed for that option's call (its ``question_id`` is ignored: it is this
+        question), written in the same transaction, so a question never names a link it does not have."""
+        what, opts, blocks = self.check(agent=agent, agent_session_id=agent_session_id, what=what, options=options,
+                                        rec=rec, blocks=blocks, cwd=cwd)
         try:
             resume_json = None if resume is None else json.dumps(resume, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
             raise ConsentError(f"resume must be JSON-serialisable: {exc}") from exc
         if resume is not None and not isinstance(resume, dict):
             raise ConsentError("resume must be an object or None")
+        if link is not None:
+            if not isinstance(link, Link) or link.option not in {o["key"] for o in opts}:
+                raise ConsentError("a link must name one of the question's option keys")
+            if link.kind != "push":
+                raise ConsentError(f"a link's kind must be push: {link.kind!r}")
+            if not all(isinstance(v, str) and v and not _has_control(v) for v in (link.request_id, link.queue_id)):
+                raise ConsentError("a link names its request and queue by id")
         qid = "q-" + os.urandom(12).hex()
         stamp = utc_stamp(_now_utc(self._clock))
         with self._write() as conn:
@@ -372,6 +423,10 @@ class QuestionStore:
                          "filed_at, resume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (qid, agent, agent_session_id, what, json.dumps(opts, ensure_ascii=False), rec, blocks,
                           cwd, stamp, resume_json))
+            if link is not None:
+                conn.execute("INSERT INTO question_links (question_id, option, kind, request_id, queue_id, "
+                             "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                             (qid, link.option, link.kind, link.request_id, link.queue_id, stamp))
             made = self._by_ref(conn, qid)
         assert made is not None
         return made
@@ -389,7 +444,7 @@ class QuestionStore:
         with self._peek() as conn:
             if conn is None:
                 return []
-            rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NULL {where} ORDER BY q.n", args).fetchall()
+            rows = conn.execute(f"{_select(conn)} WHERE a.question_id IS NULL {where} ORDER BY q.n", args).fetchall()
         return [self._question_of(r) for r in rows]
 
     def recent(self, limit: int = 50) -> list[Question]:
@@ -397,7 +452,7 @@ class QuestionStore:
         with self._peek() as conn:
             if conn is None:
                 return []
-            rows = conn.execute(f"{_SELECT} ORDER BY q.n DESC LIMIT ?", (min(max(int(limit), 0), _N_MAX),)).fetchall()
+            rows = conn.execute(f"{_select(conn)} ORDER BY q.n DESC LIMIT ?", (min(max(int(limit), 0), _N_MAX),)).fetchall()
         return [self._question_of(r) for r in rows]
 
     # --- answering -----------------------------------------------------------------------------------
@@ -445,15 +500,15 @@ class QuestionStore:
 
     def _claim(self, agent: str, agent_session_id: str, *, step: str | None) -> list[Question]:
         key = (agent, agent_session_id)
-        sql = (f"{_SELECT} WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
-               + _DELIVERABLE + " ORDER BY a.rowid")
+        where = (" WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
+                 + _DELIVERABLE + " ORDER BY a.rowid")
         with self._peek() as conn:                            # read-only: no write lock when nothing is due
-            if conn is None or not conn.execute(sql, key).fetchall():
+            if conn is None or not conn.execute(_select(conn) + where, key).fetchall():
                 return []
         out: list[Question] = []
         with self._write(busy_ms=HOOK_BUSY_MS) as conn:
             stamp = utc_stamp(_now_utc(self._clock))
-            for row in conn.execute(sql, key).fetchall():      # re-read under the lock: what a claimer before us left
+            for row in conn.execute(_select(conn) + where, key).fetchall():   # re-read under the lock
                 q = self._question_of(row)
                 if conn.execute("SELECT 1 FROM answer_deliveries WHERE question_id = ?", (q.id,)).fetchone() is None:
                     conn.execute("INSERT INTO answer_deliveries (question_id, agent_session_id, delivered_at) "
@@ -521,7 +576,7 @@ class QuestionStore:
         with self._peek() as conn:
             if conn is None:
                 return []
-            rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NOT NULL AND (" + _DELIVERABLE + " OR "
+            rows = conn.execute(f"{_select(conn)} WHERE a.question_id IS NOT NULL AND (" + _DELIVERABLE + " OR "
                                 + _LAST_STEP + " = 'launching') ORDER BY a.rowid").fetchall()
         return [self._question_of(r) for r in rows]
 

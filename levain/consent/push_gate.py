@@ -85,7 +85,7 @@ from levain.consent.listing import filed_input
 from levain.consent.queue import ConsentQueue, Decision, Ruling, authority_source, default_queue_dir
 from levain.consent.record import redact_display, tool_input_digest
 
-__all__ = ["AGENT_LINE", "NO_SESSION", "PUSH_HOLD", "PUSH_TIER", "PUSH_TOOL", "add_parser", "run"]
+__all__ = ["AGENT_LINE", "NO_SESSION", "PUSH_HOLD", "PUSH_TIER", "PUSH_TOOL", "add_parser", "push_call", "push_what", "run"]
 
 # the tool name a push request is filed under (never a shell tool's name: the queue shows it as structure)
 PUSH_TOOL = "levain_push"
@@ -158,6 +158,32 @@ def _branch_tip(real: str, branch: str) -> str:
 def _what(call: dict[str, str]) -> str:
     return _CONTROL.sub("?", f"push of {call['branch']} at {call['commit'][:12]} to {call['remote']} "
                              f"(from {call['repo']})")
+
+
+def push_call(repo: str, remote: str, branch: str) -> dict[str, str]:
+    """The exact call ``levain push --repo REPO --remote REMOTE --branch BRANCH`` files and takes a ruled allow for:
+    the repository's real path, the canonical remote, the branch and its tip read from outside the repository. The
+    one derivation of it, so a call filed ahead (``levain ask --would-push``) has the digest the push will have
+    while the tip is unchanged. Raises ``ValueError`` (a :class:`~levain.consent.push.PushRefused` among them),
+    ``OSError`` or ``subprocess.SubprocessError`` for a push that would be refused."""
+    canon = push.canonical_remote(remote)
+    _showable("branch", branch)
+    if problem := push.branch_problem(branch):
+        raise push.PushRefused(f"branch: {problem}")
+    path = os.path.abspath(repo)
+    _showable("repository path", path)
+    real, _ident = push._repo_topology(path)
+    _showable("repository path", real)
+    _showable("remote", canon)
+    call = {"repo": real, "remote": canon, "branch": branch, "commit": _branch_tip(real, branch)}
+    if filed_input(SimpleNamespace(tool_name=PUSH_TOOL, display=redact_display(PUSH_TOOL, call))) != call:
+        raise ValueError("the push is too long to show the operator whole")
+    return call
+
+
+def push_what(call: dict[str, str]) -> str:
+    """The push in the words the operator is pinged with."""
+    return _what(call)
 
 
 def _signable(settings: Any) -> bool:
@@ -262,18 +288,7 @@ def run(args: argparse.Namespace, out: Any = None) -> int:
         agent, session = _agent_and_session(args.agent, args.session)
         if args.hold is not None and not 0 < args.hold < float("inf"):
             raise ValueError("--hold must be a positive number of seconds")
-        canon = push.canonical_remote(args.remote)
-        _showable("branch", args.branch)
-        if problem := push.branch_problem(args.branch):
-            raise push.PushRefused(f"branch: {problem}")
-        repo = os.path.abspath(args.repo)
-        _showable("repository path", repo)
-        real, _ident = push._repo_topology(repo)
-        _showable("repository path", real)
-        _showable("remote", canon)
-        call = {"repo": real, "remote": canon, "branch": args.branch, "commit": _branch_tip(real, args.branch)}
-        if filed_input(SimpleNamespace(tool_name=PUSH_TOOL, display=redact_display(PUSH_TOOL, call))) != call:
-            raise ValueError("the push is too long to show the operator whole")
+        call = push_call(args.repo, args.remote, args.branch)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:   # PushRefused is a ValueError
         say(f"levain push: refused, nothing was pushed: {exc}")
         return EXIT_NOT_TAKEN
