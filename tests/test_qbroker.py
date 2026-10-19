@@ -1,7 +1,7 @@
 """F10 S1: the queue broker (levain.qbroker), against a fake CONTROL resolver.
 
 Keys are real ssh-keygen keys; the answer-signer snapshot is signed by a real trust-root key in
-levain-dispatch-config; answers are real SSHSIGs in levain-consent-answer. Sockets live under a short /tmp dir
+levain-allowed-signers; answers are real SSHSIGs in levain-consent-answer. Sockets live under a short /tmp dir
 (macOS caps sun_path at 104 bytes). Peer-uid checks are injected where a test runs as one uid, except the one test
 that holds a real socket to a wrong expected uid.
 """
@@ -27,11 +27,12 @@ from levain.qbroker.broker import Broker, Resolved
 from levain.qbroker.control import ControlResolver
 from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.server import SlotListener, peer_uid
-from levain.qbroker.signers import CONFIG_NAMESPACE, SignersSource
+from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, QueueStore
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 HEAD = {"size": 0, "root": "0" * 64}
+D64 = "sha256:" + "d" * 64
 
 
 class Key:
@@ -66,18 +67,19 @@ class FakeResolver:
 
     def add(self, slot: int, cap: str, resolved: Resolved) -> None:
         import hashlib
-        self.caps[("egress", slot, hashlib.sha256(cap.encode()).hexdigest())] = resolved
+        self.caps[("egress", slot, "sha256:" + hashlib.sha256(cap.encode()).hexdigest())] = resolved
 
     def queue_resolve(self, slot: int, cap_digest: str):
         self.calls.append((slot, cap_digest))
         return self.caps.get((slot["class"], slot["index"], cap_digest), "cap-unknown")
 
 
-def write_signers(root: Path, keys, generation: int, signers=None, *, sign_with="trust") -> None:
+def write_signers(root: Path, keys, generation: int, signers=None, *, sign_with="trust",
+                  namespace="levain-allowed-signers") -> None:
     record = {"format": "levain-allowed-signers/1", "generation": generation, "issued_at": utc_stamp(NOW),
               "signers": signers if signers is not None else [keys["operator"].signer()]}
     body = canonical_bytes(record)
-    sig = keys[sign_with].sign(body, CONFIG_NAMESPACE)
+    sig = keys[sign_with].sign(body, namespace)
     tmp_body, tmp_sig = root / "policy" / ".b", root / "policy" / ".s"
     tmp_body.write_bytes(body)
     tmp_sig.write_text(sig)
@@ -103,7 +105,7 @@ def clock():
 
 SESSION_A = Resolved(session="sess-a", kind="interactive", run=None)
 SESSION_B = Resolved(session="sess-b", kind="interactive", run=None)
-RUN = {"run_id": "run-1", "job_id": "job-1", "run_index": 0, "contract_digest": "c" * 64,
+RUN = {"run_id": "run-1", "job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "c" * 64,
        "model_requested": "sonnet"}
 
 
@@ -179,7 +181,8 @@ def test_a_filed_request_takes_session_slot_kind_from_the_resolve_only(L, broker
     assert oct((L / "queue" / "requests" / f"{got['request_id']}.json").stat().st_mode & 0o777) == "0o640"
     # the raw cap is nowhere on disk
     assert not any(b"cap-a" in p.read_bytes() for p in (L / "queue" / "requests").iterdir())
-    assert resolver.calls[-1][0] == {"class": "egress", "index": 1} and resolver.calls[-1][1] != "cap-a"
+    import hashlib
+    assert resolver.calls[-1] == ({"class": "egress", "index": 1}, "sha256:" + hashlib.sha256(b"cap-a").hexdigest())
 
 
 def test_a_dispatch_row_carries_the_resolved_run_verbatim(L, broker):
@@ -521,13 +524,13 @@ def test_the_control_resolver_speaks_queue_resolve(run_dir):
     t.start()
     try:
         r = ControlResolver(path)
-        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == Resolved(session="s9", kind="dispatch", run=RUN)
-        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "revoked"
-        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"
+        assert r.queue_resolve({"class": "egress", "index": 4}, D64) == Resolved(session="s9", kind="dispatch", run=RUN)
+        assert r.queue_resolve({"class": "egress", "index": 4}, D64) == "revoked"
+        assert r.queue_resolve({"class": "egress", "index": 4}, D64) == "resolve-malformed"
     finally:
         t.join(timeout=10)
         srv.close()
-    assert seen[0] == {"v": 1, "op": "QUEUE-RESOLVE", "id": 1, "slot": {"class": "egress", "index": 4}, "cap_digest": "d" * 64}
+    assert seen[0] == {"v": 1, "op": "QUEUE-RESOLVE", "id": 1, "slot": {"class": "egress", "index": 4}, "cap_digest": D64}
 
 
 def test_an_unreachable_control_fails_closed(L, clock, run_dir):
@@ -680,9 +683,9 @@ def test_control_ok_zero_or_a_true_id_is_refused(run_dir):
     t.start()
     try:
         r = ControlResolver(path)
-        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"   # id 1
+        assert r.queue_resolve({"class": "egress", "index": 4}, D64) == "resolve-malformed"   # id 1
         r2 = ControlResolver(path)
-        assert r2.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"  # id 1 vs True
+        assert r2.queue_resolve({"class": "egress", "index": 4}, D64) == "resolve-malformed"  # id 1 vs True
     finally:
         t.join(timeout=10)
         srv.close()
@@ -744,3 +747,27 @@ def test_a_drip_fed_frame_hits_its_deadline(broker, run_dir):
                 assert got is not None and b"verb-not-allowed" not in got
     finally:
         lst.stop()
+
+
+def test_a_snapshot_signed_in_the_dispatch_config_namespace_is_refused(L, broker, keys):
+    """CONTRACT c6 §3.7: the snapshot's SSHSIG is in its own namespace, never a config item's."""
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"])
+    write_signers(L, keys, 2, namespace="levain-dispatch-config")
+    assert ask(broker, rid)["refused"] == "answer-refused"
+    write_signers(L, keys, 3)
+    assert ask(broker, rid)["decision"] == "allow"
+
+
+def test_an_allowed_signer_reads_as_an_authority_key(L, keys):
+    """The attributes levain.consent.queue's key check reads (key.active, key_class, custody, public_key,
+    fingerprint), so the seam can hand a snapshot to it as its ``authority``."""
+    from levain.authority import DISPLAY_PHONE, PASSKEY, UNSTATED
+    snap = SignersSource(L / "policy", L / "routes" / "trust.pub").current()
+    key = snap.key(keys["operator"].fp)
+    assert (key.active, key.key_class, key.custody) == (True, DISPLAY_PHONE, UNSTATED)
+    assert key.fingerprint == keys["operator"].fp and key.public_key.startswith("ssh-ed25519 ")
+    from levain.qbroker.signers import AllowedSigner
+    sk = AllowedSigner(principal="p", public_key="sk-ecdsa-sha2-nistp256@openssh.com AAAA", fingerprint="SHA256:x",
+                       namespaces=frozenset({"levain-consent-answer"}))
+    assert sk.custody == PASSKEY

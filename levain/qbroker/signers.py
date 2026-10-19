@@ -1,12 +1,12 @@
-"""levain.qbroker.signers — the answer-signer snapshot (CONTRACT c3 §3.7), verified before any answer is.
+"""levain.qbroker.signers — the answer-signer snapshot (CONTRACT c6 §3.7), verified before any answer is.
 
 ``L/policy/allowed_signers.json`` is the canonical ``levain-allowed-signers/1`` record ``{generation, issued_at,
 signers: [{principal, key_type, key_b64, namespaces}]}``; ``allowed_signers.json.sig`` is an SSHSIG over its bytes
-by the dispatch trust root (``L/routes/trust.pub``) in :data:`CONFIG_NAMESPACE`. :class:`SignersSource` re-verifies
-the pair whenever any of the three files changes or the last try could not run the verifier, and accepts a
-generation only when it is strictly greater than the last it accepted (the same bytes read again are not a
-change). While the pair is missing, unverifiable or a
-rollback, :meth:`SignersSource.current` returns ``None`` and every answer is refused (fail closed).
+by the dispatch trust root (``L/routes/trust.pub``) in its own namespace, :data:`SIGNERS_NAMESPACE` (never a config
+item's). :class:`SignersSource` re-verifies the pair whenever any of the three files changes or the last try could
+not run the verifier, and accepts a generation only when it is strictly greater than the last it accepted (the same
+bytes read again are not a change). While the pair is missing, unverifiable or a rollback, :meth:`SignersSource.current` returns ``None`` and
+every answer is refused (fail closed).
 
 The high-water generation lives in this process only: a restarted broker accepts any validly signed generation,
 and only the install helper's own check (strictly greater before the rename) stops a rollback across a restart.
@@ -22,14 +22,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from levain.authority import VerifierUnavailable, verify_link_sig
+from levain.authority import DISPLAY_PHONE, PASSKEY, UNSTATED, VerifierUnavailable, verify_link_sig
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.contracts.keys import fingerprint_line
 
-__all__ = ["CONFIG_NAMESPACE", "SIGNERS_FORMAT", "AllowedSigner", "SignersSnapshot", "SignersSource", "load"]
+__all__ = ["SIGNER_CLASS", "SIGNERS_FORMAT", "SIGNERS_NAMESPACE", "AllowedSigner", "SignersSnapshot",
+           "SignersSource", "load"]
 
-CONFIG_NAMESPACE = "levain-dispatch-config"
+SIGNERS_NAMESPACE = "levain-allowed-signers"
+# an allowed signer carries no class: every one is held to the lowest class that may allow at all (a phone key's)
+SIGNER_CLASS = DISPLAY_PHONE
 SIGNERS_FORMAT = "levain-allowed-signers/1"
 _KEYS = frozenset({"format", "generation", "issued_at", "signers"})
 _SIGNER_KEYS = frozenset({"principal", "key_type", "key_b64", "namespaces"})
@@ -43,10 +46,26 @@ class SignersError(Exception):
 
 @dataclass(frozen=True)
 class AllowedSigner:
+    """One snapshot signer, readable as an authority key (``active``, ``key_class``, ``custody``, ``public_key``,
+    ``fingerprint``: the attributes ``levain.consent.queue``'s answer check reads off ``authority.key(fp)``)."""
     principal: str
     public_key: str
     fingerprint: str
     namespaces: frozenset[str]
+
+    @property
+    def active(self) -> bool:
+        return True               # a removed signer is absent from the snapshot, never listed inactive
+
+    @property
+    def key_class(self) -> str:
+        return SIGNER_CLASS
+
+    @property
+    def custody(self) -> str:
+        # an allowed signer declares no custody; an sk-ecdsa key is held to the passkey checks, every other key
+        # gets only the presence check verify_link_sig makes
+        return PASSKEY if self.public_key.startswith("sk-ecdsa") else UNSTATED
 
 
 @dataclass(frozen=True)
@@ -106,7 +125,7 @@ def load(policy_dir: Path, trust_pub: Path, *, ssh_keygen: Path | str | None = N
     except ContractError as exc:
         raise SignersError(f"trust.pub does not parse: {exc}") from None
     kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
-    if not verify_link_sig(body, sig, public_key=trust_key, fingerprint=trust_fp, namespace=CONFIG_NAMESPACE,
+    if not verify_link_sig(body, sig, public_key=trust_key, fingerprint=trust_fp, namespace=SIGNERS_NAMESPACE,
                            **kwargs):
         raise SignersError("the signers snapshot's signature does not verify by the trust root")
     try:

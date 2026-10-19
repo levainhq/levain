@@ -1,7 +1,7 @@
 """levain.qbroker.broker — the verbs a slot's hook may send, each answered from CONTROL's facts and signed rows only.
 
 ``REQUEST {cap, request}`` files a request: the cap resolves through CONTROL (:class:`Resolver`, by the LISTENER's
-slot and the cap's sha256, never anything the hook claims about itself); the request is re-sealed from its fields,
+slot and the cap's ``sha256:`` digest, never anything the hook claims about itself); the request is re-sealed from its fields,
 so its id is the sealed id; the row takes ``session``, ``slot``, ``kind`` and ``run`` from the resolve only.
 Filing the same sealed request again returns the row already there (before the clock and hold checks, which bound
 new rows only); a new row is refused ``queue-busy`` past :data:`PENDING_PER_SESSION` and ``quota-exhausted`` past
@@ -107,9 +107,10 @@ def slot_ref(index: int) -> dict[str, Any]:
 
 
 def cap_digest(cap: Any) -> str | None:
+    """``sha256:`` + 64 lowercase hex over the cap's UTF-8 bytes (CONTRACT c6: every ``*_digest`` on the wire)."""
     if not isinstance(cap, str) or not cap or len(cap) > CAP_MAX:
         return None
-    return hashlib.sha256(cap.encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(cap.encode("utf-8")).hexdigest()
 
 
 def _quota_key(session: str, run: Mapping[str, Any] | None) -> str:

@@ -27,16 +27,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from levain.authority import DISPLAY_PHONE, VerifierUnavailable, verify_link_sig
+from levain.authority import PASSKEY, VerifierUnavailable, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import _ANSWER_KEYS, class_covers
 from levain.consent.receipt_log import head_problem
 from levain.consent.record import ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message
-from levain.qbroker.signers import SignersSnapshot
+from levain.qbroker.signers import SIGNER_CLASS, SignersSnapshot
 
 __all__ = ["SIGNER_CLASS", "answer_refusal", "request_of"]
 
-SIGNER_CLASS = DISPLAY_PHONE
 _REQUEST_KEYS = frozenset(ExternalGateRequest.__dataclass_fields__)
 
 
@@ -53,8 +52,9 @@ def request_of(fields: Any) -> ExternalGateRequest | None:
 
 # SEAM GAP (routed to B2): replace this body with one call to a pure consent-side check, e.g.
 # levain.consent.queue.answer_refusal(request, queue_id, payload, signature, authority, *, ssh_keygen=None), whose
-# ``authority`` is any object with key(fp) -> {public_key, fingerprint, active, key_class, custody}; the signers
-# snapshot then needs key_class + custody per signer to stand in for it.
+# ``authority`` is any object whose key(fp) has the ATTRIBUTES public_key, fingerprint, active, key_class, custody:
+# a SignersSnapshot already is one (signers.AllowedSigner). The namespace check below is not in that check and
+# stays here, before the call.
 def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers: SignersSnapshot | None,
                    now: datetime, *, ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not authority for the request ``row`` holds; ``None`` when it is."""
@@ -97,11 +97,13 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
         return "the signer is not in the answer-signer snapshot"
     if ANSWER_NAMESPACE not in signer.namespaces:
         return f"the signer may not sign in {ANSWER_NAMESPACE}"
-    if decision == "allow" and not class_covers(SIGNER_CLASS, request.tier):
-        return f"an allowed signer (held to class {SIGNER_CLASS}) does not cover {request.tier}"
+    if not signer.active:
+        return "the signer is not active"
+    if decision == "allow" and not class_covers(signer.key_class, request.tier):
+        return f"an allowed signer (held to class {signer.key_class}) does not cover {request.tier}"
     if not isinstance(signature, str) or not signature:
         return "the answer carries no signature"
-    if signer.public_key.startswith("sk-ecdsa"):
+    if signer.custody == PASSKEY:
         from levain.consent.passkey import answer_signature_problem
 
         problem = answer_signature_problem(signature, signer.public_key)
