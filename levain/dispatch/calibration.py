@@ -20,6 +20,13 @@ because it is meant to read the queue without writing it; this module writes not
 
 Each label carries its action class, ``(agent, tool_name, tier)``, the request id and when it was decided.
 
+A judge is REPLAYED over those labels (:func:`replay`, :func:`report`): it is shown each request as the consent listing
+shows it (agent, tool, the input display, tier; never the human's decision, signer, ruling or request id) and answers
+allow, deny or abstain. This slice calls no real model, on purpose. A real judge needs the gateway (wave 3), and a
+consent request's content is the operator's own commands: sending it to a provider is a data-boundary decision that
+belongs to that gateway, not to this layer. So :func:`replay` refuses any judge not marked ``local``, which keeps a raw
+API client from being wired in by accident until a gateway-backed judge exists.
+
 The honest limit is stated once, in :data:`CAVEAT`, and repeated by every report that prints a number. Stdlib only.
 """
 from __future__ import annotations
@@ -29,12 +36,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from levain.consent.listing import ConsentEntry, read_listing
 from levain.dispatch import DispatchError
 
-__all__ = ["ActionClass", "CAVEAT", "ClassReport", "DEFAULT_SPAN", "Label", "LabelSet", "PREDICTIONS", "agreement",
-           "deny_rate", "proposal_eligible", "read_labels"]
+__all__ = ["ActionClass", "CAVEAT", "ClassReport", "DEFAULT_SPAN", "Judge", "JudgeContext", "Label", "LabelSet",
+           "PREDICTIONS", "ClassEntry", "Replay", "ReplayReport", "agreement", "deny_rate", "proposal_eligible", "read_labels",
+           "replay", "report"]
 
 CAVEAT = ("Labels exist only for what was asked: a call the gate never held has no label. They include stamps: a human "
           "allow can be a rubber stamp. So agreement measures agreement with his record, not correctness.")
@@ -63,16 +72,34 @@ class LabelSet:
     (see the module docstring), how many rows the reader skipped because they did not check out, and whether the set
     is ``incomplete``: the queue listing overflowed its cap (more undecided requests than it reads, or more pending,
     which it does not tell apart), so some requests were not read at all. Every report built from an incomplete set
-    says so, and :func:`proposal_eligible` refuses it."""
+    says so, and :func:`proposal_eligible` refuses it. ``contexts`` maps a request id to what a judge may see of it
+    (:class:`JudgeContext`)."""
     labels: tuple[Label, ...] = ()
     excluded_grants: int = 0
     skipped: int = 0
     incomplete: bool = False
+    contexts: Mapping[str, "JudgeContext"] = field(default_factory=dict, compare=False)
+
+
+@dataclass(frozen=True)
+class JudgeContext:
+    """The raw request as the consent listing shows it, and nothing of the answer: the agent, the tool, the input
+    display and the tier. No decision, signer, ruling, grant, timestamp or request id is a field, so none can reach a
+    judge."""
+    agent: str
+    tool_name: str
+    display: str
+    tier: str
 
 
 def _class_of(entry: ConsentEntry) -> ActionClass:
     r = entry.request
     return (r.agent, r.tool_name, r.tier)
+
+
+def _context_of(entry: ConsentEntry) -> JudgeContext:
+    r = entry.request
+    return JudgeContext(r.agent, r.tool_name, r.display, r.tier)
 
 
 def read_labels(directory: Path | str | None = None, *, now: datetime, span: timedelta = DEFAULT_SPAN) -> LabelSet:
@@ -83,6 +110,7 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
         raise DispatchError("read_labels needs an aware now (a naive datetime has no zone to compare stamps in)")
     listing = read_listing(directory, now=now, span=span, cap=_NO_CAP)
     labels: list[Label] = []
+    contexts: dict[str, JudgeContext] = {}
     grants = 0
     for entry in (*listing.recent, *listing.undecided):
         if entry.state == "undecided":
@@ -91,11 +119,12 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
             if entry.via == "grant":
                 grants += 1
             elif entry.via in ("signature", "ruling"):
+                contexts[entry.request.id] = _context_of(entry)
                 labels.append(Label(entry.request.id, _class_of(entry), "allow" if entry.state == "allowed" else "deny",
                                     entry.via, entry.decided_at))
             # an allowed or denied row with any other via carries no signed judgment this layer can name: left out
     labels.sort(key=lambda lab: (lab.decided_at or "", lab.request_id))
-    return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow)
+    return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow, contexts)
 
 
 def _unique(labels: Iterable[Label] | LabelSet, incomplete: bool | None) -> tuple[list[Label], bool]:
@@ -280,3 +309,102 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
     if got is None or base is None or got <= base:
         why.append(f"does not beat the always-allow baseline ({base}) over the same requests")
     return (False, "; ".join(why)) if why else (True, "")
+
+
+# --- the judge replay ------------------------------------------------------------------------------------------
+
+@runtime_checkable
+class Judge(Protocol):
+    """A candidate decision model. ``local`` must be ``True`` for :func:`replay` to run it (see the module
+    docstring). ``predict`` gets the request as a :class:`JudgeContext` and returns ``"allow"``, ``"deny"`` or
+    ``"abstain"``. A judge never authorises; its word is scored, never acted on."""
+    local: bool
+
+    def predict(self, context: JudgeContext) -> str: ...
+
+
+@dataclass(frozen=True)
+class Replay:
+    """What :func:`replay` got: ``predictions`` (request id -> allow, deny or abstain) for every replayed request,
+    ``raised`` (request id -> the exception's class name) for the ones where the judge raised or answered something
+    outside the three words; each of those is recorded in ``predictions`` as ``abstain``. ``replayed`` the request ids
+    shown to the judge, in order."""
+    predictions: Mapping[str, str]
+    raised: Mapping[str, str]
+    replayed: tuple[str, ...]
+
+
+def replay(labels: LabelSet, judge: Judge, *, limit: int | None = None) -> Replay:
+    """Show ``judge`` each allow/deny request in ``labels`` (oldest decision first; at most ``limit``) and record its
+    answer. Undecided requests are not shown: there is no human judgment to score. A judge exception is an
+    ``abstain`` recorded with its class name, never a crash and never a guess. ``labels`` must be a
+    :class:`LabelSet` from :func:`read_labels`: a bare list carries no request content to show."""
+    if getattr(judge, "local", None) is not True or not callable(getattr(judge, "predict", None)):
+        raise DispatchError("replay runs only a judge marked local (judge.local is True) with a predict method: no real "
+                            "model is called until a gateway-backed judge exists")
+    if not isinstance(labels, LabelSet):
+        raise DispatchError("replay needs the LabelSet read_labels returns (it carries the request contexts)")
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise DispatchError("limit must be a non-negative integer")
+    unique, _ = _unique(labels, None)
+    todo = [lab for lab in unique if lab.decision != "undecided"]
+    if limit is not None:
+        todo = todo[:limit]
+    predictions: dict[str, str] = {}
+    raised: dict[str, str] = {}
+    for lab in todo:
+        context = labels.contexts.get(lab.request_id)
+        if context is None:
+            raise DispatchError(f"request {lab.request_id!r} has no context to show the judge")
+        try:
+            said = judge.predict(context)
+        except Exception as exc:                                # noqa: BLE001 - any judge failure is an abstain
+            predictions[lab.request_id], raised[lab.request_id] = "abstain", type(exc).__name__
+            continue
+        if said not in PREDICTIONS:
+            predictions[lab.request_id], raised[lab.request_id] = "abstain", "InvalidPrediction"
+        else:
+            predictions[lab.request_id] = said
+    return Replay(predictions, raised, tuple(lab.request_id for lab in todo))
+
+
+@dataclass(frozen=True)
+class ClassEntry:
+    """One action class in a :class:`ReplayReport`: the agreement report, his deny rate, and the proposal verdict
+    (``eligible`` and ``why_not``; the card may show an offer only on ``True``)."""
+    report: ClassReport
+    deny_rate: DenyRate
+    eligible: bool
+    why_not: str
+
+
+@dataclass(frozen=True)
+class ReplayReport:
+    """A judge's replay as plain data: per action class entries, how many requests the judge was shown and how many
+    raised, the caveat, and ``incomplete`` (the queue listing overflowed, or ``limit`` cut the replay short: either
+    way the counts are a sample and no proposal rests on them)."""
+    classes: Mapping[ActionClass, ClassEntry]
+    replayed: int
+    raised: int
+    incomplete: bool
+    caveat: str = CAVEAT
+
+
+def report(labels: LabelSet, judge: Judge, *, min_n: int, min_agreement: Fraction | int | float | str,
+           min_coverage: Fraction | int | float | str, max_dangerous: int, limit: int | None = None) -> ReplayReport:
+    """:func:`replay` + :func:`agreement` + :func:`deny_rate` + :data:`CAVEAT` + :func:`proposal_eligible`, per action
+    class. The thresholds are required: this layer owns no default for what is enough. A ``limit`` that cut the
+    replay marks the report incomplete, since the unreplayed requests would otherwise read as abstentions."""
+    run = replay(labels, judge, limit=limit)
+    shown = set(run.replayed)
+    sample = [lab for lab in labels.labels if lab.request_id in shown]
+    cut = limit is not None and len(run.replayed) < sum(1 for lab in labels.labels if lab.decision != "undecided")
+    incomplete = labels.incomplete or cut
+    agreed = agreement(sample, run.predictions, incomplete=incomplete)
+    rates = deny_rate(sample, incomplete=incomplete)
+    classes: dict[ActionClass, ClassEntry] = {}
+    for cls, rep_ in agreed.items():
+        ok, why = proposal_eligible(rep_, min_n=min_n, min_agreement=min_agreement, min_coverage=min_coverage,
+                                    max_dangerous=max_dangerous)
+        classes[cls] = ClassEntry(rep_, rates[cls], ok, why)
+    return ReplayReport(classes, len(run.replayed), len(run.raised), incomplete)

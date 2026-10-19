@@ -17,8 +17,10 @@ The store is its own file (``outcomes.db`` in the dispatch directory, the operat
 triggers refuse an update, a delete and a replace. Nothing in it is authority; it is a record to read.
 
 The rollup is hierarchical and counts RUNS: a run is a (job, run index) pair, counted once per cell however many labels it
-carries. A rate is shown only where a cell holds at least ``min_n`` runs; below that the cell reports its N and the caller
-shows the coarser line (:func:`finest_reporting`). Rates are exact fractions, never floats. Stdlib only.
+carries. Each label divides by its OWN denominator (``DENOMINATORS``): the runs that could have carried it. A run still
+awaiting a human is not a miss against the adopted rate, and a run that never reached a verifier is not one against the
+verifier rate. A rate is shown only where that label's N is at least ``min_n``; below that the cell reports the N and the
+caller shows the coarser line (:func:`finest_reporting`). Rates are exact fractions, never floats. Stdlib only.
 """
 from __future__ import annotations
 
@@ -27,7 +29,8 @@ import sqlite3
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 
@@ -36,11 +39,12 @@ from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import parse_stamp
 from levain.dispatch import DispatchError
 
-__all__ = ["Cell", "DB_NAME", "FORMAT", "LABELS", "OutcomeRow", "OutcomeStore", "REVERTED_CAVEAT", "SOURCES",
-           "VERIFIER_KINDS", "VERIFIER_LABELS", "cell_line", "default_directory", "finest_reporting", "rollup"]
+__all__ = ["Cell", "DB_NAME", "DENOMINATORS", "FORMAT", "LABELS", "OutcomeRow", "OutcomeStore", "Panel", "PanelEntry",
+           "PanelRow", "REVERTED_CAVEAT", "REVERT_WINDOW", "SOURCES", "VERIFIER_KINDS", "VERIFIER_LABELS", "cell_line",
+           "default_directory", "finest_reporting", "panel", "rollup"]
 
 DB_NAME = "outcomes.db"
-FORMAT = "levain-dispatch-outcomes/1"
+FORMAT = "levain-dispatch-outcomes/2"
 UNKNOWN = "unknown"
 _ACCESS_BY_OTHERS = 0o077
 _FIELD_MAX = 200
@@ -64,11 +68,17 @@ SOURCES: Mapping[str, str] = {
     "gated_undecided": "machine",
     "gated_allowed": "human",
     "gated_denied": "human",
+    # the job store's terminal state for a run that did not end adopted (failed or cancelled): the fact that makes a
+    # run's decision FINAL without an adoption, so the adopted and authorised rates can leave out runs still waiting
+    "closed_without_adoption": "machine",
 }
 LABELS: tuple[str, ...] = tuple(SOURCES)
 VERIFIER_LABELS: frozenset[str] = frozenset({"verifier_pass", "verifier_fail"})
 # an in-process verifier runs inside the executor's reach and is forgeable; the ledger records which kind spoke
 VERIFIER_KINDS: tuple[str, ...] = ("black-box", "in-process")
+
+# how long an adoption must have stood before its revert label can exist
+REVERT_WINDOW = timedelta(days=14)
 
 REVERTED_CAVEAT = ("reverted_14d is survivor-biased: only a commit someone looked at again within 14 days can be "
                    "reverted, so a low rate is not proof of quality.")
@@ -309,18 +319,49 @@ class OutcomeStore:
 
 _LEVELS = ("model", "route", "harness", "template")
 
+# label -> (denominator group, the words that name its N). A run is in a group's N when it carries one of the group's
+# qualifying labels (``_QUALIFIES``); the group's labels are counted among those runs only, so no rate can pass 1.
+_GROUP: Mapping[str, str] = {
+    "verifier_pass": "verifier", "verifier_fail": "verifier",
+    "contrast_clean": "contrast", "contrast_divergent": "contrast",
+    "planner_recommends": "planner", "planner_refiles": "planner",
+    "authorised": "decision", "adopted": "decision",
+    "reverted_14d": "revert",
+    "gated_filed": "gated", "gated_allowed": "gated", "gated_denied": "gated", "gated_undecided": "gated",
+    "closed_without_adoption": "decision",
+}
+_GROUP_WORDS: Mapping[str, str] = {
+    "verifier": "with a final verifier label",
+    "contrast": "with a contrast label",
+    "planner": "with a planner label",
+    "decision": "with a final decision",
+    "revert": "adopted 14 or more days ago",
+    "gated": "gated calls filed",
+}
+DENOMINATORS: Mapping[str, str] = {label: _GROUP_WORDS[_GROUP[label]] for label in LABELS}
+# the labels whose presence puts a run in the group's N; the revert group is decided by an adoption's age
+_QUALIFIES: Mapping[str, frozenset[str]] = {
+    "verifier": VERIFIER_LABELS,
+    "contrast": frozenset({"contrast_clean", "contrast_divergent"}),
+    "planner": frozenset({"planner_recommends", "planner_refiles"}),
+    "decision": frozenset({"adopted", "closed_without_adoption"}),
+    "gated": frozenset({"gated_filed"}),
+}
+
 
 @dataclass(frozen=True)
 class Cell:
     """One rollup cell. ``key`` is the path down the hierarchy, 1 to 4 parts: ``(model,)``, then route, harness,
     template. The model part is ``(name, basis)`` with basis ``"answered"`` or ``"requested"``: a model the gateway
     never saw answer is keyed by what was asked for and marked, never merged with an answered one. ``n`` is the
-    distinct runs counted; ``counts`` the distinct runs carrying each label; ``min_n`` the floor below which no
-    rate is shown."""
+    distinct runs counted; ``counts`` the distinct runs carrying each label among that label's denominator runs;
+    ``denoms`` each label's N (``DENOMINATORS`` names what it counts); ``min_n`` the floor below which no rate is
+    shown for a label."""
     key: tuple
     n: int
     counts: Mapping[str, int]
     min_n: int
+    denoms: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def level(self) -> int:
@@ -330,11 +371,21 @@ class Cell:
     def reporting(self) -> bool:
         return self.n >= self.min_n
 
-    def rate(self, label: str) -> Fraction | None:
-        """``count / n`` as an exact fraction, or ``None`` below ``min_n`` (the cell then reports only its N)."""
+    def denominator(self, label: str) -> int:
+        """``label``'s own N in this cell."""
         if label not in SOURCES:
             raise DispatchError(f"unknown label {label!r}")
-        return Fraction(self.counts.get(label, 0), self.n) if self.reporting and self.n else None
+        return self.denoms.get(label, 0)
+
+    def reporting_for(self, label: str) -> bool:
+        """Whether ``label``'s own N reaches ``min_n``."""
+        return self.denominator(label) >= self.min_n
+
+    def rate(self, label: str) -> Fraction | None:
+        """``count / N`` over the label's own denominator as an exact fraction, or ``None`` below ``min_n`` (the
+        cell then reports only that N)."""
+        n = self.denominator(label)
+        return Fraction(self.counts.get(label, 0), n) if n and n >= self.min_n else None
 
 
 def _model_key(row: OutcomeRow) -> tuple[str, str]:
@@ -343,48 +394,57 @@ def _model_key(row: OutcomeRow) -> tuple[str, str]:
     return (row.model_requested, "requested")
 
 
-def rollup(rows: Iterable[OutcomeRow], *, min_n: int) -> dict[tuple, Cell]:
+def rollup(rows: Iterable[OutcomeRow], *, min_n: int, now: datetime | None = None) -> dict[tuple, Cell]:
     """Roll ``rows`` up model -> model×route -> model×route×harness -> model×route×harness×template, one
     :class:`Cell` per distinct key at each level. A run's facts come from its first row in ``rows``; the store
-    refuses a row that disagrees, so a list read from it never holds two versions of a run."""
+    refuses a row that disagrees, so a list read from it never holds two versions of a run. ``now`` (aware; the
+    present when omitted) fixes which adoptions are old enough for the ``reverted_14d`` denominator."""
     if type(min_n) is not int or min_n < 1:
         raise DispatchError("min_n must be a positive integer")
-    runs: dict[tuple[str, int], tuple[tuple, set[str]]] = {}
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise DispatchError("rollup needs an aware now")
+    cutoff = now - REVERT_WINDOW
+    runs: dict[tuple[str, int], tuple[tuple, dict[str, str]]] = {}
     for row in rows:
         entry = runs.get(row.run)
         if entry is None:
             path = (_model_key(row), row.route, row.harness, row.template_id)
-            entry = runs[row.run] = (path, set())
-        entry[1].add(row.label)
+            entry = runs[row.run] = (path, {})
+        entry[1].setdefault(row.label, row.at)
     counts: dict[tuple, dict[str, int]] = {}
+    denoms: dict[tuple, dict[str, int]] = {}
     totals: dict[tuple, int] = {}
     for path, labels in runs.values():
+        in_group = {g for g, qual in _QUALIFIES.items() if qual & labels.keys()}
+        if "adopted" in labels and parse_stamp(labels["adopted"]) <= cutoff:
+            in_group.add("revert")
         for depth in range(1, len(_LEVELS) + 1):
             key = path[:depth]
             totals[key] = totals.get(key, 0) + 1
-            per = counts.setdefault(key, {})
-            for label in labels:
-                per[label] = per.get(label, 0) + 1
-    return {key: Cell(key, totals[key], dict(counts[key]), min_n) for key in totals}
+            per, den = counts.setdefault(key, {}), denoms.setdefault(key, {})
+            for label in LABELS:
+                if _GROUP[label] in in_group:
+                    den[label] = den.get(label, 0) + 1
+                    if label in labels:
+                        per[label] = per.get(label, 0) + 1
+    return {key: Cell(key, totals[key], dict(counts[key]), min_n, dict(denoms[key])) for key in totals}
 
 
-def finest_reporting(cells: Mapping[tuple, Cell], key: tuple) -> Cell | None:
+def finest_reporting(cells: Mapping[tuple, Cell], key: tuple, label: str | None = None) -> Cell | None:
     """The finest cell on ``key``'s path (``key`` itself, then each coarser prefix) that has at least ``min_n``
-    runs, or ``None`` when even the model's own cell is below it. This is the coarser line a thin cell falls back
-    to."""
+    runs, or ``None`` when even the model's own cell is below it. With ``label`` the test is that label's own N,
+    since one cell can report a verifier rate and not an adopted one. This is the coarser line a thin cell falls
+    back to."""
     for depth in range(len(key), 0, -1):
         cell = cells.get(key[:depth])
-        if cell is not None and cell.reporting:
+        if cell is not None and (cell.reporting if label is None else cell.reporting_for(label)):
             return cell
     return None
 
 
-def cell_line(cell: Cell, label: str = "adopted") -> str:
-    """The panel line for ``cell`` and ``label``: ``glm-5.2, R0 `fix-lint`: 41/48 adopted (N=48)``, the harness
-    between route and template when the cell is that deep. A cell below ``min_n`` shows only its N. A
-    ``reverted_14d`` line carries the survivor-bias caveat on a line of its own."""
-    if label not in SOURCES:
-        raise DispatchError(f"unknown label {label!r}")
+def _head(cell: Cell) -> str:
     name, basis = cell.key[0]
     parts = [name if basis == "answered" else f"{name} (requested; answering model unknown)"]
     if cell.level >= 2:
@@ -394,9 +454,99 @@ def cell_line(cell: Cell, label: str = "adopted") -> str:
     head = ", ".join(parts)
     if cell.level >= 4:
         head += f" `{cell.key[3]}`"
-    if cell.reporting:
-        line = f"{head}: {cell.counts.get(label, 0)}/{cell.n} {label.replace('_', ' ')} (N={cell.n})"
+    return head
+
+
+def cell_line(cell: Cell, label: str = "adopted") -> str:
+    """The panel line for ``cell`` and ``label``: ``glm-5.2, R0 `fix-lint`: 41/48 adopted (N=48 with a final
+    decision)``, the harness between route and template when the cell is that deep. The N is the label's own
+    denominator and is named. A label below ``min_n`` shows only its N. A ``reverted_14d`` line carries the
+    survivor-bias caveat on a line of its own."""
+    if label not in SOURCES:
+        raise DispatchError(f"unknown label {label!r}")
+    head = _head(cell)
+    n, words = cell.denominator(label), DENOMINATORS[label]
+    if cell.reporting_for(label):
+        line = f"{head}: {cell.counts.get(label, 0)}/{n} {label.replace('_', ' ')} (N={n} {words})"
     else:
-        line = f"{head}: N={cell.n}, below min_n={cell.min_n}: no rate shown"
+        line = f"{head}: N={n} {words}, below min_n={cell.min_n}: no rate shown"
     return f"{line}\n{REVERTED_CAVEAT}" if label == "reverted_14d" else line
 
+
+# --- the panel's data ------------------------------------------------------------------------------------------
+
+BELOW_MIN_N = "below min_n"
+
+
+@dataclass(frozen=True)
+class PanelEntry:
+    """One label on one reporting path. ``cell`` is the key of the cell the numbers come from: the leaf's own when
+    its N reaches ``min_n``, else the finest coarser cell that does (``fell_back``), else the leaf itself with
+    ``rate`` the string ``"below min_n"``. ``count`` and ``n`` are that cell's; ``n`` is the label's own denominator
+    (``words`` names it)."""
+    label: str
+    count: int
+    n: int
+    rate: Fraction | str
+    words: str
+    cell: tuple
+    fell_back: bool
+
+
+@dataclass(frozen=True)
+class PanelRow:
+    """One finest cell (model, route, harness, template) and its labels. ``model_known`` is False for a model the
+    gateway never saw answer: such rows are keyed by the model asked for and listed apart, after the answered ones."""
+    key: tuple
+    model: str
+    model_known: bool
+    entries: tuple[PanelEntry, ...]
+
+
+@dataclass(frozen=True)
+class Panel:
+    """Plain data for a cockpit provider: no markup. ``rows`` answered-model rows first, then the answer-unknown
+    group; ``caveats`` the lines a renderer must print with the numbers."""
+    min_n: int
+    rows: tuple[PanelRow, ...]
+    caveats: tuple[str, ...]
+
+
+def panel(cells: Mapping[tuple, Cell], *, min_n: int) -> Panel:
+    """The panel's data from a :func:`rollup`: per finest cell, per label, ``(count, N, rate)`` with the label's own
+    N, the rate the string ``"below min_n"`` where no cell on the path reaches it, plus the caveat lines. ``min_n``
+    must be the one the rollup used (a mismatch is refused: a panel judging by another floor than its cells were
+    built with would print a rate the cell line withholds).
+
+    Rows whose answering model was not recorded are grouped and marked, never merged with an answered model. The
+    gateway-side field that would fill ``model_answered`` is intended work (F5, dated 2026-10-19); until it lands
+    those rows are the common case, not an error."""
+    if type(min_n) is not int or min_n < 1:
+        raise DispatchError("min_n must be a positive integer")
+    if any(c.min_n != min_n for c in cells.values()):
+        raise DispatchError("panel min_n must equal the min_n the cells were rolled up with")
+    rows: list[PanelRow] = []
+    for key in sorted((k for k in cells if len(k) == len(_LEVELS)), key=repr):
+        entries: list[PanelEntry] = []
+        for label in LABELS:
+            leaf = cells[key]
+            cell = finest_reporting(cells, key, label)
+            if cell is None:
+                if leaf.denominator(label) == 0 and not any(
+                        cells[key[:d]].denominator(label) for d in range(1, len(key))):
+                    continue                                            # nothing on this path could carry the label
+                entries.append(PanelEntry(label, leaf.counts.get(label, 0), leaf.denominator(label), BELOW_MIN_N,
+                                          DENOMINATORS[label], key, False))
+            else:
+                entries.append(PanelEntry(label, cell.counts.get(label, 0), cell.denominator(label),
+                                          cell.rate(label), DENOMINATORS[label], cell.key, cell.key != key))
+        name, basis = key[0]
+        rows.append(PanelRow(key, name, basis == "answered", tuple(entries)))
+    rows.sort(key=lambda r: not r.model_known)                          # stable: answered first, then unknown
+    caveats: list[str] = []
+    if any(e.label == "reverted_14d" for r in rows for e in r.entries):
+        caveats.append(REVERTED_CAVEAT)
+    if any(not r.model_known for r in rows):
+        caveats.append("Rows marked answering-model-unknown are keyed by the model asked for; the model that "
+                       "actually answered was not recorded, so they are not merged with answered ones.")
+    return Panel(min_n, tuple(rows), tuple(caveats))

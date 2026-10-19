@@ -311,3 +311,119 @@ def test_a_plain_label_list_must_state_whether_it_is_complete():
         agreement(cut, {"1": "allow"})
     with pytest.raises(DispatchError, match="incomplete="):
         deny_rate(cut)
+
+
+# --- F8 slice b: the judge replay -------------------------------------------------------------------------------
+
+from dataclasses import fields  # noqa: E402
+
+from levain.dispatch.calibration import JudgeContext, replay, report  # noqa: E402
+
+
+class Fixed:
+    local = True
+
+    def __init__(self, said):
+        self.said, self.seen = said, []
+
+    def predict(self, context):
+        self.seen.append(context)
+        return self.said
+
+
+def seeded(queue, keys, denies=2, allows=4):
+    reqs = [file_req(queue) for _ in range(denies + allows)]
+    for i, r in enumerate(reqs):
+        decide(queue, keys, r, "deny" if i < denies else "allow")
+    return read_labels(queue.directory, now=at(queue)), reqs
+
+
+def test_the_judge_sees_the_request_and_no_part_of_the_answer(queue, keys):
+    got, reqs = seeded(queue, keys)
+    assert {f.name for f in fields(JudgeContext)} == {"agent", "tool_name", "display", "tier"}
+    judge = Fixed("allow")
+    replay(got, judge)
+    assert len(judge.seen) == 6 and all(type(c) is JudgeContext for c in judge.seen)
+    blob = " ".join(repr(c) for c in judge.seen)
+    for r in reqs:
+        assert r.id not in blob                                          # the id is not shown
+    for word in ("signature", "ruling", "grant", "phone", "denied", "allowed"):
+        assert word not in blob
+    assert judge.seen[0].tool_name == "Edit" and judge.seen[0].tier == "T2" and judge.seen[0].agent == "claude_code"
+    assert "touch /tmp/x" in judge.seen[0].display
+
+
+def test_a_judge_that_raises_is_an_abstain_with_its_class_name(queue, keys):
+    got, _ = seeded(queue, keys)
+
+    class Boom:
+        local = True
+
+        def predict(self, context):
+            raise KeyError("x")
+
+    run = replay(got, Boom())
+    assert set(run.predictions.values()) == {"abstain"} and set(run.raised.values()) == {"KeyError"}
+    assert len(run.raised) == 6
+
+    class Weird(Boom):
+        def predict(self, context):
+            return "maybe"
+
+    assert set(replay(got, Weird()).raised.values()) == {"InvalidPrediction"}
+
+
+def test_a_judge_not_marked_local_is_refused(queue, keys):
+    got, _ = seeded(queue, keys)
+
+    class Remote:
+        local = False
+
+        def predict(self, context):
+            return "allow"
+
+    class Unmarked:
+        def predict(self, context):
+            return "allow"
+
+    for judge in (Remote(), Unmarked()):
+        with pytest.raises(DispatchError, match="local"):
+            replay(got, judge)
+        with pytest.raises(DispatchError, match="local"):
+            report(got, judge, min_n=1, min_agreement=0, min_coverage=0, max_dangerous=0)
+
+
+def test_replay_needs_a_label_set_and_skips_the_undecided(queue, keys):
+    got, _ = seeded(queue, keys, 1, 1)
+    with pytest.raises(DispatchError, match="LabelSet"):
+        replay(list(got.labels), Fixed("allow"))
+    queue_req = file_req(queue)
+    queue.mark_undecided(queue_req.id)
+    both = read_labels(queue.directory, now=NOW + timedelta(minutes=10))
+    assert any(lab.decision == "undecided" for lab in both.labels)
+    judge = Fixed("deny")
+    assert len(replay(both, judge).replayed) == 2 and len(judge.seen) == 2
+
+
+def test_report_end_to_end_on_a_real_queue_with_both_fixture_judges(queue, keys):
+    got, _ = seeded(queue, keys, denies=2, allows=4)
+    kw = dict(min_n=6, min_agreement="0.9", min_coverage=1, max_dangerous=0)
+    allow = report(got, Fixed("allow"), **kw)
+    deny = report(got, Fixed("deny"), **kw)
+    cls = ("claude_code", "Edit", "T2")
+    a, d = allow.classes[cls], deny.classes[cls]
+    assert (a.deny_rate.n, a.deny_rate.denies, a.deny_rate.rate) == (6, 2, Fraction(1, 3))
+    assert a.report.agreement == Fraction(4, 6) == a.report.baseline_agreement      # always-allow IS the baseline
+    assert (a.report.judge_allow_human_deny, d.report.judge_deny_human_allow) == (2, 4)
+    assert d.report.agreement == Fraction(2, 6)
+    assert not a.eligible and "does not beat the always-allow baseline" in a.why_not
+    assert not d.eligible
+    assert allow.caveat == CAVEAT and (allow.replayed, allow.raised, allow.incomplete) == (6, 0, False)
+
+
+def test_a_limit_samples_and_the_report_says_it_is_incomplete(queue, keys):
+    got, _ = seeded(queue, keys)
+    rep = report(got, Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0, max_dangerous=9, limit=3)
+    entry = rep.classes[("claude_code", "Edit", "T2")]
+    assert rep.replayed == 3 and rep.incomplete and entry.report.n_labelled == 3
+    assert not entry.eligible and "incomplete" in entry.why_not
