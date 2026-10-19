@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -124,6 +125,19 @@ def test_s4_a_subscription_that_cannot_be_prepared_is_retired(tmp_path, monkeypa
     got = dict(sender.send(tmp_path, kind="test", ref=None, title="t", body="b"))
     assert got[bad] == 0 and got[good] == 201
     assert [r["id"] for r in store.live_subscriptions()] == [good]
+
+
+def test_s4_a_store_fault_on_the_vapid_token_keeps_the_subscription(tmp_path, monkeypatch):
+    store = PushStore(tmp_path)
+    p, a = _ua_keys()
+    sid = store.add_subscription(FCM, p, a, "d")
+
+    def busy(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sender.vapid, "authorization", busy)
+    assert dict(sender.send(tmp_path, kind="test", ref=None, title="t", body="b"))[sid] == 0
+    assert [r["id"] for r in store.live_subscriptions()] == [sid]
 
 
 def test_s5_a_send_child_exception_lands_in_a_bounded_log_and_exits_nonzero(tmp_path, monkeypatch):
