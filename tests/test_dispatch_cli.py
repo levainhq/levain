@@ -39,6 +39,8 @@ def ddir(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(dcli, "resolvers", lambda: (registry(), POLICY))
     # the suite itself runs under claude or codex; the operator's terminal has neither for an ancestor
+    from levain.consent import band
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([]))
     monkeypatch.setattr(dcli, "agent_caller", lambda: None, raising=False)
     return d
 
@@ -482,3 +484,171 @@ def test_render_escapes_every_field_it_shows(ddir, contract_file, capsys, monkey
     text = dcli.render(job)
     assert "\x9b" not in text and "\x1b" not in text and "\u202e" not in text
     assert "fix\\u009blint" in text and "glm\\u001b[2J" in text and "filed\\u202e" in text
+
+
+# --- fix round 2 ---------------------------------------------------------------------------------------------------
+
+def _faulty_reads(monkeypatch, failures):
+    """JobStore.get raises a disk fault on its first ``failures`` calls, then reads for real."""
+    real_get, calls = JobStore.get, {"n": 0}
+
+    def get(self, job_id):
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_get(self, job_id)
+
+    monkeypatch.setattr(JobStore, "get", get)
+
+
+@pytest.mark.parametrize("failures", [1, 99])
+def test_a_store_fault_on_the_first_read_of_sign_says_nothing_was_signed(capsys, ddir, contract_file, keys, log,
+                                                                         monkeypatch, failures):
+    # codex OPEN 1b: the job load before the confirm sat outside the guard
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    _faulty_reads(monkeypatch, failures)
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and "could not do it (OperationalError)" in out
+    state = "filed" if failures == 1 else "state unknown: the store could not be read"
+    assert f"nothing was signed; job {job_id} is unchanged ({state})" in out, out
+    monkeypatch.undo()
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+@pytest.mark.parametrize("failures", [1, 99])
+def test_a_store_fault_on_the_first_read_of_a_human_cancel_says_not_cancelled(capsys, ddir, contract_file, keys, log,
+                                                                              monkeypatch, failures):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    _faulty_reads(monkeypatch, failures)
+    code, out, _ = run(capsys, *_cancel_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and "could not do it (OperationalError)" in out
+    want = ("it is still filed and holds its files" if failures == 1
+            else "its state is unknown: the store could not be read")
+    assert f"job {job_id} is NOT cancelled; {want}" in out, out
+
+
+def test_a_record_fault_on_a_planner_cancel_says_not_cancelled(capsys, ddir, contract_file):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    os.chmod(ddir / "capabilities", 0o755)
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    assert code == 3 and "CapabilityRecordError" in out
+    assert f"job {job_id} is NOT cancelled; it is still filed and holds its files" in out, out
+
+
+def test_a_store_fault_names_an_unknown_job_id_escaped(capsys, ddir, keys, log, monkeypatch):
+    _faulty_reads(monkeypatch, 99)
+    code, out, _ = run(capsys, *_sign_argv(ddir, "dj-\x1b[2J", keys, log, "--yes"))
+    assert code == 3 and "\x1b" not in out and "dj-\\u001b[2J" in out
+
+
+@pytest.mark.parametrize("verb", ["cancel", "recommend", "file"])
+def test_a_codex_process_cannot_claim_another_agents_session(capsys, ddir, contract_file, monkeypatch, verb):
+    # codex OPEN 4: a supplied --agent suppressed detection, so Codex read a Claude Code session's record
+    job_id = file_one(capsys, ddir, contract_file, session="sess-other")["id"]
+    monkeypatch.setenv("CODEX_THREAD_ID", "thr-1")
+    target = str(contract_file) if verb == "file" else job_id
+    code, out, _ = run(capsys, verb, target, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-other")
+    assert code == 2 and "--agent 'claude_code' is not the agent this process runs under (codex" in out, out
+    assert [j.state for j in JobStore(ddir).list()] == ["filed"]
+
+
+def test_a_codex_ancestor_wins_over_a_claude_environment(capsys, ddir, contract_file, monkeypatch):
+    # a Codex run from a Claude Code shell inherits Claude Code's variables; the ancestor decides, not the flag
+    from levain.consent import band
+    job_id = file_one(capsys, ddir, contract_file, session="sess-other")["id"]
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(42, ["/usr/local/bin/codex", "exec"])]))
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-other")
+    assert code == 2 and "is not the agent this process runs under (codex" in out, out
+    monkeypatch.setattr(dcli, "agent_caller", REAL_AGENT_CALLER)
+    assert dcli.agent_caller() == "codex"
+
+
+def test_a_session_flag_under_a_detected_agent_with_no_session_is_refused(capsys, ddir, contract_file, monkeypatch):
+    # an agent was detected, its session was not: the flag cannot name one for it
+    from levain.consent import band
+    job_id = file_one(capsys, ddir, contract_file, session="sess-other")["id"]
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(42, ["/usr/local/bin/claude"])]))
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--session", "sess-other")
+    assert code == 2 and "is not this session (none, from claude_code's environment)" in out, out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def test_the_detected_agent_named_explicitly_is_accepted(capsys, ddir, contract_file, monkeypatch):
+    monkeypatch.setenv("CODEX_THREAD_ID", "thr-1")
+    code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--agent", "codex",
+                       "--json")
+    assert code == 0, out
+    job_id = json.loads(out)["id"]
+    assert JobStore(ddir).get(job_id).filer_session == "thr-1"
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir))
+    assert code == 0 and "as the PLANNER" in out
+
+
+def test_sign_refuses_under_a_detected_agent_whatever_the_fixture_says(capsys, ddir, contract_file, keys, log,
+                                                                       monkeypatch):
+    # the operator-only verbs read the same detection as the planner's identity
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    monkeypatch.setattr(dcli, "agent_caller", REAL_AGENT_CALLER)
+    monkeypatch.setenv("CODEX_THREAD_ID", "thr-1")
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 2 and "runs under codex" in out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def _record_dir(ddir):
+    d = ddir / "capabilities"
+    d.mkdir(mode=0o700, exist_ok=True)
+    return d
+
+
+@pytest.mark.parametrize("damage", ["reachable", "unwritable", "corrupt", "symlink"])
+def test_a_record_that_cannot_be_kept_refuses_the_filing_before_it_is_made(capsys, ddir, contract_file, damage,
+                                                                         tmp_path):
+    # complement MED: a record that could not be written after the filing still exited 0
+    d = _record_dir(ddir)
+    record = caps.record_path(ddir, "claude_code", "sess-1")
+    if damage == "reachable":
+        os.chmod(d, 0o755)
+    elif damage == "unwritable":
+        os.chmod(d, 0o500)
+    elif damage == "corrupt":
+        record.write_bytes(b"not a record")
+        os.chmod(record, 0o600)
+    else:
+        os.rmdir(d)
+        (tmp_path / "elsewhere").mkdir(mode=0o700)
+        os.symlink(tmp_path / "elsewhere", d)
+    try:
+        code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--agent", "claude_code",
+                           "--session", "sess-1")
+    finally:
+        if damage == "unwritable":
+            os.chmod(d, 0o700)
+    assert code == 3 and "CapabilityRecordError" in out and "nothing was filed" in out, out
+    assert JobStore(ddir).list() == []
+
+
+def test_a_record_that_fails_after_the_filing_still_shows_the_capability_once(capsys, ddir, contract_file,
+                                                                            monkeypatch):
+    # the job IS filed by then; a retry with the same idem key is the replay, so the capability is shown, exit 0
+    def broken(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(caps, "keep", broken)
+    code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--agent", "claude_code",
+                       "--session", "sess-1", "--json")
+    assert code == 0, out
+    data = json.loads(out)
+    assert data["capability"] and data["capability_kept"].startswith("NOT kept")
+    assert [j.id for j in JobStore(ddir).list()] == [data["id"]]
+
+
+def test_a_session_with_no_record_files_without_a_preflight(capsys, ddir, contract_file):
+    os.makedirs(ddir / "capabilities", mode=0o755)
+    os.chmod(ddir / "capabilities", 0o755)
+    code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--json")
+    assert code == 0 and json.loads(out)["capability_kept"].startswith("not kept"), out

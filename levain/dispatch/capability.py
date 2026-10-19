@@ -36,8 +36,8 @@ from typing import Any
 
 from levain.dispatch import DispatchError
 
-__all__ = ["AGENTS", "DIR_NAME", "FORMAT", "NO_SESSION", "CapabilityRecordError", "keep", "recall", "record_path",
-           "session_problem"]
+__all__ = ["AGENTS", "DIR_NAME", "FORMAT", "NO_SESSION", "CapabilityRecordError", "keep", "preflight", "recall",
+           "record_path", "session_problem"]
 
 FORMAT = "levain-dispatch-capabilities/1"
 DIR_NAME = "capabilities"
@@ -195,6 +195,22 @@ def keep(directory: Path | str, agent: str, session: Any, job_id: str, capabilit
         finally:
             os.close(dfd)
     return path
+
+
+def preflight(directory: Path | str, agent: str, session: Any) -> None:
+    """Refuse (:class:`CapabilityRecordError`) when :func:`keep` would refuse ``agent``'s session ``session``'s record
+    for a reason already on disk: a directory that is not the operator's private one or that cannot be written, or a
+    record that is not one. Run before filing, so a record that cannot be kept stops the filing, not the keeping. A
+    session that gets no record (:func:`session_problem`) and a directory not made yet pass."""
+    if session_problem(session) is not None:
+        return
+    path = record_path(directory, agent, session)
+    for d in (path.parent.parent, path.parent):
+        if not _private_dir(d, create=False):
+            return
+        if not os.access(d, os.W_OK | os.X_OK):
+            raise CapabilityRecordError(f"{d} cannot be written by uid {os.getuid()}")
+    _read(path, agent, session)
 
 
 def recall(directory: Path | str, agent: str, session: Any, job_id: str) -> str | None:
