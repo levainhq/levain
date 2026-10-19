@@ -234,3 +234,18 @@ def test_a_store_that_never_worked_is_still_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "_count", boom)
     states = [_count(q, i).state for i in range(L.FAIL_DENY_AFTER)]
     assert states[-1] == "fail_deny" and "moves that file aside" in _count(q, 99).reason
+
+
+def test_ruling_text_suppresses_only_an_end_whose_own_halt_was_released(tmp_path):
+    q = _qdir(tmp_path)
+    _count(q, 1)
+    conn = L._connect(q)
+    conn.execute("INSERT INTO halts (agent, root, kind, request_id, at, released_at) VALUES "
+                 "('claude_code','s1','calls','A',1,2)")
+    conn.execute("INSERT INTO halts (agent, root, kind, request_id, at) VALUES ('claude_code','s1','calls','B',3)")
+    conn.close()
+    disp = L.LIMIT_TOOL + " " + json.dumps(L.limit_call("claude_code", "s1", "calls", 3, 2), sort_keys=True)
+    assert L.ruling_text("deny", 1, disp, queue_dir=q, request_id="A") is None      # released: stale, even with B open
+    assert "ENDED" in L.ruling_text("deny", 2, disp, queue_dir=q, request_id="B")
+    assert "ENDED" in L.ruling_text("deny", 2, disp, queue_dir=tmp_path / "nowhere", request_id="A")   # unreadable: told
+    assert L.ruling_text("maybe", 1, disp) is None
