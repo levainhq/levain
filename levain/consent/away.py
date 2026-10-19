@@ -171,7 +171,7 @@ def _leave(qdir: Path, agent: str, adapter_settings: Any, signing_key: Path | No
     ``signing_key`` in :data:`AWAY_NAMESPACE`, stored by the queue once it verifies. A mark whose stored leave no
     longer verifies (its key revoked since) is marked anew and that mark left. Returns whether the store changed.
     Raises ``ValueError`` when the store cannot be read, a mark stands and there is no key, or the leave is
-    refused or cannot be signed or checked."""
+    refused or cannot be signed or checked (saying so when a new mark was recorded first)."""
     try:
         mark = claude_code.away_mark_of(qdir, adapter_settings, agent)
     except (QueueStoreError, sqlite3.Error, OSError) as e:
@@ -194,8 +194,10 @@ def _leave(qdir: Path, agent: str, adapter_settings: Any, signing_key: Path | No
             marked = True
         payload = queue.away_leave_payload(agent, signer_fp)
         queue.leave_away(payload, sign(away_leave_message(payload)))
-    except (AnswerRefused, ConsentError, KeyError_, AuthorityError, OSError) as e:
+    except (AnswerRefused, ConsentError, KeyError_, AuthorityError, OSError, QueueStoreError, sqlite3.Error) as e:
         # AuthorityError covers VerifierUnavailable: ssh-keygen missing, untrusted or out of time
+        if not marked and isinstance(e, (QueueStoreError, sqlite3.Error)):
+            raise ValueError(_unreadable(qdir)) from e
         again = "; a new away mark was recorded first, so away mode stands" if marked else ""
         raise ValueError(f"away mode not left: {e}{again}") from e
     return True
@@ -214,7 +216,8 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     ``signing_key`` (:func:`_leave`; refused without one, and a ``signing_key`` that cannot be read is refused
     before the store is touched). Then by an atomic replace of its settings file, whose new body is checked before
     the store changes; returns the new settings. When the store changed and the file write then fails, the
-    ``ValueError`` says so: the hook follows the store.
+    ``ValueError`` says what stands: a recorded mark holds whatever the file says, and after a recorded leave the
+    hook acts on the file's old word (an ``on`` there keeps holding until this is run again).
     Raises ``ValueError`` for a hold outside (0, :data:`MAX_HOLD`], an ``idle_after`` that is not a finite number
     above 0, a missing settings file, a store that cannot be read, or a queue directory that breaks the queue's own
     rule (``QueueStoreError``)."""
@@ -250,6 +253,7 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
         data["away_hold_seconds"] = float(hold)
     if idle_after is not None:
         data["away_idle_seconds"] = float(idle_after)
+    was = "on" if adapter_settings.away_mode else "off" if adapter_settings.explicit_off else "auto"
     path = _settings_path(qdir, agent)
     body = json.dumps(data, indent=2) + "\n"
     if len(body.encode("utf-8")) > _MAX_BYTES:
@@ -267,9 +271,12 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     except (OSError, ValueError) as e:
         if not changed:
             raise
-        raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}); the hook follows "
-                         "the store, so away mode is as the store says: run it again to bring the file in line") \
-            from e
+        stands = ("the hook holds on that mark whatever the file says; run `levain consent away on` again to bring "
+                  "the file in line" if on else
+                  "the hook keeps holding on that word until `levain consent away off` or `auto` is run again"
+                  if was == "on" else "the hook acts on that word; run it again to bring the file in line")
+        raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}) and still says "
+                         f"`{was}`: {stands}") from e
     return data
 
 

@@ -326,8 +326,9 @@ _SCHEMA = (
     "WHEN EXISTS (SELECT 1 FROM away_leaves WHERE mark_id = NEW.mark_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an away leave is never replaced'); END",
 )
-# what an away mark is read from (:meth:`ConsentQueue.away_mark`)
-_AWAY_TABLES = frozenset({"meta", "away_marks", "away_leaves"})
+# what an away mark is read from (:meth:`ConsentQueue.away_mark`): a current-format store holding neither was made
+# before them (no mark); one holding only one of them is damaged
+_AWAY_TABLES = frozenset({"away_marks", "away_leaves"})
 _AUTHORITY_NOW_UNREADABLE = "the authority log cannot be replayed now"
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
@@ -596,6 +597,9 @@ class ConsentQueue:
                 _migrate_from_prior(conn)
             elif row is not None and row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
+            elif row is not None and _AWAY_TABLES - tables and _AWAY_TABLES & tables:
+                # never recreated: an empty table read as no mark would drop away mode
+                raise QueueStoreError(f"the store is damaged: it lacks {', '.join(sorted(_AWAY_TABLES - tables))}")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -620,10 +624,10 @@ class ConsentQueue:
     @contextmanager
     def _read_as_is(self, tables: frozenset[str]) -> Iterator[sqlite3.Connection | None]:
         """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
-        (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet) or a store of
-        :data:`PRIOR_FORMAT`, which predates ``tables``; raises :class:`QueueStoreError` for any other format, a
-        database with no format marker, and a current-format store missing any of ``tables`` (damaged, never read
-        as holding nothing)."""
+        (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet), a store of
+        :data:`PRIOR_FORMAT`, which predates ``tables``, or a current-format store holding none of ``tables`` (made
+        before them); raises :class:`QueueStoreError` for any other format, a database with no format marker, and a
+        current-format store holding some of ``tables`` but not all (damaged, never read as holding nothing)."""
         self._check_directory()
         conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0,
                                isolation_level=None)
@@ -639,6 +643,10 @@ class ConsentQueue:
             if row is None or row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"{self.path} is not a consent queue store: format "
                                       f"{None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+            if not tables & have:
+                conn.execute("COMMIT")
+                yield None
+                return
             if not tables <= have:
                 raise QueueStoreError(f"{self.path} is damaged: it lacks {', '.join(sorted(tables - have))}")
             yield conn

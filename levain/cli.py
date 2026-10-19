@@ -2106,7 +2106,8 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                       help="With `off` or `auto`: an enrolled key that signs leaving an away mode `on` set (its "
                            "private key file, or the .pub of a key an agent holds). With --agent all, one "
                            "signature per marked agent, in turn: a failure part way leaves the agents before it "
-                           "left and exits non-zero. Not needed when no `on` stands.")
+                           "left and exits non-zero. Not needed when no `on` stands, but whenever it is given it "
+                           "is checked (the file and its .pub readable) before anything changes.")
     away.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                       help="The consent queue's directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     away.set_defaults(func=_cmd_consent_away)

@@ -337,3 +337,39 @@ def test_a_damaged_or_foreign_store_is_unreadable_never_no_mark(qdir, damage, ca
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "on"   # nothing written
     assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
     assert "neither hold nor file requests" in capsys.readouterr().out
+
+
+def _drop(db: Path, *tables: str) -> None:
+    conn = sqlite3.connect(db, isolation_level=None)
+    for table in tables:
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                                    (table,)).fetchall():
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(f"DROP TABLE {table}")
+    conn.close()
+
+
+def test_a_store_from_before_away_marks_has_no_mark(qdir, capsys):
+    """Fix r3 (complement + codex MED), reproduced on 23a1458e: a current-format store made before the away
+    tables (neither one there) made `show` say the store is unreadable. It has no mark, and the queue adds them."""
+    assert main(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    cc._queue_for(qdir, away.settings(qdir, "claude_code")).queue_id   # the store, in its current format
+    _drop(qdir / "queue.db", "away_marks", "away_leaves")
+    capsys.readouterr()
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert "unreadable" not in capsys.readouterr().out
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert away.settings(qdir, "claude_code").away_marked
+
+
+def test_the_hook_never_recreates_a_lost_away_table(qdir):
+    """Fix r3 (complement + codex MED), reproduced on 23a1458e: a current-format store that lost away_marks read
+    as unreadable to `show`, but the hook's own queue recreated the table empty and did not hold under the mark."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    _drop(qdir / "queue.db", "away_marks")
+    started = cc.settings_from(json.loads((qdir / cc.SETTINGS_NAME).read_text()))
+    got = cc.with_away_mark(started, qdir, "claude_code", queue=cc._queue_for(qdir, started))
+    assert got.away_marked and "consent store unreadable at" in got.away_unreadable
+    conn = sqlite3.connect(qdir / "queue.db")
+    assert "away_marks" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    conn.close()
