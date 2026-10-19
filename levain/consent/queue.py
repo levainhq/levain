@@ -409,10 +409,12 @@ class Gapped:
 
 
 def session_handle(agent_session_id: str) -> str:
-    """A short handle for an agent session in what the operator reads and types: the first 6 characters of its id,
-    and for a subagent's key (``<session>#agent:<id>``) ``+`` the first 6 of the subagent's id."""
+    """A short handle for an agent session in what the operator reads and types: the LAST 6 characters of its id
+    (hyphens dropped), and for a subagent's key (``<session>#agent:<id>``) ``+`` the last 6 of the subagent's id.
+    The tail, not the head: a UUIDv7 (Codex's session ids) leads with a millisecond clock, so two sessions started in
+    the same minute share their first characters, while the tail is random in v7 and v4 alike."""
     base, sep, sub = agent_session_id.partition("#agent:")
-    return base[:6] + (f"+{sub[:6]}" if sep else "")
+    return base.replace("-", "")[-6:] + (f"+{sub.replace('-', '')[-6:]}" if sep else "")
 
 
 def gap_label(gap: int, agent_session_id: str) -> str:
