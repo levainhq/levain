@@ -271,12 +271,12 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     except (OSError, ValueError) as e:
         if not changed:
             raise
+        # what the file says now is not asserted: another process may have changed or removed it meanwhile
         stands = ("the hook holds on that mark whatever the file says; run `levain consent away on` again to bring "
                   "the file in line" if on else
-                  "the hook keeps holding on that word until `levain consent away off` or `auto` is run again"
-                  if was == "on" else "the hook acts on that word; run it again to bring the file in line")
-        raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}) and still says "
-                         f"`{was}`: {stands}") from e
+                  f"the hook acts on whatever the file says now (it said `{was}` when read); "
+                  "run `levain consent away off` or `auto` again")
+        raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}): {stands}") from e
     return data
 
 
