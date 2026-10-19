@@ -173,3 +173,12 @@ def test_flagged_members_of_the_native_set():
              "ps auxe": "bash-other", "ps aux -e": "bash-other"}
     for cmd, want in cases.items():
         assert friction.classify_bash(cmd, "/w") == want, cmd
+
+
+def test_l3_r2_fixes():
+    assert friction.classify_bash("git -p log", "/w") == "bash-other"
+    assert friction.classify_bash("git --paginate log", "/w") == "bash-other"
+    assert friction.classify_bash("git log -3", "/w") == "bash-native-ro"
+    assert friction.classify_tool("Read", {"file_path": "/etc/hosts"}, None, friction.SILENT) == "read-outside-cwd"
+    assert friction.classify_tool("Glob", {"pattern": "/etc/*.conf"}, "/w", friction.SILENT) == "read-outside-cwd"
+    assert friction.classify_tool("Glob", {"pattern": "**/*.py"}, "/w", friction.SILENT) == "silent"

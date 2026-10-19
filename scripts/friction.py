@@ -179,8 +179,8 @@ def _git_class(words):
     i = 1
     while i < len(words) and words[i].startswith('-'):
         o = words[i]
-        if o =='--exec-path' or o.startswith('--exec-path='):
-            return 'prompt'
+        if o =='--exec-path' or o.startswith('--exec-path=') or o in ('-p', '--paginate'):
+            return 'prompt'          # -p / --paginate run the configured pager
         if o in GIT_OPT_WITH_VALUE:
             if o in ('-c', '--config-env'):
                 val = words[i + 1] if i + 1 < len(words) else ''
@@ -300,11 +300,18 @@ def _target(inp):
 
 
 def _outside(inp, cwd):
-    """True when the tool input names a path outside the entry's cwd. Unknown cwd or no path: not outside."""
+    """True when the tool input names a path outside the entry's cwd (for Glob, an absolute ``pattern`` counts as its
+    path). No path: not outside. Unknown cwd: outside only for an absolute or ~ path (conservative)."""
     t = _target(inp)
-    if t is None or not isinstance(cwd, str) or not cwd:
+    if t is None:
+        pat = inp.get('pattern')
+        if isinstance(pat, str) and pat.startswith(('/', '~')):
+            t = pat.split('*', 1)[0] or '/'
+    if t is None:
         return False
     t = os.path.expanduser(t)
+    if not isinstance(cwd, str) or not cwd:
+        return os.path.isabs(t)
     return not _inside(os.path.join(cwd, t), cwd)
 
 
