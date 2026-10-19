@@ -1,6 +1,7 @@
 """levain.cockpit.session_context — how much context a Claude Code or Codex session holds, read from its own transcript.
 
-A DISPLAY, never an authority: nothing here decides anything. Reads are bounded, never follow a symlink, never write.
+A DISPLAY, never an authority: nothing here decides anything. Reads are bounded, never follow a symlink at the file itself,
+never write.
 
 One reusable token reader: :func:`last_context` (the meter) and :func:`iter_usage` (spend totals, for a later per-session
 budget). Both read the transcript the agent already writes, so the session needs nothing installed to be measured.
@@ -8,23 +9,29 @@ budget). Both read the transcript the agent already writes, so the session needs
 Claude Code. Every assistant record carries ``message.usage``; the live context is
 ``input_tokens + cache_read_input_tokens + cache_creation_input_tokens`` of the LAST one (the prompt that call sent).
 No window is derived from the model name: the transcript's model string reads the same for a 1M and a 200K session, so
-a name-to-window table would be a guess dressed as a measurement. The model is reported verbatim and the only wall shown
-is a MEASURED one, an auto compaction boundary's ``compactMetadata.preTokens``.
+a name-to-window table would be a guess dressed as a measurement. The model is reported verbatim and no wall is shown.
+A record that is not a real prompt (the ``<synthetic>`` model, an API-error record, a usage summing to 0) is skipped, and
+a ``compact_boundary`` newer than the newest usable record reads "just compacted" with no number: until the next reply
+the newest usable record is the pre-compaction prompt, and the boundary's own ``postTokens`` is not the next reading.
 
 Codex. The newest ``token_count`` event's ``info.last_token_usage.input_tokens`` is the last request's whole prompt:
 Codex counts cached input INSIDE ``input_tokens`` (``cached_input_tokens`` is a subset of it, and
 ``total_tokens == input_tokens + output_tokens`` on the same record), so adding the cached field would double-count.
-``info.model_context_window`` is Codex's own number, so "of N" is allowed there.
+``info.model_context_window`` is Codex's own number, so "of N" is allowed there. A ``token_count`` right after a
+compaction reports 0 input tokens; it is skipped, and a ``compacted`` record newer than the newest nonzero reading reads
+"just compacted".
 
 The meter shows the main transcript's last record only: a subagent's transcript is a separate context and does not add to
 the session's live context. Spend is different (every call is paid for), hence ``include_subagents`` on the iterator.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, NamedTuple
 
@@ -37,14 +44,17 @@ _START = 1 << 20            # the first window read from the end of the file
 _CAP = 8 << 20              # the widest window; a usage record further back than this is "not read"
 _SPEND_CAP = 256 << 20      # a file larger than this is not read for spend
 _CACHE_MAX = 256
+_LINE_CAP = 4 << 20         # a spend-scan line longer than this is skipped, never held whole
 _cache: dict[tuple[str, str], tuple[int, int, Any]] = {}
+_rollouts: dict[tuple[str, str], tuple[Path | None, float]] = {}    # (codex home, sid) -> (rollout or None, when looked)
+_MISS_S = 10.0              # how long "no rollout yet" is believed
 
 
 class Context(NamedTuple):
     tokens: int
     window: int | None       # Codex's own window; None for Claude Code (not knowable from the transcript)
     model: str | None
-    wall: int | None         # a measured auto-compaction trigger, Claude Code only
+    compacted: bool = False  # the session was compacted after its newest usable reading; ``tokens`` is then 0
 
 
 def _open_regular(path: Path | str) -> tuple[int, os.stat_result] | None:
@@ -93,41 +103,57 @@ def _claude_prompt(usage: Mapping[str, Any]) -> int:
         + _num(usage.get("cache_creation_input_tokens"))
 
 
+def _usable_claude(d: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The message of a real, main-thread assistant reply, else None: ``<synthetic>`` and API-error records carry a
+    zeroed usage that is not a prompt."""
+    m = d.get("message")
+    if d.get("type") != "assistant" or d.get("isSidechain") or d.get("isApiErrorMessage") or not isinstance(m, dict):
+        return None
+    if m.get("model") == "<synthetic>" or not isinstance(m.get("usage"), dict) or _claude_prompt(m["usage"]) <= 0:
+        return None
+    return m
+
+
 def _scan_claude(lines: list[bytes]) -> Context | None:
-    last_msg: dict[str, Any] | None = None
-    wall: int | None = None
+    compacted = False
     for line in reversed(lines):
+        if b'"usage"' not in line and b"compact_boundary" not in line:
+            continue
         d = _json(line)
         if d is None:
             continue
-        md = d.get("compactMetadata")
-        if wall is None and isinstance(md, dict) and md.get("trigger") == "auto" and _num(md.get("preTokens")):
-            wall = md["preTokens"]
-        m = d.get("message")
-        if last_msg is None and d.get("type") == "assistant" and isinstance(m, dict) \
-                and isinstance(m.get("usage"), dict) and not d.get("isSidechain"):
-            last_msg = m
-        if last_msg is not None and wall is not None:
-            break
-    if last_msg is None:
-        return None
-    # one message can be written as several records; the usage of the same id is the max, and the last record is that
-    model = last_msg.get("model") if isinstance(last_msg.get("model"), str) else None
-    return Context(_claude_prompt(last_msg["usage"]), None, model, wall)
+        if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+            compacted = True
+            continue
+        m = _usable_claude(d)
+        if m is not None:
+            if compacted:
+                break
+            model = m.get("model") if isinstance(m.get("model"), str) else None
+            return Context(_claude_prompt(m["usage"]), None, model)
+    return Context(0, None, None, True) if compacted else None
 
 
 def _scan_codex(lines: list[bytes]) -> Context | None:
+    compacted = False
     for line in reversed(lines):
-        if b'"token_count"' not in line:
+        if b'"token_count"' not in line and b'"compacted"' not in line:
             continue
         d = _json(line)
-        p = d.get("payload") if d else None
+        if d is None:
+            continue
+        if d.get("type") == "compacted":
+            compacted = True
+            continue
+        p = d.get("payload")
         info = p.get("info") if isinstance(p, dict) and p.get("type") == "token_count" else None
         last = info.get("last_token_usage") if isinstance(info, dict) else None
-        if isinstance(last, dict) and isinstance(last.get("input_tokens"), int):
+        if isinstance(last, dict) and isinstance(last.get("input_tokens"), int) and last["input_tokens"] > 0:
+            if compacted:
+                break
             w = info.get("model_context_window")
-            return Context(_num(last["input_tokens"]), w if isinstance(w, int) and w > 0 else None, None, None)
-    return None
+            return Context(last["input_tokens"], w if isinstance(w, int) and w > 0 else None, None)
+    return Context(0, None, None, True) if compacted else None
 
 
 def last_context(path: Path | str, agent: str = "claude_code") -> tuple[Context | None, str]:
@@ -164,6 +190,46 @@ def _claude_dir(env: Mapping[str, str]) -> Path:
     return Path(cfg) if cfg and os.path.isabs(cfg) else Path.home() / ".claude"
 
 
+def _find_rollout(home: Path, sid: str) -> tuple[Path | None, str]:
+    """The Codex rollout for a session id: a remembered path (re-checked on use), else the date directories newest
+    first, since a session being measured is nearly always a recent one."""
+    if "/" in sid or "\\" in sid:
+        return None, "rollout not found"
+    key = (str(home), sid)
+    hit = _rollouts.get(key)
+    if hit:
+        path, when = hit
+        if path is not None:
+            try:
+                if stat.S_ISREG(os.stat(path).st_mode):
+                    return path, ""
+            except OSError:
+                pass
+        elif time.monotonic() - when < _MISS_S:
+            return None, "rollout not found"
+    found: Path | None = None
+    pat = f"rollout-*-{glob.escape(sid)}.jsonl"
+    try:
+        root = home / "sessions"
+        for y in sorted(root.glob("[0-9]*"), reverse=True):
+            for mo in sorted(y.glob("[0-9]*"), reverse=True):
+                for dd in sorted(mo.glob("[0-9]*"), reverse=True):
+                    hits = sorted(dd.glob(pat))
+                    if hits:
+                        found = hits[-1]
+                        break
+                if found:
+                    break
+            if found:
+                break
+    except OSError:
+        pass
+    if len(_rollouts) >= _CACHE_MAX:
+        _rollouts.clear()
+    _rollouts[key] = (found, time.monotonic())
+    return (found, "") if found else (None, "rollout not found")
+
+
 def find_transcript(rec: Mapping[str, Any], env: Mapping[str, str] | None = None) -> tuple[Path | None, str]:
     """The registry record's recorded transcript when the hook stored one, else the agent's default location under the
     cockpit's own environment (a relocated config directory is invisible without the recorded path)."""
@@ -177,11 +243,7 @@ def find_transcript(rec: Mapping[str, Any], env: Mapping[str, str] | None = None
     if rec.get("agent") == "codex":
         cfg = env.get("CODEX_HOME", "")
         home = Path(cfg) if cfg and os.path.isabs(cfg) else Path.home() / ".codex"
-        try:
-            found = sorted((home / "sessions").glob(f"*/*/*/rollout-*-{sid}.jsonl"))
-        except OSError:
-            return None, "rollout not found"
-        return (found[-1], "") if found else (None, "rollout not found")
+        return _find_rollout(home, sid)
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
         return None, "no working directory"
     # Claude Code names a project directory by turning every non-alphanumeric character of the cwd into "-"
@@ -209,13 +271,27 @@ def iter_usage(path: Path | str, include_subagents: bool = False) -> Iterator[di
             if st.st_size > _SPEND_CAP:
                 continue
             with os.fdopen(os.dup(fd), "rb") as fh:
-                for line in fh:
+                offset = 0
+                while True:
+                    line = fh.readline(_LINE_CAP + 1)
+                    if not line:
+                        break
+                    at, offset = offset, offset + len(line)
+                    if len(line) > _LINE_CAP and not line.endswith(b"\n"):
+                        while True:       # an over-long line is skipped to its end, never held whole
+                            rest = fh.readline(_LINE_CAP)
+                            offset += len(rest)
+                            if not rest or rest.endswith(b"\n"):
+                                break
+                        continue
+                    if b'"usage"' not in line:
+                        continue
                     d = _json(line)
                     m = d.get("message") if d else None
                     if not (d and d.get("type") == "assistant" and isinstance(m, dict) and isinstance(m.get("usage"), dict)):
                         continue
                     u = m["usage"]
-                    mid = m.get("id") if isinstance(m.get("id"), str) else f"{f.name}:{d.get('uuid')}"
+                    mid = m.get("id") if isinstance(m.get("id"), str) else f"{f.name}:{d.get('uuid') or at}"
                     row = {"id": mid, "model": m.get("model"), "file": f.name,
                            "input": _num(u.get("input_tokens")), "cache_read": _num(u.get("cache_read_input_tokens")),
                            "cache_creation": _num(u.get("cache_creation_input_tokens")),
@@ -244,6 +320,8 @@ def context_chip(rec: Mapping[str, Any], env: Mapping[str, str] | None = None) -
         ctx, why = last_context(path, "codex" if rec.get("agent") == "codex" else "claude_code")
     if ctx is None:
         return f"context not read: {why}", None
+    if ctx.compacted:
+        return "context: just compacted", ctx
     text = f"context {_k(ctx.tokens)}" + (f" of {_k(ctx.window)}" if ctx.window else "")
     if ctx.tokens >= CONTEXT_WARN_TOKENS:
         text += f", past the {_k(CONTEXT_WARN_TOKENS)} warn line"

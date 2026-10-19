@@ -454,3 +454,24 @@ def test_a_notebook_tool_logs_its_path(agent_root):
                                            "tool_input": {"notebook_path": "/w/n.ipynb", "new_source": "x"}})
     assert proc.returncode == 0 and proc.stdout == ""
     assert [e["text"] for e in _events(root, agent, "s9")] == ["NotebookEdit: /w/n.ipynb"]
+
+
+def test_the_transcript_path_is_kept_on_a_later_none_and_a_bad_one_is_refused(agent_root):
+    agent, root = agent_root
+    good = "/tmp/x/s1.jsonl"
+    _run(root, "session_start.py", {"session_id": "s1", "source": "startup", "cwd": "/w", "transcript_path": good})
+    assert _record(root, agent, "s1")["transcript"] == good
+    _run(root, "user_prompt_submit.py", {"session_id": "s1", "prompt": "hi", "cwd": "/w"})
+    assert _record(root, agent, "s1")["transcript"] == good
+    for bad in ("rel/s1.jsonl", "/tmp/x/s1.txt", "/tmp/" + "a" * 1100 + ".jsonl"):
+        _run(root, "user_prompt_submit.py", {"session_id": "s1", "prompt": "hi", "cwd": "/w", "transcript_path": bad})
+        assert _record(root, agent, "s1")["transcript"] == good
+    # a hand-edited record with a bad transcript field is still a record; only the field is dropped
+    from levain.cockpit.providers import _session_record
+    key = hashlib.sha1(f"{agent}:s1".encode()).hexdigest()[:24]
+    path = root / ".levain" / "sessions" / f"{key}.json"
+    rec = json.loads(path.read_text())
+    rec["transcript"] = "relative.jsonl"
+    path.write_text(json.dumps(rec))
+    got = _session_record(path)
+    assert got is not None and "transcript" not in got
