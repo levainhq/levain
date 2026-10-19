@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.8] — 2026-10-19
+
+### Added
+- **A question can carry the push it leads to, and one tap answers it and allows that push.** `levain ask --would-push KEY --repo PATH --remote URL --branch NAME` files that exact `levain push` (the repository, remote, branch and its current tip, derived as `levain push` derives it) as an undecided consent request tied to option KEY. On the phone page that option shows the push as its own consent card shows it; picking it with a passkey signs a late ruling ALLOW on that request and then records the answer. The answer is still only words: the ALLOW is the signed ruling, and `levain push` from the asking session takes it once. Any other answer, from any channel, allows nothing. Refused unless an active key can allow a push.
+
+### Known edges
+- v1 ties only `levain push` (a passkey allows up to T2, and `levain push` is the one gated T2 call); a commit on the branch after the ask is a different push, which asks again; the push must run from the session that asked; the tied request takes the session's next gap number although the agent was never refused.
+
 ## [0.11.7] — 2026-10-19
 
 ### Added
