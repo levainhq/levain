@@ -26,25 +26,34 @@ from typing import Any
 
 from levain.autonomic.pending import seal_pending_id
 from levain.cockpit.consent import ConsentError, encode, parse_stamp, record_sha256, value_sha256
+from levain.consent.receipt_log import head_problem
 
-__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_NAMESPACE", "AWAY_LEAVE_FORMAT", "AWAY_NAMESPACE", "DECISIONS",
-           "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE",
-           "RULING_FORMAT", "RULING_NAMESPACE", "ExternalGateRequest", "answer_message", "answer_payload",
-           "away_leave_message", "away_leave_payload", "grant_answer_payload", "redact_display", "ruling_message",
-           "ruling_payload", "tool_input_digest"]
+__all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_FORMAT_UNCHAINED", "ANSWER_NAMESPACE", "AWAY_LEAVE_FORMAT",
+           "AWAY_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE", "RULING_FORMAT",
+           "RULING_FORMAT_UNCHAINED", "RULING_NAMESPACE", "UNCHAINED_FORMATS", "ExternalGateRequest",
+           "answer_message", "answer_payload", "away_leave_message", "away_leave_payload", "grant_answer_payload",
+           "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
 # the posture name inside the seal: an external gate's request never seals equal to a manual pending
 POSTURE = "external-gate"
-ANSWER_FORMAT = "levain-consent-answer/1"
+# /2 (Q11): the answer carries ``receipts_head``, the head of the queue's receipt log (levain.consent.receipt_log)
+ANSWER_FORMAT = "levain-consent-answer/2"
+# the format before the receipts were chained: refused when applied (the request is answered again); one applied
+# before the upgrade still delivers, its signature re-verified with no head check, and `levain consent receipts
+# verify` lists it as signed before chaining
+ANSWER_FORMAT_UNCHAINED = "levain-consent-answer/1"
 # its own SSHSIG namespace: an answer verifies as nothing else, and nothing else verifies as an answer
 ANSWER_NAMESPACE = "levain-consent-answer"
 # a late ruling on a request that went undecided (its hold ended with no verified answer): signed after the hold
 # ended, so it is never an answer; its own format and its own SSHSIG namespace, so an answer never verifies as a
 # ruling and a ruling never verifies as an answer
-RULING_FORMAT = "levain-consent-ruling/1"
+# /2 (Q11): the ruling carries ``receipts_head``, as an answer does
+RULING_FORMAT = "levain-consent-ruling/2"
+RULING_FORMAT_UNCHAINED = "levain-consent-ruling/1"
 RULING_NAMESPACE = "levain-consent-ruling"
+UNCHAINED_FORMATS = frozenset({ANSWER_FORMAT_UNCHAINED, RULING_FORMAT_UNCHAINED})
 # leaving an away mode the operator set with `levain consent away on` (its away mark): signed, since leaving it
 # lowers what the hook holds back to the operator's own presence; its own format and its own SSHSIG namespace, so a
 # leave verifies as nothing else and no answer or ruling verifies as a leave
@@ -195,18 +204,28 @@ class ExternalGateRequest:
         return record_sha256(encode(self.fields()))
 
 
+def _need_head(receipts_head: Any) -> dict[str, Any]:
+    problem = head_problem(receipts_head)
+    if problem is not None:
+        raise ConsentError(f"the {problem}")
+    return {"size": receipts_head["size"], "root": receipts_head["root"]}
+
+
 def answer_payload(*, queue_id: str, request: ExternalGateRequest, decision: str, signer_fp: str,
-                   signed_at: str) -> dict[str, str]:
-    """The record an answer signs: this queue, this request, its digest and expiry, the decision, the key, and
-    when it was made (``signed_at``, a :func:`~levain.cockpit.consent.utc_stamp`; the queue's
-    :meth:`~levain.consent.queue.ConsentQueue.answer_payload` sets it from the queue's clock). Delivery checks
+                   signed_at: str, receipts_head: Any) -> dict[str, Any]:
+    """The record an answer signs: this queue, this request, its digest and expiry, the decision, the key, when
+    it was made (``signed_at``, a :func:`~levain.cockpit.consent.utc_stamp`), and the head of the queue's receipt
+    log (``receipts_head``, :func:`levain.consent.receipt_log.head`). The queue's
+    :meth:`~levain.consent.queue.ConsentQueue.answer_payload` sets ``signed_at`` from its clock and the head from a
+    read of its receipts; applying the answer refuses it unless that head still holds. Delivery checks
     ``signed_at`` against the expiry, never the row's ``decided_at``, which any raw writer can set."""
     if decision not in DECISIONS:
         raise ConsentError(f"decision must be one of {DECISIONS}: {decision!r}")
     parse_stamp(signed_at)
     return {"format": ANSWER_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
             "request_digest": request.digest, "decision": decision, "expires_at": request.expires_at,
-            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
+            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at,
+            "receipts_head": _need_head(receipts_head)}
 
 
 def answer_message(payload: dict[str, str]) -> bytes:
@@ -228,10 +247,11 @@ def grant_answer_payload(*, queue_id: str, request: ExternalGateRequest, grant_i
 
 
 def ruling_payload(*, queue_id: str, request: ExternalGateRequest, gap: int, decision: str, signer_fp: str,
-                   signed_at: str) -> dict[str, Any]:
+                   signed_at: str, receipts_head: Any) -> dict[str, Any]:
     """The record a late ruling signs: this queue, this request and its digest, the gap number the request was
-    given when it went undecided, the decision, the key, and when it was made (``signed_at``, a
-    :func:`~levain.cockpit.consent.utc_stamp`). No expiry: a ruling is made after the request's hold ended."""
+    given when it went undecided, the decision, the key, when it was made (``signed_at``, a
+    :func:`~levain.cockpit.consent.utc_stamp`), and the head of the queue's receipt log (``receipts_head``), as an
+    answer carries it. No expiry: a ruling is made after the request's hold ended."""
     if decision not in DECISIONS:
         raise ConsentError(f"decision must be one of {DECISIONS}: {decision!r}")
     if type(gap) is not int or gap < 1:
@@ -239,7 +259,8 @@ def ruling_payload(*, queue_id: str, request: ExternalGateRequest, gap: int, dec
     parse_stamp(signed_at)
     return {"format": RULING_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
             "request_digest": request.digest, "gap": gap, "decision": decision,
-            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
+            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at,
+            "receipts_head": _need_head(receipts_head)}
 
 
 def ruling_message(payload: dict[str, Any]) -> bytes:
