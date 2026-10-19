@@ -1169,3 +1169,49 @@ def test_a_default_mode_gate_hold_ends_when_the_operator_comes_back(queue, monke
     assert out is None
     assert time.monotonic() - t0 < 2.5
     assert queue.pending() == []
+
+
+# --- the T3 floor (Q10) --------------------------------------------------------------------------------------
+
+def _hook_write(mode):
+    return {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": "/work/proj", "session_id": "sess-1",
+            "permission_mode": mode, "tool_use_id": "toolu_1",
+            "tool_input": {"file_path": "/work/proj/.claude/hooks/x.sh", "content": "#!/bin/sh\n"}}
+
+
+def test_with_no_key_a_hook_write_is_denied_with_the_stop_in_every_mode_but_default(queue, monkeypatch):
+    """Q10 D1, the hole as measured (DESIGN R7: bypass, no key, Write .claude/hooks/v.sh -> written): with no
+    enrolled key nothing_can_decide answered None and the session's mode ran it. Now every mode where no dialog asks
+    (an absent or unknown mode included) gets the floor's deny with the hard stop, nothing filed, a floor ledger row;
+    default still leaves it to the dialog."""
+    from levain.consent.ledger import Ledger
+
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    settings = cc.AdapterSettings()  # no cockpit: no key can sign T3
+    assert cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
+    for mode in ("bypassPermissions", "auto", "acceptEdits", "dontAsk", None, "x"):
+        out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"))
+        what = "Write of /work/proj/.claude/hooks/x.sh"
+        assert out["continue"] is False and what in out["stopReason"], mode
+        spec = out["hookSpecificOutput"]
+        assert (spec["permissionDecision"], spec["permissionDecisionReason"]) == ("deny", cc.FLOOR_TEXT.format(x=what))
+    assert queue.pending() == []
+    assert cc.gate(_hook_write("default"), queue, settings, home=Path("/home/u")) is None
+    assert cc.gate(_hook_write("plan"), queue, settings, home=Path("/home/u")) is None
+    rows = Ledger(Path(queue.directory)).window(cc.AGENT, "sess-1", datetime.now(timezone.utc) - timedelta(days=1))
+    assert {(r.phase, r.outcome, (r.stamp_detail or {}).get("decision")) for r in rows} == {
+        ("denied_by_gate", "refused", "floor")}
+
+
+def test_an_unconfined_session_passes_a_hook_write_and_spends_no_ruled_allow(queue, monkeypatch):
+    """Q10 D2 (R3b 3a: a clear path to run an unconfined session that can edit hooks): LEVAIN_UNCONFINED=1 in the
+    session's launch env passes the gated call to the mode, read at call time, and never takes a ruled allow; any
+    other value is not unconfined."""
+    taken = []
+    monkeypatch.setattr(queue, "take_ruled_allow", lambda *a, **kw: taken.append(a))
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    assert cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert taken == [] and queue.pending() == []
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "true")
+    out = cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and len(taken) == 1

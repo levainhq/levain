@@ -716,7 +716,7 @@ def gate_row(agent: str, queue_dir: Path | str, event: Mapping[str, Any], sessio
     """File a gated call's row at decision time, from the gate's own answer: a verified allow is phase ``pre``,
     stamped with its authority (``answer`` / ``grant`` / ``ruling``, the answering request); anything the gate
     denied is ``denied_by_gate`` (stamp ``unknown``, outcome ``refused``), its ``decision`` saying how (``deny``,
-    ``undecided``, ``halted``, ``failed``). ``session`` is the gate's own key. None on any failure: the queue's
+    ``undecided``, ``halted``, ``failed``, ``floor``: the T3 floor, no key could approve it). ``session`` is the gate's own key. None on any failure: the queue's
     receipts still record every decision."""
     try:
         common = _common(agent, event, session, tool_name, tool_input, cwd)
