@@ -67,12 +67,13 @@ from levain.consent.record import tool_input_digest
 
 __all__ = ["ACTIVE_GAP", "DB_NAME", "DEFAULTS", "FAIL_DENY_AFTER", "GO", "KINDS", "LIMIT_TIER", "LIMIT_TOOL", "LIMITS_NAME",
            "Outcome", "REPEAT_WINDOW", "Verdict", "check", "file_extend", "release_if_extended", "retry_text", "stop_text",
-           "verified_allow",
+           "verified_allow", "root_halted", "extended_by",
            "count_call", "extend", "load_limits", "session_root", "snapshot"]
 
 DB_NAME = "limits.db"
 LIMITS_NAME = "limits.json"
 LIMITS_FORMAT = "levain-limits/1"
+LIMITS_MAX = 64 << 10       # bytes: a larger limits.json is not read (the defaults stand) and is never written
 STORE_FORMAT = "levain-limits-store/1"
 KINDS = ("calls", "active_hours", "fresh_tokens", "cache_read_tokens", "repeat")
 # F5b, ruled 10-19: on by default, set above the operator's measured sessions (design §3 holds the measurement and its command)
@@ -166,7 +167,7 @@ def load_limits(queue_dir: Path | str, agent: str) -> tuple[dict[str, float], st
         return out, "defaults"
     except OSError as exc:
         return out, f"defaults ({LIMITS_NAME} unreadable: {type(exc).__name__})"
-    if not stat.S_ISREG(st.st_mode) or st.st_size > 64 << 10:
+    if not stat.S_ISREG(st.st_mode) or st.st_size > LIMITS_MAX:
         return out, f"defaults ({LIMITS_NAME} is not a small regular file)"
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -346,6 +347,47 @@ def _halt_released(qdir: Path, request_id: str) -> bool:
         return row is not None and row[0] is not None
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        conn.close()
+
+
+def _halt_released_by_other(qdir: Path, request_id: str) -> bool:
+    """True only when the halt on ``request_id`` READS as released by ANOTHER request's Extend; no row, a release by
+    this request itself, or any failure to read, is False."""
+    try:
+        conn = sqlite3.connect((qdir / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        row = conn.execute("SELECT released_at, released_by FROM halts WHERE request_id = ?", (request_id,)).fetchone()
+        return row is not None and row[0] is not None and row[1] != request_id
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        conn.close()
+
+
+def root_halted(queue_dir: Path | str, agent: str, root: str) -> bool | None:
+    """Whether ``root`` has an open limit halt, read without the write lock; ``None`` when it cannot be read."""
+    try:
+        conn = sqlite3.connect((Path(queue_dir) / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return _open_halt(conn, agent, session_root(root)) is not None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
+def extended_by(queue_dir: Path | str, request_id: str) -> bool:
+    """True when ``request_id``'s own Extend was applied AND it is what released the root's halt (``released_by``):
+    the one allow whose holder may resume the session."""
+    conn = _connect(Path(queue_dir))
+    try:
+        return (conn.execute("SELECT 1 FROM extensions WHERE request_id = ?", (request_id,)).fetchone() is not None
+                and conn.execute("SELECT 1 FROM halts WHERE released_by = ?", (request_id,)).fetchone() is not None)
     finally:
         conn.close()
 
@@ -821,10 +863,12 @@ def _extended(qdir: Path, request_id: str) -> bool:
         conn.close()
 
 
-def file_extend(queue: Any, agent: str, session: str, *, hold: float, cwd: str) -> tuple[str, dict[str, Any]]:
+def file_extend(queue: Any, agent: str, session: str, *, hold: float, cwd: str,
+                resume: Mapping[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     """File the Extend request ``levain limits extend <session>`` asks the operator to sign, for the limit the root is
     halted on. Returns (request id, its call). The operator's verified allow on it lifts the halt
-    (:func:`release_if_extended`)."""
+    (:func:`release_if_extended`). ``resume`` is the halting request's resume record, so a late allow RULED on this
+    request resumes the session through delivery as a ruling on the halting request would."""
     from datetime import timedelta
 
     qdir, root = Path(queue.directory), session_root(session)
@@ -841,7 +885,7 @@ def file_extend(queue: Any, agent: str, session: str, *, hold: float, cwd: str) 
     lim, _w = _scaled(_limits_or_defaults(qdir, agent), _loads(row[0], {}) if row else {})
     call = limit_call(agent, root, kind, 0, lim[kind], purpose="extend")
     request = queue.file(agent=agent, agent_session_id=root, tool_name=LIMIT_TOOL, tool_input=call, cwd=cwd,
-                         hold=timedelta(seconds=hold), tier=LIMIT_TIER)
+                         hold=timedelta(seconds=hold), tier=LIMIT_TIER, resume=resume)
     _record_filed(qdir, agent, root, kind, request.id, "extend", time.time())
     return request.id, call
 
@@ -851,7 +895,9 @@ def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir:
     """What a session is told of a late ruling on its LIMIT request (never the gated-action text: there is no action
     to do): an allow is an Extend, so it goes on; a deny is an End, so it stays stopped. ``None`` for an unknown
     ruling, and for an End whose own halt (given ``queue_dir`` and ``request_id``) READS as released: an Extend lifted it
-    since, so a stale End is never told to a session that was extended. Anything that cannot be read tells the End."""
+    since, so a stale End is never told to a session that was extended. Likewise ``None`` for an allow whose own halt
+    reads as released by ANOTHER request: the session was extended and told so already. Anything that cannot be read
+    tells the ruling. The gap is named only when there is one (an End-halted session has none)."""
     from types import SimpleNamespace
 
     from levain.consent.listing import filed_input
@@ -861,15 +907,17 @@ def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir:
     label = LABELS.get(call.get("limit"), "budget")
     if ruling not in ("allow", "deny"):
         return None
-    if ruling == "deny" and queue_dir is not None and request_id is not None \
-            and _halt_released(Path(queue_dir), request_id):
-        return None
+    if queue_dir is not None and request_id is not None:
+        released = _halt_released if ruling == "deny" else _halt_released_by_other
+        if released(Path(queue_dir), request_id):
+            return None
+    on = f" (gap #{gap})" if isinstance(gap, int) and not isinstance(gap, bool) else ""
     if ruling == "allow":
         n = call.get("extend_to")
         to = f" to {n}" if isinstance(n, str) and n and len(n) <= 24 and set(n) <= set("0123456789,.") else ""
-        return (f"levain: the operator EXTENDED this session's {label} limit{to} (gap #{gap}). Go on with the work "
+        return (f"levain: the operator EXTENDED this session's {label} limit{to}{on}. Go on with the work "
                 "where it stopped.")
-    return (f"levain: the operator ENDED this session at its {label} limit (gap #{gap}). Stop here; do not continue "
+    return (f"levain: the operator ENDED this session at its {label} limit{on}. Stop here; do not continue "
             "the work another way.")
 
 

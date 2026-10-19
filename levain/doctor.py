@@ -291,7 +291,7 @@ def _check_consent_limits() -> list[CheckResult]:
         forces, not_counting, halted, counted = [], [], 0, 0
         for agent in limits.AGENTS:
             lim, src = limits.load_limits(qdir, agent)
-            shown = ", ".join(f"{k} {int(v) if k != 'active_hours' else v:g}" for k, v in lim.items())
+            shown = ", ".join(f"{k} {limits._num_text(k, v)}" for k, v in lim.items())
             forces.append(f"{agent}: {shown} [{src}]")
         for row in limits.snapshot(qdir):
             counted += 1
