@@ -256,7 +256,7 @@ def test_doctor_rows_on_a_fresh_install(make_install):
     cc = make_install("cc")
     rows = doctor._check_claude_code(cc)
     hook = _row(rows, "Claude Code consent hook")  # a fresh install has no key: the Q10 floor's WARN (L2-7)
-    assert hook.warn and "refused outright outside default and acceptEdits" in hook.detail
+    assert hook.warn and "refused outright outside default mode" in hook.detail
     away = _row(rows, "Claude Code away mode")
     assert not away.warn and away.detail.startswith("follows input idle:"), away
     auth = _row(rows, "Claude Code consent authority")

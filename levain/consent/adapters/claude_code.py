@@ -253,7 +253,7 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
     server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
     ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
-    human, or, when no enrolled key can sign T3 outside ``default`` and ``acceptEdits``, the call is refused (the
+    human, or, when no enrolled key can sign T3 outside ``default``, the call is refused (the
     Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
@@ -313,7 +313,7 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
     files nothing (a queue row is kept for good). The PermissionRequest hook then leaves the call to the agent's own
-    dialog; the PreToolUse gate does so in ``default`` and ``acceptEdits`` only, and in every other mode denies a
+    dialog; the PreToolUse gate does so in ``default`` only, and in every other mode denies a
     T3 call (the floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
@@ -699,7 +699,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 #    decides, and no ruled allow is spent; unless a settings file the session can load sets the variable
 #    (:func:`unconfined_state`), which is then ignored;
 # 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
-# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default`` and ``acceptEdits``
+# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default``
 #    (:data:`ATTENDED_POSTURES`) no decision (the dialog, or the operator's own allow rule, decides); in every other
 #    mode, an absent or unknown one included, the T3 FLOOR (Q10 D1): a plain deny with :data:`FLOOR_TEXT`, nothing
 #    filed (no hard stop: nothing is undecided, L2-2);
@@ -759,12 +759,12 @@ UNCONFINED_IGNORED_TEXT = (" The session's environment asks for an unconfined se
 # Q10 D2: a session started with this set to "1" in its environment is unconfined: the gate passes its gated calls
 # and the session's mode decides. Read from the hook's own environment at every call (the agent's launch env)
 UNCONFINED_ENV = "LEVAIN_UNCONFINED"
-# the modes the gate treats as attended (head triage L2-3): Claude Code's dialog prompts in both for the paths it
-# protects itself (``.claude/``, ``.git/``, ``.mcp.json``, ``.claude.json``: its permission-modes docs; Codex sends
-# ``default`` with approvals on). With no key that can sign T3 the gate leaves the call to that dialog there, and
-# holds only while the operator is away. A T3 path Claude Code does not protect (``.codex/config.toml``) runs with no
-# question in acceptEdits (measured 10-19, Q10 run 4 case C5): open, routed to the head
-ATTENDED_POSTURES = ("default", "acceptEdits")
+# the modes the gate treats as attended: only ``default`` (Codex sends ``default`` with approvals on). With no key
+# that can sign T3 the gate leaves the call to Claude Code's dialog there, and holds only while the operator is
+# away. acceptEdits is NOT attended: it auto-accepts workspace edits Claude Code does not itself protect (measured
+# 10-19, Q10 run 4 case C5: a Write of ``.codex/config.toml`` ran with no question), so it is floored/held like any
+# no-dialog mode
+ATTENDED_POSTURES = ("default",)
 
 
 def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None) -> list[tuple[str, Path]]:
@@ -1060,10 +1060,10 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
     or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
     allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
-    ``default`` and ``acceptEdits`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
+    ``default`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
     (:func:`floor_text`, nothing filed), else, in every mode (``default`` included), it is filed with its hold = D
     (``gate_hold_seconds``), pinged (:func:`notify`), held for a verified decision (delivered), and at D marked
-    undecided and denied (:func:`undecided_output`). In ``default`` and ``acceptEdits`` the hold runs only while
+    undecided and denied (:func:`undecided_output`). In ``default`` the hold runs only while
     the operator is away, and ``still_away``
     (default :func:`still_away_from` the queue directory's settings file) is re-read every :data:`RECHECK_EVERY`
     (:func:`hold_for_answer`): when away ends the request is withdrawn and Claude Code's dialog asks. Anything
@@ -1179,7 +1179,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             note(refused="floor")
             return _pre("deny", floor_text(what, loose))
         if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
-            # an attended default or acceptEdits session: Claude Code's own dialog (or his own allow rule) decides,
+            # an attended default session: Claude Code's own dialog (or his own allow rule) decides,
             # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
             return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
