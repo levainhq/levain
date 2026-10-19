@@ -400,6 +400,7 @@ def test_a_ruling_applied_before_the_chaining_is_still_taken_but_one_is_never_ap
     monkeypatch.setattr(qmod.ConsentQueue, "_ruling_refusal",
                         lambda self, *a, **kw: real(self, *a, **{**kw, "unchained_ok": True}))
     monkeypatch.setattr(qmod, "head_refusal", lambda *a, **kw: None)
+    monkeypatch.setattr(qmod, "_detached", lambda payload: payload)      # nor copied the payload (Old stays Old)
 
     class Old(dict):                       # the old apply never read a head; the record stored is the /1 one
         def __missing__(self, key):
