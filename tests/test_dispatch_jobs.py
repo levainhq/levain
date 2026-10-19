@@ -650,3 +650,130 @@ def test_a_capability_that_is_not_encodable_text_is_a_mismatch_never_a_crash(sto
     with pytest.raises(CapabilityRefused):
         store.cancel_by_planner(job.id, capability)
     assert store.get(job.id).state == "filed"
+
+
+# --- the human cancel (slice b1) ----------------------------------------------------------------------------------
+
+CNS = dsign.DISPATCH_CANCEL_NAMESPACE
+
+
+def cancel_item(job, key, at=None, reason="not this one", ns=CNS, **over):
+    payload = dsign.cancel_payload(job, signer_fp=key.fp, signed_at=at or NOW + timedelta(minutes=1), reason=reason)
+    payload.update(over)
+    return payload, key.sign(dsign.sign_message(payload), ns)
+
+
+@pytest.mark.parametrize("state", ["filed", "signed", "queued", "running", "verified", "recommended", "authorised"])
+def test_the_human_cancels_any_live_job(tmp_path, clock, repo, keys, log, state):
+    store = new_store(tmp_path, clock)
+    job, _cap = at_state(store, repo, state)
+    clock.now = NOW + timedelta(minutes=2)
+    payload, sig = cancel_item(job, keys["laptop"])
+    out = store.cancel_by_human(job.id, payload, sig, log.source)
+    assert out.state == "cancelled" and out.history[-1].cause == "human_cancel"
+    assert '"reason": "not this one"' in out.history[-1].evidence and keys["laptop"].fp in out.history[-1].evidence
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT payload, signature, signer_fp FROM cancel_signatures").fetchall() == [
+            (dsign.sign_message(payload).decode(), sig, keys["laptop"].fp)]
+        assert conn.execute("SELECT COUNT(*) FROM signatures WHERE payload LIKE '%dispatch-cancel%'").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("state", ["adopted", "failed", "cancelled"])
+def test_a_terminal_job_cannot_be_cancelled(tmp_path, clock, repo, keys, log, state):
+    store = new_store(tmp_path, clock)
+    job, _cap = at_state(store, repo, state)
+    payload, sig = cancel_item(job, keys["laptop"])
+    with pytest.raises(TransitionRefused, match=f"is {state}, which is final"):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+
+
+def test_a_contract_signature_presented_as_a_cancel_is_refused(store, repo, keys, log, clock):
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    spayload, ssig = signed(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="not a dispatch cancel record"):
+        store.cancel_by_human(job.id, spayload, ssig, log.source)
+    # a cancel payload signed in the contract namespace
+    payload, sig = cancel_item(job, keys["phone"], ns=NS)
+    with pytest.raises(SignatureRefused, match="does not verify"):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+    # and a cancel presented as a contract signature
+    payload, sig = cancel_item(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="not a dispatch signature record"):
+        store.sign(job.id, payload, sig, log.source)
+    assert store.get(job.id).state == "filed"
+
+
+@pytest.mark.parametrize("over, match", [
+    ({"store_id": "0" * 32}, "another dispatch store"),
+    ({"job_id": "dj-" + "0" * 32}, "another job"),
+    ({"digest": "sha256:" + "0" * 64}, "another contract digest"),
+])
+def test_a_cancel_for_another_store_job_or_digest_is_refused(store, repo, keys, log, clock, over, match):
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["phone"], **over)
+    with pytest.raises(SignatureRefused, match=match):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+    assert store.get(job.id).state == "filed"
+
+
+def test_a_cancel_by_a_revoked_key_is_refused(store, repo, keys, log):
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["revoked"])
+    with pytest.raises(SignatureRefused, match="revoked"):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+
+
+def test_a_future_dated_cancel_is_refused(store, repo, keys, log):
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["phone"], at=NOW + timedelta(minutes=10))
+    with pytest.raises(SignatureRefused, match="the cancel is dated in the future"):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+    # inside the skew it is the operator's
+    payload, sig = cancel_item(job, keys["phone"], at=NOW + timedelta(minutes=1))
+    assert store.cancel_by_human(job.id, payload, sig, log.source).state == "cancelled"
+
+
+def test_a_cancel_takes_the_authority_source_never_a_snapshot(store, repo, keys, snapshot):
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="AuthoritySource"):
+        store.cancel_by_human(job.id, payload, sig, snapshot)
+
+
+def test_a_cancel_verifier_that_cannot_run_is_a_machine_fault(tmp_path, repo, keys, log, clock):
+    from levain.authority import VerifierUnavailable
+    d = tmp_path / "dispatch"
+    d.mkdir(mode=0o700)
+    store = JobStore(d, clock=clock, ssh_keygen=tmp_path / "no-ssh-keygen")
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["phone"])
+    with pytest.raises(VerifierUnavailable):
+        store.cancel_by_human(job.id, payload, sig, log.source)
+    assert store.get(job.id).state == "filed"
+
+
+def test_an_authorised_job_cancelled_by_the_human_releases_its_write_files(store, repo, keys, log, clock):
+    job, _cap = at_state(store, repo, "authorised")
+    with pytest.raises(ContractRefused, match="already writes"):
+        file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    payload, sig = cancel_item(job, keys["laptop"])
+    store.cancel_by_human(job.id, payload, sig, log.source)
+    again, _ = file_job(store, repo)                 # the same write files, now free
+    assert again.state == "filed" and again.id != job.id
+
+
+def test_the_cancel_table_is_append_only(store, repo, keys, log, clock):
+    job, _ = file_job(store, repo)
+    payload, sig = cancel_item(job, keys["phone"])
+    store.cancel_by_human(job.id, payload, sig, log.source)
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        for sql in ("UPDATE cancel_signatures SET signature = 'y'", "DELETE FROM cancel_signatures",
+                    f"INSERT OR REPLACE INTO cancel_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')",
+                    f"INSERT INTO cancel_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')"):
+            with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
+                conn.execute(sql)
+    finally:
+        conn.close()

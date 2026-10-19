@@ -201,3 +201,87 @@ def test_an_oversized_signature_is_refused_before_it_is_verified(job, keys, snap
     assert dsign.refusal(payload, "A" * (dsign.SIGNATURE_MAX + 1), snapshot, job) == (
         f"the contract signature is over {dsign.SIGNATURE_MAX} characters")
     assert called == []
+
+
+# --- the human cancel (slice b1) ----------------------------------------------------------------------------------
+
+CNS = dsign.DISPATCH_CANCEL_NAMESPACE
+
+
+def cancelled(job, key, *, at=None, ns=CNS, **over):
+    payload = dsign.cancel_payload(job, signer_fp=key.fp, signed_at=at or NOW + timedelta(minutes=1), reason="wrong")
+    payload.update(over)
+    return payload, key.sign(dsign.sign_message(payload), ns)
+
+
+def test_a_cancel_is_its_own_payload_in_its_own_namespace(job, keys, snapshot):
+    payload, sig = cancelled(job, keys["laptop"])
+    assert set(payload) == dsign.CANCEL_KEYS and payload["format"] == "levain-dispatch-cancel/1"
+    assert CNS == "levain-dispatch-cancel" and CNS != NS
+    assert dsign.cancel_refusal(payload, sig, snapshot, job) is None
+    # an empty reason is a reason
+    payload, sig = cancelled(job, keys["phone"], reason="")
+    assert dsign.cancel_refusal(payload, sig, snapshot, job) is None
+
+
+def test_a_contract_signature_is_never_a_cancel_and_a_cancel_never_a_contract_signature(job, keys, snapshot):
+    # the same key, each payload signed in the OTHER namespace: neither verifies
+    payload, sig_in_sign_ns = cancelled(job, keys["phone"], ns=NS)
+    assert dsign.cancel_refusal(payload, sig_in_sign_ns, snapshot, job) == "the cancel signature does not verify"
+    spayload, _ = signed(job, keys["phone"])
+    sig_in_cancel_ns = keys["phone"].sign(dsign.sign_message(spayload), CNS)
+    assert dsign.refusal(spayload, sig_in_cancel_ns, snapshot, job) == "the contract signature does not verify"
+    # and each payload shape is refused by the other check before any signature is looked at
+    good_sign = keys["phone"].sign(dsign.sign_message(spayload), NS)
+    assert dsign.cancel_refusal(spayload, good_sign, snapshot, job) == "the cancel payload is not a dispatch cancel record"
+    good_cancel = keys["phone"].sign(dsign.sign_message(payload), CNS)
+    assert dsign.refusal(payload, good_cancel, snapshot, job) == "the signature payload is not a dispatch signature record"
+
+
+@pytest.mark.parametrize("over, match", [
+    ({"format": "levain-dispatch-sign/1"}, "cancel format"),
+    ({"store_id": "0" * 32}, "another dispatch store"),
+    ({"job_id": "dj-" + "0" * 32}, "another job"),
+    ({"digest": "sha256:" + "0" * 64}, "another contract digest"),
+    ({"signed_at": "yesterday"}, "not a timestamp"),
+    ({"signed_at": utc_stamp(NOW - timedelta(seconds=1))}, "before the contract was filed"),
+    ({"reason": "two\nlines"}, "one line"),
+    ({"reason": "x" * (dsign.FIELD_MAX + 1)}, f"over {dsign.FIELD_MAX} characters"),
+    ({"signer_fp": 7}, "every field"),
+])
+def test_cancel_payload_refusals(job, keys, snapshot, over, match):
+    payload, sig = cancelled(job, keys["phone"], **over)
+    assert match in dsign.cancel_refusal(payload, sig, snapshot, job)
+
+
+def test_a_cancel_has_no_lease_window(job, keys, snapshot):
+    # signed long after the unsigned lease: the cancel is still the operator's (the store decides if the job is live)
+    payload, sig = cancelled(job, keys["phone"], at=NOW + UNSIGNED_LEASE + timedelta(hours=5))
+    assert dsign.cancel_refusal(payload, sig, snapshot, job) is None
+
+
+def test_cancel_signer_refusals_in_the_queues_order(job, keys, snapshot):
+    for name, want in (("stranger", "the signer is not an enrolled key"), ("revoked", "the signer's key is revoked"),
+                       ("presence", "key class presence does not cover T2")):
+        payload, sig = cancelled(job, keys[name])
+        assert dsign.cancel_refusal(payload, sig, snapshot, job) == want
+    payload, _sig = cancelled(job, keys["phone"])
+    assert dsign.cancel_refusal(payload, "", snapshot, job) == "the cancel signature is empty"
+    assert dsign.cancel_refusal(payload, "A" * (dsign.SIGNATURE_MAX + 1), snapshot, job) == (
+        f"the cancel signature is over {dsign.SIGNATURE_MAX} characters")
+    assert "no authority snapshot" in dsign.cancel_refusal(payload, _sig, None, job)
+    other = keys["laptop"].sign(dsign.sign_message(payload), CNS)
+    assert dsign.cancel_refusal(payload, other, snapshot, job) == "the cancel signature does not verify"
+
+
+def test_a_passkey_cancel_gets_the_passkey_checks(job, keys, snapshot):
+    fp = fingerprint_of(passkey_line())
+    payload = dsign.cancel_payload(job, signer_fp=fp, signed_at=NOW + timedelta(minutes=1))
+    plain = keys["phone"].sign(dsign.sign_message(payload), CNS)
+    assert dsign.cancel_refusal(payload, plain, snapshot, job) == "a passkey answer must be a WebAuthn signature"
+
+
+def test_a_cancel_verifier_that_cannot_run_is_raised_never_a_refusal(job, keys, snapshot, tmp_path):
+    payload, sig = cancelled(job, keys["phone"])
+    with pytest.raises(auth.VerifierUnavailable):
+        dsign.cancel_refusal(payload, sig, snapshot, job, ssh_keygen=tmp_path / "no-ssh-keygen")

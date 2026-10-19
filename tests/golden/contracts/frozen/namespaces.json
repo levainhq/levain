@@ -67,6 +67,11 @@
    "namespace": "levain-dispatch-contract",
    "status": "reserved",
    "owner": "levain/dispatch/sign.py"
+  },
+  {
+   "namespace": "levain-dispatch-cancel",
+   "status": "reserved",
+   "owner": "levain/dispatch/sign.py"
   }
  ],
  "families": [
