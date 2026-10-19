@@ -1590,6 +1590,91 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; grid
 body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="tray"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="loops"] { order: 1; }
 body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="now"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="keep"] { order: 2; }
 
+/* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
+   Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
+.k7-sess, .k7-zt, .k7-zg, .k7-opend, .row > .k7-repo { display: none; }
+body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: var(--sec); }
+.k7-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
+.k7-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
+.k7-head span { font-size: var(--fs-meta); color: var(--meta); }
+.k7-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; min-width: 0; }
+.k7-card-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) var(--sp-6) var(--sp-4); }
+.k7-card-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
+.k7-card-h .ck-count { margin: 0; }
+.k7-sum, .k7-stats { font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
+.k7-sp { flex: 1 1 0; }
+.k7-mode-slot:empty { display: none; }
+.k7-card-h .k7-open { display: inline-flex; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-3); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
+.k7-card-h .k7-open:hover { background: var(--card-2); color: var(--text); }
+.k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
+.k7-card.k7-lone { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; text-align: left; border-style: dashed; border-color: var(--hair-2); background: none; }
+.k7-card.k7-lone .k7-card-h { padding: var(--sp-4) var(--sp-5); flex: none; }
+.k7-card.k7-lone .k7-none { padding: var(--sp-4) var(--sp-5) var(--sp-4) 0; flex: 1 1 240px; }
+.k7-none.err { color: var(--bad); }
+.k7-srow { display: grid; grid-template-columns: 14px minmax(170px, 1.1fr) minmax(220px, 1.6fr) minmax(190px, 1fr) minmax(96px, auto); align-items: center; gap: var(--sp-4) var(--sp-6);
+  padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--hair); }
+.k7-sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--meta); justify-self: center; }
+.k7-sdot.live { background: var(--ok); }
+.k7-who { min-width: 0; }
+.k7-who-t { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.k7-agent { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
+.k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
+.k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.k7-cwd { color: var(--meta); font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-now { min-width: 0; color: var(--text); font-size: var(--fs-body); }
+.k7-srow.quiet .k7-now .k7-tool { color: var(--label); }
+.k7-tool { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-limits { font-size: var(--fs-meta); color: var(--meta); }
+.k7-limits.amber { color: var(--warn); }
+.k7-limits.over { color: var(--bad); }
+.k7-meter { min-width: 0; }
+.k7-meter-h { display: flex; justify-content: space-between; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); letter-spacing: .08em; color: var(--label); }
+.k7-meter-v { letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.k7-bar { height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden; margin-top: var(--sp-1); }
+.k7-bar > i { display: block; height: 100%; background: var(--label); }
+.k7-meter.waiting .k7-bar > i { background: var(--accent); }
+.k7-meter.unread .k7-meter-v { color: var(--meta); }
+.k7-when { text-align: right; color: var(--label); font-size: var(--fs-meta); white-space: nowrap; }
+.k7-srow.waiting .k7-now .k7-tool { color: var(--text); }
+@media (max-width: 720px) {
+  .k7-srow { grid-template-columns: 14px minmax(0, 1fr); }
+  .k7-srow > .k7-now, .k7-srow > .k7-meter, .k7-srow > .k7-when { grid-column: 2; }
+  .k7-when { text-align: left; }
+}
+/* Results & edits */
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-title:not(.k7-zt),
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-gloss:not(.k7-zg) { display: none; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { display: block; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
+@media (min-width: 721px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] { grid-template-rows: auto 1fr; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { grid-column: 2; grid-row: 2; align-self: start; }
+}
+body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
+  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
+body.ke .ck-zgrid .panel.k7-results-none .phead { padding: 0; flex: none; }
+body.ke .ck-zgrid .panel.k7-results-none .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; color: var(--label); font-size: var(--fs-body); }
+body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
+@media (max-width: 720px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { order: 3; }
+}
+body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
+body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
+body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
+/* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--accent); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 100%; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+
 /* F7: an empty provider is its header line, one sentence and its action: a single dashed row (Team without a ledger, an Inbox with no
    source). Never a card with a body gap, never an empty box. The action opens the compose box under the line. */
 body.ke .ck-zgrid .panel.ck-dash { flex-direction: row; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;

@@ -1459,6 +1459,10 @@
       row.appendChild(due);
     }
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
+    // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
+    const aged = /^(\d+)d old$/.exec(String(s.age || ""));
+    if (aged) row.appendChild(el("span", "k7-opend", "open " + aged[1] + " d"));
+    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); row.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["edit", "schedule", "dismiss"] : null);
     return row;
   }
@@ -3784,6 +3788,7 @@
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
       if (typeof o.repo === "string" && o.repo) row.dataset.repoFacet = o.repo;   // read by the project-colour tag pass (cockpit_view.js)
+      if (o.dot === "ok" || o.dot === "bad" || o.dot === "off") { row.classList.add("k7-res"); row.appendChild(el("i", "k7-rdot " + o.dot)); }   // Build's Results: the outcome dot leads
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
         // an addressed row leads with `source -> for` ("everyone" when it names no reader)
@@ -3807,7 +3812,7 @@
   function renderEdits(entry, view) {
     const list = view.recent_edits || [];
     const p = panel(entry);
-    if (list.length === 0) { p.appendChild(el("p", "empty", "no edits yet")); return p; }
+    if (list.length === 0) { p.appendChild(el("p", "empty", "Edits appear here once a session writes a file.")); return p; }
     const claimed = new Set();
     for (const e of list) {
       const row = el("div", "edit-row");

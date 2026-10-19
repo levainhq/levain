@@ -223,11 +223,22 @@
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
         if (head.id === "sessions") {
           line.wrapMeta = true;
+          // the Build tab's session row (paintBuildSessions below): the provider's own measures, never a full cwd
+          const sv = (r.facets || {}).session_view;
+          if (isObj(sv)) line.sess = Object.assign({ agent: typeof (r.facets || {}).agent === "string" ? r.facets.agent : "", active: (r.facets || {}).session_activity === "active" }, sv);
           // the transcript button's key: the row id is "session:<stem>" (the stem is a hash, not the session id)
           if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
         }
         if (typeof r.id === "string" && r.id) line.key = r.id;
         if (grouped) line.grp = grp;
+        if (head.id === "jobs") {
+          // Build's Results: a finished job is a result: ok or failed, what ran, and when (never the raw result body)
+          const jf = r.facets || {};
+          const st = jf.job_status;
+          line.dot = st === "done" ? "ok" : st === "failed" ? "bad" : "off";
+          line.text = (typeof jf.verb === "string" && jf.verb ? jf.verb : r.title) + " " + (st === "done" ? "finished" : st === "failed" ? "failed" : st || "");
+          line.meta = [typeof jf.at === "string" ? ago(jf.at) : "", st === "pending" || st === "running" ? st : ""].filter(Boolean).join(" \u00b7 ");
+        }
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
         if (addressed) {
@@ -375,7 +386,7 @@
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
     tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
-    edits: "build", jobs: "build", sessions: "morning board build", health: "memory",
+    edits: "build", jobs: "build", sessions: "morning board", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
   const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });
@@ -602,7 +613,7 @@
       const panel = P.get(pid);
       const groupTitles = new Map();
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
-      const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
+      const entry = { zone: zoneId, edit_class: "", title: pid === "jobs" ? "Results" : titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
       if (region) entry.region = region;
       // how many rows the panel holds, from the kernel's own count: the page's count pill reads this, never the title's words
@@ -1827,6 +1838,13 @@
       // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
+    // Build's repo chips (session rows, Open loops rows) take the sky's hue for a repo its registry knows, and stay neutral otherwise
+    for (const c of document.querySelectorAll(".k7-repo[data-repo-facet]")) {
+      const facet = (c.dataset.repoFacet || "").toLowerCase();
+      const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
+      const key = known && sky && typeof sky.hueKey === "function" ? sky.hueKey(known[0]) : "";
+      if (key) { c.classList.add("rp-tag"); if (c.dataset.repo !== key) c.dataset.repo = key; }
+    }
     // the Decisions tile glows only while something waits on the operator
     for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
       const big = w.querySelector(".big[data-count]");
@@ -1835,7 +1853,164 @@
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
-  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) tintRepos(); }, 1500);
+  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) { tintRepos(); paintBuild(); } }, 1500);
+  // ---- K7: the Build tab ----
+  // Sessions is a count tile on Morning and Board; on Build it is a large card of its own, drawn here from the same panel
+  // state (so one read feeds both) into #k7-sessions, with the headings the Build tab carries. Nothing here reads a store.
+  const K7_NONE_SESSIONS = "No agent session yet: start Claude Code or Codex in a workspace.";
+  const K7_NONE_RESULTS = "No results yet: finished jobs and checks appear here.";
+  let k7Sig = "";
+  function k7Time(iso) {
+    const t = parseIso(iso);
+    return isNaN(t) ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+  function k7Ago(iso, now) {
+    const t = parseIso(iso);
+    if (isNaN(t)) return "";
+    const s = Math.max(0, Math.floor((now - t) / 1000));
+    return s < 60 ? s + " s ago" : s < 3600 ? Math.floor(s / 60) + " m ago" : s < 86400 ? Math.floor(s / 3600) + " h ago" : Math.floor(s / 86400) + " d ago";
+  }
+  const k7K = (n) => (n >= 1000 ? Math.round(n / 1000) + "K" : String(n));
+  // the context meter: how much of the model's window (Codex states it) or of the operator's warn line (Claude Code does not)
+  // the session holds. Orange only while the session waits on a decision; never a number the transcript did not give.
+  function k7Meter(v, waiting) {
+    const m = el("div", "k7-meter");
+    const head = el("div", "k7-meter-h");
+    head.appendChild(el("span", "k7-meter-l", "CONTEXT"));
+    const bar = el("div", "k7-bar");
+    const fill = el("i");
+    bar.appendChild(fill);
+    let label = "not read", frac = 0;
+    if (isNum(v.tokens) && v.compacted) { label = "compacted"; }
+    else if (isNum(v.tokens) && v.tokens > 0) {
+      const wall = isNum(v.window) && v.window > 0 ? v.window : (isNum(v.warn) && v.warn > 0 ? v.warn : 0);
+      frac = wall ? Math.min(1, v.tokens / wall) : 0;
+      label = isNum(v.window) && v.window > 0 ? Math.round((v.tokens / v.window) * 100) + "%" : k7K(v.tokens);
+    }
+    fill.style.width = Math.round(frac * 100) + "%";
+    head.appendChild(el("span", "k7-meter-v", label));
+    m.append(head, bar);
+    if (typeof v.context === "string" && v.context) m.title = v.context;
+    if (waiting) m.classList.add("waiting");
+    if (label === "not read") m.classList.add("unread");
+    return m;
+  }
+  function k7Limits(v) {
+    const l = v.limits;
+    if (!isObj(l)) return null;
+    let text = "", tone = "ok";
+    if (l.counting === false) { text = "limits: not counting"; tone = "over"; }
+    else if (typeof l.halted === "string" && l.halted) { text = "halted: " + l.halted; tone = "over"; }
+    else if (typeof l.metric === "string" && l.metric) { text = l.metric; tone = l.status === "over" || l.status === "amber" ? l.status : "ok"; }
+    return text ? el("div", "k7-limits " + tone, text) : null;
+  }
+  function k7Row(ln, now) {
+    const v = ln.sess, live = v.active === true;
+    const waiting = live && typeof v.waiting === "string" && v.waiting !== "";
+    const row = el("div", "k7-srow" + (live ? " live" : " quiet") + (waiting ? " waiting" : ""));
+    const dot = el("i", "k7-sdot " + (live ? "live" : "quiet"));
+    dot.setAttribute("aria-hidden", "true");
+    const who = el("div", "k7-who");
+    const top = el("div", "k7-who-t");
+    top.appendChild(el("b", "k7-agent", v.agent || "agent"));
+    if (ln.repo) { const chip = el("span", "k7-repo", ln.repo); chip.dataset.repoFacet = ln.repo; top.appendChild(chip); }
+    who.append(top, el("div", "k7-cwd", v.cwd || ""));
+    const nowc = el("div", "k7-now");
+    let said;
+    if (waiting) said = "waiting on a decision (" + v.waiting + ")";
+    else if (live) said = v.tool ? v.tool + " · " + k7Ago(v.tool_at, now) : "last hook " + k7Ago(v.last_seen, now);
+    else said = v.tool ? "last tool " + k7Time(v.tool_at) : "last hook " + k7Time(v.last_seen);
+    nowc.appendChild(el("div", "k7-tool", said));
+    const lim = k7Limits(v);
+    if (lim) nowc.appendChild(lim);
+    // "ended" would claim what no hook announces: a quiet session says when it last fired one
+    row.append(dot, who, nowc, k7Meter(v, waiting), el("div", "k7-when", live ? "since " + k7Time(v.first_seen) : "last active " + k7Time(v.last_seen)));
+    return row;
+  }
+  function k7Host() {
+    let sec = document.getElementById("k7-sessions");
+    if (sec) return sec;
+    const after = document.getElementById("ck-widgets");
+    if (!after || !after.parentNode) return null;
+    sec = el("section", "k7-sess frame");
+    sec.id = "k7-sessions";
+    sec.hidden = true;
+    after.parentNode.insertBefore(sec, after.nextSibling);
+    return sec;
+  }
+  function k7Heading(title, gloss) {
+    const h = el("div", "k7-head");
+    h.append(el("h3", null, title), el("span", null, gloss));
+    return h;
+  }
+  function paintBuildSessions() {
+    const sec = k7Host();
+    if (!sec) return;
+    const s = Array.from(states).find((o) => o.pid === "sessions" && o.ctx && o.ctx.widget && o.p && o.p.isConnected);
+    if (!s || document.body.dataset.mode !== "build") { if (!s) { sec.hidden = true; k7Sig = ""; } return; }
+    const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
+    const now = Date.now();
+    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), Math.floor(now / 5000), s.data.empty || ""]);
+    if (sig === k7Sig && !sec.hidden) return;
+    k7Sig = sig;
+    sec.hidden = false;
+    const card = el("div", "panel k7-card");
+    const head = el("div", "k7-card-h");
+    const live = lines.filter((l) => l.sess.active === true).length;
+    const ttl = el("h2", null, "Sessions");
+    head.appendChild(ttl);
+    if (lines.length) {
+      const pill = el("span", "ck-count", String(lines.length));
+      head.append(pill, el("span", "k7-sum", live + " live · " + (lines.length - live) + " quiet"));
+    }
+    head.appendChild(el("span", "k7-sp"));
+    // the hook for the `list | topology` switch: a later lane renders into this slot from its own file; no switch is drawn here
+    const slot = el("span", "k7-mode-slot");
+    slot.dataset.k7Slot = "mode";
+    head.appendChild(slot);
+    if (lines.length) {
+      const day = new Date(now).toDateString();
+      const today = lines.filter((l) => { const t = parseIso(l.sess.first_seen); return !isNaN(t) && new Date(t).toDateString() === day; }).length;
+      head.appendChild(el("span", "k7-stats", "started today " + today));
+      const open = el("button", "k7-open", "all details");
+      open.type = "button";
+      open.title = "open the full session list with each session's transcript";
+      open.addEventListener("click", () => s.p.click());
+      head.appendChild(open);
+    }
+    card.appendChild(head);
+    if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
+    else if (!lines.length) { card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS)); card.classList.add("k7-lone"); }
+    else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), card);
+    tintRepos();
+  }
+  // "Results & edits": the Work zone's own heading, shown on Build only, and the one line a Results card says when no job has
+  // ever been recorded (the jobs panel is optional: an install with none has no card to say so)
+  function paintBuildZone() {
+    const zone = document.querySelector('.ck-zone[data-zone="operate"]');
+    if (!zone) return;
+    const head = zone.querySelector(".zone-head");
+    if (head && !head.querySelector(".k7-zt")) {
+      const t = el("div", "zone-title k7-zt", "Results & edits");
+      const g = el("span", "zone-gloss k7-zg", "What the sessions produced.");
+      head.append(t, g);
+    }
+    const grid = zone.querySelector(".ck-zgrid");
+    if (grid && !grid.querySelector('[data-ck-panel="jobs"]') && !grid.querySelector(".k7-results-none")) {
+      const p = el("div", "panel ck-dash k7-results-none");
+      p.dataset.ckPanel = "jobs-none";
+      p.dataset.modes = "build";
+      const h = el("div", "phead");
+      h.appendChild(el("h2", null, "Results"));
+      p.append(h, el("div", "pbody", K7_NONE_RESULTS));
+      grid.appendChild(p);
+    }
+  }
+  function paintBuild() {
+    try { paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
+  }
+
   // The glance is a compact strip (one bordered row of equal tiles) on Board and whenever fewer than four tiles show; four or more are full
   // tiles. A zone's grid is told which of its columns have a card on this tab, and a card that would sit alone in a row of a wider grid
   // is stretched to the row: a lone card never leaves a hole beside it. Measured after layout, so it is redone on every tab change.
@@ -1866,6 +2041,7 @@
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
     tintRepos();
+    paintBuild();
     const board = document.body.dataset.mode === "board";
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
@@ -2020,7 +2196,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, hashMode, revealTab });
+  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

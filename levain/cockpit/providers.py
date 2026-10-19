@@ -888,7 +888,10 @@ SESSIONS_NOTE = ("Sandbox is what the settings files say for each session's work
                  f"not visible to doctor or here: {SANDBOX_UNSEEN}. A session shows when it last fired a hook; "
                  "nothing says when one ends, so a silent one goes Quiet. Context is read from each session's transcript; a "
                  "relocated config directory is only found for sessions whose hook has recorded the path.")
-SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta"})
+SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta", "repo", "session_view"})
+SESSION_TOOL_LISTED = 12            # the newest listed sessions whose transcript log is read for the tool they last ran
+SESSION_TOOL_MAX = 60               # characters of a tool event's text the Build tab shows
+LIMIT_STATUS_RANK = {"ok": 0, "amber": 1, "over": 2}
 
 
 def _session_stamp(v: Any) -> datetime | None:
@@ -975,6 +978,93 @@ def _context_chip(rec: dict[str, Any]) -> tuple[str, Any]:
         return "context not read: unreadable", None
 
 
+def _cwd_hint(cwd: str) -> str:
+    """Where a session works, WITHOUT the whole path: this panel is token-free, and its tile has never carried the full
+    cwd. ``~/repo`` for a direct child of the home directory, ``~/…/repo`` deeper under it, ``/…/repo`` elsewhere."""
+    home = os.path.expanduser("~").rstrip("/\\")
+    name = "".join(c for c in (os.path.basename(cwd.rstrip("/\\")) or "/") if c.isprintable())[:64]
+    if name == "/":
+        return "/"
+    if home and cwd.rstrip("/\\") == home:
+        return "~"
+    if home and os.path.dirname(cwd.rstrip("/\\")) == home:
+        return f"~/{name}"
+    return f"~/…/{name}" if home and cwd.startswith(home + os.sep) else f"/…/{name}"
+
+
+def _last_tool(install_root: Path, stem: str) -> tuple[str, str] | None:
+    """The newest ``tool`` event of a session's transcript log as (iso time, one line of text), or None. A display read
+    through the log reader's own bounded tail; any failure is no reading, never a dark panel."""
+    try:
+        from levain.cockpit import session_log as sl
+
+        raw = sl._tail(install_root / ".levain" / "sessions" / f"{stem}.log.jsonl")
+        if not raw:
+            return None
+        for line in reversed(raw.splitlines()):
+            ev = sl._event(line)
+            if ev is not None and ev["kind"] == "tool":
+                text = " ".join(ev["text"].split())
+                text = text.replace(": ", " ", 1) if ": " in text[:40] else text
+                text = "".join(c for c in text if c.isprintable())
+                return ev["at"], (text[:SESSION_TOOL_MAX - 1] + "\u2026" if len(text) > SESSION_TOOL_MAX else text)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _limit_figure(v: Any) -> str:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return str(v)
+    return str(int(v)) if float(v).is_integer() else f"{v:.1f}"
+
+
+def _limit_lines() -> dict[tuple[str, str], dict[str, Any]]:
+    """Per (agent, session id), the budget line the Q13 limits panel reports: its worst metric, whether the session is
+    counted at all, whether it is halted. ``levain.consent.limits.panel`` is another lane's; where it does not exist (or
+    reads nothing) this is empty and the session row draws no limits line, and nothing is raised."""
+    import importlib
+
+    try:
+        mod = importlib.import_module("levain.consent.limits")
+        fn = getattr(mod, "panel", None)
+        if not callable(fn):
+            return {}
+        from levain.consent.queue import default_queue_dir
+
+        data = fn(default_queue_dir())
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(sessions, list):
+            return {}
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for ent in sessions:
+            if not isinstance(ent, dict) or not isinstance(ent.get("agent"), str) or not isinstance(ent.get("session"), str):
+                continue
+            worst, wr = None, (-1, -1.0)
+            for m in ent.get("metrics") or ():
+                if not isinstance(m, dict) or not isinstance(m.get("label"), str):
+                    continue
+                st = m.get("status") if m.get("status") in LIMIT_STATUS_RANK else "ok"
+                v, lim = m.get("value"), m.get("limit")
+                ratio = (v / lim) if isinstance(v, (int, float)) and isinstance(lim, (int, float)) \
+                    and not isinstance(v, bool) and not isinstance(lim, bool) and lim else 0.0
+                if (LIMIT_STATUS_RANK[st], ratio) > wr:
+                    worst, wr = (m, st), (LIMIT_STATUS_RANK[st], ratio)
+            line: dict[str, Any] = {"counting": ent.get("counting") is not False}
+            if worst is not None:
+                m, st = worst
+                figure = _limit_figure(m.get("value")) + (f"/{_limit_figure(m['limit'])}" if m.get("limit") is not None else "")
+                line["metric"] = f"{m['label']} {figure}"
+                line["status"] = st
+            halted = ent.get("halted")
+            if isinstance(halted, dict):
+                line["halted"] = str(halted.get("kind") or "limit")[:40]
+            out[(ent["agent"], ent["session"])] = line
+        return out
+    except Exception:  # noqa: BLE001 - a limits panel that cannot be read is no line, never a dark sessions panel
+        return {}
+
+
 def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime], Any] | None]
               ) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
@@ -1000,6 +1090,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             return Fault(f"the sessions directory cannot be read: {type(exc).__name__}")
         found.sort(key=lambda p: p[0], reverse=True)
         waiting: dict[tuple[str, str], int] = {}
+        waiting_on: dict[tuple[str, str], str] = {}
         consent_read = True
         reader = consent()
         if reader is not None:
@@ -1010,9 +1101,11 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                     if e.state in ("pending", "undecided"):
                         k = (e.request.agent, e.request.agent_session_id)
                         waiting[k] = waiting.get(k, 0) + 1
+                        waiting_on.setdefault(k, e.request.tool_name)
             except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting
                 consent_read = False
-        listed: list[tuple[dict[str, Any], list[str], str, bool]] = []
+        listed: list[tuple[dict[str, Any], list[str], str, bool, dict[str, Any]]] = []
+        limits = _limit_lines()
         bad = 0
         sandbox: dict[str, str] = {}
         for _mt, path in found[:SESSIONS_SHOWN]:
@@ -1031,24 +1124,39 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                 chips.append("memory loaded at start")
             elif rec["context_delivered"] is False:
                 chips.append("memory not loaded")
-            chips.append(_context_chip(rec)[0])
+            ctx_text, sctx = _context_chip(rec)
+            chips.append(ctx_text)
             if not consent_read:
                 chips.append("consent not read")
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
             work = "".join(c for c in work if c.isprintable())[:64]
-            listed.append((rec, chips, work, age < SESSION_ACTIVE_S))
+            key = (rec["agent"], rec["session_id"])
+            view: dict[str, Any] = {"cwd": _cwd_hint(rec["cwd"]), "first_seen": rec["first_seen"], "last_seen": rec["last_seen"],
+                                    "context": ctx_text}
+            if sctx is not None:
+                from levain.cockpit.session_context import CONTEXT_WARN_TOKENS
+
+                view["tokens"], view["window"], view["compacted"] = sctx.tokens, sctx.window, bool(sctx.compacted)
+                view["warn"] = CONTEXT_WARN_TOKENS
+            if len(listed) < SESSION_TOOL_LISTED and (tool := _last_tool(source.install_root, rec["_stem"])) is not None:
+                view["tool_at"], view["tool"] = tool
+            if key in waiting_on:
+                view["waiting"] = waiting_on[key] or "a tool"
+            if key in limits:
+                view["limits"] = limits[key]
+            listed.append((rec, chips, work, age < SESSION_ACTIVE_S, view))
         # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
         # started (never the session id, ruling 4). Two whose starts round alike (same minute; past an hour, same
         # hour) still read alike (known edge).
         titles: dict[tuple[str, str], int] = {}
-        for rec, _chips, work, _active in listed:
+        for rec, _chips, work, _active, _view in listed:
             titles[(rec["agent"], work)] = titles.get((rec["agent"], work), 0) + 1
         rows: list[RowIn] = []
-        for rec, chips, work, active in listed:
+        for rec, chips, work, active, view in listed:
             stored = {"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
-                      "active": active, "chips": chips[1:]}
+                      "active": active, "chips": chips[1:], "view": view}
             started = _session_stamp(rec["first_seen"]) if titles[(rec["agent"], work)] > 1 else None
             meta = chips
             if started is not None and started <= rec["_seen"]:
@@ -1058,7 +1166,8 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             rows.append(RowIn(
                 id=f"session:{rec['_stem']}", title=f"{rec['agent']} · {work}",
                 facets={"agent": rec["agent"], "last_seen": rec["last_seen"], "source": work,
-                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(meta)},
+                        "session_activity": "active" if active else "quiet", "legacy_meta": " · ".join(meta),
+                        "repo": work, "session_view": view},
                 stored=stored))
         skipped = ((bad, "session record that does not have the registry file's shape"),) if bad else ()
         if lost:
