@@ -6853,7 +6853,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 "read-only would take the workspace with it. Refusing to grant bash hands "
                 "(fail-closed). Replace the symlink with the real directory or file to use bash."
             )
-        if home_ro is not None and parent.is_relative_to(home_ro):
+        if ((home_ro is not None and parent.is_relative_to(home_ro))
+                or parent.is_relative_to(ws_real)):
+            # Under $HOME, or inside the workspace (a hands workspace lives outside $HOME; L3 r2, gemini).
             trees.add(parent)
     for real in sorted(trees, key=str):   # parent-first: a tree inside one already bound is skipped
         if _in_persist_ro(real) or _in_tool_view(real):
@@ -6873,15 +6875,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 persist_ro.append(real)
             continue   # a file where a tree would be holds nothing below it
         anc = _nearest_existing(real)
-        if anc == ws_real and not os.access(anc, os.W_OK):
+        if (anc == ws_real or anc.is_relative_to(ws_real)) and not os.access(anc, os.W_OK):
             # A hands workspace (owned by the hands user; this process has read access only): bash
             # could create the agents' directory here and this process cannot pre-create it.
-            # `levain setup-isolation` makes both as root's; an install from before that has neither.
+            # `levain setup-isolation` makes the workspace's two; an install from before that has neither.
+            # Deeper in the workspace (a CODEX_HOME or CLAUDE_CONFIG_DIR there) setup makes nothing.
+            remedy = ("Run `sudo levain setup-isolation` once more for this entity: it creates the "
+                      "workspace's .claude and .codex for bash to find." if anc == ws_real else
+                      f"Create {real} first (as the workspace's owner), or point CODEX_HOME / "
+                      "CLAUDE_CONFIG_DIR outside the workspace.")
             raise ConfinementError(
                 f"{real} does not exist, and in this hands workspace bash could create it with agent "
                 "configuration your own Claude Code or Codex would load. Refusing to grant bash hands "
-                "(fail-closed). Run `sudo levain setup-isolation` once more for this entity: it creates "
-                "the workspace's .claude and .codex as root's."
+                f"(fail-closed). {remedy}"
             )
         if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not _bash_may_write(anc):
             continue   # bash cannot create it either

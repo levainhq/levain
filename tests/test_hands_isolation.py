@@ -974,3 +974,28 @@ def test_the_agent_dirs_are_made_without_following_a_planted_link(tmp_path: Path
     ok, why = hands._make_agent_dirs(ws, os.getuid(), os.getgid())
     assert ok, why
     assert (ws / ".claude").is_dir() and not (ws / ".claude").is_symlink() and (ws / ".codex").is_dir()
+
+
+def test_a_linux_repair_does_not_need_setfacl(tmp_path: Path, monkeypatch, capsys) -> None:
+    # L3 r2 (codex LOW): `acl` removed after setup must not block the repair that makes the
+    # workspace's .claude/.codex; a repair sets no ACL.
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "linux_tool_missing", lambda: "acl is not installed (no `setfacl`)")
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me if n != hands_user_name(ed) else
+                        hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    agent_dirs: list = []
+    monkeypatch.setattr(hands, "_make_agent_dirs", lambda ws, uid, gid: agent_dirs.append((ws, uid)) or (True, ""))
+    monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
+    monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
+    monkeypatch.setattr(hands, "retired_ids", lambda h: set())
+    monkeypatch.setattr(hands, "_install_file", lambda path, *a, **kw: (True, ""))
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
+    assert agent_dirs and "refusing" not in capsys.readouterr().out

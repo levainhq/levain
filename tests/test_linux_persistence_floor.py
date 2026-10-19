@@ -263,3 +263,53 @@ def test_the_hardlink_check_follows_links_inside_config_subdirs_and_reads_memory
     os.link(mem / "MEMORY.md", ws / "mem-alias")
     with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
         C._refuse_multiply_linked_jewels(build_policy(ent, workspace=ws, deny_standard_creds=False))
+
+
+def test_an_override_root_reached_through_a_linked_ancestor_binds_the_hop_parent(
+        home: Path, monkeypatch) -> None:
+    # L3 r2 (gemini MED): CODEX_HOME=~/dots/link/codex with ~/dots/link -> ~/real: bash could
+    # re-point ~/dots/link at a codex home of its own unless ~/dots is bound read-only. RUN before
+    # any fix: it passed, the override's hop is already in the agents' pins; kept as the regression.
+    ent, ws = _entity(home)
+    (home / "real" / "codex").mkdir(parents=True)
+    (home / "dots").mkdir()
+    (home / "dots" / "link").symlink_to(home / "real")
+    monkeypatch.setenv("CODEX_HOME", str(home / "dots" / "link" / "codex"))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    ro = _ro_binds(argv)
+    assert str(home / "dots") in ro and str(home / "real" / "codex") in ro
+
+
+def test_a_link_hop_inside_a_workspace_outside_home_has_its_parent_bound_read_only(
+        home: Path, tmp_path: Path) -> None:
+    # L3 r2 (gemini HIGH): a hands workspace lives outside $HOME, so a hop in one of its
+    # subdirectories was neither refused nor bound; bash could re-point it.
+    d = home / "proj" / "ent"
+    (d / ".levain").mkdir(parents=True)
+    ws = tmp_path / "hands-ws"
+    (ws / "safe").mkdir(parents=True)
+    (ws / "safe" / "settings.json").write_text("{}")
+    (ws / "sub").mkdir()
+    (ws / "sub" / "hop").symlink_to(ws / "safe")
+    (ws / ".claude").mkdir()
+    (ws / ".claude" / "settings.json").symlink_to(ws / "sub" / "hop" / "settings.json")
+    argv, _ = C._bwrap_plan(build_policy(d, workspace=ws, deny_standard_creds=False))
+    ro = _ro_binds(argv)
+    assert str(ws / "sub") in ro
+    assert str(ws) not in ro          # the workspace itself stays writable
+
+
+def test_an_absent_tree_under_a_workspace_subdir_this_process_cannot_write_refuses_bash(
+        home: Path, monkeypatch) -> None:
+    # L3 r2 (gemini HIGH, part 2): the nearest existing ancestor is a hands-owned subdirectory of
+    # the workspace, not the workspace itself; the plan used to try (and fail) to create it.
+    ent, ws = _entity(home)
+    sub = ws / "sub"
+    sub.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(sub / ".codex"))
+    sub.chmod(0o555)
+    try:
+        with pytest.raises(ConfinementError, match="outside the workspace"):
+            C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    finally:
+        sub.chmod(0o755)

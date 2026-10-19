@@ -1730,7 +1730,9 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
     except HandsSetupError as exc:
         print(f"setup-isolation: {exc}")
         return 1
-    if host == "linux":
+    # setfacl is a fresh setup's (and --reenable's): a repair sets no ACL, so it does not need it
+    # (L3 r2, codex: removing `acl` after setup must not block the repair that makes .claude/.codex).
+    if host == "linux" and cfg.hands_user is None:
         missing = linux_tool_missing()
         if missing:
             print(f"setup-isolation: refusing: {missing}.")
