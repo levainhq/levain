@@ -88,8 +88,9 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
     protected_paths,
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
-    FLOOR_TEXT, GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN, RULING_TEXT,
-    UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, notify, send_repings, unconfined,
+    ATTENDED_POSTURES, FLOOR_TEXT, GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN,
+    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
+    unconfined_state,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
@@ -253,6 +254,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
                                         protected=protected)
+    if agent_config and unconfined(cwd, home=home, codex_home=codex_dir):
+        return None  # an unconfined session (Q10 D2): Codex's approval answers, as the gate left it to the mode
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
@@ -306,8 +309,9 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # exists): the entry's timeout is the ceiling's (:data:`GATE_TIMEOUT`), and :func:`main` never raises.
 #
 # The T3 floor (Q10 D1) and the unconfined session (D2) are Claude Code's (its gate section): with no enrolled key
-# that can sign a T3 allow, a gated call in any mode but ``default`` and ``plan`` is denied (a plain deny, per the
-# first bullet), and a session started with ``LEVAIN_UNCONFINED=1`` passes gated calls, its halt still read first.
+# that can sign a T3 allow, a gated call in any mode but ``default``, ``acceptEdits`` and ``plan`` is denied (a plain
+# deny, per the first bullet), and a session started with ``LEVAIN_UNCONFINED=1`` passes gated calls, its halt still
+# read first, unless a settings file the session can load (Codex's or Claude Code's) sets the variable.
 #
 # Codex keeps no per-call approval in its rollout, so the authority ledger cannot read after the fact who allowed
 # a gated call: the gate files the call's row itself when levain answered it (:func:`_ledger_note`).
@@ -445,10 +449,11 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     first, as soon as the event names a session: a session halted on a gap gets :data:`HALT_TEXT` for EVERY call,
     gated or not, until the ruling on that gap releases it. An event missing a required field (``session_id``,
     ``tool_name``, ``cwd``) is denied. Else a gated call (:func:`gate_class`) gets no decision in a session started
-    unconfined (:func:`levain.consent.adapters.claude_code.unconfined`; no ruled allow is spent, and a halt read
-    above still wins); else is run once on a ruled allow; else, when nothing can decide it (:func:`nothing_can_decide`
-    at the gated tier), gets no decision in ``default`` (Codex's approval asks) or ``plan``, and in every other mode,
-    an absent or unknown one included, the floor's plain deny (:data:`FLOOR_TEXT`, nothing filed); else,
+    unconfined (:func:`levain.consent.adapters.claude_code.unconfined_state` ``"on"``; no ruled allow is spent, and a
+    halt read above still wins); else is run once on a ruled allow; else, when nothing can decide it
+    (:func:`nothing_can_decide` at the gated tier), gets no decision in ``default`` (Codex's approval asks; also
+    ``acceptEdits``, should Codex ever send it) or ``plan``, and in every other mode, an absent or unknown one
+    included, the floor's plain deny (:func:`floor_text`, nothing filed); else,
     when something could decide it and, in ``default`` mode (approvals
     on), only while the operator is away, filed with its hold = D (``gate_hold_seconds``), pinged, held for a
     verified decision (delivered), and at D marked undecided (the irreversible tier halting its session) and denied
@@ -554,21 +559,23 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
         mode = event.get("permission_mode")
         posture = mode if isinstance(mode, str) and mode else None
-        if unconfined():
+        loose = unconfined_state(cwd, home=home, codex_home=codex_dir)
+        if loose == "on":
             # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow is spent. A
-            # halt was read before this call reached here (:func:`gate`): the env var never releases one
+            # halt was read before this call reached here (:func:`gate`): the env var never releases one. A
+            # settings file that sets the variable makes it ignored (L2-1, :func:`unconfined_state`)
             return None
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
-            if posture in ("default", "plan"):
+            if posture in (*ATTENDED_POSTURES, "plan"):
                 return None  # Codex's own approval asks (default), or the mode runs nothing (plan)
             # no approval asks in this mode (an absent or unknown mode counts as none) and no key could answer a
             # request: the floor denies, files nothing (Q10 D1); a plain deny, never ``continue: false`` (above)
             note(refused="floor")
-            return _deny(FLOOR_TEXT.format(x=what))
-        if posture == "default" and not effective_away(settings)[0]:
+            return _deny(floor_text(what, loose))
+        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
             # approvals on and the operator present: Codex's own approval asks for an agent-config write (measured
             # B5-fix1, MEASURE_away), so the gate holds only while he is away, as Claude Code's does (head ruling 10-18)
             return None
@@ -583,7 +590,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
                cwd=queue.directory)
-        if posture == "default" and still_away is not None:
+        if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): when away ends, the call goes back to Codex's approval
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
                                         still_away=still_away)

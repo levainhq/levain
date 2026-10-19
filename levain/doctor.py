@@ -1492,12 +1492,19 @@ def _check_transcript_hooks(install: Path, hooks: Any, events: Sequence[str], ag
                         f"nothing for those events", "Run `levain update` to add them.", warn=True)]
 
 
+# how an operator allows agent config and hook edits when no key can sign them (the Q10 floor), for both agents
+UNCONFINED_HOW = ("To allow them, enrol a key that can sign T3 (a laptop-presence key) in this install's cockpit, "
+                  "so each one is asked, or launch the session with LEVAIN_UNCONFINED=1 from your own shell "
+                  "(a settings file that sets it is ignored).")
+
+
 def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[CheckResult]:
     """The consent hook `levain init` wires (S1436): whether the PermissionRequest entry runs this install's
     script, the away mode the hook will read, and which cockpit its grants and signed answers verify against.
     Advisory only (at most a WARN): with no hook, no settings or no cockpit the agent's own dialog answers."""
     from levain.consent.adapters import claude_code, codex
     from levain.consent.adapters.claude_code import CLEANUP_RESERVE, DEFAULT_MAX_HOLD
+    from levain.consent.policy import AGENT_CONFIG_TIER
     from levain.install import CONSENT_HOOK_SCRIPTS, PENDING_REL, _consent_queue_dir, consent_cockpit_root
 
     from levain.install import persisted_consent_hook
@@ -1513,8 +1520,19 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
                                 warn=True)]
         return [CheckResult(f"{label} consent hook", True,
                             "off (.levain/config.json): the agent's own dialog answers every permission")]
+    qdir = _consent_queue_dir()
+    settings = mod.load_settings(qdir)
     if _hooks_wired_anywhere(hooks, "PermissionRequest", install, CONSENT_HOOK_SCRIPTS[adapter]):
-        out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
+        if adapter == "claude-code" and claude_code.nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
+            # the Q10 floor: the PreToolUse gate refuses these outright where no dialog asks (L2-7)
+            out.append(CheckResult(f"{label} consent hook", True,
+                                   "wired to this install, but no active key can sign an agent config change (T3), "
+                                   "so an agent config or hook edit is refused outright outside default and "
+                                   "acceptEdits mode, and in them left to Claude Code's own dialog, which asks for "
+                                   "the paths Claude Code protects (.claude/, .git/, .mcp.json)",
+                                   UNCONFINED_HOW, warn=True))
+        else:
+            out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
     else:
         staged = install.joinpath(*PENDING_REL, *((".claude", "settings.json") if adapter == "claude-code"
                                                   else ("codex-home", "hooks.json")))
@@ -1525,8 +1543,6 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         out.append(CheckResult(f"{label} consent hook", True,
                                "not wired: the agent's own dialog answers every permission; no grant or away "
                                "answer can reach it", hint, warn=True))
-    qdir = _consent_queue_dir()
-    settings = mod.load_settings(qdir)
     try:
         mark, unread = claude_code.away_mark_of(qdir, settings, mod.AGENT), None
     except Exception as e:  # noqa: BLE001 - a store the hook cannot open: say what that costs
@@ -3149,7 +3165,7 @@ def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -
                             "nothing can decide a gated call now: no active key whose class signs T3 (away mode "
                             "alone does not count: no key could answer a held call), so an agent config or hook "
                             "edit is refused outright outside approval mode, and asked by Codex's own approval in it",
-                            "Enrol a laptop-presence key in this install's cockpit.", warn=True)]
+                            UNCONFINED_HOW, warn=True)]
     return [CheckResult(name, True, "wired to this install and trusted by Codex (its own hooks/list: trusted, "
                         "enabled, levain's hash)")]
 

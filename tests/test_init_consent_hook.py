@@ -137,7 +137,8 @@ def test_update_wires_a_pre_consent_install_and_keeps_the_pin(make_install):
     r = refresh_adapter(cc, apply=True, emit=lambda _l: None)
     assert ".claude/settings.json" in r.refreshed and "activation/hooks/consent_claude_code.py" in r.refreshed, r
     assert settings.read_bytes() == want
-    assert not _row(doctor._check_claude_code(cc), "Claude Code consent hook").warn
+    wired = _row(doctor._check_claude_code(cc), "Claude Code consent hook")  # no key: the Q10 floor's WARN (L2-7)
+    assert wired.detail.startswith("wired to this install, but no active key") and "LEVAIN_UNCONFINED=1" in wired.hint
     (res,) = doctor._check_agent_hook_pins(cc)
     assert res.ok and not res.warn, res
 
@@ -254,7 +255,8 @@ def test_codex_init_says_trust_and_machine_wide(make_install, monkeypatch):
 def test_doctor_rows_on_a_fresh_install(make_install):
     cc = make_install("cc")
     rows = doctor._check_claude_code(cc)
-    assert not _row(rows, "Claude Code consent hook").warn
+    hook = _row(rows, "Claude Code consent hook")  # a fresh install has no key: the Q10 floor's WARN (L2-7)
+    assert hook.warn and "refused outright outside default and acceptEdits" in hook.detail
     away = _row(rows, "Claude Code away mode")
     assert not away.warn and away.detail.startswith("follows input idle:"), away
     auth = _row(rows, "Claude Code consent authority")
