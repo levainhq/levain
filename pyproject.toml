@@ -176,7 +176,7 @@ where = ["."]
 include = ["levain*"]
 
 [tool.setuptools.package-data]
-levain = ["templates/**/*"]
+levain = ["templates/**/*", "webpush/static/*"]
 
 # Never ship compiled bytecode in the wheel: the `templates/**/*` glob above would
 # otherwise pull in any `__pycache__/*.pyc` left in the working tree (cross-version

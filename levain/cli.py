@@ -1414,6 +1414,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_team(subparsers)
 
+    from levain.webpush.cli import register as _register_webpush
+
+    _register_webpush(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 
