@@ -10,8 +10,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Context meter in the Sessions view.** Each Claude Code and Codex session shows how much context it holds now ("context
   142K"; Codex "context 80K of 258K"), and says when it passes 200K (a fixed warn line, not the model's window). Read from
   the session's own transcript; a display, it decides nothing.
+- **The phone page and the cockpit show what you are signing.** Each request on the phone consent page and in the
+  cockpit's Decisions view now shows its input digest and request digest (short, the full value one tap away): the same
+  two values `levain consent answer` prints before it signs. A question that leads to a push shows them too, since one tap
+  there allows the push.
+- **A hint beside a shell command.** For a shell request, a short "hint (a few patterns only; informs, never authorises)"
+  says what the command looks like: piping a download into a shell, `$()`, `sudo`, `rm -r`, a force-push, writes outside the
+  working directory and similar. When nothing matches it says "no pattern matched: read the command". A hint never changes
+  what is signed or allowed.
+- Invisible and direction-changing characters in an agent's text (the command, its path, a tool or agent name) are shown as
+  visible markers such as ⟨U+202E⟩ on both surfaces.
 
 ### Known edges
+- The hint is a pattern reader, not a shell parser: a command written to dodge the patterns gets no hint, and the full command
+  is always shown above it.
+- A download saved to a file and run in a later step (`curl -o x.sh URL; bash x.sh`) is not hinted.
+- The digests are a record of what is signed, to compare with the terminal's output; a person cannot recompute them.
 - Claude Code's transcript does not say which context window a session has, so the meter shows tokens and the 200K warn
   line, never a percentage, for Claude Code.
 - A session started by an older install's hooks, under a relocated `CLAUDE_CONFIG_DIR`, shows "context not read" until its
