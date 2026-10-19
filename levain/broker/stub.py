@@ -19,6 +19,7 @@ no Expect: 100-continue, no keep-alive, no streaming response; the real front (3
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import re
@@ -142,8 +143,11 @@ class Stub:
         if reader is not None:  # body length unknown or too big: drain a bounded amount so the close is not an RST
             if writer.can_write_eof():
                 writer.write_eof()
+            deadline = asyncio.get_running_loop().time() + 1.0  # one fixed budget for the whole drain
             try:
-                await asyncio.wait_for(reader.read(_BODY_CAP), timeout=1.0)
+                while (left := deadline - asyncio.get_running_loop().time()) > 0:
+                    if not await asyncio.wait_for(reader.read(65536), timeout=left):
+                        break  # EOF: the client sent everything
             except (asyncio.TimeoutError, OSError):
                 pass
 
@@ -157,14 +161,14 @@ class Stub:
             if not stat.S_ISSOCK(os.lstat(path).st_mode):
                 raise FileExistsError(path)
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.setblocking(False)  # a full backlog must not block the event loop
             try:
-                probe.connect(path)
-            except OSError:
-                os.unlink(path)  # stale: nobody is listening
-            else:
-                raise FileExistsError(f"{path}: a live server is listening there")
+                err = probe.connect_ex(path)
             finally:
                 probe.close()
+            if err != errno.ECONNREFUSED:  # only a refused connect proves nobody listens; anything else may be live
+                raise FileExistsError(f"{path}: in use or unprobeable ({errno.errorcode.get(err, err) if err else 'listening'})")
+            os.unlink(path)  # stale
         except FileNotFoundError:
             pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -218,10 +222,13 @@ def main(argv: list[str] | None = None) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):  # a plain `kill` must clean up too, not only Ctrl-C
             loop.add_signal_handler(sig, stop.set)
         server = await (stub.serve_unix(a.unix) if a.unix is not None else stub.serve_tcp(a.port))
-        async with server:
-            await stop.wait()
-            server.close()
-            stub.close_live()
+        await stop.wait()
+        server.close()
+        stub.close_live()
+        try:  # bounded: a connection accepted in the same tick as the signal must not hold the exit
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
     try:
         asyncio.run(run())
