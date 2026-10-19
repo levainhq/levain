@@ -35,6 +35,18 @@ from tests.test_consent_queue import authority, keys, signed  # noqa: F401 - the
 LOCAL = "http://127.0.0.1:8080/"
 
 
+@pytest.fixture(autouse=True)
+def operator_env(tmp_path, monkeypatch):
+    """Every test runs with a scratch HOME (never the operator's ~/.pypirc or ~/.npmrc) and PyPI credentials in the
+    environment; the credential tests take them away."""
+    user = tmp_path / "userhome"
+    user.mkdir()
+    monkeypatch.setenv("HOME", str(user))
+    monkeypatch.setenv("TWINE_USERNAME", "__token__")
+    monkeypatch.setenv("TWINE_PASSWORD", "pypi-test")
+    return user
+
+
 # --- artifacts ---------------------------------------------------------------------------------------------------
 
 def metadata(name, version):
@@ -311,10 +323,14 @@ def test_planted_redirects_do_not_move_the_target(home, art, monkeypatch):
         assert env["PATH"] == publish.PUBLISH_PATH and env["HOME"] == str(home)
         assert (env["TWINE_USERNAME"], env["TWINE_PASSWORD"], env["NODE_AUTH_TOKEN"]) == ("__token__", "pypi-x",
                                                                                           "npm-x")
-        assert env["HTTPS_PROXY"] == "http://proxy:3128" and env["TWINE_NON_INTERACTIVE"] == "1"
+        # both targets are local: no proxy reaches the upload (an https target keeps them; see the m4 test)
+        assert "HTTPS_PROXY" not in env and env["NO_PROXY"] == "127.0.0.1,localhost"
+        assert env["TWINE_NON_INTERACTIVE"] == "1"
     assert py["argv"][py["argv"].index("--repository-url") + 1] == LOCAL
     assert npm["argv"] == ["/opt/fake/npm", "publish", str(nsnap / t.name), "--registry=http://127.0.0.1:4873/",
-                           "--scope=", "--ignore-scripts", "--@acme:registry=http://127.0.0.1:4873/"]
+                           "--scope=", "--tag=latest", "--access=null", "--dry-run=false", "--strict-ssl=true",
+                           "--ignore-scripts", "--proxy=null", "--https-proxy=null", "--noproxy=127.0.0.1,localhost",
+                           "--@acme:registry=http://127.0.0.1:4873/"]
     assert npm["cwd"] == str(nsnap)
 
 
@@ -478,3 +494,330 @@ def test_gate_a_refused_artifact_files_nothing(gate, art):
     rc = publish_gate.run(_args(queue, [wheel(art, meta=metadata("other", "1.0.0"))]), out)
     assert (rc, runner.calls, queue.pending()) == (publish_gate.EXIT_NOT_TAKEN, [], []), out.getvalue()
     assert "refused, nothing was published" in out.getvalue()
+
+
+# --- L1/L2 round 1 (1019-q20/L1L2_r1.md) -------------------------------------------------------------------------
+
+def _tgz_raw(p: Path, members):
+    """A gzip tarball whose member names are written exactly as given (tarfile keeps them verbatim)."""
+    return _tgz(p, members)
+
+
+@pytest.mark.parametrize("shadow", ["package/./package.json", "package//package.json"])
+def test_h1_npm_shadow_manifest_is_refused(home, art, shadow):
+    # npm / pacote normalise both onto package/package.json and the later one wins: the card would show the first
+    shown = json.dumps({"name": "shown-pkg", "version": "1.0.0"}).encode()
+    hidden = json.dumps({"name": "hidden-pkg", "version": "9.9.9"}).encode()
+    p = _tgz_raw(art / "shown-pkg-1.0.0.tgz", [("package/package.json", shown), (shadow, hidden)])
+    _refuse(home, "npm", [p], "empty or '.' segment")
+
+
+@pytest.mark.parametrize("shadow", ["demo_pkg-1.0.0/./PKG-INFO", "demo_pkg-1.0.0//PKG-INFO"])
+def test_h1_sdist_shadow_pkg_info_is_refused(home, art, shadow):
+    _refuse(home, "pypi", [sdist(art, extra=[(shadow, metadata("hidden", "6.6"))])], "empty or '.' segment")
+
+
+@pytest.mark.parametrize("shadow", ["demo_pkg-1.0.0.dist-info/./x", "demo_pkg//x.py", "./demo_pkg/y.py"])
+def test_h1_wheel_member_with_an_empty_or_dot_segment_is_refused(home, art, shadow):
+    _refuse(home, "pypi", [wheel(art, extra=[(shadow, b"")])], "empty or '.' segment")
+
+
+@pytest.mark.parametrize("shadow", ["METADATA", "0.dist-info/METADATA.x", "demo_pkg/METADATA"])
+def test_m1_wheel_metadata_shadow_is_refused(home, art, shadow):
+    # twine reads the shortest member path containing METADATA that holds a Metadata-Version line
+    _refuse(home, "pypi", [wheel(art, extra=[(shadow, metadata("hidden", "6.6"))])], "METADATA")
+
+
+def test_m2_npm_tag_and_access_default_shown_and_pinned(home, art):
+    call, snap = publish.snapshot("npm", [str(npm_tgz(art))], "http://127.0.0.1:4873", home)
+    assert (call["tag"], call["access"]) == ("latest", "default")
+    assert '"tag": "latest"' in redact_display(publish_gate.PUBLISH_TOOL, call)
+    runner = Runner()
+    _exec(call, snap, home, runner)
+    argv = runner.calls[0]["argv"]
+    for flag in ("--tag=latest", "--access=null", "--dry-run=false", "--strict-ssl=true", "--ignore-scripts"):
+        assert flag in argv, argv
+    assert "dist-tag latest" in publish_gate.publish_what(call)
+
+
+def test_m2_npm_publish_config_tag_and_access_shown_and_pinned(home, art):
+    t = npm_tgz(art, manifest={"name": "@acme/thing", "version": "2.0.0",
+                               "publishConfig": {"tag": "beta", "access": "public"}}, file_name="t.tgz")
+    call, snap = publish.snapshot("npm", [str(t)], "https://registry.npmjs.org/", home)
+    assert (call["tag"], call["access"]) == ("beta", "public")
+    runner = Runner()
+    _exec(call, snap, home, runner)
+    argv = runner.calls[0]["argv"]
+    assert "--tag=beta" in argv and "--access=public" in argv and "--dry-run=false" in argv
+
+
+@pytest.mark.parametrize("pc", [{"tag": "bad tag"}, {"access": "everyone"}, {"tag": 3}, "public"])
+def test_m2_npm_publish_config_unshowable_is_refused(home, art, pc):
+    t = npm_tgz(art, manifest={"name": "demo-pkg", "version": "1.0.0", "publishConfig": pc}, file_name="t.tgz")
+    _refuse(home, "npm", [t], "publishConfig")
+
+
+def test_m3_multi_file_pypi_failure_is_unknown(home, art, tmp_path):
+    s = tmp_path / "s"
+    s.mkdir()
+    call, snap = publish.snapshot("pypi", [str(wheel(art)), str(sdist(s))], LOCAL, home)
+    receipts = []
+    with pytest.raises(publish.PublishOutcomeUnknown, match="some files may have landed"):
+        _exec(call, snap, home, Runner(rc=1, err="HTTPError: 400 Bad Request"), receipts=receipts)
+    assert receipts[0]["status"] == "unknown" and journal(home, call)[-1]["status"] == "unknown"
+
+
+def test_m3_gate_partial_is_exit_4_and_single_failure_says_the_index_may_hold_it(gate, art, keys, tmp_path):
+    queue, runner = gate
+    runner.rc, runner.err = 1, "HTTPError: 400"
+    s = tmp_path / "s"
+    s.mkdir()
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(art), sdist(s)], hold=20.0), out)
+    t.join(10)
+    assert rc == publish_gate.EXIT_UNKNOWN, out.getvalue()
+    one = tmp_path / "one"
+    one.mkdir()
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(one, version="2.0.0")], hold=20.0), out)
+    t.join(10)
+    assert rc == publish_gate.EXIT_NOT_TAKEN and "may already hold" in out.getvalue(), out.getvalue()
+
+
+def test_m4_a_local_target_runs_without_the_callers_proxies(home, art, monkeypatch):
+    for k in ("HTTP_PROXY", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(k, "http://proxy.example:3128")
+    runner = Runner()
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    _exec(call, snap, home, runner)
+    env = runner.calls[0]["env"]
+    assert not [k for k in env if k.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY")]
+    assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost"
+    ncall, nsnap = publish.snapshot("npm", [str(npm_tgz(art))], "http://localhost:4873", home)
+    _exec(ncall, nsnap, home, runner)
+    assert "--proxy=null" in runner.calls[1]["argv"] and "--https-proxy=null" in runner.calls[1]["argv"]
+    # an https target keeps them: the operator may need the proxy to reach the index
+    hcall, hsnap = publish.snapshot("pypi", [str(art / "demo_pkg-1.0.0-py3-none-any.whl")],
+                                    publish.DEFAULT_TARGETS["pypi"], home)
+    _exec(hcall, hsnap, home, runner)
+    assert runner.calls[2]["env"]["HTTP_PROXY"] == "http://proxy.example:3128"
+
+
+def _pypirc(user: Path, text: str) -> None:
+    (user / ".pypirc").write_text(text)
+
+
+def test_m5_pypirc_section_for_the_target_supplies_the_credentials(home, art, operator_env, monkeypatch):
+    monkeypatch.delenv("TWINE_USERNAME")
+    monkeypatch.delenv("TWINE_PASSWORD")
+    _pypirc(operator_env, "[distutils]\nindex-servers = pypi local\n\n[pypi]\nusername = __token__\n"
+                          "password = pypi-real%x\n\n[local]\nrepository = http://127.0.0.1:8080\n"
+                          "username = u\npassword = p\n")
+    runner = Runner()
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    _exec(call, snap, home, runner)
+    assert (runner.calls[0]["env"]["TWINE_USERNAME"], runner.calls[0]["env"]["TWINE_PASSWORD"]) == ("u", "p")
+    assert "--config-file" not in runner.calls[0]["argv"]
+    assert publish.pypi_credentials(publish.DEFAULT_TARGETS["pypi"]) == {"TWINE_USERNAME": "__token__",
+                                                                         "TWINE_PASSWORD": "pypi-real%x"}
+
+
+def test_m5_env_credentials_win_over_pypirc(home, art, operator_env):
+    _pypirc(operator_env, "[pypi]\nusername = file-user\npassword = file-pass\n")
+    runner = Runner()
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], publish.DEFAULT_TARGETS["pypi"], home)
+    _exec(call, snap, home, runner)
+    assert (runner.calls[0]["env"]["TWINE_USERNAME"], runner.calls[0]["env"]["TWINE_PASSWORD"]) == ("__token__",
+                                                                                                   "pypi-test")
+
+
+def test_m5_no_credential_source_is_refused_before_filing(gate, art, operator_env, monkeypatch):
+    queue, runner = gate
+    monkeypatch.delenv("TWINE_USERNAME")
+    monkeypatch.delenv("TWINE_PASSWORD")
+    _pypirc(operator_env, "[pypi]\nusername = __token__\npassword = pypi-x\n")   # names pypi.org, not the target
+    out = io.StringIO()
+    rc = publish_gate.run(_args(queue, [wheel(art)]), out)
+    assert (rc, runner.calls, queue.pending()) == (publish_gate.EXIT_NOT_TAKEN, [], []), out.getvalue()
+    assert "TWINE_PASSWORD" in out.getvalue() and "pypi-x" not in out.getvalue()
+    assert snaps(queue.directory.parent) == []
+
+
+def test_m5_control_characters_are_stripped_from_the_detail(home, art):
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    receipts = []
+    result = _exec(call, snap, home, Runner(rc=1, err="\x1b[31mERROR\x1b[0m    403‮ Forbidden\x07"),
+                   receipts=receipts)
+    assert result.detail == "ERROR    403 Forbidden" == receipts[0]["detail"]
+
+
+def test_l1_corrupt_and_encrypted_zips_are_refusals_not_tracebacks(home, art, tmp_path):
+    p = art / "demo_pkg-1.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("demo_pkg-1.0.0.dist-info/METADATA", metadata("demo-pkg", "1.0.0") + b"x" * 4000)
+    raw = bytearray(p.read_bytes())
+    start = raw.index(b"METADATA") + len(b"METADATA")
+    for i in range(start + 10, start + 40):
+        raw[i] ^= 0xFF
+    p.write_bytes(bytes(raw))
+    _refuse(home, "pypi", [p], "not a readable wheel")
+    e = tmp_path / "e"
+    e.mkdir()
+    q = wheel(e)
+    raw = bytearray(q.read_bytes())          # set the encrypted bit (zipfile will not write one)
+    for sig, at in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = -1
+        while (i := raw.find(sig, i + 1)) != -1:
+            raw[i + at] |= 0x1
+    q.write_bytes(bytes(raw))
+    _refuse(home, "pypi", [q], "not a readable wheel")
+
+
+def test_l2_stale_snapshots_are_swept_and_fresh_ones_kept(home, art):
+    (home / "publish").mkdir(mode=0o700)
+    stale, fresh = home / "publish" / "snap-stale", home / "publish" / "snap-fresh"
+    stale.mkdir(mode=0o700), fresh.mkdir(mode=0o700)
+    old = time.time() - publish.SNAP_STALE - 60
+    os.utime(stale, (old, old))
+    publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    assert not stale.exists() and fresh.exists()
+
+
+def test_l2_an_interrupt_while_snapshotting_publishes_nothing_and_leaves_nothing(gate, art, monkeypatch):
+    queue, runner = gate
+    real = publish.snapshot
+
+    def interrupted(*a, **kw):
+        real(*a, **kw)
+        raise publish_gate._Interrupted("SIGTERM")
+    monkeypatch.setattr(publish, "snapshot", interrupted)
+    out = io.StringIO()
+    rc = publish_gate.run(_args(queue, [wheel(art)]), out)
+    assert (rc, runner.calls, queue.pending()) == (publish_gate.EXIT_NOT_TAKEN, [], []), out.getvalue()
+    assert "interrupted" in out.getvalue()
+
+
+def test_l3_a_copy_that_changes_while_its_identity_is_read_is_refused(home, art, monkeypatch):
+    real = publish._identity
+
+    def racing(index, path, name):
+        got = real(index, path, name)
+        with open(path, "ab") as fh:
+            fh.write(b"x")
+        return got
+    monkeypatch.setattr(publish, "_identity", racing)
+    _refuse(home, "pypi", [wheel(art)], "changed")
+
+
+def test_l4_an_interrupt_before_the_intent_line_is_not_published_exit_1(gate, art, keys, monkeypatch):
+    queue, runner = gate
+
+    def interrupted_resolve(index):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(publish, "execute", functools.partial(
+        publish.execute.func, resolve=interrupted_resolve, run=runner))
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(art)], hold=20.0), out)
+    t.join(10)
+    assert (rc, runner.calls) == (publish_gate.EXIT_NOT_TAKEN, []), out.getvalue()
+    assert "nothing was published" in out.getvalue()
+
+
+def test_l4_an_interrupt_during_the_upload_is_unknown_exit_4(gate, art, keys):
+    queue, runner = gate
+    runner.raise_ = KeyboardInterrupt()
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(art)], hold=20.0), out)
+    t.join(10)
+    assert rc == publish_gate.EXIT_UNKNOWN, out.getvalue()
+    assert "may or may not" in out.getvalue()
+
+
+def test_l5_a_file_name_with_a_trailing_newline_is_not_plain(home, art):
+    p = wheel(art)
+    q = art / (p.name + "\n")
+    p.rename(q)
+    _refuse(home, "pypi", [q], "not plain")
+
+
+def test_l6_count_and_size_are_checked_before_anything_is_copied(home, art, tmp_path, monkeypatch):
+    monkeypatch.setattr(publish, "_copy_in", lambda *a: pytest.fail("copied before the checks"))
+    monkeypatch.setattr(publish, "MAX_FILES", 1)
+    s = tmp_path / "s"
+    s.mkdir()
+    _refuse(home, "pypi", [wheel(art), sdist(s)], "at most 1 file")
+    monkeypatch.setattr(publish, "MAX_ARTIFACT", 10)
+    _refuse(home, "pypi", [art / "demo_pkg-1.0.0-py3-none-any.whl"], "over 10 bytes")
+
+
+def test_l6_max_files_fits_the_display_whole(home, tmp_path):
+    files = []
+    for i in range(publish.MAX_FILES):
+        d = tmp_path / f"d{i}"
+        d.mkdir()
+        files.append(str(wheel(d, name="a-very-long-project-name-for-the-card", version="10.20.30rc40",
+                               file_name=f"a_very_long_project_name_for_the_card-10.20.30rc40-{i}-cp313-cp313-"
+                                         "macosx_14_0_arm64.whl")))
+    call, _ = publish.snapshot("pypi", files, LOCAL, home)
+    assert len(redact_display(publish_gate.PUBLISH_TOOL, call)) < 2000
+
+
+def test_gate_a_record_that_cannot_be_written_after_a_publish_is_still_published(gate, art, keys, monkeypatch):
+    queue, runner = gate
+
+    def broken(home, extra):
+        def write(record):
+            raise OSError("disk full")
+        return write
+    monkeypatch.setattr(publish_gate, "_receipt", broken)
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(art)], hold=20.0), out)
+    t.join(10)
+    assert rc == publish_gate.EXIT_PUBLISHED and "record is incomplete" in out.getvalue(), out.getvalue()
+
+
+def test_gate_an_interrupt_in_the_hold_withdraws_the_request(gate, art, monkeypatch):
+    queue, runner = gate
+
+    def interrupted(*a, **kw):
+        raise publish_gate._Interrupted("SIGTERM")
+    monkeypatch.setattr(publish_gate._ADAPTERS["claude_code"], "hold_for_answer", interrupted)
+    out = io.StringIO()
+    rc = publish_gate.run(_args(queue, [wheel(art)], hold=20.0), out)
+    assert (rc, runner.calls, queue.pending()) == (publish_gate.EXIT_NOT_TAKEN, [], []), out.getvalue()
+    assert "withdrawn" in out.getvalue()
+
+
+def test_the_lock_serialises_two_publishes_of_one_package(home, art, tmp_path):
+    other = tmp_path / "o"
+    other.mkdir()
+    a = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    b = publish.snapshot("pypi", [str(wheel(other))], LOCAL, home)
+    live, overlap = [], []
+
+    def slow(argv, **kw):
+        live.append(1)
+        overlap.append(len(live))
+        time.sleep(0.3)
+        live.pop()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    threads = [threading.Thread(target=_exec, args=(call, snap, home, slow)) for call, snap in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert overlap == [1, 1]
+
+
+def test_lowercase_npm_config_is_dropped(home, art, monkeypatch):
+    monkeypatch.setenv("npm_config_dry_run", "true")
+    monkeypatch.setenv("npm_config_tag", "evil")
+    runner = Runner()
+    call, snap = publish.snapshot("npm", [str(npm_tgz(art))], "http://127.0.0.1:4873", home)
+    _exec(call, snap, home, runner)
+    assert not [k for k in runner.calls[0]["env"] if k.lower().startswith("npm_config_")]
