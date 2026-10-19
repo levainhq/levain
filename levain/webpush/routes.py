@@ -28,6 +28,7 @@ _STATIC_FILES = {
     "/badge-96.png": ("badge-96.png", "image/png"),
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
+STATIC_PATHS = frozenset(_STATIC_FILES)
 MAX_BODY = 8192
 MAX_ENDPOINT = 2048
 _PAIR_CODE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -151,7 +152,19 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
                 raise ValueError("auth")
         except (TypeError, KeyError, ValueError):
             return _err(400, "bad_keys", "keys.p256dh must be a P-256 point and keys.auth 16 bytes, base64url")
-        return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id)})
+        minted = None
+        if device_id is None:
+            # the run token is not a device: the page that turns pings on becomes one, so a revoke can stop them
+            conn = store.connection()
+            try:
+                minted = devices.mint_device(conn, obj.get("label"), datetime.now(timezone.utc))
+            finally:
+                conn.close()
+            device_id = minted[0]
+        out: dict = {"id": store.add_subscription(endpoint, p256dh, auth, device_id)}
+        if minted is not None:
+            out.update(device_id=minted[0], token=minted[1])
+        return _json(200, out)
     if method == "POST" and path == "/webpush/unsubscribe":
         obj = _body_json(body)
         endpoint = valid_endpoint(obj.get("endpoint")) if obj else None

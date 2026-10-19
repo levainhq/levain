@@ -72,7 +72,7 @@ def test_phone_sets_the_state_line_and_works_the_tray_only_as_the_kernel_allows(
               "params": {"spore_kind": kind}, "confirm": True})
     assert _panel(app.board(), "tray")["rows"] == []        # one held to its date, one resolved
 
-    # capture is tiered above a surface token by the kernel; edits and other panels are not on the phone at all
+    # capture stays on the laptop (b1); edits and other panels are not on the phone at all
     for req in ({"verb": "spore_seed", "panel_id": "tray", "params": {"text": "x"}},
                 {"verb": "spore_update", "panel_id": "tray", "params": {}},
                 {"verb": "spore_descend", "panel_id": "keep", "params": {}}):
@@ -128,3 +128,70 @@ def test_the_phone_port_seam_gates_each_route_by_credential(install):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def _raise_on_the_laptop(inst: Path, tmp_path: Path, verb: str) -> Path:
+    """A laptop-presence key enrolled in the install's cockpit journal and a signed raise of ``verb`` to T2, anchored as
+    the broker anchors its own appends; returns the cockpit data root."""
+    import sqlite3
+    import subprocess
+
+    import levain.authority as auth
+    from levain.authority import ReplayCache
+
+    key = tmp_path / "laptop"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "laptop", "-f", str(key)], check=True,
+                   capture_output=True, timeout=30)
+    public = " ".join((tmp_path / "laptop.pub").read_text().split()[:2])
+    fp = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(key)], check=True, capture_output=True,
+                        text=True).stdout.split()[1]
+
+    def sign(message: bytes) -> str:
+        return subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(key), "-n", auth.NAMESPACE], input=message,
+                              capture_output=True, check=True, timeout=30).stdout.decode()
+
+    root = inst / ".levain" / "cockpit"
+    root.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    try:
+        auth.create_schema(conn)
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for op in ({"op": "enrol", "fingerprint": fp, "public_key": public, "class": "laptop-presence",
+                    "custody": "passphrase"}, {"op": "raise", "verb": verb, "tier": "T2"}):
+            auth.sign_and_append(conn, op, signer_fp=fp, sign=sign, clock=lambda: datetime.now(timezone.utc),
+                                 cache=ReplayCache(), anchor=auth.anchor_path(root))
+    finally:
+        conn.close()
+    return root
+
+
+def test_a_verb_the_laptop_raised_is_laptop_only_on_the_phone(install, tmp_path: Path):
+    inst, qdir = install
+    _raise_on_the_laptop(inst, tmp_path, "operator_state")
+    app = PhoneApp(qdir)
+    act = app.state()["actions"][0]
+    assert (act["verb"], act["gesture"]) == ("operator_state", "laptop-only")
+    with pytest.raises(PhoneAppError) as exc:
+        app.fire({"verb": "operator_state", "panel_id": "state", "params": {"text": "raised"},
+                  "panel_version": act["target"]["panel_version"]})
+    assert exc.value.status == 403
+    ctx = inst / ".levain" / "context.json"
+    assert not ctx.exists() or json.loads(ctx.read_text()).get("state") != "raised"
+
+
+def test_a_governed_install_whose_log_cannot_be_read_takes_no_phone_writes(install, tmp_path: Path):
+    from levain.cockpit.install import marker_path
+
+    inst, qdir = install
+    root = _raise_on_the_laptop(inst, tmp_path, "spore_note")
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    marker_path(root, markers).write_text("{}")
+    (root / "cockpit.db").write_bytes(b"not a database")
+    app = PhoneApp(qdir, marker_directory=markers)
+    act = app.state()["actions"][0]                     # reads still answer, every verb laptop-only
+    assert act["gesture"] == "laptop-only"
+    with pytest.raises(PhoneAppError) as exc:
+        app.fire({"verb": "operator_state", "panel_id": "state", "params": {"text": "x"},
+                  "panel_version": act["target"]["panel_version"]})
+    assert (exc.value.status, exc.value.error) == (503, "authority_unreadable")

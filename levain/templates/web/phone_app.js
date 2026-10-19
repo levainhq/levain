@@ -6,9 +6,15 @@
   const TOKEN_KEY = "levain-phone-token", DEVICE_KEY = "levain-device-token";
   const store = {
     get(area, k) { try { return window[area].getItem(k); } catch (e) { return null; } },
-    set(area, k, v) { try { window[area].setItem(k, v); } catch (e) { /* kept in memory only */ } },
+    set(area, k, v) { try { window[area].setItem(k, v); return true; } catch (e) { return false; } },
+    remove(area, k) { try { window[area].removeItem(k); } catch (e) { /* nothing kept to remove */ } },
   };
-  let pairFailed = false;
+  let pairFailed = false, forgets = false;
+  // the credentials as this page holds them: memory first, so a browser that refuses storage keeps them for this visit
+  let memToken = "", memDevice = "";
+  function keepToken(t) { memToken = t; store.set("sessionStorage", TOKEN_KEY, t); }
+  function keepDevice(t) { memDevice = t; if (!store.set("localStorage", DEVICE_KEY, t)) forgets = true; }
+  const deviceToken = () => memDevice || store.get("localStorage", DEVICE_KEY) || "";
 
   // ---- BOOT: runs before phone.js reads its token ---------------------------------------------------------------
   // The pairing redeem is a synchronous request on purpose: phone.js runs right after this file and must find the
@@ -23,23 +29,23 @@
         x.send(JSON.stringify({ code: pair }));
         if (x.status === 200) {
           const t = JSON.parse(x.responseText).token;
-          if (typeof t === "string" && t) { store.set("localStorage", DEVICE_KEY, t); store.set("sessionStorage", TOKEN_KEY, t); }
+          if (typeof t === "string" && t) { keepDevice(t); keepToken(t); }
         } else if (!store.get("localStorage", DEVICE_KEY)) pairFailed = true;
         // 403 with a device token already stored is the normal relaunch: the installed app opens with its spent code
       } catch (e) { if (!store.get("localStorage", DEVICE_KEY)) pairFailed = true; }
       try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) { /* the address stays */ }
     }
     const m = /(?:^#|&)phone_token=([^&]+)/.exec(location.hash);
-    if (m) store.set("sessionStorage", TOKEN_KEY, decodeURIComponent(m[1]));
-    else if (!store.get("sessionStorage", TOKEN_KEY)) {
-      const dev = store.get("localStorage", DEVICE_KEY);
-      if (dev) store.set("sessionStorage", TOKEN_KEY, dev);
+    if (m) keepToken(decodeURIComponent(m[1]));
+    else if (!memToken && !store.get("sessionStorage", TOKEN_KEY)) {
+      const dev = deviceToken();
+      if (dev) keepToken(dev);
     }
   })();
 
   // ---- helpers --------------------------------------------------------------------------------------------------
   const $ = (id) => document.getElementById(id);
-  const token = () => store.get("sessionStorage", TOKEN_KEY) || "";
+  const token = () => memToken || store.get("sessionStorage", TOKEN_KEY) || "";
   function h(tag, attrs, ...kids) {
     const e = document.createElement(tag);
     for (const k in attrs || {}) {
@@ -51,9 +57,8 @@
     for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
     return e;
   }
-  function api(method, route, body, noToken) {
-    const headers = {};
-    if (!noToken) headers["X-Levain-Phone-Token"] = token();
+  function api(method, route, body, tok) {
+    const headers = { "X-Levain-Phone-Token": tok || token() };
     if (body) headers["Content-Type"] = "application/json";
     return fetch(route, { method: method, cache: "no-store", headers: headers, body: body ? JSON.stringify(body) : undefined })
       .then((res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
@@ -114,7 +119,15 @@
   const SL_MAX = 280;
   let slData = null, slEditing = false, slNote = "", slNoteKind = "";
   function loadState() {
-    return api("GET", "/app/state.json").then((r) => { slData = r.ok ? r.body : { error: why(r) }; renderState(); });
+    const used = token();
+    return api("GET", "/app/state.json").then((r) => {
+      if (r.status === 403 && used && used === deviceToken()) {
+        // the laptop revoked this device: forget it, so the page stops offering what it can no longer open
+        store.remove("localStorage", DEVICE_KEY); store.remove("sessionStorage", TOKEN_KEY); memToken = memDevice = "";
+        slData = { error: "this phone was unpaired; pair it again from the laptop" };
+      } else slData = r.ok ? r.body : { error: why(r) };
+      renderState();
+    });
   }
   function renderState() {
     const box = $("stateline");
@@ -133,9 +146,11 @@
                                          onclick: () => startEdit(line && line.text || "", act) }) : null;
     box.append(h("div", { class: "sl-row" }, textEl, edit));
     if (slNote) box.append(h("p", { class: "note " + slNoteKind, role: "status", text: slNote }));
+    if (forgets) box.append(h("p", { class: "note bad", text: "This browser will not remember the pairing: it works until the page is closed, then open the install link from the laptop again." }));
   }
   function startEdit(text, act) {
     slEditing = true; slNote = "";
+    const target = act.target || {};          // the line this edit was opened on: a save never lands on a newer one
     const box = $("stateline");
     const ta = h("textarea", { id: "sl-text", maxlength: String(SL_MAX), "aria-label": "state line" });
     ta.value = text;
@@ -145,12 +160,11 @@
     const busy = (on) => { for (const b of box.querySelectorAll("button")) b.disabled = on; };
     const send = (val) => {
       busy(true);
-      const target = (slData.actions || [])[0].target || {};
       api("POST", "/app/verb", { verb: "operator_state", panel_id: "state", params: { text: val }, panel_version: target.panel_version })
         .then((r) => {
           slEditing = false;
           if (r.ok) { slNote = val ? "saved" : "cleared"; slNoteKind = "ok"; }
-          else if (r.status === 409) { slNote = "it changed; here it is now"; slNoteKind = ""; }
+          else if (r.status === 409) { slNote = "it changed since you opened it; here it is now"; slNoteKind = ""; }
           else { slNote = why(r); slNoteKind = "bad"; }
           setTimeout(() => { slNote = ""; renderState(); }, 4000);
           return loadState();
@@ -170,8 +184,14 @@
                    spore_ascend: "promote", spore_promote: "promote", spore_descend: "resolve", spore_surface_at: "snooze",
                    spore_seed: "capture" };
   const label = (verb) => LABELS[verb] || String(verb).replace(/^spore_/, "").replace(/_/g, " ");
-  let boardData = null, boardNote = "", boardNoteKind = "";
-  let ui = null;       // {row, mode: "resolve"|"snooze", kind}: kept across redraws, so a poll never closes a form
+  let boardData = null, boardNote = "", boardNoteKind = "", boardNoteTimer = null;
+  // {row, version, mode: "resolve"|"snooze", kind}: kept across redraws, so a poll never closes a form on the same row
+  let ui = null;
+  function noteBoard(text, kind) {
+    boardNote = text; boardNoteKind = kind || "";
+    clearTimeout(boardNoteTimer);
+    if (text) boardNoteTimer = setTimeout(() => { boardNote = ""; renderBoard(); }, 4000);
+  }
   function loadBoard() {
     return api("GET", "/app/board.json").then((r) => { boardData = r.ok ? r.body : { error: why(r) }; renderBoard(); });
   }
@@ -181,11 +201,11 @@
   function fire(act, params, extra) {
     const t = act.target || {};
     const body = Object.assign({ verb: act.verb, panel_id: t.panel_id, row_id: t.row_id, row_version: t.row_version, params: params }, extra || {});
-    ui = null; boardNote = "working…"; boardNoteKind = ""; renderBoard();
+    ui = null; boardNote = "working…"; boardNoteKind = ""; clearTimeout(boardNoteTimer); renderBoard();
     return api("POST", "/app/verb", body).then((r) => {
-      if (r.ok) { boardNote = act.verb === "spore_descend" ? "resolved" : "snoozed"; boardNoteKind = "ok"; }
-      else if (r.status === 409) { boardNote = "it changed; here it is now"; boardNoteKind = ""; }
-      else { boardNote = why(r); boardNoteKind = "bad"; }
+      if (r.ok) noteBoard(act.verb === "spore_descend" ? "resolved" : "snoozed", "ok");
+      else if (r.status === 409) noteBoard("it changed; here it is now");
+      else noteBoard(why(r), "bad");
       return loadBoard();
     });
   }
@@ -213,8 +233,8 @@
       card.append(h("div", { class: "acts" },
         resolve ? h("button", { type: "button", class: "resolve", text: "Resolve", onclick: () => {
           const kinds = (resolve.options && resolve.options.spore_kind) || ["done"];
-          ui = { row: row.id, mode: "resolve", kind: kinds.includes("done") ? "done" : kinds[0] }; renderBoard(); } }) : null,
-        snooze ? h("button", { type: "button", class: "snooze", text: "Snooze", onclick: () => { ui = { row: row.id, mode: "snooze" }; renderBoard(); } }) : null));
+          ui = { row: row.id, version: row.version, mode: "resolve", kind: kinds.includes("done") ? "done" : kinds[0] }; renderBoard(); } }) : null,
+        snooze ? h("button", { type: "button", class: "snooze", text: "Snooze", onclick: () => { ui = { row: row.id, version: row.version, mode: "snooze" }; renderBoard(); } }) : null));
     }
     if (open && ui.mode === "resolve" && resolve) {
       const kinds = (resolve.options && resolve.options.spore_kind) || ["done"];
@@ -222,12 +242,12 @@
         h("button", { type: "button", "aria-pressed": ui.kind === k ? "true" : "false", text: k, onclick: () => { ui.kind = k; renderBoard(); } }))));
       card.append(h("div", { class: "confirm-line", text: "Resolve this as “" + ui.kind + "”? It leaves the Tray." }));
       card.append(h("div", { class: "acts" },
-        h("button", { type: "button", class: "go confirm", text: "Confirm " + ui.kind, onclick: () => fire(resolve, { spore_kind: ui.kind }, { confirm: true }) }),
+        h("button", { type: "button", class: "go confirm", text: "Confirm " + ui.kind, onclick: () => fire(resolve, { spore_kind: ui.kind }, { confirm: true, row_version: ui.version }) }),
         h("button", { type: "button", class: "quiet", text: "cancel", onclick: () => { ui = null; renderBoard(); } })));
     } else if (open && ui.mode === "snooze" && snooze) {
       card.append(h("div", { class: "choices" },
         [["tomorrow", 1], ["in 3 days", 3], ["next week", 7]].map(([name, d]) =>
-          h("button", { type: "button", class: "snz", text: name, onclick: () => fire(snooze, { surface_at: ymd(d) }) })),
+          h("button", { type: "button", class: "snz", text: name, onclick: () => fire(snooze, { surface_at: ymd(d) }, { row_version: ui.version }) })),
         h("button", { type: "button", class: "quiet", text: "cancel", onclick: () => { ui = null; renderBoard(); } })));
     }
     const others = [];
@@ -258,6 +278,10 @@
     box.replaceChildren();
     if (!boardData) { box.append(h("p", { class: "status", text: "reading the board…" })); return; }
     if (boardData.error) { box.append(h("p", { class: "status", text: "board unavailable: " + boardData.error })); return; }
+    if (ui) {
+      const now = (boardData.panels || []).flatMap((p) => (p.rows || []).concat(p.held || [])).find((r) => r.id === ui.row);
+      if (!now || now.version !== ui.version) { ui = null; noteBoard("this row changed"); }
+    }
     if (boardNote) box.append(h("p", { class: "note " + boardNoteKind, role: "status", text: boardNote }));
     for (const p of boardData.panels || []) {
       const rows = p.rows || [];
@@ -301,14 +325,26 @@
           const make = () => reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(k.body.key) });
           return old ? old.unsubscribe().then(make) : make();
         }));
-      }).then((sub) => {
-        const j = sub.toJSON();
-        return api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }).then((r) => {
-          if (!r.ok) throw new Error(why(r));
-          giveToken(); pingNote = "pings are on for this phone"; pingNoteKind = "ok"; return refreshSub();
-        });
-      });
+      }).then((sub) => sendSub(sub).then((r) => {
+        // a browser subscription the laptop does not hold would read "on" and never ping
+        if (!r.ok) return sub.unsubscribe().catch(() => {}).then(() => { throw new Error(why(r)); });
+        giveToken(); pingNote = "pings are on for this phone"; pingNoteKind = "ok"; return refreshSub();
+      }));
     }).catch((e) => { pingNote = "could not turn pings on: " + ((e && e.message) || e); pingNoteKind = "bad"; renderPings(); });
+  }
+  function sendSub(sub) {
+    const j = sub.toJSON();
+    return api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }, deviceToken()).then((r) => {
+      // on the run token the server pairs this page as a device, which owns the subscription from here on
+      if (r.ok && typeof r.body.token === "string" && r.body.token) keepDevice(r.body.token);
+      return r;
+    });
+  }
+  function resync() {
+    if (!token() && !deviceToken()) return;
+    currentSub().then((s) => s ? sendSub(s).then((r) => {
+      if (!r.ok) { pingNote = "the laptop could not confirm this phone's pings: " + why(r); pingNoteKind = "bad"; renderPings(); }
+    }) : null);
   }
   function turnOff() {
     currentSub().then((s) => {
@@ -416,5 +452,6 @@
   show(view);
   renderPings();
   if (token()) { loadState(); loadRecord(); } else if (!pairFailed) renderState();
+  resync();
   setInterval(tick, 10000);
 })();
