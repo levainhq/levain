@@ -133,11 +133,13 @@ def test_an_exception_is_no_decision_never_allow(monkeypatch, boom):
     assert (rc, out) == (0, "")
 
 
-@pytest.mark.parametrize("stdin_text", ["", "not json", "[]", json.dumps({"hook_event_name": "PreToolUse"}),
-                                        json.dumps(event(session_id=None))])
+@pytest.mark.parametrize("stdin_text", ["", "not json", "[]", json.dumps(event(session_id=None))])
 def test_bad_input_is_no_decision(monkeypatch, stdin_text):
     q = FakeQueue("allow")
     assert run_main(monkeypatch, q, stdin_text) == (0, "")
+    # a PreToolUse naming no tool is no longer no decision: it is denied (L3 r1 G4)
+    rc, out = run_main(monkeypatch, q, json.dumps({"hook_event_name": "PreToolUse"}))
+    assert rc == 0 and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_nothing_on_stdin_is_a_decision(monkeypatch):
@@ -1168,4 +1170,334 @@ def test_a_default_mode_gate_hold_ends_when_the_operator_comes_back(queue, monke
     out = cc.gate(event, queue, settings, home=Path("/home/u"))
     assert out is None
     assert time.monotonic() - t0 < 2.5
+    assert queue.pending() == []
+
+
+# --- the T3 floor (Q10) --------------------------------------------------------------------------------------
+
+def _hook_write(mode):
+    return {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": "/work/proj", "session_id": "sess-1",
+            "permission_mode": mode, "tool_use_id": "toolu_1",
+            "tool_input": {"file_path": "/work/proj/.claude/hooks/x.sh", "content": "#!/bin/sh\n"}}
+
+
+def test_with_no_key_a_hook_write_is_a_plain_deny_in_every_mode_where_no_dialog_asks(queue, monkeypatch):
+    """Q10 D1, the hole as measured (DESIGN R7: bypass, no key, Write .claude/hooks/v.sh -> written): with no
+    enrolled key nothing_can_decide answered None and the session's mode ran it. Now every mode where no dialog asks
+    (an absent or unknown mode included) gets the floor's PLAIN deny (L2-2: no hard stop, nothing is undecided),
+    nothing filed, a floor ledger row; default still leaves it to the dialog (acceptEdits does not: run 4 C5), plan runs nothing."""
+    from levain.consent.ledger import Ledger
+
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    settings = cc.AdapterSettings()  # no cockpit: no key can sign T3
+    assert cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
+    for mode in ("bypassPermissions", "auto", "dontAsk", "acceptEdits", None, "x"):
+        out = cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u"))
+        what = "Write of /work/proj/.claude/hooks/x.sh"
+        assert "continue" not in out and "stopReason" not in out, mode
+        spec = out["hookSpecificOutput"]
+        assert (spec["permissionDecision"], spec["permissionDecisionReason"]) == ("deny", cc.FLOOR_TEXT.format(x=what))
+    assert "LEVAIN_UNCONFINED" not in cc.FLOOR_TEXT and "levain doctor" in cc.FLOOR_TEXT  # L2-5
+    assert queue.pending() == []
+    codex_cfg = {**_hook_write("acceptEdits"),
+                 "tool_input": {"file_path": "/work/proj/.codex/config.toml", "content": "x"}}  # run 4 C5
+    out = cc.gate(codex_cfg, queue, settings, home=Path("/home/u"))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and queue.pending() == []
+    for mode in ("default", "plan"):
+        assert cc.gate(_hook_write(mode), queue, settings, home=Path("/home/u")) is None, mode
+    rows = Ledger(Path(queue.directory)).window(cc.AGENT, "sess-1", datetime.now(timezone.utc) - timedelta(days=1))
+    assert {(r.phase, r.outcome, (r.stamp_detail or {}).get("decision")) for r in rows} == {
+        ("denied_by_gate", "refused", "floor")}
+
+
+def test_an_unconfined_session_passes_a_hook_write_and_spends_no_ruled_allow(queue, monkeypatch):
+    """Q10 D2 (R3b 3a: a clear path to run an unconfined session that can edit hooks): LEVAIN_UNCONFINED=1 in the
+    session's launch env passes the gated call to the mode, read at call time, and never takes a ruled allow; any
+    other value is not unconfined."""
+    taken = []
+    monkeypatch.setattr(queue, "take_ruled_allow", lambda *a, **kw: taken.append(a))
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    assert cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+    assert taken == [] and queue.pending() == []
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "true")
+    out = cc.gate(_hook_write("bypassPermissions"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and len(taken) == 1
+
+
+def test_a_settings_file_that_sets_unconfined_does_not_open_the_session(tmp_path, monkeypatch, queue):
+    """L2-1, measured by L2 on Claude Code: a project's ``.claude/settings.json``
+    ``{"env": {"LEVAIN_UNCONFINED": "1"}}`` reaches the hook's environment, so a cloned repository could turn the gate off. The variable counts only when no
+    settings file the session can load sets it (any value), or cannot be ruled out (a file that does not parse);
+    the floor's deny then says it was ignored. The operator's own shell, with no such file, still opens the session."""
+    for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    home, ws = tmp_path / "home", tmp_path / "ws" / "proj"
+    home.mkdir()
+    managed = tmp_path / "etc" / "managed-settings.json"   # L3 r1 G3: the machine-wide files count too
+    monkeypatch.setattr(cc, "SYSTEM_SETTINGS_FILES", (("json", managed), ("toml", tmp_path / "etc" / "config.toml")))
+    (ws / "sub").mkdir(parents=True)
+    target = str(ws / ".claude" / "hooks" / "x.sh")
+    ev = {**_hook_write("bypassPermissions"), "cwd": str(ws / "sub"),
+          "tool_input": {"file_path": target, "content": "x"}}
+    settings = cc.AdapterSettings()
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    assert cc.unconfined_state(str(ws / "sub"), home=home) == "on"
+    assert cc.gate(ev, queue, settings, home=home) is None
+    ignored = cc.FLOOR_TEXT.format(x=f"Write of {target}") + cc.UNCONFINED_IGNORED_TEXT
+    for path, body in ((ws / ".claude" / "settings.json", json.dumps({"hooks": {}, "env": {cc.UNCONFINED_ENV: "1"}})),
+                       (ws / ".claude" / "settings.local.json", json.dumps({"env": {cc.UNCONFINED_ENV: "0"}})),
+                       (home / ".claude" / "settings.json", "{not json"),
+                       (tmp_path / "ws" / ".codex" / "config.toml",
+                        f'[shell_environment_policy.set]\n{cc.UNCONFINED_ENV} = "1"\n'),
+                       # L3 r1 G3: a mention anywhere, not only an ``env`` key: a JSON value, a TOML list value, an
+                       # escaped spelling, and the machine-wide files
+                       (ws / ".claude" / "settings.json",
+                        json.dumps({"hooks": {"SessionStart": [{"command": f"export {cc.UNCONFINED_ENV}=1"}]}})),
+                       (ws / ".codex" / "config.toml", f'[profiles.p]\nset = ["{cc.UNCONFINED_ENV}=1"]\n'),
+                       (ws / ".claude" / "settings.local.json", '{"x": "\\u004cEVAIN_UNCONFINED"}'),
+                       (managed, json.dumps({"env": {cc.UNCONFINED_ENV: "1"}})),
+                       (tmp_path / "etc" / "config.toml", f'x = "{cc.UNCONFINED_ENV}"\n')):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        assert cc.unconfined_state(str(ws / "sub"), home=home) == "ignored", path
+        out = cc.gate(ev, queue, settings, home=home)
+        assert "continue" not in out and out["hookSpecificOutput"]["permissionDecisionReason"] == ignored, path
+        path.unlink()
+    (ws / ".claude" / "settings.json").write_text(json.dumps({"env": {"OTHER": "1"}}))
+    assert cc.gate(ev, queue, settings, home=home) is None  # an env block that does not set it leaves his word
+    monkeypatch.delenv(cc.UNCONFINED_ENV)
+    assert cc.unconfined_state(str(ws / "sub"), home=home) is None
+    assert queue.pending() == []
+
+
+def test_with_a_key_that_can_sign_t3_the_floor_is_skipped_and_a_git_hook_write_is_filed(tmp_path, monkeypatch):
+    """L1-4: once an active key can sign T3 the floor never answers: the call is filed for the operator. Also the
+    desk's S1 L3 r1 item: git's executable config (``.git/hooks/*``, ``.git/config``, a linked worktree's
+    ``config.worktree``, a gitfile) is agent config on both adapters, never objects, refs or ``.gitignore``. And
+    L1-7: an unconfined session's T3 dialog gets no decision from the PermissionRequest hook, nothing filed."""
+    from levain.consent.adapters import codex as cx
+
+    for var in (cc.UNCONFINED_ENV, "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    home, codex_dir = Path("/home/u"), Path("/home/u/.codex")
+    for p in (".git/hooks/pre-commit", ".git/config", ".GIT/Config", "sub/.git/hooks/d/x", ".git/config.worktree",
+              ".git/worktrees/wt/config.worktree", ".git/worktrees/wt/hooks/post-checkout", "wt/.git",
+              ".git/worktrees/config", ".git/description"):
+        assert cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+        patch = {"command": f"*** Begin Patch\n*** Add File: {p}\n+x\n*** End Patch"}
+        assert cx.targets_agent_config("apply_patch", patch, "/work/proj", home=home, codex_dir=codex_dir), p
+    for p in (".git/HEAD", ".git/refs/heads/main", ".git/objects/ab/cd", ".git/logs/HEAD", ".git/index",
+              ".git/packed-refs", ".git/FETCH_HEAD", ".gitignore", ".gitattributes", "src/config"):
+        assert not cc.targets_agent_config("Write", {"file_path": p, "content": "x"}, "/work/proj", home=home), p
+
+    key = Key(tmp_path, "laptop")
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    with CockpitDB(root).read():
+        pass
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    auth.sign_and_append(conn, {"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key,
+                                "class": "laptop-presence", "custody": "passphrase"},
+                         signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
+                         clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+    conn.close()
+    settings = cc.AdapterSettings(cockpit_data_root=str(root))
+    assert not cc.nothing_can_decide(settings, tier=cc.AGENT_CONFIG_TIER)
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    q = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None))
+    filed = []
+
+    def at_the_ping(*a, **kw):
+        filed.extend(q.pending())
+        raise RuntimeError("stop at the ping")  # the call was filed; the hold is not this test's
+    monkeypatch.setattr(cc, "notify", at_the_ping)
+    ev = {**_hook_write("bypassPermissions"),
+          "tool_input": {"file_path": "/work/proj/.git/hooks/pre-commit", "content": "#!/bin/sh\n"}}
+    out = cc.gate(ev, q, settings, home=home)
+    assert [(r.tool_name, r.tier) for r in filed] == [("Write", cc.AGENT_CONFIG_TIER)]
+    assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith("levain: the gate failed (RuntimeError)")
+    assert cc.gate({**ev, "tool_input": {"file_path": "/work/proj/.git/HEAD", "content": "x"}}, q, settings,
+                   home=home) is None
+
+    monkeypatch.setenv(cc.UNCONFINED_ENV, "1")
+    calls = []
+    monkeypatch.setattr(q, "file", lambda **kw: calls.append(kw))
+    dialog = {"hook_event_name": "PermissionRequest", "tool_name": "Write", "cwd": "/work/proj",
+              "session_id": "sess-1", "permission_mode": "acceptEdits",
+              "tool_input": {"file_path": "/work/proj/.claude/settings.json", "content": "{}"}}
+    assert cc.decide(dialog, q, settings, home=home) is None and calls == []
+
+
+# --- L3 r1 G1 / r2 G1': git's config and hooks, by path, and where git itself says hooks run ----------------------
+
+def _git(home, *args):
+    """Run git for a fixture with ``home`` as HOME and no system config (never the operator's own git config)."""
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1", "LANG": "C"}
+    subprocess.run(["git", *map(str, args)], env=env, check=True, capture_output=True, stdin=subprocess.DEVNULL)
+
+
+def _git_case(name, tmp_path, monkeypatch):
+    """(cwd, home, target, expected) for one G1 case: a REAL repository under ``tmp_path`` (``git init``), its
+    ``core.hooksPath`` set with ``git config``. ``home`` is the ``~`` a target expands with; the operator's home
+    (the password database's, :func:`cc.operator_home`) is ``tmp_path/home`` in every case."""
+    home, ws = tmp_path / "home", tmp_path / "ws"
+    home.mkdir()
+    _git(home, "init", "-q", ws)
+    if name == "submodule-config":
+        return ws, home, ".git/modules/sub/config", True
+    if name == "submodule-hook-nested":
+        return ws, home, ".git/modules/libs/foo/modules/inner/hooks/pre-commit", True
+    if name == "git-info":
+        return ws, home, ".git/info/attributes", True
+    if name == "git-objects":
+        return ws, home, ".git/objects/xx", True    # r3: git answers no work tree there, so fail closed
+    if name == "git-logs":
+        return ws, home, ".git/logs/HEAD", True     # (the known edge: an over-match, git writes these itself)
+    if name == "hookspath-local":
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        return ws, home, ".husky/pre-commit", True
+    if name == "no-hookspath":
+        _git(home, "-C", ws, "config", "core.x.hooksPath", ".husky")   # [core "x"]: another section
+        return ws, home, ".husky/pre-commit", False
+    if name == "hookspath-outside-absolute":
+        # codex r2 MED / gemini r2 HIGH: an absolute hooksPath outside the worktree, written from a cwd inside it
+        outside = tmp_path / "outside-hooks"
+        outside.mkdir()
+        _git(home, "-C", ws, "config", "core.hooksPath", outside)
+        (ws / "src").mkdir()
+        return ws / "src", home, str(outside / "pre-commit"), True
+    if name == "hookspath-outside-relative":
+        _git(home, "-C", ws, "config", "core.hooksPath", "../shared-hooks")
+        return ws, home, "../shared-hooks/pre-push", True
+    if name == "hookspath-global-tilde":
+        (home / ".gitconfig").write_text("[core]\n  hooksPath = ~/.githooks\n")
+        return ws, home, str(home / ".githooks" / "pre-push"), True
+    if name == "hookspath-worktree":
+        _git(home, "-C", ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        _git(home, "-C", ws, "config", "core.hooksPath", ".githooks")
+        _git(home, "-C", ws, "worktree", "add", "-q", tmp_path / "wt")
+        return tmp_path / "wt", home, ".githooks/post-checkout", True
+    if name == "hookspath-submodule-gitfile":
+        # a submodule-like layout: sub/.git is a gitfile naming ws/.git/modules/sub, whose config sets hooksPath
+        (ws / ".git" / "modules").mkdir()
+        _git(home, "init", "-q", "--separate-git-dir", ws / ".git" / "modules" / "sub", ws / "sub")
+        _git(home, "-C", ws / "sub", "config", "core.hooksPath", ".hooks")
+        return ws, home, "sub/.hooks/pre-commit", True
+    if name == "hookspath-unreadable":
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        (ws / ".git" / "config").chmod(0)
+        return ws, home, ".husky/pre-commit", True   # r3: a git error but "not a git repository" fails closed
+    if name == "hookspath-relative-from-subdir":
+        # complement r3 HIGH: a relative hooksPath, the cwd a worktree subdirectory, ``.husky/`` already there
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        (ws / ".husky").mkdir()
+        (ws / "sub").mkdir()
+        return ws / "sub", home, "../.husky/pre-commit", True
+    if name == "hookspath-relative-inside-husky":
+        # the same, git asked from inside ``.husky/`` itself (the cwd outside any repository)
+        _git(home, "-C", ws, "config", "core.hooksPath", ".husky")
+        (ws / ".husky").mkdir()
+        (tmp_path / "elsewhere").mkdir()
+        return tmp_path / "elsewhere", home, str(ws / ".husky" / "pre-commit"), True
+    if name == "fake-git-on-path":
+        # codex r3 HIGH: a ``git`` earlier on the session's PATH that prints nothing is never the one asked (were
+        # it, its empty answer would fail closed and tag this ordinary file)
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "git").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "git").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+        return ws, home, "src/a.py", False
+    if name == "git-times-out":
+        # codex r3 HIGH: a query that times out (the budget spent) tags the target, never leaves it untagged
+        def timed_out(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout") or 0)
+        monkeypatch.setattr(cc.subprocess, "run", timed_out)
+        return ws, home, "src/a.py", True
+    if name == "xdg-hookspath":
+        # complement r3 MED: the operator's XDG global config sets hooksPath; asked with XDG_CONFIG_HOME as well
+        (tmp_path / "xdg" / "git").mkdir(parents=True)
+        (tmp_path / "xdg" / "git" / "config").write_text(f"[core]\n  hooksPath = {tmp_path / 'xdg-hooks'}\n")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        return ws, home, str(tmp_path / "xdg-hooks" / "pre-commit"), True
+    if name == "global-gitconfig":
+        return ws, home, str(home / ".gitconfig"), True
+    if name == "xdg-git-config":
+        return ws, home, "~/.config/git/config", True
+    if name == "xdg-spoofed":
+        # gemini r2 HIGH: an agent-set XDG_CONFIG_HOME must not unprotect the operator's ~/.config/git/config; the
+        # ``~`` a target expands with is another directory here, so only the password database's home tags it
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "fake-xdg"))
+        return ws, tmp_path / "claude-home", str(home / ".config" / "git" / "config"), True
+    if name == "xdg-set":
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        return ws, home, str(tmp_path / "xdg" / "git" / "config"), True
+    if name == "gitconfig-elsewhere":
+        return ws, home, "fixtures/.gitconfig", False
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize("name", [
+    "submodule-config", "submodule-hook-nested", "git-info", "git-objects", "git-logs", "hookspath-local",
+    "no-hookspath", "hookspath-outside-absolute", "hookspath-outside-relative", "hookspath-global-tilde",
+    "hookspath-worktree", "hookspath-submodule-gitfile", "hookspath-unreadable", "global-gitconfig",
+    "xdg-git-config", "xdg-spoofed", "xdg-set", "gitconfig-elsewhere", "hookspath-relative-from-subdir",
+    "hookspath-relative-inside-husky", "fake-git-on-path", "git-times-out", "xdg-hookspath"])
+def test_git_executable_config_includes_submodules_the_effective_hooks_path_and_global_config(name, tmp_path,
+                                                                                            monkeypatch):
+    """L3 r1 G1 + r2 G1' (codex, gemini): everything under a ``.git`` directory but its objects, refs, reflogs and
+    state files is agent config (a submodule's git directory ``.git/modules/<name>/``, nested, ``info/``), by path;
+    the directory git runs hooks from is ASKED of git for the event cwd's repository and the target's
+    (``git rev-parse --git-path hooks``: a relative or an absolute ``core.hooksPath``, one outside the worktree, the
+    user's ``~/.gitconfig``, a linked worktree's, a submodule's through its gitfile), never parsed; ``.husky/`` with
+    no hooksPath set is ordinary; ``~/.gitconfig`` and ``~/.config/git/config``
+    of the operator's home (the password database's) are config by full path whatever ``XDG_CONFIG_HOME`` says,
+    and ``$XDG_CONFIG_HOME/git/config`` too. r3 (complement, codex, gemini): git answers in absolute paths (a
+    relative hooksPath from a subdirectory, or asked from inside ``.husky/``), from a fixed binary (never the PATH's),
+    asked with and without the operator's XDG_CONFIG_HOME; a config git cannot read, a timeout, or no work tree
+    (inside ``.git/objects``) fails closed. Both adapters agree."""
+    import types
+
+    from levain.consent.adapters import codex as cx
+
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(cc.pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(tmp_path / "home")))
+    cwd, home, target, expected = _git_case(name, tmp_path, monkeypatch)
+    try:
+        got = cc.targets_agent_config("Write", {"file_path": target, "content": "x"}, str(cwd), home=home)
+        patch = {"command": f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch"}
+        got_cx = cx.targets_agent_config("apply_patch", patch, str(cwd), home=home, codex_dir=home / ".codex")
+    finally:
+        cfg = tmp_path / "ws" / ".git" / "config"
+        cfg.exists() and cfg.chmod(0o600)
+    assert (got, got_cx) == (expected, expected)
+
+
+def test_a_malformed_pretooluse_event_naming_a_gated_call_is_denied(queue, monkeypatch):
+    """L3 r1 G4 (codex M6) + r2 G4' (codex, gemini): an event with no session id, no cwd or no tool name returned
+    None, so the gated write ran in bypass; then a missing cwd left a relative ``.husky/pre-commit`` unanchored and
+    classified ungated. Now every file tool and MCP tool (and an unnamed one) is denied with the hard stop, never
+    classified; only another named tool (Bash, never parsed) goes on."""
+    monkeypatch.delenv(cc.UNCONFINED_ENV, raising=False)
+    settings = cc.AdapterSettings()
+    good = _hook_write("bypassPermissions")
+    no_cwd = {k: v for k, v in good.items() if k != "cwd"}
+    for bad, missing in (({**good, "session_id": None}, "session_id"), ({**good, "cwd": ""}, "cwd"),
+                         ({k: v for k, v in good.items() if k != "tool_name"}, "tool_name"),
+                         ({**no_cwd, "tool_input": {"file_path": ".husky/pre-commit", "content": "x"}}, "cwd"),
+                         ({**good, "session_id": None, "tool_input": {"file_path": "/work/proj/src/a.py",
+                                                                      "content": "x"}}, "session_id"),
+                         ({**good, "cwd": None, "tool_name": "mcp__fs__write_file",
+                           "tool_input": {"path": "notes.txt"}}, "cwd"),
+                         # gemini r3 MED: a relative or blank cwd anchors nothing either
+                         ({**good, "cwd": "."}, "cwd"), ({**good, "cwd": " "}, "cwd"),
+                         ({**good, "cwd": "ws", "tool_input": {"file_path": ".husky/pre-commit", "content": "x"}},
+                          "cwd")):
+        out = cc.gate(bad, queue, settings, home=Path("/home/u"))
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", missing
+        assert out["continue"] is False and f"no valid {missing}" in out["hookSpecificOutput"][
+            "permissionDecisionReason"], missing
+    ungated = {**good, "session_id": None, "tool_name": "Bash", "tool_input": {"command": "ls"}}
+    assert cc.gate(ungated, queue, settings, home=Path("/home/u")) is None
     assert queue.pending() == []

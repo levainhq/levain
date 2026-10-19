@@ -62,6 +62,11 @@
    "namespace": "levain-consent-away",
    "status": "shipped",
    "owner": "levain/consent/record.py"
+  },
+  {
+   "namespace": "levain-dispatch-contract",
+   "status": "reserved",
+   "owner": "levain/dispatch/sign.py"
   }
  ],
  "families": [

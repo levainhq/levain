@@ -10,12 +10,66 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Context meter in the Sessions view.** Each Claude Code and Codex session shows how much context it holds now ("context
   142K"; Codex "context 80K of 258K"), and says when it passes 200K (a fixed warn line, not the model's window). Read from
   the session's own transcript; a display, it decides nothing.
+- **The phone page and the cockpit show what you are signing.** Each request on the phone consent page and in the
+  cockpit's Decisions view now shows its input digest and request digest (short, the full value one tap away): the same
+  two values `levain consent answer` prints before it signs. A question that leads to a push shows them too, since one tap
+  there allows the push.
+- **A hint beside a shell command.** For a shell request, a short "hint (a few patterns only; informs, never authorises)"
+  says what the command looks like: piping a download into a shell, `$()`, `sudo`, `rm -r`, a force-push, writes outside the
+  working directory and similar. When nothing matches it says "no pattern matched: read the command". A hint never changes
+  what is signed or allowed.
+- Invisible and direction-changing characters in an agent's text (the command, its path, a tool or agent name) are shown as
+  visible markers such as ⟨U+202E⟩ on both surfaces.
+
+### Changed
+- **Agent config and hooks are refused when nothing can approve the edit.** Until now, with no enrolled key that could
+  approve an edit of agent config or hooks, Claude Code and Codex in acceptEdits, bypass, auto or dontAsk mode (Codex
+  with approvals off) could make the edit with no question. Now levain refuses it with a plain denial: the agent is told
+  the change is the operator's, not to retry it or route around it (the shell included), and to ask you; it carries on
+  with the rest of its work. Claude Code's default mode and Codex with approvals on keep asking through the agent's own
+  dialog, and with an enrolled key that can approve it the edit comes to you as before. `levain doctor` warns when no
+  key can approve such edits and says how to allow them. To make such edits in one session, start it from your own shell
+  with `LEVAIN_UNCONFINED=1`; a settings file that sets that variable is ignored, so a cloned repository cannot turn the
+  gate off. Git's own config and hooks now count as agent config too, since git runs what they name at your next git
+  command: everything inside a repository's `.git/` folder except its objects, refs, logs and state files (so its
+  `config`, `hooks/`, `info/`, and a linked worktree's or submodule's git folder), a `.git` file pointing at another git
+  folder, the folder git itself says it runs hooks from (levain asks git, so a `core.hooksPath` such as husky's
+  `.husky/`, or one outside the repository, counts), and your `~/.gitconfig` and `~/.config/git/config`. Known edges: a
+  shell command that writes agent config is not caught here (that belongs to the session sandbox); and a Codex hook that
+  runs past Codex's timeout lets the call through, as Codex has no setting to block on a hook failure.
 
 ### Known edges
+- The hint is a pattern reader, not a shell parser: a command written to dodge the patterns gets no hint, and the full command
+  is always shown above it.
+- A download saved to a file and run in a later step (`curl -o x.sh URL; bash x.sh`) is not hinted.
+- The digests are a record of what is signed, to compare with the terminal's output; a person cannot recompute them.
 - Claude Code's transcript does not say which context window a session has, so the meter shows tokens and the 200K warn
   line, never a percentage, for Claude Code.
 - A session started by an older install's hooks, under a relocated `CLAUDE_CONFIG_DIR`, shows "context not read" until its
   hooks are updated (`levain update`).
+- A session the agent itself starts through the shell with `LEVAIN_UNCONFINED=1`, or one a trusted repository's startup
+  hook sets it for, is unconfined: both need code you already let run.
+- In Claude Code's default mode, your own allow rules (or a trusted repository's, or `--allowedTools`) can let an edit
+  of agent config through with no dialog, for the paths Claude Code does not protect itself.
+- An unconfined session's edits of agent config get no gate row in the ledger; the record of the call itself still
+  lands.
+- Codex, two calls at once in one session: a call that passed its last halt check just before the other halts the
+  session can still run.
+- A settings file passed to Claude Code with `--settings` cannot be seen by the hook, so one that sets
+  `LEVAIN_UNCONFINED` is not caught.
+- A config that turns hooks off (Claude Code's `disableAllHooks`, Codex's `[features] hooks = false`) turns the floor
+  off with every other hook; `levain doctor` fails when it finds one. Codex's setting inside a `[profiles.<name>]`
+  section is not in that check.
+- levain asks git with your user's home and no `GIT_*` variables, so a `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` in
+  your own shell can point git at a hooks folder levain does not see.
+- A machine-wide Claude Code settings file your user cannot read is not checked for `LEVAIN_UNCONFINED` (the gate stays
+  on there).
+- An edit inside a `.git` folder's objects, refs or logs, or anywhere in a bare repository, counts as agent config; so
+  does any file when git cannot answer (an unreadable config, or past its 3 seconds or 4 repositories in one call).
+- levain asks `/usr/bin/git` first; on a machine without it, it uses `/opt/homebrew/bin/git` or `/usr/local/bin/git`,
+  and an agent that can write that file could make levain misread where hooks run.
+- A single Codex patch touching more than 4 repositories can have the agent-config path cut from its description in the
+  ledger; the call is still gated.
 
 ## [0.11.9] — 2026-10-19
 
