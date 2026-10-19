@@ -418,7 +418,7 @@ def resume_meta_of(event: Mapping[str, Any]) -> dict[str, Any]:
     invocation = "interactive"
     ppid = os.getppid()
     try:
-        args = subprocess.run(["ps", "-o", "args=", "-p", str(ppid)], capture_output=True, text=True, timeout=2,
+        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(ppid)], capture_output=True, text=True, timeout=2,
                               stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout.split()
     except (OSError, subprocess.SubprocessError, ValueError):
         args = []
