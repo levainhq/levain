@@ -1238,7 +1238,8 @@ def ruling_line(queue: ConsentQueue, ruling: Any, *, quote: bool = False) -> str
     if got is not None and got[0].tool_name == "levain_limit":   # Q13: a limit has no action to do
         from levain.consent.limits import ruling_text
 
-        return ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory, agent=AGENT)
+        return ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory,
+                           request_id=ruling.request_id)
     text = RULING_TEXT.get(ruling.ruling)
     if text is None:
         return None

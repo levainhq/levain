@@ -335,6 +335,21 @@ def _halt_read_only(qdir: Path, agent: str, root: str) -> dict[str, Any] | None:
         conn.close()
 
 
+def _halt_released(qdir: Path, request_id: str) -> bool:
+    """True only when the halt on ``request_id`` is READ as released; no row, or any failure to read, is False."""
+    try:
+        conn = sqlite3.connect((qdir / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        row = conn.execute("SELECT released_at FROM halts WHERE request_id = ?", (request_id,)).fetchone()
+        return row is not None and row[0] is not None
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        conn.close()
+
+
 def _limits_or_defaults(qdir: Path, agent: str) -> dict[str, float]:
     """The limits in force, or :data:`DEFAULTS` when they cannot be read at all: a bad limits file never turns the
     brake off."""
@@ -832,11 +847,11 @@ def file_extend(queue: Any, agent: str, session: str, *, hold: float, cwd: str) 
 
 
 def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir: Path | str | None = None,
-                agent: str | None = None) -> str | None:
+                request_id: str | None = None) -> str | None:
     """What a session is told of a late ruling on its LIMIT request (never the gated-action text: there is no action
     to do): an allow is an Extend, so it goes on; a deny is an End, so it stays stopped. ``None`` for an unknown
-    ruling, and for an End the session no longer stands under (given ``queue_dir`` and ``agent``: its root has no open
-    limit halt, so an Extend lifted it since): a stale End is never told to a session that was extended."""
+    ruling, and for an End whose own halt (given ``queue_dir`` and ``request_id``) READS as released: an Extend lifted it
+    since, so a stale End is never told to a session that was extended. Anything that cannot be read tells the End."""
     from types import SimpleNamespace
 
     from levain.consent.listing import filed_input
@@ -846,9 +861,9 @@ def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir:
     label = LABELS.get(call.get("limit"), "budget")
     if ruling not in ("allow", "deny"):
         return None
-    if ruling == "deny" and queue_dir is not None and agent is not None and isinstance(call.get("session"), str):
-        if _halt_read_only(Path(queue_dir), agent, call["session"]) is None:
-            return None
+    if ruling == "deny" and queue_dir is not None and request_id is not None \
+            and _halt_released(Path(queue_dir), request_id):
+        return None
     if ruling == "allow":
         n = call.get("extend_to")
         to = f" to {n}" if isinstance(n, str) and n and len(n) <= 24 and set(n) <= set("0123456789,.") else ""

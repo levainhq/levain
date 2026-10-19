@@ -404,7 +404,8 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
         if got is not None and got[0].tool_name == "levain_limit":   # Q13: a limit has no action to do
             from levain.consent.limits import ruling_text
 
-            text = ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory, agent=AGENT)
+            text = ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory,
+                               request_id=ruling.request_id)
             if text:
                 lines.append(text)
             continue
