@@ -146,6 +146,10 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
     answerable = pending and shown is not UNSHOWN
     from levain.cockpit.hintview import hints_for      # rendering only: what a shell command looks like (Q16)
 
+    try:
+        hints = hints_for(r, shown, shown is UNSHOWN)
+    except Exception:  # noqa: BLE001 - a hint is a reading aid: it never takes the decision surface down
+        hints = []
     return {"id": r.id, "agent": r.agent, "tool": r.tool_name, "tier": r.tier, "state": entry.state,
             "display": r.display, "cwd": r.cwd, "targets": consent_targets(r),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
@@ -153,7 +157,7 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
             "note": TOO_LONG if pending and not answerable else "",
             # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
             "tool_input_digest": r.tool_input_digest, "digest": r.digest,
-            "hints": hints_for(r, shown, shown is UNSHOWN),
+            "hints": hints,
             "audit": "" if pending else audit_line(entry)}
 
 
