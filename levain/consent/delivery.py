@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -265,8 +266,6 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     ``timeout`` :data:`GATE_TIMEOUT`, no other field), and no settings file the resume loads may set
     ``disableAllHooks``. A lookalike entry (another matcher, a non-blocking one) gates less than every call, so the
     reason names the field that differs."""
-    import shlex
-
     from levain.consent.adapters.claude_code import GATE_EVENT, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN
     from levain.install import CONSENT_HOOK_SCRIPTS
 
@@ -545,9 +544,14 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     if running(pid, started) is not False:
         return "hook", f"its process {pid} (started {started or 'at a time not recorded'}) may still run; {lands}", \
             (), None
-    if named(target) is not False:
+    resuming = named(target)
+    if resuming is True:
         return "hook", f"a process resuming this session may be running (an earlier resume, or one by hand); {lands}", \
             (), None
+    if resuming is not False:
+        return "hook", ("a resume without a session id is running (codex resume --last or by name, claude -c, "
+                        "--continue or a --resume picker), or the process list could not be read, so this session "
+                        f"may be the one it resumed; {lands}"), (), None
     why = resume_refusal(agent, target, meta)
     if why is not None:
         return "hook", f"the session has ended but is not resumed: {why}; resume it by hand and {lands}", (), None
@@ -557,30 +561,71 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
 
 
-def _resumes(tokens: list[str], session: str) -> bool:
-    """Whether the argv ``tokens`` resume ``session``: Claude Code's ``--resume <id>``, ``--resume=<id>`` or
-    ``-r <id>``, or Codex's ``resume`` subcommand (``codex resume``, ``codex exec resume``) after a ``codex`` token with
+def _resumes(tokens: list[str], session: str) -> bool | None:
+    """Whether the argv ``tokens`` run ``session``: ``True`` for Claude Code's ``--resume <id>``, ``--resume=<id>``,
+    ``-r <id>``, ``-r=<id>``, ``-r<id>``, ``--session-id <id>`` or ``--session-id=<id>`` (a fresh run that keeps
+    the id), or Codex's ``resume`` subcommand (``codex resume``, ``codex exec resume``) after a ``codex`` token with
     ``<id>`` the first UUID after it (the id precedes the prompt, so an id quoted in another resume's prompt does not
-    count). The id counts only as a whole token, never inside another (a path, a ``--session``)."""
-    for i, tok in enumerate(tokens):
-        if tok == f"--resume={session}":
+    count); ids compare case-insensitively and only as a whole token, never inside another (a path, a ``--session``).
+    ``None`` for a resume that names no session id and so may be resuming this one: a ``claude`` process (its first or
+    second token, a script's interpreter being the first) with ``-c`` / ``--continue``, or ``--resume`` / ``-r`` with
+    no UUID (the picker, a name); a ``codex`` one whose ``resume`` has ``--last`` or no UUID after it (a name, the
+    picker). ``False`` otherwise."""
+    want = session.lower()
+    low = [t.lower() for t in tokens]
+    for i, tok in enumerate(low):
+        if tok in (f"--resume={want}", f"--session-id={want}", f"-r={want}", f"-r{want}"):
             return True
-        if tok in ("--resume", "-r") and tokens[i + 1:i + 2] == [session]:
+        if tok in ("--resume", "-r", "--session-id") and low[i + 1:i + 2] == [want]:
             return True
         if tok == "resume" and any(os.path.basename(t) == "codex" for t in tokens[:i]):
-            first = next((t for t in tokens[i + 1:] if _UUID.fullmatch(t)), None)
-            if first is not None and first.lower() == session.lower():
+            first = next((t for t in low[i + 1:] if _UUID.fullmatch(t)), None)
+            if first == want:
                 return True
+    head = [os.path.basename(t) for t in tokens[:2]]
+    if "claude" in head:
+        rest = _options(low[head.index("claude") + 1:])
+        for i, tok in enumerate(rest):
+            if tok in ("-c", "--continue"):
+                return None
+            if tok in ("--resume", "-r") and not (rest[i + 1:i + 2] and _UUID.fullmatch(rest[i + 1])):
+                return None
+            if tok.startswith(("--resume=", "-r")) and tok not in ("-r", "--resume") and not _UUID.fullmatch(
+                    tok.split("=", 1)[1] if "=" in tok else tok[2:]):
+                return None
+    if "codex" in head:
+        rest = low[head.index("codex") + 1:]
+        lead = _options(rest, words=("exec",))
+        if "resume" in lead:
+            after = rest[lead.index("resume") + 1:]
+            if "--last" in _options(after) or not any(_UUID.fullmatch(t) for t in after):
+                return None
     return False
+
+
+def _options(tokens: list[str], words: tuple[str, ...] = ()) -> list[str]:
+    """The leading run of ``tokens`` that can still be options (or the subcommand ``words``): it ends before the first
+    word that neither starts with ``-`` nor follows a token that does (an option's value), so a prompt's words
+    (``please resume``, a ``-c`` inside an unquoted prompt) are not read as flags. The last word kept may be a
+    subcommand (``resume``)."""
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        if not (tok.startswith("-") or tok in words or tok == "resume"
+                or (i and tokens[i - 1].startswith("-") and "=" not in tokens[i - 1])):
+            break
+        out.append(tok)
+        if tok == "resume":
+            break
+    return out
 
 
 def session_named_running(session: str) -> bool | None:
     """Whether a running process resumes ``session`` (:func:`_resumes`, read from ``ps``'s command lines), ``None``
-    when the process list cannot be read (read as maybe: no resume). A process that only mentions the id (``levain
-    consent rule --session <id>``, its shell, ``tail -f`` of the transcript) does not count, and this process never
-    does. An ancestor that IS a resume of the session counts: the session is then running (a hook of it delivering)."""
-    import shlex
-
+    when the process list cannot be read or a resume that names no session id is running (``codex resume --last``,
+    ``claude -c``: it may be resuming this one, and which session it holds is not in its command line), so the caller
+    starts no resume. A process that only mentions the id (``levain consent rule --session <id>``, its shell,
+    ``tail -f`` of the transcript) does not count, and this process never does. An ancestor that IS a resume of the
+    session counts: the session is then running (a hook of it delivering)."""
     if not session_ok(session):
         return None
     try:
@@ -591,6 +636,7 @@ def session_named_running(session: str) -> bool | None:
     if got.returncode != 0:
         return None
     me = str(os.getpid())
+    idless = False
     for line in got.stdout.splitlines():
         pid, _, args = line.strip().partition(" ")
         if pid == me:
@@ -601,9 +647,11 @@ def session_named_running(session: str) -> bool | None:
             quoted = shlex.split(args)
         except ValueError:
             quoted = []
-        if _resumes(quoted, session) or _resumes(args.split(), session):
+        readings = (_resumes(quoted, session), _resumes(args.split(), session))
+        if True in readings:
             return True
-    return False
+        idless = idless or None in readings
+    return None if idless else False
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:

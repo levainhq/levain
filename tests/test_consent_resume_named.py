@@ -125,3 +125,71 @@ def test_an_unreadable_process_list_is_none(session, monkeypatch):
     monkeypatch.setattr(dv.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "denied"))
     assert dv.session_named_running(session) is None
     assert dv.session_named_running("not-a-uuid") is None
+
+
+# fix r1 (L3 r1 on the self-match fix, project_memory/1019-seatB/b3/resume_FIX_r1.md)
+
+@pytest.fixture
+def standin(tmp_path):
+    """Start a harmless stand-in named ``claude`` or ``codex`` (a shell script that sleeps, first on PATH), never the
+    real CLI: ps then shows ``/bin/sh <dir>/<name> <args>``, the interpreter first and the name second."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("claude", "codex"):
+        (bindir / name).write_text("#!/bin/sh\nsleep 60\n")
+        (bindir / name).chmod(0o755)
+    procs = []
+
+    def start(*argv: str) -> subprocess.Popen:
+        proc = subprocess.Popen(list(argv), env={**os.environ, "PATH": f"{bindir}:/bin:/usr/bin"},
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(proc)
+        time.sleep(0.2)
+        assert proc.poll() is None
+        return proc
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("argv", [("claude", "--session-id", "{s}"), ("claude", "-p", "--session-id={s}", "go")])
+def test_r1_a_fresh_run_with_the_session_id_counts(standin, session, argv):
+    standin(*(a.format(s=session) for a in argv))
+    assert dv.session_named_running(session) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ("claude", "-c"),
+    ("claude", "-p", "--continue", "go on"),
+    ("claude", "--resume"),
+    ("claude", "-r", "my-named-session"),
+    ("codex", "resume", "--last"),
+    ("codex", "exec", "resume", "my-named-session", "go on"),
+])
+def test_r2_a_resume_without_a_session_id_is_indeterminate_and_holds(standin, session, argv, tmp_path):
+    standin(*argv)
+    assert dv.session_named_running(session) is None
+    meta = {"invocation": "-p", "cwd": str(tmp_path), "codex_pid": 999999}
+    got = dv.route("codex", session, meta, running=lambda pid, started=None: False)
+    assert got[0] == "hook" and got[1].startswith("a resume without a session id is running"), got
+
+
+def test_r2_an_id_less_word_in_a_prompt_or_another_tool_does_not_count(standin, spawn, session):
+    other = str(uuid.uuid4())
+    standin("codex", "exec", "please", "resume", "the", "work")          # "resume" inside a prompt
+    standin("claude", "-p", f"--resume={other}", "--permission-mode", "bypassPermissions", "use", "python", "-c")
+    spawn("python3", "-c", "x", "claude", "-c")                           # claude is not the program here
+    assert dv.session_named_running(session) is False
+
+
+def test_r3_an_upper_case_id_counts_for_claude(spawn, session):
+    spawn("claude", "--resume", session.upper())
+    assert dv.session_named_running(session) is True
+
+
+@pytest.mark.parametrize("form", ["-r={s}", "-r{s}"])
+def test_r4_attached_short_resume_forms_count(standin, session, form):
+    standin("claude", "-p", form.format(s=session))
+    assert dv.session_named_running(session) is True
