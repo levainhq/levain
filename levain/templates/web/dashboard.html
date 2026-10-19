@@ -8,17 +8,9 @@
 </head>
 <body>
   <div class="deck">
-    <!-- The KE page's regions (hidden until the manifest declares hero / brief / widgets). The masthead below moves
-         into the hero's strip, and the state line into the brief, while they are shown. -->
-    <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
-      <div class="when" id="ck-when"></div>
-      <div class="skycol" id="ck-skycol"><div class="tools" id="ck-strip"></div><div id="ck-sky"></div></div>
-    </section>
-    <div class="ck-legend" id="ck-legend" hidden></div>
-    <div class="ck-secthead frame" id="ck-h-brief" hidden><h3>Today</h3></div>
-    <section class="ck-brief frame" id="ck-brief" data-ck-region="brief" hidden></section>
-    <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
-    <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
+    <!-- The page: masthead (brand, the four tabs, readout, theme), then the KE regions (hidden until the manifest declares
+         hero / brief / widgets). The masthead never moves. The hero is the now band (clock, date, the state line, the wrap line)
+         with the sky as a card under it. The state line (#state, below) moves into the band while the KE page is up. -->
     <header class="masthead frame">
       <div class="brand">
         <div class="wordmark">Levain</div>
@@ -28,6 +20,7 @@
         <button class="mode" type="button" data-mode-tab="morning" aria-selected="false"><kbd>1</kbd>Morning</button>
         <button class="mode" type="button" data-mode-tab="board" aria-selected="true"><kbd>2</kbd>Board</button>
         <button class="mode" type="button" data-mode-tab="build" aria-selected="false"><kbd>3</kbd>Build</button>
+        <button class="mode" type="button" data-mode-tab="memory" aria-selected="false"><kbd>4</kbd>Memory</button>
       </nav>
       <div class="readout">
         <div class="unit">
@@ -40,11 +33,32 @@
           <button id="refresh" type="button">Sync</button>
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
+        <div class="themesw" role="group" aria-label="Theme">
+          <button type="button" data-theme-set="dark" aria-pressed="false" aria-label="Dark theme" title="Dark">&#9790;</button>
+          <button type="button" data-theme-set="light" aria-pressed="false" aria-label="Light theme" title="Light">&#9788;</button>
+        </div>
       </div>
     </header>
+    <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
+      <div class="band frame" id="ck-band">
+        <div class="when" id="ck-when"></div>
+        <div class="band-state" id="ck-state-slot"></div>
+        <div class="band-meta" id="ck-wrapline"></div>
+      </div>
+      <div class="skycol frame" id="ck-skycol">
+        <div class="skycard" id="ck-skycard">
+          <div id="ck-sky"></div>
+          <div class="ck-legend" id="ck-legend" hidden></div>
+        </div>
+      </div>
+    </section>
+    <div class="ck-secthead frame" id="ck-h-brief" hidden><h3>Today</h3></div>
+    <section class="ck-brief frame" id="ck-brief" data-ck-region="brief" hidden></section>
+    <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
+    <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <p class="stateline frame" id="state" hidden></p>
     <p class="sub frame" id="store">connecting…</p>
-    <!-- Modes 1 / 2 / 3 show subsets of the board; the keys are ignored while typing. -->
+    <!-- Modes 1-4 show subsets of the board; the keys are ignored while typing. -->
     <main class="frame"><div class="grid" id="board"></div></main>
     <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
   </div>

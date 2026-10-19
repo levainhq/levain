@@ -1,5 +1,6 @@
-"""A sparse install (every new user's) keeps the designed widths: each glance widget is one of four tracks, and Morning's lone
-Work card is one of three, not stretched across the page (Phill 10-14: "stretches full screen and looks like shit")."""
+"""A sparse install (every new user's) keeps the designed widths: on Morning each glance widget is one of four tracks (a lone tile is
+never stretched across the page; Phill 10-14: "stretches full screen and looks like shit"), and Morning's Tray is the page's full
+width on purpose (the cockpit shape, F3: Morning = intake, the Tray wide)."""
 
 from __future__ import annotations
 
@@ -17,14 +18,17 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 @needs_browser
 def test_a_sparse_glance_keeps_one_of_four_tracks_per_widget(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": """(() => { const w = document.querySelector('.ck-widgets'); const cs = [...w.querySelectorAll(':scope > .ck-card.w')];
+    vals = _page(tmp_path, [{"eval": "(() => { document.querySelector('[data-mode-tab=\"morning\"]').click(); return document.body.dataset.mode; })()"},
+      {"eval": """(() => { const w = document.querySelector('.ck-widgets');
+      const cs = [...w.querySelectorAll(':scope > .ck-card.w')].filter(c => getComputedStyle(c).display !== 'none');
       return [cs.length, cs.map(c => c.getBoundingClientRect().width / w.getBoundingClientRect().width)]; })()"""}])
-    n, shares = vals[1]
+    assert vals[1] == "morning", vals
+    n, shares = vals[2]
     assert 1 <= n <= 4 and all(0.2 < s < 0.3 for s in shares), vals
 
 
 @needs_browser
-def test_morning_does_not_stretch_a_lone_work_card_across_the_page(tmp_path: Path) -> None:
+def test_morning_draws_the_tray_the_full_width_of_the_page(tmp_path: Path) -> None:
     vals = _page(tmp_path, [
         {"eval": "(() => { document.querySelector('[data-mode-tab=\"morning\"]').click(); return document.body.dataset.mode; })()"},
         {"eval": """(async () => { await new Promise(r => setTimeout(r, 300));
@@ -34,7 +38,7 @@ def test_morning_does_not_stretch_a_lone_work_card_across_the_page(tmp_path: Pat
     ])
     assert vals[1] == "morning", vals
     n, share = vals[2]
-    assert n == 1 and 0.25 < share < 0.4, vals
+    assert n == 1 and share > 0.95, vals
 
 
 @needs_browser

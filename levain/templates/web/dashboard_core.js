@@ -480,31 +480,23 @@
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
   const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
-  // the two structural nodes the KE page moves into its regions. A region that fails restores its own node here, BEFORE
-  // anything is cleared, so no catch can strand them inside a region it is about to wipe.
+  // the one structural node the KE page moves into a region: the state line, which lives in the now band while the KE page is up.
+  // A region that fails restores it here BEFORE anything is cleared, so no catch can strand it inside a region it is about to wipe.
+  // (The masthead and the brand no longer move: the bar is the same on every page.)
   function restoreState() {
     const state = document.getElementById("state"), store = document.getElementById("store");
     if (state && store && store.parentNode && state.parentNode !== store.parentNode) store.parentNode.insertBefore(state, store);
   }
-  function restoreMasthead() {
-    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand");
-    const state = document.getElementById("state"), store = document.getElementById("store");
-    if (!mast || !store || !store.parentNode) return;
-    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
-    const anchor = state && state.parentNode === store.parentNode ? state : store;
-    if (mast.parentNode !== store.parentNode || mast.nextSibling !== anchor) store.parentNode.insertBefore(mast, anchor);
-  }
-  // a failed hero render: the masthead goes home and the CONTENT mounts are emptied (stale weather and sky beside the
-  // error line would read as current); the structural mounts (#ck-hero, #ck-skycol, #ck-strip) stay for the next render
+  // a failed hero render: the CONTENT mounts are emptied (stale weather and sky beside the error line would read as current);
+  // the structural mounts (#ck-hero, #ck-band, #ck-skycol) stay for the next render
   function restoreHero() {
-    restoreMasthead();
-    for (const id of ["ck-when", "ck-sky", "ck-legend"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
   }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
-    // the hero's legend band follows the hero: shown by the sky's own render, hidden with the region
+    // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
     // the section headers are page chrome that follows its region: hidden here, set by the region's own render
@@ -513,11 +505,10 @@
     const bd = document.getElementById("board");
     if (bd) bd.classList.toggle("ke", on);
     if (on) return;
-    // back to the pre-KE page: the brand, the masthead and the state line return to where the static page put them
+    // back to the pre-KE page: the state line returns to where the static page put it
     restoreState();
-    restoreMasthead();
     // what the regions drew is stale once the page is no longer the KE page
-    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {
@@ -561,11 +552,24 @@
     return node;
   }
 
+  // The band's last-wrap line, from the wraps the page already holds (the Projection history panel): "Last wrap Mon 06:02" over
+  // "3 wraps". A page with no wrap history draws none, and the band keeps the clock, the date and the state line.
+  function wrapLineOf(view) {
+    const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const at = ws.length && ws[0] ? new Date(ws[0].wrapped_at) : null;
+    if (!at || Number.isNaN(at.getTime())) return null;
+    const box = el("div", "wrapline");
+    const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    const first = el("div");
+    first.append(el("b", null, "Last wrap"), " " + when);
+    box.append(first, el("div", null, ws.length + (ws.length === 1 ? " wrap" : " wraps")));
+    return box;
+  }
+
   let heroEpoch = 0;
   function renderHero(view, byId) {
-    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), skycol = document.getElementById("ck-skycol");
-    const strip = document.getElementById("ck-strip"), skyHost = document.getElementById("ck-sky");
-    const mast = document.querySelector("header.masthead");
+    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), wrapline = document.getElementById("ck-wrapline");
+    const skyHost = document.getElementById("ck-sky");
     // The legend band (#ck-legend) is the hero's: cleared and hidden here, filled and placed with the other mounts at
     // the end, and only when a sky painted a key. Until then the sky hands its legend to `place`, which holds it off
     // the page; after, `place` writes the band (a hot repaint) and `hide` clears it (a dropped or failed sky).
@@ -580,16 +584,20 @@
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
-    // the nav bar's brand sits over the clock; everything else it carried is the strip above the sky
-    const brand = document.querySelector(".brand");
+    // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
+    // wrap line, the sky's event count and the weather when a provider supplies one. A bare install has no sky and no weather and
+    // the band is still whole: clock, date, state, wrap line.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
     // everything that can throw is built off the page; the structural mounts (when, strip, sky) and the masthead
     // are touched only once all of it exists
-    const whenKids = [], skyKids = [];
+    const whenKids = [], metaKids = [], skyKids = [];
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
-    whenKids.push(stamp, events);
+    whenKids.push(stamp);
+    const wl = wrapLineOf(view);
+    if (wl) metaKids.push(wl);
+    metaKids.push(events);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
@@ -616,16 +624,14 @@
         });
         node.appendChild(again);
       }
-      whenKids.push(node);
-    } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
+      metaKids.push(node);
+    }
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
     for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
-    when.replaceChildren();
-    if (brand) when.appendChild(brand);
-    when.append(...whenKids);
-    if (mast) strip.replaceChildren(mast);
+    when.replaceChildren(...whenKids);
+    if (wrapline) wrapline.replaceChildren(...metaKids);
     skyHost.replaceChildren(...skyKids);
     hero.hidden = false;
     live = true;
@@ -633,18 +639,21 @@
     pending = null;
   }
 
+  // TODAY: where to begin, one card. The state line is not in it any more: it lives in the now band (#ck-state-slot), so a
+  // bare install, which has no brief panel, draws no Today card and no heading at all.
   function renderBriefRegion(view, byId) {
     const region = document.getElementById("ck-brief");
     const state = document.getElementById("state");
-    const card = el("div", "ck-card ck-briefcard");
+    const slot = document.getElementById("ck-state-slot");
     const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
     const bodies = entries.map((e) => bareNode(e, view, "ck-brief-body", { region: "brief" }));   // may throw: #state has not moved yet
-    if (state) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; card.appendChild(state); }
-    for (const node of bodies) card.appendChild(node);
-    region.replaceChildren(card);
-    // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
-    const st = view.state;
-    region.hidden = !entries.length && !(st && (st.text || (commit && st.can_edit !== false)));
+    if (state && slot) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; slot.appendChild(state); }
+    if (bodies.length) {
+      const card = el("div", "ck-card ck-briefcard");
+      for (const node of bodies) card.appendChild(node);
+      region.replaceChildren(card);
+    } else region.replaceChildren();
+    region.hidden = !entries.length;
     const hb = document.getElementById("ck-h-brief"); if (hb) hb.hidden = region.hidden;   // page chrome: the section's header follows its region
   }
 
@@ -805,6 +814,20 @@
     }
     sec.appendChild(grid);
     board.appendChild(sec);
+    dashPass(grid);
+    if (typeof MutationObserver === "function") new MutationObserver(() => dashPass(grid)).observe(grid, { childList: true, subtree: true });
+  }
+
+  // F7, the empty provider: a panel that says only "nothing here yet" collapses to ONE dashed line (its title, the sentence, the fix),
+  // never a card with a body gap. The Team panel on an install with no team ledger is the case; a panel with a compose box or an
+  // editor (Tray, Keep, Inbox, Identity) stays a card because the box is its content, and an empty list card folds in
+  // markEmptyCards (cockpit_view.js). Idempotent: it only toggles a class, so the observer that calls it again cannot loop.
+  function dashPass(grid) {
+    for (const p of grid.children) {
+      const rows = p.querySelectorAll(".pbody .row");
+      const bare = rows.length === 1 && rows[0].dataset.keepKey === "no_team";
+      p.classList.toggle("ck-dash", !!(p.dataset.ckPanel && bare));
+    }
   }
 
   // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries

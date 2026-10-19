@@ -20,7 +20,10 @@
     --label: color-mix(in oklch, var(--contrast) 66%, var(--base));
     --meta: color-mix(in oklch, var(--contrast) 58%, var(--base));
     --on-accent: var(--base);
-        --sky-lo: color-mix(in oklch, var(--base), var(--contrast) 7%);
+    /* two literal accent tints (the "waiting on you" halo and rule) and two cool hues the sky's mark kinds use (memory writes, questions) */
+    --accent-soft: oklch(0.25 0.045 55); --accent-line: oklch(0.52 0.11 55);
+    --info: oklch(0.78 0.10 235); --violet: oklch(0.76 0.12 305);
+    --sky-lo: color-mix(in oklch, var(--base), var(--contrast) 7%);
     --dot: color-mix(in oklch, var(--contrast) 80%, var(--base));
 
     /* space: a 4px base, 9 steps (spec D2). Components use these, never a raw px. */
@@ -70,6 +73,53 @@
     --classC: var(--label);
     --node: var(--mind);
     --edge: var(--hair-2);
+  }
+
+  /* THE THEME (F6): one token set, two themes. The tokens above are the dark set. Light is the phone's (phone.css), by system
+     preference unless the page's switch chose (html[data-theme]); every derived token recomputes from the three. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --base: oklch(0.975 0.006 265);
+      --accent: oklch(0.66 0.17 55);
+      --contrast: oklch(0.2 0.03 265);
+      --card: color-mix(in oklch, var(--base), var(--contrast) 3%);
+      --card-2: color-mix(in oklch, var(--base), var(--contrast) 7%);
+      --hair: color-mix(in oklch, var(--base), var(--contrast) 13%);
+      --hair-2: color-mix(in oklch, var(--base), var(--contrast) 24%);
+      --label: color-mix(in oklch, var(--contrast) 72%, var(--base));
+      --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
+      --on-accent: oklch(0.99 0.004 265);
+      --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
+      --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+      --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
+      --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
+      --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
+      --hue-1: oklch(0.55 0.14 75); --hue-2: oklch(0.5 0.14 255); --hue-3: oklch(0.52 0.19 350);
+      --hue-4: oklch(0.55 0.12 105); --hue-5: oklch(0.48 0.11 165);
+      --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --base: oklch(0.975 0.006 265);
+    --accent: oklch(0.66 0.17 55);
+    --contrast: oklch(0.2 0.03 265);
+    --card: color-mix(in oklch, var(--base), var(--contrast) 3%);
+    --card-2: color-mix(in oklch, var(--base), var(--contrast) 7%);
+    --hair: color-mix(in oklch, var(--base), var(--contrast) 13%);
+    --hair-2: color-mix(in oklch, var(--base), var(--contrast) 24%);
+    --label: color-mix(in oklch, var(--contrast) 72%, var(--base));
+    --meta: color-mix(in oklch, var(--contrast) 64%, var(--base));
+    --on-accent: oklch(0.99 0.004 265);
+    --accent-soft: oklch(0.945 0.04 65); --accent-line: oklch(0.78 0.11 60);
+    --ok: oklch(0.45 0.12 155); --warn: oklch(0.48 0.12 70); --bad: oklch(0.5 0.17 25);
+    --info: oklch(0.5 0.12 245); --violet: oklch(0.5 0.15 305);
+    --aqi-moderate: oklch(0.55 0.12 90); --aqi-sensitive: oklch(0.55 0.15 55); --aqi-unhealthy: oklch(0.5 0.17 25);
+    --aqi-very: oklch(0.45 0.17 320); --aqi-hazard: oklch(0.4 0.15 10);
+    --hue-1: oklch(0.55 0.14 75); --hue-2: oklch(0.5 0.14 255); --hue-3: oklch(0.52 0.19 350);
+    --hue-4: oklch(0.55 0.12 105); --hue-5: oklch(0.48 0.11 165);
+    --shadow-overlay: 0 12px 32px -8px rgb(20 30 60 / .25);
+    color-scheme: light;
   }
 
   * { box-sizing: border-box; }
@@ -160,7 +210,9 @@
     .readout { margin-left: 0; }
   }
   body[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
-  body[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
+  body[data-mode="board"] [data-modes]:not([data-modes~="board"]),
+  body[data-mode="build"] [data-modes]:not([data-modes~="build"]),
+  body[data-mode="memory"] [data-modes]:not([data-modes~="memory"]) { display: none; }
 
   .panel {
     background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg);
@@ -1046,22 +1098,29 @@
 body.ke { --gutter: var(--gutter-ke); }
 body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 
-/* HERO: the first block on the page. The clock column (brand, time, date, events, weather) and the sky beside it,
-   the nav bar's modes / unit / live / sync / jump as a slim strip above the sky. */
-body.ke .hero > .ck-region-err { grid-column: 1 / -1; padding: var(--sp-5) var(--gutter); }
-body.ke .hero { display: grid; grid-template-columns: 340px minmax(0, 1fr); border-bottom: 1px solid var(--hair);
-  background: var(--base); }
-body.ke .hero .when { padding: var(--sp-6) var(--sp-6) var(--sp-6) var(--gutter); border-right: 1px solid var(--hair);
-  display: flex; flex-direction: column; justify-content: flex-start; gap: var(--sp-5); }
-body.ke .hero .brand .wordmark { font: var(--fw-bold) var(--fs-lead)/16px var(--round); color: var(--label); letter-spacing: 0; gap: var(--sp-3); }
-body.ke .hero .brand .wordmark::before { width: 8px; height: 8px; }
-body.ke .hero .clock { font: var(--fw-clock) var(--fs-display)/var(--lh-display) var(--round); letter-spacing: var(--track-tight); margin-top: var(--sp-2); }
-body.ke .hero .clock small { font-size: var(--fs-title); line-height: 1; font-weight: var(--fw-bold); color: var(--label); margin-left: var(--sp-2); letter-spacing: 0; }
-body.ke .hero .date { font: var(--fw-semibold) var(--fs-title)/20px var(--round); color: var(--text); margin-top: var(--sp-3); }
-body.ke .hero .events { font-size: var(--fs-body); line-height: 20px; color: var(--label); margin-top: calc(var(--sp-2) * -1); }
-body.ke .hero .events .bad { color: var(--accent); }
-body.ke .hero .wx { border-top: 1px solid var(--hair); padding-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
-body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-4); }
+/* THE NOW BAND, then the sky as a card under it (F1). The band is one row: the clock and date, the state line verbatim with its
+   age, and at the right the last-wrap line (and the weather, when a provider supplies it). The masthead above it (brand, the four
+   tabs, the status cluster, the theme switch) is the page's bar and never moves into the hero. A bare install has no sky and no
+   weather: the band is still whole, and the sky card is simply not drawn. */
+body.ke .hero > .ck-region-err { padding: var(--sp-5) var(--gutter); }
+body.ke .hero { display: block; }
+body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--sp-7); padding-block: var(--sp-6) var(--sp-5); }
+body.ke .band .when { display: flex; flex-direction: column; padding: 0; border: 0; gap: 0; }
+body.ke .band .clock { font: var(--fw-clock) 46px/1 var(--round); letter-spacing: -.04em; }
+body.ke .band .clock small { font: var(--fw-semibold) var(--fs-lead)/1 var(--round); letter-spacing: 0; color: var(--label); margin-left: var(--sp-2); }
+body.ke .band .date { font: var(--fw-regular) var(--fs-body)/1.2 var(--sans); color: var(--label); margin-top: var(--sp-3); }
+body.ke .band-state { min-width: 0; padding-left: var(--sp-7); border-left: 1px solid var(--hair); }
+body.ke .band-state:not(:has(.stateline:not([hidden]))) { border-left: 0; padding-left: 0; }
+body.ke .band-state .stateline { padding: 0; margin: 0; align-items: baseline; gap: var(--sp-4); }
+body.ke .band-state .stateline .ftext { font: var(--fw-bold) var(--fs-lead)/var(--lh-tight) var(--round); }
+body.ke .band-meta { max-width: 460px; text-align: right; color: var(--meta); font-size: var(--fs-meta); line-height: 1.6; min-width: 0; display: flex; flex-direction: column; align-items: flex-end; }
+body.ke .band-meta b { color: var(--label); font-weight: var(--fw-semibold); }
+body.ke .band-meta .events { font-size: var(--fs-meta); line-height: 1.6; color: var(--meta); margin: 0; }
+body.ke .band-meta .events:empty { display: none; }
+body.ke .band-meta .events .bad { color: var(--accent); }
+body.ke .band-meta .wx { padding: var(--sp-2) 0 0; display: flex; flex-flow: row wrap; gap: var(--sp-2) var(--sp-5); min-width: 0; align-items: center; justify-content: flex-end; }
+body.ke .band-meta .wx .xbody { display: flex; flex-flow: row wrap; gap: var(--sp-2) var(--sp-5); align-items: center; justify-content: flex-end; }
+body.ke .band-meta .wx-refresh { padding: var(--sp-1) var(--sp-3); }
 .wx-main { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: nowrap; }
 .wx-icon { flex: none; }
 .wx-t { display: flex; align-items: baseline; gap: var(--sp-2); }
@@ -1087,51 +1146,45 @@ body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-
 .aqi .pill { background: color-mix(in srgb, currentColor 15%, transparent); color: inherit; }
 .aqi.band-other .pill { background: var(--card-2); color: var(--label); }
 
-body.ke .hero .skycol { min-width: 0; display: flex; flex-direction: column; }
-body.ke .hero .tools { display: flex; align-items: center; padding: var(--sp-5) var(--gutter) var(--sp-4) var(--sp-6); }
-/* ONE control row at --ctl-md: the mode segment, the status cluster (sans, tabular numerals), then Sync / Ambient / Jump.
-   Nothing wraps alone; on a narrow screen the cluster drops under the segment as a whole (see the 720px rule). */
-body.ke .hero .masthead { flex: 1; min-width: 0; padding: 0; border: 0; gap: var(--sp-3); flex-wrap: nowrap; align-items: center; }
-body.ke .hero .masthead.frame { padding-inline: 0; }
-body.ke .hero .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
-body.ke .hero .mode { display: inline-flex; align-items: center; padding: 0 var(--sp-3); font-size: var(--fs-meta); font-weight: var(--fw-medium); border-radius: var(--r-sm); white-space: nowrap; }
-body.ke .hero .readout { gap: var(--sp-3); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
-body.ke .hero .unit { gap: 0; flex: 0 1 auto; }
-body.ke .hero .unit-label { display: none; }
-body.ke .hero .entity { font: var(--fw-medium) var(--fs-meta) var(--sans); color: var(--label); max-width: 12ch; }
-body.ke .hero .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; }
-body.ke .hero .jar svg { width: 16px; height: 20px; flex: none; }
-body.ke .hero .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
-body.ke .hero .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; }
-body.ke .hero .stamp, body.ke .hero .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
-body.ke .hero .indicators button { height: var(--ctl-md); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
-body.ke .hero .indicators button#refresh { font-family: var(--sans); }
-body.ke .hero .tools { container-type: inline-size; }
-/* where the strip cannot hold one row (a phone, a half-width window), the SAME controls regroup by role: the segment on its own
-   line, the three buttons together under it, the status cluster last. Nothing is left alone on a line it does not share. */
-@container (max-width: 880px) {
-  body.ke .hero .masthead { flex-wrap: wrap; row-gap: var(--sp-3); }
-  body.ke .hero .readout, body.ke .hero .indicators, body.ke .hero .unit { display: contents; }
-  body.ke .hero .seg { order: 1; flex: 1 1 100%; }
-  body.ke .hero .seg .mode { flex: 1 1 0; justify-content: center; }
-  body.ke .hero .indicators button { order: 2; }
-  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 3; }
-  body.ke .hero .entity { display: none; }   /* the clock column already names the unit */
-  body.ke .hero .jar { flex: 0 1 auto; }
-}
-body.ke .hero .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
-#ck-sky { padding: 0 var(--gutter) 0 var(--sp-6); min-width: 0; }
-body.ke .hero .ck-sky { min-width: 0; }
-body.ke .hero .sky-hero { display: block; border: 0; }
-body.ke .hero .sky-hero .plot { padding: 0; min-height: 200px; }
-body.ke .hero .ck-sky .xbody { padding: 0; }
+/* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
+body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
+body.ke .masthead .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
+body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
+body.ke .masthead .mode[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--accent); }
+body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
+body.ke .masthead .unit { gap: 0; flex: 0 1 auto; }
+body.ke .masthead .unit-label { display: none; }
+body.ke .masthead .entity { font: var(--fw-bold) var(--fs-lead) var(--round); color: var(--text); max-width: 14ch; }
+body.ke .masthead .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; }
+body.ke .masthead .jar svg { width: 16px; height: 20px; flex: none; }
+body.ke .masthead .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
+body.ke .masthead .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; display: flex; align-items: center; }
+body.ke .masthead .stamp, body.ke .masthead .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
+body.ke .masthead .indicators button { height: var(--ctl-md); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
+.themesw { display: flex; flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-1); background: var(--card); gap: var(--sp-1); }
+.themesw button { border: 0; background: none; width: 28px; height: 24px; border-radius: var(--r-sm); color: var(--label); cursor: pointer; display: grid; place-items: center; font-size: var(--fs-body); line-height: 1; padding: 0; }
+.themesw button:hover { color: var(--text); }
+.themesw button[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+body.ke .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+/* the sky: a card under the band, its key as the card's footer (the sky's own bar and plot are sky.js's) */
+body.ke .skycol { padding-bottom: var(--sp-2); }
+body.ke .skycard { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; overflow: hidden; }
+body.ke .skycard:not(:has(#ck-sky > *)) { display: none; }
+#ck-sky { padding: 0 var(--sp-6); min-width: 0; }
+body.ke .ck-sky { min-width: 0; }
+body.ke .sky-hero { display: block; border: 0; }
+body.ke .sky-hero .plot { padding: 0; min-height: 200px; }
+body.ke[data-mode="build"] .sky-hero .plot { min-height: 300px; }
+body.ke .ck-sky .xbody { padding: 0; }
+body.ke .skycard .ck-legend { border-top: 1px solid var(--hair); }
+body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }
+/* a tab with no sky (Memory) or no band content draws no hole */
+body.ke[data-mode="memory"] .skycol { display: none; }
 
 /* BRIEF: his state line and where to begin, one wide card */
 body.ke .ck-brief { padding-top: var(--sp-6); }
 body.ke .ck-briefcard, body.ke .ck-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; position: relative; }
 body.ke .ck-briefcard { padding: var(--sp-6); }
-body.ke .ck-briefcard .stateline { padding: 0; margin: 0; }
-body.ke .ck-briefcard .stateline.frame { padding-inline: 0; }
 .ck-brief-body { margin-top: var(--sp-5); }
 .ck-brief-body .brief-line:first-child { margin-top: 0; }
 .ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) 300px; column-gap: var(--sp-7); }
@@ -1192,14 +1245,14 @@ body.ke .ck-zone { margin-top: var(--sp-7); }
 .lg-g .lg-ring.lg-bad { stroke: var(--accent); stroke-width: 2; }
 .lg-g .lg-mem { fill: var(--meta); }
 /* the sky's key: a full-width band under the hero (mock-e), aligned to the page gutter */
-body.ke .ck-legend { border-bottom: 1px solid var(--hair); }
-body.ke .ck-legend .legendbar { padding: var(--sp-4) var(--gutter); font-size: var(--fs-meta); color: var(--label); }
-body.ke .hero .ck-sky .legendbar { padding-block: var(--sp-4); font-size: var(--fs-meta); color: var(--label); }   /* a page without the mount keeps it here */
+body.ke .ck-legend .legendbar { font-size: var(--fs-meta); color: var(--label); }
 body.ke .ck-secthead { display: flex; align-items: baseline; gap: var(--sp-4); padding-top: var(--sp-7); }
 body.ke .ck-secthead[hidden] { display: none; }
 /* a mode that hides every card in a region hides its header too (the cards' own mode rule is near the top) */
 body.ke[data-mode="morning"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="morning"]))),
-body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))) { display: none; }
+body.ke[data-mode="board"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="board"]))),
+body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))),
+body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="memory"]))) { display: none; }
 body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-body) var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
 body.ke .ck-brief { padding-top: var(--sp-6); }
@@ -1207,7 +1260,9 @@ body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { padding-t
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
    is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
 body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
-body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
+body.ke[data-mode="board"] [data-modes]:not([data-modes~="board"]),
+body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]),
+body.ke[data-mode="memory"] [data-modes]:not([data-modes~="memory"]) { display: none; }
 body.ke .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
 body.ke .zone-head .zone-title { margin: 0; }
 body.ke .zone-gloss { font-size: var(--fs-meta); color: var(--meta); }
@@ -1252,8 +1307,8 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
 .ck-tab[aria-selected="true"] { background: var(--card-2); color: var(--text); }
 @media (max-width: 1180px) {
   body.ke { --gutter-ke: 32px; }
-  body.ke .hero { grid-template-columns: 1fr; }
-  body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
+  body.ke .band { grid-template-columns: auto minmax(0, 1fr); }
+  body.ke .band-meta { grid-column: 1 / -1; align-items: flex-start; text-align: left; flex-direction: row; gap: var(--sp-5); flex-wrap: wrap; }
   body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body.ke .ck-zgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 4; }
@@ -1392,26 +1447,30 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 
 /* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
-/* PHONE HEADER (<=720px). The nav comes FIRST: the mode segment spans the width, the three buttons are one centred row under it, the
-   status line under that; then the clock and the weather; then the sky, full-bleed. The strip's own container query already
-   regroups the controls by role (the segment on its own line, the buttons together, the status last); this puts the strip first
-   and centres it. The numerals on the mode buttons and the shortcut hint on Jump are keyboard cues: a phone has no keyboard. */
+/* PHONE HEADER (<=720px). The bar first: the tab segment spans the width, the buttons and the theme switch under it, the status line
+   last; then the band stacked (clock, date, the state line, the wrap line), then the sky card edge to edge. The numerals on the tab
+   buttons and the shortcut hint on Jump are keyboard cues: a phone has no keyboard. */
+@media (max-width: 960px) {
+  body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); padding-block: var(--sp-4); }
+  body.ke .masthead .seg { order: 1; flex: 1 1 100%; }
+  body.ke .masthead .seg .mode { flex: 1 1 0; justify-content: center; }
+  body.ke .masthead .readout, body.ke .masthead .indicators, body.ke .masthead .unit { display: contents; }
+  body.ke .masthead .indicators button, body.ke .masthead .themesw { order: 2; }
+  body.ke .masthead .jar, body.ke .masthead .livechip, body.ke .masthead .stamp { order: 3; }
+  body.ke .masthead .entity { display: none; }
+}
 @media (max-width: 720px) {
-  body.ke .hero { display: flex; flex-direction: column; }
-  body.ke .hero .skycol { display: contents; }
-  body.ke .hero .tools { order: -2; padding: var(--sp-4) var(--gutter); border-bottom: 1px solid var(--hair); }
-  body.ke .hero .when { order: -1; padding: var(--sp-6) var(--gutter); border-right: 0; border-bottom: 1px solid var(--hair); }
-  body.ke #ck-sky { order: 0; padding: 0; }
-  body.ke .hero .masthead { justify-content: center; text-align: center; }
-  body.ke .hero .mode kbd, body.ke .hero #jumpbtn kbd { display: none; }
-  /* the status cluster is always its own line under the buttons, however short it is: a zero-height full-width item sits between */
-  body.ke .hero .masthead::after { content: ""; flex: 1 1 100%; order: 3; height: 0; margin-top: calc(var(--sp-3) * -1); }
-  /* the nav is the first thing on a phone, so its controls are touch-sized */
-  body.ke .hero .seg { height: auto; min-height: var(--hit-min); }
-  body.ke .hero .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
-  body.ke .hero .indicators button { height: var(--hit-min); }
-  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 4; justify-content: center; }
-  /* the sky is full-bleed: the plot runs edge to edge, the summary line keeps the page gutter */
+  body.ke .band { grid-template-columns: 1fr; gap: var(--sp-4); }
+  body.ke .band-state { padding-left: 0; border-left: 0; }
+  body.ke .masthead { justify-content: center; text-align: center; }
+  body.ke .masthead .mode kbd, body.ke .masthead #jumpbtn kbd { display: none; }
+  body.ke .masthead .seg { height: auto; min-height: var(--hit-min); }
+  body.ke .masthead .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
+  body.ke .masthead .indicators button { height: var(--hit-min); }
+  body.ke .masthead .themesw button { width: var(--hit-min); height: calc(var(--hit-min) - var(--sp-2) * 2); }
+  body.ke .skycol { padding-inline: 0; }
+  body.ke .skycard { border-radius: 0; border-inline: 0; }
+  body.ke #ck-sky { padding: 0; }
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
 }
 
@@ -1465,3 +1524,69 @@ html :is(.ck-card.w, .ck-zgrid > .panel):is([data-ck-panel="memory"], [data-ck-p
 html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
   border-color: color-mix(in oklch, var(--accent) 55%, var(--hair));
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 28%, transparent), 0 0 30px color-mix(in oklch, var(--accent) 24%, transparent); }
+
+
+/* ═══════════════════════════ THE FOUR TABS (F3, K2): what each one shows, in what widths ═══════════════════════════
+   Morning = intake (Today, the glance, the Tray). Board = the work. Build = the live agents. Memory = the mind. Which panel is in
+   which tab is cockpit_view.js's TABS_OF_ID / TABS_OF_REGION; this block is how each tab lays its panels out. */
+/* Today is Morning's; the glance is a full row on Morning, one compact strip on Board, and on Build and Memory only the tiles those tabs
+   name (Sessions; Levain health), with no "At a glance" heading over one tile. */
+body.ke:not([data-mode="morning"]) #ck-h-brief, body.ke:not([data-mode="morning"]) #ck-brief { display: none; }
+body.ke:not([data-mode="morning"]) #ck-h-widgets { display: none; }
+body.ke:not([data-mode="morning"]) .ck-widgets { padding-top: var(--sp-5); }
+body.ke[data-mode="board"] .ck-widgets { display: flex; gap: 0; padding-top: var(--sp-5); background: none; }
+body.ke[data-mode="board"] .ck-widgets:not([hidden]) { border: 0; }
+body.ke[data-mode="board"] .ck-widgets > .ck-card.w { flex: 1 1 0; height: auto; min-height: 0; flex-direction: row; align-items: center; gap: var(--sp-4); padding: var(--sp-4) var(--sp-5);
+  border-radius: 0; border-right-width: 0; overflow: hidden; }
+body.ke[data-mode="board"] .ck-widgets > .ck-card.w:first-of-type { border-top-left-radius: var(--r-lg); border-bottom-left-radius: var(--r-lg); }
+body.ke[data-mode="board"] .ck-widgets > .ck-card.w:last-of-type { border-top-right-radius: var(--r-lg); border-bottom-right-radius: var(--r-lg); border-right-width: 1px; }
+body.ke[data-mode="board"] .ck-widgets .w > .k { flex: none; }
+body.ke[data-mode="board"] .ck-widgets .wbody { flex-direction: row; align-items: baseline; gap: var(--sp-4); min-width: 0; flex: 1; }
+body.ke[data-mode="board"] .ck-widgets .w .big { font-size: 20px; }
+body.ke[data-mode="board"] .ck-widgets .w .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+body.ke[data-mode="board"] .ck-widgets .w .sub ~ .sub, body.ke[data-mode="board"] .ck-widgets .w .xnote { display: none; }
+body.ke[data-mode="build"] .ck-widgets, body.ke[data-mode="memory"] .ck-widgets { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+body.ke[data-mode="build"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="build"]),
+body.ke[data-mode="memory"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="memory"]) { display: none; }
+
+/* the work zones: cards size to what they hold (up to their size class, then they scroll) instead of a fixed height, two to a row on
+   Board, the Tray the full width on Morning */
+body.ke .ck-zgrid > .panel.ck-h-tall { height: auto; max-height: var(--card-tall); }
+body.ke .ck-zgrid > .panel.ck-h-medium { height: auto; max-height: var(--card-medium); }
+body.ke .ck-zgrid > .panel.ck-h-short { height: auto; max-height: var(--card-short); }
+body.ke .ck-zgrid > .panel { display: flex; flex-direction: column; }
+body.ke .ck-zone { margin-top: var(--sp-6); }
+/* a zone with no card in this tab is not drawn, and only Board's Work zone keeps its heading */
+body.ke .zone-head { display: none; }
+body.ke[data-mode="board"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
+body.ke[data-mode="morning"] .ck-zone:not(:has(.ck-zgrid > .panel[data-modes~="morning"])),
+body.ke[data-mode="board"] .ck-zone:not(:has(.ck-zgrid > .panel[data-modes~="board"])),
+body.ke[data-mode="build"] .ck-zone:not(:has(.ck-zgrid > .panel[data-modes~="build"])),
+body.ke[data-mode="memory"] .ck-zone:not(:has(.ck-zgrid > .panel[data-modes~="memory"])) { display: none; }
+body.ke[data-mode="morning"] .ck-zgrid > .panel[data-ck-panel="tray"] { grid-column: 1 / -1; }
+body.ke[data-mode="board"] .ck-zgrid { align-items: start; }
+body.ke[data-mode="board"] .ck-zgrid > .panel { grid-column: span 3; order: 6; }
+body.ke[data-mode="board"] .ck-zgrid > [data-ck-panel="tray"] { order: 1; }
+body.ke[data-mode="board"] .ck-zgrid > [data-ck-panel="loops"] { order: 2; }
+body.ke[data-mode="board"] .ck-zgrid > [data-ck-panel="now"] { order: 3; }
+body.ke[data-mode="board"] .ck-zgrid > [data-ck-panel="keep"] { order: 4; }
+body.ke[data-mode="board"] .ck-zgrid > [data-ck-panel="episodes"] { order: 5; grid-column: 1 / -1; }
+body.ke[data-mode="build"] .ck-zgrid > .panel { grid-column: span 3; }
+body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel^="section:"] { grid-column: 1 / -1; }
+body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel="crystals"], body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel="graph"],
+body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel="wraps"] { grid-column: span 3; }
+body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid > [data-ck-panel="wraps"] { align-self: start; }
+body.ke .ck-zgrid > .panel.ck-fold { grid-column: 1 / -1; order: 90; }
+
+/* F7: a panel with nothing to say is its header line and one sentence, never a card with a body gap; a provider that is absent
+   (Team on an install with no ledger) is ONE dashed line: its title, the sentence, the fix. No empty card, no bare heading. */
+body.ke .ck-zgrid > .panel.ck-dash { grid-column: 1 / -1; order: 95; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: var(--sp-5); height: auto; max-height: none;
+  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
+body.ke .ck-zgrid > .panel.ck-dash::before { display: none; }
+body.ke .ck-zgrid > .panel.ck-dash .phead { padding: 0; flex: none; }
+body.ke .ck-zgrid > .panel.ck-dash .phead .src, body.ke .ck-zgrid > .panel.ck-dash .phead .ck-card-title ~ * { display: none; }
+body.ke .ck-zgrid > .panel.ck-dash h2 { font: var(--fw-bold) var(--fs-body) var(--round); min-width: var(--sp-8); }
+body.ke .ck-zgrid > .panel.ck-dash .pbody { padding: 0; flex: 1; min-width: 0; overflow: visible; max-height: none; color: var(--label); font-size: var(--fs-body); }
+body.ke .ck-zgrid > .panel.ck-dash .pbody .row { padding: 0; border: 0; }
+body.ke .ck-zgrid > .panel.ck-dash .pbody .clause-toggle { display: none; }
+body.ke .ck-zgrid > .panel.ck-is-empty .pbody { padding-bottom: var(--sp-4); }

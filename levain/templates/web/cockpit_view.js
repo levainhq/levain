@@ -365,18 +365,19 @@
     return t;
   }
 
-  // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
-  // sky); Build drops the readings that are only for orientation; Board is everything. An ambient panel, and anything placed in the hero, is in all.
-  const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
-  const BUILD_DROPS = new Set(["brief", "reading", "section"]);
+  // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, loops, Now,
+  // Keep, episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
+  // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
+  // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
+  const ALL_TABS = "morning board build memory";
+  const TABS_OF_ID = {
+    tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "ext:inbox": "board", "team-status": "board",
+    edits: "build", jobs: "build", sessions: "morning board build", health: "memory",
+    graph: "memory", wraps: "memory", crystals: "memory"
+  };
+  const TABS_OF_REGION = { brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" };
   function modesOf(e) {
-    const k = e.pkind || e.kind;
-    if (k === "ambient") return "morning board build";
-    const out = [];
-    if (MORNING_KINDS.has(k) || e.kind === "tray" || e.kind === "section") out.push("morning");
-    out.push("board");
-    if (!BUILD_DROPS.has(k) && e.kind !== "section") out.push("build");
-    return out.join(" ");
+    return TABS_OF_ID[e.id] || TABS_OF_REGION[e.region || e.zone] || "board";
   }
 
   // The entity record: a bad masthead string is omitted and named in view.errors.entity; the jar is all-or-null.
@@ -766,7 +767,7 @@
     // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
     // readings Build drops
     const inHero = new Set(view.ke ? view.ke.hero : []);
-    for (const e of view.layout) e.modes = inHero.has(e.id) ? "morning board build" : modesOf(e);
+    for (const e of view.layout) e.modes = inHero.has(e.id) ? ALL_TABS : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
@@ -783,7 +784,7 @@
   const states = new Set();             // every live typed panel body (a panel and its expanded copy are two)
   const FILTER_KEY = "levain_cockpit_filter:";
   const MODE_KEY = "levain_cockpit_mode";
-  const MODES = ["morning", "board", "build"];
+  const MODES = ["morning", "board", "build", "memory"];
   const SEARCH_DEBOUNCE_MS = 250;
   const STORE_LIMIT = 50;
   let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
@@ -1655,6 +1656,26 @@
     return "applied";
   }
 
+  // ---- the theme (F6): one token set, two themes. Unset = the system's (dashboard.css follows prefers-color-scheme); a choice is
+  // kept per browser, never anywhere an agent reads. A browser that refuses storage still switches for the page's life.
+  const THEME_KEY = "levain_cockpit_theme";
+  function storedTheme() { try { const t = root.localStorage.getItem(THEME_KEY); return t === "light" || t === "dark" ? t : ""; } catch (_) { return ""; } }
+  const pageRoot = () => document.documentElement || null;   // a DOM without an <html> (the test fake) has no theme to set
+  function effectiveTheme() {
+    const t = pageRoot() ? pageRoot().dataset.theme : "";
+    if (t === "light" || t === "dark") return t;
+    return root.matchMedia && root.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+  function paintThemeSwitch() {
+    const now = effectiveTheme();
+    for (const b of document.querySelectorAll("[data-theme-set]")) b.setAttribute("aria-pressed", b.dataset.themeSet === now ? "true" : "false");
+  }
+  function setTheme(t, keep) {
+    const html = pageRoot();
+    if (html) { if (t === "light" || t === "dark") html.dataset.theme = t; else delete html.dataset.theme; }
+    if (keep) { try { if (t) root.localStorage.setItem(THEME_KEY, t); else root.localStorage.removeItem(THEME_KEY); } catch (_) { /* the page still switched */ } }
+    paintThemeSwitch();
+  }
   // ---- the modes and the keys ----
   function applyMode(m) {
     if (MODES.indexOf(m) < 0) m = "board";
@@ -1809,8 +1830,9 @@
     const choose = (it) => {
       close();
       if (it.kind === "panel") {
-        // a panel the current mode hides is reached through Board, which shows every panel
-        if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        // a panel the current tab hides is reached through the first tab that shows it
+        const tabs = (it.node.dataset.modes || "").split(" ").filter(Boolean);
+        if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0]);
         if (it.node.ckShowTab) it.node.ckShowTab();
         it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
       applyMode("board");
@@ -1846,6 +1868,12 @@
 
   function install() {
     applyMode(saved(MODE_KEY) || "board");
+    setTheme(storedTheme(), false);
+    if (root.matchMedia) { const mq = root.matchMedia("(prefers-color-scheme: light)"); if (mq.addEventListener) mq.addEventListener("change", paintThemeSwitch); }
+    document.addEventListener("click", (ev) => {
+      const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
+      if (b) setTheme(b.dataset.themeSet, true);
+    });
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
@@ -1873,7 +1901,7 @@
         const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
         near.focus(onScreen ? { preventScroll: true } : undefined);
         near.select();
-      } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
+      } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)]);
     });
   }
   if (typeof document !== "undefined") {
