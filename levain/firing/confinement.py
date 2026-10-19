@@ -5844,7 +5844,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             with os.scandir(root) as entries:
                 subdirs = []
                 for entry in entries:
-                    if entry.is_dir(follow_symlinks=False):
+                    if entry.is_dir():   # a config subdirectory that is a link counts by its name
                         if entry.name.casefold() in _AGENT_CONFIG_SUBDIRS:
                             subdirs.append(entry.path)
                     else:
@@ -5853,11 +5853,27 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             continue
         except OSError as exc:
             unverifiable(str(root), exc)
+        # Claude Code's auto-memory files are loaded as rules too: ~/.claude/projects/*/memory/.
+        projects = os.path.join(root, "projects")
+        try:
+            with os.scandir(projects) as entries:
+                subdirs += [os.path.join(e.path, "memory") for e in entries if e.is_dir(follow_symlinks=False)]
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError as exc:
+            unverifiable(projects, exc)
+        visited: set[str] = set()
         for sub in subdirs:
-            for dirpath, _dirs, files in os.walk(sub, onerror=walk_error):
+            # Links are followed (a skill manager's skills/active -> ../cache/v1 is still a skill),
+            # each real directory once, so a link loop ends.
+            for dirpath, dirs, files in os.walk(sub, onerror=walk_error, followlinks=True):
                 real_dir = os.path.realpath(dirpath)
+                if real_dir in visited:
+                    dirs[:] = []
+                    continue
+                visited.add(real_dir)
                 for name in files:
-                    note(os.path.join(real_dir, name), follow=False)
+                    note(os.path.join(real_dir, name), follow=True)
     real_roots = [Path(os.path.realpath(r)) for r in agent_roots]
     outside = [d for d in policy.persistence_agent_dirs
                if not any(Path(d) == r or Path(d).is_relative_to(r) for r in real_roots)]
@@ -6741,7 +6757,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 continue
             if child.is_symlink():
                 argv += ["--symlink", os.readlink(child), str(child)]
-            elif child.is_dir() and not any(real == r or real.is_relative_to(r) for r in persist_subtrees):
+            elif child.is_dir() and not any(q == r or q.is_relative_to(r)
+                                            for q in (real, child) for r in persist_subtrees):
                 argv += ["--bind-try", str(child), str(child)]
                 tool_windows.append(child)
             else:
@@ -6779,22 +6796,43 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         return any(q == r or q.is_relative_to(r) for r in persist_ro)
 
     def _in_tool_view(q: Path) -> bool:
-        return any(q == v or q.is_relative_to(v) for v in tool_views)
+        # The read-only part of a view only: a window (a subdirectory bound back read-write) is not.
+        return (any(q == v or q.is_relative_to(v) for v in tool_views)
+                and not any(q == w or q.is_relative_to(w) for w in tool_windows))
+
+    def _bash_may_write(q: Path) -> bool:
+        # This process is the operator; bash may be the hands user, which owns its workspace. So the
+        # workspace counts as bash's whatever this process may do there (L3 r1, codex + gemini).
+        return os.access(q, os.W_OK) or q == ws_real or q.is_relative_to(ws_real)
 
     def _link_components(p: Path) -> list[Path]:
         # Every symlink dentry the kernel would follow resolving ``p`` from the root (the policy keeps
         # these for the agents' set; a static subtree's own path needs the same walk).
         out: list[Path] = []
+        pending = list(Path(os.path.abspath(p)).parts[1:])
         cur = Path(p.anchor)
-        for part in p.parts[1:]:
+        followed = 0
+        while pending:
+            part = pending.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                cur = cur.parent
+                continue
             cand = cur / part
-            if cand.is_symlink():
-                out.append(cand)
-                cur = Path(os.path.realpath(cand))
-            else:
+            if not cand.is_symlink():
                 cur = cand
-            if not os.path.lexists(cur):
-                break
+                if not os.path.lexists(cur):
+                    break
+                continue
+            followed += 1
+            if followed > _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS:
+                raise ConfinementError(f"{p} resolves through more than {_PERSISTENCE_AGENT_MAX_SYMLINK_HOPS} "
+                                       "symlinks — refusing to grant bash hands (fail-closed).")
+            out.append(cand)
+            target = Path(os.readlink(cand))
+            cur = Path(target.anchor) if target.is_absolute() else cand.parent
+            pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
         return out
 
     trees = {Path(os.path.realpath(t)) for t in (*policy.persistence_write_subtrees,
@@ -6806,8 +6844,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     for q in sorted(hops, key=str):
         parent = q.parent
         if (any(parent == t or parent.is_relative_to(t) for t in existing_trees)
-                or parent in ro_store_dirs or _in_tool_view(parent) or not os.access(parent, os.W_OK)):
-            continue   # frozen by a tree, $HOME's view, the store or a tool view; or not this user's
+                or parent in ro_store_dirs or _in_tool_view(parent) or not _bash_may_write(parent)):
+            continue   # frozen by a tree, $HOME's view, the store or a tool view; or not bash's
         if parent == ws_real or ws_real.is_relative_to(parent):
             raise ConfinementError(
                 f"{q} is a symlink the agent's configuration resolves through, in {parent}, which "
@@ -6820,11 +6858,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     for real in sorted(trees, key=str):   # parent-first: a tree inside one already bound is skipped
         if _in_persist_ro(real) or _in_tool_view(real):
             continue
-        covered = next((v for v in must_not_cover if v != real and v.is_relative_to(real)), None)
-        if covered is not None or real == ws_real:
+        covered = next((v for v in must_not_cover if v.is_relative_to(real)), None)
+        if covered is not None:
             raise ConfinementError(
                 f"the Linux floor would bind {real} read-only to keep the agents' configuration and the "
-                f"shell's startup files out of bash's reach, and that would cover {covered or real}, "
+                f"shell's startup files out of bash's reach, and that would cover {covered}, "
                 "which bash needs as it is. Refusing to grant bash hands (fail-closed). This comes from "
                 "a symlink under ~/.claude or ~/.codex (or a startup directory) resolving into that "
                 "directory: replace the symlink with the real directory or file to use bash."
@@ -6845,7 +6883,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 "(fail-closed). Run `sudo levain setup-isolation` once more for this entity: it creates "
                 "the workspace's .claude and .codex as root's."
             )
-        if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not os.access(anc, os.W_OK):
+        if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not _bash_may_write(anc):
             continue   # bash cannot create it either
         argv += ["--ro-bind", str(real), str(real)]
         persist_ro.append(real)
@@ -6855,7 +6893,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             continue   # dangling (not built, above), or a tree
         if _in_persist_ro(f) or f.parent in ro_store_dirs or _in_tool_view(f):
             continue
-        if os.access(f, os.W_OK) or os.access(f.parent, os.W_OK):
+        if os.access(f, os.W_OK) or _bash_may_write(f.parent):
             argv += ["--ro-bind", str(f), str(f)]
 
     view_roots = {*tool_views, *frozen_home}
@@ -7336,7 +7374,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         if q.is_symlink() or not q.is_dir():
             continue   # links: step (2p); an absent root: created there when bash could create it
         r = q.resolve()
-        if _in_persist_ro(r) or r in frozen_home or not os.access(r.parent, os.W_OK):
+        if _in_persist_ro(r) or r in frozen_home or not _bash_may_write(r.parent):
             continue
         if _in_tool_view(r) or any(r == rr or r.is_relative_to(rr) for rr in runtime_roots):
             continue

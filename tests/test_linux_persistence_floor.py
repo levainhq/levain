@@ -230,3 +230,36 @@ def test_an_absent_agent_dir_in_a_workspace_this_process_cannot_write_refuses_ba
             C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
     finally:
         ws.chmod(0o755)
+
+
+def test_a_multi_hop_subtree_link_records_every_hop(home: Path) -> None:
+    # L3 r1 (gemini MED): ~/.config/fish -> ~/d/a/fish with ~/d/a -> ~/d/b: the middle hop ~/d/a
+    # sits in the writable ~/d (a hop directly in $HOME would be frozen by step (0)).
+    ent, ws = _entity(home)
+    (home / "d" / "b" / "fish").mkdir(parents=True)
+    (home / "d" / "a").symlink_to(home / "d" / "b")
+    (home / ".config").mkdir()
+    (home / ".config" / "fish").symlink_to(home / "d" / "a" / "fish")
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    ro = _ro_binds(argv)
+    assert str(home / ".config") in ro and str(home / "d") in ro
+
+
+def test_the_hardlink_check_follows_links_inside_config_subdirs_and_reads_memory(home: Path) -> None:
+    import os
+    ent, ws = _entity(home)
+    cache = home / ".claude" / "cache" / "skill-v1"
+    cache.mkdir(parents=True)
+    (cache / "SKILL.md").write_text("x")
+    (home / ".claude" / "skills").mkdir()
+    (home / ".claude" / "skills" / "active").symlink_to(cache)
+    os.link(cache / "SKILL.md", ws / "skill-alias")
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
+        C._refuse_multiply_linked_jewels(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    (ws / "skill-alias").unlink()
+    mem = home / ".claude" / "projects" / "-p" / "memory"
+    mem.mkdir(parents=True)
+    (mem / "MEMORY.md").write_text("rule")
+    os.link(mem / "MEMORY.md", ws / "mem-alias")
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
+        C._refuse_multiply_linked_jewels(build_policy(ent, workspace=ws, deny_standard_creds=False))

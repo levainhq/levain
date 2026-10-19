@@ -861,6 +861,8 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
                         hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
     monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    agent_dirs: list = []
+    monkeypatch.setattr(hands, "_make_agent_dirs", lambda ws, uid, gid: agent_dirs.append((ws, uid)) or (True, ""))
     monkeypatch.setattr(hands, "_group_exists", lambda n: False)
     monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
     monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
@@ -874,6 +876,7 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
     out = capsys.readouterr().out
     assert any("enable-linger" in a for a in ran) and "linger is on" in out and "--undo" not in out
+    assert agent_dirs and agent_dirs[0][1] == 499   # the repair makes the workspace agent dirs too
     # P-1 (a): the repair also loads the network boundary (an install from before it has none).
     h = hands_user_name(ed)
     assert written == [hands.sudoers_path(h), hands.egress_rules_path(h), hands.egress_unit_path(h)]
@@ -947,9 +950,27 @@ def test_linux_setup_refuses_before_any_step_without_setfacl_dry_run_too(tmp_pat
     assert ran == []
 
 
-def test_linux_undo_without_setfacl_skips_the_acl_step_instead_of_crashing(tmp_path: Path, monkeypatch) -> None:
+def test_linux_undo_without_setfacl_stops_by_name_instead_of_crashing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "setfacl" else f"/usr/bin/{name}")
     ed = _entity(tmp_path)
     plan = _undo(ed, "linux", hands_user=hands_user_name(ed), hands_id=999)
     step = next(s for s in plan.steps if s.why == "remove the workspace ACLs")
-    assert step.call() == (True, "skipped: setfacl is not installed, so no ACL could be removed")
+    ok, why = step.call()
+    assert not ok and "install acl, then run --undo again" in why
+
+
+def test_the_agent_dirs_are_made_without_following_a_planted_link(tmp_path: Path) -> None:
+    # L3 r1 (codex + gemini): on repair, `.claude -> /etc` in the hands user's workspace made
+    # `test -d` skip the mkdir and `chown` follow the link, giving the target to the hands user.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws / ".claude").symlink_to(outside)
+    ok, why = hands._make_agent_dirs(ws, os.getuid(), os.getgid())
+    assert not ok and "not a directory" in why
+    assert (ws / ".claude").is_symlink() and not (ws / ".codex").exists()
+    (ws / ".claude").unlink()
+    ok, why = hands._make_agent_dirs(ws, os.getuid(), os.getgid())
+    assert ok, why
+    assert (ws / ".claude").is_dir() and not (ws / ".claude").is_symlink() and (ws / ".codex").is_dir()

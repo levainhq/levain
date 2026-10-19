@@ -58,6 +58,7 @@ import platform
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -241,19 +242,43 @@ def linux_tool_missing() -> str | None:
     return None
 
 
-def _agent_dir_steps(ws: Path, owner: str) -> list["Step"]:
+def _make_agent_dirs(ws: Path, uid: int, gid: int) -> tuple[bool, str]:
+    """Create the workspace's .claude and .codex (0755, the hands user's), never following a link.
+
+    Everything is done relative to the workspace opened with O_NOFOLLOW, and an existing entry is
+    accepted only as a real directory: a repair runs on a workspace the hands user has had, so
+    ``.claude -> /etc`` there must not make root create or chown anything outside it (L3 r1,
+    codex + gemini: `test -d` and `chown` followed such a link)."""
+    try:
+        fd = os.open(ws, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return False, f"could not open the workspace {ws} without following a link ({exc})"
+    try:
+        for name in (".claude", ".codex"):
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(name, 0o755, dir_fd=fd)
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode):
+                return False, (f"{ws / name} is not a directory (a link or a file); remove it, then run "
+                               "setup again")
+            os.chown(name, uid, gid, dir_fd=fd, follow_symlinks=False)
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        os.close(fd)
+    return True, ""
+
+
+def _agent_dir_steps(ws: Path, uid: int, gid: int) -> list["Step"]:
     """The workspace's .claude and .codex, made before bash ever runs, so the bash floor always has a
     directory to bind read-only over them: inside bash the hands user can then never put agent
     configuration there that the operator's own Claude Code or Codex would load (an absent one, in a
     workspace the operator cannot write, refuses bash). Given to the hands user like everything in
     its workspace (Ruling A, Phill 2026-10-07); the hands user runs nothing outside the floor."""
-    steps: list[Step] = []
-    for name in (".claude", ".codex"):
-        d = str(ws / name)
-        steps += [Step(f"create the workspace's {name}, so bash finds it to bind read-only",
-                       (_abs("mkdir"), "-m", "755", d), skip_if=(_abs("test"), "-d", d)),
-                  Step(f"give the workspace's {name} to the hands user", (_abs("chown"), owner, d))]
-    return steps
+    return [Step("create the workspace's .claude and .codex, so bash finds them to bind read-only",
+                 call=lambda: _make_agent_dirs(ws, uid, gid))]
 
 
 def egress_unavailable() -> str | None:
@@ -722,7 +747,7 @@ def plan_setup(
                  (_abs("setfacl"), "-m", f"u:{operator}:rX", str(ws))),
             Step("make new files in the workspace inherit it (default ACL)",
                  (_abs("setfacl"), "-d", "-m", f"u:{operator}:rX", str(ws))),
-            *_agent_dir_steps(ws, f"{hands}:{hands_id}"),
+            *_agent_dir_steps(ws, hands_id, hands_id),
             # Each Linux command runs in a cgroup leaf of its own, a transient scope of the operator's
             # systemd user manager (confinement `_cgroup_problem`); linger keeps that manager running
             # without a login session (cron, ssh without pam_systemd). --undo leaves it: it is the
@@ -871,8 +896,9 @@ def plan_undo(
              call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(tree)) if host == "darwin"
                                   else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)
              if host == "darwin" or shutil.which("setfacl", path=SECURE_PATH) is not None
-             # With setfacl absent, setup (which refuses without it) set no ACLs; an ACL left from a setfacl since removed stays.
-             else (True, "skipped: setfacl is not installed, so no ACL could be removed")),
+             # Without setfacl an ACL setup made cannot be removed, so undo stops here and says why.
+             else (False, "setfacl is not installed, so the workspace ACLs cannot be removed: install acl, "
+                         "then run --undo again")),
         Step("let your group read it, and empty the hooks and settings of the entity's repositories",
              call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
@@ -1514,7 +1540,7 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
                       validate=(_abs("visudo"), "-cf")))
     steps += egress_steps(hands, hands_id, ports, net_gid)
     if cfg.hands_workspace is not None:
-        steps += _agent_dir_steps(Path(cfg.hands_workspace), f"{hands}:{hands_id}")
+        steps += _agent_dir_steps(Path(cfg.hands_workspace), hands_id, hands_id)
     plan = Plan("linux", operator, hands, hands_id, entity_dir, cfg.hands_workspace, tuple(steps))
     print(f"Repairing the setup recorded in {entity_dir} (user {hands}): linger, and the network boundary "
           + (f"(loopback ports {', '.join(map(str, ports))} allowed)." if ports else "(no port allowed)."))
