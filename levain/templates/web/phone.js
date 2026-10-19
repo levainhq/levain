@@ -394,11 +394,11 @@
     btn.disabled = true;
     busy++;
     const rand = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return a; };
-    // the passkey's user name carries when it was made (this phone's local time, to the minute), so the phone's
+    // the passkey's user name carries when it was made (this phone's local time, to the second), so the phone's
     // password list tells one levain passkey from another; the key's fingerprint does not exist until it is made
     const pad = (n) => String(n).padStart(2, "0"), now = new Date();
     const name = "levain " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate())
-      + " " + pad(now.getHours()) + ":" + pad(now.getMinutes());
+      + " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
     const create = made ? Promise.resolve(made) : navigator.credentials.create({ publicKey: {
       rp: { id: rpId, name: "levain" }, user: { id: rand(16), name: name, displayName: name },
       challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
@@ -415,7 +415,7 @@
       }
       remember(r.body.fingerprint, c.rawId);
       setMade(null);
-      note.textContent = "passkey made (" + r.body.fingerprint + (c.name ? ", named \"" + c.name + "\" in this phone's passwords" : "")
+      note.textContent = "passkey made (" + r.body.fingerprint + (c.name ? ", named \"" + c.name + "\"" : "")
         + "). On the laptop, run these to enrol it"
         + " (a passkey cannot enrol itself), then refresh:" + (r.body.note ? " " + r.body.note : "");
       out.replaceChildren(...(r.body.commands || []).map((cmd) => {
