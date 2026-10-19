@@ -132,3 +132,49 @@ def test_macos_policy_gains_no_linux_subtree(home: Path, monkeypatch) -> None:
     policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
     names = {p.name for p in policy.persistence_write_subtrees}
     assert not names & {"systemd", "autostart", "fish", ".bashrc.d", "environment.d"}
+
+
+def test_an_absent_ancestor_is_created_before_the_tree_under_it(home: Path) -> None:
+    # ~/.local exists, ~/.local/share does not: the pin step creates ~/.local/share first, or the
+    # tree's mkdir (no parents) fails and bash is refused. Holds because step (2p) is in argv before
+    # step (1) reads it.
+    ent, ws = _entity(home)
+    (home / ".local").mkdir()
+    _, create_first = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    share, units = str(home / ".local" / "share"), str(home / ".local" / "share" / "systemd")
+    assert share in create_first and units in create_first
+    assert create_first.index(share) < create_first.index(units)
+
+
+def test_the_agents_config_dir_overrides_are_roots(home: Path, tmp_path: Path, monkeypatch) -> None:
+    ent, ws = _entity(home)
+    cc, cx = tmp_path / "cc-config", tmp_path / "codex-home"
+    cc.mkdir()
+    cx.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cc))
+    monkeypatch.setenv("CODEX_HOME", str(cx))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    ro = _ro_binds(argv)
+    assert str(cc.resolve()) in ro and str(cx.resolve()) in ro
+
+
+def test_the_hardlink_check_covers_agent_config_surfaces_not_agent_data(home: Path) -> None:
+    # RUN 2026-10-19: Claude Code hardlinks its file-history backups and a job's git clone hardlinks
+    # its objects; with whole trees in the strict check, bash was refused for every real user.
+    ent, ws = _entity(home)
+    data = home / ".claude" / "file-history" / "s1" / "abc@v1"
+    data.parent.mkdir(parents=True)
+    data.write_text("backup")
+    (ws / "edited.py").write_text("x")
+    data.unlink()
+    import os
+    os.link(ws / "edited.py", data)
+    policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
+    C._refuse_multiply_linked_jewels(policy)          # data: no refusal
+    hook = home / ".claude" / "hooks" / "pre.sh"
+    hook.parent.mkdir()
+    hook.write_text("#!/bin/sh\n")
+    os.link(hook, ws / "pre-alias")
+    policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
+        C._refuse_multiply_linked_jewels(policy)

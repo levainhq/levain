@@ -580,6 +580,12 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
 
 
 _PERSISTENCE_AGENT_NAMES = (".claude", ".codex")
+# The subdirectories of a .claude/.codex root that Claude Code or Codex load as configuration or run
+# (hooks, agents, slash commands and prompts, skills, plugins, Codex rules, output styles, scripts a
+# setting names). Only the hardlink-alias check reads this list (:func:`_jewel_inodes`); the write
+# floor covers the whole tree whatever this says. Compared casefolded.
+_AGENT_CONFIG_SUBDIRS = frozenset({"hooks", "agents", "commands", "prompts", "skills", "plugins", "rules",
+                                   "output-styles", "scripts", "bin"})
 _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS = 40
 
 
@@ -717,18 +723,25 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
                 elif stat.S_ISDIR(child_st.st_mode):
                     directories_to_walk.append(child)
 
-    for anchor in (home, workspace):
-        candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
-        try:
-            with os.scandir(anchor) as entries:
-                candidates.extend(
-                    Path(entry.path) for entry in entries
-                    if entry.name.casefold() in _PERSISTENCE_AGENT_NAMES
-                )
-        except (FileNotFoundError, NotADirectoryError):
-            pass
-        except OSError as exc:
-            refuse(anchor, f"an anchor that cannot be scanned ({exc})", exc)
+    # The agents' own overrides of where their configuration lives: an absolute CLAUDE_CONFIG_DIR or
+    # CODEX_HOME in levain's environment is a root like ~/.claude and ~/.codex.
+    overrides = [Path(v) for v in (os.environ.get("CLAUDE_CONFIG_DIR"), os.environ.get("CODEX_HOME"))
+                 if v and os.path.isabs(v)]
+    for anchor in (home, workspace, None):
+        if anchor is None:
+            candidates = overrides
+        else:
+            candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
+            try:
+                with os.scandir(anchor) as entries:
+                    candidates.extend(
+                        Path(entry.path) for entry in entries
+                        if entry.name.casefold() in _PERSISTENCE_AGENT_NAMES
+                    )
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            except OSError as exc:
+                refuse(anchor, f"an anchor that cannot be scanned ({exc})", exc)
 
         for raw in _dedup_paths(candidates):
             try:
@@ -2449,6 +2462,8 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
+            # zsh's startup files when ~/.zshenv sets ZDOTDIR to the usual XDG place.
+            (home / ".config" / "zsh", "operator zsh config"),
             # Linux's own: the systemd user manager reads units and environment from these, a
             # desktop session starts autostart entries, Fedora's .bashrc sources ~/.bashrc.d, and
             # fish runs its config. Bound read-only by the bwrap plan's step (2p).
@@ -2457,7 +2472,8 @@ def build_policy(
                (home / ".config" / "environment.d", "operator user environment"),
                (home / ".config" / "autostart", "operator autostart"),
                (home / ".bashrc.d", "operator bashrc.d"),
-               (home / ".config" / "fish", "operator fish config"))
+               (home / ".config" / "fish", "operator fish config"),
+               (home / ".config" / "plasma-workspace" / "env", "operator KDE login environment"))
               if platform.system() == "Linux" else ()),
         )
         for p in _required_spellings(root, label)
@@ -5812,8 +5828,41 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
     for home in policy.persistence_home_dirs:
         scan_children(home, lambda _name: True)
 
-    roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees,
-                    *policy.persistence_agent_roots, *policy.persistence_agent_dirs,
+    # The agents' trees join by their CONFIGURATION SURFACES only: every file directly in a .claude or
+    # .codex root (settings, hooks.json, config.toml, CLAUDE.md/AGENTS.md, a statusline script) and
+    # every file under its config subdirectories, plus any directory a link resolves to OUTSIDE the
+    # roots, walked whole. Not the rest: Claude Code hardlinks its own file-history backups to the
+    # files it edits, and a git clone in a job's tmp hardlinks its objects, so with the whole trees in
+    # this strict check bash was refused for any real Claude Code user (RUN 2026-10-19: 1,958
+    # multiply-linked files in one real ~/.claude, refused on its first git object; argushub refused
+    # on a tool-results file). The write floor still covers every file in the trees; only the
+    # hardlink-alias refusal is scoped. A pre-existing link between a data file there and a path bash
+    # can write lets bash change that data file: a known edge (the agent loads none of it as code).
+    agent_roots = [r for r in sorted({*policy.persistence_agent_roots}, key=str) if os.path.isdir(r)]
+    for root in agent_roots:
+        try:
+            with os.scandir(root) as entries:
+                subdirs = []
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name.casefold() in _AGENT_CONFIG_SUBDIRS:
+                            subdirs.append(entry.path)
+                    else:
+                        note(entry.path, follow=True)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            unverifiable(str(root), exc)
+        for sub in subdirs:
+            for dirpath, _dirs, files in os.walk(sub, onerror=walk_error):
+                real_dir = os.path.realpath(dirpath)
+                for name in files:
+                    note(os.path.join(real_dir, name), follow=False)
+    real_roots = [Path(os.path.realpath(r)) for r in agent_roots]
+    outside = [d for d in policy.persistence_agent_dirs
+               if not any(Path(d) == r or Path(d).is_relative_to(r) for r in real_roots)]
+
+    roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees, *outside,
                     *([policy.ssh_dir] if policy.ssh_dir else [])}, key=lambda p: str(p))
     walked: list[Path] = []
     for root in roots:
