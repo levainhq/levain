@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -68,6 +69,8 @@ CAP_MAX = 1024
 # CONTRACT c5 §1.1: a slot is {class, index}, never the bare index; R/qb/slot<n>/ exists for the egress class only,
 # so a listener's n is egress index n
 SLOT_CLASS = "egress"
+# CONTRACT c6: every *_digest is sha256: + 64 lowercase hex (the run a row carries verbatim included)
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _HOOK_REQUEST_KEYS = frozenset(ExternalGateRequest.__dataclass_fields__) - {"id"}
 _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 
@@ -94,7 +97,8 @@ def resolved_from(answer: Any) -> Resolved | None:
         return None
     if kind == "dispatch":
         if not isinstance(run, Mapping) or set(run) != RUN_KEYS or not isinstance(run["run_id"], str) \
-                or not run["run_id"]:
+                or not run["run_id"] or not isinstance(run["contract_digest"], str) \
+                or _DIGEST.fullmatch(run["contract_digest"]) is None:
             return None
     elif run is not None:
         return None

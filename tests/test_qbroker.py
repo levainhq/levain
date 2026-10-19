@@ -771,3 +771,12 @@ def test_an_allowed_signer_reads_as_an_authority_key(L, keys):
     sk = AllowedSigner(principal="p", public_key="sk-ecdsa-sha2-nistp256@openssh.com AAAA", fingerprint="SHA256:x",
                        namespaces=frozenset({"levain-consent-answer"}))
     assert sk.custody == PASSKEY
+
+
+@pytest.mark.parametrize("digest", ["c" * 64, "sha256:" + "C" * 64, "sha256:" + "c" * 63, "sha1:" + "c" * 40, 7])
+def test_a_resolved_run_whose_contract_digest_is_not_the_sha256_form_is_refused(L, resolver, clock, digest):
+    """CONTRACT c6 line 22: every ``*_digest`` is sha256: + 64 lowercase hex; the row carries run verbatim."""
+    resolver.add(3, "cap-bad", Resolved(session="sess-3", kind="dispatch", run={**RUN, "contract_digest": digest}))
+    got = req(make_broker(L, resolver, clock), slot=3, cap="cap-bad")
+    assert got["ok"] is False and got["refused"] == "resolve-malformed"
+    assert list((L / "queue" / "requests").glob("pend-*")) == []
