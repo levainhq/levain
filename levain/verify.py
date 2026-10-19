@@ -142,7 +142,7 @@ def run_verify_hooks(path: Path) -> int:
                 "The install was wired to this Python (likely in a venv that's "
                 "been deleted or moved). Re-run `levain init --force` from the "
                 "venv you want to wire it to, or fix the path in "
-                ".claude/settings.json / ~/.codex/hooks.json."
+                ".claude/settings.local.json / ~/.codex/hooks.json."
             ),
         ))
         print("\n1 check(s) FAILED.")
@@ -413,7 +413,8 @@ def _resolve_install_python(install: Path) -> str:
 def _resolve_install_launcher(install: Path) -> list[str]:
     """Return the Python interpreter path the install's adapter is wired to.
 
-    Reads it from `.claude/settings.json` (Claude Code) or `~/.codex/hooks.json`
+    Reads it from `.claude/settings.local.json` (Claude Code; `.claude/settings.json` on an install from
+    before levain's hooks moved there) or `~/.codex/hooks.json`
     via CODEX_HOME (Codex). Falls back to `sys.executable` when no config is
     available or no python can be extracted. The point is to test the same
     interpreter the harness will actually invoke at fire time, which may
@@ -432,11 +433,13 @@ def _resolve_install_launcher(install: Path) -> list[str]:
     gets skipped — so verify-hooks never accidentally tests a non-Levain
     interpreter.
     """
-    # Claude Code: .claude/settings.json — gated by CLAUDE.md tag file.
+    # Claude Code: .claude/settings.local.json (where levain wires its hooks), then .claude/settings.json (an
+    # install from before the move, until `levain update`) — gated by CLAUDE.md tag file.
     if (install / "CLAUDE.md").is_file():
-        py = _launcher_from_hooks_config(install / ".claude" / "settings.json", install)
-        if py is not None:
-            return py
+        for name in ("settings.local.json", "settings.json"):
+            py = _launcher_from_hooks_config(install / ".claude" / name, install)
+            if py is not None:
+                return py
 
     # Codex: CODEX_HOME/hooks.json sidecar — gated by AGENTS.md tag file.
     if (install / "AGENTS.md").is_file():
@@ -453,8 +456,9 @@ def _resolve_install_launcher(install: Path) -> list[str]:
 
 # Claude Code's settings.template.json writes the hook command with a RUNTIME
 # harness placeholder, `${CLAUDE_PROJECT_DIR}`, that Claude Code substitutes at
-# fire time — NOT an install-time placeholder like {{PYTHON}}. So the
-# settings.json on disk literally contains the string
+# fire time. `levain init` now fills it with the install path (levain's hooks
+# live in settings.local.json with absolute paths), but an install from before
+# that, until `levain update`, has a settings.json that literally contains
 # `${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py`. To match that
 # against this install's hooks dir we substitute it ourselves — the same
 # substitution doctor.py makes (see _hook_command_targets). Kept as a named
@@ -474,9 +478,9 @@ def _launcher_from_hooks_config(path: Path, install: Path) -> list[str] | None:
         {"hooks": {<event>: [{"hooks": [{"command": "..."}, ...]}]}}
 
     The script-path token may carry a RUNTIME harness placeholder
-    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — Claude Code's
-    template ships that shape and `levain init` does not rewrite it (the harness
-    substitutes it at fire time). We substitute it here so the foreign-hook
+    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — an install
+    from before levain's hooks moved to settings.local.json carries the template's
+    shape (the harness substitutes it at fire time). We substitute it here so the foreign-hook
     filter can still locate the script inside THIS install. Without this the
     filter would reject every Claude Code install's command as "foreign" and
     verify-hooks would silently fall back to its own interpreter — testing the

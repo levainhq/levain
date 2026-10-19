@@ -195,8 +195,8 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
             ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json",
              False),
             # the shape `levain init` wires: a static script in the activation tree
-            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"], install / ".claude" / "settings.json",
-             True),
+            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"],
+             install / ".claude" / "settings.local.json", True),
             ("codex", hooks_dir / CONSENT_HOOK_SCRIPTS["codex"], chome / "hooks.json", True)):
         try:
             out += _agent_findings(agent, install, script, config, codex_home, deadline, wired_by_init=by_init)

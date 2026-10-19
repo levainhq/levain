@@ -18,7 +18,7 @@ def _row(results, agent: str):
 
 
 def _settings(install: Path) -> tuple[Path, dict]:
-    p = install / ".claude" / "settings.json"
+    p = install / ".claude" / "settings.local.json"  # where levain wires its hooks
     return p, json.loads(p.read_text(encoding="utf-8"))
 
 

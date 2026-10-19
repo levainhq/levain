@@ -1447,15 +1447,38 @@ def _hook_command_targets(
     if not tokens or len(tokens) < 2:
         return False
     expected = (install / "activation" / "hooks" / expected_script).resolve()
+    return any(_hook_token_path(tok, install) == expected for tok in tokens[1:])
+
+
+def _hook_token_path(tok: str, install: Path) -> Path | None:
+    """A hook command token as the resolved path it names, reading the harness placeholder
+    ``${CLAUDE_PROJECT_DIR}`` (or ``$CLAUDE_PROJECT_DIR``) as this install; None when it cannot be resolved."""
+    candidate = tok.replace("${CLAUDE_PROJECT_DIR}", str(install)).replace("$CLAUDE_PROJECT_DIR", str(install))
+    try:
+        return Path(candidate).resolve()
+    except (OSError, RuntimeError, ValueError):  # RuntimeError: a symlink loop before Python 3.13 (L3 r1)
+        return None
+
+
+def levain_hook_handler(h: Any, install: Path) -> bool:
+    """Whether the hook handler ``h`` is one levain wired for this install: a command whose token after the
+    interpreter is an absolute path (after :func:`_hook_token_path`'s placeholder reading) to a ``.py`` directly
+    in ``<install>/activation/hooks/``. The reading :func:`_hook_command_targets` makes for one named script,
+    widened to any of levain's scripts, so the consent hook's ``-m levain.hookrun <script>`` form counts too.
+    Anything else (another install's script, a team hook, the user's own) is not levain's."""
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+        return False
+    try:
+        tokens = shlex.split(h["command"])
+    except ValueError:
+        return False
+    hooks_dir = (install / "activation" / "hooks").resolve()
     for tok in tokens[1:]:
-        # Token may be a literal path OR contain a harness placeholder like
-        # ${CLAUDE_PROJECT_DIR}. Substitute the known placeholder and check.
-        candidate = tok.replace("${CLAUDE_PROJECT_DIR}", str(install))
-        try:
-            if Path(candidate).resolve() == expected:
-                return True
-        except (OSError, RuntimeError):  # RuntimeError: a symlink loop before Python 3.13 (L3 r1)
+        if not os.path.isabs(tok.replace("${CLAUDE_PROJECT_DIR}", "/").replace("$CLAUDE_PROJECT_DIR", "/")):
             continue
+        p = _hook_token_path(tok, install)
+        if p is not None and p.suffix == ".py" and p.parent == hooks_dir:
+            return True
     return False
 
 
@@ -1586,7 +1609,7 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         else:
             out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
     else:
-        staged = install.joinpath(*PENDING_REL, *((".claude", "settings.json") if adapter == "claude-code"
+        staged = install.joinpath(*PENDING_REL, *((".claude", "settings.local.json") if adapter == "claude-code"
                                                   else ("codex-home", "hooks.json")))
         hint = (f"`levain update` staged levain's version at {staged}: merge its PermissionRequest entry."
                 if staged.is_file() else
@@ -2865,6 +2888,62 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
     return [CheckResult("context surface", True, detail)]
 
 
+def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[CheckResult]]:
+    """(hooks object to check, the file it came from, rows about where levain's hooks are). Levain's hooks belong
+    in ``.claude/settings.local.json`` (``install.CC_LOCAL_SETTINGS_REL``): Claude Code reads the workspace's
+    settings.json only for a session started in the workspace folder itself. The local file's hooks are checked
+    when they hold any levain handler; else settings.json's, when they do (an install from before the move), with a
+    WARN naming `levain update`. Also a WARN for a levain handler left in settings.json beside the local ones, and
+    for a levain command that names its script through ``${CLAUDE_PROJECT_DIR}``."""
+    from levain.install import CC_LOCAL_SETTINGS_REL, _split_hooks
+
+    rows: list[CheckResult] = []
+    local_path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
+    local_label = "/".join(CC_LOCAL_SETTINGS_REL)
+    local_hooks: Any = {}
+    try:
+        local = json.loads(local_path.read_text(encoding="utf-8"))
+        if not isinstance(local, dict):
+            raise ValueError("not a JSON object")
+        local_hooks = local.get("hooks", {})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        rows.append(CheckResult(local_label, False, f"cannot be read: {e}",
+                                "Fix the file (it holds levain's hooks), then run `levain update`."))
+    local_hooks = local_hooks if isinstance(local_hooks, dict) else {}
+    shared_hooks = settings.get("hooks", {})
+    shared_hooks = shared_hooks if isinstance(shared_hooks, dict) else {}
+    local_ours = _split_hooks(local_hooks, install, ours=True)
+    shared_ours = _split_hooks(shared_hooks, install, ours=True)
+    if local_ours:
+        hooks, label = local_hooks, local_label
+        if shared_ours:
+            rows.append(CheckResult("levain hooks location", True,
+                                    "levain's hooks are still in settings.json too (an older release's place), "
+                                    "so a session started at the workspace root may run them twice",
+                                    "Run `levain update` to remove them from settings.json.", warn=True))
+    elif shared_ours:
+        hooks, label = shared_hooks, ".claude/settings.json"
+        rows.append(CheckResult("levain hooks location", True,
+                                "levain's hooks are in settings.json, which Claude Code reads only for a session "
+                                "started in the workspace folder: a session started in a subfolder runs no levain "
+                                "hook (no consent gate)",
+                                f"Run `levain update` to move them to {local_label}.", warn=True))
+    else:
+        hooks, label = local_hooks, local_label
+    templated = sorted({event for src in (local_ours, shared_ours) for event, groups in src.items()
+                        for g in groups for h in g.get("hooks", [])
+                        if "CLAUDE_PROJECT_DIR" in h.get("command", "")})
+    if templated:
+        rows.append(CheckResult("levain hook paths", True,
+                                f"{', '.join(templated)}: the command names its script through "
+                                "${CLAUDE_PROJECT_DIR}, which is the folder a session starts in, so from a "
+                                "subfolder the script is not found (the hook exits 2, which for UserPromptSubmit blocks the "
+                                "prompt)", "Run `levain update` to write absolute paths.", warn=True))
+    return hooks, label, rows
+
+
 def _check_claude_code(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
@@ -2897,13 +2976,14 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             settings = None
 
         if settings is not None:
-            hooks = settings.get("hooks", {})
+            hooks, label, located = _cc_levain_hooks(install, settings)
+            results.extend(located)
             ss = hooks.get("SessionStart", [])
             ups = hooks.get("UserPromptSubmit", [])
             if ss and ups:
                 results.append(
                     CheckResult(
-                        ".claude/settings.json hooks",
+                        f"{label} hooks",
                         True,
                         "SessionStart + UserPromptSubmit configured",
                     )
@@ -2958,7 +3038,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             else:
                 results.append(
                     CheckResult(
-                        ".claude/settings.json hooks",
+                        f"{label} hooks",
                         False,
                         "SessionStart or UserPromptSubmit missing",
                         "Re-run `levain init`.",
