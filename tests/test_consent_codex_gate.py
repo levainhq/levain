@@ -82,3 +82,26 @@ def test_trusted_hash_is_codex_own_and_doctor_reads_trust(tmp_path):
         hooks.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": group["matcher"], "hooks": [h]}]}}))
         got = cx.gate_trust(hooks, script, home=home, codex_bin=no_codex, python="/py")
         assert got.status == "changed" and "differs from levain's render" in got.detail, (group, got)
+
+
+def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unconfined(tmp_path, monkeypatch):
+    """Q10 D1 + D2 on Codex: with no enrolled key a gated call answered nothing and the mode ran it. Now any mode
+    but default gets the floor's PLAIN deny (Codex drops a deny that carries continue:false, runs2 BC_1), nothing
+    filed; default leaves it to Codex's approval; LEVAIN_UNCONFINED=1 passes it."""
+    monkeypatch.delenv(cx.UNCONFINED_ENV, raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    patch = {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"}
+    event = _event("S1", "apply_patch", patch, str(tmp_path))
+    out = json.loads(_run(qdir, event))
+    assert "continue" not in out
+    spec = out["hookSpecificOutput"]
+    assert (spec["permissionDecision"], spec["permissionDecisionReason"]) == (
+        "deny", cx.FLOOR_TEXT.format(x="apply_patch of .codex/hooks.json"))
+    rows = Ledger(qdir).window("codex", "S1", datetime.now(timezone.utc) - timedelta(days=1))
+    assert [(r.phase, (r.stamp_detail or {}).get("decision")) for r in rows] == [("denied_by_gate", "floor")]
+    assert _run(qdir, {**event, "permission_mode": "default"}) == ""
+    monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
+    assert _run(qdir, event) == ""
+    assert ConsentQueue(qdir, authority=authority_source(qdir, anchor=None)).pending() == []

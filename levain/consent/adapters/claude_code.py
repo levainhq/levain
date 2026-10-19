@@ -294,7 +294,9 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
-    files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
+    files nothing (a queue row is kept for good). The PermissionRequest hook then leaves the call to the agent's own
+    dialog; the PreToolUse gate does so in ``default`` mode only, and in every other mode denies a T3 call (the
+    floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
@@ -307,7 +309,7 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     try:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
-        return True  # an authority that does not replay verifies nothing; the dialog answers
+        return True  # an authority that does not replay verifies nothing
     if tier == AGENT_CONFIG_TIER:
         from levain.consent.queue import class_covers
 
@@ -670,7 +672,12 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # protects, ``.claude/settings.json``), the PermissionRequest hook delivers that same allow once
 # (:meth:`ConsentQueue.take_gate_allow`), so the operator is asked once:
 #
+# 0. a session started with ``LEVAIN_UNCONFINED=1`` (:data:`UNCONFINED_ENV`, Q10 D2) gets no decision: the mode
+#    decides, and no ruled allow is spent;
 # 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
+# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default`` no decision (the
+#    dialog, or the operator's own allow rule, decides); in every other mode, an absent or unknown one included, the
+#    T3 FLOOR (Q10 D1): a deny with :data:`FLOOR_TEXT` and the hard stop, nothing filed;
 # 2. else the request is filed with ``expires_at`` = now + D (the library owns the deadline, B1 fix 3), the operator
 #    is pinged through the notify seam (R-f; a failed ping never fails the gate), and the hook waits up to D for a
 #    verified decision, which it delivers;
@@ -714,6 +721,21 @@ U_REV = ("levain: UNDECIDED, not denied. The operator did not answer in time, so
 U_IRR = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
          "This class of action stops the task: do no further work. Do not retry it or achieve it another way. "
          "Write a short summary of what is done and what waits on gap #{n}, and end your turn.")
+# Q10 D1: the deny for a gated call when no enrolled key can sign it and no dialog asks
+FLOOR_TEXT = ("levain: the action was NOT taken: {x}. Agent config and hooks are the operator's, and no enrolled key "
+              "can approve this, so it cannot be asked for. Do not retry it and do not achieve it another way. To "
+              "allow changes like this, the operator enrols a key that can sign them (they will then be asked), or "
+              "makes the change themselves or in a session they start with LEVAIN_UNCONFINED=1.")
+# Q10 D2: a session started with this set to "1" in its environment is unconfined: the gate passes its gated calls
+# and the session's mode decides. Read from the hook's own environment at every call (the agent's launch env)
+UNCONFINED_ENV = "LEVAIN_UNCONFINED"
+
+
+def unconfined() -> bool:
+    """Whether the operator started this session unconfined (:data:`UNCONFINED_ENV` is exactly ``"1"``)."""
+    return os.environ.get(UNCONFINED_ENV) == "1"
+
+
 # DESIGN §3.6, verbatim: a late ruling delivered to its live session
 RULING_TEXT = {
     "allow": ("levain: ruling on gap #{n}: ALLOW. Do {x} now, it will be allowed. Then list what you skipped or "
@@ -922,9 +944,11 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent),
-    else a ruled allow (taken once), else, in every other mode (``default`` included) and when
-    something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
+    A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
+    or in a session started unconfined (:func:`unconfined`, nor is a ruled allow spent), else a ruled allow (taken
+    once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in ``default`` and the
+    floor's deny with the hard stop in every other mode (:data:`FLOOR_TEXT`, nothing filed), else, in every mode
+    (``default`` included), it is filed with its hold = D (``gate_hold_seconds``),
     pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
     (:func:`undecided_output`). In ``default`` the hold runs only while the operator is away, and ``still_away``
     (default :func:`still_away_from` the queue directory's settings file) is re-read every :data:`RECHECK_EVERY`
@@ -1025,12 +1049,20 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     posture = mode if isinstance(mode, str) and mode else None
     if posture == "plan":
         return None  # plan runs nothing: no decision, and a ruled allow is not spent on a call that will not run
+    if unconfined():
+        return None  # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow spent
     try:
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
-            return None
+            if posture == "default":
+                return None  # Claude Code's own dialog (or the operator's own allow rule) decides while he is present
+            # no dialog asks in this mode (an absent or unknown mode counts as none) and no key could answer a
+            # request: the floor denies, files nothing (Q10 D1)
+            note(refused="floor")
+            return _pre("deny", FLOOR_TEXT.format(x=what),
+                        **_stop(tier, what, "no enrolled key can approve a change to agent config or hooks."))
         if posture == "default" and not effective_away(settings)[0]:
             # an attended default-mode session: Claude Code's own dialog (or the operator's own allow rule) decides,
             # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
