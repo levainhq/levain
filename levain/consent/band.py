@@ -501,7 +501,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--would-push", dest="would_push", default=None, metavar="KEY",
                    help="Option KEY leads to `levain push --repo --remote --branch` (given below): levain files that "
                         "exact push as an undecided consent request tied to the option, so the operator's pick of "
-                        "it on the phone, with Face ID, also allows that one push. The answer itself allows nothing.")
+                        "it on the phone page with a passkey also signs a ruling that allows that one push (or they "
+                        "rule it with `levain consent rule`). The answer itself allows nothing. Refused unless an "
+                        "active key can allow a push.")
     a.add_argument("--repo", default=None, help="With --would-push: the repository (default: the current directory).")
     a.add_argument("--remote", default=None, help="With --would-push: the remote URL, as `levain push` takes it.")
     a.add_argument("--branch", default=None, help="With --would-push: the branch, as `levain push` takes it.")
