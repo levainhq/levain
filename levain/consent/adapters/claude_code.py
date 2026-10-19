@@ -958,7 +958,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     try:
         from levain.consent.band import question_context
 
-        answers = question_context(queue.directory, AGENT, session)
+        # a hard stop ends the turn: an answer claimed on it may never be read, so it waits for the next call
+        stopped = out is not None and out.get("continue") is False
+        answers = None if stopped else question_context(queue.directory, AGENT, session)
     except Exception:
         answers = None  # undelivered answers stay for the next hook
     context = "\n".join(c for c in (context, answers) if c) or None

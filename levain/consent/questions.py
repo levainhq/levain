@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.queue import default_queue_dir
@@ -67,6 +67,7 @@ _WHAT_MAX = 1000
 _LABEL_MAX = 200
 _BLOCKS_MAX = 300
 _TEXT_MAX = 4000
+_N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
 # how long the hook's reads and its claim wait on a lock another writer holds: past it the answers wait for the
 # session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is not this)
 HOOK_BUSY_MS = 2000
@@ -208,14 +209,14 @@ def _parse_ref(ref: Any) -> tuple[str, Any] | None:
     if isinstance(ref, bool):
         return None
     if isinstance(ref, int):
-        return ("n", ref)
+        return ("n", ref) if 1 <= ref <= _N_MAX else None
     if isinstance(ref, str):
         text = ref.strip()
         if text.startswith("q-"):
             return ("id", text)
         digits = text[1:] if text.startswith("#") else text
-        if digits.isascii() and digits.isdigit():
-            return ("n", int(digits))
+        if digits.isascii() and digits.isdigit() and len(digits) <= 18:
+            return ("n", int(digits)) if int(digits) >= 1 else None
     return None
 
 
@@ -290,17 +291,8 @@ class QuestionStore:
             yield conn
 
     @contextmanager
-    def _read(self) -> Iterator[sqlite3.Connection]:
-        with read_transaction(self._connect) as conn:
-            yield conn
-
-    def _exists(self) -> bool:
-        """Whether there is a store to read: a hook's reads never create one."""
-        return self.path.exists()
-
-    @contextmanager
     def _peek(self) -> Iterator[sqlite3.Connection | None]:
-        """The hook's read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
+        """Every read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
         creates, sets up or writes the store, so a tool call with nothing to deliver takes no write lock. ``None``
         when there is no store yet (no file, an empty one, or one a filer has not set up); a store of another
         format raises :class:`QuestionStoreError`."""
@@ -325,6 +317,7 @@ class QuestionStore:
                 return
             if row is None or row[0] != FORMAT or "answer_resume_steps" not in have:
                 raise QuestionStoreError(f"{self.path} is not a question store of format {FORMAT!r}")
+            self._ready = True                # set up and of this format: a write here need not set it up again
             yield conn
             conn.execute("COMMIT")
         finally:
@@ -385,26 +378,26 @@ class QuestionStore:
 
     def get(self, ref: Any) -> Question | None:
         """A question by its id (``q-…``), its number, or ``#n`` / ``n`` as a string; ``None`` if there is none."""
-        if not self._exists():
-            return None
-        with self._read() as conn:
+        with self._peek() as conn:
+            if conn is None:
+                return None
             return self._by_ref(conn, ref)
 
     def open_questions(self, agent: str | None = None) -> list[Question]:
         """The unanswered questions (of ``agent``, if given), oldest first."""
-        if not self._exists():
-            return []
         where, args = ("AND q.agent = ?", (agent,)) if agent is not None else ("", ())
-        with self._read() as conn:
+        with self._peek() as conn:
+            if conn is None:
+                return []
             rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NULL {where} ORDER BY q.n", args).fetchall()
         return [self._question_of(r) for r in rows]
 
     def recent(self, limit: int = 50) -> list[Question]:
         """The newest ``limit`` questions, answered or not, newest first."""
-        if not self._exists():
-            return []
-        with self._read() as conn:
-            rows = conn.execute(f"{_SELECT} ORDER BY q.n DESC LIMIT ?", (max(int(limit), 0),)).fetchall()
+        with self._peek() as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(f"{_SELECT} ORDER BY q.n DESC LIMIT ?", (min(max(int(limit), 0), _N_MAX),)).fetchall()
         return [self._question_of(r) for r in rows]
 
     # --- answering -----------------------------------------------------------------------------------
@@ -507,9 +500,9 @@ class QuestionStore:
         """Where the question's answer text is, with when it got there: ``undelivered`` (never claimed),
         ``delivered`` (claimed by a hook, or by a resume that was confirmed), ``failed`` (its resume failed:
         deliverable again) or ``unconfirmed`` (claimed for a resume that was never settled: it may have run)."""
-        if not self._exists():
-            return "undelivered", None
-        with self._read() as conn:
+        with self._peek() as conn:
+            if conn is None:
+                return "undelivered", None
             q = self._by_ref(conn, ref)
             if q is None:
                 return "undelivered", None
@@ -525,9 +518,9 @@ class QuestionStore:
     def undelivered(self) -> list[Question]:
         """The answered questions whose text is not known to have reached their session (undelivered, failed or
         unconfirmed: :meth:`delivery_state`), oldest answer first."""
-        if not self._exists():
-            return []
-        with self._read() as conn:
+        with self._peek() as conn:
+            if conn is None:
+                return []
             rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NOT NULL AND (" + _DELIVERABLE + " OR "
                                 + _LAST_STEP + " = 'launching') ORDER BY a.rowid").fetchall()
         return [self._question_of(r) for r in rows]
@@ -536,12 +529,12 @@ class QuestionStore:
     def resume_meta(self, ref: Any) -> dict[str, Any] | None:
         """What ``levain ask`` recorded for a later resume of the asking session (unsigned, never authority), or
         ``None`` when nothing was recorded, the store does not exist or there is no such question."""
-        if not self._exists():
-            return None
         parsed = _parse_ref(ref)
         if parsed is None:
             return None
-        with self._read() as conn:
+        with self._peek() as conn:
+            if conn is None:
+                return None
             row = conn.execute(f"SELECT resume FROM questions WHERE {parsed[0]} = ?", (parsed[1],)).fetchone()
         if row is None or row[0] is None:
             return None

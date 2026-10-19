@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from levain.cli import main as cli_main
 from levain.consent import band
 from levain.consent import delivery as dv
@@ -33,19 +35,35 @@ def test_transcript_facts_reads_the_first_cwd_and_the_last_mode(tmp_path):
     assert band.transcript_facts(tmp_path / "missing.jsonl") == (None, None)
 
 
-def test_ask_resume_meta_claude_code_from_env_and_transcript(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def _no_process_tree(monkeypatch):
+    """No test reads this run's own process tree (it runs under an agent)."""
+    monkeypatch.setattr(band, "_ancestors", lambda: iter(()))
+
+
+def _cc_transcript(tmp_path, start="/work/my.proj", mode="plan"):
     config = tmp_path / "cfg"
-    start = "/work/my.proj"
     tdir = config / "projects" / "-work-my-proj"
-    tdir.mkdir(parents=True)
-    (tdir / f"{SESSION}.jsonl").write_text(json.dumps({"cwd": start, "permissionMode": "plan"}) + "\n")
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / f"{SESSION}.jsonl").write_text(json.dumps({"cwd": start, "permissionMode": mode}) + "\n")
+    return config, tdir
+
+
+def test_ask_resume_meta_claude_code_from_env_and_transcript(tmp_path, monkeypatch):
+    config, tdir = _cc_transcript(tmp_path)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)
     monkeypatch.setenv("CLAUDE_PID", str(os.getpid()))
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(1111, ["zsh", "-c", "levain ask"]),
+                                                          (os.getpid(), ["claude", "-p", "--model", "x"])]))
     meta = band.ask_resume_meta("claude_code", SESSION)
     assert (meta["invocation"], meta["permission_mode"], meta["cwd"], meta["config_dir"], meta["claude_pid"]) == \
-        ("-p", "plan", start, str(config), os.getpid())
+        ("-p", "plan", "/work/my.proj", str(config), os.getpid())
     assert meta["claude_started"] and meta["claude_flags"]
+    # CLAUDE_PID naming a process that is not this command's claude ancestor is not trusted
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    assert band.ask_resume_meta("claude_code", SESSION)["claude_pid"] is None
     # a start directory that does not name the transcript's directory is not trusted
     (tdir / f"{SESSION}.jsonl").write_text(json.dumps({"cwd": "/elsewhere", "permissionMode": "plan"}) + "\n")
     assert band.ask_resume_meta("claude_code", SESSION)["cwd"] is None
@@ -59,12 +77,38 @@ def test_ask_resume_meta_claude_code_from_env_and_transcript(tmp_path, monkeypat
     assert band.ask_resume_meta("claude_code", f"{SESSION}#agent:x") is None
 
 
-def test_ask_resume_meta_codex(monkeypatch, tmp_path):
-    monkeypatch.setattr(band, "_codex_ancestor", lambda: (4242, True))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    assert band.ask_resume_meta("codex", SESSION) == {"invocation": "-p", "codex_pid": 4242,
-                                                       "cwd": str(tmp_path.resolve()), "config_dir": str(tmp_path)}
+def test_ask_resume_meta_is_only_for_the_callers_own_session(monkeypatch):
+    other = "aaaaaaaa-2e6d-433f-b374-0ad96dd5f62d"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)
+    monkeypatch.setenv("CODEX_THREAD_ID", SESSION)
+    assert band.ask_resume_meta("claude_code", other) is None
+    assert band.ask_resume_meta("codex", other) is None
+
+
+def test_ask_resume_meta_codex_from_its_rollout(monkeypatch, tmp_path):
+    chome = tmp_path / "codex"
+    day = chome / "sessions" / "2026" / "10" / "18"
+    day.mkdir(parents=True)
+    (day / f"rollout-2026-10-18T22-00-00-{SESSION}.jsonl").write_text(json.dumps(
+        {"type": "session_meta", "payload": {"id": SESSION, "cwd": "/work/start"}}) + "\n{}\n")
+    monkeypatch.setenv("CODEX_HOME", str(chome))
+    monkeypatch.setenv("CODEX_THREAD_ID", SESSION)
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(10, ["bash", "-lc", "x"]), (4242, ["codex", "exec", "go"])]))
+    assert band.ask_resume_meta("codex", SESSION) == {"invocation": "-p", "codex_pid": 4242, "cwd": "/work/start",
+                                                       "config_dir": str(chome)}
+    # an app-server outlives its threads: no pid, so the thread is never judged ended by it
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(4242, ["codex", "app-server"])]))
+    assert band.ask_resume_meta("codex", SESSION)["codex_pid"] is None
+    # a rollout whose record names another thread is not read
+    assert band.codex_rollout_cwd(chome, "bbbbbbbb-2e6d-433f-b374-0ad96dd5f62d") is None
+
+
+def test_the_nearest_agent_ancestor_names_the_agent(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)
+    monkeypatch.setenv("CODEX_THREAD_ID", "t-1")
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(5, ["bash"]), (6, ["/opt/bin/codex", "exec"]),
+                                                          (7, ["claude"])]))
+    assert band._agent_and_session(None, None) == ("codex", "t-1")
 
 
 def test_levain_ask_records_the_resume_meta(tmp_path, monkeypatch):
@@ -166,3 +210,53 @@ def test_deliver_answers_and_the_cli(tmp_path, monkeypatch):
     assert cli_main(["question", "answer", str(q2.n), "--option", "b", "--no-deliver", "--queue-dir",
                      str(store.directory)]) == 0
     assert "delivery" not in out.getvalue()
+
+
+def test_a_resume_needs_the_transcript_to_still_show_the_recorded_mode(tmp_path, monkeypatch):
+    config, tdir = _cc_transcript(tmp_path, mode="bypassPermissions")
+    meta = {"invocation": "-p", "cwd": "/work/my.proj", "permission_mode": "bypassPermissions",
+            "config_dir": str(config)}
+    store, q = _answered(tmp_path, resume=meta)
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("/bin/claude",), str(tmp_path)))
+    (tdir / f"{SESSION}.jsonl").write_text(
+        json.dumps({"cwd": "/work/my.proj", "permissionMode": "bypassPermissions"}) + "\n"
+        + json.dumps({"permissionMode": "default"}) + "\n")                # he dropped the mode before it ended
+    got = band.deliver_answer(store, q.id, launch=lambda *a: None)
+    assert got.route == "hook" and "no longer shows" in got.reason
+    assert store.delivery_state(q.id)[0] == "undelivered"
+
+
+def test_the_real_route_refuses_untrusted_meta_for_an_answer(tmp_path):
+    """No seam patched: an ended Claude Code session whose recorded start directory does not exist is not resumed."""
+    store, q = _answered(tmp_path, resume={"invocation": "-p", "cwd": str(tmp_path / "gone"), "claude_pid": 999999,
+                                           "permission_mode": "default", "claude_flags": "claude"})
+    got = band.deliver_answer(store, q.id, listing=lambda meta: {}, running=lambda pid, started=None: False)
+    assert got.route == "hook" and "is not an existing absolute directory" in got.reason
+    assert got.reason.endswith("the answer lands at its next step")
+
+
+def test_deliver_answers_tries_one_resume_per_session(tmp_path, monkeypatch):
+    store, q = _answered(tmp_path)
+    q2 = store.file(agent="claude_code", agent_session_id=SESSION, what="q2?", options=[("a", "x"), ("b", "y")],
+                    rec="a", blocks="z", cwd="/w")
+    store.answer(q2.id, option="a", channel="cli")
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("/bin/claude",), str(tmp_path)))
+    launches = []
+    got = band.deliver_answers(store, launch=lambda *a: launches.append(a) or "it exited 1")
+    assert len(launches) == 1 and [d.route for d in got] == ["failed"]
+
+
+def test_the_cli_says_the_answer_stands_when_delivery_raises(tmp_path, monkeypatch):
+    store = QuestionStore(tmp_path / "consent")
+    store.file(agent="codex", agent_session_id=SESSION, what="q?", options=[("a", "x"), ("b", "y")], rec="a",
+               blocks="z", cwd="/w")
+
+    def boom(*a, **k):
+        raise OSError("listing died")
+
+    monkeypatch.setattr(band, "deliver_answer", boom)
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    assert cli_main(["question", "answer", "1", "--option", "a", "--queue-dir", str(store.directory)]) == 0
+    assert "the answer is recorded; its delivery raised OSError" in out.getvalue()
+    assert store.get(1).answer is not None

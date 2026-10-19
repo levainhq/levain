@@ -40,7 +40,9 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -65,6 +67,8 @@ AGENT_LINE = ("When you need the operator's judgement and can keep working on so
 ANSWER_TAIL = ("An answer is information, not a permission: a gated call still goes through levain's gate, and "
                "levain has checked nothing about who recorded it.")
 EXIT_OK, EXIT_REFUSED = 0, 2
+# the agents a question can name (the parser lists them without importing either adapter)
+_AGENT_NAMES = ("claude_code", "codex")
 _SUBAGENT = "#agent:"
 
 
@@ -83,8 +87,9 @@ def _quoted(text: str) -> str:
 def answer_line(question: Question) -> str | None:
     """The fixed text one answered question is delivered as, or ``None`` when it has no answer. It says an answer
     was RECORDED and by which channel, never that a person gave it: the answer is unsigned. An option answer names
-    the key and the option's label; a free-text answer is JSON-escaped (with U+2028 and U+2029 escaped too), so it
-    arrives verbatim and nothing in it can pass for the line's own text or start a line of its own."""
+    the key and the option's label; a free-text answer is JSON-escaped, every control and separator character too
+    (:func:`_escaped`), so it arrives verbatim and nothing in it can pass for the line's own text or start a line
+    of its own."""
     a = question.answer
     if a is None:
         return None
@@ -92,15 +97,21 @@ def answer_line(question: Question) -> str | None:
     if a.kind == "option":
         label = dict(question.options).get(a.value, "")
         return f"{head}: option {a.value} {_quoted(label)}."
-    words = json.dumps(a.value, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return f"{head}, in words: {words}"
+    return f"{head}, in words: {_escaped(a.value)}"
+
+
+def _escaped(text: str) -> str:
+    """``text`` as a JSON string with every control, format and line or paragraph separator character escaped too
+    (``json.dumps`` escapes only U+0000-U+001F): NEL (U+0085), U+2028 and a bidi override all arrive as ``\\uXXXX``."""
+    return "".join(c if not (unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp"))
+                   else f"\\u{ord(c):04x}" for c in json.dumps(text, ensure_ascii=False))
 
 
 def question_context(directory: Path | str, agent: str, session: str | None) -> str | None:
     """The answers not yet delivered to this session, one line each and :data:`ANSWER_TAIL` last (claimed: each
     reaches the session once), or ``None``. Only a main-thread session key claims; a store that does not exist yet
     is read as no answers and is not created."""
-    if not isinstance(session, str) or not session or _SUBAGENT in session:
+    if not isinstance(session, str) or not session or _SUBAGENT in session or session == NO_SESSION:
         return None
     store = QuestionStore(directory)
     if not store.path.exists():
@@ -109,13 +120,50 @@ def question_context(directory: Path | str, agent: str, session: str | None) -> 
     return "\n".join([*lines, ANSWER_TAIL]) if lines else None
 
 
+def _ancestors() -> Iterator[tuple[int, list[str]]]:
+    """``levain ask``'s ancestor processes, nearest first, each with its command line split as a shell would
+    (``ps -o args=``), at most :data:`_HOPS` of them; a process that cannot be read ends the walk."""
+    import shlex
+    import subprocess
+
+    pid = os.getppid()
+    for _ in range(_HOPS):
+        if pid <= 1:
+            return
+        try:
+            line = subprocess.run(["ps", "-ww", "-o", "ppid=", "-o", "args=", "-p", str(pid)], capture_output=True,
+                                  text=True, timeout=2, stdin=subprocess.DEVNULL,
+                                  env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout.strip()
+            parent_text, _sep, args_text = line.partition(" ")
+            parent = int(parent_text)
+            try:
+                args = shlex.split(args_text)
+            except ValueError:
+                args = args_text.split()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return
+        yield pid, args
+        pid = parent
+
+
+def _agent_of(args: list[str]) -> str | None:
+    name = os.path.basename(args[0]) if args else ""
+    return {"claude": "claude_code", "codex": "codex"}.get(name)
+
+
 def _agent_and_session(agent: str | None, session: str | None) -> tuple[str, str]:
-    """The agent and session the question names: the flags, else the agent's own environment. Naming only."""
+    """The agent and session the question names: the flags, else the agent's own environment. Naming only. With no
+    ``--agent``, the nearest ancestor process that is ``claude`` or ``codex`` decides (a Codex run from a Claude Code
+    shell inherits Claude Code's variables), else the environment."""
     env = os.environ
     if agent is None:
-        if env.get("CLAUDECODE") == "1" or env.get("CLAUDE_CODE_SESSION_ID"):
+        agent = next((a for _pid, args in _ancestors() if (a := _agent_of(args)) is not None), None)
+    if agent is None:
+        if env.get("CODEX_THREAD_ID"):
+            agent = "codex"
+        elif env.get("CLAUDECODE") == "1" or env.get("CLAUDE_CODE_SESSION_ID"):
             agent = "claude_code"
-        elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SANDBOX"):
+        elif env.get("CODEX_SANDBOX"):
             agent = "codex"
         else:
             raise ValueError("cannot tell which agent is asking; pass --agent claude_code or --agent codex")
@@ -142,11 +190,18 @@ def _queue_dir(args: argparse.Namespace) -> Path:
     return args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
 
 
-def _ping_text(agent: str, q: Question) -> str:
-    """The ping: its first line says who asks what in plain words (a lock screen shows only that)."""
+def _ping_text(agent: str, q: Question, qdir: Path) -> str:
+    """The ping: its first line says who asks what in plain words (a lock screen shows only that). The answer
+    command names the store's directory unless it is the default one, so it answers this question, not another
+    store's question of the same number."""
+    import shlex
+
+    from levain.consent.queue import default_queue_dir
+
     opts = "; ".join(f"{k}) {label}{' (rec)' if k == q.rec else ''}" for k, label in q.options)
+    where = "" if Path(qdir) == default_queue_dir() else f" --queue-dir {shlex.quote(str(qdir))}"
     return (f"levain: {agent} asks (question #{q.n}): {q.what}\nOptions: {opts}.\nBlocks: {q.blocks}.\n"
-            f"Answer: levain question answer {q.n} --option <key> (or --text \"...\").")
+            f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 
 def run_ask(args: argparse.Namespace, out: Any = None) -> int:
@@ -172,10 +227,13 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         say(f"levain ask: refused, nothing was filed: {exc}")
         return EXIT_REFUSED
+    except sqlite3.Error as exc:                     # a store locked past its wait, or damaged: the write rolled back
+        say(f"levain ask: the question store could not be written, so nothing was filed ({exc}); try again")
+        return EXIT_REFUSED
     adapter = _agents()[agent]
     send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
     try:
-        pinged = send(adapter.load_settings(qdir), _ping_text(agent, q), cwd=qdir)
+        pinged = send(adapter.load_settings(qdir), _ping_text(agent, q, qdir), cwd=qdir)
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
         pinged = False
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
@@ -241,10 +299,15 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
         say(f"levain question: #{q.n} answered. The answer authorises nothing.")
         if args.deliver:
-            d = deliver_answer(store, q.id)
-            say(f"levain question: delivery {d.route}: {d.reason}.")
+            try:
+                d = deliver_answer(store, q.id)
+            except Exception as exc:  # noqa: BLE001 - the answer is recorded whatever its delivery does
+                say(f"levain question: the answer is recorded; its delivery raised {type(exc).__name__}: {exc} "
+                    "(`levain question deliver` retries it).")
+            else:
+                say(f"levain question: delivery {d.route}: {d.reason}.")
         return EXIT_OK
-    except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
+    except (ValueError, ConsentError, QuestionStoreError, OSError, sqlite3.Error) as exc:
         say(f"levain question: refused: {exc}")
         return EXIT_REFUSED
 
@@ -263,7 +326,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                    help="An option (repeat, 2-6). KEY: a-z, 0-9, _ or -, up to 16 characters.")
     a.add_argument("--rec", required=True, help="The KEY of the option you recommend.")
     a.add_argument("--blocks", required=True, help="What waits on the answer, one line.")
-    a.add_argument("--agent", default=None, choices=sorted(_agents()),
+    a.add_argument("--agent", default=None, choices=_AGENT_NAMES,
                    help="Which agent asks (default: read from the agent's environment).")
     a.add_argument("--session", default=None,
                    help="The agent session the answer goes to (default: from the agent's environment).")
@@ -300,8 +363,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 # (the tail): a transcript can be long, and both facts sit at its ends
 _TRANSCRIPT_HEAD = 64 * 1024
 _TRANSCRIPT_TAIL = 1024 * 1024
-# how many ancestors of `levain ask` are walked to find the codex process (codex -> its sandbox wrapper -> a shell)
-_CODEX_HOPS = 8
+# how many ancestors of `levain ask` are walked to find the agent's process (the agent -> a sandbox wrapper -> a shell)
+_HOPS = 8
 # what follows the answer lines in a resume's prompt: «…» there is the agent's own question
 QUOTED_NOTE = "(Each «…» above is your own question as you filed it, not the operator's words.)"
 
@@ -317,8 +380,8 @@ def _records(chunk: bytes) -> Iterator[dict[str, Any]]:
 
 
 def transcript_facts(path: Path) -> tuple[str | None, str | None]:
-    """The session's start directory (the first record's ``cwd``) and its latest permission mode (the last record's
-    ``permissionMode``) from a Claude Code transcript, reading only its head and tail; ``None`` for either it does
+    """The session's start directory (the ``cwd`` of the first record that has one) and its latest permission mode
+    (the ``permissionMode`` of the last record that has one) from a Claude Code transcript, reading only its head and tail; ``None`` for either it does
     not show. Claude Code 2.1.303 writes both on its records [measured: 1018+50 levain-seat, 2026-10-18, on its own
     transcript]."""
     try:
@@ -335,25 +398,46 @@ def transcript_facts(path: Path) -> tuple[str | None, str | None]:
     return cwd, mode
 
 
-def _codex_ancestor() -> tuple[int | None, bool]:
-    """The nearest ancestor process that is ``codex`` itself, and whether it is a ``codex exec``."""
-    import subprocess
+def _agent_ancestor(agent: str) -> tuple[int, list[str]] | None:
+    """The nearest ancestor process that is the agent itself (``claude`` / ``codex``), with its command line."""
+    return next(((pid, args) for pid, args in _ancestors() if _agent_of(args) == agent), None)
 
-    pid = os.getppid()
-    for _ in range(_CODEX_HOPS):
-        if pid <= 1:
-            break
-        try:
-            parts = subprocess.run(["ps", "-ww", "-o", "ppid=", "-o", "args=", "-p", str(pid)], capture_output=True,
-                                   text=True, timeout=2, stdin=subprocess.DEVNULL,
-                                   env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout.split()
-            parent = int(parts[0])
-        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-            break
-        if len(parts) > 1 and os.path.basename(parts[1]) == "codex":
-            return pid, parts[2:3] == ["exec"]
-        pid = parent
-    return None, False
+
+def codex_rollout_cwd(chome: Path, thread: str) -> str | None:
+    """The start directory Codex recorded for ``thread``: the ``cwd`` of the ``session_meta`` record that opens its
+    one rollout file (``<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl``, that record's ``id`` the
+    thread) [measured: Codex 0.162.1, 1018+50 levain-seat, 2026-10-18], else ``None``."""
+    found = list((chome / "sessions").glob(f"*/*/*/rollout-*-{thread}.jsonl"))
+    if len(found) != 1:
+        return None
+    try:
+        with open(found[0], "rb") as fh:
+            first = json.loads(fh.readline(_TRANSCRIPT_HEAD))
+    except (OSError, ValueError):
+        return None
+    meta = first.get("payload") if isinstance(first, dict) and first.get("type") == "session_meta" else None
+    if not isinstance(meta, dict) or meta.get("id") != thread or not isinstance(meta.get("cwd"), str):
+        return None
+    return meta["cwd"]
+
+
+def claude_transcript(config_dir: str | None, session: str) -> Path | None:
+    """The session's one transcript under its config directory, or ``None`` (none, or more than one)."""
+    base = Path(config_dir) if config_dir else Path.home() / ".claude"
+    found = sorted((base / "projects").glob(f"*/{session}.jsonl"))
+    return found[0] if len(found) == 1 else None
+
+
+def _claude_facts(config_dir: str | None, session: str) -> tuple[str | None, str | None]:
+    """(start directory, latest permission mode) from the session's transcript; the directory only when it names
+    the directory the transcript is kept under."""
+    path = claude_transcript(config_dir, session)
+    if path is None:
+        return None, None
+    cwd, mode = transcript_facts(path)
+    if cwd is not None and re.sub(r"[^A-Za-z0-9]", "-", cwd) != path.parent.name:
+        cwd = None
+    return cwd, mode
 
 
 def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
@@ -364,32 +448,36 @@ def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
     Claude Code gives its shell ``CLAUDE_CODE_SESSION_ID``, ``CLAUDE_PID`` and ``CLAUDE_CODE_ENTRYPOINT`` but not the
     project directory or the permission mode [measured: 1018+50, Claude Code 2.1.303]; those two come from the
     session's one transcript (:func:`transcript_facts`), and the start directory only when it names the directory
-    the transcript is kept under. Codex: the nearest ancestor ``codex`` process, the working directory and
-    ``CODEX_HOME``."""
+    the transcript is kept under; ``CLAUDE_PID`` is kept only when it is the nearest ``claude`` ancestor of this
+    command. Codex: the nearest ``codex`` ancestor (none for an app-server or MCP host, which outlives its threads),
+    the start directory from the thread's rollout (:func:`codex_rollout_cwd`) and ``CODEX_HOME``. Nothing is
+    recorded for a session other than the caller's own (``--session`` naming another)."""
     from levain.consent.delivery import option_names, process_identity, session_ok
 
     if not session_ok(session) or _SUBAGENT in session:
         return None
     env = os.environ
+    own = env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")
+    if session != own:
+        return None                       # a session named by --session is not this process's: nothing to trust
+    found = _agent_ancestor(agent)
     if agent == "codex":
-        pid, is_exec = _codex_ancestor()
         chome = env.get("CODEX_HOME", "")
-        return {"invocation": "-p" if is_exec else "interactive", "codex_pid": pid, "cwd": os.path.abspath(os.getcwd()),
-                "config_dir": chome if os.path.isabs(chome) else None}
+        config_dir = chome if os.path.isabs(chome) else None
+        subcommand = next((a for a in (found[1][1:] if found else []) if not a.startswith("-")), None)
+        return {"invocation": "-p" if subcommand == "exec" else "interactive",
+                "codex_pid": found[0] if found and subcommand not in ("app-server", "mcp-server") else None,
+                "cwd": codex_rollout_cwd(Path(config_dir) if config_dir else Path.home() / ".codex", session),
+                "config_dir": config_dir}
     config = env.get("CLAUDE_CONFIG_DIR", "")
     config_dir = config if os.path.isabs(config) else None
-    base = Path(config_dir) if config_dir else Path.home() / ".claude"
-    found = sorted((base / "projects").glob(f"*/{session}.jsonl"))
-    cwd = mode = None
-    if len(found) == 1:
-        cwd, mode = transcript_facts(found[0])
-        if cwd is not None and re.sub(r"[^A-Za-z0-9]", "-", cwd) != found[0].parent.name:
-            cwd = None                                   # not the directory its transcript is kept under
+    cwd, mode = _claude_facts(config_dir, session)
     try:
-        pid: int | None = int(env.get("CLAUDE_PID", ""))
+        named: int | None = int(env.get("CLAUDE_PID", ""))
     except ValueError:
-        pid = None
-    pid = pid if pid is not None and pid > 0 else None
+        named = None
+    # the session's process is trusted only when it IS an ancestor of this command, the claude it was run under
+    pid = found[0] if found is not None and found[0] == named else None
     seen = process_identity(pid) if pid is not None else None
     return {"invocation": "-p" if env.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") else "interactive",
             "permission_mode": mode, "cwd": cwd, "config_dir": config_dir, "claude_pid": pid,
@@ -397,17 +485,20 @@ def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
             "claude_flags": option_names(seen[1]) if seen and seen[1] else None}
 
 
-def deliver_answer(store: QuestionStore, ref: Any, **kw: Any) -> Any:
+def deliver_answer(store: QuestionStore, ref: Any, *, listing: Any = None, running: Any = None,
+                   launch: Any = None) -> Any:
     """Get one answered question's text to its session (``levain question answer``, ``levain question deliver``):
     an ENDED session is resumed with the session's undelivered answers as its prompt (leased, then settled by the
     resume's outcome, as a ruling's: :func:`levain.consent.delivery.deliver`); any other is left to its next hook,
-    the reason saying why. Returns a :class:`levain.consent.delivery.Delivery` (``request_id`` = the question id).
+    the reason saying why. A Claude Code resume also needs the session's transcript to show, NOW, the start directory
+    and permission mode ``levain ask`` recorded (:func:`_claude_facts`): a mode changed since the question was asked
+    is never resumed into. Returns a :class:`levain.consent.delivery.Delivery` (``request_id`` = the question id).
     ``listing``, ``running`` and ``launch`` are the delivery module's seams."""
     from levain.consent import delivery as dv
 
-    listing = kw.get("listing", dv.claude_listing)
-    running = kw.get("running", dv.process_running)
-    launch = kw.get("launch", dv._launch)
+    listing = listing if listing is not None else dv.claude_listing
+    running = running if running is not None else dv.process_running
+    launch = launch if launch is not None else dv._launch
     q = store.get(ref)
     if q is None:
         return dv.Delivery(str(ref), "", "", "none", "no question of that id")
@@ -432,6 +523,13 @@ def deliver_answer(store: QuestionStore, ref: Any, **kw: Any) -> Any:
                                  dv.route(q.agent, q.agent_session_id, meta, noun="answer", listing=listing,
                                           running=running))
     out = replace(out, route=where, reason=why, argv=argv, cwd=cwd)
+    if where == "resumed" and q.agent == "claude_code":
+        now = _claude_facts(meta.get("config_dir") if isinstance(meta.get("config_dir"), str) else None,
+                            dv.base_session(q.agent_session_id))
+        if now != (meta.get("cwd"), meta.get("permission_mode")):
+            return replace(out, route="hook", argv=(), cwd=None,
+                           reason="the session's transcript no longer shows the start directory and permission mode "
+                                  "recorded when it asked, so it is not resumed; the answer lands at its next step")
     if where != "resumed":
         return out
     if not os.path.isdir(cwd or ""):
@@ -440,12 +538,15 @@ def deliver_answer(store: QuestionStore, ref: Any, **kw: Any) -> Any:
     leased = store.lease_answers_for(q.agent, q.agent_session_id)
     if not leased:
         state, when = store.delivery_state(q.id)
-        return replace(out, route={"delivered": "delivered", "unconfirmed": "unconfirmed"}.get(state, "hook"),
-                       argv=(), reason=f"another delivery holds it ({state}{' at ' + when if when else ''})")
+        if state in ("delivered", "unconfirmed"):
+            return replace(out, route=state, argv=(), reason=f"another delivery took it first ({state} at {when})")
+        return replace(out, route="hook", argv=(), reason="nothing could be leased for its session now; the answer "
+                                                          "lands at its next step")
     ids = tuple(x.id for x in leased)
-    prompt = "\n".join([*(line for line in (answer_line(x) for x in leased) if line), ANSWER_TAIL, QUOTED_NOTE])
-    full = [*argv, prompt]
+    full = list(argv)
     try:
+        prompt = "\n".join([*(line for line in (answer_line(x) for x in leased) if line), ANSWER_TAIL, QUOTED_NOTE])
+        full = [*argv, prompt]
         env = dv._env(q.agent, meta)
         log = Path(store.directory) / "resumes" / f"{ids[0]}.log"
     except Exception as exc:  # noqa: BLE001 - nothing was started: the lease settles failed, so it is retried
@@ -467,12 +568,18 @@ def deliver_answers(store: QuestionStore, **kw: Any) -> list[Any]:
     from levain.consent import delivery as dv
 
     out = []
+    tried: set[tuple[str, str]] = set()                          # one resume attempt per session per run
     for q in store.undelivered():
         if store.delivery_state(q.id)[0] == "delivered":       # a resume above may have carried it
             continue
+        if (q.agent, q.agent_session_id) in tried:
+            continue
         try:
-            out.append(deliver_answer(store, q.id, **kw))
+            got = deliver_answer(store, q.id, **kw)
         except Exception as exc:  # noqa: BLE001 - the next answer is still delivered
-            out.append(dv.Delivery(q.id, q.agent, q.agent_session_id, "failed",
-                                   f"delivery raised {type(exc).__name__}: {exc}"))
+            got = dv.Delivery(q.id, q.agent, q.agent_session_id, "failed",
+                              f"delivery raised {type(exc).__name__}: {exc}")
+        if got.route in ("resumed", "failed"):
+            tried.add((q.agent, q.agent_session_id))
+        out.append(got)
     return out
