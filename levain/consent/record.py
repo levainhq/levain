@@ -40,8 +40,9 @@ DECISIONS: tuple[str, ...] = ("allow", "deny")
 POSTURE = "external-gate"
 # /2 (Q11): the answer carries ``receipts_head``, the head of the queue's receipt log (levain.consent.receipt_log)
 ANSWER_FORMAT = "levain-consent-answer/2"
-# the format before the receipts were chained: refused when applied or delivered (the request is answered again);
-# `levain consent receipts verify` lists a stored one as signed before chaining
+# the format before the receipts were chained: refused when applied (the request is answered again); one applied
+# before the upgrade still delivers, its signature re-verified with no head check, and `levain consent receipts
+# verify` lists it as signed before chaining
 ANSWER_FORMAT_UNCHAINED = "levain-consent-answer/1"
 # its own SSHSIG namespace: an answer verifies as nothing else, and nothing else verifies as an answer
 ANSWER_NAMESPACE = "levain-consent-answer"
