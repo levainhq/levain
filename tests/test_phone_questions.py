@@ -20,7 +20,7 @@ _CALLS: list = []   # the refs the stubbed delivery was asked for
 
 @contextmanager
 def _serving(qdir: Path):
-    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK)
+    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK, dispatch_dir=qdir)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

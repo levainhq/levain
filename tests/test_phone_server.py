@@ -87,7 +87,7 @@ def world(tmp_path: Path):
 
 @contextmanager
 def _serving(qdir: Path, name: str = "localhost"):
-    httpd = make_phone_server(qdir, name, port=0, token=_TOK)
+    httpd = make_phone_server(qdir, name, port=0, token=_TOK, dispatch_dir=qdir)   # never the real dispatch store
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
