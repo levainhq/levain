@@ -695,3 +695,34 @@ def test_macos_status_names_the_stricter_same_domain_cost(monkeypatch) -> None:
     assert lines[0] == conf.MACOS_SOCKET_TIER_LINE
     assert "sockets created inside the sandbox are denied too" in lines[0]
     assert "default grant: /private/var/run/mDNSResponder (name resolution)" in lines
+
+
+def test_an_override_root_with_any_name_renders_and_is_denied(tmp_path, monkeypatch) -> None:
+    # RUN 2026-10-19 in a macOS VM (1019-conf/mac-final): CLAUDE_CONFIG_DIR=/tmp/lvA3/lvA_claudecfg
+    # refused the whole shell ("invalid protected agent-directory root"). An override is a root
+    # whatever its last component is called (~/.config/claude); it must render, as a deny.
+    cc = tmp_path / "xdg" / "claude"
+    cx = tmp_path / "codex_home+1"
+    cc.mkdir(parents=True)
+    cx.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cc))
+    monkeypatch.setenv("CODEX_HOME", str(cx))
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+    for root in (cc, cx):
+        real = Path(os.path.realpath(root))
+        assert any(r == root or r == real for r in policy.persistence_agent_roots)
+        assert f'(regex #"{conf._agent_root_regex(real)}")' in text
+    # The '+' in a name is escaped, so it cannot widen the match.
+    assert r"\+1($|\/.*)" in text
+
+
+def test_agent_root_regex_under_slash_and_non_ascii(tmp_path) -> None:
+    # L3 r4 (complement, gemini): a root directly under / doubled the separator, so its deny matched nothing.
+    assert conf._agent_root_regex(Path("/claudecfg")).startswith(r"^\/[cC]")
+    assert conf._agent_root_regex(Path("/Users/a/.claude")).startswith(r"^\/Users\/a\/\.[cC]")
+    with pytest.raises(conf.ConfinementError, match="non-ASCII"):
+        conf._agent_root_regex(Path("/x/Caf\u00e9"))
+    with pytest.raises(conf.ConfinementError):
+        conf._agent_root_regex(Path("claude"))
+

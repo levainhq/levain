@@ -374,6 +374,9 @@ _KEYCHAIN_MACH_SERVICES = (
     "com.apple.securityd.xpc",
     "com.apple.securityd.systemkeychain",
 )
+# sysmond, the root daemon behind pgrep/pkill -f and top, hands out every process's argv; see
+# render_profile.
+_SYSMOND_MACH_SERVICE = "com.apple.sysmond"
 
 
 def cred_floor_label(system: str | None = None) -> str:
@@ -577,6 +580,12 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
 
 
 _PERSISTENCE_AGENT_NAMES = (".claude", ".codex")
+# The subdirectories of a .claude/.codex root that Claude Code or Codex load as configuration or run
+# (hooks, agents, slash commands and prompts, skills, plugins, Codex rules, output styles, scripts a
+# setting names). Only the hardlink-alias check reads this list (:func:`_jewel_inodes`); the write
+# floor covers the whole tree whatever this says. Compared casefolded.
+_AGENT_CONFIG_SUBDIRS = frozenset({"hooks", "agents", "commands", "prompts", "skills", "plugins", "rules",
+                                   "output-styles", "scripts", "bin"})
 _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS = 40
 
 
@@ -714,18 +723,25 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
                 elif stat.S_ISDIR(child_st.st_mode):
                     directories_to_walk.append(child)
 
-    for anchor in (home, workspace):
-        candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
-        try:
-            with os.scandir(anchor) as entries:
-                candidates.extend(
-                    Path(entry.path) for entry in entries
-                    if entry.name.casefold() in _PERSISTENCE_AGENT_NAMES
-                )
-        except (FileNotFoundError, NotADirectoryError):
-            pass
-        except OSError as exc:
-            refuse(anchor, f"an anchor that cannot be scanned ({exc})", exc)
+    # The agents' own overrides of where their configuration lives: an absolute CLAUDE_CONFIG_DIR or
+    # CODEX_HOME in levain's environment is a root like ~/.claude and ~/.codex.
+    overrides = [Path(v) for v in (os.environ.get("CLAUDE_CONFIG_DIR"), os.environ.get("CODEX_HOME"))
+                 if v and os.path.isabs(v)]
+    for anchor in (home, workspace, None):
+        if anchor is None:
+            candidates = overrides
+        else:
+            candidates = [anchor / name for name in _PERSISTENCE_AGENT_NAMES]
+            try:
+                with os.scandir(anchor) as entries:
+                    candidates.extend(
+                        Path(entry.path) for entry in entries
+                        if entry.name.casefold() in _PERSISTENCE_AGENT_NAMES
+                    )
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            except OSError as exc:
+                refuse(anchor, f"an anchor that cannot be scanned ({exc})", exc)
 
         for raw in _dedup_paths(candidates):
             try:
@@ -2434,8 +2450,8 @@ def build_policy(
         own_memory_files_l.append(_lexical)
     own_memory_files_t = _dedup(own_memory_files_l)
 
-    # macOS persistence floor, represented in the shared policy so the Seatbelt hand and the
-    # in-process editor consume one source. Every path keeps its lexical and canonical spellings;
+    # The persistence floor, one source for the Seatbelt hand, the bwrap plan's step (2p) and the
+    # in-process editor. Every path keeps its lexical and canonical spellings;
     # unlike ordinary jewels, an unresolvable spelling refuses the floor because Seatbelt's
     # canonical data-write matching would make a lexical-only deny inert.
     persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
@@ -2446,6 +2462,19 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
+            # zsh's startup files when ~/.zshenv sets ZDOTDIR to the usual XDG place.
+            (home / ".config" / "zsh", "operator zsh config"),
+            # Linux's own: the systemd user manager reads units and environment from these, a
+            # desktop session starts autostart entries, Fedora's .bashrc sources ~/.bashrc.d, and
+            # fish runs its config. Bound read-only by the bwrap plan's step (2p).
+            *(((home / ".config" / "systemd", "operator systemd user config"),
+               (home / ".local" / "share" / "systemd", "operator systemd user units"),
+               (home / ".config" / "environment.d", "operator user environment"),
+               (home / ".config" / "autostart", "operator autostart"),
+               (home / ".bashrc.d", "operator bashrc.d"),
+               (home / ".config" / "fish", "operator fish config"),
+               (home / ".config" / "plasma-workspace" / "env", "operator KDE login environment"))
+              if platform.system() == "Linux" else ()),
         )
         for p in _required_spellings(root, label)
     ])
@@ -4751,12 +4780,23 @@ def _sbpl_regex(value: str) -> str:
 
 
 def _agent_root_regex(path: Path) -> str:
-    """An anchored SBPL regex for one whole `.claude`/`.codex` root, ASCII-case-insensitive."""
-    name = path.name.casefold()
-    if name not in _PERSISTENCE_AGENT_NAMES:
+    """An anchored SBPL regex for one whole agent root, its last component ASCII-case-insensitive.
+
+    A root is `.claude` / `.codex`, or an absolute CLAUDE_CONFIG_DIR / CODEX_HOME, whose last component
+    can be any name (`~/.config/claude`): the macOS VM run of 10-19 (1019-conf/mac-final) measured a
+    non-dot override refusing the whole shell here."""
+    name = path.name
+    if not path.is_absolute() or not name or name in (".", ".."):
         raise ConfinementError(f"invalid protected agent-directory root {path} — refusing fail-closed")
-    folded = "\\." + "".join(f"[{ch.lower()}{ch.upper()}]" for ch in name[1:])
-    return f'^{_sbpl_regex(str(path.parent))}\\/{folded}($|\\/.*)'
+    if not name.isascii():
+        # Only ASCII letters can be folded here; a case variant of another letter would miss the deny
+        # on a case-insensitive volume (L3 r4, complement).
+        raise ConfinementError(f"the agent configuration directory {path} has a non-ASCII name, which the "
+                               "macOS floor cannot match in every letter case — refusing fail-closed. "
+                               "Use an ASCII name for CLAUDE_CONFIG_DIR / CODEX_HOME.")
+    folded = "".join(f"[{ch.lower()}{ch.upper()}]" if ch.isalpha() else _sbpl_regex(ch) for ch in name)
+    # A root directly under / has the parent "/", which must not double the separator (L3 r4).
+    return f'^{_sbpl_regex(str(path.parent).rstrip("/"))}\\/{folded}($|\\/.*)'
 
 
 def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
@@ -5022,6 +5062,16 @@ class SeatbeltProvider(ConfinementProvider):
             for svc in _KEYCHAIN_MACH_SERVICES:
                 lines.append(f'(deny mach-lookup (global-name "{svc}"))')
             lines.append("")
+
+        lines.append(";; OTHER PROCESSES' COMMAND LINES THROUGH sysmond — `pgrep -fl` and `pkill -f` ask the")
+        lines.append(";; root daemon sysmond for every process's argv, so they show the command line of")
+        lines.append(";; processes run by ANY user, a different uid included (measured 2026-10-07).")
+        lines.append(";; Denying the lookup of its mach service closes that path. A name filter on")
+        lines.append(";; mach-lookup, the same kind as the Keychain rules above. Cost inside the")
+        lines.append(";; entity's bash: pgrep and pkill fail outright, by name too (\"sysmond service")
+        lines.append(";; not found\"); kill <pid> and psutil are unaffected (measured 2026-10-07).")
+        lines.append(f'(deny mach-lookup (global-name "{_SYSMOND_MACH_SERVICE}"))')
+        lines.append("")
 
         if policy.config_file is not None:
             lines.append(";; the confinement CONFIG that defines the floor is floor-protected (read+")
@@ -5789,8 +5839,57 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
     for home in policy.persistence_home_dirs:
         scan_children(home, lambda _name: True)
 
-    roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees,
-                    *policy.persistence_agent_roots, *policy.persistence_agent_dirs,
+    # The agents' trees join by their CONFIGURATION SURFACES only: every file directly in a .claude or
+    # .codex root (settings, hooks.json, config.toml, CLAUDE.md/AGENTS.md, a statusline script) and
+    # every file under its config subdirectories, plus any directory a link resolves to OUTSIDE the
+    # roots, walked whole. Not the rest: Claude Code hardlinks its own file-history backups to the
+    # files it edits, and a git clone in a job's tmp hardlinks its objects, so with the whole trees in
+    # this strict check bash was refused for any real Claude Code user (RUN 2026-10-19: 1,958
+    # multiply-linked files in one real ~/.claude, refused on its first git object; argushub refused
+    # on a tool-results file). The write floor still covers every file in the trees; only the
+    # hardlink-alias refusal is scoped. A pre-existing link between a data file there and a path bash
+    # can write lets bash change that data file: a known edge (the agent loads none of it as code).
+    agent_roots = [r for r in sorted({*policy.persistence_agent_roots}, key=str) if os.path.isdir(r)]
+    for root in agent_roots:
+        try:
+            with os.scandir(root) as entries:
+                subdirs = []
+                for entry in entries:
+                    if entry.is_dir():   # a config subdirectory that is a link counts by its name
+                        if entry.name.casefold() in _AGENT_CONFIG_SUBDIRS:
+                            subdirs.append(entry.path)
+                    else:
+                        note(entry.path, follow=True)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            unverifiable(str(root), exc)
+        # Claude Code's auto-memory files are loaded as rules too: ~/.claude/projects/*/memory/.
+        projects = os.path.join(root, "projects")
+        try:
+            with os.scandir(projects) as entries:
+                subdirs += [os.path.join(e.path, "memory") for e in entries if e.is_dir(follow_symlinks=False)]
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError as exc:
+            unverifiable(projects, exc)
+        visited: set[str] = set()
+        for sub in subdirs:
+            # Links are followed (a skill manager's skills/active -> ../cache/v1 is still a skill),
+            # each real directory once, so a link loop ends.
+            for dirpath, dirs, files in os.walk(sub, onerror=walk_error, followlinks=True):
+                real_dir = os.path.realpath(dirpath)
+                if real_dir in visited:
+                    dirs[:] = []
+                    continue
+                visited.add(real_dir)
+                for name in files:
+                    note(os.path.join(real_dir, name), follow=True)
+    real_roots = [Path(os.path.realpath(r)) for r in agent_roots]
+    outside = [d for d in policy.persistence_agent_dirs
+               if not any(Path(d) == r or Path(d).is_relative_to(r) for r in real_roots)]
+
+    roots = sorted({*policy.deny_read_write, *policy.persistence_write_subtrees, *outside,
                     *([policy.ssh_dir] if policy.ssh_dir else [])}, key=lambda p: str(p))
     walked: list[Path] = []
     for root in roots:
@@ -6641,6 +6740,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                                                *policy.deny_sockets)}
     tool_views: list[Path] = []
     tool_windows: list[Path] = []
+    # The trees step (2p) binds read-only, filled there. Declared here because the absent-path test
+    # below must already see them: nothing at all can be created anywhere inside one.
+    persist_ro: list[Path] = []
+    # A tool directory that is also a persistence subtree (~/.config/git, with the standard cred
+    # floor on) keeps its view; only its subdirectories come back read-only instead of read-write.
+    persist_subtrees = [Path(os.path.realpath(t)) for t in policy.persistence_write_subtrees]
     for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
         real = t.parent.resolve() / t.name
         if real.is_symlink():
@@ -6663,7 +6768,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 continue
             if child.is_symlink():
                 argv += ["--symlink", os.readlink(child), str(child)]
-            elif child.is_dir():
+            elif child.is_dir() and not any(q == r or q.is_relative_to(r)
+                                            for q in (real, child) for r in persist_subtrees):
                 argv += ["--bind-try", str(child), str(child)]
                 tool_windows.append(child)
             else:
@@ -6671,6 +6777,142 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     argv += store_argv
     # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
     ro_store_dirs += list(frozen_home)
+
+    # (2p) THE PERSISTENCE TREES ARE READ-ONLY (ledger #2 on Linux, RUN 2026-10-19 in the b1c VM:
+    # on main f0bc6fde bash planted ~/bin, ~/.local/bin, ~/.config/systemd/user, ~/.config/autostart,
+    # existing ~/.claude and ~/.codex contents and the workspace's .claude/.codex). Step (0) freezes
+    # only $HOME's own entries; below a subdirectory everything stayed writable, and that is where a
+    # program the operator runs later picks up what bash leaves. The trees are the policy's own
+    # (``persistence_write_subtrees`` and the agents' one resolved set, which the in-process editor
+    # and macOS read too). An existing tree is bound read-only over itself. An absent tree bash could
+    # create is created first (0700, by the provider, in the placeholder ledger like every other
+    # placeholder) so the bind has a source. A file a link resolves to outside every tree is bound
+    # read-only, and so is the parent of a link HOP outside them (a dotfile manager's chain): a mount
+    # cannot pin a link, and replacing the hop would re-point what the operator's agent reads.
+    # Emitted before step (2), so a jewel's tmpfs inside a tree still lands on top of it, and after
+    # the store and tool views. A tree may sit INSIDE a view (a view inside a tree binds back
+    # read-only) but never CONTAINS a view, the entity's store or the workspace: a recursive host bind
+    # over one would re-expose what the view hides (L1 r1 CRITICAL: a hop parent ~/.config over the
+    # ~/.config/git credential view), so such a tree refuses bash by name.
+    # ⚠ Not built, by the reachability line: a DANGLING link's missing target outside every tree
+    # (macOS denies that literal; a mount needs a source). A dangling link the agent reads as config
+    # is already broken config. Nor a hop outside $HOME (no read-only bind of a system directory).
+    persist_create: list[str] = []
+    ws_real = policy.workspace.resolve()
+    must_not_cover = [ws_real, *tool_views, *entity_store_dirs,
+                      *(Path(r) for r in (runtime_roots if runtime_roots is not None else _runtime_roots())),
+                      *(h.resolve() for h in _gnupg_homes())]
+
+    def _in_persist_ro(q: Path) -> bool:
+        return any(q == r or q.is_relative_to(r) for r in persist_ro)
+
+    def _in_tool_view(q: Path) -> bool:
+        # The read-only part of a view only: a window (a subdirectory bound back read-write) is not.
+        return (any(q == v or q.is_relative_to(v) for v in tool_views)
+                and not any(q == w or q.is_relative_to(w) for w in tool_windows))
+
+    def _bash_may_write(q: Path) -> bool:
+        # This process is the operator; bash may be the hands user, which owns its workspace. So the
+        # workspace counts as bash's whatever this process may do there (L3 r1, codex + gemini).
+        return os.access(q, os.W_OK) or q == ws_real or q.is_relative_to(ws_real)
+
+    def _link_components(p: Path) -> list[Path]:
+        # Every symlink dentry the kernel would follow resolving ``p`` from the root (the policy keeps
+        # these for the agents' set; a static subtree's own path needs the same walk).
+        out: list[Path] = []
+        pending = list(Path(os.path.abspath(p)).parts[1:])
+        cur = Path(p.anchor)
+        followed = 0
+        while pending:
+            part = pending.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                cur = cur.parent
+                continue
+            cand = cur / part
+            if not cand.is_symlink():
+                cur = cand
+                if not os.path.lexists(cur):
+                    break
+                continue
+            followed += 1
+            if followed > _PERSISTENCE_AGENT_MAX_SYMLINK_HOPS:
+                raise ConfinementError(f"{p} resolves through more than {_PERSISTENCE_AGENT_MAX_SYMLINK_HOPS} "
+                                       "symlinks — refusing to grant bash hands (fail-closed).")
+            out.append(cand)
+            target = Path(os.readlink(cand))
+            cur = Path(target.anchor) if target.is_absolute() else cand.parent
+            pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+        return out
+
+    trees = {Path(os.path.realpath(t)) for t in (*policy.persistence_write_subtrees,
+                                                   *policy.persistence_agent_roots,
+                                                   *policy.persistence_agent_dirs)}
+    existing_trees = [t for t in trees if t.is_dir()]
+    hops = {Path(p) for p in policy.persistence_agent_pins if Path(p).is_symlink()}
+    hops |= {q for t in policy.persistence_write_subtrees for q in _link_components(Path(t))}
+    for q in sorted(hops, key=str):
+        parent = q.parent
+        if (any(parent == t or parent.is_relative_to(t) for t in existing_trees)
+                or parent in ro_store_dirs or _in_tool_view(parent) or not _bash_may_write(parent)):
+            continue   # frozen by a tree, $HOME's view, the store or a tool view; or not bash's
+        if parent == ws_real or ws_real.is_relative_to(parent):
+            raise ConfinementError(
+                f"{q} is a symlink the agent's configuration resolves through, in {parent}, which "
+                "bash can write. The Linux floor cannot pin a link, and binding that directory "
+                "read-only would take the workspace with it. Refusing to grant bash hands "
+                "(fail-closed). Replace the symlink with the real directory or file to use bash."
+            )
+        if ((home_ro is not None and parent.is_relative_to(home_ro))
+                or parent.is_relative_to(ws_real)):
+            # Under $HOME, or inside the workspace (a hands workspace lives outside $HOME; L3 r2, gemini).
+            trees.add(parent)
+    for real in sorted(trees, key=str):   # parent-first: a tree inside one already bound is skipped
+        if _in_persist_ro(real) or _in_tool_view(real):
+            continue
+        covered = next((v for v in must_not_cover if v.is_relative_to(real)), None)
+        if covered is not None:
+            raise ConfinementError(
+                f"the Linux floor would bind {real} read-only to keep the agents' configuration and the "
+                f"shell's startup files out of bash's reach, and that would cover {covered}, "
+                "which bash needs as it is. Refusing to grant bash hands (fail-closed). This comes from "
+                "a symlink under ~/.claude or ~/.codex (or a startup directory) resolving into that "
+                "directory: replace the symlink with the real directory or file to use bash."
+            )
+        if os.path.lexists(real):
+            if real.is_dir() and not real.is_symlink():
+                argv += ["--ro-bind", str(real), str(real)]
+                persist_ro.append(real)
+            continue   # a file where a tree would be holds nothing below it
+        anc = _nearest_existing(real)
+        if (anc == ws_real or anc.is_relative_to(ws_real)) and not os.access(anc, os.W_OK):
+            # A hands workspace (owned by the hands user; this process has read access only): bash
+            # could create the agents' directory here and this process cannot pre-create it.
+            # `levain setup-isolation` makes the workspace's two; an install from before that has neither.
+            # Anything else there (a CODEX_HOME or CLAUDE_CONFIG_DIR in the workspace) setup makes nothing.
+            remedy = ("Run `sudo levain setup-isolation` once more for this entity: it creates the "
+                      "workspace's .claude and .codex for bash to find."
+                      if real in (ws_real / ".claude", ws_real / ".codex") else
+                      f"Create {real} first (as the workspace's owner), or point CODEX_HOME / "
+                      "CLAUDE_CONFIG_DIR outside the workspace.")
+            raise ConfinementError(
+                f"{real} does not exist, and in this hands workspace bash could create it with agent "
+                "configuration your own Claude Code or Codex would load. Refusing to grant bash hands "
+                f"(fail-closed). {remedy}"
+            )
+        if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not _bash_may_write(anc):
+            continue   # bash cannot create it either
+        argv += ["--ro-bind", str(real), str(real)]
+        persist_ro.append(real)
+        persist_create.append(str(real))
+    for f in sorted({Path(p) for p in policy.persistence_agent_files}, key=str):
+        if not os.path.lexists(f) or f.is_symlink() or f.is_dir():
+            continue   # dangling (not built, above), or a tree
+        if _in_persist_ro(f) or f.parent in ro_store_dirs or _in_tool_view(f):
+            continue
+        if os.access(f, os.W_OK) or _bash_may_write(f.parent):
+            argv += ["--ro-bind", str(f), str(f)]
 
     view_roots = {*tool_views, *frozen_home}
 
@@ -6699,7 +6941,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         anc = f.parent.resolve()
         while anc not in dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
-        return anc in dirs
+        return anc in dirs or any(anc == r or anc.is_relative_to(r) for r in persist_ro)
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -7143,6 +7385,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
+    # The agents' resolved set pins its own ancestors (``persistence_agent_pins``): renaming one aside
+    # and planting below the old name would re-point what the operator's agent reads. A directory
+    # inside a step (2p) tree, $HOME itself, or one whose parent this user cannot write needs none.
+    for q in sorted({Path(p) for p in policy.persistence_agent_pins}, key=str):
+        if q.is_symlink() or not q.is_dir():
+            continue   # links: step (2p); an absent root: created there when bash could create it
+        r = q.resolve()
+        if _in_persist_ro(r) or r in frozen_home or not _bash_may_write(r.parent):
+            continue
+        if _in_tool_view(r) or any(r == rr or r.is_relative_to(rr) for rr in runtime_roots):
+            continue
+        if str(r) not in [p for p, _ in pins]:
+            pins.append((str(r), False))
     # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
     # ruling, same day, (b)). $HOME is a read-only tmpfs holding its existing entries except the
     # credential names: each subdirectory bound back read-write, each file read-only, each link as
@@ -7191,6 +7446,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             outer += ["--bind", path, path]
         else:
             ancestors += ["--bind", path, path]
+    # After the pins, which create the absent ancestors parent-first: each tree mkdir has its parent.
+    create_first += [p for p in persist_create if p not in create_first]
 
     # The runtime views after every pin (an ancestor's bind would cover a view) and before the body.
     out = head + outer + home_ops + ancestors + runtime_ops + argv

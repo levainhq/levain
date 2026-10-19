@@ -30,6 +30,15 @@ from levain.firing.hands import (
     sudoers_text,
 )
 
+_REAL_LINUX_TOOL_MISSING = hands.linux_tool_missing
+
+
+@pytest.fixture(autouse=True)
+def _linux_tools_present(monkeypatch) -> None:
+    # A plan test that sets host_os to linux must not depend on this machine having `setfacl`; the
+    # two tests of the check itself call the real function.
+    monkeypatch.setattr(hands, "linux_tool_missing", lambda: None)
+
 
 def _entity(tmp_path: Path, name: str = "coyote") -> Path:
     d = tmp_path / name
@@ -121,7 +130,8 @@ def test_the_workspace_is_outside_home_owned_by_the_hands_user_and_never_entity_
     assert plan.workspace.is_relative_to(hands.WORKSPACE_ROOT[host])
     assert str(plan.entity_dir / "workspace") not in _joined(plan)
     chowns = [a for a in _argvs(plan) if a[0].endswith("chown") and str(plan.workspace) in a[-1]]
-    assert chowns == [(chowns[0][0], f"{plan.hands_user}:{plan.hands_id}", str(plan.workspace))]
+    assert (chowns[0][0], f"{plan.hands_user}:{plan.hands_id}", str(plan.workspace)) in chowns
+    assert {a[1] for a in chowns} == {f"{plan.hands_user}:{plan.hands_id}"}   # nothing in it is anyone else's
     # the entity's directory above it stays root's: the hands user cannot swap the workspace out
     assert not any(a[0].endswith("chown") and a[-1] == str(plan.workspace.parent) for a in _argvs(plan))
     assert "alice:20" not in _joined(plan) and not any(a[0].endswith("chown") and "alice" in a[1] for a in _argvs(plan))
@@ -851,6 +861,8 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
                         hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
     monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    agent_dirs: list = []
+    monkeypatch.setattr(hands, "_make_agent_dirs", lambda ws, uid, gid: agent_dirs.append((ws, uid)) or (True, ""))
     monkeypatch.setattr(hands, "_group_exists", lambda n: False)
     monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
     monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
@@ -864,6 +876,7 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
     out = capsys.readouterr().out
     assert any("enable-linger" in a for a in ran) and "linger is on" in out and "--undo" not in out
+    assert agent_dirs and agent_dirs[0][1] == 499   # the repair makes the workspace agent dirs too
     # P-1 (a): the repair also loads the network boundary (an install from before it has none).
     h = hands_user_name(ed)
     assert written == [hands.sudoers_path(h), hands.egress_rules_path(h), hands.egress_unit_path(h)]
@@ -917,3 +930,72 @@ def test_linux_setup_refuses_by_name_when_the_kernel_refuses_nftables(monkeypatc
         argv, 1, "", "Error: Operation not permitted (you must be root)\n"))
     problem = hands.egress_unavailable()
     assert problem is not None and problem.startswith("the kernel refused nftables (Error: Operation not permitted")
+
+
+# --- a Linux host without `setfacl` (RUN on argushub 2026-10-19: setup stopped half-applied) -------
+
+
+def test_linux_setup_refuses_before_any_step_without_setfacl_dry_run_too(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(hands, "linux_tool_missing", _REAL_LINUX_TOOL_MISSING)
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "setfacl" else f"/usr/bin/{name}")
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    ran: list = []
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: ran.append(argv)
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    ed = _entity(tmp_path)
+    for dry in (True, False):
+        assert hands.cmd_setup_isolation(ed, undo=False, dry_run=dry) == 1
+        assert "refusing: acl is not installed (no `setfacl`" in capsys.readouterr().out
+    assert ran == []
+
+
+def test_linux_undo_without_setfacl_stops_by_name_instead_of_crashing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "setfacl" else f"/usr/bin/{name}")
+    ed = _entity(tmp_path)
+    plan = _undo(ed, "linux", hands_user=hands_user_name(ed), hands_id=999)
+    step = next(s for s in plan.steps if s.why == "remove the workspace ACLs")
+    ok, why = step.call()
+    assert not ok and "install acl, then run --undo again" in why
+
+
+def test_the_agent_dirs_are_made_without_following_a_planted_link(tmp_path: Path) -> None:
+    # L3 r1 (codex + gemini): on repair, `.claude -> /etc` in the hands user's workspace made
+    # `test -d` skip the mkdir and `chown` follow the link, giving the target to the hands user.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws / ".claude").symlink_to(outside)
+    ok, why = hands._make_agent_dirs(ws, os.getuid(), os.getgid())
+    assert not ok and "not a directory" in why
+    assert (ws / ".claude").is_symlink() and not (ws / ".codex").exists()
+    (ws / ".claude").unlink()
+    ok, why = hands._make_agent_dirs(ws, os.getuid(), os.getgid())
+    assert ok, why
+    assert (ws / ".claude").is_dir() and not (ws / ".claude").is_symlink() and (ws / ".codex").is_dir()
+
+
+def test_a_linux_repair_does_not_need_setfacl(tmp_path: Path, monkeypatch, capsys) -> None:
+    # L3 r2 (codex LOW): `acl` removed after setup must not block the repair that makes the
+    # workspace's .claude/.codex; a repair sets no ACL.
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "linux_tool_missing", lambda: "acl is not installed (no `setfacl`)")
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me if n != hands_user_name(ed) else
+                        hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    agent_dirs: list = []
+    monkeypatch.setattr(hands, "_make_agent_dirs", lambda ws, uid, gid: agent_dirs.append((ws, uid)) or (True, ""))
+    monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
+    monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
+    monkeypatch.setattr(hands, "retired_ids", lambda h: set())
+    monkeypatch.setattr(hands, "_install_file", lambda path, *a, **kw: (True, ""))
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
+    assert agent_dirs and "refusing" not in capsys.readouterr().out
