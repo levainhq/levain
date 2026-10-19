@@ -19,6 +19,11 @@ from levain.consent.adapters import claude_code, codex
 from levain.install import refresh_adapter
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
 
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
+
 
 def _cj(tmp_path: Path) -> Path:
     return tmp_path / "codex-home" / "hooks.json"

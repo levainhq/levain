@@ -9,6 +9,12 @@ from pathlib import Path
 
 from levain import doctor
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
+import pytest
+
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
 
 
 def _row(results, agent: str):

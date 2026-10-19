@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from levain import doctor
+from levain import host_guard
 from levain import install as inst
 from levain import verify
 from levain.consent import delivery
@@ -21,6 +23,19 @@ from levain.install import refresh_adapter
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
 
 LOCAL = (".claude", "settings.local.json")
+REAL_LAYOUT = host_guard.cc_levain_hooks_file
+
+
+@pytest.fixture
+def cc_local_layout(monkeypatch):
+    """A test workspace counts as the toplevel of a main checkout for host_guard.cc_levain_hooks_file (tmp_path is
+    not in git, which gets the settings.json layout): the local layout's tests. The layout decision itself is tested
+    with real git below (test_layout_*), with REAL_LAYOUT."""
+    monkeypatch.setattr(host_guard, "cc_levain_hooks_file",
+                        lambda ws: Path(os.path.abspath(ws)) / ".claude" / "settings.local.json")
+
+
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
 
 
 @pytest.fixture
@@ -286,3 +301,211 @@ def test_resume_gate_check_finds_the_gate_in_the_local_file(tmp_path, make_insta
     assert delivery.gate_refusal(str(cc), str(tmp_path / "cfg")) is None
     cc.joinpath(*LOCAL).unlink()
     assert delivery.gate_refusal(str(cc), str(tmp_path / "cfg")) == "no levain gate is installed in the settings it would load"
+
+
+# --- fix r1 (b3/subhook_FIX_r1.md) -------------------------------------------------------------------------------
+
+GIT = ("git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main")
+
+
+def _g(*args: str) -> None:
+    subprocess.run([*GIT, *args], check=True, capture_output=True, text=True)
+
+
+def _init_at(install: Path, tmp_path: Path, capsys, *, force: bool = True) -> tuple[int, str]:
+    from tests.test_init_answers import _filled
+
+    af = tmp_path / f"{install.name}-{abs(hash(str(install)))}-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    rc = inst.run_init(install, "claude-code", force=force, answers_file=af)
+    return rc, capsys.readouterr().out
+
+
+def _levain_cmds(doc: dict, install: Path) -> list[str]:
+    return [h["command"] for gs in (doc.get("hooks") or {}).values() for g in gs for h in g["hooks"]
+            if inst._levain_handler(h, install)]
+
+
+@pytest.fixture
+def real_layout(monkeypatch, make_install):
+    """host_guard.cc_levain_hooks_file as shipped, asking git (make_install: scratch HOME / CODEX_HOME)."""
+    monkeypatch.setattr(host_guard, "cc_levain_hooks_file", REAL_LAYOUT)
+
+
+def _assert_layout(install: Path, *, local: bool, out: str) -> None:
+    shared, lfile = install / ".claude" / "settings.json", install.joinpath(*LOCAL)
+    assert (REAL_LAYOUT(install) == lfile) is local
+    if local:
+        assert "hooks" not in _json(shared)
+        assert _levain_cmds(_json(lfile), install)
+        assert host_guard.CC_HOOKS_ROOT_ONLY not in out
+    else:
+        assert _levain_cmds(_json(shared), install)
+        assert not lfile.exists() or not _levain_cmds(_json(lfile), install)
+        assert host_guard.CC_HOOKS_ROOT_ONLY in out
+        res = doctor._check_claude_code(install)
+        assert _row(res, "levain hooks coverage").detail == host_guard.CC_HOOKS_ROOT_ONLY
+        assert _row(res, ".claude/settings.json hooks").ok
+        assert not [r for r in res if r.name == "levain hooks location"]
+
+
+def test_layout_s0_git_root_workspace_uses_the_local_file(tmp_path, capsys, real_layout):
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    _assert_layout(ws, local=True, out=out)
+
+
+def test_layout_s0_nested_workspace_keeps_settings_json(tmp_path, capsys, real_layout):
+    _g("init", "-q", str(tmp_path / "outer"))
+    ws = tmp_path / "outer" / "ws"
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    _assert_layout(ws, local=False, out=out)
+    # never into the parent repo's settings
+    assert not (tmp_path / "outer" / ".claude").exists()
+
+
+def test_layout_s0_linked_worktree_keeps_settings_json(tmp_path, capsys, real_layout):
+    main = tmp_path / "main"
+    _g("init", "-q", str(main))
+    _g("-C", str(main), "commit", "-q", "--allow-empty", "-m", "x")
+    ws = tmp_path / "wt"
+    _g("-C", str(main), "worktree", "add", "-q", str(ws))
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    _assert_layout(ws, local=False, out=out)
+    assert not (main / ".claude").exists()  # never into the main checkout's settings
+
+
+def test_layout_s0_non_git_workspace_keeps_settings_json(tmp_path, capsys, real_layout):
+    ws = tmp_path / "plain"
+    rc, out = _init_at(ws, tmp_path, capsys, force=False)
+    assert rc == 0, out
+    _assert_layout(ws, local=False, out=out)
+
+
+def test_layout_s0_update_migrates_both_ways_when_the_decision_flips(tmp_path, capsys, real_layout):
+    import shutil
+
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    local_cmds = sorted(_levain_cmds(_json(ws.joinpath(*LOCAL)), ws))
+    shutil.rmtree(ws / ".git")  # no longer its repo's root: the hooks go back to settings.json
+    r, text = _refresh(ws)
+    assert ".claude/settings.local.json (levain's hooks moved to settings.json)" in r.refreshed, text
+    assert _levain_cmds(_json(ws / ".claude" / "settings.json"), ws)
+    assert not _levain_cmds(_json(ws.joinpath(*LOCAL)), ws)
+    assert inst.CC_LOCAL_HOOKS_KEY not in _json(ws / ".levain" / "adapter-receipt.json")["files"]
+    assert _refresh(ws)[0].refreshed == []  # settled
+    _g("init", "-q", str(ws))  # a git root again: back to the local file, written fresh (not read as a deletion)
+    r, text = _refresh(ws)
+    assert ".claude/settings.local.json (levain's hooks)" in r.refreshed, text
+    assert sorted(_levain_cmds(_json(ws.joinpath(*LOCAL)), ws)) == local_cmds
+    assert "hooks" not in _json(ws / ".claude" / "settings.json")
+
+
+def test_s1_aliased_settings_files_are_never_split_or_migrated(tmp_path, capsys, make_install):
+    cc = make_install("cc")
+    shared, lfile = cc / ".claude" / "settings.json", cc.joinpath(*LOCAL)
+    merged = {**_json(shared), "hooks": _json(lfile)["hooks"]}
+    for link, target in ((lfile, shared), (shared, lfile)):
+        for p in (shared, lfile):
+            p.unlink(missing_ok=True)
+        target.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+        link.symlink_to(target.name)
+        before = target.read_bytes()
+        r, text = _refresh(cc)
+        assert ".claude/settings.json" in r.review and "one file (a link)" in text, text
+        assert link.is_symlink() and target.read_bytes() == before and _levain_cmds(_json(target), cc)
+        res = doctor._check_claude_code(cc)
+        assert _row(res, "levain hooks location").warn
+        rc, out = _init_at(cc, tmp_path, capsys)
+        assert rc == 1 and "one file (a link)" in out, out
+        assert link.is_symlink() and target.read_bytes() == before
+
+
+def test_s2_a_moved_workspace_s_stale_hooks_are_replaced(tmp_path, capsys, make_install):
+    import os as _os
+
+    cc = make_install("cc")
+    moved = tmp_path / "moved"
+    _os.rename(cc, moved)
+    stale = _levain_cmds(_json(moved.joinpath(*LOCAL)), moved)
+    assert stale and all(str(cc) in c for c in stale)  # claimed as levain's: stale_levain_handler
+    row = _row(doctor._check_claude_code(moved), "levain hook scripts")
+    assert row.warn and "a levain hook names a missing script (moved workspace?)" in row.detail
+    assert "levain update" in row.hint
+    r, text = _refresh(moved)
+    cmds = _commands(_json(moved.joinpath(*LOCAL))["hooks"])
+    assert not [c for c in cmds if f"{cc}/" in c], cmds
+    assert any(str(moved / "activation" / "hooks" / "session_start.py") in c for c in cmds)
+    assert not [r for r in doctor._check_claude_code(moved) if r.name == "levain hook scripts"]
+    # init --force replaces them too
+    other = tmp_path / "other"
+    _os.rename(moved, other)
+    rc, out = _init_at(other, tmp_path, capsys)
+    assert rc == 0, out
+    hooks = _json(other.joinpath(*LOCAL))["hooks"]
+    assert not [c for c in _commands(hooks) if f"{moved}/" in c]
+    for event, groups in hooks.items():  # one set, no stale copy beside it
+        per = [h["command"] for g in groups for h in g["hooks"]]
+        assert len(per) == len(set(per)), (event, per)
+
+
+def test_s2_a_foreign_script_that_exists_is_not_claimed(tmp_path):
+    from levain.doctor import stale_levain_handler
+
+    there = tmp_path / "x" / "activation" / "hooks" / "stop.py"
+    there.parent.mkdir(parents=True)
+    there.write_text("", encoding="utf-8")
+    assert stale_levain_handler({"command": f"/usr/bin/python3 {there}"}) is None
+    assert stale_levain_handler({"command": f"/usr/bin/python3 {tmp_path}/gone/activation/hooks/stop.py"})
+    assert stale_levain_handler({"command": f"/usr/bin/python3 {tmp_path}/gone/activation/hooks/mine.py"}) is None
+    assert stale_levain_handler({"command": '"/p" "${CLAUDE_PROJECT_DIR}/activation/hooks/stop.py"'}) is None
+
+
+def test_s2_levain_hook_scripts_match_the_package():
+    with inst._templates_root() as root:
+        shipped = {p.name for p in (root / "activation" / "hooks").glob("*.py") if not p.name.startswith("_")}
+    assert doctor.LEVAIN_HOOK_SCRIPTS == shipped | set(inst.CONSENT_HOOK_SCRIPTS.values())
+
+
+def test_s3_doctor_finds_levain_s_handler_after_the_user_s(make_install):
+    cc = make_install("cc")
+    lfile = cc.joinpath(*LOCAL)
+    doc = _json(lfile)
+    for event in ("SessionStart", "UserPromptSubmit"):
+        doc["hooks"][event] = [{"hooks": [{"type": "command", "command": "/bin/echo mine"}]}, *doc["hooks"][event]]
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+    res = doctor._check_claude_code(cc)
+    for event, script in (("SessionStart", "session_start.py"), ("UserPromptSubmit", "user_prompt_submit.py")):
+        r = _row(res, f"settings {event} → {script}")
+        assert r.ok and "wired to this install" in r.detail, r
+
+
+@pytest.mark.parametrize("bad", [{"SessionStart": 7}, {"Stop": "x", "SessionStart": []}])
+def test_s4_init_refuses_a_local_file_with_a_non_list_event_before_writing(tmp_path, capsys, make_install, bad):
+    ws = tmp_path / "cc"
+    (ws / ".claude").mkdir(parents=True)
+    text = json.dumps({"hooks": bad})
+    ws.joinpath(*LOCAL).write_text(text, encoding="utf-8")
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 1 and "could not take levain's hooks" in out and "not lists" in out, out
+    assert ws.joinpath(*LOCAL).read_text(encoding="utf-8") == text
+    assert not (ws / ".claude" / "settings.json").exists() and not (ws / "activation").exists()
+
+
+def test_s4_update_lists_a_local_file_with_a_non_list_event_and_writes_nothing(make_install):
+    cc = make_install("cc")
+    lfile, shared = cc.joinpath(*LOCAL), cc / ".claude" / "settings.json"
+    doc = _json(lfile)
+    doc["hooks"]["SessionStart"] = 7
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+    before, shared_before = lfile.read_bytes(), shared.read_bytes()
+    r, text = _refresh(cc)
+    assert ".claude/settings.local.json" in r.review and "not lists" in text, text
+    assert lfile.read_bytes() == before and shared.read_bytes() == shared_before

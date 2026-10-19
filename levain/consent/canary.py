@@ -184,6 +184,7 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
     referenced: nothing). Every finding is at most a WARN: the hooks fail toward the human's own dialog, never
     toward an allow. Waits on the agents at most about :data:`DOCTOR_BUDGET` seconds; an error is a WARN."""
     from levain.consent.adapters import claude_code, codex
+    from levain.host_guard import cc_levain_hooks_file
     from levain.install import CONSENT_HOOK_SCRIPTS
     deadline = time.monotonic() + DOCTOR_BUDGET
     out: list[Finding] = []
@@ -195,8 +196,7 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
             ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json",
              False),
             # the shape `levain init` wires: a static script in the activation tree
-            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"],
-             install / ".claude" / "settings.local.json", True),
+            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"], cc_levain_hooks_file(install), True),
             ("codex", hooks_dir / CONSENT_HOOK_SCRIPTS["codex"], chome / "hooks.json", True)):
         try:
             out += _agent_findings(agent, install, script, config, codex_home, deadline, wired_by_init=by_init)

@@ -30,6 +30,11 @@ from levain.packs import compose_roster
 from levain.verify import _python_from_hooks_config
 from tests.test_install import _templates_root
 
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
+
 # apply_init's subprocess.run is stubbed below, and that stub is the module-global function.
 _run = subprocess.run
 

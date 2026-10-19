@@ -1460,6 +1460,35 @@ def _hook_token_path(tok: str, install: Path) -> Path | None:
         return None
 
 
+# The hook scripts levain ships in activation/hooks/ (the codex consent hook too): what a stale levain entry names.
+# Pinned against the package's templates/activation/hooks/ by tests/test_subfolder_hooks.py.
+LEVAIN_HOOK_SCRIPTS = frozenset({
+    "session_start.py", "user_prompt_submit.py", "post_tool_use.py", "stop.py", "automemory_mirror.py",
+    "consent_claude_code.py", "consent_codex.py"})
+
+
+def stale_levain_handler(h: Any) -> str | None:
+    """The missing script a stale levain handler names, else None: a command with an absolute literal token
+    ``<anything>/activation/hooks/<one of LEVAIN_HOOK_SCRIPTS>`` that does not exist on disk. What a moved or
+    copied workspace leaves behind in a settings file (its commands name scripts by absolute path); `levain update`
+    and `init --force` replace it as levain's own. A ``${CLAUDE_PROJECT_DIR}`` token is never stale (it follows the
+    start folder)."""
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+        return None
+    try:
+        tokens = shlex.split(h["command"])
+    except ValueError:
+        return None
+    for tok in tokens[1:]:
+        if "CLAUDE_PROJECT_DIR" in tok or not os.path.isabs(tok):
+            continue
+        p = Path(tok)
+        if (p.name in LEVAIN_HOOK_SCRIPTS and p.parent.name == "hooks" and p.parent.parent.name == "activation"
+                and not os.path.lexists(tok)):
+            return tok
+    return None
+
+
 def levain_hook_handler(h: Any, install: Path) -> bool:
     """Whether the hook handler ``h`` is one levain wired for this install: a command whose token after the
     interpreter is an absolute path (after :func:`_hook_token_path`'s placeholder reading) to a ``.py`` directly
@@ -1609,8 +1638,10 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         else:
             out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
     else:
-        staged = install.joinpath(*PENDING_REL, *((".claude", "settings.local.json") if adapter == "claude-code"
-                                                  else ("codex-home", "hooks.json")))
+        from levain.host_guard import cc_levain_hooks_file
+
+        staged = install.joinpath(*PENDING_REL, *((".claude", cc_levain_hooks_file(install).name)
+                                                  if adapter == "claude-code" else ("codex-home", "hooks.json")))
         hint = (f"`levain update` staged levain's version at {staged}: merge its PermissionRequest entry."
                 if staged.is_file() else
                 "`levain update` wires it unless the file holds your own edit, which it keeps: then add the entry back, "
@@ -2889,17 +2920,30 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
 
 
 def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[CheckResult]]:
-    """(hooks object to check, the file it came from, rows about where levain's hooks are). Levain's hooks belong
-    in ``.claude/settings.local.json`` (``install.CC_LOCAL_SETTINGS_REL``): Claude Code reads the workspace's
-    settings.json only for a session started in the workspace folder itself. The local file's hooks are checked
-    when they hold any levain handler; else settings.json's, when they do (an install from before the move), with a
-    WARN naming `levain update`. Also a WARN for a levain handler left in settings.json beside the local ones, and
-    for a levain command that names its script through ``${CLAUDE_PROJECT_DIR}``."""
+    """(hooks object to check, the file it came from, rows about where levain's hooks are). Where they belong is
+    :func:`host_guard.cc_levain_hooks_file`'s answer: ``.claude/settings.local.json`` for a workspace that is the
+    toplevel of a main checkout (a session started in any subfolder loads it), else ``.claude/settings.json`` with
+    one row saying a subfolder start is not covered. The expected file's hooks are checked when they hold a levain
+    handler; else the other file's, when they do, with a WARN naming `levain update`. Also a WARN for levain's
+    hooks in both files, for a levain command naming a missing script (a moved workspace), for the two files being
+    one (a link), and, in the local layout, for a command naming its script through ``${CLAUDE_PROJECT_DIR}``."""
+    from levain.host_guard import CC_HOOKS_ROOT_ONLY, cc_levain_hooks_file, cc_settings_aliased
     from levain.install import CC_LOCAL_SETTINGS_REL, _split_hooks
 
     rows: list[CheckResult] = []
     local_path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
-    local_label = "/".join(CC_LOCAL_SETTINGS_REL)
+    local_label, shared_label = "/".join(CC_LOCAL_SETTINGS_REL), ".claude/settings.json"
+    in_local = cc_levain_hooks_file(install).name == CC_LOCAL_SETTINGS_REL[-1]
+    if not in_local:
+        rows.append(CheckResult("levain hooks coverage", True, CC_HOOKS_ROOT_ONLY))
+    shared_hooks = settings.get("hooks", {})
+    shared_hooks = shared_hooks if isinstance(shared_hooks, dict) else {}
+    if cc_settings_aliased(install):
+        rows.append(CheckResult("levain hooks location", True,
+                                f"{local_label} and {shared_label} are one file (a link), so levain does not split "
+                                "or move its hooks there",
+                                f"Make {local_label} a file of its own, then run `levain update`.", warn=True))
+        return shared_hooks, shared_label, rows
     local_hooks: Any = {}
     try:
         local = json.loads(local_path.read_text(encoding="utf-8"))
@@ -2909,39 +2953,60 @@ def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[Che
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as e:
-        rows.append(CheckResult(local_label, False, f"cannot be read: {e}",
-                                "Fix the file (it holds levain's hooks), then run `levain update`."))
+        rows.append(CheckResult(local_label, not in_local, f"cannot be read: {e}",
+                                "Fix the file, then run `levain update`.", warn=not in_local))
     local_hooks = local_hooks if isinstance(local_hooks, dict) else {}
-    shared_hooks = settings.get("hooks", {})
-    shared_hooks = shared_hooks if isinstance(shared_hooks, dict) else {}
     local_ours = _split_hooks(local_hooks, install, ours=True)
     shared_ours = _split_hooks(shared_hooks, install, ours=True)
-    if local_ours:
-        hooks, label = local_hooks, local_label
-        if shared_ours:
+    want_hooks, want_ours, want_label = ((local_hooks, local_ours, local_label) if in_local else
+                                         (shared_hooks, shared_ours, shared_label))
+    other_hooks, other_ours, other_label = ((shared_hooks, shared_ours, shared_label) if in_local else
+                                            (local_hooks, local_ours, local_label))
+    if want_ours:
+        hooks, label = want_hooks, want_label
+        if other_ours:
             rows.append(CheckResult("levain hooks location", True,
-                                    "levain's hooks are still in settings.json too (an older release's place), "
-                                    "so a session started at the workspace root may run them twice",
-                                    "Run `levain update` to remove them from settings.json.", warn=True))
-    elif shared_ours:
-        hooks, label = shared_hooks, ".claude/settings.json"
-        rows.append(CheckResult("levain hooks location", True,
-                                "levain's hooks are in settings.json, which Claude Code reads only for a session "
-                                "started in the workspace folder: a session started in a subfolder runs no levain "
-                                "hook (no consent gate)",
-                                f"Run `levain update` to move them to {local_label}.", warn=True))
+                                    f"levain's hooks are in {other_label} too, so a session started at the "
+                                    "workspace folder may run them twice",
+                                    f"Run `levain update` to remove them from {other_label}.", warn=True))
+    elif other_ours:
+        hooks, label = other_hooks, other_label
+        why = ("Claude Code reads settings.json only for a session started in the workspace folder: a session "
+               "started in a subfolder runs no levain hook (no consent gate)" if in_local else
+               "this workspace is not its git repository's root, so Claude Code does not read that file for it")
+        rows.append(CheckResult("levain hooks location", True, f"levain's hooks are in {other_label}: {why}",
+                                f"Run `levain update` to move them to {want_label}.", warn=True))
     else:
-        hooks, label = local_hooks, local_label
-    templated = sorted({event for src in (local_ours, shared_ours) for event, groups in src.items()
-                        for g in groups for h in g.get("hooks", [])
-                        if "CLAUDE_PROJECT_DIR" in h.get("command", "")})
+        hooks, label = want_hooks, want_label
+    stale = sorted({s for src in (local_ours, shared_ours) for groups in src.values() for g in groups
+                    for h in g.get("hooks", []) if (s := stale_levain_handler(h)) is not None})
+    if stale:
+        rows.append(CheckResult("levain hook scripts", True,
+                                "a levain hook names a missing script (moved workspace?): " + ", ".join(stale)
+                                + " (UserPromptSubmit's exits 2, which blocks the prompt)",
+                                "Run `levain update`.", warn=True))
+    # the placeholder is the start folder: wrong only where a subfolder start loads the hooks (the local layout)
+    templated = sorted({event for src in (local_ours, shared_ours) for event, groups in src.items() for g in groups
+                        for h in g.get("hooks", []) if "CLAUDE_PROJECT_DIR" in h.get("command", "")}
+                       ) if in_local else []
     if templated:
         rows.append(CheckResult("levain hook paths", True,
                                 f"{', '.join(templated)}: the command names its script through "
                                 "${CLAUDE_PROJECT_DIR}, which is the folder a session starts in, so from a "
-                                "subfolder the script is not found (the hook exits 2, which for UserPromptSubmit blocks the "
-                                "prompt)", "Run `levain update` to write absolute paths.", warn=True))
+                                "subfolder the script is not found (the hook exits 2, which for UserPromptSubmit "
+                                "blocks the prompt)", "Run `levain update` to write absolute paths.", warn=True))
     return hooks, label, rows
+
+
+def _entries_for(entries: Any, install: Path, script: str) -> list:
+    """``entries`` (an event's groups) narrowed to the first handler targeting this install's ``script``, wherever
+    it sits in the list (the user's own handlers come first in a merged file); ``entries`` unchanged when none
+    does, so the checks below report the first command as before."""
+    for g in entries if isinstance(entries, list) else ():
+        for h in (g.get("hooks") if isinstance(g, dict) else None) or ():
+            if isinstance(h, dict) and _hook_command_targets([{"hooks": [h]}], install, script):
+                return [{"hooks": [h]}]
+    return entries
 
 
 def _check_claude_code(install: Path) -> list[CheckResult]:
@@ -2993,6 +3058,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
                     ("UserPromptSubmit", ups, "user_prompt_submit.py"),
                 )
                 for ev_name, entries, script_name in ev_scripts:
+                    # levain's handler wherever it sits: a merged file puts the user's own handlers first (L3 r1)
+                    entries = _entries_for(entries, install, script_name)
                     py = _extract_command_python(entries)
                     if py is None:
                         results.append(

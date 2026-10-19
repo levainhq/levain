@@ -142,7 +142,7 @@ def run_verify_hooks(path: Path) -> int:
                 "The install was wired to this Python (likely in a venv that's "
                 "been deleted or moved). Re-run `levain init --force` from the "
                 "venv you want to wire it to, or fix the path in "
-                ".claude/settings.local.json / ~/.codex/hooks.json."
+                ".claude/settings.local.json (or .claude/settings.json) / ~/.codex/hooks.json."
             ),
         ))
         print("\n1 check(s) FAILED.")
@@ -433,10 +433,13 @@ def _resolve_install_launcher(install: Path) -> list[str]:
     gets skipped — so verify-hooks never accidentally tests a non-Levain
     interpreter.
     """
-    # Claude Code: .claude/settings.local.json (where levain wires its hooks), then .claude/settings.json (an
-    # install from before the move, until `levain update`) — gated by CLAUDE.md tag file.
+    # Claude Code: the file levain wires its hooks into (host_guard.cc_levain_hooks_file), then the other one (an
+    # install whose hooks `levain update` has not moved yet) — gated by CLAUDE.md tag file.
     if (install / "CLAUDE.md").is_file():
-        for name in ("settings.local.json", "settings.json"):
+        from levain.host_guard import cc_levain_hooks_file
+
+        wired = cc_levain_hooks_file(install)  # where levain wires them; the other file: an unmigrated install
+        for name in dict.fromkeys((wired.name, "settings.local.json", "settings.json")):
             py = _launcher_from_hooks_config(install / ".claude" / name, install)
             if py is not None:
                 return py

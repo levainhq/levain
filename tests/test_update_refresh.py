@@ -24,6 +24,10 @@ from levain.install import (
     refresh_adapter,
     run_init,
 )
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
 
 
 def _sha(data: bytes) -> str:

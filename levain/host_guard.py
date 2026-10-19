@@ -718,6 +718,60 @@ def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLi
     return ([at_root] if at_root == beside else [at_root, beside]), shared
 
 
+# The line init and doctor print for a workspace whose hooks stay in settings.json (cc_levain_hooks_file).
+CC_HOOKS_ROOT_ONLY = ("levain's hooks run only when Claude Code starts at the workspace folder itself (a session "
+                      "started in a subfolder is not covered: the workspace is not the root of its own git "
+                      "repository)")
+
+
+def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
+    """The ONE answer to where levain wires its Claude Code hooks for the workspace ``install``: its
+    ``.claude/settings.local.json`` when Claude Code reads that file for a session started anywhere in the workspace,
+    else its ``.claude/settings.json``. Claude Code reads settings.local.json at the git repository root, resolved
+    through worktrees to the main checkout, and settings.json from the start folder only; so the local file covers a
+    subfolder start only when the workspace IS the toplevel of a main checkout. Asked of git: ``rev-parse
+    --show-toplevel`` is the workspace and ``--git-common-dir`` is the workspace's own ``.git`` (not a linked
+    worktree, a submodule or a separate git dir), and :func:`cc_project_settings_files` agrees (not the home
+    directory, owned by this user, not Windows). Anything else, git missing or failing included, gets settings.json,
+    which loads for a session started at the workspace folder in every layout (:data:`CC_HOOKS_ROOT_ONLY`).
+    install, update, doctor, the consent canary and verify-hooks all ask this; none derives it again."""
+    ws = Path(os.path.abspath(install))
+    shared = ws / ".claude" / "settings.json"
+    local = ws / ".claude" / "settings.local.json"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # the workspace's git, not a caller's
+
+    def ask(*args: str) -> str | None:
+        try:
+            r = subprocess.run(["git", "-C", str(ws), "rev-parse", *args], capture_output=True, text=True,
+                               timeout=10, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        out = r.stdout.strip()
+        return out if r.returncode == 0 and out else None
+
+    top = ask("--show-toplevel")
+    common = ask("--git-common-dir") if top is not None else None
+    real = os.path.realpath(ws)
+    if (top is None or common is None or os.path.realpath(top) != real
+            or os.path.realpath(os.path.join(ws, common)) != os.path.join(real, ".git")):
+        return shared
+    return local if cc_project_settings_files(ws)[0][0] == local else shared
+
+
+def cc_settings_aliased(install: str | os.PathLike[str]) -> bool:
+    """Whether the workspace's ``.claude/settings.local.json`` and ``.claude/settings.json`` are one file (a symlink
+    either way, or a hard link): then levain neither splits its hooks out of it nor migrates them between the two
+    (removing them from one would remove them from both)."""
+    d = Path(os.path.abspath(install)) / ".claude"
+    a, b = d / "settings.json", d / "settings.local.json"
+    if (os.path.islink(a) or os.path.islink(b)) and os.path.realpath(a) == os.path.realpath(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _settings_files(ent: Path) -> list[tuple[str, Path]]:
     """(component name, path) of every project settings file Claude Code loads for this install."""
     out = [(".claude/settings.json hooks", ent / ".claude" / "settings.json"),

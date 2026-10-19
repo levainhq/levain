@@ -1953,6 +1953,8 @@ def _install_claude_code(
     # (templates/activation) first, then any pack activation/ trees by order.
     # base_activation is passed explicitly so its OWN completeness can be checked
     # (a pack must not mask an empty base).
+    # where the hooks go, and whether settings.local.json can take them, is settled before the adapter writes a file
+    in_local, local_doc = _plan_claude_code_local(install, adapter_root, python_path)
     _copy_activation_tree(
         activation_roots,
         install / "activation",
@@ -1962,40 +1964,50 @@ def _install_claude_code(
     )
 
     for target, text in _claude_code_files(
-        install, adapter_root, python_path, import_seed, on_demand_seed, messaging=messaging
+        install, adapter_root, python_path, import_seed, on_demand_seed, messaging=messaging, in_local=in_local
     ).items():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
-    _write_claude_code_local_hooks(install, claude_code_local_hooks(install, adapter_root, python_path), emit)
+    _write_claude_code_local_hooks(install, in_local, local_doc, emit)
 
     emit("  Claude Code adapter installed.")
 
 
-# Levain's Claude Code hooks live in the workspace's `.claude/settings.local.json`, never its settings.json. Claude
-# Code reads a project's settings.json from the session's start folder only, and settings.local.json at the git
-# root, so a session started in a subfolder of a git-root workspace loads the local file alone (measured on 2.1.303,
-# project_memory/1019-q10/run9 and 1019-subhook/run11). Every command names its script by absolute path:
-# ${CLAUDE_PROJECT_DIR} expands to the start folder, which is not the workspace from a subfolder. The file is shared
-# with the user (their allow rules) and `levain team` (its own hooks): levain owns only the handlers
-# doctor.levain_hook_handler calls its own, and merges them in.
+# Where levain's Claude Code hooks live is host_guard.cc_levain_hooks_file's answer, per workspace. Claude Code reads
+# a project's settings.json from the session's start folder only, and settings.local.json at the git root (resolved
+# through worktrees to the main checkout), so for a workspace that IS the toplevel of a main checkout the hooks live
+# in its `.claude/settings.local.json`, which a session started in any subfolder loads (measured on 2.1.303,
+# project_memory/1019-q10/run9 and 1019-subhook/run11); there every command names its script by absolute path, since
+# ${CLAUDE_PROJECT_DIR} expands to the start folder. Any other workspace (nested in a bigger repo, a linked worktree,
+# not in git) keeps them in settings.json exactly as the template renders them: the local file there would load
+# for no session started in a subfolder either, and from the root settings.json already does. The local file is
+# shared with the user (their allow rules) and `levain team` (its own hooks): levain owns only the handlers
+# doctor.levain_hook_handler calls its own (plus a stale one, doctor.stale_levain_handler), and merges them in.
 CC_LOCAL_SETTINGS_REL = (".claude", "settings.local.json")
 # The adapter receipt's record of levain's hook entries in that file (the entries only: the rest is not levain's).
 CC_LOCAL_HOOKS_KEY = ".claude/settings.local.json#hooks"
 
 
 def _claude_code_settings(install: Path, adapter_root: Path, python_path: str,
-                          messaging: str | None = None) -> tuple[str, dict[str, Any]]:
-    """(settings.json text without ``hooks``, levain's hooks for settings.local.json): ONE render of the template,
-    split, so the two files cannot disagree. ``${CLAUDE_PROJECT_DIR}`` in the template's commands is filled with
-    this install's path (quoted as ``{{PYTHON}}`` is) in the same pass as ``{{PYTHON}}``; the template keeps the
-    placeholder because host_guard.cc_hook_settings reads the template's command shape."""
+                          messaging: str | None = None, *, local: bool) -> tuple[str, dict[str, Any]]:
+    """ONE render of the template for both layouts, so the files cannot disagree. ``local`` (the hooks live in
+    settings.local.json): (settings.json text without ``hooks``, levain's hooks), ``${CLAUDE_PROJECT_DIR}`` in the
+    commands filled with this install's path (quoted as ``{{PYTHON}}`` is) in the same pass as ``{{PYTHON}}``; the
+    template keeps the placeholder because host_guard.cc_hook_settings reads the template's command shape. Else
+    (settings.json text with the hooks, ``{}``): byte for byte the render of a release before the move, placeholder
+    kept, so `levain update` leaves such an install's settings.json as it is."""
     text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
-    slots = {"{{PYTHON}}": _hook_arg_body(python_path), "${CLAUDE_PROJECT_DIR}": _hook_arg_body(str(install))}
-    text = re.sub(r"\{\{PYTHON\}\}|\$\{CLAUDE_PROJECT_DIR\}", lambda m: slots[m.group(0)], text)
+    if local:
+        slots = {"{{PYTHON}}": _hook_arg_body(python_path), "${CLAUDE_PROJECT_DIR}": _hook_arg_body(str(install))}
+        text = re.sub(r"\{\{PYTHON\}\}|\$\{CLAUDE_PROJECT_DIR\}", lambda m: slots[m.group(0)], text)
+    else:
+        text = _fill(text, {"PYTHON": _hook_arg_body(python_path)})
     text = (_apply_messaging(text, messaging) if messaging is not None else
             _apply_messaging(text, persisted_messaging(install),
                              keep_from=install / ".claude" / "settings.json"))
     text = _apply_consent_hook(text, python_path, install, "claude-code")
+    if not local:
+        return text, {}
     doc = json.loads(text)
     hooks = doc.pop("hooks", None) or {}
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n", hooks
@@ -2003,13 +2015,21 @@ def _claude_code_settings(install: Path, adapter_root: Path, python_path: str,
 
 def claude_code_local_hooks(install: Path, adapter_root: Path, python_path: str) -> dict[str, Any]:
     """Levain's hook entries for this install's ``.claude/settings.local.json`` (absolute script paths)."""
-    return _claude_code_settings(install, adapter_root, python_path, messaging=DEFAULT_MESSAGING)[1]
+    return _claude_code_settings(install, adapter_root, python_path, messaging=DEFAULT_MESSAGING, local=True)[1]
+
+
+def _cc_hooks_in_local(install: Path) -> bool:
+    """Whether this workspace's levain hooks live in settings.local.json (host_guard.cc_levain_hooks_file)."""
+    from levain.host_guard import cc_levain_hooks_file
+
+    return cc_levain_hooks_file(install).name == CC_LOCAL_SETTINGS_REL[-1]
 
 
 def _levain_handler(h: Any, install: Path) -> bool:
-    from levain.doctor import levain_hook_handler
+    """Levain's handler for this install, or a stale one a moved workspace left (L3 r1): both are replaced."""
+    from levain.doctor import levain_hook_handler, stale_levain_handler
 
-    return levain_hook_handler(h, install)
+    return levain_hook_handler(h, install) or stale_levain_handler(h) is not None
 
 
 def _split_hooks(hooks: Any, install: Path, ours: bool) -> dict[str, Any]:
@@ -2040,10 +2060,13 @@ def _split_hooks(hooks: Any, install: Path, ours: bool) -> dict[str, Any]:
 def _merge_local_hooks(doc: dict[str, Any], ours: Mapping[str, Any], install: Path) -> dict[str, Any]:
     """``doc`` (a settings.local.json object) with levain's handlers replaced by ``ours``; everything else kept
     (the other handlers first in each event, levain's groups after them). Raises ValueError on a ``hooks`` that is
-    not an object."""
+    not an object or an event whose value is not a list, before anything is merged (L3 r1: it crashed mid-update)."""
     hooks = doc.get("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("its 'hooks' is not a JSON object")
+    bad = [event for event, groups in hooks.items() if not isinstance(groups, list)]
+    if bad:
+        raise ValueError(f"its hooks for {', '.join(map(repr, bad))} are not lists")
     merged = _split_hooks(hooks, install, ours=False)
     for event, groups in ours.items():
         merged[event] = [*merged.get(event, []), *groups]
@@ -2089,18 +2112,57 @@ def _read_local_settings(path: Path) -> dict[str, Any]:
     return doc
 
 
-def _write_claude_code_local_hooks(install: Path, ours: Mapping[str, Any], emit: Callable[[str], None]) -> None:
-    """Init's write: merge levain's hooks into ``.claude/settings.local.json`` (the user's entries kept) and make
-    sure git ignores it. A file that cannot be merged fails the init, since without it no levain hook runs."""
+def _plan_claude_code_local(install: Path, adapter_root: Path, python_path: str) -> tuple[bool, dict | None]:
+    """Init's decision for ``.claude/settings.local.json``, made BEFORE the adapter writes a file (L3 r1): (whether the
+    hooks live there, the file's new content or None to leave it). In the local layout levain's hooks are merged in
+    (the user's entries kept); else levain's handlers already there (a re-init after the workspace stopped being its
+    repo's root, or a moved one's) are taken out, and nothing else is touched. Raises InitError when the two
+    settings files are one (a link: splitting would remove the hooks from both), or when the local file cannot take
+    the merge (not JSON, not an object, an event that is not a list)."""
+    from levain.host_guard import cc_settings_aliased
+
     path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
+    if cc_settings_aliased(install):
+        raise InitError(f"{path} and {install / '.claude' / 'settings.json'} are one file (a link), and levain will "
+                        f"not split its hooks out of it: make {path} a file of its own, then re-run init.")
+    in_local = _cc_hooks_in_local(install)
     try:
-        doc = _merge_local_hooks(_read_local_settings(path), ours, install)
-        _atomic_write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        if in_local:
+            return True, _merge_local_hooks(_read_local_settings(path),
+                                            claude_code_local_hooks(install, adapter_root, python_path), install)
     except (OSError, ValueError) as e:
         raise InitError(f"{path} could not take levain's hooks ({e}); fix or move it, then re-run init.") from e
-    line = _ensure_local_settings_ignored(install)
-    if line:
-        emit(line)
+    try:
+        doc = _read_local_settings(path)
+        if not _split_hooks(doc.get("hooks", {}), install, ours=True):
+            return False, None
+        return False, _merge_local_hooks(doc, {}, install)
+    except (OSError, ValueError) as e:
+        raise InitError(f"{path} holds levain's hooks and could not be rewritten without them ({e}); fix or move "
+                        f"it, then re-run init.") from e
+
+
+def _write_claude_code_local_hooks(install: Path, in_local: bool, doc: dict | None,
+                                   emit: Callable[[str], None]) -> None:
+    """Init's write of :func:`_plan_claude_code_local`'s decision, and its lines: in the local layout the file is
+    git-ignored; else the line that a subfolder start is not covered (host_guard.CC_HOOKS_ROOT_ONLY)."""
+    from levain.host_guard import CC_HOOKS_ROOT_ONLY
+
+    path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
+    if doc is not None:
+        try:
+            _atomic_write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        except OSError as e:
+            raise InitError(f"{path} could not be written ({e}); fix it, then re-run init.") from e
+    if in_local:
+        line = _ensure_local_settings_ignored(install)
+        if line:
+            emit(line)
+        return
+    if doc is not None:
+        emit(f"  {'/'.join(CC_LOCAL_SETTINGS_REL)}: levain's hooks taken out (they live in .claude/settings.json "
+             f"for this workspace)")
+    emit(f"  note: {CC_HOOKS_ROOT_ONLY}.")
 
 
 def _refresh_local_hooks(install: Path, ours: Mapping[str, Any], *, apply: bool, out: AdapterRefresh,
@@ -2220,6 +2282,58 @@ def _migrate_settings_json_hooks(install: Path, *, apply: bool, carried: bool, o
                      f"session started at the workspace root may run them twice.")
 
 
+def _migrate_local_hooks_to_shared(install: Path, *, apply: bool, out: AdapterRefresh, lines: list[str]) -> None:
+    """`levain update` for a workspace whose hooks live in settings.json (host_guard.cc_levain_hooks_file): the
+    other direction of :func:`_migrate_settings_json_hooks`. Levain's handlers in ``.claude/settings.local.json``
+    (a release that put them there, or a moved workspace's stale ones) are removed, everyone else's kept and the
+    previous copy kept beside it, only once settings.json carries levain's hooks (else they stay and the file is
+    listed). The receipt's record of levain's entries in the local file is dropped, so a later move back writes them
+    fresh instead of reading their absence as the operator's deletion. A file levain cannot read, or one whose hooks
+    are not lists, is left as it is and listed."""
+    key = "/".join(CC_LOCAL_SETTINGS_REL)
+    path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
+    if apply:
+        record = _read_adapter_receipt(install) or {}
+        if CC_LOCAL_HOOKS_KEY in record:
+            try:
+                _write_adapter_receipt(install, {k: v for k, v in record.items() if k != CC_LOCAL_HOOKS_KEY})
+            except OSError as e:
+                lines.append(f"  note: could not record the adapter receipt ({e}).")
+    try:
+        doc = _read_local_settings(path)
+        if not _split_hooks(doc.get("hooks", {}), install, ours=True):
+            return
+        new = _merge_local_hooks(doc, {}, install)
+    except (OSError, ValueError) as e:
+        out.review.append(key)
+        lines.append(f"  {key}: holds levain's hooks and could not be rewritten without them ({e}); fix it and run "
+                     f"`levain update` again.")
+        return
+    shared = ".claude/settings.json"
+    carried = (_settings_json_levain_hooks(install) if apply else
+               any(r.startswith(shared) for r in out.refreshed)
+               or (_settings_json_levain_hooks(install) and shared not in out.review))
+    if not carried:
+        out.review.append(key)
+        lines.append(f"  {key}: still carries levain's hooks, kept until .claude/settings.json holds them (see "
+                     f"above).")
+        return
+    out.refreshed.append(f"{key} (levain's hooks moved to settings.json)")
+    if not apply:
+        return
+    try:
+        backup = _timestamped_backup_path(path)
+        shutil.copy2(path, backup)
+        _atomic_write_text(path, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
+        lines.append(f"  {key}: levain's hooks removed (this workspace is not its git repository's root, so they "
+                     f"run from settings.json); the previous copy is kept at {backup.name}")
+    except OSError as e:
+        out.refreshed.pop()
+        out.review.append(key)
+        lines.append(f"  {key}: levain's hooks could not be removed ({e}); until they are, a session started at "
+                     f"the workspace folder may run them twice.")
+
+
 def _claude_code_files(
     install: Path,
     adapter_root: Path,
@@ -2227,9 +2341,11 @@ def _claude_code_files(
     import_seed: Sequence[SeedEntry],
     on_demand_seed: Sequence[SeedEntry],
     messaging: str | None = None,
+    in_local: bool | None = None,
 ) -> dict[Path, str]:
     """The install-local files the claude-code adapter renders from its templates:
-    the carrier, the settings (without the hooks) and the MCP registration. One builder for both
+    the carrier, the settings (with the hooks only when they do not live in settings.local.json, ``in_local``,
+    host_guard.cc_levain_hooks_file's answer when not given) and the MCP registration. One builder for both
     `init` and `levain update`'s refresh, so the two cannot render different bytes. ``messaging`` is an explicit
     choice from `init`; without one the recorded choice is read (`update`)."""
     # The @seed import list is roster-driven, not hard-coded — so a pack's added
@@ -2239,9 +2355,10 @@ def _claude_code_files(
     claude_md = _fill_seed_imports(claude_md, _claude_import_block(import_seed))
     claude_md = _fill_seed_on_demand(claude_md, _on_demand_block(on_demand_seed))
 
-    # the hooks half goes to settings.local.json, merged rather than written whole (_write_claude_code_local_hooks,
-    # _refresh_local_hooks)
-    settings_text = _claude_code_settings(install, adapter_root, python_path, messaging)[0]
+    # in the local layout the hooks half goes to settings.local.json, merged rather than written whole
+    # (_plan_claude_code_local, _refresh_local_hooks)
+    settings_text = _claude_code_settings(install, adapter_root, python_path, messaging,
+                                          local=_cc_hooks_in_local(install) if in_local is None else in_local)[0]
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
@@ -3103,7 +3220,7 @@ def record_adapter_receipt(
     if not files:
         return
     extra: dict[str, str] = {}
-    if adapter == "claude-code":  # init merges levain's hooks into settings.local.json too
+    if adapter == "claude-code" and _cc_hooks_in_local(install):  # init merged levain's hooks into the local file
         try:
             extra[CC_LOCAL_HOOKS_KEY] = _sha256_text(_canonical_hooks(claude_code_local_hooks(
                 install, templates_root / "adapters" / adapter, python_path)).decode("utf-8"))
@@ -3376,23 +3493,38 @@ def _refresh_adapter(
                 # inferred from the file's text (spore-866 L3 r1-r7; ruled 2026-10-10 "go
                 # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
-        carried = False
+        carried = cc_aliased = False
+        cc_in_local = adapter == "claude-code" and _cc_hooks_in_local(install)
         if adapter == "claude-code":
-            # BEFORE the whole-file refresh, which would otherwise write a hook-less settings.json over an install
-            # whose hooks could not reach settings.local.json: then settings.json is held as it is
-            try:
-                local_hooks = claude_code_local_hooks(install, adapter_root, python_path)
-            except (InitError, OSError, ValueError) as e:
-                out.review.append("/".join(CC_LOCAL_SETTINGS_REL))
-                lines.append(f"  {'/'.join(CC_LOCAL_SETTINGS_REL)}: levain's hooks could not be rendered ({e}).")
-            else:
-                carried = _refresh_local_hooks(install, local_hooks, apply=apply, out=out, lines=lines)
-            if not carried and _settings_json_levain_hooks(install):
+            from levain.host_guard import cc_settings_aliased
+
+            cc_aliased = cc_settings_aliased(install)
+            if cc_aliased:
+                # one file under two names: no split, no migration, no rewrite, never a delete (L3 r1)
+                out.review.append(".claude/settings.json")
+                lines.append("  .claude/settings.local.json and .claude/settings.json are one file (a link), so "
+                             "levain left it as it is and did not split or move its hooks; make "
+                             "settings.local.json a file of its own, then run `levain update` again.")
                 files = {t: x for t, x in files.items() if t != install / ".claude" / "settings.json"}
+            elif cc_in_local:
+                # BEFORE the whole-file refresh, which would otherwise write a hook-less settings.json over an
+                # install whose hooks could not reach settings.local.json: then settings.json is held as it is
+                try:
+                    local_hooks = claude_code_local_hooks(install, adapter_root, python_path)
+                except (InitError, OSError, ValueError) as e:
+                    out.review.append("/".join(CC_LOCAL_SETTINGS_REL))
+                    lines.append(f"  {'/'.join(CC_LOCAL_SETTINGS_REL)}: levain's hooks could not be rendered ({e}).")
+                else:
+                    carried = _refresh_local_hooks(install, local_hooks, apply=apply, out=out, lines=lines)
+                if not carried and _settings_json_levain_hooks(install):
+                    files = {t: x for t, x in files.items() if t != install / ".claude" / "settings.json"}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
                                variants=variants, carrier_name=carrier_name)
-        if adapter == "claude-code":
-            _migrate_settings_json_hooks(install, apply=apply, carried=carried, out=out, lines=lines)
+        if adapter == "claude-code" and not cc_aliased:
+            if cc_in_local:
+                _migrate_settings_json_hooks(install, apply=apply, carried=carried, out=out, lines=lines)
+            else:
+                _migrate_local_hooks_to_shared(install, apply=apply, out=out, lines=lines)
         if adapter == "codex":
             _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
