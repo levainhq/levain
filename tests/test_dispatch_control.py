@@ -1,8 +1,11 @@
-"""Dispatch configuration: one signed item per change, one generation over every kind, a trust root pinned once.
-Keys are real ssh-keygen keys enrolled in a real signed authority log (the consent queue tests' ``Key`` and ``Log``),
-the store is real SQLite in tmp, and the end-to-end filing runs over the contract tests' real git repo."""
+"""Dispatch configuration: one signed item per change, one hash-chained generation over every kind, bound to its
+store, a trust root pinned once. Keys are real ssh-keygen keys enrolled in a real signed authority log (the consent
+queue tests' ``Key`` and ``Log``), the store is real SQLite in tmp, and the end-to-end filing runs over the contract
+tests' real git repo."""
 from __future__ import annotations
 
+import inspect
+import json
 import os
 import sqlite3
 from datetime import timedelta
@@ -74,9 +77,9 @@ def _dir(tmp_path, name="dispatch"):
 
 
 @pytest.fixture
-def cdir(tmp_path, keys):
+def cdir(tmp_path, keys, log):
     d = _dir(tmp_path)
-    ctl.ControlStore.init(d, keys["laptop"].fp)
+    ctl.ControlStore.init(d, keys["laptop"].fp, authority=log.source)
     return d
 
 
@@ -85,14 +88,31 @@ def store(cdir, log):
     return ctl.ControlStore(cdir, authority=log.source, clock=Clock(NOW))
 
 
-def signed(kind, gen, body, key, *, ns=NS, at=None):
-    item = ctl.item_bytes(kind, gen, body, at or NOW - timedelta(minutes=1))
+# a well-formed prev for an item that is refused before its chain link is looked at
+OTHER_PREV = "sha256:" + "0" * 64
+
+
+def signed(store, kind, gen, body, key, *, ns=NS, at=None, prev=None, store_id=None):
+    """An item for ``store`` and its signature. ``prev`` defaults to the store's verified head digest when ``gen``
+    is the next generation (what a signing tool builds), else a placeholder."""
+    if prev is None:
+        top, head = store.head()
+        prev = "" if gen == 1 else head if gen == top + 1 else OTHER_PREV
+    item = ctl.item_bytes(kind, gen, body, at or NOW - timedelta(minutes=1), prev=prev,
+                          store_id=store_id or store.store_id())
     return item, key.sign(item, ns)
 
 
 def accept(store, log, keys, kind, gen, body, key="laptop", **kw):
-    item, sig = signed(kind, gen, body, keys[key], **kw)
-    return store.accept(item, sig, log.source)
+    return store.accept(*signed(store, kind, gen, body, keys[key], **kw))
+
+
+def raw_item(**over) -> bytes:
+    """Item bytes in canonical key order, built without the canon module so a malformed value can be written."""
+    obj = {"format": ctl.FORMAT, "store_id": "0" * 32, "generation": 1, "prev": "",
+           "issued_at": "2026-10-19T19:59:00.000000Z", "kind": "verifiers", "body": {}}
+    obj.update(over)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
 def base_config(store, log, keys):
@@ -125,41 +145,142 @@ def test_the_active_item_is_the_latest_of_its_kind(store, log, keys):
 
 
 def test_item_text_and_bytes_both_accepted(store, log, keys):
-    item, sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
-    assert store.accept(item.decode("utf-8"), sig, log.source).generation == 1
+    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    assert store.accept(item.decode("utf-8"), sig).generation == 1
 
 
-# --- generation ----------------------------------------------------------------------------------------------------
+# --- generation and the chain --------------------------------------------------------------------------------------
 
 def test_a_replayed_older_item_is_refused(store, log, keys):
-    old, old_sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
-    store.accept(old, old_sig, log.source)
+    old, old_sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
+    store.accept(old, old_sig)
     accept(store, log, keys, "verifiers", 2, {"pytest-bb": VERIFIERS["pytest-bb"]})
     with pytest.raises(ctl.ConfigRefused, match="not above the highest accepted"):
-        store.accept(old, old_sig, log.source)
+        store.accept(old, old_sig)
     assert store.active()["verifiers"].generation == 2
 
 
 def test_the_generation_spans_every_kind(store, log, keys):
     # a policy item signed at generation 1 and held back is refused once ANY kind has passed it
-    held, held_sig = signed("provider_policy", 1, POLICY.to_mapping(), keys["laptop"])
-    accept(store, log, keys, "verifiers", 2, VERIFIERS)
-    with pytest.raises(ctl.ConfigRefused, match=r"generation 1 is not above the highest accepted \(2\)"):
-        store.accept(held, held_sig, log.source)
+    held, held_sig = signed(store, "provider_policy", 1, POLICY.to_mapping(), keys["laptop"])
+    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    with pytest.raises(ctl.ConfigRefused, match=r"generation 1 is not above the highest accepted \(1\)"):
+        store.accept(held, held_sig)
     with pytest.raises(ctl.ConfigRefused, match="not above"):
-        accept(store, log, keys, "templates", 2, [tmpl()])
-    accept(store, log, keys, "templates", 7, [tmpl()])      # gaps are fine; only order matters
-    assert store.generation() == 7
+        accept(store, log, keys, "templates", 1, [tmpl()])
+    accept(store, log, keys, "templates", 2, [tmpl()])
+    assert store.generation() == 2
+
+
+def test_a_generation_gap_is_refused(store, log, keys):
+    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    with pytest.raises(ctl.ConfigRefused, match="the next is 2"):
+        accept(store, log, keys, "templates", 7, [tmpl()])
+    assert store.generation() == 1
+
+
+def test_an_item_not_chained_to_the_head_is_refused(store, log, keys):
+    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    with pytest.raises(ctl.ConfigRefused, match="does not chain to the head"):
+        accept(store, log, keys, "templates", 2, [tmpl()], prev=OTHER_PREV)
+    _top, head = store.head()
+    assert head == store.active()["verifiers"].digest and head.startswith("sha256:")
+
+
+@pytest.mark.parametrize("gen, prev", [(1, OTHER_PREV), (2, ""), (2, "sha256:xyz")])
+def test_prev_is_empty_exactly_at_generation_one(store, keys, gen, prev):
+    item = raw_item(generation=gen, prev=prev, store_id=store.store_id())
+    with pytest.raises(ctl.ConfigRefused, match="prev"):
+        store.accept(item, keys["laptop"].sign(item, NS))
+
+
+def test_a_deleted_middle_item_fails_every_read_closed(store, log, keys, cdir):
+    # the L2 probe: removing a newer policy from the middle would revive the older, looser one under a signed head
+    base_config(store, log, keys)
+    tighter = POLICY.to_mapping()
+    tighter["never"] = list(tighter.get("never", [])) + ["secrets/**"]
+    accept(store, log, keys, "provider_policy", 4, tighter)
+    accept(store, log, keys, "templates", 5, [tmpl()])
+    conn = _raw(cdir)
+    try:
+        conn.execute("DROP TRIGGER items_kept")
+        conn.execute("DELETE FROM items WHERE generation = 4")
+    finally:
+        conn.close()
+    for read in (store.active, store.generation, store.head, lambda: resolver(store)("fix-lint"),
+                 lambda: active_policy(store)):
+        with pytest.raises(DispatchError, match="no item 4"):
+            read()
+    with pytest.raises(ctl.ControlStateUnavailable, match="no item 4"):
+        accept(store, log, keys, "verifiers", 6, VERIFIERS, prev=OTHER_PREV)
+
+
+def test_a_middle_item_swapped_for_another_signed_one_fails_closed(store, log, keys, cdir):
+    # a validly signed item for the same store and generation, but not the one the head chains to
+    base_config(store, log, keys)
+    accept(store, log, keys, "verifiers", 4, VERIFIERS)
+    swap, swap_sig = signed(store, "provider_policy", 3, POLICY.to_mapping(), keys["laptop"],
+                            at=NOW - timedelta(minutes=5), prev=store.active()["templates"].digest)
+    conn = _raw(cdir)
+    try:
+        conn.execute("DROP TRIGGER items_frozen")
+        conn.execute("UPDATE items SET item = ?, signature = ? WHERE generation = 3", (swap.decode(), swap_sig))
+    finally:
+        conn.close()
+    with pytest.raises(ctl.ControlStateUnavailable, match="does not chain to item 3"):
+        store.active()
 
 
 @pytest.mark.parametrize("gen", [0, -1, True, "3", 2 ** 53])
 def test_generation_is_a_positive_integer(store, log, keys, gen):
-    item = canonical_bytes({"format": ctl.FORMAT, "generation": gen, "issued_at": "2026-10-19T19:59:00.000000Z",
-                            "kind": "verifiers", "body": VERIFIERS}) if gen != 2 ** 53 else \
-        b'{"body":{},"format":"levain-dispatch-config/1","generation":9007199254740992,' \
-        b'"issued_at":"2026-10-19T19:59:00.000000Z","kind":"verifiers"}'
+    item = raw_item(generation=gen, prev=OTHER_PREV, store_id=store.store_id())
     with pytest.raises(ctl.ConfigRefused):
-        store.accept(item, keys["laptop"].sign(item, NS), log.source)
+        store.accept(item, keys["laptop"].sign(item, NS))
+
+
+def test_generation_reads_the_verified_head(store, log, keys, cdir):
+    base_config(store, log, keys)
+    assert store.generation() == 3
+    conn = _raw(cdir)
+    try:
+        conn.execute("DROP TRIGGER items_frozen")
+        conn.execute("UPDATE items SET signature = 'x' WHERE generation = 3")
+    finally:
+        conn.close()
+    with pytest.raises(ctl.ControlStateUnavailable, match="does not verify"):
+        store.generation()
+
+
+# --- the store id --------------------------------------------------------------------------------------------------
+
+def test_an_item_signed_for_another_store_is_refused(store, log, keys, tmp_path):
+    # the L2 probe: the same signed items replayed into a fresh store pinned to the same root
+    items = [signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])]
+    store.accept(*items[0])
+    items.append(signed(store, "templates", 2, [tmpl()], keys["laptop"]))
+    store.accept(*items[1])
+    d2 = _dir(tmp_path, "fresh")
+    ctl.ControlStore.init(d2, keys["laptop"].fp, authority=log.source)
+    s2 = ctl.ControlStore(d2, authority=log.source, clock=Clock(NOW))
+    assert s2.store_id() != store.store_id()
+    for it, sig in items:
+        with pytest.raises(ctl.ConfigRefused, match="another control store"):
+            s2.accept(it, sig)
+    assert s2.generation() == 0
+
+
+@pytest.mark.parametrize("sid", ["", "0" * 31, "G" * 32, 7])
+def test_a_malformed_store_id_is_refused(store, keys, sid):
+    item = raw_item(store_id=sid)
+    with pytest.raises(ctl.ConfigRefused, match="store_id"):
+        store.accept(item, keys["laptop"].sign(item, NS))
+
+
+def test_the_store_id_is_drawn_once(cdir, log, keys):
+    s = ctl.ControlStore(cdir, authority=log.source)
+    first = s.store_id()
+    ctl.ControlStore.init(cdir, keys["laptop"].fp, authority=log.source)
+    assert s.store_id() == first and len(first) == 32
 
 
 # --- the signer ----------------------------------------------------------------------------------------------------
@@ -171,21 +292,96 @@ def test_a_non_pinned_signer_is_refused_even_at_t3(store, log, keys):
     assert store.generation() == 0
 
 
-def test_a_t2_display_phone_root_cannot_sign(tmp_path, log, keys):
-    d = _dir(tmp_path, "phone-root")
-    ctl.ControlStore.init(d, keys["phone"].fp)
-    store = ctl.ControlStore(d, authority=log.source, clock=Clock(NOW))
+def _two_logs(tmp_path_factory, ks, name, first, second):
+    """Two authority logs over the same keys, ``name`` enrolled by its ``first`` op in one and its ``second`` in the
+    other: a store pinned under the first, then read under the second, shows the verify-time rule apart from
+    init's."""
+    logs = []
+    for op in (first, second):
+        lg = Log(tmp_path_factory.mktemp("root-auth"), ks)
+        lg.enrol("laptop", "laptop-presence")
+        lg.link(op(ks[name]))
+        logs.append(lg)
+    return logs
+
+
+def _legacy_unstated(k):
+    return {"op": "enrol", "fingerprint": k.fp, "public_key": k.public_key, "class": "laptop-presence",
+            "custody": auth.UNSTATED, "legacy_enrolled_at": "2026-01-01T00:00:00.000000Z"}
+
+
+def _passphrase(k):
+    return {"op": "enrol", "fingerprint": k.fp, "public_key": k.public_key, "class": "laptop-presence",
+            "custody": "passphrase"}
+
+
+def test_a_t2_display_phone_root_is_refused(tmp_path, log, keys):
     with pytest.raises(ctl.ConfigRefused, match="key class display-phone does not cover T3"):
-        accept(store, log, keys, "verifiers", 1, VERIFIERS, key="phone")
+        ctl.ControlStore.init(_dir(tmp_path, "phone-root"), keys["phone"].fp, authority=log.source)
 
 
-def test_a_passkey_root_cannot_sign(tmp_path, log, keys):
-    d = _dir(tmp_path, "passkey-root")
-    ctl.ControlStore.init(d, fingerprint_of(passkey_line()))
-    store = ctl.ControlStore(d, authority=log.source, clock=Clock(NOW))
-    item, _sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
+def test_a_passkey_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_factory, log, keys):
+    pk = passkey_line()
     with pytest.raises(ctl.ConfigRefused, match="passkey"):
-        store.accept(item, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n", log.source)
+        ctl.ControlStore.init(_dir(tmp_path, "passkey-root"), fingerprint_of(pk), authority=log.source)
+    # the same public key enrolled at a presence custody pins; read under the log where it is a passkey, it refuses
+    fido = Log(tmp_path_factory.mktemp("fido-auth"), keys)
+    fido.enrol("laptop", "laptop-presence")
+    fido.link({"op": "enrol", "fingerprint": fingerprint_of(pk), "public_key": pk, "class": "laptop-presence",
+               "custody": "fido"})
+    d = _dir(tmp_path, "fido-root")
+    ctl.ControlStore.init(d, fingerprint_of(pk), authority=fido.source)
+    store = ctl.ControlStore(d, authority=log.source, clock=Clock(NOW))
+    item = ctl.item_bytes("verifiers", 1, VERIFIERS, NOW, prev="", store_id=store.store_id())
+    with pytest.raises(ctl.ConfigRefused, match="passkey"):
+        store.accept(item, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n")
+
+
+def test_an_unstated_custody_root_is_refused_at_init_and_at_verify(tmp_path, tmp_path_factory):
+    ks = {n: Key(tmp_path_factory.mktemp("unstated-keys"), n) for n in ("laptop", "root")}
+    stated, unstated = _two_logs(tmp_path_factory, ks, "root", _passphrase, _legacy_unstated)
+    assert unstated.source().key(ks["root"].fp).custody == auth.UNSTATED
+    with pytest.raises(ctl.ConfigRefused, match="unstated"):
+        ctl.ControlStore.init(_dir(tmp_path, "u1"), ks["root"].fp, authority=unstated.source)
+    d = _dir(tmp_path, "u2")
+    ctl.ControlStore.init(d, ks["root"].fp, authority=stated.source)
+    store = ctl.ControlStore(d, authority=stated.source, clock=Clock(NOW))
+    accept(store, stated, ks, "verifiers", 1, VERIFIERS, key="root")
+    read_unstated = ctl.ControlStore(d, authority=unstated.source, clock=Clock(NOW))
+    with pytest.raises(ctl.ControlStateUnavailable, match="unstated"):
+        read_unstated.active()
+    with pytest.raises(ctl.ConfigRefused, match="unstated"):
+        read_unstated.accept(*signed(store, "verifiers", 2, VERIFIERS, ks["root"]))
+
+
+def test_init_refuses_an_unenrolled_or_revoked_root(tmp_path, tmp_path_factory, log, keys):
+    # the L2 probe: init pinned a fingerprint no log had ever enrolled
+    with pytest.raises(ctl.ConfigRefused, match="not an enrolled key"):
+        ctl.ControlStore.init(_dir(tmp_path, "x"), "SHA256:" + "A" * 43, authority=log.source)
+    with pytest.raises(ctl.ConfigRefused, match="not an enrolled key"):
+        ctl.ControlStore.init(_dir(tmp_path, "y"), keys["stranger"].fp, authority=log.source)
+    assert not (tmp_path / "x" / ctl.DB_NAME).exists()
+    ks = {n: Key(tmp_path_factory.mktemp("init-revoke-keys"), n) for n in ("laptop", "root")}
+    lg = Log(tmp_path_factory.mktemp("init-revoke-auth"), ks)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("root", "laptop-presence")
+    lg.revoke("root")
+    with pytest.raises(ctl.ConfigRefused, match="revoked"):
+        ctl.ControlStore.init(_dir(tmp_path, "z"), ks["root"].fp, authority=lg.source)
+
+
+def test_init_takes_the_authority_source(tmp_path, log, keys):
+    with pytest.raises(ctl.ConfigRefused, match="AuthoritySource"):
+        ctl.ControlStore.init(_dir(tmp_path), keys["laptop"].fp, authority=log.source())
+
+
+def test_init_refuses_a_symlinked_store(tmp_path, log, keys):
+    d = _dir(tmp_path)
+    real = _dir(tmp_path, "elsewhere")
+    ctl.ControlStore.init(real, keys["laptop"].fp, authority=log.source)
+    os.symlink(real / ctl.DB_NAME, d / ctl.DB_NAME)
+    with pytest.raises(ctl.ConfigRefused, match="symlink"):
+        ctl.ControlStore.init(d, keys["laptop"].fp, authority=log.source)
 
 
 def test_the_wrong_namespace_is_refused(store, log, keys):
@@ -195,62 +391,63 @@ def test_the_wrong_namespace_is_refused(store, log, keys):
 
 
 def test_a_tampered_body_is_refused(store, log, keys):
-    item, sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
+    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
     obj = parse(item)
     obj["body"]["pytest-bb"]["artifact_hash"] = "sha256:" + "d" * 64
     with pytest.raises(ctl.ConfigRefused, match="does not verify"):
-        store.accept(canonical_bytes(obj), sig, log.source)
+        store.accept(canonical_bytes(obj), sig)
 
 
 def test_a_non_canonical_item_is_refused(store, log, keys):
-    item, sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
+    item, sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
     loose = item.replace(b'"format":', b'"format": ')
     with pytest.raises(ctl.ConfigRefused, match="canonical"):
-        store.accept(loose, keys["laptop"].sign(loose, NS), log.source)
+        store.accept(loose, keys["laptop"].sign(loose, NS))
 
 
 @pytest.mark.parametrize("raw, match", [
     (b"[]", "exactly"),
-    (b'{"body":{},"format":"levain-dispatch-config/2","generation":1,"issued_at":"2026-10-19T19:59:00.000000Z",'
-     b'"kind":"verifiers"}', "format"),
-    (b'{"body":{},"format":"levain-dispatch-config/1","generation":1,"issued_at":"today","kind":"verifiers"}',
-     "issued_at"),
-    (b'{"body":{},"format":"levain-dispatch-config/1","generation":1,"issued_at":"2026-10-19T19:59:00.000000Z",'
-     b'"kind":"jobs"}', "kind"),
-    (b'{"body":1.5,"format":"levain-dispatch-config/1","generation":1,"issued_at":"2026-10-19T19:59:00.000000Z",'
-     b'"kind":"verifiers"}', "parse"),
+    (raw_item()[:-1] + b',"extra":1}', "exactly"),
+    (raw_item(format="levain-dispatch-config/2"), "format"),
+    (raw_item(issued_at="today"), "issued_at"),
+    (raw_item(kind="jobs"), "kind"),
+    (raw_item(body=1.5), "parse"),
     (12, "canonical bytes or text"),
 ])
-def test_item_shape_refusals(store, log, raw, match):
+def test_item_shape_refusals(store, raw, match):
     with pytest.raises(ctl.ConfigRefused, match=match):
-        store.accept(raw, "sig", log.source)
+        store.accept(raw, "sig")
 
 
-def test_accept_takes_the_authority_source_never_a_snapshot(store, log, keys):
-    item, sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
-    with pytest.raises(ctl.ConfigRefused, match="AuthoritySource"):
-        store.accept(item, sig, log.source())
+def test_accept_uses_the_stores_own_authority():
+    # one authority source: the store's, given at construction and checked there
+    assert list(inspect.signature(ctl.ControlStore.accept).parameters) == ["self", "item", "signature"]
+
+
+def test_the_store_takes_the_authority_source_never_a_snapshot(cdir, log):
+    with pytest.raises(ctl.ControlStateUnavailable, match="AuthoritySource"):
+        ctl.ControlStore(cdir, authority=log.source())
 
 
 def test_an_empty_or_oversized_signature_is_refused(store, log, keys):
-    item, _sig = signed("verifiers", 1, VERIFIERS, keys["laptop"])
+    item, _sig = signed(store, "verifiers", 1, VERIFIERS, keys["laptop"])
     with pytest.raises(ctl.ConfigRefused, match="empty"):
-        store.accept(item, "", log.source)
+        store.accept(item, "")
     with pytest.raises(ctl.ConfigRefused, match="over"):
-        store.accept(item, "x" * (ctl.SIGNATURE_MAX + 1), log.source)
+        store.accept(item, "x" * (ctl.SIGNATURE_MAX + 1))
 
 
 # --- the pin -------------------------------------------------------------------------------------------------------
 
-def test_the_pin_is_set_once(cdir, keys):
-    ctl.ControlStore.init(cdir, keys["laptop"].fp)           # the same root again: a no-op
+def test_the_pin_is_set_once(cdir, log, keys):
+    ctl.ControlStore.init(cdir, keys["laptop"].fp, authority=log.source)   # the same root again: a no-op
     with pytest.raises(ctl.ConfigRefused, match="another trust root"):
-        ctl.ControlStore.init(cdir, keys["other"].fp)
+        ctl.ControlStore.init(cdir, keys["other"].fp, authority=log.source)
 
 
-def test_init_refuses_a_non_fingerprint(tmp_path):
+def test_init_refuses_a_non_fingerprint(tmp_path, log):
     with pytest.raises(ctl.ConfigRefused, match="fingerprint"):
-        ctl.ControlStore.init(_dir(tmp_path), "laptop")
+        ctl.ControlStore.init(_dir(tmp_path), "laptop", authority=log.source)
 
 
 def test_a_revoked_root_fails_every_read_closed(tmp_path, tmp_path_factory):
@@ -259,16 +456,16 @@ def test_a_revoked_root_fails_every_read_closed(tmp_path, tmp_path_factory):
     lg.enrol("laptop", "laptop-presence")
     lg.enrol("root", "laptop-presence")
     d = _dir(tmp_path)
-    ctl.ControlStore.init(d, ks["root"].fp)
+    ctl.ControlStore.init(d, ks["root"].fp, authority=lg.source)
     store = ctl.ControlStore(d, authority=lg.source, clock=Clock(NOW))
-    item, sig = signed("verifiers", 1, VERIFIERS, ks["root"])
-    store.accept(item, sig, lg.source)
+    accept(store, lg, ks, "verifiers", 1, VERIFIERS, key="root")
     assert store.active()["verifiers"].generation == 1
+    _top, head = store.head()
     lg.revoke("root")
     with pytest.raises(ctl.ControlStateUnavailable, match="revoked"):
         store.active()
     with pytest.raises(ctl.ConfigRefused, match="revoked"):
-        accept(store, lg, ks, "verifiers", 2, VERIFIERS, key="root")
+        accept(store, lg, ks, "verifiers", 2, VERIFIERS, key="root", prev=head)
 
 
 # --- append-only and fail-closed -----------------------------------------------------------------------------------
@@ -288,7 +485,7 @@ def _raw(cdir):
     "INSERT OR REPLACE INTO meta (key, value) VALUES ('trust_root', 'x')",
 ])
 def test_the_tables_are_append_only(store, log, keys, cdir, sql):
-    accept(store, log, keys, "verifiers", 2, VERIFIERS)
+    accept(store, log, keys, "verifiers", 1, VERIFIERS)
     conn = _raw(cdir)
     try:
         with pytest.raises(sqlite3.IntegrityError):
@@ -297,17 +494,19 @@ def test_the_tables_are_append_only(store, log, keys, cdir, sql):
         conn.close()
 
 
-def test_a_forged_row_fails_every_read_closed(store, log, keys, cdir):
+def test_a_forged_middle_row_fails_every_read_closed(store, log, keys, cdir):
+    # well formed, for this store, chained to its predecessor: the next item's prev no longer matches it
     base_config(store, log, keys)
     conn = _raw(cdir)
     try:
         conn.execute("DROP TRIGGER items_frozen")
         forged = tmpl(write_paths=["src/a.py", "src/b.py", "src/new.py", "src/c.py"])
-        text = ctl.item_bytes("templates", 2, [forged], NOW).decode()
+        text = ctl.item_bytes("templates", 2, [forged], NOW, prev=store.active()["verifiers"].digest,
+                              store_id=store.store_id()).decode()
         conn.execute("UPDATE items SET item = ? WHERE generation = 2", (text,))
     finally:
         conn.close()
-    with pytest.raises(ctl.ControlStateUnavailable, match="does not verify"):
+    with pytest.raises(ctl.ControlStateUnavailable, match="item 3 does not chain to item 2"):
         store.active()
     with pytest.raises(DispatchError):
         resolver(store)("fix-lint")
