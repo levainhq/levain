@@ -86,7 +86,7 @@ def test_trusted_hash_is_codex_own_and_doctor_reads_trust(tmp_path):
 
 def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unconfined(tmp_path, monkeypatch):
     """Q10 D1 + D2 on Codex: with no enrolled key a gated call answered nothing and the mode ran it. Now any mode
-    but default (and acceptEdits) gets the floor's PLAIN deny (Codex drops a deny that carries continue:false,
+    but default gets the floor's PLAIN deny (Codex drops a deny that carries continue:false,
     runs2 BC_1), nothing filed; default leaves it to Codex's approval; LEVAIN_UNCONFINED=1 passes it."""
     monkeypatch.delenv(cx.UNCONFINED_ENV, raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
@@ -102,7 +102,7 @@ def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unco
     rows = Ledger(qdir).window("codex", "S1", datetime.now(timezone.utc) - timedelta(days=1))
     assert [(r.phase, (r.stamp_detail or {}).get("decision")) for r in rows] == [("denied_by_gate", "floor")]
     assert _run(qdir, {**event, "permission_mode": "default"}) == ""
-    assert _run(qdir, {**event, "permission_mode": "acceptEdits"}) == ""  # L2-3: treated as default
+    assert "deny" in _run(qdir, {**event, "permission_mode": "acceptEdits"})  # run 4 C5: floored, not attended
     for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
