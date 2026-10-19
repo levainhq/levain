@@ -691,7 +691,8 @@ def test_c4_the_event_cap_keeps_what_is_still_waiting(tmp_path):
 def test_codex_a_doctor_fault_drops_the_cached_ok(tmp_path, monkeypatch):
     from levain.cockpit import glance
     clock = [1000.0]
-    monkeypatch.setattr(glance.time, "monotonic", lambda: clock[0])
+    import types
+    monkeypatch.setattr(glance, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))   # glance only, never the process clock
     calls: list[int] = []
     state = {"fail": False}
 
