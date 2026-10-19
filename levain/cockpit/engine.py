@@ -50,6 +50,7 @@ from levain.cockpit.registry import (
     ORDERINGS,
     CockpitRegistrationError,
     CONSENT_ROW_PREFIX,
+    QUESTION_ROW_PREFIX,
     OUTCOME_ROW_PREFIX,
     PENDING_ROW_PREFIX,
     FacetValueError,
@@ -117,10 +118,13 @@ _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
 
 DECISIONS_ID = "decisions"
 DECISION_ORDER = "decision.queue"
-KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX)
+KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX, CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
-                                    "agent", "tool", "consent_state", "consent_tier", "decided_at"})
+                                    "agent", "tool", "consent_state", "consent_tier", "decided_at",
+                                    "question_n", "question_state", "question_options"})
+QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
+QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 
 
 def _canon(obj: Any) -> bytes:
@@ -386,6 +390,7 @@ class _Decisions:
     source: "ProviderSpec | None" = None
     rows: Callable[[datetime], Any] | None = None
     consent: Callable[[datetime], Any] | None = None
+    questions: Any = None             # a ``levain.consent.questions.QuestionStore`` (Q-2b), read and answered at the source
     spec: "ProviderSpec | None" = None
 
 
@@ -461,6 +466,34 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
         except Exception:  # noqa: BLE001 - one entry that does not build is skipped and counted
             bad += 1
     return rows, bad
+
+
+def _question_row_in(q: Any) -> RowIn:
+    """One question (``levain.consent.questions.Question``) as a row: ``question:<n>``. A row carries who asked,
+    when, how many options it offers and whether it is answered, and NOTHING the agent wrote (the question, the
+    option labels, what it blocks): this panel is token-free on loopback, so those words are served only to a token
+    holder (``/cockpit/question/<n>.json``). Its version is its number and its answered-ness, read from the source,
+    so an answer that landed elsewhere (the phone, the CLI) makes a stale row a 409, never a second answer."""
+    answered = q.answer is not None
+    facets: dict[str, Any] = {"agent": q.agent, "at": q.filed_at, "question_n": q.n,
+                              "question_state": "answered" if answered else "open",
+                              "question_options": len(q.options)}
+    if answered:
+        facets["decided_at"] = q.answer.answered_at
+    return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{q.agent} · question #{q.n}", facets=facets,
+                 stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
+
+
+def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
+    """The question store's open questions, and those answered in the last day, as rows (with the count of open
+    ones left out past the cap). A queue with no ``questions.db`` lists nothing and creates nothing."""
+    from levain.consent.listing import PENDING_CAP
+
+    open_ = store.open_questions()
+    since = (now - timedelta(hours=QUESTION_DONE_HOURS)).astimezone(timezone.utc)
+    done = [q for q in store.recent(50) if q.answer is not None
+            and _parse_iso(q.answer.answered_at) >= since]
+    return [_question_row_in(q) for q in (*open_[:PENDING_CAP], *done)], max(len(open_) - PENDING_CAP, 0)
 
 
 class Cockpit:
@@ -575,6 +608,21 @@ class Cockpit:
             if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
                 self._install_decisions_locked()
 
+    def attach_question_rows(self, store: Any) -> None:
+        """The question band's store (``levain.consent.questions.QuestionStore``): agents' questions waiting on the
+        operator (Q-2b), read at the source, as the consent queue is. Its rows carry no question text, and the
+        panel offers ``question_answer`` on an open one. A read fault is a note, never a dark panel."""
+        with self._lock:
+            self._dec.questions = store
+            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+                self._install_decisions_locked()
+
+    @property
+    def question_store(self) -> Any:
+        """The store ``attach_question_rows`` was given (None before one is attached): ``question_answer`` writes
+        through it, and the verb dispatch hands it to the verb."""
+        return self._dec.questions
+
     @property
     def consent_reader(self) -> Callable[[datetime], Any] | None:
         """The reader ``attach_consent_rows`` was given (None before one is attached): the sessions panel joins
@@ -594,12 +642,15 @@ class Cockpit:
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
             version_fields=("*",),
             # what a decisions row shows: who asks and for which tool (the title) and its state word and tier
-            search_fields=tuple(dict.fromkeys((*((src.search_fields if src else ()) or ROW_SEARCH_DEFAULT["list"]), "consent_state", "consent_tier"))),
+            search_fields=tuple(dict.fromkeys((*((src.search_fields if src else ()) or ROW_SEARCH_DEFAULT["list"]), "consent_state", "consent_tier", "question_state"))),
             search_default_visible=src.search_default_visible if src else 10,
             read_one=lambda ctx, row_id: Fault("the decisions panel routes read_one by row id"),
             note=src.note if src else "", empty=src.empty if src else "Nothing is waiting on you.",
             rowset=src.rowset if src else None, edit_class=src.edit_class if src else "",
-            verbs=src.verbs if src else (), label_key=src.label_key if src else None)
+            # question_answer applies to a question row only (VerbSpec.applies_to), so a downstream row never gets it
+            verbs=tuple(dict.fromkeys((*(src.verbs if src else ()),
+                                       *((QUESTION_VERB,) if self._dec.questions is not None else ())))),
+            label_key=src.label_key if src else None)
         old = self._dec.spec
         if old is not None and self._specs.get(DECISIONS_ID) is old:
             self._unregister_locked(DECISIONS_ID)
@@ -1094,7 +1145,7 @@ class Cockpit:
             skipped += out.skipped
             if mine:
                 skipped.append({"count": len(mine), "reason": "open row skipped: its id carries a broker "
-                                                               "prefix (pend:/out:/consent:)"})
+                                                               "prefix (pend:/out:/consent:/question:)"})
             filtered += out.filtered
             if out.note:
                 notes.append(out.note)
@@ -1133,6 +1184,17 @@ class Cockpit:
                 skipped += cs.skipped
             except Exception as exc:  # noqa: BLE001 - a consent-queue fault is a note, never a dark panel
                 notes.append(f"agent consent requests unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        if dec.questions is not None:
+            try:
+                built, left_out = _question_rows_in(dec.questions, ctx.now)
+                if left_out:
+                    overflowed = True
+                    notes.append("more questions are waiting than are shown: the oldest are shown, the rest are not read")
+                qs = self._read_snap(self._broker_dec_spec, Read(rows=tuple(built)), ctx, now_iso)
+                rows += qs.rows or []
+                skipped += qs.skipped
+            except Exception as exc:  # noqa: BLE001 - a question-store fault is a note, never a dark panel
+                notes.append(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         rows = self._regroup(rows, ctx.today)
         status = "partial" if skipped or overflowed else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
@@ -1171,6 +1233,15 @@ class Cockpit:
             if r.id == row_id:
                 return Read(rows=(r,))
         return Absent(f"decision {row_id!r} is gone")
+
+    def _question_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        store = self._dec.questions
+        if store is None:
+            return Absent("no question store")
+        q = store.get(row_id[len(QUESTION_ROW_PREFIX):])     # also reads `#3` or `q-…`: only the canonical id is the row
+        if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
+            return Absent(f"decision {row_id!r} is gone")
+        return Read(rows=(_question_row_in(q),))
 
     def _book(self, spec: ProviderSpec, st: _State, out: Any, ctx: ReadContext) -> _Snap:
         """The owner's bookkeeping for one outcome: failure start, last good, presence. It reads only
@@ -2030,8 +2101,10 @@ class Cockpit:
         out = []
         for r in rows:
             pid = r.get("panel_id") or panel_id
-            if self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES):
-                # a broker row offers no panel verb; a pending offers its own cancel (§3)
+            if (self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES)
+                    and not str(r["id"]).startswith(QUESTION_ROW_PREFIX)):
+                # a broker row offers no panel verb; a pending offers its own cancel (§3). A question row is the
+                # exception: it offers question_answer through the ordinary row path (applies_to: an open one)
                 acts = (self._verb_view.pending_actions(r, cred, auth=auth)
                         if str(r["id"]).startswith(PENDING_ROW_PREFIX) else [])
             else:
@@ -2051,8 +2124,9 @@ class Cockpit:
             # the decisions panel routes by row id to the contributor that owns it (§0.4, §8d row 4)
             if row_id.startswith(KERNEL_DECISION_PREFIXES):
                 spec = self._broker_dec_spec
-                reader = self._consent_decision_one if row_id.startswith(CONSENT_ROW_PREFIX) \
-                    else self._broker_decision_one
+                reader = (self._consent_decision_one if row_id.startswith(CONSENT_ROW_PREFIX)
+                          else self._question_decision_one if row_id.startswith(QUESTION_ROW_PREFIX)
+                          else self._broker_decision_one)
             else:
                 src = self._dec.source
                 spec, reader = src, (src.read_one if src is not None else None)

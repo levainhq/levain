@@ -94,6 +94,8 @@
   let commitJob = null;
   // Cancel a waiting pending (the manifest source only): `cancelPending(cancel) → Promise<{ok}|{ok:false,...}>`.
   let cancelPending = null;
+  // Answer an agent's question (Q-2b, the manifest source only): `answerQuestion(rowId, {option}|{text}) → Promise<{ok}|{ok:false,...}>`.
+  let answerQuestion = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
@@ -249,6 +251,7 @@
     commitAction = opts && typeof opts.commitAction === "function" ? opts.commitAction : null;
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
     cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
+    answerQuestion = opts && typeof opts.answerQuestion === "function" ? opts.answerQuestion : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
@@ -3275,6 +3278,138 @@
     return row;
   }
 
+  // An agent's question to the operator (Q-2b). The panel row carries only who asked, when, how many options and whether
+  // it is answered: the question, the option labels and what it blocks are the agent's words, so they are fetched from
+  // /cockpit/question/<n>.json with the token this page holds (the consent body's gate) when the row is opened. With the
+  // write token and an offered verb the body shows one button per option and a words box; without them it shows the CLI
+  // command to copy. Every string is drawn with textContent, never as HTML; an answer authorises nothing (ruling 26a).
+  const questionBodies = new Map();
+  function questionFetch(q, headers, tryNo) {
+    return fetchBounded("/cockpit/question/" + encodeURIComponent(String(q.n)) + ".json", { cache: "no-store", headers: headers },
+      (res) => {
+        if (res.status === 403) return { error: CONSENT_BAD_TOKEN };
+        if (res.status === 404) return { error: "this question is no longer listed" };
+        if (res.status === 503 && tryNo < CONSENT_TRIES) {
+          return new Promise((r) => setTimeout(r, CONSENT_RETRY_MS)).then(() => questionFetch(q, headers, tryNo + 1));
+        }
+        if (!res.ok) return { error: "the question could not be read (HTTP " + res.status + ")" };
+        return res.json().then((b) => (b && typeof b === "object" ? b : { error: "the question could not be read" }),
+                               () => ({ error: "the question could not be read" }));
+      },
+      () => ({ error: "the question could not be read (network)" }));
+  }
+  function questionBody(q, row) {
+    const key = q.n + "|" + q.state;
+    if (questionBodies.has(key)) return questionBodies.get(key);
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? t.headers() : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN, noToken: true });
+    const got = consentQueued(() => questionFetch(q, headers, 1), "the question could not be read", row)
+      .then((b) => { if (b.error && questionBodies.get(key) === got) questionBodies.delete(key); return b; });
+    questionBodies.set(key, got);
+    return got;
+  }
+  function copyLine(cmd, label) {
+    const line = el("div", "consent-cmd");
+    const code = el("code", "consent-code", cmd);
+    const btn = el("button", "undo-btn consent-copy", "copy " + label);
+    btn.type = "button";
+    btn.dataset.label = btn.textContent;
+    btn.addEventListener("click", () => copyText(cmd, code, btn));
+    line.append(code, btn);
+    return line;
+  }
+  function drawQuestionBody(q, slot, b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const open = q.state === "open";
+    const cli = "levain question answer " + q.n + " --option <key>";
+    if (b.error) {
+      const parts = [el("div", "consent-note ext-meta", b.error)];
+      if (open) parts.push(copyLine(cli, "answer command"));   // no token: the terminal route still answers
+      slot.replaceChildren(...parts);
+      return;
+    }
+    const parts = [el("pre", "consent-display", sv(b.what))];
+    const options = Array.isArray(b.options) ? b.options : [];
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
+    facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
+    parts.push(facts);
+    const a = b.answer && typeof b.answer === "object" ? b.answer : null;
+    if (a) {
+      const opt = options.find((o) => o && o.key === a.value);
+      parts.push(el("div", "consent-note ext-meta", "answered via " + sv(a.channel) + (a.kind === "option"
+        ? ": option " + sv(a.value) + (opt ? " (" + sv(opt.label) + ")" : "") : ", in words: " + sv(a.value))));
+      slot.replaceChildren(...parts);
+      return;
+    }
+    if (!(open && q.offered && answerQuestion)) {
+      for (const o of options) parts.push(el("div", "ext-meta", sv(o && o.key) + " — " + sv(o && o.label)));
+      if (open) parts.push(copyLine(cli, "answer command"));
+      slot.replaceChildren(...parts);
+      return;
+    }
+    const wrap = el("div", "verb-actions question-answer");
+    const controls = [];
+    const msg = el("span", "edit-msg", "");
+    const send = async (params) => {
+      for (const c of controls) c.disabled = true;
+      let res;
+      try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
+      if (res && res.ok) return;   // the board re-reads and redraws this row as answered
+      for (const c of controls) c.disabled = false;
+      msg.textContent = (res && (res.message || res.error)) || "failed";
+    };
+    for (const o of options) {
+      const key = sv(o && o.key);
+      const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (key === sv(b.rec) ? " (recommended)" : ""));
+      btn.type = "button";
+      btn.title = "answer with option " + key;
+      btn.addEventListener("click", () => send({ option: key }));
+      controls.push(btn);
+      wrap.appendChild(btn);
+    }
+    const words = el("textarea", "question-words");
+    words.rows = 2;
+    words.maxLength = 4000;
+    words.placeholder = "or answer in your own words";
+    const sendWords = el("button", "undo-btn question-send", "send words");
+    sendWords.type = "button";
+    sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
+    controls.push(words, sendWords);
+    parts.push(wrap, words, sendWords, msg);
+    slot.replaceChildren(...parts);
+  }
+  function questionRow(o) {
+    const q = o.question;
+    const open = q.state === "open";
+    const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
+    row.setAttribute("data-question-row", "");
+    const head = el("div", "consent-head");
+    head.appendChild(el("span", "consent-agent", q.agent || "agent"));
+    head.appendChild(el("b", "consent-tool", "question #" + q.n));
+    head.appendChild(el("span", "ext-meta", q.options + " options"));
+    head.appendChild(el("span", "consent-audit", q.state));
+    if (q.age) head.appendChild(el("span", "ext-meta", "filed " + q.age));
+    if (!open && q.decidedAge) head.appendChild(el("span", "ext-meta", "answered " + q.decidedAge));
+    row.appendChild(head);
+    const btn = el("button", "undo-btn consent-details", open ? "open" : "details");
+    btn.type = "button";
+    btn.title = open ? "read the question and answer it" : "show how this question was answered";
+    let slot = null;   // one slot per row: a retry after a failed read reuses it
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
+      slot.replaceChildren(document.createTextNode("reading the question…"));
+      questionBody(q, row).then((b) => {
+        drawQuestionBody(q, slot, b);
+        if (b.error) btn.disabled = false; else btn.remove();
+      });
+    });
+    head.appendChild(btn);
+    return row;
+  }
+
   // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
   // page holds, as the consent details do, and draws it as text only (textContent, never HTML: the prompts and replies are
   // whatever an agent said). The record shows the events the hooks kept (cut ones marked) with the session's consent
@@ -3466,6 +3601,7 @@
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
+      if (o.question) { host.appendChild(questionRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint

@@ -106,6 +106,12 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "consent_state": ("enum", _enum("pending", "allowed", "denied", "expired", "withdrawn", "undecided")),
     "consent_tier": ("str", _is_str),
     "decided_at": ("timestamp", _is_str),    # a decided request's time (an unswept one: its expiry); `at` stays the filing
+    # Q-2b: an agent's question in the decisions panel; `agent`, `at` and `decided_at` are registered above. The
+    # question's words are never a facet (the panel is token-free on loopback): only its number, whether it is
+    # answered, and how many options it offers
+    "question_n": ("int", _is_int),
+    "question_state": ("enum", _enum("open", "answered")),
+    "question_options": ("int", _is_int),
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
 
@@ -245,9 +251,12 @@ def _decision_key(row: RowIn, today: date) -> tuple:
 PENDING_ROW_PREFIX = "pend:"
 OUTCOME_ROW_PREFIX = "out:"
 CONSENT_ROW_PREFIX = "consent:"      # an external agent's consent request (Q6a): the kernel's, like the two above
+QUESTION_ROW_PREFIX = "question:"    # an agent's question to the operator (Q-2b): the kernel's too
 
 
 def _queue_group(row: RowIn, today: date) -> str:
+    if row.id.startswith(QUESTION_ROW_PREFIX):
+        return "needs_input" if row.facets.get("question_state") == "open" else "resolved"
     if row.id.startswith(CONSENT_ROW_PREFIX):
         # an undecided request waits on the operator's late ruling, as a pending one waits on his answer
         return "needs_input" if row.facets.get("consent_state") in ("pending", "undecided") else "resolved"
@@ -261,10 +270,12 @@ def _queue_group(row: RowIn, today: date) -> str:
 def _queue_key(row: RowIn, today: date) -> tuple:
     # open and waiting: dated first (a pending's due is its expiry date); history: newest first
     if _queue_group(row, today) == "needs_input":      # an agent is blocked on it: soonest expiry first
+        if row.id.startswith(QUESTION_ROW_PREFIX):     # a question never expires: after the requests, oldest first
+            return (0, 1, str(row.facets.get("at") or ""), row.id)
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
     if _queue_group(row, today) in ("open", "waiting"):
         return _decision_key(row, today)
-    if row.id.startswith(CONSENT_ROW_PREFIX):          # a decided consent row: newest decision first (`at` is the filing)
+    if row.id.startswith((CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX)):   # a decided consent or answered question row: newest decision first (`at` is the filing)
         at = str(row.facets.get("decided_at") or row.facets.get("at") or "")
         return (0 if at else 1, tuple(-ord(c) for c in at), row.id)
     return _time_desc_key(row, today)

@@ -587,6 +587,16 @@
     return { ok: true, data: d };
   }
 
+  // answer an agent's question (Q-2b): the row's own offered question_answer, posted like any row verb (C1, one tap
+  // = one answer, so no confirm); the kernel's 409 on a row that changed is the answer when it was answered elsewhere
+  async function answerQuestion(rowId, params) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const row = live.rows[rowId];
+    const action = row && Array.isArray(row.actions) ? row.actions.find((a) => a && a.verb === "question_answer") : null;
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers an answer here; nothing was sent" };
+    return postVerb(action, params, {});
+  }
+
   // Draw what the last write said on its row (or in the status line when the row is gone). The status
   // line carries it either way.
   function showNotice() {
@@ -692,7 +702,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;

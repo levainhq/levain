@@ -302,6 +302,50 @@ def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
 
 
 _SPORE_ROW = lambda r: str(r.get("id", "")).startswith("spore:")   # noqa: E731
+# an OPEN question row only: an answered one is a 409 (the row it was rendered on is no longer offered the verb)
+_OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   # noqa: E731
+                                and _facet(r, "question_state") == "open")
+
+
+def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """Answer one question (Q-2b): the operator's words or option key, recorded once and unsigned, channel
+    ``cockpit``, then delivered to the agent's session on a daemon thread (a resume settles in seconds, and a verb
+    handler does not hold its request for it). The answer authorises nothing (ruling 26a), so this is C1 and needs
+    no broker. A delivery error never undoes the answer: ``levain question deliver`` retries it."""
+    import threading
+
+    from levain.cockpit.consent import ConsentError
+    from levain.consent import band
+    from levain.consent.questions import QuestionStoreError
+
+    store = target.get("questions")
+    if store is None:
+        raise EditError("not_built", 501, "this cockpit has no question store")
+    if ("option" in params) == ("text" in params):
+        raise EditError("bad_request", 400, "answer with exactly one of an option key or free text")
+    n = _facet(target["row"], "question_n")
+    try:
+        q = store.get(n)
+        if q is None or q.answer is not None:      # the version check ran on the row; this is the race behind it
+            raise EditError("stale", 409, f"question #{n} was answered or is gone")
+        if "option" in params and (not isinstance(params["option"], str)
+                                   or params["option"] not in {k for k, _ in q.options}):
+            raise EditError("bad_request", 400, f"{params['option']!r} is not an option of question #{n}")
+        store.answer(q.id, option=params.get("option"), text=params.get("text"), channel="cockpit")
+    except ConsentError as exc:
+        raise EditError("stale" if "already answered" in str(exc) else "bad_request",
+                        409 if "already answered" in str(exc) else 400, str(exc)) from None
+    except (QuestionStoreError, OSError) as exc:
+        raise EditError("source_unavailable", 503, f"the question store cannot answer now: {exc}") from None
+
+    def deliver() -> None:
+        try:
+            band.deliver_answer(store, q.id)
+        except Exception:  # noqa: BLE001 - the answer stands; `levain question deliver` retries it
+            pass
+
+    threading.Thread(target=deliver, name="levain-answer-delivery", daemon=True).start()
+    return {"answered": n, "delivery": "started"}
 
 
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
@@ -351,6 +395,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              # the entity's own episodes only: a federated feed's row (``feed:<name>:<id>``) is another
              # writer's, and this store cannot tombstone it
              applies_to=lambda r: str(r.get("id", "")).startswith("episode:")),
+    VerbSpec("question_answer", "answer", "records your answer to an agent's question and sends it to the agent "
+             "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
+             reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
              fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),
@@ -771,7 +818,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
-                              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web")}
+                              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web"),
+                              "questions": cockpit.question_store}
     if verb.binding == "value":
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)

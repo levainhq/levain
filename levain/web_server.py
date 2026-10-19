@@ -135,7 +135,12 @@ _COCKPIT_VERB_PATH = "/cockpit/verb"
 _CONSENT_BODY_PREFIX = "/cockpit/consent/"
 _CONSENT_BODY_SUFFIX = ".json"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
-PROPOSALS_ID = "proposals"       # GET /cockpit/consent/proposals.json: the standing-rule proposals, same token gate
+# One agent question's body (Q-2b): GET /cockpit/question/<n>.json. The question's words, its option labels and what
+# it blocks are the agent's, as unmaskable as a Bash command's text, so the decisions panel's question row carries
+# none of them and this route serves them behind EXACTLY the consent body's gate (a surface token on every bind).
+_QUESTION_BODY_PREFIX = "/cockpit/question/"
+_QUESTION_ID = re.compile(r"[1-9][0-9]{0,11}")
+PROPOSALS_ID = "proposals"      # GET /cockpit/consent/proposals.json: the standing-rule proposals, same token gate
 # One agent session's transcript (Q8): GET /cockpit/session/<stem>.json. It names the session id and full cwd and
 # carries the operator's prompts, so it rides the consent body's gate: a surface token on EVERY bind, loopback included.
 _SESSION_LOG_PREFIX = "/cockpit/session/"
@@ -379,7 +384,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
-_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX)
+_RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -659,6 +664,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     surface_tokens: dict[str, str]
     # Q6a: ``fn(now)`` -> the consent queue's read-only listing, shared by the decisions panel and the body route
     consent_reader: Callable[[datetime], Any]
+    # Q-2b: the question band's store over the same queue directory, shared by the decisions panel, the body route
+    # and the answer verb; a queue with no questions.db lists none and creates none
+    question_store: Any
     verb_registry: VerbRegistry
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
@@ -726,6 +734,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
                     built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
                 built.attach_consent_rows(self.consent_reader)    # agents waiting on the operator (Q6a)
+                if getattr(self, "question_store", None) is not None:
+                    built.attach_question_rows(self.question_store)   # and the questions they ask him (Q-2b)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -876,6 +886,41 @@ class _Handler(GuardedHandler):
                     if entry is not None:
                         status, payload = 200, entry_body(entry)
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
+                status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+            finally:
+                self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _serve_question_body(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/question/<n>.json``: one question's body (what, options, rec, blocks, agent, filed_at, and
+        its answer if any). The consent body's gate, exactly: reached only through ``_route``, then a surface token
+        on every bind, judged by the one compare every token check here uses, before the id is looked at. Read-only:
+        an id that is not 1 to 12 digits, or names no question, is 404, and no ``questions.db`` is ever created."""
+        if not self._off_box_token_valid():
+            self._send(json.dumps({"error": "forbidden", "message": (
+                f"a question's details need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
+            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
+                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        n = urllib.parse.unquote(path[len(_QUESTION_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
+        status, payload = 404, {"error": "not_found", "message": "no such question"}
+        store = getattr(self.server, "question_store", None)
+        if store is not None and _QUESTION_ID.fullmatch(n):
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                q = store.get(int(n))
+                if q is not None:
+                    a = q.answer
+                    status, payload = 200, {
+                        "n": q.n, "agent": q.agent, "what": q.what,
+                        "options": [{"key": k, "label": label} for k, label in q.options],
+                        "rec": q.rec, "blocks": q.blocks, "filed_at": q.filed_at,
+                        "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
+                                                          "answered_at": a.answered_at}}
+            except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
                 status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             finally:
                 self.server.request_gate.release()
@@ -1047,6 +1092,9 @@ class _Handler(GuardedHandler):
 
         if path.startswith(_CONSENT_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_consent_body(path, head=head)
+            return
+        if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
+            self._serve_question_body(path, head=head)
             return
         if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
             self._serve_session_log(path, head=head)
@@ -1738,8 +1786,12 @@ def make_server(
         cockpit.attach_decision_rows(httpd.broker.decision_rows)
     # one reader over one queue directory for the decisions panel's rows and the consent body route alike
     httpd.consent_reader = _consent_reader()
+    from levain.consent.questions import QuestionStore
+
+    httpd.question_store = QuestionStore(getattr(httpd.consent_reader, "directory", None))
     if cockpit is not None:
         cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
+        cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address

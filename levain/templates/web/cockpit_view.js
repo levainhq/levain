@@ -263,6 +263,18 @@
                            age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                            decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "" };
         }
+        // an agent's question (Q-2b): the row carries who asked, when, how many options and whether it is answered; the
+        // question itself is fetched with the page's token (dashboard_core.js questionRow). `offered` is the kernel's
+        // own answer that this credential may answer it from here (the verb's gesture), never the page's guess
+        if (head.id === "decisions" && typeof r.id === "string" && r.id.indexOf("question:") === 0) {
+          const f = r.facets || {};
+          const sv = (x) => (typeof x === "string" ? x : "");
+          line.question = { id: r.id, n: isNum(f.question_n) ? f.question_n : 0, agent: sv(f.agent), state: sv(f.question_state),
+                            options: isNum(f.question_options) ? f.question_options : 0,
+                            age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
+                            decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
+                            offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct") };
+        }
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
