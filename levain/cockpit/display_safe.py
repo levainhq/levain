@@ -13,7 +13,7 @@ __all__ = ["visible"]
 
 # blank-looking characters outside Cf/Cc/Zs: line and paragraph separators, Hangul fillers, braille blank,
 # combining grapheme joiner, Mongolian free variation selectors
-_BLANKS = "  ㅤ⠀ᅟᅠﾠ͏᠋᠌᠍"
+_BLANKS = "\u2028\u2029\u3164\u2800\u115f\u1160\uffa0\u034f\u180b\u180c\u180d"
 
 
 def visible(text: Any) -> Any:
