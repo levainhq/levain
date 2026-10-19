@@ -387,6 +387,9 @@ class _PhoneServer(ThreadingHTTPServer):
         from levain.cockpit.consent import ConsentError
         from levain.consent.questions import QuestionStore, QuestionStoreError
 
+        from levain.authority import AuthorityError, VerifierUnavailable
+        from levain.consent.queue import QueueStoreError
+
         need = {"option", "payload", "authenticator_data", "client_data_json", "signature"}
         if not isinstance(req, dict) or set(req) != need or not isinstance(req["option"], str):
             raise PhoneError(400, "bad_request", f"request keys must be {sorted(need)}")
@@ -403,7 +406,11 @@ class _PhoneServer(ThreadingHTTPServer):
         if link is None or req["option"] != link.option:
             raise PhoneError(422, "answer_refused", f"option {req['option'][:20]!r} of question #{n} leads to no push: "
                                                     "answer it without a passkey")
-        if not self._link_matches(q):
+        try:
+            matches = self._link_matches(q)
+        except (AuthorityError, VerifierUnavailable, QueueStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the consent queue cannot answer now: {exc}") from None
+        if not matches:
             raise PhoneError(422, "answer_refused", f"question #{n}'s link does not name a push of its own session; "
                                                     "rule the request from its own card")
         payload = req["payload"]

@@ -240,7 +240,7 @@ def _file_push_request(agent: str, session: str, option: str, push: tuple[str, s
     from datetime import timedelta
 
     from levain.consent import push_gate
-    from levain.consent.queue import gap_label
+    from levain.consent.queue import class_covers, gap_label
 
     if session == NO_SESSION:
         raise ValueError("--would-push needs the session the push will run from, and none was found: pass --session")
@@ -250,6 +250,11 @@ def _file_push_request(agent: str, session: str, option: str, push: tuple[str, s
         raise ValueError(f"no enrolled key can rule on the push (the queue's {_agents()[agent].SETTINGS_NAME} names "
                          "no cockpit with an active key)")
     queue = push_gate._queue(qdir, settings)
+    snapshot = queue._fresh_authority()
+    if snapshot is None or not any(class_covers(k.key_class, push_gate.PUSH_TIER) for k in snapshot.active_keys()):
+        raise ValueError(f"no active key can allow a {push_gate.PUSH_TIER} push (the authority log holds none of a "
+                         "class that covers it), so the option could never allow it")
+    queue_id = queue.queue_id                    # read before filing: nothing after the filing may fail unnamed
     request = queue.file(agent=agent, agent_session_id=session, tool_name=push_gate.PUSH_TOOL, tool_input=call,
                          cwd=call["repo"], hold=timedelta(seconds=1), tier=push_gate.PUSH_TIER)
     try:
@@ -262,8 +267,19 @@ def _file_push_request(agent: str, session: str, option: str, push: tuple[str, s
     if marked.state != "undecided" or marked.gap is None:
         raise _PushFiled(f"the push request {request.id} was filed but is {marked.state}, not undecided "
                          f"({marked.reason}); no question was tied to it")
-    return (Link(option, "push", request.id, queue.queue_id), push_gate.push_what(call),
+    return (Link(option, "push", request.id, queue_id), push_gate.push_what(call),
             gap_label(marked.gap, session), call)
+
+
+def _push_state(agent: str, qdir: Path, request_id: str) -> str:
+    """The linked push request's state now, or ``unknown`` when the queue cannot say."""
+    from levain.consent import push_gate
+
+    try:
+        got = push_gate._queue(qdir, _agents()[agent].load_settings(qdir)).get(request_id)
+    except Exception:  # noqa: BLE001 - only the words to the agent depend on it
+        return "unknown"
+    return "missing" if got is None else got[1]
 
 
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
@@ -328,7 +344,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     try:
         ping_text = _ping_text(agent, q, qdir)
         if link is not None:
-            ping_text += f"\nOption {link.option} also allows, with one Face ID on the phone page: the {push_words}."
+            ping_text += f"\nOption {link.option} also allows, with one passkey tap on the phone page: the {push_words}."
         pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
         pinged = False
@@ -345,9 +361,16 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         # the call as filed (the repository's real path, the canonical remote): the push names the same call
         # from whatever directory the agent runs it in
         repo, remote, branch = call["repo"], call["remote"], call["branch"]
+        state = _push_state(agent, qdir, link.request_id)
+        if state not in ("undecided", "unknown"):              # ruled while the question waited on its store's lock
+            text += (f" Option {link.option} leads to the {push_words}: its consent request {link.request_id} is "
+                     f"already {state}; the option's one tap no longer rules it. Run `levain push` only if the "
+                     "operator's answer says to; it asks if nothing allows it.")
+            return q, text
         text += (f" Option {link.option} leads to the {push_words}: levain filed it as consent request "
-                 f"{link.request_id}, undecided (gap {gap}). If the operator picks that option on the phone with "
-                 "Face ID, that same tap signs a ruling that allows the push; then, from this same session, run "
+                 f"{link.request_id}, undecided (gap {gap}). If the operator picks that option on the phone page "
+                 "with a passkey, that same tap signs a ruling that allows the push (with no passkey enrolled the "
+                 "operator rules it with `levain consent rule`); then, from this same session, run "
                  f"`levain push --repo {shlex.quote(repo)} --remote {shlex.quote(remote)} --branch {shlex.quote(branch)}` and it runs "
                  f"once without asking again. A new commit on {branch} before then is a different push, which asks.")
     return q, text
