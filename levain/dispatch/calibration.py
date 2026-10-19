@@ -96,13 +96,16 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
     return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow)
 
 
-def _unique(labels: Iterable[Label] | LabelSet, incomplete: bool) -> tuple[list[Label], bool]:
+def _unique(labels: Iterable[Label] | LabelSet, incomplete: bool | None) -> tuple[list[Label], bool]:
     """The labels once per request id, and whether the set they came from is incomplete. The same label twice (two
     overlapping reads concatenated) counts once; two DIFFERENT labels for one request are refused, since one of them
-    is not his record."""
+    is not his record. A plain iterable carries no completeness of its own, so its caller must state it: a list cut
+    from an incomplete :class:`LabelSet` would otherwise read as complete."""
     if isinstance(labels, LabelSet):
-        incomplete = incomplete or labels.incomplete
+        incomplete = bool(incomplete) or labels.incomplete
         labels = labels.labels
+    elif incomplete is None:
+        raise DispatchError("a plain label list must state incomplete= (a LabelSet carries its own)")
     seen: dict[str, Label] = {}
     for lab in labels:
         prior = seen.get(lab.request_id)
@@ -131,11 +134,11 @@ class DenyRate:
 
 
 def deny_rate(labels: Iterable[Label] | LabelSet, *, by_class: bool = True,
-              incomplete: bool = False) -> dict[object, DenyRate]:
+              incomplete: bool | None = None) -> dict[object, DenyRate]:
     """How often he denied, with N: per action class (``by_class``) or under the single key ``"all"``. The
     always-allow judge's score is ``1 - rate``; :func:`agreement` states that baseline per class. Each request counts
     once (see :func:`agreement`); a :class:`LabelSet` passes its ``incomplete`` flag on to every rate, and a plain
-    iterable takes it from ``incomplete``."""
+    iterable must state it with ``incomplete``."""
     unique, incomplete = _unique(labels, incomplete)
     tally: dict[object, list[int]] = {}
     for lab in unique:
@@ -172,8 +175,8 @@ class ClassReport:
     deny_rate: Fraction | None
     baseline_agreement: Fraction | None
     undecided: int = 0
-    incomplete: bool = False
     caveat: str = field(default=CAVEAT, compare=False)
+    incomplete: bool = False
 
     @property
     def agreement(self) -> Fraction | None:
@@ -181,7 +184,7 @@ class ClassReport:
 
 
 def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str], *,
-              incomplete: bool = False) -> dict[ActionClass, ClassReport]:
+              incomplete: bool | None = None) -> dict[ActionClass, ClassReport]:
     """Score a judge's ``predictions`` (request id -> allow, deny or abstain) against ``labels``, per action class.
     The judge is not called here. A prediction for a request with no allow/deny label (an undecided one, an unknown
     id) is not scored. A labelled request the judge made no prediction for counts as abstained.
@@ -189,7 +192,7 @@ def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str]
     Each request counts ONCE: the same label repeated (overlapping reads concatenated) is counted once, and two
     different labels for one request id are refused (:class:`DispatchError`), so N is the number of his decisions,
     never of rows. A :class:`LabelSet` passes its ``incomplete`` flag to every report; for a plain iterable the
-    caller states it with ``incomplete``."""
+    caller must state it with ``incomplete``."""
     for rid, said in predictions.items():
         if said not in PREDICTIONS:
             raise DispatchError(f"prediction for {rid!r} must be one of {', '.join(PREDICTIONS)}: {said!r}")
@@ -222,7 +225,7 @@ def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str]
             cls, t["labelled"], t["predicted"], t["agree"], t["dangerous"], t["costly"], t["abstained"],
             Fraction(t["denied"], t["labelled"]) if t["labelled"] else None,
             Fraction(t["predicted_allowed"], t["predicted"]) if t["predicted"] else None, t["undecided"],
-            incomplete)
+            incomplete=incomplete)
     return out
 
 

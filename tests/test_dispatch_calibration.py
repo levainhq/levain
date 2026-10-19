@@ -111,18 +111,18 @@ def L(rid, cls, decision):
 
 def test_deny_rate_per_class_with_n_and_undecided_kept_apart():
     labels = [L("1", A, "allow"), L("2", A, "allow"), L("3", A, "deny"), L("4", A, "undecided"), L("5", B, "deny")]
-    got = deny_rate(labels)
+    got = deny_rate(labels, incomplete=False)
     assert (got[A].n, got[A].denies, got[A].undecided, got[A].rate) == (3, 1, 1, Fraction(1, 3))
     assert (got[B].n, got[B].rate) == (1, Fraction(1))
-    whole = deny_rate(labels, by_class=False)["all"]
+    whole = deny_rate(labels, by_class=False, incomplete=False)["all"]
     assert (whole.n, whole.denies, whole.undecided) == (4, 2, 1)
-    assert deny_rate([]) == {}
+    assert deny_rate([], incomplete=False) == {}
 
 
 def test_agreement_counts_both_disagreement_directions_and_the_baseline():
     labels = [L("1", A, "allow"), L("2", A, "allow"), L("3", A, "allow"), L("4", A, "deny"), L("5", A, "deny")]
     preds = {"1": "allow", "2": "deny", "3": "allow", "4": "allow", "5": "deny"}
-    r = agreement(labels, preds)[A]
+    r = agreement(labels, preds, incomplete=False)[A]
     assert (r.n_labelled, r.n_predicted, r.agree) == (5, 5, 3)
     assert (r.judge_allow_human_deny, r.judge_deny_human_allow, r.abstained) == (1, 1, 0)
     assert r.deny_rate == Fraction(2, 5) and r.baseline_agreement == Fraction(3, 5)   # 1 - deny_rate over all
@@ -133,27 +133,27 @@ def test_agreement_counts_both_disagreement_directions_and_the_baseline():
 def test_an_always_allow_judge_scores_exactly_the_baseline():
     labels = [L(str(i), A, "deny" if i % 4 == 0 else "allow") for i in range(1, 21)]
     preds = {lab.request_id: "allow" for lab in labels}
-    r = agreement(labels, preds)[A]
+    r = agreement(labels, preds, incomplete=False)[A]
     assert r.agreement == r.baseline_agreement == Fraction(1) - r.deny_rate == Fraction(3, 4)
     assert proposal_eligible(r, min_n=1, min_agreement="0.5", min_coverage=0, max_dangerous=99)[0] is False
 
 
 def test_abstain_and_missing_predictions_are_not_scored_and_the_baseline_follows_the_predicted_set():
     labels = [L("1", A, "allow"), L("2", A, "deny"), L("3", A, "deny"), L("4", A, "undecided")]
-    r = agreement(labels, {"1": "allow", "2": "abstain", "4": "deny", "zzz": "allow"})[A]
+    r = agreement(labels, {"1": "allow", "2": "abstain", "4": "deny", "zzz": "allow"}, incomplete=False)[A]
     assert (r.n_labelled, r.n_predicted, r.abstained, r.undecided) == (3, 1, 2, 1)   # 3 had no prediction
     assert r.agreement == Fraction(1) and r.baseline_agreement == Fraction(1)         # over the one predicted
     assert r.deny_rate == Fraction(2, 3)
 
 
 def test_a_class_with_no_prediction_has_no_agreement_and_no_baseline():
-    r = agreement([L("1", A, "allow")], {})[A]
+    r = agreement([L("1", A, "allow")], {}, incomplete=False)[A]
     assert (r.agreement, r.baseline_agreement, r.n_predicted) == (None, None, 0)
 
 
 def test_a_prediction_value_outside_the_three_is_refused():
     with pytest.raises(DispatchError):
-        agreement([L("1", A, "allow")], {"1": "maybe"})
+        agreement([L("1", A, "allow")], {"1": "maybe"}, incomplete=False)
 
 
 # --- eligibility -------------------------------------------------------------------------------------------------
@@ -163,7 +163,7 @@ def good_report(**override):
     labels = [L(f"a{i}", A, "allow") for i in range(30)] + [L(f"d{i}", A, "deny") for i in range(10)]
     preds = {lab.request_id: lab.decision for lab in labels}
     preds["a0"] = "deny"
-    r = agreement(labels, preds)[A]
+    r = agreement(labels, preds, incomplete=False)[A]
     return r if not override else type(r)(**{**r.__dict__, **override})
 
 
@@ -193,14 +193,14 @@ def test_a_dangerous_disagreement_over_the_ceiling_fails():
 
 def test_not_beating_the_baseline_fails_even_with_high_agreement():
     labels = [L(f"a{i}", A, "allow") for i in range(39)] + [L("d", A, "deny")]
-    r = agreement(labels, {lab.request_id: "allow" for lab in labels})[A]      # 39/40 = the baseline exactly
+    r = agreement(labels, {lab.request_id: "allow" for lab in labels}, incomplete=False)[A]      # 39/40 = the baseline exactly
     ok, why = proposal_eligible(r, min_n=10, min_agreement="0.9", min_coverage=0, max_dangerous=5)
     assert not ok and "always-allow baseline" in why
 
 
 def test_every_failing_reason_is_named_together():
     labels = [L("1", A, "deny")]
-    r = agreement(labels, {"1": "allow"})[A]
+    r = agreement(labels, {"1": "allow"}, incomplete=False)[A]
     ok, why = proposal_eligible(r, min_n=5, min_agreement="0.9", min_coverage=0, max_dangerous=0)
     assert not ok and why.count(";") == 3
 
@@ -221,7 +221,7 @@ def test_end_to_end_from_a_real_queue(queue, keys):
         decide(queue, keys, r, "deny" if i < 2 else "allow")
     labels = read_labels(queue.directory, now=at(queue)).labels
     judge = {r.id: ("deny" if i < 2 else "allow") for i, r in enumerate(reqs)}
-    rep = agreement(labels, judge)[("claude_code", "Edit", "T2")]
+    rep = agreement(labels, judge, incomplete=False)[("claude_code", "Edit", "T2")]
     assert (rep.n_labelled, rep.agree, rep.judge_allow_human_deny, rep.deny_rate) == (6, 6, 0, Fraction(1, 3))
     assert proposal_eligible(rep, min_n=6, min_agreement=1, min_coverage=0, max_dangerous=0) == (True, "")
     assert proposal_eligible(rep, min_n=7, min_agreement=1, min_coverage=0, max_dangerous=0)[0] is False
@@ -232,7 +232,7 @@ def test_a_judge_that_abstains_on_the_hard_calls_fails_the_coverage_floor():
     right, beating the baseline), so its coverage is 30/80."""
     labels = [L(f"a{i}", A, "allow") for i in range(60)] + [L(f"d{i}", A, "deny") for i in range(20)]
     preds = {f"a{i}": "allow" for i in range(20)} | {f"d{i}": "deny" for i in range(10)}
-    r = agreement(labels, preds)[A]
+    r = agreement(labels, preds, incomplete=False)[A]
     assert (r.n_labelled, r.n_predicted, r.abstained) == (80, 30, 50)
     ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
     assert not ok and "answered 30 of 80 labelled requests" in why and "below 1/2" in why
@@ -255,19 +255,19 @@ def test_a_request_counts_once_however_many_times_its_label_is_repeated():
     # codex: one allow and one deny repeated twenty times scored as 40 decisions and passed min_n=30
     labels = [L("1", A, "allow"), L("2", A, "deny")] * 20
     preds = {"1": "allow", "2": "deny"}
-    r = agreement(labels, preds)[A]
+    r = agreement(labels, preds, incomplete=False)[A]
     assert (r.n_labelled, r.n_predicted, r.agree) == (2, 2, 2)
     ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=0)
     assert ok is False and "below min_n=30" in why
-    assert deny_rate(labels)[A].n == 2
+    assert deny_rate(labels, incomplete=False)[A].n == 2
 
 
 def test_two_different_labels_for_one_request_are_refused():
     for other in (L("1", A, "deny"), L("1", B, "allow")):
         with pytest.raises(DispatchError, match="two different labels"):
-            agreement([L("1", A, "allow"), other], {"1": "allow"})
+            agreement([L("1", A, "allow"), other], {"1": "allow"}, incomplete=False)
         with pytest.raises(DispatchError, match="two different labels"):
-            deny_rate([L("1", A, "allow"), other])
+            deny_rate([L("1", A, "allow"), other], incomplete=False)
 
 
 def test_an_overflowing_listing_marks_the_set_incomplete_and_no_proposal_rests_on_it(monkeypatch):
@@ -293,3 +293,13 @@ def test_an_overflowing_listing_marks_the_set_incomplete_and_no_proposal_rests_o
     assert complete.incomplete is False
     assert proposal_eligible(complete, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=0) == (True, "")
     assert agreement(labels, preds, incomplete=True)[A].incomplete is True
+
+
+def test_a_plain_label_list_must_state_whether_it_is_complete():
+    # a list cut from an incomplete LabelSet must not read as complete: the caller states it or is refused
+    from levain.dispatch.calibration import LabelSet
+    cut = LabelSet((L("1", A, "allow"),), incomplete=True).labels
+    with pytest.raises(DispatchError, match="incomplete="):
+        agreement(cut, {"1": "allow"})
+    with pytest.raises(DispatchError, match="incomplete="):
+        deny_rate(cut)
