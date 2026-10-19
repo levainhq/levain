@@ -158,10 +158,11 @@ def test_another_keys_signature_does_not_verify(job, keys, snapshot):
     assert dsign.refusal(payload, sig, snapshot, job) == "the contract signature does not verify"
 
 
-def test_a_verifier_that_cannot_run_is_a_refusal(job, keys, snapshot, tmp_path):
+def test_a_verifier_that_cannot_run_is_raised_never_a_refusal(job, keys, snapshot, tmp_path):
+    # L1 M1 (fix r1): a fault on this machine is not a verdict on the signature, for a contract as for a cancel
     payload, sig = signed(job, keys["phone"])
-    problem = dsign.refusal(payload, sig, snapshot, job, ssh_keygen=tmp_path / "no-ssh-keygen")
-    assert problem is not None and problem.startswith("the contract signature could not be verified")
+    with pytest.raises(auth.VerifierUnavailable):
+        dsign.refusal(payload, sig, snapshot, job, ssh_keygen=tmp_path / "no-ssh-keygen")
 
 
 def test_no_snapshot_refuses(job, keys, log):

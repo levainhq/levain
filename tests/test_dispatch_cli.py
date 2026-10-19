@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,6 +19,9 @@ from levain.dispatch import contract as dcontract
 from levain.dispatch.jobs import JobStore
 from tests.test_dispatch_contract import POLICY, make_repo, registry, submission
 from tests.test_dispatch_sign import keys, log  # noqa: F401  (module fixtures)
+
+# the real check, kept before the fixture below stands it down: these tests run under an agent's process tree
+REAL_AGENT_CALLER = getattr(dcli, "agent_caller", None)
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +38,8 @@ def ddir(tmp_path, monkeypatch):
     for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(dcli, "resolvers", lambda: (registry(), POLICY))
+    # the suite itself runs under claude or codex; the operator's terminal has neither for an ancestor
+    monkeypatch.setattr(dcli, "agent_caller", lambda: None, raising=False)
     return d
 
 
@@ -44,6 +50,10 @@ def contract_file(tmp_path, repo):
     f = tmp_path / "contract.json"
     f.write_text(json.dumps(sub))
     return f
+
+
+def _soon():
+    return utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2))
 
 
 def run(capsys, *argv):
@@ -106,7 +116,8 @@ def test_sign_without_a_tty_refuses(capsys, ddir, contract_file, keys, log, monk
     monkeypatch.setattr(dcli, "_is_tty", lambda: False)
     code, out, _ = run(capsys, "sign", job_id, "--dispatch-dir", str(ddir), "--signing-key", str(keys["laptop"].path),
                        "--data-root", str(log.path.parent))
-    assert code == 2 and "pass --yes" in out
+    assert code == 2 and "in your own terminal" in out
+    assert "--yes" not in out.splitlines()[-1]               # the refusal never hands an agent the bypass
     assert "Fix the lint in a.py." in out                    # the view came first
     assert JobStore(ddir).get(job_id).state == "filed"
 
@@ -155,7 +166,8 @@ def test_cancel_with_no_capability_is_the_human_signed(capsys, ddir, contract_fi
                        "another-session", "--signing-key", str(keys["laptop"].path), "--data-root",
                        str(log.path.parent), "--yes", "--reason", "scope moved")
     assert code == 0, out
-    assert "as the HUMAN (signed)" in out
+    assert ("no capability for job " + job_id + " in this session's record (claude_code, another-session)") in out
+    assert out.index("no capability for job") < out.index("as the HUMAN (signed)")
     last = JobStore(ddir).get(job_id).history[-1]
     assert last.cause == "human_cancel" and "scope moved" in last.evidence
 
@@ -165,7 +177,7 @@ def test_a_human_cancel_without_a_tty_refuses(capsys, ddir, contract_file, keys,
     monkeypatch.setattr(dcli, "_is_tty", lambda: False)
     code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--human", "--signing-key",
                        str(keys["laptop"].path), "--data-root", str(log.path.parent))
-    assert code == 2 and "pass --yes" in out
+    assert code == 2 and "in your own terminal" in out and "--yes" not in out.splitlines()[-1]
     assert JobStore(ddir).get(job_id).state == "filed"
 
 
@@ -236,3 +248,237 @@ def test_a_planner_cancel_after_authorisation_points_at_the_human_cancel(capsys,
     code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
                        "sess-1")
     assert code == 2 and "--human" in out
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+def _sign_argv(ddir, job_id, keys, log, *extra):
+    return ("sign", job_id, "--dispatch-dir", str(ddir), "--signing-key", str(keys["laptop"].path), "--data-root",
+            str(log.path.parent), *extra)
+
+
+def _cancel_argv(ddir, job_id, keys, log, *extra):
+    return ("cancel", job_id, "--dispatch-dir", str(ddir), "--human", "--signing-key", str(keys["laptop"].path),
+            "--data-root", str(log.path.parent), *extra)
+
+
+def test_a_sign_verifier_that_cannot_run_is_exit_3_and_says_nothing_was_signed(capsys, ddir, contract_file, keys,
+                                                                                log, monkeypatch):
+    # L1 M1: the contract signature's verifier fault read as "refused"
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+
+    def unavailable(*a, **k):
+        raise VerifierUnavailable("ssh-keygen could not run")
+
+    monkeypatch.setattr("levain.dispatch.sign.verify_link_sig", unavailable)
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and "could not do it (VerifierUnavailable)" in out
+    assert f"nothing was signed; job {job_id} is unchanged (filed)" in out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def test_a_cancel_fault_says_the_job_is_not_cancelled(capsys, ddir, contract_file, keys, log, monkeypatch):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+
+    def unavailable(*a, **k):
+        raise VerifierUnavailable("ssh-keygen could not run")
+
+    monkeypatch.setattr("levain.dispatch.sign.verify_link_sig", unavailable)
+    code, out, _ = run(capsys, *_cancel_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and f"job {job_id} is NOT cancelled; it is still filed and holds its files" in out
+
+
+@pytest.mark.parametrize("verb", ["sign", "cancel"])
+def test_an_authority_log_that_cannot_be_read_is_exit_3(capsys, ddir, contract_file, keys, tmp_path, verb):
+    # L1 M1: a garbage cockpit.db read as "refused, nothing changed"
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    root = tmp_path / "bad-cockpit"
+    root.mkdir()
+    (root / "cockpit.db").write_bytes(b"this is not a database" * 100)
+    argv = ["--dispatch-dir", str(ddir), "--signing-key", str(keys["laptop"].path), "--data-root", str(root), "--yes"]
+    code, out, _ = run(capsys, *(["sign", job_id] if verb == "sign" else ["cancel", job_id, "--human"]), *argv)
+    assert code == 3 and "DatabaseError" in out, out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def test_an_authority_log_its_anchor_refuses_stays_a_refusal(capsys, ddir, contract_file, keys, log, tmp_path):
+    from levain.authority import anchor_path
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    root = tmp_path / "anchored"
+    root.mkdir()
+    src, dst = sqlite3.connect(log.path), sqlite3.connect(root / "cockpit.db")
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    anchor_path(root).parent.mkdir(parents=True, exist_ok=True)
+    anchor_path(root).write_text("not an anchor")
+    code, out, _ = run(capsys, "sign", job_id, "--dispatch-dir", str(ddir), "--signing-key",
+                       str(keys["laptop"].path), "--data-root", str(root), "--yes")
+    assert code == 2 and "the authority log is refused" in out, out
+
+
+def _keygen(monkeypatch, behaviour):
+    import subprocess
+
+    import levain.cockpit.keys as k
+    real = subprocess.run
+
+    def run2(cmd, *a, **kw):
+        if "-Y" in cmd and "sign" in cmd:
+            return behaviour(cmd, *a, **kw)
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(k.subprocess, "run", run2)
+
+
+def test_an_ssh_keygen_that_cannot_run_to_sign_is_exit_3(capsys, ddir, contract_file, keys, log, monkeypatch):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+
+    def missing(*a, **k):
+        raise FileNotFoundError("ssh-keygen")
+
+    _keygen(monkeypatch, missing)
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and "could not do it (SignerUnavailable)" in out and "nothing was signed" in out
+
+
+def test_an_ssh_keygen_that_refuses_to_sign_is_exit_2(capsys, ddir, contract_file, keys, log, monkeypatch):
+    import subprocess
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    _keygen(monkeypatch, lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 1, b"", b""))
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 2 and "could not sign" in out and "(exit 1)" in out
+
+
+def test_a_value_error_from_below_is_a_fault_not_a_refusal(capsys, ddir, monkeypatch):
+    def broken(self, **kw):
+        raise ValueError("a malformed row")
+
+    monkeypatch.setattr(JobStore, "list", broken)
+    code, out, _ = run(capsys, "list", "--dispatch-dir", str(ddir))
+    assert code == 3 and "could not do it (ValueError)" in out
+
+
+@pytest.mark.parametrize("yes", [False, True])
+@pytest.mark.parametrize("verb", ["sign", "cancel"])
+def test_an_agent_cannot_sign_or_human_cancel(capsys, ddir, contract_file, keys, log, monkeypatch, verb, yes):
+    # L1 M2 / L2 Q1: --yes let an agent sign as the operator
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    argv = (_sign_argv if verb == "sign" else _cancel_argv)(ddir, job_id, keys, log, *(["--yes"] if yes else []))
+    code, out, _ = run(capsys, *argv)
+    assert code == 2 and "runs under claude_code" in out and "--yes" not in out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def test_the_agent_check_is_the_question_bands(monkeypatch):
+    from levain.consent import band
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([]))
+    for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX"):
+        monkeypatch.delenv(var, raising=False)
+    assert REAL_AGENT_CALLER() is None
+    monkeypatch.setenv("CLAUDECODE", "1")
+    assert REAL_AGENT_CALLER() == "claude_code"
+    monkeypatch.delenv("CLAUDECODE")
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(42, ["/usr/local/bin/codex", "exec"])]))
+    assert REAL_AGENT_CALLER() == "codex"
+
+
+def test_the_prompt_sits_under_a_fixed_height_summary(capsys, ddir, contract_file, keys, log, monkeypatch):
+    # L2 Q1: a long view scrolled the digest and the counts away from the question
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    seen = {}
+
+    def answer(prompt):
+        seen["before"] = capsys.readouterr().out
+        return "n"
+
+    monkeypatch.setattr("builtins.input", answer)
+    run(capsys, *_sign_argv(ddir, job_id, keys, log))
+    job = JobStore(ddir).get(job_id)
+    summary = dcli.confirm_summary(job, "sign")
+    assert seen["before"].rstrip("\n").splitlines()[-len(summary):] == summary
+    text = "\n".join(summary)
+    for want in (job.digest, "fix-lint  tier R0", "glm-5, kimi-k2 (k=2)", "40 tool calls", job.contract.expires_at,
+                 "2 read, 2 write", "bytes, 2 lines", "filed by  claude_code, session sess-1"):
+        assert want in text, want
+
+
+def test_the_summary_is_the_same_height_for_any_goal(ddir, repo):
+    path, base = repo
+    store, other = JobStore(ddir / "short"), JobStore(ddir / "long")
+    short, _ = store.file(submission(path, base, goal="x", expires_at=_soon()), resolve_template=registry(),
+                          policy=POLICY, filer_session="s1")
+    long, _ = other.file(submission(path, base, goal="line\n" * 300, expires_at=_soon()),
+                         resolve_template=registry(), policy=POLICY, filer_session="s1")
+    assert len(dcli.confirm_summary(short, "sign")) == len(dcli.confirm_summary(long, "cancel"))
+    assert all("\n" not in line for line in dcli.confirm_summary(long, "cancel"))
+
+
+@pytest.mark.parametrize("verb", ["file", "cancel", "recommend"])
+def test_a_session_other_than_the_detected_one_is_refused(capsys, ddir, contract_file, monkeypatch, verb):
+    # L2 Q3: --session let one planner session read another's capability record
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-mine")
+    target = str(contract_file) if verb == "file" else job_id
+    code, out, _ = run(capsys, verb, target, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    assert code == 2 and "is not this session" in out and "--capability" in out
+    assert JobStore(ddir).get(job_id).state == "filed"
+
+
+def test_the_detected_session_named_explicitly_is_accepted(capsys, ddir, contract_file, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    assert code == 0 and "as the PLANNER" in out
+
+
+def test_a_human_cancel_without_a_key_names_the_operators_signed_cancel(capsys, ddir, contract_file):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "codex", "--yes")
+    assert code == 2 and "the operator's signed cancel needs --signing-key" in out
+    assert out.index("no capability for job") < out.index("signed cancel needs")
+
+
+def test_the_view_names_the_filing_agent_and_session(capsys, ddir, contract_file):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    code, out, _ = run(capsys, "show", job_id, "--dispatch-dir", str(ddir))
+    assert "filed by    claude_code, session sess-1" in out
+    code, out, _ = run(capsys, "show", job_id, "--dispatch-dir", str(ddir), "--json")
+    view = json.loads(out)
+    assert view["filer_agent"] == "claude_code" and view["filer_session"] == "sess-1"
+
+
+def test_json_output_is_ascii_escaped(capsys, ddir, tmp_path, repo):
+    path, base = repo
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps(submission(path, base, goal="caf\u00e9 \u00bfs\u00ed?",
+                                       expires_at=utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2)))))
+    job_id = file_one(capsys, ddir, f)["id"]
+    code, out, _ = run(capsys, "show", job_id, "--dispatch-dir", str(ddir), "--json")
+    assert code == 0 and out.isascii() and "caf\\u00e9" in out
+    assert json.loads(out)["goal"].startswith("caf\u00e9")
+
+
+def test_render_escapes_every_field_it_shows(ddir, contract_file, capsys, monkeypatch):
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    job = JobStore(ddir).get(job_id)
+    real_view = dcli.job_view
+
+    def view(j):
+        v = real_view(j)
+        v["template"] = dict(v["template"], id="fix\x9blint", models=["glm\x1b[2J"])
+        v["history"][0]["cause"] = "filed\u202e"
+        return v
+
+    monkeypatch.setattr(dcli, "job_view", view)
+    text = dcli.render(job)
+    assert "\x9b" not in text and "\x1b" not in text and "\u202e" not in text
+    assert "fix\\u009blint" in text and "glm\\u001b[2J" in text and "filed\\u202e" in text

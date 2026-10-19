@@ -166,3 +166,33 @@ def test_the_real_server_over_stdio(ddir):
     replies = [json.loads(x) for x in cp.stdout.splitlines()]
     assert [r["id"] for r in replies] == [1, 2, 3]
     assert replies[2]["result"]["isError"] is False and replies[2]["result"]["content"][0]["text"] == "No jobs."
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+def test_show_puts_the_state_first_and_labels_the_goal_unverified(ddir, repo):
+    # L2 Q4: a planner read another filing's goal as if it were the door's own text
+    job_id = call(ddir, "dispatch_file", {"contract": contract(repo)}, meta={"threadId": "t-1"})["result"][
+        "structuredContent"]["result"]["id"]
+    text = call(ddir, "dispatch_show", {"job": job_id})["result"]["content"][0]["text"]
+    lines = text.splitlines()
+    assert lines[0] == "state: filed"
+    assert "goal: the filer's text (unverified):" in text and "sent to the provider" not in text
+
+
+def test_the_file_description_keeps_r2_and_claims_no_present_refusal():
+    # L1 LOW: .capitalize() lowered "R2", and "filing refuses" goes false when the registry lands
+    desc = next(t for t in mcp.TOOLS if t["name"] == "dispatch_file")["description"]
+    assert "R2" in desc and "r2" not in desc
+    assert "filing refuses" not in desc.lower() and "Filing needs a registered template" in desc
+
+
+def test_a_value_error_from_below_is_a_fault(ddir, monkeypatch):
+    def broken(self, **kw):
+        raise ValueError("a malformed row")
+
+    monkeypatch.setattr(JobStore, "list", broken)
+    result = call(ddir, "dispatch_list", {})["result"]
+    assert result["isError"] is True and result["content"][0]["text"].startswith("This machine could not do it "
+                                                                                 "(ValueError)")
+

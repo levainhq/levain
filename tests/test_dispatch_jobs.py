@@ -609,18 +609,50 @@ def test_a_key_revoked_while_signing_waits_for_the_lock_is_refused(store, repo, 
     assert store.get(job.id).state == "filed"
 
 
-def test_an_authority_log_that_cannot_be_read_is_a_signature_refusal(store, repo, keys, clock, tmp_path):
-    # codex: a sqlite3.Error from the authority source escaped sign() as a crash
+def test_an_authority_log_that_cannot_be_read_is_a_machine_fault(store, repo, keys, clock, tmp_path):
+    # L1 M1 (fix r1): a log that cannot be read is a fault on this machine, raised as itself, never "refused"
     from levain.consent.queue import authority_source
     bad = tmp_path / "cockpit.db"
     bad.write_bytes(b"this is not a database" * 100)
     job, _ = file_job(store, repo)
     clock.now = NOW + timedelta(minutes=1)
     payload, sig = signed(job, keys["phone"])
-    with pytest.raises(SignatureRefused, match="the authority log could not be read"):
-        store.sign(job.id, payload, sig, authority_source(bad, anchor=None))
-    with pytest.raises(SignatureRefused, match="the authority log could not be read"):
-        store.sign(job.id, payload, sig, authority_source(tmp_path / "missing" / "cockpit.db", anchor=None))
+    cpayload, csig = cancel_item(job, keys["phone"])
+    for source in (authority_source(bad, anchor=None),
+                   authority_source(tmp_path / "missing" / "cockpit.db", anchor=None)):
+        with pytest.raises(sqlite3.Error):
+            store.sign(job.id, payload, sig, source)
+        with pytest.raises(sqlite3.Error):
+            store.cancel_by_human(job.id, cpayload, csig, source)
+    assert store.get(job.id).state == "filed"
+
+
+def test_an_authority_log_the_replay_refuses_stays_a_signature_refusal(store, repo, keys, log, clock, tmp_path):
+    from levain.consent.queue import authority_source
+    anchor = tmp_path / "authority.anchor"
+    anchor.write_text("not an anchor")
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    payload, sig = signed(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="the authority log is refused"):
+        store.sign(job.id, payload, sig, authority_source(log.path, anchor=anchor))
+    cpayload, csig = cancel_item(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="the authority log is refused"):
+        store.cancel_by_human(job.id, cpayload, csig, authority_source(log.path, anchor=anchor))
+    assert store.get(job.id).state == "filed"
+
+
+def test_a_sign_verifier_that_cannot_run_is_a_machine_fault(tmp_path, repo, keys, log, clock):
+    # L1 M1 (fix r1): the contract signature's twin of the cancel's verifier fault
+    from levain.authority import VerifierUnavailable
+    d = tmp_path / "dispatch"
+    d.mkdir(mode=0o700)
+    store = JobStore(d, clock=clock, ssh_keygen=tmp_path / "no-ssh-keygen")
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    payload, sig = signed(job, keys["phone"])
+    with pytest.raises(VerifierUnavailable):
+        store.sign(job.id, payload, sig, log.source)
     assert store.get(job.id).state == "filed"
 
 
@@ -773,6 +805,56 @@ def test_the_cancel_table_is_append_only(store, repo, keys, log, clock):
         for sql in ("UPDATE cancel_signatures SET signature = 'y'", "DELETE FROM cancel_signatures",
                     f"INSERT OR REPLACE INTO cancel_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')",
                     f"INSERT INTO cancel_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')"):
+            with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+def test_a_stale_cancel_never_undoes_a_later_contract_signature(store, repo, keys, log, clock):
+    # L2 Q2: a cancel signed before the operator signed the contract could still kill it
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=5)
+    job = store._transition(job.id, "signed", "signature")
+    stale, stale_sig = cancel_item(job, keys["phone"], at=NOW + timedelta(minutes=2))
+    with pytest.raises(SignatureRefused, match="before the job's signature at"):
+        store.cancel_by_human(job.id, stale, stale_sig, log.source)
+    assert store.get(job.id).state == "signed"
+    clock.now = NOW + timedelta(minutes=6)
+    fresh, fresh_sig = cancel_item(job, keys["phone"], at=NOW + timedelta(minutes=6))
+    assert store.cancel_by_human(job.id, fresh, fresh_sig, log.source).state == "cancelled"
+
+
+def test_a_stale_cancel_never_undoes_a_later_authorisation(store, repo, keys, log, clock):
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    for to, cause in PATH["verified"]:
+        job = store._transition(job.id, to, cause)
+    clock.now = NOW + timedelta(minutes=10)
+    job = store._transition(job.id, "authorised", "human_authorises")
+    stale, stale_sig = cancel_item(job, keys["laptop"], at=NOW + timedelta(minutes=5))
+    with pytest.raises(SignatureRefused, match="before the job's human_authorises at"):
+        store.cancel_by_human(job.id, stale, stale_sig, log.source)
+    assert store.get(job.id).state == "authorised"
+
+
+def test_the_filing_agent_is_kept_beside_the_job(store, repo):
+    # L2 Q1 LOW: the signer could not see which agent filed the job
+    path, base = repo
+    job, _ = store.file(submission(path, base), resolve_template=registry(), policy=POLICY, filer_session="sess-1",
+                        filer_agent="codex")
+    assert job.filer_agent == "codex" and store.get(job.id).filer_agent == "codex"
+    other, _ = file_job(store, repo, write=["src/b.py"], read=["src/b.py"])
+    assert other.filer_agent is None
+    with pytest.raises(DispatchError, match="filer_agent must be one line"):
+        store.file(submission(path, base), resolve_template=registry(), policy=POLICY, filer_session="sess-1",
+                   filer_agent="co\ndex")
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        for sql in ("UPDATE job_filers SET agent = 'claude_code'", "DELETE FROM job_filers",
+                    f"INSERT OR REPLACE INTO job_filers VALUES ('{job.id}', 'claude_code')"):
             with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
                 conn.execute(sql)
     finally:

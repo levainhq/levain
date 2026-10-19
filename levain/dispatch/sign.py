@@ -6,11 +6,12 @@ own SSHSIG namespace, so a dispatch signature verifies as nothing else and nothi
 random ``store_id`` is bound so a signature made for a job in one dispatch store is refused by any other.
 
 :func:`refusal` is the one check: exact keys and format, every field and the signature bounded in length
-(:data:`FIELD_MAX`, :data:`SIGNATURE_MAX`) before anything is verified, the store, the job's id, digest and expiry, a ``signed_at``
-inside the job's unsigned lease, then the signer checks (an enrolled key, not revoked, of a class that covers T2, a
-non-empty signature, a passkey's extra checks, the signature over the payload's bytes), in an order meant to mirror
-the consent queue's signer check for an allow; this module's tests pin the order here. A verifier that cannot run is
-a refusal, never a pass.
+(:data:`FIELD_MAX`, :data:`SIGNATURE_MAX`) before anything is verified, the store, the job's id, digest and expiry,
+a ``signed_at`` inside the job's unsigned lease, then the signer checks (an enrolled key, not revoked, of a class
+that covers T2, a non-empty signature, a passkey's extra checks, the signature over the payload's bytes), in an
+order meant to mirror the consent queue's signer check for an allow; this module's tests pin the order here. A verifier that cannot run is
+never a pass and never a refusal either: it is raised as :class:`levain.authority.VerifierUnavailable`, so a caller
+tells "this machine cannot check a signature right now" from "this is not the operator's signature".
 
 WHY T2. Signing a contract is an allow at T2, so a Face ID passkey (a display-phone key, which covers T2 and never T3)
 can sign a dispatch digest from the phone. The intent that makes T2 the right tier: the digest's grant (Write, Edit,
@@ -27,9 +28,8 @@ presented as a cancel nor a cancel as a contract signature. It binds the store, 
 shown, the signer, when it was signed and a one-line reason (which may be empty). It is tied to no expiry and no lease
 window: it is good from the job's filing until the job is terminal, and what makes it single-use is that the cancel
 it carries is terminal. :func:`cancel_refusal` checks it in :func:`refusal`'s order, at the same tier (removing
-authority never needs more than granting it did). One difference, by intent: a verifier that cannot run is raised as
-:class:`levain.authority.VerifierUnavailable`, never returned as a refusal, so a caller can tell "this machine cannot
-check a signature right now" from "this is not the operator's cancel". Stdlib only.
+authority never needs more than granting it did), and a verifier that cannot run is raised there as here. Stdlib
+only.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from levain.authority import PASSKEY, AuthoritySnapshot, VerifierUnavailable, verify_link_sig
+from levain.authority import PASSKEY, AuthoritySnapshot, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import class_covers
 from levain.contracts.canon import canonical_bytes
@@ -117,7 +117,7 @@ def reason_problem(reason: Any) -> str | None:
 def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: SignableJob, *,
             ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not the operator's signature over ``job`` under ``authority``; ``None``
-    when it verifies."""
+    when it verifies. Raises :class:`levain.authority.VerifierUnavailable` when the verifier cannot run."""
     if not isinstance(payload, Mapping) or set(payload) != PAYLOAD_KEYS:
         return "the signature payload is not a dispatch signature record"
     if not all(isinstance(payload[k], str) for k in PAYLOAD_KEYS):
@@ -170,11 +170,9 @@ def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Sig
     except (TypeError, ValueError) as exc:
         return f"the signature payload cannot be encoded: {exc}"
     kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
-    try:
-        ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
-                             namespace=DISPATCH_SIGN_NAMESPACE, **kwargs)
-    except VerifierUnavailable as exc:
-        return f"the contract signature could not be verified: {exc}"
+    # a VerifierUnavailable propagates: a fault on this machine is not a verdict on the signature
+    ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+                         namespace=DISPATCH_SIGN_NAMESPACE, **kwargs)
     return None if ok else "the contract signature does not verify"
 
 

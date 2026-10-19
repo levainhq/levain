@@ -9,7 +9,10 @@ The session is read per call, as the question band's door reads it (:mod:`levain
 id, else the server's own environment (``CLAUDE_CODE_SESSION_ID`` / ``CODEX_THREAD_ID``), else
 :data:`levain.dispatch.capability.NO_SESSION`, which keeps no capability record. The session decides which record a
 filing's capability is kept in and which record ``dispatch_recommend`` / ``dispatch_cancel`` read when no capability
-is passed. A refusal or a machine fault comes back as the tool's own error, its text leading with which it was."""
+is passed. A refusal or a machine fault comes back as the tool's own error, its text leading with which it was; a
+``ValueError`` from below is a fault, never a refusal. ``dispatch_show`` puts the job's state on its own first line
+and labels the goal as the filer's text, unverified: a planner reading another filing's goal reads words no one has
+checked, never an instruction."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +27,7 @@ from levain.authority import VerifierUnavailable
 from levain.consent.band_mcp import _meta_session
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
-from levain.dispatch.cli import NO_REGISTRY, file_job, job_view, planner_capability, render
+from levain.dispatch.cli import file_job, job_view, planner_capability, render
 from levain.dispatch.contract import GitUnavailable
 from levain.dispatch.jobs import (
     TERMINAL, CapabilityRefused, JobStore, JobStoreError, SignatureRefused, TransitionRefused,
@@ -34,8 +37,8 @@ __all__ = ["TOOLS", "handle", "main", "serve"]
 
 _PROTOCOL = "2025-06-18"
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR = -32700, -32600, -32601, -32602, -32603
-_NO_AUTHORITY = ("Filing creates a contract the operator must sign on their own device before anything runs; a recommend "
-                 "confers no authority.")
+_NO_AUTHORITY = ("Filing creates a contract the operator must sign on their own device before anything runs; a "
+                 "recommend confers no authority.")
 _JOB = {"type": "string", "description": "The job id (dj-...)."}
 _CAPABILITY = {"type": "string", "description": "The job's capability, as filing returned it (default: the one this "
                                                 "session's record kept)."}
@@ -43,7 +46,8 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "dispatch_file",
      "description": "File a task contract for cheaper executors to run. " + _NO_AUTHORITY + " Returns the job id, its "
                     "digest, its lease end and, once, its capability (kept in this session's record when the "
-                    "session is known). " + NO_REGISTRY.capitalize() + " until a registry exists, so filing refuses.",
+                    "session is known). Filing needs a registered template: a contract with none is R2, which is "
+                    "never dispatched.",
      "inputSchema": {"type": "object",
                      "properties": {"contract": {"type": "object", "description": "The contract: template, goal, "
                                                  "read, write, base, budget, grant, expires_at, repo."},
@@ -59,7 +63,8 @@ TOOLS: list[dict[str, Any]] = [
      "description": "The live jobs (all: every job), oldest first.",
      "inputSchema": {"type": "object",
                      "properties": {"repo": {"type": "string", "description": "Only this repository (absolute)."},
-                                    "all": {"type": "boolean", "description": "Include adopted, failed, cancelled."}},
+                                    "all": {"type": "boolean",
+                                            "description": "Include adopted, failed, cancelled."}},
                      "additionalProperties": False}},
     {"name": "dispatch_recommend",
      "description": "Mark a VERIFIED job you filed as recommended. Advisory: a recommend confers no authority; only the "
@@ -73,8 +78,9 @@ TOOLS: list[dict[str, Any]] = [
                      "additionalProperties": False}},
 ]
 _NAMES = {t["name"]: t for t in TOOLS}
-_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, sqlite3.Error, OSError)
-_REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError, ValueError)
+_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, sqlite3.Error, OSError,
+           ValueError)
+_REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
 
 class _RpcError(Exception):
@@ -135,12 +141,13 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any]) -> dict[st
             found = store.get(args["job"])
             if found is None:
                 raise TransitionRefused(f"no dispatch job {args['job'][:40]!r}")
-            return _text(render(found), job_view(found))
+            return _text(f"state: {found.state}\n" + render(found, goal_label="goal: the filer's text (unverified)"),
+                         job_view(found))
         if name == "dispatch_list":
             jobs = [j for j in store.list(repo=args.get("repo")) if args.get("all") or j.state not in TERMINAL]
             rows = [{"id": j.id, "state": j.state, "repo": j.repo, "lease_end": j.lease_end,
                      "template": j.contract.template.template_id} for j in jobs]
-            return _text(json.dumps(rows, ensure_ascii=False) if rows else "No jobs.", rows)
+            return _text(json.dumps(rows, ensure_ascii=True) if rows else "No jobs.", rows)
         cap = planner_capability(store.directory, agent, session, args["job"], args.get("capability"))
         if cap is None:
             raise CapabilityRefused(f"this session's record holds no capability for {args['job'][:40]!r}; pass "
@@ -184,7 +191,7 @@ def handle(agent: str, msg: Any, *, directory: Path | None = None) -> dict[str, 
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)
-    except Exception as exc:  # noqa: BLE001 - a server that dies mid-conversation loses the agent's tools for the session
+    except Exception as exc:  # noqa: BLE001 - a server that dies mid-conversation loses the agent's tools
         return _error(rid, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 
 

@@ -1,26 +1,44 @@
-"""levain.dispatch.cli — ``levain dispatch file|show|list|sign|cancel|recommend``: the planner's door and the operator's.
+"""levain.dispatch.cli — ``levain dispatch file|show|list|sign|cancel|recommend``: the planner's door and the
+operator's.
 
 A planner files a contract (``file``) and gets the job's capability once; the door keeps it in the planner session's
-own record (:mod:`levain.dispatch.capability`) so a restarted session can still ``recommend`` or ``cancel``. The operator
-reads a job RESOLVED as a signer sees it (``show``), and signs its digest (``sign``) or cancels it (``cancel``) with
-an enrolled laptop key, after reading the same view and answering y/N on a terminal. ``cancel`` acts as the PLANNER when
-the caller's session record holds the job's capability (or ``--capability`` is given), else as the HUMAN, signed, and
-says which it was. Nothing a planner does here authorises anything.
+own record (:mod:`levain.dispatch.capability`) so a restarted session can still ``recommend`` or ``cancel``. A
+``--session`` that is not the session the agent's own environment names is refused: a planner reaches another
+session's job only by holding its capability (``--capability``). The operator reads a job RESOLVED as a signer sees
+it (``show``), and signs its digest (``sign``) or cancels it (``cancel``) with an enrolled laptop key, after reading
+the same view, then a fixed-height summary right above the y/N prompt (so the view cannot have scrolled the point
+away), and answering y/N on a terminal. ``cancel`` acts as the PLANNER when the caller's session record holds the
+job's capability (or ``--capability`` is given), else as the HUMAN, signed, and says which it was. Nothing a planner
+does here authorises anything.
 
-Exit codes: 0 done; 2 the input or a refusal (the contract, the transition, the signature or the capability was
-refused: the message says why, and nothing changed); 3 a fault on this machine, told apart by its CLASS, never by its
-text: git could not run (:class:`levain.dispatch.contract.GitUnavailable`), a store or record that cannot be trusted
-(:class:`levain.dispatch.jobs.JobStoreError`, :class:`levain.dispatch.capability.CapabilityRecordError`, an operating
-system or database error), or a signature verifier that cannot run (:class:`levain.authority.VerifierUnavailable`).
+THE OPERATOR'S VERBS ARE NOT AN AGENT'S. ``sign`` and the human ``cancel`` are refused, with or without ``--yes``,
+when this process runs under an agent: a ``claude`` or ``codex`` ancestor process, or an agent's environment (the
+question band's walk and checks, :func:`agent_caller`). This is a check of INTENT, not a boundary: an agent can still
+run ssh-keygen over the payload itself, so until S1 places the control principal, a laptop signature an agent can
+reach is gated only by the custody of the signing key (a touch, a passphrase, a key no agent can read).
+
+Exit codes: 0 done; 2 the input or a refusal (the contract, the transition, the signature, the capability or the
+command line was refused: the message says why, and nothing changed); 3 a fault on this machine, told apart by its
+CLASS, never by its text: git could not run (:class:`levain.dispatch.contract.GitUnavailable`), a store, record or
+log that cannot be read or trusted (:class:`levain.dispatch.jobs.JobStoreError`,
+:class:`levain.dispatch.capability.CapabilityRecordError`, an operating system or database error, a ``ValueError``
+from below), a signature verifier that cannot run (:class:`levain.authority.VerifierUnavailable`) or an ssh-keygen
+that cannot run to sign (:class:`SignerUnavailable`). Every exit 3 from ``sign`` or ``cancel`` also says what did NOT
+happen. The command line's own refusals are :class:`InputRefused`, so nothing raised below it reads as "refused".
 
 Until the template registry and the provider policy live in signed control state (F3), :func:`resolvers` has neither,
 and ``file`` refuses: every contract would be R2, which is never dispatched. Stdlib only.
+
+Known edges: a read path made of homoglyphs shows as the path it imitates (a write path is bounded by the operator's
+template, so only what is read can be dressed up). ``file`` reports a template resolver that raises as a refusal
+(exit 2), not a fault; revisited when F3's resolver is wired in.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 import unicodedata
 from collections.abc import Callable
@@ -38,18 +56,39 @@ from levain.dispatch.jobs import (
 )
 from levain.dispatch.policy import ProviderPolicy
 
-__all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "add_parsers", "file_job", "job_view", "planner_capability",
-           "render", "resolvers", "run_dispatch"]
+__all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "InputRefused", "SignerUnavailable", "add_parsers", "agent_caller",
+           "confirm_summary", "file_job", "job_view", "planner_capability", "render", "resolvers", "run_dispatch"]
 
 EXIT_OK, EXIT_REFUSED, EXIT_FAULT = 0, 2, 3
 # a contract is a few kilobytes; the bound only stops a stray file from being read whole
 _CONTRACT_MAX = 1024 * 1024
 _TERM_UNSAFE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 NO_REGISTRY = "no template registry is set up; every contract is R2, which is never dispatched"
+
+
+class InputRefused(DispatchError):
+    """The command line's own refusal: no terminal to ask on, a file it cannot read, a flag that does not fit, a
+    signing key that would not sign. The message says why, and nothing changed."""
+
+
+class SignerUnavailable(Exception):
+    """ssh-keygen could not run (or timed out) to make the operator's signature: a fault on this machine, not a key
+    that refused. Told apart by the cause chained to the key error, never by its message."""
+
+
+class _NotDone(Exception):
+    """A machine fault in ``sign`` or the human ``cancel``, with the sentence that says what did NOT happen."""
+
+    def __init__(self, fault: BaseException, not_done: str) -> None:
+        super().__init__(str(fault))
+        self.fault, self.not_done = fault, not_done
+
+
 # machine faults first: GitUnavailable is a ContractRefused and JobStoreError a DispatchError, and each must be read
-# as the fault it is
-_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, sqlite3.Error, OSError)
-_REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError, ValueError)
+# as the fault it is; a ValueError raised below the command line is a fault too (its own refusals are InputRefused)
+_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, SignerUnavailable,
+           sqlite3.Error, OSError, ValueError)
+_REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
 
 def resolvers() -> tuple[Callable[[str], ResolvedTemplate | None], ProviderPolicy] | None:
@@ -67,15 +106,41 @@ def _safe(text: object) -> str:
 
 # --- the planner's identity and capability ----------------------------------------------------------------------------
 
-def planner_session(agent: str | None, session: str | None) -> tuple[str | None, str]:
-    """The planner's agent and session: the flags, else the agent's own environment, as ``levain ask`` reads them;
-    ``(None, NO_SESSION)`` when no agent can be told."""
+def agent_caller() -> str | None:
+    """The agent this process runs under (``claude_code`` / ``codex``): the nearest ``claude`` or ``codex``
+    ancestor, else the agent's own environment, as ``levain ask`` tells them; ``None`` when it is neither. An intent
+    check (see the module docstring), never a boundary."""
     from levain.consent.band import _agent_and_session
 
     try:
-        agent, session = _agent_and_session(agent, session)
+        return _agent_and_session(None, None)[0]
+    except ValueError:
+        return None
+
+
+def _refuse_an_agent(verb: str) -> None:
+    agent = agent_caller()
+    if agent is not None:
+        raise InputRefused(f"`levain dispatch {verb}` is the operator's own act, and this process runs under "
+                           f"{agent} (an agent's process or environment): an agent never signs or cancels for the "
+                           "operator. Run it from your own terminal.")
+
+
+def planner_session(agent: str | None, session: str | None) -> tuple[str | None, str]:
+    """The planner's agent and session: the flags, else the agent's own environment, as ``levain ask`` reads them;
+    ``(None, NO_SESSION)`` when no agent can be told. A ``session`` that is not the one the environment names (when
+    it names one) is refused: another session's job is reached by its capability, never by naming the session."""
+    from levain.consent.band import NO_SESSION as BAND_NO_SESSION
+    from levain.consent.band import _agent_and_session
+
+    try:
+        agent, detected = _agent_and_session(agent, None)
     except ValueError:
         return None, caps.NO_SESSION
+    if session is not None and detected != BAND_NO_SESSION and session != detected:
+        raise InputRefused(f"--session {_safe(session)[:80]!r} is not this session ({_safe(detected)[:80]!r}, from "
+                           f"{agent}'s environment); a job filed in another session is reached with --capability")
+    session = detected if session is None else session
     return agent, session if caps.session_problem(session) is None else caps.NO_SESSION
 
 
@@ -90,7 +155,7 @@ def file_job(store: JobStore, submission: Any, *, agent: str | None, session: st
         raise ContractRefused(NO_REGISTRY)
     resolve_template, policy = resolved
     job, capability = store.file(submission, resolve_template=resolve_template, policy=policy,
-                                 filer_session=session, idem_key=idem_key)
+                                 filer_session=session, idem_key=idem_key, filer_agent=agent)
     if capability is None:
         return job, None, ("this is a replay of a filing already made: its capability was shown once, then, and is "
                            "not shown again")
@@ -127,7 +192,8 @@ def job_view(job: Job) -> dict[str, Any]:
             "base_tree": c.base_tree, "goal": c.goal, "read": [e.to_mapping() for e in c.read],
             "write": [e.to_mapping() for e in c.write], "template": t.to_mapping(), "budget": dict(c.budget),
             "grant": list(c.grant), "expires_at": c.expires_at, "policy_hash": c.policy_hash, "filed_at": job.filed_at,
-            "lease_end": job.lease_end, "signer_fp": job.signer_fp,
+            "lease_end": job.lease_end, "signer_fp": job.signer_fp, "filer_agent": job.filer_agent,
+            "filer_session": job.filer_session,
             "history": [{"seq": h.seq, "to_state": h.to_state, "cause": h.cause, "at": h.at, "evidence": h.evidence}
                         for h in job.history]}
 
@@ -137,8 +203,9 @@ def _entries(rows: list[dict[str, str]]) -> list[str]:
             for e in rows]
 
 
-def render(job: Job) -> str:
-    """The job as text, every field of :func:`job_view`, the goal in full."""
+def render(job: Job, *, goal_label: str = "goal (sent to the provider, in full)") -> str:
+    """The job as text, every field of :func:`job_view`, the goal in full under ``goal_label``. Every line is passed
+    through the terminal-safe escape, whatever field it shows."""
     v = job_view(job)
     t = v["template"]
     b = v["budget"]
@@ -158,7 +225,9 @@ def render(job: Job) -> str:
         f"  lease ends  {v['lease_end']}" + ("  (unsigned: it lapses then)" if v["state"] == "filed" else ""),
         f"  policy      {v['policy_hash']}",
         f"  signer      {v['signer_fp'] or '(not signed)'}",
-        "  goal (sent to the provider, in full):",
+        f"  filed by    {v['filer_agent'] or '(no agent named)'}, session {v['filer_session']} (as the filing door "
+        "named them)",
+        f"  {goal_label}:",
         *[f"    | {_safe(line)}" for line in v["goal"].split("\n")],
         f"  read ({len(v['read'])}, what the executor sees and the provider receives):",
         *_entries(v["read"]),
@@ -169,10 +238,33 @@ def render(job: Job) -> str:
         *[f"    {h['seq']:>2} {h['to_state']:<12} {h['cause']:<20} {h['at']}"
           + (f"  {_safe(h['evidence'])}" if h["evidence"] else "") for h in v["history"]],
     ]
-    return "\n".join(lines)
+    # _safe leaves only printable text, so a second pass over a line it already escaped changes nothing
+    return "\n".join(_safe(line) for line in lines)
 
 
-# --- the commands -------------------------------------------------------------------------------------------------------
+def confirm_summary(job: Job, verb: str) -> list[str]:
+    """The fixed-height summary printed right above the y/N prompt: the same number of lines for every job, each one
+    line however long the goal or the lists, so the point of the view is on screen when the question is."""
+    c = job.contract
+    t = c.template
+    b = c.budget
+    goal_lines = len(c.goal.split("\n"))
+    rows = [
+        f"---- you are about to {verb} job {job.id} ----",
+        f"  digest    {job.digest}",
+        f"  template  {t.template_id}  tier {t.tier}",
+        f"  models    {', '.join(t.models)} (k={t.k})",
+        f"  budget    {b['tool_calls']} tool calls, {b['tokens']} tokens, {b['dollars_cents']} cents",
+        f"  expires   {c.expires_at}",
+        f"  files     {len(c.read)} read, {len(c.write)} write",
+        f"  goal      {len(c.goal.encode('utf-8'))} bytes, {goal_lines} line{'s' if goal_lines != 1 else ''} "
+        "(in full above)",
+        f"  filed by  {job.filer_agent or '(no agent named)'}, session {job.filer_session}",
+    ]
+    return [_safe(r) for r in rows]
+
+
+# --- the commands -----------------------------------------------------------------------------------------------------
 
 def _store(args: argparse.Namespace) -> JobStore:
     return JobStore(args.dispatch_dir.expanduser() if args.dispatch_dir is not None else None)
@@ -186,13 +278,13 @@ def _read_contract(source: str) -> Any:
             with open(Path(source).expanduser(), "rb") as fh:
                 raw = fh.read(_CONTRACT_MAX + 1)
     except OSError as exc:
-        raise ValueError(f"the contract file cannot be read: {exc.strerror or exc}") from None
+        raise InputRefused(f"the contract file cannot be read: {exc.strerror or exc}") from None
     if len(raw) > _CONTRACT_MAX:
-        raise ValueError(f"the contract is over {_CONTRACT_MAX} bytes")
+        raise InputRefused(f"the contract is over {_CONTRACT_MAX} bytes")
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
-        raise ValueError("the contract is not JSON") from None
+        raise InputRefused("the contract is not JSON") from None
 
 
 def _must_get(store: JobStore, job_id: str) -> Job:
@@ -209,19 +301,21 @@ def _is_tty() -> bool:
         return False
 
 
-def _confirm(args: argparse.Namespace, what: str) -> None:
-    """Ask y/N on the terminal; refuse without one unless ``--yes``. The caller has printed the whole view."""
+def _confirm(args: argparse.Namespace, job: Job, what: str, out: Any) -> None:
+    """Ask y/N on the terminal, right below :func:`confirm_summary`; refuse without a terminal unless ``--yes``.
+    The caller has printed the whole view."""
     if args.yes:
         return
     if not _is_tty():
-        raise ValueError(f"{what} asks y/N on a terminal and there is none; pass --yes to {what} without asking "
-                         "(the whole view is still printed first)")
+        raise InputRefused(f"{what} asks y/N on the operator's terminal and this process has none; run "
+                           f"`levain dispatch {what} {job.id}` in your own terminal")
+    print("\n".join(confirm_summary(job, what)), file=sys.stderr if args.json else out, flush=True)
     try:
         answer = input(f"{what} this job? [y/N] ")
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
-        raise ValueError("not confirmed; nothing was signed and the job is unchanged")
+        raise InputRefused(f"not confirmed; nothing was done and job {job.id} is unchanged")
 
 
 def _authority(args: argparse.Namespace, store: JobStore) -> Any:
@@ -237,24 +331,62 @@ def _authority(args: argparse.Namespace, store: JobStore) -> Any:
     else:
         roots = hook_roots(store.directory)
         if len(roots) != 1:
-            raise ValueError("name the cockpit data root with --data-root (the consent hooks here name "
+            raise InputRefused("name the cockpit data root with --data-root (the consent hooks here name "
                              + ("none" if not roots else f"{len(roots)}: {', '.join(map(str, roots))}") + ")")
         root = roots[0]
     if not (root / "cockpit.db").is_file():
-        raise ValueError(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root")
+        raise InputRefused(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root")
     return authority_source(root / "cockpit.db", anchor=anchor_path(root))
 
 
-def _signer(args: argparse.Namespace, namespace: str) -> tuple[str, Callable[[bytes], str]]:
+def _signer(args: argparse.Namespace, namespace: str, what: str) -> tuple[str, Callable[[bytes], str]]:
+    """The signer for ``--signing-key``. A key file that cannot be read or is not a key is the operator's input
+    (exit 2); a verifier that cannot run to fingerprint it propagates as the fault it is."""
     from levain.cockpit.keys import KeyError_, ssh_signer
 
     if args.signing_key is None:
-        raise ValueError("signing needs --signing-key (an enrolled key: its private key file, or the .pub of a key an "
-                         "agent holds)")
+        raise InputRefused(f"{what} needs --signing-key (an enrolled key: its private key file, or the .pub of a key "
+                           "an agent holds)")
     try:
         return ssh_signer(args.signing_key, namespace=namespace)
     except KeyError_ as exc:
-        raise ValueError(str(exc)) from None
+        raise InputRefused(str(exc)) from None
+
+
+def _signature(sign: Callable[[bytes], str], payload: dict[str, str]) -> str:
+    """``payload`` signed. An ssh-keygen that could not run or timed out (the chained cause) is
+    :class:`SignerUnavailable`, a fault; a key that would not sign (a cancelled touch, a refusing exit) is the
+    operator's refusal."""
+    from levain.cockpit.keys import KeyError_
+
+    try:
+        return sign(dsign.sign_message(payload))
+    except KeyError_ as exc:
+        if isinstance(exc.__cause__ or exc.__context__, (OSError, subprocess.TimeoutExpired)):
+            raise SignerUnavailable(str(exc)) from exc
+        raise InputRefused(str(exc)) from None
+
+
+def _not_done(store: JobStore, job: Job, verb: str) -> str:
+    """What a faulted ``sign`` / ``cancel`` did NOT do, with the job's state read again when the store answers."""
+    try:
+        now = store.get(job.id)
+    except (*_FAULTS, DispatchError):
+        now = None
+    state = now.state if now is not None else f"{job.state} when last read"
+    if verb == "sign":
+        return f"nothing was signed; job {job.id} is " + ("unchanged " if now is None or now.state == job.state
+                                                           else "") + f"({state})"
+    if now is not None and now.state in TERMINAL:
+        return f"this call cancelled nothing; job {job.id} is {now.state}"
+    return f"job {job.id} is NOT cancelled; it is still {state} and holds its files"
+
+
+def _guarded(store: JobStore, job: Job, verb: str, act: Callable[[], Job]) -> Job:
+    try:
+        return act()
+    except _FAULTS as exc:
+        raise _NotDone(exc, _not_done(store, job, verb)) from exc
 
 
 def _show_first(args: argparse.Namespace, job: Job, out: Any) -> None:
@@ -263,23 +395,23 @@ def _show_first(args: argparse.Namespace, job: Job, out: Any) -> None:
 
 
 def _signed_cancel(args: argparse.Namespace, store: JobStore, job: Job, out: Any) -> Job:
-    from levain.cockpit.keys import KeyError_
-
+    _refuse_an_agent("cancel")
     problem = dsign.reason_problem(args.reason)
     if problem is not None:
-        raise ValueError(problem)
+        raise InputRefused(problem)
     if job.state in TERMINAL:
         raise TransitionRefused(f"job {job.id} is {job.state}, which is final; only a live job can be cancelled")
     _show_first(args, job, out)
-    authority = _authority(args, store)
-    signer_fp, sign = _signer(args, dsign.DISPATCH_CANCEL_NAMESPACE)
-    payload = dsign.cancel_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc), reason=args.reason)
-    _confirm(args, "cancel")
-    try:
-        signature = sign(dsign.sign_message(payload))
-    except KeyError_ as exc:
-        raise ValueError(str(exc)) from None
-    return store.cancel_by_human(job.id, payload, signature, authority)
+
+    def act() -> Job:
+        signer_fp, sign = _signer(args, dsign.DISPATCH_CANCEL_NAMESPACE, "the operator's signed cancel")
+        authority = _authority(args, store)
+        payload = dsign.cancel_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc),
+                                       reason=args.reason)
+        _confirm(args, job, "cancel", out)
+        return store.cancel_by_human(job.id, payload, _signature(sign, payload), authority)
+
+    return _guarded(store, job, "cancel", act)
 
 
 def _run(args: argparse.Namespace, out: Any) -> int:
@@ -287,7 +419,8 @@ def _run(args: argparse.Namespace, out: Any) -> int:
     cmd = args.dispatch_cmd
 
     def emit(data: Any, text: str) -> None:
-        print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else text, file=out, flush=True)
+        # ASCII-escaped JSON: no C1 control or line separator reaches a terminal raw
+        print(json.dumps(data, ensure_ascii=True, indent=2) if args.json else text, file=out, flush=True)
 
     if cmd == "file":
         submission = _read_contract(args.contract)
@@ -311,26 +444,25 @@ def _run(args: argparse.Namespace, out: Any) -> int:
         jobs = [j for j in store.list(repo=args.repo) if args.all or j.state not in TERMINAL]
         emit([{"id": j.id, "state": j.state, "repo": j.repo, "filed_at": j.filed_at, "lease_end": j.lease_end,
                "template": j.contract.template.template_id, "digest": j.digest} for j in jobs],
-             "\n".join(f"{j.id}  {j.state:<12} {j.contract.template.template_id:<16} lease {j.lease_end}  "
-                       f"{_safe(j.repo)}" for j in jobs)
+             "\n".join(_safe(f"{j.id}  {j.state:<12} {j.contract.template.template_id:<16} lease {j.lease_end}  "
+                             f"{j.repo}") for j in jobs)
              or ("levain dispatch: no jobs." if args.all else "levain dispatch: no live jobs (--all for every job)."))
         return EXIT_OK
     if cmd == "sign":
-        from levain.cockpit.keys import KeyError_
-
+        _refuse_an_agent("sign")
         job = _must_get(store, args.job)
         if job.state != "filed":
             raise SignatureRefused(f"job {job.id} is {job.state}; only a filed job can be signed")
         _show_first(args, job, out)
-        authority = _authority(args, store)
-        signer_fp, sign = _signer(args, dsign.DISPATCH_SIGN_NAMESPACE)
-        payload = dsign.sign_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc))
-        _confirm(args, "sign")
-        try:
-            signature = sign(dsign.sign_message(payload))
-        except KeyError_ as exc:
-            raise ValueError(str(exc)) from None
-        job = store.sign(job.id, payload, signature, authority)
+
+        def act() -> Job:
+            signer_fp, sign = _signer(args, dsign.DISPATCH_SIGN_NAMESPACE, "signing")
+            authority = _authority(args, store)
+            payload = dsign.sign_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc))
+            _confirm(args, job, "sign", out)
+            return store.sign(job.id, payload, _signature(sign, payload), authority)
+
+        job = _guarded(store, job, "sign", act)
         emit({"id": job.id, "state": job.state, "signer_fp": job.signer_fp, "lease_end": job.lease_end},
              f"levain dispatch: signed job {job.id} as {job.signer_fp}; it is {job.state} until {job.lease_end}.")
         return EXIT_OK
@@ -359,12 +491,18 @@ def _run(args: argparse.Namespace, out: Any) -> int:
             emit({"id": job.id, "state": job.state, "as": "planner"},
                  f"levain dispatch: cancelled job {job.id} as the PLANNER (its capability).")
             return EXIT_OK
+        if args.capability is None and not args.human:
+            print(f"levain dispatch: no capability for job {_safe(args.job)[:40]} in this session's record "
+                  f"({agent or 'no agent'}, "
+                  f"{'no session' if session == caps.NO_SESSION else _safe(session)[:80]}); cancelling as the "
+                  "operator, signed.",
+                  file=sys.stderr if args.json else out, flush=True)
         job = _signed_cancel(args, store, _must_get(store, args.job), out)
         emit({"id": job.id, "state": job.state, "as": "human", "signer_fp": json.loads(job.history[-1].evidence)
               ["signer_fp"]},
              f"levain dispatch: cancelled job {job.id} as the HUMAN (signed); it holds none of its files now.")
         return EXIT_OK
-    raise ValueError(f"unknown dispatch command {cmd!r}")
+    raise InputRefused(f"unknown dispatch command {cmd!r}")
 
 
 def run_dispatch(args: argparse.Namespace, out: Any = None) -> int:
@@ -372,6 +510,10 @@ def run_dispatch(args: argparse.Namespace, out: Any = None) -> int:
     out = out if out is not None else sys.stdout
     try:
         return _run(args, out)
+    except _NotDone as exc:
+        print(f"levain dispatch: this machine could not do it ({type(exc.fault).__name__}): {_safe(exc.fault)}. "
+              f"{exc.not_done}.", file=out, flush=True)
+        return EXIT_FAULT
     except _FAULTS as exc:
         print(f"levain dispatch: this machine could not do it ({type(exc).__name__}): {_safe(exc)}", file=out,
               flush=True)
@@ -409,7 +551,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                        help="The cockpit data root whose authority log verifies the signature (default: the one the "
                             "consent hooks in the dispatch directory name).")
         p.add_argument("--yes", action="store_true",
-                       help="Sign without asking y/N (needed without a terminal); the whole view is still printed.")
+                       help="Do not ask y/N; the whole view is still printed. Never from an agent's process.")
 
     f = sub.add_parser("file", help="File a task contract (planner); prints the job and its capability once.")
     f.add_argument("contract", help="The contract JSON file, or - for stdin.")
