@@ -532,3 +532,18 @@ class QuestionStore:
                                 + _LAST_STEP + " = 'launching') ORDER BY a.rowid").fetchall()
         return [self._question_of(r) for r in rows]
 
+
+    def resume_meta(self, ref: Any) -> dict[str, Any] | None:
+        """What ``levain ask`` recorded for a later resume of the asking session (unsigned, never authority), or
+        ``None`` when nothing was recorded, the store does not exist or there is no such question."""
+        if not self._exists():
+            return None
+        parsed = _parse_ref(ref)
+        if parsed is None:
+            return None
+        with self._read() as conn:
+            row = conn.execute(f"SELECT resume FROM questions WHERE {parsed[0]} = ?", (parsed[1],)).fetchone()
+        if row is None or row[0] is None:
+            return None
+        got = json.loads(row[0])
+        return got if isinstance(got, dict) else None

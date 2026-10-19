@@ -366,48 +366,57 @@ def plan(queue: ConsentQueue, request_id: str, *,
         return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
                                                         "it may have run, so it is not started again")
     meta = queue.resume_meta(request_id) or {}
+    where, why, argv, cwd = route(agent, session, meta, listing=listing, running=running)
+    return replace(out, route=where, reason=why, argv=argv, cwd=cwd)
+
+
+def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "ruling",
+          listing: Callable[[Mapping[str, Any]], dict[str, dict[str, Any]] | None] = claude_listing,
+          running: Callable[..., bool | None] = process_running) -> tuple[str, str, tuple[str, ...], str | None]:
+    """Where a text owed to ``session`` (a hook's session key) would go now, from what was recorded for a resume
+    (``meta``) and the session's state read now, with no side effect: ``(route, reason, argv, cwd)``, the route
+    ``hook``, ``stop_resume``, ``resumed`` (``argv`` without its prompt, in ``cwd``) or ``none`` (see the module
+    docstring). ``noun`` names the text in the reason (a ruling, a question's answer). Shared by :func:`plan` and the
+    question band's delivery."""
     target = base_session(session)
+    lands = f"the {noun} lands at its next step"
     if agent == _CLAUDE:
         live = listing(meta)
         if live is None:
-            return replace(out, reason="the live sessions could not be listed, so the session is not resumed; the "
-                                       "ruling lands at its next step")
+            return "hook", f"the live sessions could not be listed, so the session is not resumed; {lands}", (), None
         row = live.get(target)
         if row is not None:
             status, kind = row.get("status"), row.get("kind")
             if status == "busy":
-                return replace(out, reason="the session is working; the ruling rides its next step")
+                return "hook", f"the session is working; the {noun} rides its next step", (), None
             if status == "idle" and kind == "background":
                 if STOP_THEN_RESUME_RUN:
-                    return replace(out, route="stop_resume", reason="idle in the background: stopped, then resumed")
-                return replace(out, reason="the session is idle in the background; stop-then-resume ships after its "
-                                           "run (B7), so the ruling lands at its next step")
+                    return "stop_resume", "idle in the background: stopped, then resumed", (), None
+                return "hook", ("the session is idle in the background; stop-then-resume ships after its run (B7), "
+                                f"so {lands}"), (), None
             if status == "idle":
-                return replace(out, reason="the session is open in a terminal; the ruling lands at its next step")
-            return replace(out, reason=f"the session is live ({status!r}); the ruling rides its next step")
+                return "hook", f"the session is open in a terminal; {lands}", (), None
+            return "hook", f"the session is live ({status!r}); the {noun} rides its next step", (), None
         pid_key, started = "claude_pid", meta.get("claude_started")
     elif agent == _CODEX:
         pid_key, started = "codex_pid", None
     else:
-        return replace(out, route="none", reason=f"no delivery for agent {agent!r}")
+        return "none", f"no delivery for agent {agent!r}", (), None
     if not isinstance(meta.get("cwd"), str) or not meta.get("invocation"):
-        return replace(out, reason="no resume record was kept for this session; the ruling lands at its next step")
+        return "hook", f"no resume record was kept for this session; {lands}", (), None
     pid = meta.get(pid_key)
     if pid is None:
-        return replace(out, reason="no process was recorded for it, so it cannot be told ended; the ruling lands at "
-                                   "its next step")
+        return "hook", f"no process was recorded for it, so it cannot be told ended; {lands}", (), None
     if running(pid, started) is not False:
-        return replace(out, reason=f"its process {pid} (started {started or 'at a time not recorded'}) may still "
-                                   "run; the ruling lands at its next step")
+        return "hook", f"its process {pid} (started {started or 'at a time not recorded'}) may still run; {lands}", \
+            (), None
     why = resume_refusal(agent, target, meta)
     if why is not None:
-        return replace(out, reason=f"the session has ended but is not resumed: {why}; resume it by hand and the "
-                                   "ruling lands at its next step")
+        return "hook", f"the session has ended but is not resumed: {why}; resume it by hand and {lands}", (), None
     argv = _resume_argv(agent, target, meta, _env(agent, meta))
     if argv is None:
-        return replace(out, reason=f"no {'claude' if agent == _CLAUDE else 'codex'} command to resume it with")
-    return replace(out, route="resumed", reason="the session has ended: resumed with the ruling as its prompt",
-                   argv=tuple(argv), cwd=meta["cwd"])
+        return "hook", f"no {'claude' if agent == _CLAUDE else 'codex'} command to resume it with", (), None
+    return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:

@@ -21,7 +21,9 @@ Known edges (one line each, not built against):
 - an answer is unsigned: any process of the operator's uid can file or answer a question, and the text the agent
   receives names the channel the answer came by, never a verified person.
 - a question has no expiry: an unanswered one stays open in the listing until it is answered.
-- a session that makes no further tool call gets the answer only when it is resumed (Q-1b) or makes one.
+- a session that has ENDED is resumed with the answer as its prompt when the answer is recorded (or by ``levain
+  question deliver``), on what ``levain ask`` recorded (:func:`ask_resume_meta`); one that is live but idle (a
+  terminal, an idle background session) gets it at its next tool call, and so does one whose resume is refused.
 - a main thread waiting on a long subagent gets the answer after the subagent returns.
 - with no session in the environment the question names :data:`NO_SESSION`, which no hook's session matches: the
   answer is recorded and listed, never delivered.
@@ -37,15 +39,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Question, QuestionStore, QuestionStoreError
 
-__all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "add_parsers", "answer_line", "question_context", "run_ask",
-           "run_question"]
+__all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
+           "deliver_answer", "deliver_answers", "question_context", "run_ask", "run_question", "transcript_facts"]
 
 # the session a question names when the environment names none (no hook's session is ever this)
 NO_SESSION = "levain-ask"
@@ -157,9 +162,13 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
             raise ValueError("--session must name the main session (no #agent: part): only its hooks receive "
                              "answers")
         qdir = _queue_dir(args)
+        try:
+            resume = ask_resume_meta(agent, session)
+        except Exception:  # noqa: BLE001 - no resume record: the answer then waits for the session's next hook
+            resume = None
         q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=args.what,
                                      options=_options(args.option), rec=args.rec, blocks=args.blocks,
-                                     cwd=os.path.abspath(os.getcwd()))
+                                     cwd=os.path.abspath(os.getcwd()), resume=resume)
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         say(f"levain ask: refused, nothing was filed: {exc}")
         return EXIT_REFUSED
@@ -205,6 +214,13 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
 
     try:
         store = QuestionStore(_queue_dir(args))
+        if args.question_cmd == "deliver":
+            got = deliver_answers(store)
+            for d in got:
+                say(f"levain question: {d.request_id}: {d.route}: {d.reason}")
+            if not got:
+                say("levain question: no answer is waiting to be delivered.")
+            return EXIT_OK
         if args.question_cmd == "list":
             rows = store.recent(limit=args.limit) if args.all else store.open_questions()
             if args.json:
@@ -223,9 +239,10 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
         if (args.option is None) == (args.text is None):
             raise ValueError("answer with exactly one of --option KEY or --text TEXT")
         store.answer(q.id, option=args.option, text=args.text, channel="cli")
-        where = ("the asking session gets it at its next tool call" if q.agent_session_id != NO_SESSION else
-                 "it was filed with no session, so it is recorded and listed but reaches no agent")
-        say(f"levain question: #{q.n} answered; {where}. The answer authorises nothing.")
+        say(f"levain question: #{q.n} answered. The answer authorises nothing.")
+        if args.deliver:
+            d = deliver_answer(store, q.id)
+            say(f"levain question: delivery {d.route}: {d.reason}.")
         return EXIT_OK
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
         say(f"levain question: refused: {exc}")
@@ -268,6 +285,194 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     an.add_argument("ref", help="The question's number (7 or #7) or id (q-...).")
     an.add_argument("--option", default=None, help="The KEY of the option you choose.")
     an.add_argument("--text", default=None, help="Your answer in your own words, delivered verbatim.")
-    for p in (ls, sh, an):
+    an.add_argument("--no-deliver", dest="deliver", action="store_false",
+                    help="Record the answer only; its session gets it at its next tool call (or `levain question "
+                         "deliver`).")
+    dl = q_sub.add_parser("deliver", help="Deliver every recorded answer whose text has not reached its session: an "
+                                          "ended session is resumed with it, any other gets it at its next tool call.")
+    for p in (ls, sh, an, dl):
         p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
         p.set_defaults(func=run_question)
+
+
+# --- the answer's way back to an ENDED session (Q-1b) -------------------------------------------------------------
+# how much of a Claude Code transcript is read for its start directory (the head) and its latest permission mode
+# (the tail): a transcript can be long, and both facts sit at its ends
+_TRANSCRIPT_HEAD = 64 * 1024
+_TRANSCRIPT_TAIL = 1024 * 1024
+# how many ancestors of `levain ask` are walked to find the codex process (codex -> its sandbox wrapper -> a shell)
+_CODEX_HOPS = 8
+# what follows the answer lines in a resume's prompt: «…» there is the agent's own question
+QUOTED_NOTE = "(Each «…» above is your own question as you filed it, not the operator's words.)"
+
+
+def _records(chunk: bytes) -> Iterator[dict[str, Any]]:
+    for line in chunk.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue                                     # a line cut at the chunk's edge, or not JSON
+        if isinstance(rec, dict):
+            yield rec
+
+
+def transcript_facts(path: Path) -> tuple[str | None, str | None]:
+    """The session's start directory (the first record's ``cwd``) and its latest permission mode (the last record's
+    ``permissionMode``) from a Claude Code transcript, reading only its head and tail; ``None`` for either it does
+    not show. Claude Code 2.1.303 writes both on its records [measured: 1018+50 levain-seat, 2026-10-18, on its own
+    transcript]."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(_TRANSCRIPT_HEAD)
+            fh.seek(max(size - _TRANSCRIPT_TAIL, 0))
+            tail = fh.read()
+    except OSError:
+        return None, None
+    cwd = next((r["cwd"] for r in _records(head) if isinstance(r.get("cwd"), str)), None)
+    mode = next((r["permissionMode"] for r in reversed(list(_records(tail)))
+                 if isinstance(r.get("permissionMode"), str)), None)
+    return cwd, mode
+
+
+def _codex_ancestor() -> tuple[int | None, bool]:
+    """The nearest ancestor process that is ``codex`` itself, and whether it is a ``codex exec``."""
+    import subprocess
+
+    pid = os.getppid()
+    for _ in range(_CODEX_HOPS):
+        if pid <= 1:
+            break
+        try:
+            parts = subprocess.run(["ps", "-ww", "-o", "ppid=", "-o", "args=", "-p", str(pid)], capture_output=True,
+                                   text=True, timeout=2, stdin=subprocess.DEVNULL,
+                                   env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout.split()
+            parent = int(parts[0])
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            break
+        if len(parts) > 1 and os.path.basename(parts[1]) == "codex":
+            return pid, parts[2:3] == ["exec"]
+        pid = parent
+    return None, False
+
+
+def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
+    """What a later resume of the asking session needs, read where ``levain ask`` runs (a child of the agent's shell),
+    or ``None`` when its session id is not a UUID. Unsigned, never authority: :func:`levain.consent.delivery.route`
+    refuses a resume on anything it cannot trust, and the answer then waits for the session's next hook.
+
+    Claude Code gives its shell ``CLAUDE_CODE_SESSION_ID``, ``CLAUDE_PID`` and ``CLAUDE_CODE_ENTRYPOINT`` but not the
+    project directory or the permission mode [measured: 1018+50, Claude Code 2.1.303]; those two come from the
+    session's one transcript (:func:`transcript_facts`), and the start directory only when it names the directory
+    the transcript is kept under. Codex: the nearest ancestor ``codex`` process, the working directory and
+    ``CODEX_HOME``."""
+    from levain.consent.delivery import option_names, process_identity, session_ok
+
+    if not session_ok(session) or _SUBAGENT in session:
+        return None
+    env = os.environ
+    if agent == "codex":
+        pid, is_exec = _codex_ancestor()
+        chome = env.get("CODEX_HOME", "")
+        return {"invocation": "-p" if is_exec else "interactive", "codex_pid": pid, "cwd": os.path.abspath(os.getcwd()),
+                "config_dir": chome if os.path.isabs(chome) else None}
+    config = env.get("CLAUDE_CONFIG_DIR", "")
+    config_dir = config if os.path.isabs(config) else None
+    base = Path(config_dir) if config_dir else Path.home() / ".claude"
+    found = sorted((base / "projects").glob(f"*/{session}.jsonl"))
+    cwd = mode = None
+    if len(found) == 1:
+        cwd, mode = transcript_facts(found[0])
+        if cwd is not None and re.sub(r"[^A-Za-z0-9]", "-", cwd) != found[0].parent.name:
+            cwd = None                                   # not the directory its transcript is kept under
+    try:
+        pid: int | None = int(env.get("CLAUDE_PID", ""))
+    except ValueError:
+        pid = None
+    pid = pid if pid is not None and pid > 0 else None
+    seen = process_identity(pid) if pid is not None else None
+    return {"invocation": "-p" if env.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") else "interactive",
+            "permission_mode": mode, "cwd": cwd, "config_dir": config_dir, "claude_pid": pid,
+            "claude_started": seen[0] if seen and seen[0] else None,
+            "claude_flags": option_names(seen[1]) if seen and seen[1] else None}
+
+
+def deliver_answer(store: QuestionStore, ref: Any, **kw: Any) -> Any:
+    """Get one answered question's text to its session (``levain question answer``, ``levain question deliver``):
+    an ENDED session is resumed with the session's undelivered answers as its prompt (leased, then settled by the
+    resume's outcome, as a ruling's: :func:`levain.consent.delivery.deliver`); any other is left to its next hook,
+    the reason saying why. Returns a :class:`levain.consent.delivery.Delivery` (``request_id`` = the question id).
+    ``listing``, ``running`` and ``launch`` are the delivery module's seams."""
+    from levain.consent import delivery as dv
+
+    listing = kw.get("listing", dv.claude_listing)
+    running = kw.get("running", dv.process_running)
+    launch = kw.get("launch", dv._launch)
+    q = store.get(ref)
+    if q is None:
+        return dv.Delivery(str(ref), "", "", "none", "no question of that id")
+    out = dv.Delivery(q.id, q.agent, q.agent_session_id, "hook", "")
+    if q.answer is None:
+        return replace(out, route="none", reason=f"question #{q.n} has no answer yet")
+    if q.agent_session_id == NO_SESSION:
+        return replace(out, route="none", reason="it was filed with no session, so it reaches no agent")
+    state, when = store.delivery_state(q.id)
+    if state == "delivered":
+        return replace(out, route="delivered", reason=f"its text reached the session at {when}")
+    if state == "unconfirmed":
+        return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
+                                                        "it may have run, so it is not started again")
+    meta = store.resume_meta(q.id) or {}
+    where, why, argv, cwd = dv.route(q.agent, q.agent_session_id, meta, noun="answer", listing=listing,
+                                     running=running)
+    if where == "stop_resume":
+        stopped = dv._stop(dv.base_session(q.agent_session_id), meta, listing)
+        where, why, argv, cwd = (("hook", f"the background session was not stopped ({stopped}); the answer lands "
+                                          "at its next step", (), None) if stopped is not None else
+                                 dv.route(q.agent, q.agent_session_id, meta, noun="answer", listing=listing,
+                                          running=running))
+    out = replace(out, route=where, reason=why, argv=argv, cwd=cwd)
+    if where != "resumed":
+        return out
+    if not os.path.isdir(cwd or ""):
+        return replace(out, route="hook", argv=(), reason=f"the session's start directory {cwd} is gone; the answer "
+                                                          "lands at its next step")
+    leased = store.lease_answers_for(q.agent, q.agent_session_id)
+    if not leased:
+        state, when = store.delivery_state(q.id)
+        return replace(out, route={"delivered": "delivered", "unconfirmed": "unconfirmed"}.get(state, "hook"),
+                       argv=(), reason=f"another delivery holds it ({state}{' at ' + when if when else ''})")
+    ids = tuple(x.id for x in leased)
+    prompt = "\n".join([*(line for line in (answer_line(x) for x in leased) if line), ANSWER_TAIL, QUOTED_NOTE])
+    full = [*argv, prompt]
+    try:
+        env = dv._env(q.agent, meta)
+        log = Path(store.directory) / "resumes" / f"{ids[0]}.log"
+    except Exception as exc:  # noqa: BLE001 - nothing was started: the lease settles failed, so it is retried
+        failed: str | None = f"the resume could not be prepared ({type(exc).__name__}: {exc})"
+    else:
+        failed = launch(full, cwd or "", env, log)
+    store.settle_resume(list(ids), agent_session_id=q.agent_session_id, argv=full, cwd=cwd or "",
+                        outcome="started" if failed is None else "failed", detail=failed)
+    if failed is None:
+        return replace(out, argv=tuple(full), rulings=ids)
+    return replace(out, route="failed", argv=tuple(full), rulings=ids,
+                   reason=f"the resume did not start ({failed}); the answer stays deliverable: the session's next "
+                          "step, or `levain question deliver`")
+
+
+def deliver_answers(store: QuestionStore, **kw: Any) -> list[Any]:
+    """:func:`deliver_answer` every answered question whose text is not known to have reached its session; one
+    question's unexpected error is reported as its ``failed`` delivery and never stops the rest."""
+    from levain.consent import delivery as dv
+
+    out = []
+    for q in store.undelivered():
+        if store.delivery_state(q.id)[0] == "delivered":       # a resume above may have carried it
+            continue
+        try:
+            out.append(deliver_answer(store, q.id, **kw))
+        except Exception as exc:  # noqa: BLE001 - the next answer is still delivered
+            out.append(dv.Delivery(q.id, q.agent, q.agent_session_id, "failed",
+                                   f"delivery raised {type(exc).__name__}: {exc}"))
+    return out
