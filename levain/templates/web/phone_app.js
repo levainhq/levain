@@ -17,8 +17,9 @@
   function keepToken(t) { memToken = t; store.set("sessionStorage", TOKEN_KEY, t); }
   function keepDevice(t) { memDevice = t; if (!store.set("localStorage", DEVICE_KEY, t)) forgets = true; }
   const deviceToken = () => memDevice || store.get("localStorage", DEVICE_KEY) || "";
-  // one unpaired state, said in the same words by every part of the page (Needs-you's status line included)
-  const UNPAIRED = "this phone was unpaired; pair it again from the laptop";
+  // one unpaired state, said in the same words by every part of the page (Needs-you's status line included); the
+  // Pairing code box is on screen whenever it shows
+  const UNPAIRED = "This phone was unpaired on the laptop: type a new pairing code in the box above to pair it again.";
   let unpaired = false;
   function sayUnpaired() { const st = document.getElementById("status"); if (st && st.textContent !== UNPAIRED) st.textContent = UNPAIRED; }
   // a page holding no credential the laptop takes: the server's own words for that name a header, so the page says
@@ -27,12 +28,12 @@
   let needsPair = false;
   function sayNotPaired() { const st = document.getElementById("status"); if (st && st.textContent !== NOT_PAIRED) st.textContent = NOT_PAIRED; }
   function forgetDevice(dev) {
-    // the laptop revoked this device: forget it, so the page stops offering what it can no longer open
+    // the laptop revoked this device: forget it, and offer the Pairing code box, the one way back in
     store.remove("localStorage", DEVICE_KEY); memDevice = "";
     if (token() === dev) { store.remove("sessionStorage", TOKEN_KEY); memToken = ""; }
     if (token()) return;
     unpaired = true;
-    sayUnpaired(); renderState(); renderBoard(); renderPings(); renderRecord();
+    sayUnpaired(); renderPairing(); renderState(); renderBoard(); renderPings(); renderRecord();
   }
 
   // ---- BOOT: runs before phone.js reads its token ---------------------------------------------------------------
@@ -77,15 +78,42 @@
     return e;
   }
   function api(method, route, body, tok) {
-    const headers = { "X-Levain-Phone-Token": tok || token() };
+    const used = tok || token();
+    const headers = { "X-Levain-Phone-Token": used };
     if (body) headers["Content-Type"] = "application/json";
     return fetch(route, { method: method, cache: "no-store", headers: headers, body: body ? JSON.stringify(body) : undefined })
       .then((res) => res.json().then((j) => ({ ok: res.ok, status: res.status, body: j && typeof j === "object" ? j : {} }),
                                      () => ({ ok: false, status: res.status, body: {} })),
-            () => ({ ok: false, status: 0, body: { message: "the phone port could not be reached" } }));
+            () => ({ ok: false, status: 0, body: { message: "the phone port could not be reached" } }))
+      .then((r) => { if (credentialNeeded(r)) credentialRefused(used); return r; });
   }
-  const refusedCredential = (r) => r.status === 403 && (r.body.error === "forbidden" || r.body.error === "credential_required");
-  const why = (r) => refusedCredential(r) ? NOT_PAIRED : (r.body.message || ("refused (HTTP " + r.status + ")"));
+  // the laptop refused the credential itself (none sent, a dead run token, a revoked device). Its words for that are
+  // these two; every other 403 (a bad Host, a cross-origin write, a device asking to mint) is shown in its own words
+  const credentialNeeded = (r) => r.status === 403 && typeof r.body.message === "string"
+    && /^this page's (token|credential) is needed/.test(r.body.message);
+  let switched = false;
+  function credentialRefused(used) {
+    const dev = deviceToken();
+    // the device token itself refused: the laptop revoked this phone
+    if (dev && used === dev) return forgetDevice(dev);
+    if (dev) {
+      // a dead run token (the laptop's phone server restarted) held over a device token that still works: drop it and
+      // load the page again on the device token, so phone.js, which reads its token once at load, uses it too. Once per
+      // page load; the reload carries no run token, so it cannot come back here on the same one
+      if (switched) return;
+      switched = true;
+      memToken = ""; store.remove("sessionStorage", TOKEN_KEY); keepToken(dev);
+      try { history.replaceState(null, "", location.pathname); } catch (e) { /* the address stays */ }
+      location.reload();
+      return;
+    }
+    needPairing();
+  }
+  const pairingShown = () => !!document.getElementById("pairing");
+  // the not-paired words go up only where the box to type the code into is on screen
+  const why = (r) => credentialNeeded(r)
+    ? (pairingShown() ? (unpaired ? UNPAIRED : NOT_PAIRED) : "the laptop refused this page's credential")
+    : (r.body.message || ("refused (HTTP " + r.status + ")"));
   function ago(iso) {
     const t = Date.parse(iso);
     if (!isFinite(t)) return "";
@@ -140,11 +168,9 @@
   const SL_MAX = 280;
   let slData = null, slEditing = false, slNote = "", slNoteKind = "";
   function loadState() {
-    const used = token();
+    // a refused credential is handled in api(): a revoked device is forgotten, a dead run token gives way to a kept
+    // device token, and a page holding neither shows the Pairing code box
     return api("GET", "/app/state.json").then((r) => {
-      if (r.status === 403 && used && used === deviceToken()) return forgetDevice(used);
-      // a run token from a link whose run has ended: this page holds nothing the laptop takes now
-      if (refusedCredential(r) && !deviceToken()) needPairing();
       slData = r.ok ? r.body : { error: why(r) };
       renderState();
     });
@@ -167,7 +193,7 @@
                                          onclick: () => startEdit(line && line.text || "", act) }) : null;
     box.append(h("div", { class: "sl-row" }, textEl, edit));
     if (slNote) box.append(h("p", { class: "note " + slNoteKind, role: "status", text: slNote }));
-    if (forgets) box.append(h("p", { class: "note bad", text: "This browser will not remember the pairing: it works until the page is closed, then open the install link from the laptop again." }));
+    if (forgets) box.append(h("p", { class: "note bad", text: "This browser will not remember the pairing: it works until the page is closed. To pair for good, get a new pairing code (in Safari: Install on this phone; on the laptop: levain ping pair) and try again in a browser that keeps site data." }));
   }
   function startEdit(text, act) {
     slEditing = true; slNote = "";
@@ -364,9 +390,8 @@
       return r;
     };
     return api("POST", "/webpush/subscribe", body, dev).then((r) => {
-      if (r.status !== 403 || !dev) return kept(r);
-      // the device was revoked: forget it, then once more on the run token, when the page holds one
-      forgetDevice(dev);
+      if (!credentialNeeded(r) || !dev) return kept(r);
+      // the device was revoked, and api() has forgotten it: once more on the run token, when the page holds one
       return token() ? api("POST", "/webpush/subscribe", body, token()).then(kept) : r;
     });
   }
@@ -388,8 +413,17 @@
       });
     }).catch((e) => { pingNote = "could not turn pings off: " + ((e && e.message) || e); pingNoteKind = "bad"; renderPings(); });
   }
+  // one mint at a time: each mint kills the short code before it, so a second tap's answer could arrive first and
+  // leave a dead code on screen. The flag is set in the tap itself; a completion that is not the newest is dropped
+  let installBusy = false, installSeq = 0;
   function install() {
+    if (installBusy) return;
+    installBusy = true;
+    const seq = ++installSeq;
+    renderPings();
     api("POST", "/webpush/pair", { label: "iPhone" }).then((r) => {
+      if (seq !== installSeq) return;
+      installBusy = false;
       if (r.status === 403) { installNote = "To install, open the link the laptop printed (this page was opened from a saved copy, which cannot make an install code)."; return renderPings(); }
       if (!r.ok || !r.body.code) { installNote = "could not make an install code: " + why(r); return renderPings(); }
       installCode = r.body.code;
@@ -401,6 +435,9 @@
       const ttl = Number(r.body.short_ttl_seconds) > 0 ? Number(r.body.short_ttl_seconds) : 600;
       installShortUntil = Date.now() + ttl * 1000; installShortMin = Math.max(1, Math.round(ttl / 60));
       installNote = ""; renderPings();
+    }).catch((e) => {
+      if (seq !== installSeq) return;
+      installBusy = false; installNote = "could not make an install code: " + ((e && e.message) || e); renderPings();
     });
   }
   function installCard(box) {
@@ -414,7 +451,9 @@
     box.append(h("ol", {}, h("li", { text: "Tap Share." }), h("li", { text: "Tap Add to Home Screen." }),
       h("li", { text: "Open Levain from the Home Screen." }),
       installShort ? h("li", { text: "Type this code in the box the app shows." }) : null));
-    box.append(h("div", { class: "btnrow" }, h("button", { type: "button", class: "quiet", id: "install-again", text: "New code", onclick: install })));
+    box.append(h("div", { class: "btnrow" }, h("button", { type: "button", class: "quiet", id: "install-again",
+                                                            text: installBusy ? "making a code…" : "New code",
+                                                            disabled: installBusy, onclick: install })));
   }
   const IOS_STEPS = "On iPhone, pings need this page on your Home Screen: tap Share, then Add to Home Screen, then open Levain from there.";
   function renderPings() {
@@ -425,7 +464,9 @@
     if (isIos && !standalone) {
       box.append(h("div", { class: "pstate", text: "Not set up yet" }), h("p", { class: "meta", text: IOS_STEPS }));
       if (installCode) installCard(box);
-      else box.append(h("div", { class: "btnrow" }, h("button", { type: "button", id: "install-btn", text: "Install on this phone", onclick: install })));
+      else box.append(h("div", { class: "btnrow" }, h("button", { type: "button", id: "install-btn",
+                                                                 text: installBusy ? "making a code…" : "Install on this phone",
+                                                                 disabled: installBusy, onclick: install })));
       if (installNote) box.append(h("p", { class: "note bad", text: installNote }));
       return;
     }
@@ -495,6 +536,8 @@
   // The installed app opened with no credential: the operator types the short code the laptop (`levain ping pair`) or
   // Safari's Install on this phone showed. The redeem carries no token header, since the page holds none to send.
   let pairNote = "", pairBusy = false;
+  const PAIR_FAILED = "This install link was already used or has expired. Get a new pairing code (in Safari: Install " +
+                      "on this phone; on the laptop: levain ping pair) and type it here.";
   function needPairing() {
     if (needsPair) return;
     needsPair = true; sayNotPaired(); renderPairing();
@@ -517,7 +560,10 @@
         keepDevice(t); keepToken(t);
         // the page boots on the device token it now keeps; a browser that keeps nothing would lose it to a reload
         if (store.get("sessionStorage", TOKEN_KEY) === t || store.get("localStorage", DEVICE_KEY) === t) { location.reload(); return; }
-        pairNote = "Paired, but this browser will not keep it: open the link the laptop printed instead.";
+        // phone.js reads its token once, at load, from the storage this browser refuses, so it cannot answer on this
+        // token even for this visit: the words say so, and send the operator to a new code, never to a link
+        pairNote = "This browser will not keep the pairing, and the code is spent. Get a new code and try again in a " +
+                   "browser that keeps site data.";
       } else if (r.status === 403) {
         pairNote = "That code did not match, or it expired. Get a new one: in Safari open the link from the laptop, tap Install on this phone.";
       } else if (r.status === 429) {
@@ -533,7 +579,8 @@
   }
   function renderPairing() {
     let box = $("pairing");
-    if (!needsPair || unpaired) { if (box) box.remove(); return; }
+    // two states, one box: a page that never held a credential, and a phone the laptop unpaired
+    if (!needsPair && !unpaired) { if (box) box.remove(); return; }
     if (!box) {
       box = h("section", { id: "pairing", class: "pairing", "aria-label": "pairing code" });
       const anchor = $("stateline");
@@ -547,7 +594,8 @@
     input.value = typed;
     const form = h("form", { class: "pair-row", onsubmit: (e) => { e.preventDefault(); if (!pairBusy) submitPair(input); } },
       input, h("button", { type: "submit", class: "go", id: "pair-btn", text: "Pair", disabled: pairBusy }));
-    box.replaceChildren(h("h2", { text: "Pairing code" }), h("p", { class: "meta", text: NOT_PAIRED }), form);
+    box.replaceChildren(h("h2", { text: "Pairing code" }), h("p", { class: "meta", id: "pair-lead", text: unpaired ? UNPAIRED : NOT_PAIRED }), form);
+    if (pairFailed && !unpaired) box.append(h("p", { class: "note bad", id: "pair-failed", text: PAIR_FAILED }));
     if (pairNote) box.append(h("p", { class: "note" + (pairBusy ? "" : " bad"), role: "status", id: "pair-note", text: pairNote }));
   }
 
@@ -569,12 +617,12 @@
     new MutationObserver(() => { if (unpaired) sayUnpaired(); else if (needsPair) sayNotPaired(); })
       .observe($("status"), { childList: true, characterData: true, subtree: true });
   }
-  if (pairFailed) $("stateline").append(h("p", { class: "note bad", text: "This install link was already used or has expired. Open the link the laptop printed to install." }));
-  // no run token in the link and no device kept: the typed code is the one way in
+  // no run token in the link and no device kept: the typed code is the one way in (an install link that failed says so
+  // inside the box, where the code is typed)
   if (!token()) needPairing();
   show(view);
   renderPings();
-  if (token()) { loadState(); loadRecord(); } else if (!pairFailed) renderState();
+  if (token()) { loadState(); loadRecord(); } else renderState();
   resync();
   setInterval(tick, 10000);
 })();

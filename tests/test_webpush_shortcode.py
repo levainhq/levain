@@ -98,26 +98,102 @@ def test_unknown_spent_and_expired_codes_are_one_answer_and_each_is_a_failure(co
 
 
 def test_five_wrong_codes_lock_out_a_right_one_until_the_window_slides(conn):
+    # the failures fall one minute before the code's own mint, so the window slides open while the code still lives
+    # (a mint clears the failures, so none is made inside this test after the five)
+    code = devices.mint_short_pairing(conn, "phone", T0)
+    wrong = _wrong(code)
+    early = T0 - timedelta(minutes=1)
+    for i in range(devices.SHORT_MAX_FAILURES):
+        assert devices.redeem_short(conn, wrong, early + timedelta(seconds=i)) is None
+    # locked: the right code is refused, the refusal is not another failure, and the wait runs to the first failure's
+    # age-out (early + 10 min = T0 + 9 min)
+    at = T0 + timedelta(seconds=30)
+    assert devices.redeem_short(conn, code, at) == (devices.LOCKED, 510)
+    assert devices.redeem_short(conn, wrong, at) == (devices.LOCKED, 510)
+    assert conn.execute("SELECT COUNT(*) FROM redeem_failures").fetchone()[0] == devices.SHORT_MAX_FAILURES
+    assert devices.redeem_short(conn, code, T0 + timedelta(minutes=8, seconds=59)) == (devices.LOCKED, 1)
+    # the first failure ages out at T0 + 9:00, which opens the lock; the code itself lives until T0 + 10:00
+    nine = T0 + timedelta(minutes=9)
+    got = devices.redeem_short(conn, code, nine)
+    assert got is not None and got[0].startswith("d-")
+    # a success leaves the failures: four are still in the window, so one more wrong code shuts the lock again
+    assert devices.redeem_short(conn, wrong, nine) is None
+    assert devices.redeem_short(conn, wrong, nine)[0] == devices.LOCKED
+
+
+def test_a_mint_clears_the_lock_and_the_new_code_redeems_at_once(conn):
     code = devices.mint_short_pairing(conn, "phone", T0)
     wrong = _wrong(code)
     for i in range(devices.SHORT_MAX_FAILURES):
         assert devices.redeem_short(conn, wrong, T0 + timedelta(seconds=i)) is None
-    # locked: the right code is refused, the refusal is not another failure, and the wait runs to the first failure's
-    # age-out (T0 + 10 min)
     at = T0 + timedelta(seconds=30)
-    assert devices.redeem_short(conn, code, at) == (devices.LOCKED, 570)
-    assert devices.redeem_short(conn, wrong, at) == (devices.LOCKED, 570)
-    assert conn.execute("SELECT COUNT(*) FROM redeem_failures").fetchone()[0] == devices.SHORT_MAX_FAILURES
-    assert devices.redeem_short(conn, code, T0 + timedelta(minutes=9, seconds=59)) == (devices.LOCKED, 1)
-    # the first failure ages out at T0 + 10:00, which opens the lock; the code itself is still alive until then
-    code = devices.mint_short_pairing(conn, "phone", T0 + timedelta(minutes=9, seconds=59))
-    got = devices.redeem_short(conn, code, T0 + timedelta(minutes=10))
+    assert devices.redeem_short(conn, code, at)[0] == devices.LOCKED
+    # the operator, holding the run token or the laptop, mints a fresh code: it redeems at once, lock or no lock
+    fresh = devices.mint_short_pairing(conn, "phone", at)
+    assert conn.execute("SELECT COUNT(*) FROM redeem_failures").fetchone()[0] == 0
+    got = devices.redeem_short(conn, fresh, at)
     assert got is not None and got[0].startswith("d-")
-    # a success leaves the failures: four are still in the window, so one more wrong code locks a fresh right one again
-    ten = T0 + timedelta(minutes=10)
-    assert devices.redeem_short(conn, wrong, ten) is None
-    fresh = devices.mint_short_pairing(conn, "phone", ten)
-    assert devices.redeem_short(conn, fresh, ten) == (devices.LOCKED, 1)      # the T0+1s failure ages out next
+    # and nothing a caller without a credential does clears them: a redeem's success leaves them, a refused one adds
+    again = devices.mint_short_pairing(conn, "phone", at)
+    for i in range(devices.SHORT_MAX_FAILURES - 1):
+        assert devices.redeem_short(conn, _wrong(again), at) is None
+    assert devices.redeem_short(conn, again, at) is not None
+    assert conn.execute("SELECT COUNT(*) FROM redeem_failures").fetchone()[0] == devices.SHORT_MAX_FAILURES - 1
+    long_code = devices.mint_pairing(conn, "long", at)                        # the long code's mint is not a short mint
+    assert devices.redeem(conn, long_code, at) is not None
+    assert conn.execute("SELECT COUNT(*) FROM redeem_failures").fetchone()[0] == devices.SHORT_MAX_FAILURES - 1
+
+
+def test_a_pasted_code_with_invisible_characters_still_reads(conn):
+    # what a copy from Messages or Notes can carry: zero-width space, left-to-right mark, BOM, isolates, soft hyphen,
+    # and a stray control character
+    for ch in ("​", "‎", "﻿", "⁦", "⁩", "­", "‍", "\x07"):
+        for typed in (ch + "ABCD-EFGH", "ABCD-EFGH" + ch, "ABCD" + ch + "-EFGH", "AB" + ch + "CD" + ch + "EFGH",
+                      "⁦ABCD-EFGH⁩"):
+            assert devices.normalize_short(typed) == "ABCDEFGH", repr(typed)
+    # the cap is on the input as it arrived: 64 invisible characters around a code is still too long
+    assert devices.normalize_short("​" * 57 + "ABCDEFGH") is None
+    assert devices.normalize_short("​" * 56 + "ABCDEFGH") == "ABCDEFGH"
+    # and a code that is wrong is still not a code once they are gone
+    assert devices.normalize_short("​ABCD-EFG") is None
+    # end to end: the pasted copy of a live code redeems
+    code = devices.mint_short_pairing(conn, "phone", T0)
+    assert devices.redeem_short(conn, "⁦" + code + "​⁩", T0) is not None
+
+
+def test_two_racing_mints_leave_one_redeemable_code(tmp_path: Path):
+    """Probabilistic: without the one transaction both inserts can land after both deletes. A few rounds with many
+    threads make that likely; the assertion is exact (one live code) every round."""
+    PushStore(tmp_path).connection().close()
+    for _ in range(6):
+        start = threading.Barrier(6)
+        codes: list = []
+
+        def go() -> None:
+            c = PushStore(tmp_path).connection()
+            try:
+                start.wait()
+                codes.append(devices.mint_short_pairing(c, "phone", T0))
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=go) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(codes) == 6
+        c = PushStore(tmp_path).connection()
+        try:
+            held = {r[0] for r in c.execute("SELECT code_hash FROM short_pairings WHERE used_at IS NULL")}
+            assert len(held) == 1, len(held)
+            live = [code for code in codes if devices._hash(devices.normalize_short(code)) in held]
+            assert len(live) == 1, (codes, live)
+            # the one live code redeems; every other one is dead
+            assert devices.redeem_short(c, live[0], T0) is not None
+            assert c.execute("SELECT COUNT(*) FROM short_pairings WHERE used_at IS NULL").fetchone()[0] == 0
+        finally:
+            c.close()
 
 
 def test_two_racing_redeems_of_one_code_make_one_device(tmp_path: Path):
@@ -250,6 +326,27 @@ def test_the_route_answers_200_403_and_429_through_the_phone_server(tmp_path: Pa
         assert set(body) == {"error", "message", "retry_after"}
 
 
+def test_a_locked_route_opens_only_for_a_run_token_mint(tmp_path: Path):
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    with _serving(qdir) as url:
+        dev = _post(url + "/webpush/pair/redeem", {"short": _post(url + "/webpush/pair", {}, _TOK)[1]["short"]})[1]
+        minted = _post(url + "/webpush/pair", {}, _TOK)[1]
+        for _ in range(devices.SHORT_MAX_FAILURES):
+            assert _post(url + "/webpush/pair/redeem", {"short": _wrong(minted["short"].replace("-", ""))})[0] == 403
+        assert _post(url + "/webpush/pair/redeem", {"short": minted["short"]})[0] == 429
+        # nothing a caller without the run token can send opens it: the long code's redeem, a device asking to mint,
+        # no credential asking to mint
+        assert _post(url + "/webpush/pair/redeem", {"code": minted["code"]})[0] == 200
+        assert _post(url + "/webpush/pair", {}, dev["token"])[0] == 403
+        assert _post(url + "/webpush/pair", {})[0] == 403
+        assert _post(url + "/webpush/pair/redeem", {"short": minted["short"]})[0] == 429
+        # the operator's fresh code redeems at once
+        fresh = _post(url + "/webpush/pair", {}, _TOK)[1]["short"]
+        status, body = _post(url + "/webpush/pair/redeem", {"short": fresh})
+        assert status == 200 and body["token"]
+
+
 def test_the_page_offers_the_typed_code_in_the_installed_app():
     js = _JS.read_text(encoding="utf-8")
     for words in ("This app is not paired yet: type the pairing code from the laptop or from Safari.",
@@ -266,3 +363,22 @@ def test_the_page_offers_the_typed_code_in_the_installed_app():
     redeem = js[js.index("function redeemShort"):js.index("function submitPair")]
     assert "X-Levain-Phone-Token" not in redeem and "location.reload()" in js
     assert "innerHTML" not in js
+
+
+def test_the_page_copy_never_sends_the_operator_back_to_a_browser_link():
+    """String guards only: the behaviour behind each (the revoked box, one mint per tap, the dead run token's switch,
+    a 403 that is not the credential one) is proven by driving the page in a browser, not here."""
+    js = _JS.read_text(encoding="utf-8")
+    for gone in ("Open the link the laptop printed to install.", "open the link the laptop printed instead",
+                 "then open the install link from the laptop again", "pair it again from the laptop",
+                 'r.body.error === "forbidden"'):
+        assert gone not in js, gone
+    for kept in ("This phone was unpaired on the laptop: type a new pairing code in the box above to pair it again.",
+                 "This browser will not keep the pairing, and the code is spent. Get a new code and try again in a ",
+                 "and type it here.", "this page's (token|credential) is needed", "if (installBusy) return;"):
+        assert kept in js, kept
+    # the server's two credential-needed sentences are the ones the page keys on
+    from levain.phone_server import PHONE_TOKEN_HEADER
+
+    assert re.match(r"this page's (token|credential) is needed", f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}")
+    assert re.match(r"this page's (token|credential) is needed", "this page's credential is needed")
