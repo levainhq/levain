@@ -21,6 +21,11 @@
   const UNPAIRED = "this phone was unpaired; pair it again from the laptop";
   let unpaired = false;
   function sayUnpaired() { const st = document.getElementById("status"); if (st && st.textContent !== UNPAIRED) st.textContent = UNPAIRED; }
+  // a page holding no credential the laptop takes: the server's own words for that name a header, so the page says
+  // what to do instead, in every place it would show them
+  const NOT_PAIRED = "This app is not paired yet: type the pairing code from the laptop or from Safari.";
+  let needsPair = false;
+  function sayNotPaired() { const st = document.getElementById("status"); if (st && st.textContent !== NOT_PAIRED) st.textContent = NOT_PAIRED; }
   function forgetDevice(dev) {
     // the laptop revoked this device: forget it, so the page stops offering what it can no longer open
     store.remove("localStorage", DEVICE_KEY); memDevice = "";
@@ -79,7 +84,8 @@
                                      () => ({ ok: false, status: res.status, body: {} })),
             () => ({ ok: false, status: 0, body: { message: "the phone port could not be reached" } }));
   }
-  const why = (r) => r.body.message || ("refused (HTTP " + r.status + ")");
+  const refusedCredential = (r) => r.status === 403 && (r.body.error === "forbidden" || r.body.error === "credential_required");
+  const why = (r) => refusedCredential(r) ? NOT_PAIRED : (r.body.message || ("refused (HTTP " + r.status + ")"));
   function ago(iso) {
     const t = Date.parse(iso);
     if (!isFinite(t)) return "";
@@ -137,6 +143,8 @@
     const used = token();
     return api("GET", "/app/state.json").then((r) => {
       if (r.status === 403 && used && used === deviceToken()) return forgetDevice(used);
+      // a run token from a link whose run has ended: this page holds nothing the laptop takes now
+      if (refusedCredential(r) && !deviceToken()) needPairing();
       slData = r.ok ? r.body : { error: why(r) };
       renderState();
     });
@@ -323,6 +331,8 @@
   const standalone = navigator.standalone === true || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
   const pushOk = swOk && "PushManager" in window && "Notification" in window;
   let pingNote = "", pingNoteKind = "", subState = null, installCode = null, installNote = "";
+  // the short code to type into the installed app, and when it dies (this phone's clock, from the server's lifetime)
+  let installShort = "", installShortUntil = 0, installShortMin = 10;
   function currentSub() {
     if (!pushOk) return Promise.resolve(null);
     return navigator.serviceWorker.ready.then((reg) => reg.pushManager.getSubscription()).catch(() => null);
@@ -385,8 +395,26 @@
       installCode = r.body.code;
       const m = $("manifest");
       if (m) m.setAttribute("href", "/app.webmanifest?pair=" + encodeURIComponent(r.body.code));
+      // the Home Screen app keeps its own storage, so the manifest's code may never reach it: the short code is
+      // the hand-off that does not depend on the browser
+      installShort = typeof r.body.short === "string" ? r.body.short : "";
+      const ttl = Number(r.body.short_ttl_seconds) > 0 ? Number(r.body.short_ttl_seconds) : 600;
+      installShortUntil = Date.now() + ttl * 1000; installShortMin = Math.max(1, Math.round(ttl / 60));
       installNote = ""; renderPings();
     });
+  }
+  function installCard(box) {
+    const live = installShort && Date.now() < installShortUntil;
+    if (installShort) {
+      const until = new Date(installShortUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      box.append(h("div", { class: "shortcode", id: "install-short", text: installShort }),
+        h("p", { class: "meta", id: "install-short-life",
+                 text: live ? "Works once, for " + installShortMin + " minutes (until " + until + ")." : "This code has expired: tap New code." }));
+    }
+    box.append(h("ol", {}, h("li", { text: "Tap Share." }), h("li", { text: "Tap Add to Home Screen." }),
+      h("li", { text: "Open Levain from the Home Screen." }),
+      installShort ? h("li", { text: "Type this code in the box the app shows." }) : null));
+    box.append(h("div", { class: "btnrow" }, h("button", { type: "button", class: "quiet", id: "install-again", text: "New code", onclick: install })));
   }
   const IOS_STEPS = "On iPhone, pings need this page on your Home Screen: tap Share, then Add to Home Screen, then open Levain from there.";
   function renderPings() {
@@ -396,7 +424,7 @@
     if (unpaired) { box.append(h("div", { class: "pstate bad", text: UNPAIRED })); return; }
     if (isIos && !standalone) {
       box.append(h("div", { class: "pstate", text: "Not set up yet" }), h("p", { class: "meta", text: IOS_STEPS }));
-      if (installCode) box.append(h("ol", {}, h("li", { text: "Tap Share." }), h("li", { text: "Tap Add to Home Screen." }), h("li", { text: "Open Levain from the Home Screen." })));
+      if (installCode) installCard(box);
       else box.append(h("div", { class: "btnrow" }, h("button", { type: "button", id: "install-btn", text: "Install on this phone", onclick: install })));
       if (installNote) box.append(h("p", { class: "note bad", text: installNote }));
       return;
@@ -463,6 +491,66 @@
     }
   }
 
+  // ---- pairing by a typed code -------------------------------------------------------------------------------------------
+  // The installed app opened with no credential: the operator types the short code the laptop (`levain ping pair`) or
+  // Safari's Install on this phone showed. The redeem carries no token header, since the page holds none to send.
+  let pairNote = "", pairBusy = false;
+  function needPairing() {
+    if (needsPair) return;
+    needsPair = true; sayNotPaired(); renderPairing();
+  }
+  function redeemShort(text) {
+    return fetch("/webpush/pair/redeem", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ short: text }) })
+      .then((res) => res.json().then((j) => ({ status: res.status, body: j && typeof j === "object" ? j : {} }),
+                                     () => ({ status: res.status, body: {} })),
+            () => ({ status: 0, body: {} }));
+  }
+  function submitPair(input) {
+    const text = input.value.trim();
+    if (!text) { pairNote = "Type the code first."; return renderPairing(); }
+    pairBusy = true; pairNote = "pairing…"; renderPairing();
+    redeemShort(text).then((r) => {
+      pairBusy = false;
+      if (r.status === 200 && typeof r.body.token === "string" && r.body.token) {
+        const t = r.body.token;
+        keepDevice(t); keepToken(t);
+        // the page boots on the device token it now keeps; a browser that keeps nothing would lose it to a reload
+        if (store.get("sessionStorage", TOKEN_KEY) === t || store.get("localStorage", DEVICE_KEY) === t) { location.reload(); return; }
+        pairNote = "Paired, but this browser will not keep it: open the link the laptop printed instead.";
+      } else if (r.status === 403) {
+        pairNote = "That code did not match, or it expired. Get a new one: in Safari open the link from the laptop, tap Install on this phone.";
+      } else if (r.status === 429) {
+        const secs = Number(r.body.retry_after) > 0 ? Number(r.body.retry_after) : 60;
+        pairNote = "Too many wrong codes. Try again in " + Math.max(1, Math.ceil(secs / 60)) + " min, then get a new code.";
+      } else if (r.status === 0) {
+        pairNote = "Could not reach the laptop: check the phone is online and the phone port is still running, then try again.";
+      } else {
+        pairNote = "Could not pair: " + (r.body.message || ("refused (HTTP " + r.status + ")"));
+      }
+      renderPairing();
+    });
+  }
+  function renderPairing() {
+    let box = $("pairing");
+    if (!needsPair || unpaired) { if (box) box.remove(); return; }
+    if (!box) {
+      box = h("section", { id: "pairing", class: "pairing", "aria-label": "pairing code" });
+      const anchor = $("stateline");
+      if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(box, anchor); else document.body.prepend(box);
+    }
+    const kept = box.querySelector("#pair-code");
+    const typed = kept ? kept.value : "";
+    const input = h("input", { id: "pair-code", type: "text", maxlength: "12", autocapitalize: "characters", autocorrect: "off",
+                               autocomplete: "off", spellcheck: "false", inputmode: "text", enterkeyhint: "go",
+                               placeholder: "ABCD-EFGH", "aria-label": "pairing code", disabled: pairBusy });
+    input.value = typed;
+    const form = h("form", { class: "pair-row", onsubmit: (e) => { e.preventDefault(); if (!pairBusy) submitPair(input); } },
+      input, h("button", { type: "submit", class: "go", id: "pair-btn", text: "Pair", disabled: pairBusy }));
+    box.replaceChildren(h("h2", { text: "Pairing code" }), h("p", { class: "meta", text: NOT_PAIRED }), form);
+    if (pairNote) box.append(h("p", { class: "note" + (pairBusy ? "" : " bad"), role: "status", id: "pair-note", text: pairNote }));
+  }
+
   // ---- wiring -----------------------------------------------------------------------------------------------------------
   function refreshView() {
     if (!token()) return;
@@ -478,9 +566,12 @@
   $("refresh").addEventListener("click", () => { tick(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
   if (window.MutationObserver && $("status")) {
-    new MutationObserver(() => { if (unpaired) sayUnpaired(); }).observe($("status"), { childList: true, characterData: true, subtree: true });
+    new MutationObserver(() => { if (unpaired) sayUnpaired(); else if (needsPair) sayNotPaired(); })
+      .observe($("status"), { childList: true, characterData: true, subtree: true });
   }
   if (pairFailed) $("stateline").append(h("p", { class: "note bad", text: "This install link was already used or has expired. Open the link the laptop printed to install." }));
+  // no run token in the link and no device kept: the typed code is the one way in
+  if (!token()) needPairing();
   show(view);
   renderPings();
   if (token()) { loadState(); loadRecord(); } else if (!pairFailed) renderState();

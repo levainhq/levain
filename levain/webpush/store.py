@@ -57,6 +57,11 @@ _SCHEMA: tuple[str, ...] = (
     "created TEXT, last_seen TEXT, revoked_at TEXT)",
     "CREATE TABLE IF NOT EXISTS pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
     "used_at TEXT)",
+    # the short code the operator types into the installed app, and the wrong guesses that lock it out; both are
+    # additive tables, so an existing store gains them on its next open with no format change
+    "CREATE TABLE IF NOT EXISTS short_pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
+    "used_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS redeem_failures (at TEXT NOT NULL)",
     # ``subscribed`` is the subscribe order, moved up on every re-subscribe: the caps retire by it
     "CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, "
     "endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created TEXT NOT NULL, "
