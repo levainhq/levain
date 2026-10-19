@@ -3284,6 +3284,9 @@
   // write token and an offered verb the body shows one button per option and a words box; without them it shows the CLI
   // command to copy. Every string is drawn with textContent, never as HTML; an answer authorises nothing (ruling 26a).
   const questionBodies = new Map();
+  // a refused send's words, by question id: a stale refusal empties the box so the owed re-read is not held off by it,
+  // and a redraw that still shows the question open gives the words back
+  const questionDrafts = new Map();
   function questionFetch(q, headers, tryNo) {
     return fetchBounded("/cockpit/question/" + encodeURIComponent(String(q.n)) + ".json", { cache: "no-store", headers: headers },
       (res) => {
@@ -3357,6 +3360,7 @@
       let res;
       try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
       if (res && res.ok) { words.value = ""; return; }   // the board re-reads and redraws this row as answered
+      if (res && res.error === "stale" && words.value.trim()) { questionDrafts.set(q.id, words.value); words.value = ""; }
       for (const c of controls) c.disabled = false;
       msg.textContent = (res && (res.message || res.error)) || "failed";
     };
@@ -3373,6 +3377,7 @@
     words.rows = 2;
     words.maxLength = 4000;
     words.placeholder = "or answer in your own words";
+    if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
     sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
