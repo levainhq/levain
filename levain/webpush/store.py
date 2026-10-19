@@ -198,7 +198,10 @@ class PushStore:
 
     def live_subscriptions(self) -> list[dict[str, Any]]:
         with self.read() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM subscriptions WHERE retired_at IS NULL ORDER BY id")]
+            # a subscription whose device was revoked is not live even if a revoke left its row unretired
+            return [dict(r) for r in c.execute(
+                "SELECT s.* FROM subscriptions s LEFT JOIN devices d ON d.id = s.device_id "
+                "WHERE s.retired_at IS NULL AND (d.id IS NULL OR d.revoked_at IS NULL) ORDER BY s.id")]
 
     # --- the record ----------------------------------------------------------------------------------
     def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None) -> int:

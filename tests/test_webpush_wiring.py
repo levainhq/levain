@@ -42,7 +42,8 @@ def test_a_phone_with_pings_on_gets_the_gate_ping_with_its_ref(tmp_path, monkeyp
     assert claude_code.notify(claude_code.AdapterSettings(), "levain: claude waits on you: Bash (request r1).",
                               cwd=tmp_path, ref="request:r1") is True
     assert calls == [{"kind": "consent", "ref": "request:r1", "title": "levain",
-                      "body": "claude waits on you: Bash (request r1).", "url": "/?view=needs", "command": None}]
+                      "body": "claude waits on you: Bash (request r1).", "url": "/?view=needs", "command": None,
+                      "push": True}]
 
 
 def test_a_ruling_ping_reaches_the_phone_without_a_notify_command(tmp_path, monkeypatch):
@@ -73,7 +74,8 @@ def test_a_notify_command_only_install_still_gets_the_ping_recorded(tmp_path, mo
     assert claude_code.notify(_argv_settings(true), "levain: claude waits on you: Bash (request r2).",
                               cwd=tmp_path, ref="request:r2") is True
     assert calls == [{"kind": "consent", "ref": "request:r2", "title": "levain",
-                      "body": "claude waits on you: Bash (request r2).", "url": "/?view=needs", "command": True}]
+                      "body": "claude waits on you: Bash (request r2).", "url": "/?view=needs", "command": True,
+                      "push": False}]
 
 
 def test_a_notify_command_that_cannot_start_is_recorded_as_not_started_and_the_ping_is_not_sent(tmp_path, monkeypatch):
@@ -175,3 +177,16 @@ def test_the_child_refuses_a_command_that_is_not_a_bool(tmp_path, monkeypatch, c
     monkeypatch.setattr(child.sys, "stdin", In)
     assert child.main(["send", "--queue-dir", str(tmp_path), "--kind", "consent"]) == 2
     assert not (tmp_path / DIR_NAME).exists()
+
+
+def test_a_command_only_ping_pushes_to_no_phone_even_if_a_subscription_appears_before_the_child_reads(tmp_path):
+    store = _phone(tmp_path)    # the caller saw no live phone (push=False), yet a subscription is there when the child reads
+    assert sender.send(tmp_path, kind="consent", ref=None, title="levain", body="b", command=True, push=False) == []
+    assert [r["command"] for r in store.record()] == [1] and store.record()[0]["deliveries"] == []
+
+
+def test_a_revoked_device_whose_subscription_was_left_unretired_is_not_sent_to(tmp_path):
+    store = _phone(tmp_path)
+    with store.write() as c:
+        c.execute("UPDATE devices SET revoked_at = '2026-10-19T00:00:00Z'")
+    assert store.live_subscriptions() == []
