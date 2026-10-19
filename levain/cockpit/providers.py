@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
@@ -1040,10 +1040,14 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
     return read
 
 
+# the Levain-native panels a downstream may leave out (K1_DESIGN §3): only these; the kernel's core panels are not a menu
+OPTIONAL_NATIVE = frozenset({"activity", "memory_glance", "doctor"})
+
+
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
     episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
-    team_start: Path | str | None = None,
+    team_start: Path | str | None = None, exclude: Collection[str] = (),
 ) -> Cockpit:
     """The kernel's own cockpit over one substrate: every panel the dashboard already shows,
     as the five kinds (design §6.2). A downstream registers its own providers on the result.
@@ -1051,7 +1055,16 @@ def build_default_cockpit(
     ``episode_feeds`` federates other writers' episodes into the Episodes panel (a constellation's
     agents): ``{name: read}``, where ``read(ctx)`` returns a ``Read`` of ``RowIn`` rows using only the
     episode facets and stored fields. Each row is shown under ``feed:<name>:<id>`` with ``agent`` set
-    (the feed's name when the row names none); the entity's own rows carry the entity's name."""
+    (the feed's name when the row names none); the entity's own rows carry the entity's name.
+
+    ``exclude`` leaves out Levain-native panels a downstream draws its own way (ids in ``OPTIONAL_NATIVE``; any
+    other id raises ``ValueError``). The ``activity`` ambient holds the hero's one ambient slot, so a downstream
+    registering its own hero ambient excludes it."""
+    if isinstance(exclude, str):
+        raise ValueError("exclude is a collection of panel ids, not one string")
+    bad_ids = sorted(set(exclude) - OPTIONAL_NATIVE)
+    if bad_ids:
+        raise ValueError(f"exclude {bad_ids}: only {sorted(OPTIONAL_NATIVE)} may be left out")
     feeds = tuple((episode_feeds or {}).items())
     for name, fn in feeds:
         if not isinstance(name, str) or not FEED_NAME.fullmatch(name) or not callable(fn):
@@ -1117,6 +1130,23 @@ def build_default_cockpit(
         version_fields=("*",), empty="No agent session active in the last 15 minutes."))
     ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))
+    # K1: the Levain-native activity feed (the hero's ambient) and two glance tiles; ``exclude`` leaves any out
+    from levain.cockpit.activity import ACTIVITY_GIT_DEADLINE_S, activity_reader
+    from levain.cockpit.glance import doctor_reader, memory_glance_reader
+
+    if "activity" not in exclude:
+        ck.register(ProviderSpec(
+            "activity", "ambient", "Activity", "feed",
+            activity_reader(install_root=source.install_root, episodic_db=source.anneal.episodic_db,
+                            consent=lambda: ck.consent_reader, questions=lambda: ck.question_store),
+            region="hero", rank=1, optional=True, timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0))
+    if "memory_glance" not in exclude:
+        ck.register(ProviderSpec("memory_glance", "metric-grid", "Memory", "gauge",
+                                 memory_glance_reader(lambda ctx: _view(source, ctx)), region="widgets", rank=30,
+                                 edit_class=CLASS_C))
+    if "doctor" not in exclude:
+        ck.register(ProviderSpec("doctor", "status-dots", "Levain health", "gauge",
+                                 doctor_reader(source.install_root), region="widgets", rank=45, timeout_s=20.0))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
                              size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(

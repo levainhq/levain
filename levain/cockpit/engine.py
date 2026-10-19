@@ -2396,6 +2396,9 @@ def _v_metric_grid(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
 
 EVENT_OUTCOMES = ("ok", "failed")
+# an ambient event's outcome: flow's two, then the Levain-native activity feed's (K1_DESIGN §1): a session live, a
+# decision's outcome, a question's state. A roster's last_call keeps the two.
+AMBIENT_OUTCOMES = EVENT_OUTCOMES + ("live", "allowed", "denied", "waiting", "open", "answered")
 
 
 def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -2419,8 +2422,8 @@ def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         for k in ("repo", "agent"):
             if e[k] is not None and not _is_str(e[k]):
                 raise _bad(spec, f"value.events[{i}].{k}", "must be a string or null")
-        if e["outcome"] not in EVENT_OUTCOMES:
-            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(EVENT_OUTCOMES)}, got {e['outcome']!r}")
+        if e["outcome"] not in AMBIENT_OUTCOMES:
+            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(AMBIENT_OUTCOMES)}, got {e['outcome']!r}")
     if not _is_str(v.get("legend")) or not v["legend"].strip():
         raise _bad(spec, "value.legend", "must be a non-empty string (one line saying what the encoding means)")
     return v
