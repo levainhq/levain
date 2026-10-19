@@ -131,7 +131,7 @@ MAX_IDEMPOTENCY_KEY_LEN = 200
 MAX_SPORE_TEXT_BYTES = 8 * 1024
 # Provenance for an operator-context (state line) set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
-_CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
+_CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app", "phone"})
 # Strict YYYY-MM-DD shape — anchored \d so a space-padded "2026-06- 1" (which len==10 +
 # datetime.strptime would wrongly accept) is rejected; a real-date check follows.
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")

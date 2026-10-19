@@ -605,7 +605,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
                      "Do not retry it and do not achieve it another way.")
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
-               cwd=queue.directory)
+               cwd=queue.directory, ref=f"request:{request.id}")
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): when away ends, the call goes back to Codex's approval
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
