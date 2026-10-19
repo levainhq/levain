@@ -252,6 +252,55 @@ def test_doctor_codex_band_row_ok_then_warn(make_install, tmp_path):
     assert row.ok and row.warn and "missing" in row.detail, row
 
 
+def test_the_codex_band_block_carries_this_levain_home_and_approves_its_tool(make_install, tmp_path):
+    """R-q20 amended: Codex starts an MCP server with no LEVAIN_HOME of the shell's, and `codex exec` refuses an
+    unapproved MCP call (both measured, CODEX_MCP_RUN/REPORT.md), so the block carries both."""
+    make_install("codex")
+    text = _config(tmp_path).read_text(encoding="utf-8")
+    assert "{{" not in text                                        # every slot filled
+    server = tomllib.loads(text)["mcp_servers"]["levain_band"]
+    assert server["env"] == {"LEVAIN_HOME": str((tmp_path / "levain-home").resolve()),
+                             "CODEX_HOME": str((tmp_path / "codex-home").resolve())}
+    assert server["default_tools_approval_mode"] == "approve"
+    assert set(server) == {"command", "args", "env", "default_tools_approval_mode"}
+
+
+def test_an_older_band_render_is_refreshed_and_an_operator_approval_mode_is_kept(make_install, tmp_path):
+    install = make_install("codex")
+    config = _config(tmp_path)
+    want = config.read_text(encoding="utf-8")
+    block = inst._codex_band_block(want)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data["files"].pop(inst.CODEX_BAND_KEY)                          # no record: judged by shape
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    older = "".join(line + "\n" for line in block.splitlines()
+                    if not line.startswith(("env = ", "default_tools_approval_mode")))
+    _edit_band(config, older)
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.warn and "older levain render" in row.detail and row.hint == "levain update", row
+    r, _out = _refresh(install)
+    assert any("levain_band" in x for x in r.refreshed), r
+    assert config.read_text(encoding="utf-8") == want
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data["files"].pop(inst.CODEX_BAND_KEY)
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    _edit_band(config, block.replace('"approve"', '"prompt"'))
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.warn and "'prompt'" in row.detail and "delete the [mcp_servers.levain_band]" in row.hint, row
+    r, _out = _refresh(install)
+    assert not any("levain_band" in x for x in r.refreshed), r      # the operator's mode is kept
+    assert '"prompt"' in config.read_text(encoding="utf-8")
+
+
+def test_doctor_warns_when_the_band_files_under_another_levain_home(make_install, tmp_path, monkeypatch):
+    install = make_install("codex")
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "elsewhere"))
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.warn and "LEVAIN_HOME" in row.detail and "cockpit here" in row.detail, row
+    assert row.hint == "levain update", row
+
+
 # ---- the agent line ---------------------------------------------------------------------------------------------
 
 def test_the_agent_line_names_the_mcp_tool():
@@ -422,10 +471,11 @@ def test_doctor_band_row_warns_on_a_lookalike_interpreter_and_on_extra_keys(make
     cx = make_install("codex", name="cx")
     config = _config(tmp_path)
     block = inst._codex_band_block(config.read_text(encoding="utf-8"))
-    _edit_band(config, block + 'env = { PYTHONPATH = "/tmp/evil" }\n')
+    home_line = next(line for line in block.splitlines() if line.startswith("env = "))
+    _edit_band(config, block.replace(home_line, home_line[:-1] + ', PYTHONPATH = "/tmp/evil" }'))
     (row,) = _band_rows(doctor._check_codex(cx))
     assert row.warn and "carries env" in row.detail, row
-    _edit_band(config, block)
+    _edit_band(config, block.replace(home_line + "\n", ""))
     config.write_text(config.read_text(encoding="utf-8") + '\n[mcp_servers.levain_band.env]\nPYTHONPATH = "/x"\n',
                       encoding="utf-8")
     (row,) = _band_rows(doctor._check_codex(cx))

@@ -169,3 +169,40 @@ def test_a_subagent_session_refusal_names_no_flag_the_tool_cannot_pass(tmp_path)
     text = result["content"][0]["text"]
     assert text.startswith("levain ask: refused") and "--session" not in text
     assert "the session in this server's environment must name the main session" in text
+
+
+THREAD = "01a15281-3cff-7f23-807f-5c03bb8821a0"
+
+
+def _call_with_meta(meta):
+    return _req(1, "tools/call", {"name": "ask", "arguments": ARGS, "_meta": meta})
+
+
+def test_a_codex_call_names_its_thread_from_meta_never_the_environment(tmp_path):
+    """R-q19 amended: Codex sends the thread id only in params._meta (measured, codex-cli 0.162.1)."""
+    meta = {"threadId": THREAD, "sessionId": THREAD, "progressToken": 0,
+            "x-codex-turn-metadata": {"thread_id": THREAD, "turn_id": "t1"}}
+    replies, _ = _talk(tmp_path, [_call_with_meta(meta)], agent="codex",
+                       env={"CLAUDE_CODE_SESSION_ID": None, "CODEX_THREAD_ID": "stale-env-thread"})
+    assert replies[0]["result"]["isError"] is False
+    assert "the answer arrives in your context" in replies[0]["result"]["content"][0]["text"]
+    (q,) = _store(tmp_path).open_questions()
+    assert (q.agent, q.agent_session_id) == ("codex", THREAD)
+    meta = _store(tmp_path).resume_meta(q.n)                        # the _meta thread is the caller's own
+    assert meta is not None and meta["config_dir"] is None          # this test's env names no CODEX_HOME
+
+
+def test_meta_session_id_is_read_when_no_thread_id_and_wins_over_a_stale_environment(tmp_path):
+    replies, _ = _talk(tmp_path, [_call_with_meta({"sessionId": THREAD})])     # env names SESSION
+    assert replies[0]["result"]["isError"] is False
+    (q,) = _store(tmp_path).open_questions()
+    assert q.agent_session_id == THREAD
+
+
+def test_a_malformed_or_subagent_meta_session_falls_through_to_the_environment(tmp_path):
+    bad = [{"threadId": ""}, {"threadId": 7}, {"threadId": "a\nb"}, {"threadId": "x" * 300},
+           {"threadId": THREAD + "#agent:x1"}, {"threadId": band.NO_SESSION}, "not-a-dict"]
+    replies, _ = _talk(tmp_path, [_req(i, "tools/call", {"name": "ask", "arguments": ARGS, "_meta": m})
+                                  for i, m in enumerate(bad, 1)])
+    assert all(r["result"]["isError"] is False for r in replies), replies
+    assert {q.agent_session_id for q in _store(tmp_path).open_questions()} == {SESSION}

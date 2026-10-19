@@ -2,8 +2,15 @@
 #
 # One tool, `ask`: files a question for the operator exactly as `levain ask` does, and returns at once.
 # {{PYTHON}} resolves to the interpreter Levain is installed in; `-P` keeps the directory Codex was started in
-# off sys.path. The server names no install: the question band lives in the machine's consent directory.
+# off sys.path. The server names no install: the question band lives in the levain home's consent directory, and
+# {{LEVAIN_HOME}} is that home as `levain init` / `levain update` saw it, because Codex starts an MCP server with a
+# minimal environment of its own (no LEVAIN_HOME or CODEX_HOME from the shell). {{CODEX_HOME}} is the directory this
+# config.toml is in: the band reads the asking thread's start directory from its rollout there, for the resume. `default_tools_approval_mode = "approve"` lets
+# `codex exec` call `ask` (it refuses an unapproved MCP call under approval policy never); the tool only files a
+# question, and an answer authorises nothing. It applies to this server's tool alone.
 
 [mcp_servers.levain_band]
 command = "{{PYTHON}}"
 args = ["-P", "-m", "levain.consent.band_mcp", "--agent", "codex"]
+env = { LEVAIN_HOME = "{{LEVAIN_HOME}}", CODEX_HOME = "{{CODEX_HOME}}" }
+default_tools_approval_mode = "approve"

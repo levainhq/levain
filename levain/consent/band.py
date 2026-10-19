@@ -219,18 +219,20 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
 
 def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
                   qdir: Path, *, no_session_hint: str = "(pass --session)",
-                  session_source: str = "--session") -> tuple[Question | None, str]:
+                  session_source: str = "--session", own_session: bool = False) -> tuple[Question | None, str]:
     """File one question, ping, and say so: the one path under ``levain ask`` and the ``ask`` MCP tool, so the
     refusals, the ping, the resume meta and the wording are the same for both. Returns the question (``None`` when
     it was refused or could not be written) and the text the caller shows the agent; ``no_session_hint`` is what
     that text says to do when the question names no session, and ``session_source`` what a refusal names as the
-    session's source (the MCP door has no ``--session`` flag)."""
+    session's source (the MCP door has no ``--session`` flag). ``own_session`` says the session is the caller's own
+    though its environment does not name it (the MCP door's per-call ``_meta``, which the agent's client writes and
+    the model cannot), so the resume meta is recorded for it."""
     try:
         if _SUBAGENT in session:
             raise ValueError(f"{session_source} must name the main session (no #agent: part): only its hooks "
                              "receive answers")
         try:
-            resume = ask_resume_meta(agent, session)
+            resume = ask_resume_meta(agent, session, own=session if own_session else None)
         except Exception:  # noqa: BLE001 - no resume record: the answer then waits for the session's next hook
             resume = None
         q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
@@ -464,7 +466,7 @@ def _claude_facts(config_dir: str | None, session: str) -> tuple[str | None, str
     return cwd, mode
 
 
-def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
+def ask_resume_meta(agent: str, session: str, *, own: str | None = None) -> dict[str, Any] | None:
     """What a later resume of the asking session needs, read where ``levain ask`` runs (a child of the agent's shell),
     or ``None`` when its session id is not a UUID. Unsigned, never authority: :func:`levain.consent.delivery.route`
     refuses a resume on anything it cannot trust, and the answer then waits for the session's next hook.
@@ -474,13 +476,15 @@ def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
     session's one transcript (:func:`transcript_facts`), and the start directory only when it names the directory
     the transcript is kept under; the session's process is the nearest ``claude`` ancestor of this command. Codex: the nearest ``codex`` ancestor (none for an app-server or MCP host, which outlives its threads),
     the start directory from the thread's rollout (:func:`codex_rollout_cwd`) and ``CODEX_HOME``. Nothing is
-    recorded for a session other than the caller's own (``--session`` naming another)."""
+    recorded for a session other than the caller's own (``--session`` naming another): the environment's session,
+    or ``own`` when the caller knows its session another way (the MCP door's per-call ``_meta``)."""
     from levain.consent.delivery import option_names, process_identity, session_ok
 
     if not session_ok(session) or _SUBAGENT in session:
         return None
     env = os.environ
-    own = env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")
+    if own is None:
+        own = env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")
     if session != own:
         return None                       # a session named by --session is not this process's: nothing to trust
     found = _agent_ancestor(agent)

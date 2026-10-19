@@ -115,7 +115,7 @@ def test_the_nearest_agent_ancestor_names_the_agent(monkeypatch):
 
 
 def test_levain_ask_records_the_resume_meta(tmp_path, monkeypatch):
-    monkeypatch.setattr(band, "ask_resume_meta", lambda agent, session: {"invocation": "-p", "cwd": "/w"})
+    monkeypatch.setattr(band, "ask_resume_meta", lambda agent, session, own=None: {"invocation": "-p", "cwd": "/w"})
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)
     monkeypatch.setattr("sys.stdout", io.StringIO())
     assert cli_main(["ask", "--what", "q?", "--option", "a=x", "--option", "b=y", "--rec", "a", "--blocks", "z",
@@ -402,3 +402,14 @@ def test_l3r4_a_hung_lock_holder_never_blocks_a_delivery(tmp_path, monkeypatch):
         os.close(holder)
     got = band.deliver_answer(store, 1, launch=lambda *a: launches.append(a))   # freed: it delivers
     assert got.route == "resumed" and len(launches) == 1
+
+
+def test_a_session_the_caller_knows_as_its_own_records_resume_meta_though_its_environment_names_none(monkeypatch):
+    """The MCP door's per-call _meta (QMCP R-q19 amended): Codex gives an MCP child no CODEX_THREAD_ID, so the thread
+    the call names is passed as ``own``; with neither, a named session is another's and nothing is recorded."""
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(41, ["/opt/bin/codex", "exec"])]))
+    assert band.ask_resume_meta("codex", SESSION) is None
+    meta = band.ask_resume_meta("codex", SESSION, own=SESSION)
+    assert meta is not None and meta["invocation"] == "-p" and meta["codex_pid"] == 41
+    assert band.ask_resume_meta("codex", SESSION, own="another-thread") is None

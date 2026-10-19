@@ -2977,7 +2977,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
 BAND_ROW = "levain_band MCP registered"
 
 
-def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
+def _check_band_server(where: str, server: object, agent: str, codex_home: Path | None = None) -> CheckResult:
     """QMCP R-q22: the question band's MCP server is registered as levain writes it. Advisory only (a WARN, never a
     FAIL): an agent files questions with `levain ask` without it."""
     from levain.install import BAND_SERVER, _is_levain_launcher
@@ -2991,7 +2991,7 @@ def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
                  f".levain/pending/.mcp.json (staged by `levain update`)" if agent == "claude_code" else
                  f"`levain update` keeps a block it did not write: delete the [mcp_servers.levain_band] table "
                  f"from {where}, then run `levain update`, which writes levain's")
-    extra = sorted(str(k) for k in server if k not in _BAND_KEYS)
+    extra = sorted(str(k) for k in server if k not in (_BAND_KEYS if agent == "claude_code" else _CODEX_BAND_KEYS))
     command = server.get("command")
     if not _is_levain_launcher({"mcp_servers": {BAND_SERVER: server}}, None, server=BAND_SERVER, agent=agent):
         args = server.get("args")
@@ -3003,6 +3003,12 @@ def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
         return CheckResult(BAND_ROW, True, f"{where}'s levain_band entry carries {', '.join(extra)} beside "
                                            f"levain's launcher: it may not run the band levain ships",
                            keep_hint, warn=True)
+    if agent == "codex":
+        problem = _codex_band_settings(server, codex_home if codex_home is not None else Path("~/.codex"))
+        if problem is not None:
+            detail, update_fixes = problem
+            return CheckResult(BAND_ROW, True, f"{where}'s levain_band entry {detail}",
+                               "levain update" if update_fixes else keep_hint, warn=True)
     if not _is_this_python(command):
         return CheckResult(BAND_ROW, True, f"{where} starts it with `{command}`, not this levain's Python "
                                            f"({sys.executable})", "levain update", warn=True)
@@ -3011,6 +3017,35 @@ def _check_band_server(where: str, server: object, agent: str) -> CheckResult:
 
 
 _BAND_KEYS = frozenset({"type", "command", "args"})
+# Codex's block also carries the levain home and the approval mode levain writes (QMCP R-q20 amended)
+_CODEX_BAND_KEYS = _BAND_KEYS | {"env", "default_tools_approval_mode"}
+
+
+def _codex_band_settings(server: dict, codex_home: Path) -> tuple[str, bool] | None:
+    """What is wrong with the codex band block's ``env`` and approval mode, and whether `levain update` fixes it
+    (an older render, or a levain home moved since the block was written: update rewrites a block levain recorded
+    writing) rather than it being the operator's edit, which update keeps; or ``None``. Codex gives the server no
+    LEVAIN_HOME of its own, so the block's must be this shell's levain home or questions land in another store; and
+    `codex exec` refuses an MCP call that is not pre-approved. ``codex_home`` is the directory whose config.toml
+    holds the block."""
+    from levain.consent.queue import default_queue_dir
+
+    env, mode = server.get("env"), server.get("default_tools_approval_mode")
+    if env is None and mode is None:
+        return "has no env / default_tools_approval_mode (an older levain render)", True
+    if not isinstance(env, dict) or set(env) != {"LEVAIN_HOME", "CODEX_HOME"}:
+        return (f"carries env {env!r} where levain writes only LEVAIN_HOME and CODEX_HOME: it may not run the band "
+                f"levain ships"), False
+    for key, want, why in (("LEVAIN_HOME", str(default_queue_dir().parent), "the cockpit here will not see them"),
+                           ("CODEX_HOME", str(codex_home.expanduser().resolve()),
+                            "an ended Codex thread is not resumed with its answer")):
+        named = env[key]
+        if not isinstance(named, str) or str(Path(named).expanduser().resolve()) != want:
+            return f"starts the band with {key} {named!r}, not {want}: {why}", True
+    if mode != "approve":
+        return (f"has default_tools_approval_mode {mode!r}: `codex exec` refuses an MCP call that is not approved, "
+                f"so only an interactive Codex session that asks can use the `ask` tool"), False
+    return None
 
 
 def _is_this_python(command: object) -> bool:
@@ -3240,7 +3275,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
         ))
     servers = config.get("mcp_servers")
     results.append(_check_band_server(
-        "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex"))
+        "config.toml", servers.get("levain_band") if isinstance(servers, dict) else None, "codex", codex_home))
 
     return results
 

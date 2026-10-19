@@ -3453,11 +3453,11 @@ def _py_literal_body(value: str) -> str:
     return _string_body(value).replace("'", "\\'")
 
 
-_SLOT_RE = re.compile(r"\{\{(PYTHON|INSTALL_DIR)\}\}")
+_SLOT_RE = re.compile(r"\{\{(PYTHON|INSTALL_DIR|LEVAIN_HOME|CODEX_HOME)\}\}")
 
 
 def _fill(template: str, slots: Mapping[str, str]) -> str:
-    """Fill ``{{PYTHON}}`` / ``{{INSTALL_DIR}}`` in one pass over the template, so a value that
+    """Fill ``{{PYTHON}}`` / ``{{INSTALL_DIR}}`` / ``{{LEVAIN_HOME}}`` / ``{{CODEX_HOME}}`` in one pass over the template, so a value that
     itself contains a slot name is never filled again (codex L3 r1: an install path holding
     ``{{PYTHON}}`` became the interpreter path)."""
     def one(m: re.Match[str]) -> str:
@@ -3482,8 +3482,16 @@ _CODEX_BAND_PENDING = "codex-home/config.toml.levain_band"
 
 
 def _codex_band_fragment(adapter_root: Path, python_path: str) -> str:
+    """The band block for codex's config.toml. LEVAIN_HOME is the levain home this process resolves (the one
+    `levain ask` and the cockpit would use from this shell), and CODEX_HOME the one whose config.toml this block goes
+    in, both written into the block's ``env`` because Codex gives an MCP server neither of the parent's (QMCP R-q20
+    amended)."""
+    from levain.consent.queue import default_queue_dir
+
     fragment = (adapter_root / "mcp.band.template.toml").read_text(encoding="utf-8")
-    return _fill(fragment, {"PYTHON": _string_body(python_path)})
+    return _fill(fragment, {"PYTHON": _string_body(python_path),
+                            "LEVAIN_HOME": _string_body(str(default_queue_dir().parent)),
+                            "CODEX_HOME": _string_body(str(_codex_home().expanduser().resolve()))})
 
 
 def _codex_band_block(text: str) -> str | None:
@@ -3516,12 +3524,24 @@ def _codex_band_unmatched(text: str) -> bool:
     return isinstance(servers, dict) and BAND_SERVER in servers
 
 
+# Keys the band block gained after its first render (QMCP R-q20 amended): a block that lacks them all, and is levain's
+# launcher with nothing else, is an older levain render, never the operator's.
+_BAND_AMENDED_KEYS = ("env", "default_tools_approval_mode")
+
+
 def _codex_band_is_levains(block: str, new_block: str) -> bool:
     """Whether ``block`` is a band registration levain itself writes: its launcher (R-q21) and nothing the
-    operator added beside it."""
+    operator added beside it, in this render's form or the older one without :data:`_BAND_AMENDED_KEYS`. A changed
+    ``env`` or approval mode is the operator's."""
     old_dict, new_dict = _codex_block_dict(block), _codex_block_dict(new_block)
-    return (_is_levain_launcher(old_dict, None, server=BAND_SERVER, agent="codex")
-            and _without_band_keys(old_dict) == _without_band_keys(new_dict))
+    if not _is_levain_launcher(old_dict, None, server=BAND_SERVER, agent="codex"):
+        return False
+    old_rest, new_rest = _without_band_keys(old_dict), _without_band_keys(new_dict)
+    if old_rest == new_rest:
+        return True
+    older = dict((new_rest or {}).get("mcp_servers") or {})
+    older[BAND_SERVER] = {k: v for k, v in (older.get(BAND_SERVER) or {}).items() if k not in _BAND_AMENDED_KEYS}
+    return old_rest == {**(new_rest or {}), "mcp_servers": older}
 
 
 def _merge_codex_band(path: Path, fragment: str, *, judge: bool,

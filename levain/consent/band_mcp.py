@@ -3,10 +3,13 @@
 shell. Stdlib only: JSON-RPC 2.0, one JSON message per line. Run as
 ``<python> -P -m levain.consent.band_mcp --agent <claude_code|codex>``.
 
-The server is a child of the agent, so the agent's session comes from the server's own environment
-(``CLAUDE_CODE_SESSION_ID`` / ``CODEX_THREAD_ID``) and the agent's process is the nearest ``claude`` / ``codex``
-ancestor (:func:`levain.consent.band.ask_resume_meta`). With no Codex thread in the environment the question names
-:data:`levain.consent.band.NO_SESSION` and the tool's text says so. An answer authorises nothing."""
+The session is read per call: the ``tools/call`` request's ``params._meta`` (``threadId``, then ``sessionId``) when it
+names a well-formed main-session id, else the server's own environment (``CLAUDE_CODE_SESSION_ID`` /
+``CODEX_THREAD_ID``). Per call because Codex gives an MCP child no ``CODEX_*`` environment and sends its thread id
+only in ``_meta`` (QMCP R-q19 amended, measured on codex-cli 0.162.1 ``codex exec``), and because an environment is
+fixed when the server starts while a client's session can change under it. The agent's process is the nearest
+``claude`` / ``codex`` ancestor (:func:`levain.consent.band.ask_resume_meta`). With no session from either, the question
+names :data:`levain.consent.band.NO_SESSION` and the tool's text says so. An answer authorises nothing."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +19,7 @@ import sys
 from typing import Any
 
 from levain.consent import band
+from levain.consent.questions import _SESSION_MAX, _has_control
 
 __all__ = ["TOOL", "handle", "main", "serve"]
 
@@ -72,16 +76,38 @@ def _arguments(raw: Any) -> tuple[str, list[tuple[str, str]], str, str]:
     return raw["what"], [(o["key"].strip(), o["label"].strip()) for o in opts], raw["rec"], raw["blocks"]
 
 
-def _ask(agent: str, arguments: Any) -> dict[str, Any]:
-    what, options, rec, blocks = _arguments(arguments)
-    env = os.environ
-    session = (env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")) \
-        or band.NO_SESSION
+_META_SESSION_KEYS = ("threadId", "sessionId")
+_META_SOURCE = "the session in this call's _meta"
+
+
+def _meta_session(params: dict[str, Any]) -> str | None:
+    """The main session a ``tools/call`` names in ``params._meta`` (the first of :data:`_META_SESSION_KEYS` that is
+    a well-formed main-session id: the store's length and control-character rule, no subagent part, not
+    :data:`levain.consent.band.NO_SESSION`), or ``None``: anything else falls through to the environment."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    for key in _META_SESSION_KEYS:
+        value = meta.get(key)
+        if (isinstance(value, str) and 0 < len(value) <= _SESSION_MAX and not _has_control(value)
+                and band._SUBAGENT not in value and value != band.NO_SESSION):
+            return value
+    return None
+
+
+def _ask(agent: str, params: dict[str, Any]) -> dict[str, Any]:
+    what, options, rec, blocks = _arguments(params.get("arguments"))
+    session, source = _meta_session(params), _META_SOURCE
+    if session is None:
+        env = os.environ
+        session = (env.get("CLAUDE_CODE_SESSION_ID") if agent == "claude_code" else env.get("CODEX_THREAD_ID")) \
+            or band.NO_SESSION
+        source = "the session in this server's environment"
     from levain.consent.queue import default_queue_dir
 
     q, text = band.file_question(agent, session, what, options, rec, blocks, default_queue_dir(),
-                                 no_session_hint="(this server's environment names no session)",
-                                 session_source="the session in this server's environment")
+                                 no_session_hint="(neither this call nor this server's environment names a session)",
+                                 session_source=source, own_session=source == _META_SOURCE)
     return {"content": [{"type": "text", "text": text}], "isError": q is None}
 
 
@@ -109,7 +135,7 @@ def handle(agent: str, msg: Any) -> dict[str, Any] | None:
         if method == "tools/call":
             if params.get("name") != TOOL["name"]:
                 raise _RpcError(INVALID_PARAMS, f"unknown tool {params.get('name')!r}")
-            return _ok(rid, _ask(agent, params.get("arguments")))
+            return _ok(rid, _ask(agent, params))
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)
