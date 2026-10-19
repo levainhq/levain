@@ -102,9 +102,10 @@ def answer_line(question: Question) -> str | None:
 
 def _escaped(text: str) -> str:
     """``text`` as a JSON string with every control, format and line or paragraph separator character escaped too
-    (``json.dumps`` escapes only U+0000-U+001F): NEL (U+0085), U+2028 and a bidi override all arrive as ``\\uXXXX``."""
+    (``json.dumps`` escapes only U+0000-U+001F): NEL (U+0085), U+2028 and a bidi override all arrive as ``\\uXXXX``,
+    a character past U+FFFF as its UTF-16 surrogate pair (``json.dumps`` of the one character), so it round-trips."""
     return "".join(c if not (unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp"))
-                   else f"\\u{ord(c):04x}" for c in json.dumps(text, ensure_ascii=False))
+                   else json.dumps(c)[1:-1] for c in json.dumps(text, ensure_ascii=False))
 
 
 def question_context(directory: Path | str, agent: str, session: str | None) -> str | None:
@@ -360,8 +361,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 
 # --- the answer's way back to an ENDED session (Q-1b) -------------------------------------------------------------
 # how much of a Claude Code transcript is read for its start directory (the head) and its latest permission mode
-# (the tail): a transcript can be long, and both facts sit at its ends
-_TRANSCRIPT_HEAD = 64 * 1024
+# (the tail), and the longest first line of a Codex rollout read: both facts sit at a file's ends, and a first
+# record carries the session's opening prompt or instructions (AGENTS.md included), which can be long
+_TRANSCRIPT_HEAD = 1024 * 1024
 _TRANSCRIPT_TAIL = 1024 * 1024
 # how many ancestors of `levain ask` are walked to find the agent's process (the agent -> a sandbox wrapper -> a shell)
 _HOPS = 8
@@ -448,8 +450,7 @@ def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
     Claude Code gives its shell ``CLAUDE_CODE_SESSION_ID``, ``CLAUDE_PID`` and ``CLAUDE_CODE_ENTRYPOINT`` but not the
     project directory or the permission mode [measured: 1018+50, Claude Code 2.1.303]; those two come from the
     session's one transcript (:func:`transcript_facts`), and the start directory only when it names the directory
-    the transcript is kept under; ``CLAUDE_PID`` is kept only when it is the nearest ``claude`` ancestor of this
-    command. Codex: the nearest ``codex`` ancestor (none for an app-server or MCP host, which outlives its threads),
+    the transcript is kept under; the session's process is the nearest ``claude`` ancestor of this command. Codex: the nearest ``codex`` ancestor (none for an app-server or MCP host, which outlives its threads),
     the start directory from the thread's rollout (:func:`codex_rollout_cwd`) and ``CODEX_HOME``. Nothing is
     recorded for a session other than the caller's own (``--session`` naming another)."""
     from levain.consent.delivery import option_names, process_identity, session_ok
@@ -464,20 +465,18 @@ def ask_resume_meta(agent: str, session: str) -> dict[str, Any] | None:
     if agent == "codex":
         chome = env.get("CODEX_HOME", "")
         config_dir = chome if os.path.isabs(chome) else None
-        subcommand = next((a for a in (found[1][1:] if found else []) if not a.startswith("-")), None)
-        return {"invocation": "-p" if subcommand == "exec" else "interactive",
-                "codex_pid": found[0] if found and subcommand not in ("app-server", "mcp-server") else None,
+        # the subcommand is read as any argument naming one (a top-level option's value can stand before it)
+        words = set(found[1][1:]) if found else set()
+        return {"invocation": "-p" if "exec" in words else "interactive",
+                "codex_pid": found[0] if found and not words & {"app-server", "mcp-server"} else None,
                 "cwd": codex_rollout_cwd(Path(config_dir) if config_dir else Path.home() / ".codex", session),
                 "config_dir": config_dir}
     config = env.get("CLAUDE_CONFIG_DIR", "")
     config_dir = config if os.path.isabs(config) else None
     cwd, mode = _claude_facts(config_dir, session)
-    try:
-        named: int | None = int(env.get("CLAUDE_PID", ""))
-    except ValueError:
-        named = None
-    # the session's process is trusted only when it IS an ancestor of this command, the claude it was run under
-    pid = found[0] if found is not None and found[0] == named else None
+    # the session's process is the claude this command runs under, its nearest claude ancestor; never CLAUDE_PID,
+    # which a nested claude inherits from the one that started it [measured: 1018+50, Claude Code 2.1.303]
+    pid = found[0] if found is not None else None
     seen = process_identity(pid) if pid is not None else None
     return {"invocation": "-p" if env.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") else "interactive",
             "permission_mode": mode, "cwd": cwd, "config_dir": config_dir, "claude_pid": pid,
@@ -513,7 +512,8 @@ def deliver_answer(store: QuestionStore, ref: Any, *, listing: Any = None, runni
     if state == "unconfirmed":
         return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
                                                         "it may have run, so it is not started again")
-    meta = store.resume_meta(q.id) or {}
+    # a question asked with nothing recorded borrows the session's newest record: one resume carries every answer
+    meta = store.resume_meta(q.id) or store.session_resume_meta(q.agent, q.agent_session_id) or {}
     where, why, argv, cwd = dv.route(q.agent, q.agent_session_id, meta, noun="answer", listing=listing,
                                      running=running)
     if where == "stop_resume":

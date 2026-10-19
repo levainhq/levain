@@ -65,7 +65,8 @@ from levain.consent.queue import ConsentQueue, Ruling, gap_label
 
 __all__ = ["QUOTED_NOTE", "RESUME_SETTLE", "STOP_THEN_RESUME_RUN", "Delivery", "agent_notify", "base_session",
            "claude_listing", "deliver", "deliver_undelivered", "gate_refusal", "option_names", "plan",
-           "process_identity", "process_running", "resume_refusal", "session_ok", "unrestored_flags"]
+           "process_identity", "process_running", "resume_refusal", "route", "session_named_running", "session_ok",
+           "unrestored_flags"]
 
 #: The stop-then-resume path for an IDLE background Claude Code session (R-i). Off until the run owed in B7 shows
 #: ``claude stop`` keeps the session id and its conversation and ``claude --bg --resume`` then continues it with no
@@ -372,12 +373,17 @@ def plan(queue: ConsentQueue, request_id: str, *,
 
 def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "ruling",
           listing: Callable[[Mapping[str, Any]], dict[str, dict[str, Any]] | None] = claude_listing,
-          running: Callable[..., bool | None] = process_running) -> tuple[str, str, tuple[str, ...], str | None]:
+          running: Callable[..., bool | None] = process_running,
+          named: Callable[[str], bool | None] | None = None) -> tuple[str, str, tuple[str, ...], str | None]:
     """Where a text owed to ``session`` (a hook's session key) would go now, from what was recorded for a resume
     (``meta``) and the session's state read now, with no side effect: ``(route, reason, argv, cwd)``, the route
     ``hook``, ``stop_resume``, ``resumed`` (``argv`` without its prompt, in ``cwd``) or ``none`` (see the module
     docstring). ``noun`` names the text in the reason (a ruling, a question's answer). Shared by :func:`plan` and the
-    question band's delivery."""
+    question band's delivery. ``named`` (default :func:`session_named_running`) is the last guard before a resume: a
+    recorded process that has ended does not mean the SESSION has (an earlier resume, or the operator's own
+    ``codex resume``, runs under a new process), so any running process whose command line names the session id
+    leaves the text to its next hook."""
+    named = named if named is not None else session_named_running
     target = base_session(session)
     lands = f"the {noun} lands at its next step"
     if agent == _CLAUDE:
@@ -410,6 +416,9 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     if running(pid, started) is not False:
         return "hook", f"its process {pid} (started {started or 'at a time not recorded'}) may still run; {lands}", \
             (), None
+    if named(target) is not False:
+        return "hook", f"a process naming this session may be running (an earlier resume, or one by hand); {lands}", \
+            (), None
     why = resume_refusal(agent, target, meta)
     if why is not None:
         return "hook", f"the session has ended but is not resumed: {why}; resume it by hand and {lands}", (), None
@@ -417,6 +426,21 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     if argv is None:
         return "hook", f"no {'claude' if agent == _CLAUDE else 'codex'} command to resume it with", (), None
     return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
+
+
+def session_named_running(session: str) -> bool | None:
+    """Whether a running process's command line names ``session`` (a resume of it: ``--resume=<id>``, ``codex exec
+    resume <id>``), ``None`` when the process list cannot be read (read as maybe: no resume)."""
+    if not session_ok(session):
+        return None
+    try:
+        got = subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if got.returncode != 0:
+        return None
+    return any(session in line for line in got.stdout.splitlines())
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:

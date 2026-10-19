@@ -61,9 +61,12 @@ def test_ask_resume_meta_claude_code_from_env_and_transcript(tmp_path, monkeypat
     assert (meta["invocation"], meta["permission_mode"], meta["cwd"], meta["config_dir"], meta["claude_pid"]) == \
         ("-p", "plan", "/work/my.proj", str(config), os.getpid())
     assert meta["claude_started"] and meta["claude_flags"]
-    # CLAUDE_PID naming a process that is not this command's claude ancestor is not trusted
+    # the pid is the nearest claude ANCESTOR, whatever CLAUDE_PID says (a nested claude inherits its starter's)
     monkeypatch.setenv("CLAUDE_PID", "4242")
+    assert band.ask_resume_meta("claude_code", SESSION)["claude_pid"] == os.getpid()
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(1111, ["zsh"])]))
     assert band.ask_resume_meta("claude_code", SESSION)["claude_pid"] is None
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(os.getpid(), ["claude", "-p"])]))
     # a start directory that does not name the transcript's directory is not trusted
     (tdir / f"{SESSION}.jsonl").write_text(json.dumps({"cwd": "/elsewhere", "permissionMode": "plan"}) + "\n")
     assert band.ask_resume_meta("claude_code", SESSION)["cwd"] is None
@@ -260,3 +263,68 @@ def test_the_cli_says_the_answer_stands_when_delivery_raises(tmp_path, monkeypat
     assert cli_main(["question", "answer", "1", "--option", "a", "--queue-dir", str(store.directory)]) == 0
     assert "the answer is recorded; its delivery raised OSError" in out.getvalue()
     assert store.get(1).answer is not None
+
+
+def test_l3r2_codex_subcommand_after_a_top_level_option(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_THREAD_ID", SESSION)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(77, ["codex", "-m", "o3", "exec", "go"])]))
+    meta = band.ask_resume_meta("codex", SESSION)
+    assert (meta["invocation"], meta["codex_pid"]) == ("-p", 77)
+    monkeypatch.setattr(band, "_ancestors", lambda: iter([(77, ["codex", "-c", "k=v", "mcp-server"])]))
+    assert band.ask_resume_meta("codex", SESSION)["codex_pid"] is None
+
+
+def test_l3r2_a_long_first_rollout_line_still_gives_its_cwd(tmp_path):
+    day = tmp_path / "sessions" / "2026" / "10" / "18"
+    day.mkdir(parents=True)
+    (day / f"rollout-x-{SESSION}.jsonl").write_text(json.dumps(
+        {"type": "session_meta", "payload": {"id": SESSION, "cwd": "/w", "base_instructions": "x" * 200_000}}) + "\n")
+    assert band.codex_rollout_cwd(tmp_path, SESSION) == "/w"
+
+
+def test_l3r2_a_process_naming_the_session_blocks_a_resume(tmp_path):
+    meta = {"invocation": "-p", "cwd": str(tmp_path), "codex_pid": 999999}
+    got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
+                   named=lambda s: True)
+    assert got[0] == "hook" and "a process naming this session may be running" in got[1]
+    got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
+                   named=lambda s: None)
+    assert got[0] == "hook"                                   # cannot tell: no resume
+    got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
+                   named=lambda s: False)
+    assert got[0] == "resumed"
+    assert dv.session_named_running("not-a-uuid") is None
+    assert dv.session_named_running(SESSION) is False         # no process here names the test's session
+
+
+def test_l3r2_an_answer_without_meta_borrows_the_sessions_newest(tmp_path, monkeypatch):
+    store = QuestionStore(tmp_path / "consent")
+    for resume in (None, {"invocation": "-p", "cwd": "/w2"}):
+        q = store.file(agent="codex", agent_session_id=SESSION, what="q?", options=[("a", "x"), ("b", "y")], rec="a",
+                       blocks="z", cwd="/w", resume=resume)
+    seen = {}
+    monkeypatch.setattr(dv, "route", lambda agent, session, meta, **k: seen.setdefault("meta", meta) and
+                        ("hook", "x", (), None))
+    store.answer(1, option="a", channel="cli")
+    band.deliver_answer(store, 1)
+    assert seen["meta"] == {"invocation": "-p", "cwd": "/w2"}
+
+
+def test_l3r2_non_bmp_controls_round_trip(tmp_path):
+    store = QuestionStore(tmp_path / "consent")
+    q = store.file(agent="codex", agent_session_id=SESSION, what="q?", options=[("a", "x"), ("b", "y")], rec="a",
+                   blocks="z", cwd="/w")
+    words = "flag \U000e0067\U000e0062 end \U0010fffd"
+    store.answer(q.id, text=words, channel="cli")
+    line = band.answer_line(store.get(q.id))
+    assert json.loads(line.split("in words: ", 1)[1]) == words
+    assert "\U000e0067" not in line
+
+
+def test_l3r2_nineteen_digit_numbers_and_the_agent_names():
+    from levain.consent.questions import _parse_ref
+
+    assert _parse_ref("9223372036854775807") == ("n", 2 ** 63 - 1)
+    assert _parse_ref("9223372036854775808") is None
+    assert set(band._AGENT_NAMES) == set(band._agents())

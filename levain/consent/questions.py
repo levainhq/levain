@@ -215,8 +215,8 @@ def _parse_ref(ref: Any) -> tuple[str, Any] | None:
         if text.startswith("q-"):
             return ("id", text)
         digits = text[1:] if text.startswith("#") else text
-        if digits.isascii() and digits.isdigit() and len(digits) <= 18:
-            return ("n", int(digits)) if int(digits) >= 1 else None
+        if digits.isascii() and digits.isdigit() and len(digits) <= 19:
+            return ("n", int(digits)) if 1 <= int(digits) <= _N_MAX else None
     return None
 
 
@@ -539,4 +539,14 @@ class QuestionStore:
         if row is None or row[0] is None:
             return None
         got = json.loads(row[0])
+        return got if isinstance(got, dict) else None
+
+    def session_resume_meta(self, agent: str, agent_session_id: str) -> dict[str, Any] | None:
+        """The newest resume record any question of this session carries, or ``None``."""
+        with self._peek() as conn:
+            if conn is None:
+                return None
+            row = conn.execute("SELECT resume FROM questions WHERE agent = ? AND agent_session_id = ? AND resume IS "
+                               "NOT NULL ORDER BY n DESC LIMIT 1", (agent, agent_session_id)).fetchone()
+        got = None if row is None else json.loads(row[0])
         return got if isinstance(got, dict) else None
