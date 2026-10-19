@@ -45,9 +45,13 @@ _CAP = 8 << 20              # the widest window; a usage record further back tha
 _SPEND_CAP = 256 << 20      # a file larger than this is not read for spend
 _CACHE_MAX = 256
 _LINE_CAP = 4 << 20         # a spend-scan line longer than this is skipped, never held whole
-_cache: dict[tuple[str, str], tuple[int, int, Any]] = {}
-_rollouts: dict[tuple[str, str], tuple[Path | None, float]] = {}    # (codex home, sid) -> (rollout or None, when looked)
-_MISS_S = 10.0              # how long "no rollout yet" is believed
+_SUBAGENT_FILES = 64        # subagent transcripts read for spend; more are counted as skipped
+_MODEL_CAP = 64
+_DAY_DIRS = 30              # date directories walked for a Codex rollout, newest first
+_cache: dict[tuple[str, str], tuple[tuple[int, ...], Any]] = {}
+_rollouts: dict[tuple[str, str], tuple[Path | None, float, int]] = {}    # (home, sid) -> (rollout or None, when, misses)
+_MISS_S = 10.0              # how long the first "no rollout yet" is believed; it doubles per repeat
+_MISS_MAX_S = 300.0
 
 
 class Context(NamedTuple):
@@ -60,7 +64,7 @@ class Context(NamedTuple):
 def _open_regular(path: Path | str) -> tuple[int, os.stat_result] | None:
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    except OSError:
+    except (OSError, ValueError):
         return None
     try:
         st = os.fstat(fd)
@@ -129,7 +133,7 @@ def _scan_claude(lines: list[bytes]) -> Context | None:
         if m is not None:
             if compacted:
                 break
-            model = m.get("model") if isinstance(m.get("model"), str) else None
+            model = m["model"][:_MODEL_CAP] if isinstance(m.get("model"), str) else None
             return Context(_claude_prompt(m["usage"]), None, model)
     return Context(0, None, None, True) if compacted else None
 
@@ -148,25 +152,27 @@ def _scan_codex(lines: list[bytes]) -> Context | None:
         p = d.get("payload")
         info = p.get("info") if isinstance(p, dict) and p.get("type") == "token_count" else None
         last = info.get("last_token_usage") if isinstance(info, dict) else None
-        if isinstance(last, dict) and isinstance(last.get("input_tokens"), int) and last["input_tokens"] > 0:
+        n = _num(last.get("input_tokens")) if isinstance(last, dict) else 0
+        if n > 0:
             if compacted:
                 break
-            w = info.get("model_context_window")
-            return Context(last["input_tokens"], w if isinstance(w, int) and w > 0 else None, None)
+            w = _num(info.get("model_context_window"))
+            return Context(n, w or None, None)
     return Context(0, None, None, True) if compacted else None
 
 
 def last_context(path: Path | str, agent: str = "claude_code") -> tuple[Context | None, str]:
-    """(context, "") from the transcript's newest usage record, or (None, why). Cached per (path, size, mtime)."""
+    """(context, "") from the transcript's newest usage record, or (None, why). Cached per file identity and version."""
     opened = _open_regular(path)
     if opened is None:
         return None, "transcript not found"
     fd, st = opened
     try:
         key = (str(path), agent)
+        ident = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         hit = _cache.get(key)
-        if hit and hit[:2] == (st.st_size, st.st_mtime_ns):
-            return hit[2]
+        if hit and hit[0] == ident:
+            return hit[1]
         scan = _scan_codex if agent == "codex" else _scan_claude
         width, out = _START, None
         while out is None:
@@ -177,7 +183,7 @@ def last_context(path: Path | str, agent: str = "claude_code") -> tuple[Context 
         res = (out, "") if out else (None, "no usage record in the transcript's tail")
         if len(_cache) >= _CACHE_MAX:
             _cache.clear()
-        _cache[key] = (st.st_size, st.st_mtime_ns, res)
+        _cache[key] = (ident, res)
         return res
     except OSError:
         return None, "transcript unreadable"
@@ -190,43 +196,57 @@ def _claude_dir(env: Mapping[str, str]) -> Path:
     return Path(cfg) if cfg and os.path.isabs(cfg) else Path.home() / ".claude"
 
 
+def _plain_file(p: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
 def _find_rollout(home: Path, sid: str) -> tuple[Path | None, str]:
     """The Codex rollout for a session id: a remembered path (re-checked on use), else the date directories newest
     first, since a session being measured is nearly always a recent one."""
-    if "/" in sid or "\\" in sid:
+    if "/" in sid or "\\" in sid or "\0" in sid:
         return None, "rollout not found"
     key = (str(home), sid)
     hit = _rollouts.get(key)
+    misses = 0
     if hit:
-        path, when = hit
+        path, when, misses = hit
         if path is not None:
             try:
-                if stat.S_ISREG(os.stat(path).st_mode):
+                if stat.S_ISREG(os.lstat(path).st_mode):
                     return path, ""
             except OSError:
                 pass
-        elif time.monotonic() - when < _MISS_S:
+            _rollouts.pop(key, None)
+            misses = 0
+        elif time.monotonic() - when < min(_MISS_S * 2 ** min(misses - 1, 6), _MISS_MAX_S):
             return None, "rollout not found"
     found: Path | None = None
     pat = f"rollout-*-{glob.escape(sid)}.jsonl"
     try:
         root = home / "sessions"
+        walked = 0
         for y in sorted(root.glob("[0-9]*"), reverse=True):
             for mo in sorted(y.glob("[0-9]*"), reverse=True):
                 for dd in sorted(mo.glob("[0-9]*"), reverse=True):
-                    hits = sorted(dd.glob(pat))
+                    if walked >= _DAY_DIRS:
+                        break
+                    walked += 1
+                    hits = [h for h in sorted(dd.glob(pat)) if _plain_file(h)]
                     if hits:
                         found = hits[-1]
                         break
-                if found:
+                if found or walked >= _DAY_DIRS:
                     break
-            if found:
+            if found or walked >= _DAY_DIRS:
                 break
     except OSError:
         pass
     if len(_rollouts) >= _CACHE_MAX:
         _rollouts.clear()
-    _rollouts[key] = (found, time.monotonic())
+    _rollouts[key] = (found, time.monotonic(), 0 if found else misses + 1)
     return (found, "") if found else (None, "rollout not found")
 
 
@@ -235,10 +255,10 @@ def find_transcript(rec: Mapping[str, Any], env: Mapping[str, str] | None = None
     cockpit's own environment (a relocated config directory is invisible without the recorded path)."""
     env = os.environ if env is None else env
     t = rec.get("transcript")
-    if isinstance(t, str) and os.path.isabs(t) and t.endswith(".jsonl"):
+    if isinstance(t, str) and len(t) <= 1024 and "\0" not in t and os.path.isabs(t) and t.endswith(".jsonl"):
         return Path(t), ""
     sid, cwd = rec.get("session_id"), rec.get("cwd")
-    if not isinstance(sid, str) or not sid:
+    if not isinstance(sid, str) or not sid or "\0" in sid:
         return None, "no session id"
     if rec.get("agent") == "codex":
         cfg = env.get("CODEX_HOME", "")
@@ -250,36 +270,46 @@ def find_transcript(rec: Mapping[str, Any], env: Mapping[str, str] | None = None
     return _claude_dir(env) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{sid}.jsonl", ""
 
 
-def iter_usage(path: Path | str, include_subagents: bool = False) -> Iterator[dict[str, Any]]:
+def iter_usage(path: Path | str, include_subagents: bool = False,
+               stats: dict[str, int] | None = None) -> Iterator[dict[str, Any]]:
     """Per-message usage of a Claude Code transcript (and, optionally, its ``<sid>/subagents/*.jsonl``), one dict per
-    message id: a message written as several records yields once, with the MAX of each usage field."""
+    message id: a message written as several records yields once, with the MAX of each usage field. Each file is read
+    up to the size it had when opened, and all files together up to ``_SPEND_CAP`` bytes; a file that is oversized,
+    unreadable or past a budget is left out, and ``stats["skipped_files"]`` (when given) says how many."""
     p = Path(path)
     files = [p]
+    skipped = 0
     if include_subagents:
         sub = p.with_suffix("") / "subagents"
         try:
-            files += sorted(sub.glob("*.jsonl"))
-        except OSError:
-            pass
+            found = sorted(sub.glob("*.jsonl"))
+        except (OSError, ValueError):
+            found = []
+        files += found[:_SUBAGENT_FILES]
+        skipped += max(0, len(found) - _SUBAGENT_FILES)
     best: dict[str, dict[str, Any]] = {}
+    budget = _SPEND_CAP
     for f in files:
         opened = _open_regular(f)
         if opened is None:
+            skipped += f is not p
             continue
         fd, st = opened
         try:
-            if st.st_size > _SPEND_CAP:
+            if st.st_size > budget:
+                skipped += 1
                 continue
+            budget -= st.st_size
             with os.fdopen(os.dup(fd), "rb") as fh:
                 offset = 0
-                while True:
-                    line = fh.readline(_LINE_CAP + 1)
+                while offset < st.st_size:
+                    line = fh.readline(min(_LINE_CAP + 1, st.st_size - offset))
                     if not line:
                         break
                     at, offset = offset, offset + len(line)
                     if len(line) > _LINE_CAP and not line.endswith(b"\n"):
-                        while True:       # an over-long line is skipped to its end, never held whole
-                            rest = fh.readline(_LINE_CAP)
+                        while offset < st.st_size:     # an over-long line is skipped to its end, never held whole
+                            rest = fh.readline(min(_LINE_CAP, st.st_size - offset))
                             offset += len(rest)
                             if not rest or rest.endswith(b"\n"):
                                 break
@@ -302,14 +332,17 @@ def iter_usage(path: Path | str, include_subagents: bool = False) -> Iterator[di
                             row[k] = max(row[k], old[k])
                     best[mid] = row
         except OSError:
+            skipped += 1
             continue
         finally:
             os.close(fd)
+    if stats is not None:
+        stats["skipped_files"] = skipped
     yield from best.values()
 
 
 def _k(n: int) -> str:
-    return f"{round(n / 1000)}K" if n >= 1000 else str(n)
+    return f"{n // 1000}K" if n >= 1000 else str(n)
 
 
 def context_chip(rec: Mapping[str, Any], env: Mapping[str, str] | None = None) -> tuple[str, Context | None]:

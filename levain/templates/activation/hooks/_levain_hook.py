@@ -740,6 +740,10 @@ def _sessions_dir(directory: Path) -> None:
         os.chmod(directory, 0o700, follow_symlinks=False)
 
 
+def _transcript_ok(p) -> bool:
+    return isinstance(p, str) and len(p) <= 1024 and "\0" not in p and p.endswith(".jsonl") and os.path.isabs(p)
+
+
 def session_touch(session_id, cwd, event, context_delivered=None, transcript=None) -> None:
     """Record that this session just fired `event` ("SessionStart" | "UserPromptSubmit").
     first_seen and (when `context_delivered` is None) context_delivered are kept from the
@@ -748,8 +752,10 @@ def session_touch(session_id, cwd, event, context_delivered=None, transcript=Non
     _SESSIONS_KEEP by mtime. Fail-soft: ANY exception is swallowed; a hook never fails a session
     over this."""
     try:
-        if not isinstance(session_id, str) or not session_id:
+        if not isinstance(session_id, str) or not session_id or "\0" in session_id:
             return
+        if isinstance(cwd, str) and "\0" in cwd:
+            cwd = ""
         key = hashlib.sha1(f"{_SESSION_AGENT}:{session_id}".encode("utf-8", "replace")).hexdigest()[:24]
         directory = install_root() / ".levain" / "sessions"
         path = directory / f"{key}.json"
@@ -781,8 +787,7 @@ def session_touch(session_id, cwd, event, context_delivered=None, transcript=Non
                 "last_event": event,
                 "context_delivered": delivered,
             }
-            tx = transcript if isinstance(transcript, str) and transcript.endswith(".jsonl") and os.path.isabs(transcript) \
-                and len(transcript) <= 1024 else kept_tx
+            tx = transcript if _transcript_ok(transcript) else (kept_tx if _transcript_ok(kept_tx) else None)
             if tx:
                 record["transcript"] = tx
             tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import types
 from pathlib import Path
 
+from levain.cockpit import session_context
 from levain.cockpit.session_context import CONTEXT_WARN_TOKENS, context_chip, find_transcript, iter_usage, last_context
 
 
@@ -83,3 +86,87 @@ def test_a_missing_or_symlinked_transcript_is_not_read(tmp_path):
     assert last_context(tmp_path / "none.jsonl")[0] is None and last_context(link)[0] is None
     chip, ctx = context_chip({"agent": "claude_code", "session_id": "s", "cwd": "/nowhere/x"}, {"CLAUDE_CONFIG_DIR": str(tmp_path)})
     assert ctx is None and chip.startswith("context not read: ")
+
+
+def test_a_bool_is_not_a_token_count_and_the_label_floors(tmp_path):
+    t = tmp_path / "r.jsonl"
+    t.write_text(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+        "last_token_usage": {"input_tokens": True}, "model_context_window": True}}}) + "\n")
+    assert last_context(t, "codex")[0] is None
+    t.write_text(_asst("m1", 1, inp=0, read=199_600, create=0))
+    chip, ctx = context_chip({"agent": "claude_code", "session_id": "s", "transcript": str(t)})
+    assert (chip, ctx.tokens) == ("context 199K", 199_600)       # under the warn line, so it is not rounded up to it
+    t.write_text(json.dumps({"type": "assistant", "message": {"id": "m", "model": "x" * 500, "usage": {"input_tokens": 5}}}) + "\n")
+    assert len(last_context(t)[0].model) == 64
+
+
+def test_the_cache_tells_a_replaced_same_size_file_apart(tmp_path):
+    t = tmp_path / "s.jsonl"
+    t.write_text(_asst("m1", 1, read=1000))
+    assert last_context(t)[0].tokens == 1053
+    mtime = t.stat().st_mtime_ns
+    other = tmp_path / "other.jsonl"
+    other.write_text(_asst("m1", 1, read=2000))
+    assert other.stat().st_size == t.stat().st_size
+    os.utime(other, ns=(mtime, mtime))
+    os.replace(other, t)
+    assert last_context(t)[0].tokens == 2053
+
+
+def test_a_codex_rollout_symlink_is_not_found_and_misses_back_off(tmp_path, monkeypatch):
+    sid = "zq-sid-1"
+    day = tmp_path / "sessions" / "2026" / "10" / "19"
+    day.mkdir(parents=True)
+    real = tmp_path / "real.jsonl"
+    real.write_text("")
+    (day / f"rollout-2026-10-19T00-00-00-{sid}.jsonl").symlink_to(real)
+    rec = {"agent": "codex", "session_id": sid}
+    env = {"CODEX_HOME": str(tmp_path)}
+    assert find_transcript(rec, env)[0] is None
+    clock = [1000.0]
+    monkeypatch.setattr(session_context.time, "monotonic", lambda: clock[0])
+    session_context._rollouts.clear()
+    find_transcript(rec, env)
+    clock[0] += 11
+    find_transcript(rec, env)
+    assert session_context._rollouts[(str(tmp_path), sid)][2] == 2
+    clock[0] += 11                                              # inside the doubled window: no new walk
+    find_transcript(rec, env)
+    assert session_context._rollouts[(str(tmp_path), sid)][2] == 2
+    (day / f"rollout-2026-10-19T00-00-00-{sid}.jsonl").unlink()
+    (day / f"rollout-2026-10-19T00-00-00-{sid}.jsonl").write_text("")
+    clock[0] += 400
+    assert find_transcript(rec, env)[0] is not None
+
+
+def test_spend_reads_stop_at_the_opened_size_and_report_what_they_left_out(tmp_path, monkeypatch):
+    t = tmp_path / "s.jsonl"
+    first = _asst("m1", 1)
+    t.write_text(first + _asst("m2", 2))
+    real = session_context._open_regular
+
+    def snapshot(path):
+        fd, st = real(path)
+        return fd, types.SimpleNamespace(st_size=len(first.encode()))
+    monkeypatch.setattr(session_context, "_open_regular", snapshot)
+    assert [r["id"] for r in iter_usage(t)] == ["m1"]           # the line appended after the snapshot is not read
+    monkeypatch.undo()
+    sub = tmp_path / "s" / "subagents"
+    sub.mkdir(parents=True)
+    for i in range(3):
+        (sub / f"a{i}.jsonl").write_text(_asst(f"s{i}", 1))
+    monkeypatch.setattr(session_context, "_SUBAGENT_FILES", 2)
+    stats: dict = {}
+    assert len(list(iter_usage(t, include_subagents=True, stats=stats))) == 4
+    assert stats["skipped_files"] == 1
+    monkeypatch.setattr(session_context, "_SPEND_CAP", len(first.encode()) * 3)
+    stats = {}
+    list(iter_usage(t, include_subagents=True, stats=stats))
+    assert stats["skipped_files"] >= 1
+
+
+def test_a_recorded_transcript_over_the_length_cap_or_with_a_nul_is_not_trusted(tmp_path):
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
+    for bad in ("/" + "a" * 1100 + ".jsonl", "/t/a\0b.jsonl"):
+        path, _why = find_transcript({"agent": "claude_code", "session_id": "s", "cwd": "/w", "transcript": bad}, env)
+        assert path == tmp_path / "projects" / "-w" / "s.jsonl"

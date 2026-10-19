@@ -214,3 +214,12 @@ def test_no_token_free_route_carries_the_transcript_or_the_session_id(tmp_path, 
     for _status, blob in blobs.values():
         for marker in (PROMPT, "zq-q8-reply-marker", SID, CWD, "q8 full"):
             assert marker.encode() not in blob, marker
+
+
+def test_a_nul_in_a_record_never_takes_the_session_view_down(tmp_path):
+    root, _src, _ids = _install(tmp_path)
+    rec = _put(root, "claude_code", SID, CWD, timedelta(minutes=2), transcript="/t/a\0b.jsonl")
+    body = read_session(root, _stem(rec), _now(), None)           # the bad transcript is dropped, the record stands
+    assert body is not None and body["context"]["tokens"] is None and body["context"]["compacted"] is False
+    rec = _put(root, "claude_code", SID_OTHER, CWD, timedelta(minutes=2), session_id=SID_OTHER + "\0")
+    assert read_session(root, _stem(rec), _now(), None) is None   # a NUL id is not a record of ours

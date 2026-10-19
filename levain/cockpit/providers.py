@@ -889,12 +889,14 @@ def _session_record(path: Path) -> dict[str, Any] | None:
     if not isinstance(d, dict) or d.get("v") != 1 or d.get("agent") not in SESSION_AGENTS:
         return None
     sid, cwd = d.get("session_id"), d.get("cwd")
-    if not (isinstance(sid, str) and sid and isinstance(cwd, str)) or d.get("last_event") not in SESSION_EVENTS:
+    if not (isinstance(sid, str) and sid and isinstance(cwd, str)) or "\0" in sid or "\0" in cwd \
+            or d.get("last_event") not in SESSION_EVENTS:
         return None
     if path.stem != hashlib.sha1(f"{d['agent']}:{sid}".encode("utf-8", "replace")).hexdigest()[:24]:
         return None
     tx = d.get("transcript")
-    if tx is not None and not (isinstance(tx, str) and len(tx) <= 1024 and os.path.isabs(tx) and tx.endswith(".jsonl")):
+    if tx is not None and not (isinstance(tx, str) and len(tx) <= 1024 and "\0" not in tx and os.path.isabs(tx)
+                               and tx.endswith(".jsonl")):
         d = {k: v for k, v in d.items() if k != "transcript"}    # a display field: a bad one is dropped, the record stands
     if d.get("context_delivered") not in (True, False, None) or _session_stamp(d.get("first_seen")) is None:
         return None

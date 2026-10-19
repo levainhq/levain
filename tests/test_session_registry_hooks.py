@@ -475,3 +475,34 @@ def test_the_transcript_path_is_kept_on_a_later_none_and_a_bad_one_is_refused(ag
     path.write_text(json.dumps(rec))
     got = _session_record(path)
     assert got is not None and "transcript" not in got
+
+
+def test_a_pack_supplied_older_hook_module_still_records_the_session(agent_root):
+    agent, root = agent_root
+    mod = root / "activation" / "hooks" / "_levain_hook.py"
+    src = mod.read_text(encoding="utf-8")
+    old = "def session_touch(session_id, cwd, event, context_delivered=None, transcript=None) -> None:"
+    assert old in src
+    mod.write_text(src.replace(old, "def session_touch(session_id, cwd, event, context_delivered=None) -> None:\n"
+                                    "    transcript = None"), encoding="utf-8")
+    for script, payload in (("session_start.py", {"session_id": "s1", "source": "startup", "cwd": "/w",
+                                                  "transcript_path": "/t/a.jsonl"}),
+                            ("user_prompt_submit.py", {"session_id": "s2", "prompt": "hi", "cwd": "/w",
+                                                       "transcript_path": "/t/a.jsonl"})):
+        proc = _run(root, script, payload)
+        assert proc.returncode == 0 and proc.stderr == ""
+        assert _record(root, agent, payload["session_id"])["session_id"] == payload["session_id"]
+
+
+def test_a_nul_path_is_never_recorded_and_a_kept_bad_one_is_dropped(agent_root):
+    agent, root = agent_root
+    payload = {"session_id": "s1", "source": "startup", "cwd": "/w/a\0b", "transcript_path": "/t/a\0b.jsonl"}
+    assert _run(root, "session_start.py", payload).returncode == 0
+    rec = _record(root, agent, "s1")
+    assert rec["cwd"] == "" and "transcript" not in rec
+    key = _key(agent, "s1")
+    path = root / ".levain" / "sessions" / f"{key}.json"
+    rec["transcript"] = "/t/kept\0.jsonl"
+    path.write_text(json.dumps(rec))
+    assert _run(root, "user_prompt_submit.py", {"session_id": "s1", "prompt": "x", "cwd": "/w"}).returncode == 0
+    assert "transcript" not in _record(root, agent, "s1")

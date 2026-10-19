@@ -192,7 +192,11 @@ def main() -> int:
             hook.state_seen_record(session_id, pending_sig)
         # Session registry: after emit(), so it can never change what was delivered.
         try:
-            hook.session_touch(session_id, payload.get("cwd"), "UserPromptSubmit", None, payload.get("transcript_path"))
+            args = (session_id, payload.get("cwd"), "UserPromptSubmit", None)
+            try:
+                hook.session_touch(*args, payload.get("transcript_path"))
+            except TypeError:    # a pack-supplied older _levain_hook.py takes no transcript argument
+                hook.session_touch(*args)
         except Exception:
             pass
         # Transcript line (Q8): the operator's prompt, for the cockpit's read-only view.

@@ -196,8 +196,11 @@ def main() -> int:
         # Session registry: after emit(), so it can never change what was delivered.
         # context_delivered = this hook actually delivered its context (emit confirmed).
         try:
-            hook.session_touch(session_id, payload.get("cwd"), "SessionStart", (delivered if sections else None),
-                               payload.get("transcript_path"))
+            args = (session_id, payload.get("cwd"), "SessionStart", (delivered if sections else None))
+            try:
+                hook.session_touch(*args, payload.get("transcript_path"))
+            except TypeError:    # a pack-supplied older _levain_hook.py takes no transcript argument
+                hook.session_touch(*args)
         except Exception:
             pass
     except Exception:
