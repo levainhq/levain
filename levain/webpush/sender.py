@@ -118,14 +118,15 @@ def _post(req: urllib.request.Request) -> int:
         return 0
 
 
-def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> list[tuple[int, int]]:
-    """Record the ping, push it to each live subscription concurrently; returns (subscription id, HTTP status)
+def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
+         command: bool | None = None, push: bool = True) -> list[tuple[int, int]]:
+    """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription. Every
     store write happens in this thread; the workers only talk to the push services."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
-    subs = store.live_subscriptions()
-    ping_id = store.add_ping(kind, ref, title, body)
+    subs = store.live_subscriptions() if push else []   # push=False: record only, the caller saw no live phone
+    ping_id = store.add_ping(kind, ref, title, body, command)
     data = build_payload(title, body, ref or kind, url, ping_id)
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
@@ -158,13 +159,16 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     return results
 
 
-def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> bool:
-    """Start :func:`send` detached, never waited on. The text goes to the child on its
+def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
+          command: bool | None = None, push: bool = True) -> bool:
+    """Start :func:`send` detached, never waited on. ``push=False`` records the ping and pushes it to no phone: how a
+    ping that only the notify command carried gets its row, decided by the caller's own read of the phones. The text goes to the child on its
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
     table. True when the child started."""
     from levain.launch import child_env
 
-    fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500]}
+    fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500],
+              "command": command, "push": push}
     data = json.dumps(fields).encode("utf-8", "replace")
     while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
         fields["body"] = fields["body"][: len(fields["body"]) // 2]

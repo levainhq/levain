@@ -449,12 +449,15 @@
       const ds = p.deliveries || [], opens = p.opens || [];
       const out = p.outcome;
       const wait = out && WAITING.includes(out.state);
-      const where = ds.length ? ds.map((d) => "phone " + d.subscription_id + ": " + delivery(d)).join(" · ") : "sent to no phone";
+      const where = ds.length ? ds.map((d) => "phone " + d.subscription_id + ": " + delivery(d)).join(" · ")
+        : (p.command === null || p.command === undefined ? "sent to no phone" : "");
+      const cmd = p.command === null || p.command === undefined ? null : (p.command ? "notify command started" : "notify command did not start");
       box.append(h("div", { class: "row ping" },
         h("div", { class: "head" }, h("span", { class: "kind", text: String(p.kind || "ping").replace(/_/g, " ") }), h("span", { class: "when", text: when(p.at) })),
         h("div", { class: "title", text: p.title || "" }),
         p.body ? h("div", { class: "body", text: p.body }) : null,
-        h("div", { class: "chips" }, h("span", { class: "chip", text: where }),
+        h("div", { class: "chips" }, where ? h("span", { class: "chip", text: where }) : null,
+          cmd ? h("span", { class: "chip", text: cmd }) : null,
           h("span", { class: "chip", text: opens.length ? "opened " + ago(opens[0].at) : "not opened" })),
         out ? h("div", { class: "outcome " + (wait ? "wait" : (out.state === "allowed" || out.state === "answered" ? "done" : "")), text: out.words }) : null));
     }
