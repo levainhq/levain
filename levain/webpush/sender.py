@@ -5,20 +5,70 @@ a gate never waits on a push service.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
-import os
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 from levain.webpush import ece, vapid
 from levain.webpush.store import PushStore
 
-MAX_PAYLOAD = 3000       # push services accept ~4 KiB; this leaves room for the record's overhead
 TIMEOUT = 10.0
+WALL_BUDGET = 20.0       # one dead push service never holds the rest of a send longer than this
+MAX_WORKERS = 8
 TTL = "3600"
+# serialized-byte budgets for the fields around the body, so even a title of control characters (six bytes each
+# once JSON escapes them) leaves the body room inside ece.MAX_PLAINTEXT
+_TITLE_ROOM, _TAG_ROOM, _URL_ROOM = 600, 300, 800
+_SPAWN_STDIN_MAX = 12000   # well under a pipe buffer, so the gate's write never blocks on the child
+
+
+def _dumps(obj: dict) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+
+
+def _jlen(text: str) -> int:
+    """Bytes ``text`` takes inside the serialized payload (its JSON string form, without the quotes)."""
+    return len(_dumps({"x": text})) - 8
+
+
+def _fit(text: str, room: int) -> str:
+    """The longest prefix of ``text`` (with ``...`` when cut) whose serialized form is at most ``room`` bytes.
+    A binary search over the prefix length: it ends in about log2(len) steps whatever the characters are."""
+    if _jlen(text) <= room:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _jlen(text[:mid] + "...") <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "..."
+
+
+def build_payload(title: str, body: str, tag: str, url: str, ping_id: int) -> bytes:
+    """The JSON the service worker reads, at most :data:`ece.MAX_PLAINTEXT` bytes as SERIALIZED (quotes and control
+    characters escape to two and six bytes, so the clip is by serialized size, never by raw length)."""
+    payload = {"title": _fit(title, _TITLE_ROOM), "body": "", "tag": _fit(tag, _TAG_ROOM),
+              "url": _fit(url, _URL_ROOM), "ping": ping_id}
+    payload["body"] = _fit(body, ece.MAX_PLAINTEXT - len(_dumps(payload)))
+    data = _dumps(payload)
+    assert len(data) <= ece.MAX_PLAINTEXT
+    return data
+
+
+def topic_for(ref: str | None) -> str | None:
+    """The RFC 8030 section 5.4 ``Topic`` for a ping about ``ref``: a re-ping of the same request replaces the one
+    still queued for an offline phone. 32 url-safe characters; None when the ping has no ref (a test ping)."""
+    if not ref:
+        return None
+    return base64.urlsafe_b64encode(hashlib.sha256(ref.encode("utf-8", "replace")).digest()[:24]).decode("ascii")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -29,64 +79,83 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def _clip(text: str, room: int) -> str:
-    raw = text.encode("utf-8")
-    if len(raw) <= room:
-        return text
-    return raw[: max(room - 3, 0)].decode("utf-8", "ignore") + "..."
+def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> urllib.request.Request | None:
+    """The request for one subscription, or None when its endpoint is not a known push service or its keys fail.
+    Runs in the sending thread (it touches the store for the VAPID token); the pool only does the network."""
+    from levain.webpush.routes import valid_endpoint
 
-
-def build_payload(title: str, body: str, tag: str, url: str, ping_id: int) -> bytes:
-    payload = {"title": _clip(title, 200), "body": "", "tag": _clip(tag, 200), "url": _clip(url, 500), "ping": ping_id}
-    used = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-    payload["body"] = _clip(body, MAX_PAYLOAD - used)
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _post(queue_dir: Path, sub: dict, data: bytes) -> int:
-    endpoint = sub["endpoint"]
-    if not endpoint.startswith("https://"):
-        return 0
+    endpoint = valid_endpoint(sub["endpoint"])
+    if endpoint is None:
+        return None
     try:
         body = ece.encrypt(data, ece.b64d(sub["p256dh"]), ece.b64d(sub["auth"]))
         headers = {**vapid.authorization(queue_dir, endpoint), "TTL": TTL, "Urgency": "high",
                    "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream"}
-        req = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    except Exception:   # noqa: BLE001 - bad keys: recorded as status 0, never raised at the gate
+        return None
+    if topic:
+        headers["Topic"] = topic
+    return urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+
+
+def _post(req: urllib.request.Request) -> int:
+    try:
         with _OPENER.open(req, timeout=TIMEOUT) as resp:
             return int(resp.status)
     except urllib.error.HTTPError as err:
         return int(err.code)
-    except Exception:   # noqa: BLE001 - unreachable service, bad keys: recorded as status 0, never raised at the gate
+    except Exception:   # noqa: BLE001 - unreachable service: recorded as status 0, never raised at the gate
         return 0
 
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> list[tuple[int, int]]:
-    """Record the ping, push it to each live subscription; returns (subscription id, HTTP status) pairs (status 0:
-    no answer). 404 and 410 retire the subscription."""
+    """Record the ping, push it to each live subscription concurrently; returns (subscription id, HTTP status)
+    pairs (status 0: no answer, or none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription. Every
+    store write happens in this thread; the workers only talk to the push services."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
     subs = store.live_subscriptions()
     ping_id = store.add_ping(kind, ref, title, body)
     data = build_payload(title, body, ref or kind, url, ping_id)
+    topic = topic_for(ref)
+    reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
+    statuses: dict[int, int] = {}
+    if any(r is not None for _, r in reqs):
+        pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        try:
+            futures = {pool.submit(_post, r): sub["id"] for sub, r in reqs if r is not None}
+            done, _pending = wait(futures, timeout=WALL_BUDGET)
+            for fut in done:
+                statuses[futures[fut]] = fut.result()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     results: list[tuple[int, int]] = []
-    for sub in subs:
-        status = _post(qdir, sub, data)
+    for sub, _r in reqs:
+        status = statuses.get(sub["id"], 0)
         store.add_delivery(ping_id, sub["id"], status, retire=status in (404, 410))
         results.append((sub["id"], status))
     return results
 
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> bool:
-    """Start :func:`send` detached, never waited on, in the queue directory. True when the child started."""
+    """Start :func:`send` detached, never waited on, in the queue directory. The text goes to the child on its
+    STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
+    table. True when the child started."""
     from levain.launch import child_env
 
-    argv = [sys.executable, "-m", "levain.webpush", "send", "--queue-dir", str(queue_dir), "--kind", kind,
-            "--title", title, "--body", body, "--url", url]
-    if ref is not None:
-        argv += ["--ref", ref]
+    fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500]}
+    data = json.dumps(fields).encode("utf-8", "replace")
+    while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
+        fields["body"] = fields["body"][: len(fields["body"]) // 2]
+        data = json.dumps(fields).encode("utf-8", "replace")
+    argv = [sys.executable, "-m", "levain.webpush", "send", "--queue-dir", str(queue_dir), "--kind", kind]
     try:
-        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, close_fds=True, env=child_env(), cwd=str(queue_dir))
+        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, close_fds=True, env=child_env(), cwd=str(queue_dir))
+        try:
+            child.stdin.write(data)
+        finally:
+            child.stdin.close()
     except Exception:   # noqa: BLE001 - a failed ping never fails the gate
         return False
     return True

@@ -22,6 +22,8 @@ from levain.autonomic.durable_sqlite import open_durable, read_transaction, roll
 DIR_NAME = "webpush"
 DB_NAME = "webpush.db"
 STORE_FORMAT = "levain-push-store/1"
+MAX_SUBSCRIPTIONS_PER_DEVICE = 5
+MAX_SUBSCRIPTIONS = 20
 STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
 
 
@@ -150,14 +152,29 @@ class PushStore:
 
     # --- subscriptions -------------------------------------------------------------------------------
     def add_subscription(self, endpoint: str, p256dh: str, auth: str, device_id: str | None = None) -> int:
-        """Store (or revive, with fresh keys) the subscription for ``endpoint``; returns its id."""
+        """Store (or revive, with fresh keys) the subscription for ``endpoint``; returns its id. A revived row
+        keeps the device it was made under (a re-subscribe by another credential never detaches it from its
+        device's revoke), unless it had none. Live subscriptions are capped per device and overall: the oldest
+        retire first, never the one just stored."""
         with self.write() as c:
             c.execute(
                 "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created) VALUES (?,?,?,?,?) "
                 "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, "
-                "device_id = excluded.device_id, retired_at = NULL",
+                "device_id = COALESCE(subscriptions.device_id, excluded.device_id), retired_at = NULL",
                 (device_id, endpoint, p256dh, auth, now_stamp()))
-            return int(c.execute("SELECT id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()[0])
+            row = c.execute("SELECT id, device_id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()
+            sid, owner = int(row[0]), row[1]
+            at = now_stamp()
+            c.execute(
+                "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND device_id IS ? AND id != ? "
+                "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND device_id IS ? "
+                "AND id != ? ORDER BY id DESC LIMIT ?)",
+                (at, owner, sid, owner, sid, MAX_SUBSCRIPTIONS_PER_DEVICE - 1))
+            c.execute(
+                "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND id != ? "
+                "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND id != ? "
+                "ORDER BY id DESC LIMIT ?)", (at, sid, sid, MAX_SUBSCRIPTIONS - 1))
+            return sid
 
     def retire_subscription(self, endpoint: str) -> bool:
         with self.write() as c:
