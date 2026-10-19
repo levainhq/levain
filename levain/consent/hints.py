@@ -32,9 +32,18 @@ _NET = frozenset({"nc", "ncat", "netcat", "socat", "telnet"})
 _CONTROL = frozenset({"|", "||", "&&", ";", ";;", "&", "(", ")", "|&"})
 _REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SUBST = re.compile(r"\$\(|`")
-_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+_SUBST = re.compile(r"\$\((?!\()|`")      # "$((" is arithmetic, not a substitution
+# the delimiter is the whole shell word: up to whitespace or a metacharacter, quotes and backslashes allowed inside it
+_HEREDOC = re.compile(r"""<<(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^ \t\n;|&<>()'"\\])+)""")
 _WRAPPERS = frozenset({"env", "command", "exec", "nohup", "time", "nice", "xargs"})
+# a wrapper's OWN options that take the next word as an operand (everything else starting with "-" is a bare flag)
+_WRAPPER_ARG_FLAGS = {"env": frozenset({"-u", "-C", "-S"}), "nice": frozenset({"-n"}), "exec": frozenset({"-a"}),
+                      "time": frozenset({"-f", "-o"}),
+                      "xargs": frozenset({"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a", "-R", "-S"})}
+_KEYWORDS = frozenset({"{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac"})
+_UNQUOTE = re.compile(r"""\\(.)|'([^']*)'|"([^"]*)\"""")
+_FD = re.compile(r"[0-9]+|-")
+_FORCE_SHORT = re.compile(r"-[A-Za-z]*f[A-Za-z]*")
 _ELEVATORS = frozenset({"sudo", "doas"})
 _SUDO_ARG_FLAGS = frozenset({"-u", "-g", "-h", "-p", "-C", "-r", "-t", "-U", "-D", "-R", "-T"})
 _SSH_ARG_FLAGS = frozenset("bcDEeFIiJLlmOopQRSWw")
@@ -58,6 +67,7 @@ def _scan(command: str) -> tuple[str, str, bool] | None:
     sub: list[str] = []
     pending: list[tuple[str, bool, bool]] = []     # (terminator, strip tabs, expands)
     heredoc = False
+    arith = 0
     i, n = 0, len(command)
     quote = ""
     while i < n:
@@ -82,8 +92,7 @@ def _scan(command: str) -> tuple[str, str, bool] | None:
             continue
         if c == "\\":
             if i + 1 < n and command[i + 1] == "\n":
-                out.append(" ")
-                i += 2
+                i += 2                                  # the shell removes it: "cu\\\nrl" is one word
                 continue
             out.append(command[i:i + 2])
             sub.append(command[i:i + 2])
@@ -96,15 +105,27 @@ def _scan(command: str) -> tuple[str, str, bool] | None:
                 sub.append(c)
             i += 1
             continue
-        if c == "#" and (not out or out[-1] in " \t\n;|&()"):
+        if c == "#" and (not out or out[-1][-1] in " \t\n;|&()"):
             while i < n and command[i] != "\n":
                 i += 1
             continue
-        if c == "<" and command.startswith("<<", i) and not command.startswith("<<<", i):
+        if c == "(":
+            if arith:
+                arith += 1
+            elif command.startswith("((", i):           # $(( )) and (( )): "<<" inside is a shift, not a heredoc
+                arith = 2
+                out.append("((")
+                sub.append("((")
+                i += 2
+                continue
+        elif c == ")" and arith:
+            arith -= 1
+        if c == "<" and not arith and command.startswith("<<", i) and not command.startswith("<<<", i):
             m = _HEREDOC.match(command, i)
             if m:
-                word = m.group(2) or m.group(3) or m.group(4)
-                pending.append((word, m.group(1) == "-", m.group(4) is not None and "\\" not in m.group(0)))
+                raw = m.group(2)
+                word = _UNQUOTE.sub(lambda g: g.group(1) or g.group(2) or g.group(3) or "", raw)
+                pending.append((word, m.group(1) == "-", not any(ch in raw for ch in "'\"\\")))
                 heredoc = True
                 out.append(m.group(0))
                 sub.append(m.group(0))
@@ -116,14 +137,23 @@ def _scan(command: str) -> tuple[str, str, bool] | None:
             i += 1
             while pending:
                 word, strip, expands = pending.pop(0)
-                while i < n:
-                    j = command.find("\n", i)
-                    line = command[i:] if j < 0 else command[i:j]
-                    i = n if j < 0 else j + 1
+                body: list[str] = []
+                at = i
+                found = False
+                while at < n:
+                    j = command.find("\n", at)
+                    line = command[at:] if j < 0 else command[at:j]
+                    at = n if j < 0 else j + 1
                     if (line.lstrip("\t") if strip else line) == word:
+                        found = True
                         break
-                    if expands:
-                        sub.append(line + "\n")
+                    body.append(line)
+                if not found:                           # no terminator line: nothing is cut, the rest is read as commands
+                    pending.clear()
+                    break
+                i = at
+                if expands:
+                    sub.extend(x + "\n" for x in body)
             continue
         out.append(c)
         sub.append(c)
@@ -161,8 +191,62 @@ def _outside(path: str, cwd: str) -> str:
     base = posixpath.normpath(cwd) if cwd.startswith("/") else ""
     full = posixpath.normpath(path if path.startswith("/") else posixpath.join(base or "/", path))
     if not base:
-        return "out" if path.startswith("/") or full.startswith("..") else ""
+        rel = posixpath.normpath(path)
+        return "out" if path.startswith("/") or rel == ".." or rel.startswith("../") else ""
     return "" if (full == base or full.startswith(base.rstrip("/") + "/")) else "out"
+
+
+def _skip_wrapper(name: str, rest: list[str]) -> list[str]:
+    """``rest`` after a wrapper (``env``, ``nice``, ``xargs`` ...) and ITS OWN options: the wrapped command keeps its flags."""
+    taking = _WRAPPER_ARG_FLAGS.get(name, frozenset())
+    k = 1
+    while k < len(rest):
+        w = rest[k]
+        if w == "--":
+            k += 1
+            break
+        if not w.startswith("-") or w == "-":
+            break
+        k += 2 if w in taking else 1
+    return rest[k:]
+
+
+def _redirect_len(rest: list[str]) -> int:
+    """How many words a redirect at the start of ``rest`` takes (``>f``, ``2>f``, ``<f``, ``<<EOF``): 0 when none."""
+    def is_op(w: str) -> bool:
+        return w in _REDIRECTS or (w.startswith("<") and not w.endswith("<("))
+    if rest and is_op(rest[0]):
+        return 2
+    if len(rest) > 1 and rest[0].isdigit() and is_op(rest[1]):
+        return 3
+    return 0
+
+
+def _command_start(st: list[str], add) -> list[str]:  # noqa: ANN001
+    """The stage from its command word on: leading ``VAR=`` words, compound keywords, redirects, ``sudo`` and wrappers are
+    read past (``add`` gets their hints); what follows keeps its own flags."""
+    rest = list(st)
+    while rest:
+        w = rest[0]
+        base = posixpath.basename(w)
+        if _ASSIGN.match(w):
+            add(f"env prefix {_q(w.split('=', 1)[0])}= changes how the command runs")
+            rest = rest[1:]
+        elif w in _KEYWORDS:
+            rest = rest[1:]
+        elif _redirect_len(rest):
+            rest = rest[_redirect_len(rest):]
+        elif base in _ELEVATORS:
+            add("runs with sudo (elevated rights)")
+            k = 1
+            while k < len(rest) and rest[k].startswith("-"):
+                k += 2 if rest[k] in _SUDO_ARG_FLAGS else 1
+            rest = rest[k:]
+        elif base in _WRAPPERS:
+            rest = _skip_wrapper(base, rest)
+        else:
+            break
+    return rest
 
 
 def _hints(command: str, cwd: str, depth: int) -> list[str] | None:
@@ -223,24 +307,7 @@ def _hints(command: str, cwd: str, depth: int) -> list[str] | None:
     fetched = False
     moved = False
     for i, (sep, st) in enumerate(stages):
-        j = 0
-        while j < len(st) and _ASSIGN.match(st[j]):
-            j += 1
-        if j:
-            add(f"env prefix {_q(st[0].split('=', 1)[0])}= changes how the command runs")
-        rest = st[j:]
-        while rest and posixpath.basename(rest[0]) in _WRAPPERS | _ELEVATORS:
-            w0 = posixpath.basename(rest[0])
-            if w0 in _ELEVATORS:
-                add("runs with sudo (elevated rights)")
-                k = 1
-                while k < len(rest) and rest[k].startswith("-"):
-                    k += 2 if rest[k] in _SUDO_ARG_FLAGS else 1
-                rest = rest[k:]
-            elif w0 == "env":
-                rest = [w for w in rest[1:] if not w.startswith("-") and not _ASSIGN.match(w)]
-            else:
-                rest = rest[1:]
+        rest = _command_start(st, add)
         prog = posixpath.basename(rest[0]) if rest else ""
         args = rest[1:]
         if prog in _FETCH:
@@ -275,7 +342,8 @@ def _hints(command: str, cwd: str, depth: int) -> list[str] | None:
         if prog in _NET:
             add(f"{_q(prog)} sends data over the network")
         if prog == "git" and "push" in args and any(
-                w in ("-f", "--force") or w.startswith("--force-with-lease") or w.startswith("--force-if-includes")
+                w == "--force" or _FORCE_SHORT.fullmatch(w) or w.startswith("--force-with-lease")
+                or w.startswith("--force-if-includes") or (w.startswith("+") and len(w) > 1)
                 for w in args):
             add("force-push rewrites the remote branch")
         if prog == "dd":
@@ -297,9 +365,9 @@ def _hints(command: str, cwd: str, depth: int) -> list[str] | None:
                 k += 1
             if len(words_left) > 1:
                 add("ssh runs a command on another machine")
-        for k, w in enumerate(rest):
-            if w in _REDIRECTS and k + 1 < len(rest):
-                writes(rest[k + 1], moved, "writes")
+        for k, w in enumerate(st):
+            if w in _REDIRECTS and k + 1 < len(st) and not (w == ">&" and _FD.fullmatch(st[k + 1])):
+                writes(st[k + 1], moved, "writes")      # ">&2" and ">&-" duplicate or close a descriptor: no file
         if prog in _MOVERS:
             moved = True
     return out

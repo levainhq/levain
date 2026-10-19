@@ -31,14 +31,19 @@ def is_bash_like(tool: str) -> bool:
 
 
 def visible(text: Any) -> Any:
-    """``text`` with every Unicode format or control character (Cf, Cc except newline and tab, U+2028/2029) shown as a
+    """``text`` with every Unicode format or control character (Cf, Cc except newline and tab, U+2028/2029, Zs spaces other than U+0020, U+3164, U+2800) shown as a
     visible ``<U+XXXX>`` marker. Not a string: returned as is."""
     if not isinstance(text, str):
         return text
     return "".join(
-        f"⟨U+{ord(ch):04X}⟩"
-        if (unicodedata.category(ch) in ("Cf", "Cc") and ch not in "\n\t") or ch in "  " else ch
+        f"⟨U+{ord(ch):04X}⟩" if _hidden(ch) else ch
         for ch in text)
+
+
+def _hidden(ch: str) -> bool:
+    cat = unicodedata.category(ch)
+    return ((cat in ("Cf", "Cc") and ch not in "\n\t") or ch in "\u2028\u2029\u3164\u2800"
+            or (cat == "Zs" and ch != " "))
 
 
 def _from_cut_display(display: str, tool: str) -> str:

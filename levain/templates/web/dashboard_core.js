@@ -3218,7 +3218,12 @@
     }
     for (const [label, value] of [["input digest", b.tool_input_digest], ["request digest", b.digest]]) {
       const full = sv(value);
-      if (!full) continue;
+      if (!full) {                                 // a missing digest is shown as missing, never dropped
+        const gone = el("div", "consent-facts consent-dg");
+        gone.append(el("span", "ext-meta", label + ": "), el("code", "consent-dgval", "(none)"));
+        parts.push(gone);
+        continue;
+      }
       const at = full.indexOf(":") + 1;
       const short = full.length > at + 12 ? full.slice(0, at + 12) + "\u2026" : full;
       const line = el("div", "consent-facts consent-dg");
