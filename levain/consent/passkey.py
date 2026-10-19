@@ -213,7 +213,7 @@ def _client_origin(client_data_json: bytes, application: str, page_origin: "str 
 
 
 def answer_signature_problem(signature: str, public_key: str, page_origin: "str | None" = None) -> str | None:
-    """Why ``signature`` is not a consent answer a passkey ``public_key`` may give, or None. Run by the consent
+    """Why ``signature`` is not a signature a passkey ``public_key`` may give, or None. Run by the consent
     queue on every verification of a passkey key's answer (on answer and at each delivery), beside ssh-keygen:
     the signature must be a WebAuthn assertion (never a plain sk signature), carry user verification (Face ID,
     Touch ID or the device passcode, as the authenticator reports it), and come from a page whose origin is exactly
@@ -221,13 +221,15 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
     namespaces (it runs this check for all three), and the authority replay and the broker refuse it for anything
     else. The phone port's sign requests (:mod:`levain.consent.sign`) also run this check, for a caller outside
-    levain, in namespaces levain never verifies."""
+    levain, in namespaces levain never verifies; so does dispatch (:mod:`levain.dispatch.sign`), for the operator's
+    signatures in its own namespaces (each one a ``levain-dispatch-`` row of ``levain/contracts/namespaces.py``). Its
+    refusals therefore name a signature, never an answer."""
     try:
         _key_blob, application = _key_parts(public_key)
         text = signature.strip()
         head, tail = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
         if not (text.startswith(head) and text.endswith(tail)):
-            return "the answer is not an armored SSH signature"
+            return "the signature is not an armored SSH signature"
         blob = base64.b64decode("".join(text[len(head):-len(tail)].split()), validate=True)
         at = [0]
 
@@ -243,16 +245,16 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
             return take(n)
 
         if take(6) != b"SSHSIG":
-            return "the answer is not an SSHSIG"
+            return "the signature is not an SSHSIG"
         take(4)
         for _ in range(4):             # publickey, namespace, reserved, hash algorithm
             string()
         inner = string()
         if at[0] != len(blob):
-            return "the answer's signature has trailing bytes"
+            return "the SSH signature has trailing bytes"
         blob, at[0] = inner, 0
         if string() != SIG_TYPE.encode("ascii"):
-            return "a passkey answer must be a WebAuthn signature"
+            return "a passkey signature must be a WebAuthn signature"
         string()                       # the ECDSA signature: ssh-keygen checks it
         flags = take(1)[0]
         take(4)
@@ -262,7 +264,7 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
         if at[0] != len(blob):
             return "the WebAuthn signature has trailing bytes"
     except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
-        return "the answer's passkey signature cannot be read"
+        return "the passkey signature cannot be read"
     if not flags & _FLAG_UV:
         return "the passkey did not verify the user (Face ID, Touch ID or the device PIN)"
     try:

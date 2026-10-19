@@ -535,9 +535,10 @@ class AuthoritySource:
     snapshot builder, DESIGN §3.4) takes in it: the anchor file read first, then the replay, then the replay
     checked against that anchor, so an append committing in between can only put the log ahead of the anchor.
     ``anchor=None`` checks no anchor, so the replay is only as trustworthy as the database file: production
-    passes the real anchor. Raises on any failure: capture's refusal (a refused log or anchor, a verifier that
-    cannot run, an empty or uninitialised log) as :class:`levain.authority.AuthorityError` with capture's
-    reason, a journal read as ``sqlite3.Error``; the queue turns either into no decision.
+    passes the real anchor. Raises on any failure: a verifier that cannot run during the replay as
+    :class:`levain.authority.VerifierUnavailable` (a machine fault, never a verdict on the log), capture's refusal (a
+    refused log or anchor, an empty or uninitialised log) as :class:`levain.authority.AuthorityError`, both with
+    capture's reason, a journal read as ``sqlite3.Error``; the queue turns any of them into no decision.
 
     A queue takes only this class (not a subclass, not any callable): freshness is the queue's guarantee,
     never a promise a caller's ``lambda: snapshot`` could break."""
@@ -560,6 +561,8 @@ class AuthoritySource:
             conn.execute("COMMIT")
         finally:
             conn.close()
+        if got.verifier_unavailable:
+            raise VerifierUnavailable(got.authority_error or "the authority log could not be verified")
         if got.authority is None or got.authority_error is not None:
             raise AuthorityError(got.authority_error or "the authority log yields no head")
         return got.authority
