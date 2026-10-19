@@ -128,12 +128,23 @@
       buttons.push(b);
       actions.appendChild(b);
     }
-    const leads = el("pre", "display", link && push ? "option " + link.option + " leads to: " + (push.display || "") : "");
+    // the push as its own undecided card shows it: tool, tier, agent and gap first, then exactly what is signed
+    const leads = el("div", "leads");
+    if (link && push) {
+      const ph = el("div", "req-head");
+      ph.append(el("span", "tool", "option " + link.option + " leads to: " + (push.tool || "(tool)")),
+                el("span", "tier" + (push.tier === "T3" ? " t3" : ""), push.tier || ""),
+                el("span", "meta", (push.agent || "") + " \u00b7 undecided, gap " + (push.gap_label || "#" + push.gap)));
+      leads.append(ph, el("pre", "display", typeof push.display === "string" ? push.display : ""));
+      if (push.cwd) leads.appendChild(el("div", "where", "in " + push.cwd));
+    }
     leads.hidden = !(link && push);
+    // shown, never kept in `notes`: it is about this listing, and the next one may make the option signable
     if (link && !signable && !notes.has(key)) {
-      say(push ? (push.signer_note || "this phone cannot sign a ruling on this push") + "; answering option " + link.option
-                 + " allows nothing: the push asks when it runs"
-               : "option " + link.option + "'s push is not undecided now: answering it allows nothing");
+      note.textContent = push ? (push.signer_note || "this phone cannot sign a ruling on this push") + "; answering option "
+                                + link.option + " allows nothing: the push asks when it runs"
+                              : "option " + link.option + "'s push is not shown here (no longer undecided, or past the "
+                                + "listing's limit): answering it allows nothing";
     }
     const words = el("textarea", "words");
     words.rows = 2;
@@ -222,7 +233,8 @@
         .then((a) => {
           // a sent signature: only the server's own refusal (a 4xx) says nothing was ruled
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where it stands", "bad");
-          if (!a.ok) { again(); return say("not answered, nothing allowed: " + why(a), "bad"); }
+          if (!a.ok) { if (a.status !== 409) again(); return say("not answered, nothing allowed: " + why(a), "bad"); }
+          words.value = "";
           last = "answered question #" + q.n + " and allowed its push";
           const d = a.body.delivery || {};
           const head = a.body.answered ? "answered and ruled the push allowed" : "the push is ruled allowed; " + (a.body.answer_note || "");

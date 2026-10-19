@@ -118,6 +118,27 @@ def test_the_one_tap_route_records_the_answer_only_after_the_ruling_verifies(wor
         srv.server_close()
     assert order == [("ruled", q.link.request_id, False, None)]          # the ruling first, no second delivery
     assert out["answered"] == q.n and world["store"].get(q.n).answer.channel == "phone"
+    # a link any uid writer forges onto ANOTHER session's push is neither shown in the question nor ruled from it
+    other, _ = band.file_question("claude_code", "sess-other", "Push?", [("a", "x"), ("b", "y")], "a", "z",
+                                  world["qdir"], would_push=("a", (world["call"]["repo"],
+                                                                   world["call"]["remote"], "main")))
+    plain, _ = band.file_question("claude_code", S, "Docs?", [("a", "x"), ("b", "y")], "a", "z", world["qdir"])
+    conn = sqlite3.connect(world["qdir"] / "questions.db", isolation_level=None)
+    conn.execute("INSERT INTO question_links (question_id, option, kind, request_id, queue_id, created_at) VALUES "
+                 "(?, 'a', 'push', ?, ?, '2026-10-19T00:00:00Z')", (plain.id, other.link.request_id,
+                                                                    other.link.queue_id))
+    conn.close()
+    srv = make_phone_server(world["qdir"], "localhost", port=0)
+    try:
+        forged = {**body, "payload": world["queue"].ruling_payload(other.link.request_id, "allow", "SHA256:x")}
+        with pytest.raises(PhoneError) as exc:
+            srv.question_rule(plain.n, forged)
+        listing = srv.listing()
+    finally:
+        srv.server_close()
+    assert exc.value.status == 422 and "own session" in exc.value.message
+    assert next(r for r in listing["questions"] if r["n"] == plain.n)["link"]["card"] is None
+    assert any(u["id"] == other.link.request_id for u in listing["undecided"])
 
 
 def test_a_store_from_before_q3_reads_with_no_links_and_takes_one_on_its_next_write(world):

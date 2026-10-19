@@ -38,6 +38,15 @@ Known edges (one line each, not built against):
   option value is exactly ``exec``, ``app-server`` or ``mcp-server`` (read as that subcommand).
 - Codex's hook gives a session id only (no subagent id is appended, as for its halts): if a Codex subagent's calls
   carry the parent's id, its hook can claim the answer [not measured].
+- ``--would-push``: a commit on the branch after the ask makes the push a different call, which asks again; the push
+  must run from the session that asked (``--session`` on both when given); the request it files takes the session's
+  next gap number though the agent was never refused, and its undecided receipt reads timed out (the receipt has
+  no word for filed ahead; the request's note says why); asking the same push twice files two requests, and the one
+  not ruled waits as an undecided gap; a question that fails to file after its push request did leaves that request
+  undecided, and the refusal names it; a push run before the operator taps holds and halts the session on its own
+  request, and the later tap, a ruling on the question's request, does not release that halt; an answer of another
+  option recorded while the tap is signing makes the tap's ruling apply with that other answer (the page says the
+  answer was not recorded).
 
 Stdlib only.
 """
@@ -217,6 +226,10 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 
+class _PushFiled(ValueError):
+    """A ``--would-push`` refusal raised AFTER the push's request was filed: the words name the request."""
+
+
 def _file_push_request(agent: str, session: str, option: str, push: tuple[str, str, str], qdir: Path
                        ) -> tuple[Link, str, str, dict[str, str]]:
     """File the consent request for the push an option leads to (Q-3, ``--would-push``), undecided at once, and
@@ -239,10 +252,16 @@ def _file_push_request(agent: str, session: str, option: str, push: tuple[str, s
     queue = push_gate._queue(qdir, settings)
     request = queue.file(agent=agent, agent_session_id=session, tool_name=push_gate.PUSH_TOOL, tool_input=call,
                          cwd=call["repo"], hold=timedelta(seconds=1), tier=push_gate.PUSH_TIER)
-    marked = queue.mark_undecided(request.id, halt=False,
-                                  note=f"filed undecided by levain ask: the push option {option} of a question leads to")
+    try:
+        marked = queue.mark_undecided(request.id, halt=False,
+                                      note=f"filed undecided by levain ask: the push option {option} of a question "
+                                           "leads to")
+    except Exception as exc:  # noqa: BLE001 - the request exists now: say so, never "nothing was filed"
+        raise _PushFiled(f"the push request {request.id} was filed but not made undecided ({type(exc).__name__}: "
+                         f"{exc}); it stays pending until its hold expires and allows nothing") from exc
     if marked.state != "undecided" or marked.gap is None:
-        raise ValueError(f"the push request {request.id} could not be made undecided ({marked.reason})")
+        raise _PushFiled(f"the push request {request.id} was filed but is {marked.state}, not undecided "
+                         f"({marked.reason}); no question was tied to it")
     return (Link(option, "push", request.id, queue.queue_id), push_gate.push_what(call),
             gap_label(marked.gap, session), call)
 
@@ -263,6 +282,9 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     signed on that request ever allows the push, never the answer."""
     import subprocess
 
+    from levain.authority import AuthorityError, VerifierUnavailable
+    from levain.consent.queue import QueueStoreError
+
     link: Link | None = None
     try:
         if _SUBAGENT in session:
@@ -279,14 +301,20 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
             QuestionStore.check(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
                                 blocks=blocks, cwd=os.path.abspath(os.getcwd()))
             link, push_words, gap, call = _file_push_request(agent, session, would_push[0], would_push[1], qdir)
-    except (ValueError, ConsentError, QuestionStoreError, OSError, subprocess.SubprocessError) as exc:
+    except (ValueError, ConsentError, QuestionStoreError, OSError, subprocess.SubprocessError, QueueStoreError,
+            AuthorityError, VerifierUnavailable) as exc:
+        if isinstance(exc, _PushFiled):
+            return None, f"levain ask: refused, no question was filed: {exc}"
         return None, f"levain ask: refused, nothing was filed: {exc}"
     except sqlite3.Error as exc:                     # a store locked past its wait, or damaged: the write rolled back
         return None, f"levain ask: a store could not be written, so nothing was filed ({exc}); try again"
     try:
         q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
                                      blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume, link=link)
-    except (ValueError, ConsentError, QuestionStoreError, OSError, sqlite3.Error) as exc:
+    except Exception as exc:  # noqa: BLE001 - whatever stopped it, a push filed before it is named, never hidden
+        if link is None and not isinstance(exc, (ValueError, ConsentError, QuestionStoreError, OSError,
+                                                  sqlite3.Error)):
+            raise
         if link is None:
             if isinstance(exc, sqlite3.Error):       # a store locked past its wait, or damaged: rolled back
                 return None, (f"levain ask: the question store could not be written, so nothing was filed ({exc}); "

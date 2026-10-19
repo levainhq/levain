@@ -281,6 +281,7 @@ class _PhoneServer(ThreadingHTTPServer):
         """``GET /consent.json``: each pending request as the cockpit's consent body shows it, plus ``signers``; and
         each undecided one with its gap, its ``gap_label`` and whether its display was ``cut``."""
         from levain.consent.listing import UNSHOWN, entry_body, filed_input, read_listing
+        from levain.consent.push_gate import PUSH_TIER, PUSH_TOOL
         from levain.consent.queue import gap_label
 
         listing = read_listing(self.queue_dir, now=datetime.now(timezone.utc))
@@ -305,8 +306,10 @@ class _PhoneServer(ThreadingHTTPServer):
             # a display cut at its limit: only a deny is signed for it (the page offers no allow)
             body["cut"] = filed_input(entry.request) is UNSHOWN
             body["signers"], body["signer_note"] = self._signers(entry.request, memo)
-            if entry.request.id in linked:
-                linked[entry.request.id]["link"]["card"] = body
+            row = linked.get(entry.request.id)
+            if (row is not None and entry.request.tool_name == PUSH_TOOL and entry.request.tier == PUSH_TIER
+                    and (entry.request.agent, entry.request.agent_session_id) == (row["agent"], row["session"])):
+                row["link"]["card"] = body          # a link naming any other request leaves it in the plain list
                 continue
             undecided.append(body)
         sign_pending, sign_note, sign_overflow = [], "", 0
@@ -338,7 +341,7 @@ class _PhoneServer(ThreadingHTTPServer):
             open_ = QuestionStore(self.queue_dir).open_questions()
         except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             return [], 0, f"{type(exc).__name__}: {exc}"
-        rows = [{"n": q.n, "id": q.id, "agent": q.agent, "what": q.what,
+        rows = [{"n": q.n, "id": q.id, "agent": q.agent, "session": q.agent_session_id, "what": q.what,
                  "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
                  "filed_at": q.filed_at,
                  # the push an option leads to; ``card`` (the undecided request, as the undecided list shows it) is
@@ -400,6 +403,9 @@ class _PhoneServer(ThreadingHTTPServer):
         if link is None or req["option"] != link.option:
             raise PhoneError(422, "answer_refused", f"option {req['option'][:20]!r} of question #{n} leads to no push: "
                                                     "answer it without a passkey")
+        if not self._link_matches(q):
+            raise PhoneError(422, "answer_refused", f"question #{n}'s link does not name a push of its own session; "
+                                                    "rule the request from its own card")
         payload = req["payload"]
         if (not isinstance(payload, dict) or payload.get("request_id") != link.request_id
                 or payload.get("queue_id") != link.queue_id or payload.get("decision") != "allow"):
@@ -414,6 +420,22 @@ class _PhoneServer(ThreadingHTTPServer):
         return {"ruling": ruled, "answered": q.n, "decision": ruled["decision"], "signer_fp": ruled["signer_fp"],
                 "delivery": {"route": "pending", "reason": "delivery is running"},
                 _AWAIT: self._deliver_answer_later(store, q.id)}
+
+    def _link_matches(self, q: Any, request: Any = None) -> bool:
+        """The question's link names a ``levain push`` request at its tier, of the question's own agent and session:
+        a link is unsigned (any process of the uid can write one), so it is routing and display only, and one that
+        names any other request is never shown inside the question or ruled from it."""
+        from levain.consent.push_gate import PUSH_TIER, PUSH_TOOL
+        from levain.consent.queue import ConsentQueue, authority_source
+
+        if q.link is None or q.link.kind != "push":
+            return False
+        if request is None:
+            got = ConsentQueue(self.queue_dir, authority=authority_source(self.queue_dir, anchor=None)
+                               ).get(q.link.request_id)
+            request = None if got is None else got[0]
+        return (request is not None and request.tool_name == PUSH_TOOL and request.tier == PUSH_TIER
+                and (request.agent, request.agent_session_id) == (q.agent, q.agent_session_id))
 
     def _deliver_answer_later(self, store: Any, question_id: str) -> Any:
         """As :meth:`_deliver_later`, for a question's answer (:func:`levain.consent.band.deliver_answer`)."""
