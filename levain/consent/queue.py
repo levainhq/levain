@@ -37,6 +37,13 @@ one sweeper only (:meth:`ConsentQueue.claim_repings`). What a later resume of th
 permission mode, how it was invoked, Codex's pid, the original working directory) is recorded beside the request
 at filing (:meth:`ConsentQueue.resume_meta`), unsigned: it is never authority.
 
+Away mode the operator sets with ``levain consent away on`` is an AWAY MARK here (:meth:`ConsentQueue.mark_away`,
+unsigned: it only raises what the hook holds). Leaving it takes a LEAVE (:meth:`ConsentQueue.leave_away`): a record
+binding this queue, the agent's latest mark and when it was signed, in :data:`~levain.consent.record.AWAY_NAMESPACE`,
+by any enrolled, unrevoked key, verified as an answer is and again every time the hook reads it
+(:meth:`ConsentQueue.away_mark`). An agent whose latest mark has no leave that verifies is away whatever its
+settings file says: the hook reads away mode from here, not only from a file any process of the operator's can write.
+
 What became of a request levain left to the agent's own dialog (withdrawn, expired, or answered in that dialog
 while the hook still held it) is recorded apart, UNSIGNED, in ``dialog_outcomes`` (:meth:`ConsentQueue.record_ran`,
 :meth:`ConsentQueue.close_unrun`, written by the agent's PostToolUse / Stop / UserPromptSubmit hooks): ``ran``
@@ -61,7 +68,7 @@ A terminal request never changes again: SQL triggers refuse any update of a term
 ``pending`` to a terminal state or to ``undecided`` and ``undecided`` to ``allowed``/``denied`` by a ruling, any
 change of a request's fields, and any delete (a guard against a buggy writer; authority is the signature above).
 Gap numbers, takes of a ruled allow, deliveries of a ruling's text, the resumes started to deliver one
-(:mod:`levain.consent.delivery`), resume metadata, snoozes and session halts (:meth:`ConsentQueue.halt`, released in the transaction of the ruling on the halting request) are
+(:mod:`levain.consent.delivery`), resume metadata, snoozes, away marks and their leaves, and session halts (:meth:`ConsentQueue.halt`, released in the transaction of the ruling on the halting request) are
 append-only tables beside the request row, which they never change. Every transition writes its receipt
 (built by :mod:`levain.autonomic.receipt`) in the same transaction, so a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
 its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
@@ -108,13 +115,13 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.policy import grant_refusal
 from levain.consent.record import (
-    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT, RULING_FORMAT, RULING_NAMESPACE,
-    ExternalGateRequest, answer_message, answer_payload, grant_answer_payload, redact_display, ruling_message,
-    ruling_payload, tool_input_digest,
+    AGENTS, ANSWER_FORMAT, ANSWER_NAMESPACE, AWAY_LEAVE_FORMAT, AWAY_NAMESPACE, DECISIONS, GRANT_ANSWER_FORMAT,
+    RULING_FORMAT, RULING_NAMESPACE, ExternalGateRequest, answer_message, answer_payload, away_leave_message,
+    away_leave_payload, grant_answer_payload, redact_display, ruling_message, ruling_payload, tool_input_digest,
 )
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
-           "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue", "Decision",
+           "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
            "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "authority_source", "default_queue_dir",
            "gap_label", "session_handle"]
 
@@ -130,6 +137,7 @@ _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_dig
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
                           "signed_at"})
+_LEAVE_KEYS = frozenset({"format", "queue_id", "mark_id", "agent", "decision", "signer_fp", "signed_at"})
 # how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
 VIA: tuple[str, ...] = ("signature", "grant", "ruling")
 # a ruled allow not taken by the call it rules on within this long of the queue applying it (its decided_at, the
@@ -295,7 +303,33 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'ruling resume steps are append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS ruling_resume_steps_kept BEFORE DELETE ON ruling_resume_steps "
     "BEGIN SELECT RAISE(ABORT, 'ruling resume steps are never deleted'); END",
+    # away mode the operator set (`levain consent away on`: a mark, unsigned, since it only raises what the hook
+    # holds) and its leave (signed in AWAY_NAMESPACE): an agent whose latest mark has no leave that verifies is away
+    "CREATE TABLE IF NOT EXISTS away_marks (id TEXT PRIMARY KEY, agent TEXT NOT NULL, set_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS away_marks_agent ON away_marks (agent)",
+    "CREATE TABLE IF NOT EXISTS away_leaves (mark_id TEXT PRIMARY KEY REFERENCES away_marks(id), "
+    "left_at TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS away_marks_frozen BEFORE UPDATE ON away_marks "
+    "BEGIN SELECT RAISE(ABORT, 'away marks are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS away_marks_kept BEFORE DELETE ON away_marks "
+    "BEGIN SELECT RAISE(ABORT, 'away marks are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS away_leaves_frozen BEFORE UPDATE ON away_leaves "
+    "BEGIN SELECT RAISE(ABORT, 'away leaves are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS away_leaves_kept BEFORE DELETE ON away_leaves "
+    "BEGIN SELECT RAISE(ABORT, 'away leaves are append-only'); END",
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger, and the marks are ordered by rowid:
+    # refuse a new row that reuses an id or an explicit rowid (one not given reads as -1 here, never a real row)
+    "CREATE TRIGGER IF NOT EXISTS away_marks_no_replace BEFORE INSERT ON away_marks "
+    "WHEN EXISTS (SELECT 1 FROM away_marks WHERE id = NEW.id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an away mark id is never reused'); END",
+    "CREATE TRIGGER IF NOT EXISTS away_leaves_no_replace BEFORE INSERT ON away_leaves "
+    "WHEN EXISTS (SELECT 1 FROM away_leaves WHERE mark_id = NEW.mark_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an away leave is never replaced'); END",
 )
+# what an away mark is read from (:meth:`ConsentQueue.away_mark`): a current-format store holding neither was made
+# before them (no mark); one holding only one of them is damaged
+_AWAY_TABLES = frozenset({"away_marks", "away_leaves"})
+_AUTHORITY_NOW_UNREADABLE = "the authority log cannot be replayed now"
 # the previous format's triggers on the two tables a migration rebuilds (the schema above recreates them)
 _REBUILT_TRIGGERS = ("requests_frozen", "requests_kept", "receipts_frozen", "receipts_kept")
 
@@ -396,6 +430,20 @@ class Marked:
     reason: str
     halted: bool = False
     decision: "Decision | Ruling | None" = None
+
+
+@dataclass(frozen=True)
+class AwayMark:
+    """An agent's latest away mark (:meth:`ConsentQueue.away_mark`): its id and when it was set; ``left`` whether a
+    leave of it verifies now; ``leave_by`` the key a stored leave names (``None`` when there is none) and
+    ``leave_refusal`` why that leave does not verify (``None`` when it does or there is none). The agent is away
+    while ``left`` is false."""
+    id: str
+    agent: str
+    set_at: str
+    left: bool
+    leave_by: str | None = None
+    leave_refusal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -505,6 +553,8 @@ class ConsentQueue:
         self._clock = clock
         self._ssh_keygen = ssh_keygen
         self._ready = False
+        # a stored leave's verdict by its whole row (:meth:`away_mark`): one verify per queue, so per hook process
+        self._leave_verdicts: dict[tuple[Any, ...], str | None] = {}
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -549,6 +599,9 @@ class ConsentQueue:
                 _migrate_from_prior(conn)
             elif row is not None and row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
+            elif row is not None and _AWAY_TABLES - tables and _AWAY_TABLES & tables:
+                # never recreated: an empty table read as no mark would drop away mode
+                raise QueueStoreError(f"the store is damaged: it lacks {', '.join(sorted(_AWAY_TABLES - tables))}")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -569,6 +622,39 @@ class ConsentQueue:
     def _read(self) -> Iterator[sqlite3.Connection]:
         with read_transaction(self._connect) as conn:
             yield conn
+
+    @contextmanager
+    def _read_as_is(self, tables: frozenset[str]) -> Iterator[sqlite3.Connection | None]:
+        """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
+        (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet), a store of
+        :data:`PRIOR_FORMAT`, which predates ``tables``, or a current-format store holding none of ``tables`` (made
+        before them); raises :class:`QueueStoreError` for any other format, a database with no format marker, and a
+        current-format store holding some of ``tables`` but not all (damaged, never read as holding nothing)."""
+        self._check_directory()
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0,
+                               isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("BEGIN")
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
+            if not have or (row is not None and row[0] == PRIOR_FORMAT):
+                conn.execute("COMMIT")
+                yield None
+                return
+            if row is None or row[0] != STORE_FORMAT:
+                raise QueueStoreError(f"{self.path} is not a consent queue store: format "
+                                      f"{None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+            if not tables & have:
+                conn.execute("COMMIT")
+                yield None
+                return
+            if not tables <= have:
+                raise QueueStoreError(f"{self.path} is damaged: it lacks {', '.join(sorted(tables - have))}")
+            yield conn
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
 
     @property
     def queue_id(self) -> str:
@@ -1105,12 +1191,12 @@ class ConsentQueue:
         return self._signer_refusal(request, payload, signature, authority, noun="answer",
                                     encode_record=answer_message, namespace=ANSWER_NAMESPACE)
 
-    def _signer_refusal(self, request: ExternalGateRequest, payload: Mapping[str, Any], signature: Any,
+    def _signer_refusal(self, request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any,
                         authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
                         namespace: str) -> str | None:
-        """The key and signature checks an answer and a ruling share: the named signer is a key ``authority``
-        holds active, of a class covering the request's tier for an allow, and ``signature`` verifies over the
-        record's bytes in ``namespace``."""
+        """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
+        ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
+        ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
         decision = payload["decision"]
         signer_fp = payload["signer_fp"]
         key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
@@ -1118,6 +1204,8 @@ class ConsentQueue:
             return "the signer is not an enrolled key"
         if not key.active:
             return "the signer's key is revoked"
+        if decision == "allow" and request is None:
+            return f"an allow {noun} names no request"
         if decision == "allow" and not class_covers(key.key_class, request.tier):
             return f"key class {key.key_class} does not cover {request.tier}"
         if not isinstance(signature, str) or not signature:
@@ -1216,6 +1304,168 @@ class ConsentQueue:
             raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
                               signed_at=utc_stamp(_now_utc(self._clock)))
+
+    # --- away marks ------------------------------------------------------------------------------------
+    @staticmethod
+    def _check_agent(agent: Any) -> None:
+        if agent not in AGENTS:
+            raise ConsentError(f"agent must be one of {AGENTS}: {agent!r}")
+
+    @staticmethod
+    def _latest_mark(conn: sqlite3.Connection, agent: str) -> tuple[Any, ...] | None:
+        # latest by rowid: the triggers refuse an UPDATE, a DELETE and an INSERT that reuses an id or a rowid, so a
+        # writer that leaves them in place can only add a mark (more away); one that drops them is the same-uid edge
+        return conn.execute("SELECT m.id, m.set_at, l.left_at, l.payload, l.signature, l.signer_fp FROM away_marks m "
+                            "LEFT JOIN away_leaves l ON l.mark_id = m.id WHERE m.agent = ? ORDER BY m.rowid DESC "
+                            "LIMIT 1", (agent,)).fetchone()
+
+    def mark_away(self, agent: str) -> str:
+        """Record that the operator set ``agent``'s away mode (``levain consent away on``): a new away mark, whose
+        id is returned. Unsigned, since a mark only raises what the hook holds. Until a leave of the agent's latest
+        mark verifies (:meth:`leave_away`), the agent is away whatever its settings file says (:meth:`away_mark`)."""
+        self._check_agent(agent)
+        mark_id = "am-" + os.urandom(16).hex()
+        with self._write() as conn:
+            conn.execute("INSERT INTO away_marks (id, agent, set_at) VALUES (?, ?, ?)",
+                         (mark_id, agent, utc_stamp(_now_utc(self._clock))))
+        return mark_id
+
+    def _leave_refusal(self, mark_id: str, agent: str, set_at: str, queue_id: str, payload: Any, signature: Any,
+                       authority: AuthoritySnapshot) -> str | None:
+        """Why ``payload``/``signature`` is not a leave of the away mark ``mark_id`` (``agent``'s, set at
+        ``set_at``) under ``authority``; ``None`` when it verifies. Any enrolled, unrevoked key signs a leave, of
+        any class: it lowers what the hook holds back to the operator's own presence."""
+        if not isinstance(payload, Mapping) or set(payload) != _LEAVE_KEYS:
+            return "the leave is not an away-leave record"
+        if payload["format"] != AWAY_LEAVE_FORMAT:
+            return f"leave format {payload['format']!r} is not {AWAY_LEAVE_FORMAT!r}"
+        if payload["queue_id"] != queue_id:
+            return "the leave names another queue"
+        if payload["mark_id"] != mark_id:
+            return "the leave is for another away mark"
+        if payload["agent"] != agent:
+            return "the leave is for another agent"
+        if payload["decision"] != "leave":
+            return f"decision {payload['decision']!r} is not 'leave'"
+        try:
+            early = parse_stamp(payload["signed_at"]) < parse_stamp(set_at)
+        except ConsentError:
+            return "the leave's signed_at is not a timestamp"
+        if early:
+            return "the leave was signed before away mode was set"
+        return self._signer_refusal(None, payload, signature, authority, noun="leave",
+                                    encode_record=away_leave_message, namespace=AWAY_NAMESPACE)
+
+    def _stored_leave_refusal(self, agent: str, row: tuple[Any, ...], queue_id: str) -> str | None:
+        """Why the leave stored for the mark in ``row`` (:meth:`_latest_mark`) does not count now; ``None`` when it
+        re-verifies against a fresh replay and was signed no later than its row's ``left_at`` plus
+        :data:`RULING_SKEW` (the bound :meth:`leave_away` applied)."""
+        mark_id, set_at, left_at, stored, signature, signer_fp = row
+        if not isinstance(stored, str) or not isinstance(left_at, str):
+            return "the stored leave is not a record"
+        try:
+            payload = json.loads(stored)
+            if not isinstance(payload, dict) or away_leave_message(payload) != stored.encode("utf-8"):
+                return "the stored leave is not its own canonical encoding"
+        except (ValueError, ConsentError, RecursionError):
+            return "the stored leave does not parse"
+        if payload.get("signer_fp") != signer_fp:
+            return "the stored leave names another signer than its row"
+        authority = self._fresh_authority()
+        if authority is None:
+            return _AUTHORITY_NOW_UNREADABLE
+        why = self._leave_refusal(mark_id, agent, set_at, queue_id, payload, signature, authority)
+        if why is not None:
+            return why
+        try:
+            late = parse_stamp(payload["signed_at"]) > parse_stamp(left_at) + RULING_SKEW
+        except ConsentError:
+            return "the leave row's left_at is not a timestamp"
+        return "the leave was signed after the queue recorded it" if late else None
+
+    def away_mark(self, agent: str, *, as_is: bool = False) -> AwayMark | None:
+        """``agent``'s latest away mark, or ``None`` when it never had one. A stored leave counts (``left``) only
+        when it re-verifies (:meth:`_stored_leave_refusal`): a leave by a key revoked since, or a changed row,
+        leaves the mark standing. The verdict is kept for this queue's life by the whole row, so a hook process
+        verifies a leave once and its recheck ticks reuse it (a new mark or a changed row is read afresh; a log
+        that could not be replayed is tried again). With ``as_is`` (a reader that holds no queue of its own) the
+        store is read as it stands and never written (:meth:`_read_as_is`: a prior-format store has no mark).
+        Raises when the store cannot be read (the hook takes that as away)."""
+        self._check_agent(agent)
+        reading = self._read_as_is(_AWAY_TABLES) if as_is and not self._ready else self._read()
+        with reading as conn:
+            if conn is None:
+                return None
+            row = self._latest_mark(conn, agent)
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        if row is None:
+            return None
+        if row[3] is None:
+            return AwayMark(id=row[0], agent=agent, set_at=row[1], left=False)
+        key = (queue_id, *row)
+        if key in self._leave_verdicts:
+            why = self._leave_verdicts[key]
+        else:
+            why = self._stored_leave_refusal(agent, row, queue_id)
+            if why != _AUTHORITY_NOW_UNREADABLE:
+                self._leave_verdicts[key] = why
+        return AwayMark(id=row[0], agent=agent, set_at=row[1], left=why is None, leave_by=row[5], leave_refusal=why)
+
+    def away_leave_payload(self, agent: str, signer_fp: str) -> dict[str, str]:
+        """The record to sign to leave ``agent``'s away mode: its latest mark, ``signed_at`` now by the queue's
+        clock. Raises :class:`AnswerRefused` when the agent has no mark or its latest mark already has a leave."""
+        self._check_agent(agent)
+        with self._read() as conn:
+            row = self._latest_mark(conn, agent)
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        if row is None:
+            raise AnswerRefused(f"{agent} has no away mark to leave")
+        if row[3] is not None:
+            raise AnswerRefused(f"{agent}'s away mark {row[0]} already has a leave; set away mode again to leave it "
+                                "anew")
+        return away_leave_payload(queue_id=queue_id, mark_id=row[0], agent=agent, signer_fp=signer_fp,
+                                  signed_at=utc_stamp(_now_utc(self._clock)))
+
+    def leave_away(self, payload: Mapping[str, Any], signature: str) -> AwayMark:
+        """Apply a signed leave of an agent's away mode, or raise :class:`AnswerRefused` (the mark stands). The
+        leave is verified against a fresh replay of the authority log (:meth:`_leave_refusal`, in
+        :data:`~levain.consent.record.AWAY_NAMESPACE`), its mark must still be the agent's latest with no leave
+        stored, and its ``signed_at`` no later than the queue's clock read under the write lock plus
+        :data:`RULING_SKEW`."""
+        agent = payload.get("agent") if isinstance(payload, Mapping) else None
+        if agent not in AGENTS:
+            raise AnswerRefused("the leave names no known agent")
+        authority = self._fresh_authority()
+        if authority is None:
+            raise AnswerRefused("the authority log cannot be replayed now: no leave is authority")
+        with self._read() as conn:
+            row = self._latest_mark(conn, agent)
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        if row is None:
+            raise AnswerRefused(f"{agent} has no away mark to leave")
+        why = self._leave_refusal(row[0], agent, row[1], queue_id, payload, signature, authority)
+        if why is not None:
+            raise AnswerRefused(why)
+        message = away_leave_message(dict(payload))
+        with self._write() as conn:
+            now = _now_utc(self._clock)
+            stamp = utc_stamp(now)
+            latest = self._latest_mark(conn, agent)
+            if latest is None or latest[0] != row[0]:
+                problem = "a newer away mark was set meanwhile; sign the leave again"
+            elif latest[3] is not None:
+                problem = f"away mark {row[0]} already has a leave"
+            elif parse_stamp(payload["signed_at"]) > now + RULING_SKEW:
+                problem = (f"the leave's signed_at {payload['signed_at']} is later than the queue's clock {stamp} "
+                           f"plus {int(RULING_SKEW.total_seconds())} s")
+            else:
+                problem = None
+                conn.execute("INSERT INTO away_leaves (mark_id, left_at, payload, signature, signer_fp) "
+                             "VALUES (?, ?, ?, ?, ?)", (row[0], stamp, message.decode("utf-8"), signature,
+                                                        payload["signer_fp"]))
+        if problem is not None:
+            raise AnswerRefused(problem)
+        return AwayMark(id=row[0], agent=agent, set_at=row[1], left=True, leave_by=payload["signer_fp"])
 
     # --- late rulings ----------------------------------------------------------------------------------
     def _undecided(self, request_id: str) -> tuple[ExternalGateRequest, tuple[int, str], str]:

@@ -83,7 +83,7 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
-    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from,
+    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from, with_away_mark,
     hook_timeout, nothing_can_decide,
     protected_paths,
 )
@@ -471,7 +471,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
-        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings)
+        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
                      sleep=sleep, still_away=still_away)
     return _with_rulings(out, queue, session)
@@ -638,12 +638,14 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         args = parser.parse_args(argv)
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
+        queue = _queue_for(queue_dir, settings)   # one queue: the away mark, the hold and every recheck read it
+        settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
         event = json.loads(stdin.read())
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-            out = gate(event, _queue_for(queue_dir, settings), settings)
+            out = gate(event, queue, settings)
         else:
-            out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
+            out = decide(event, queue, settings, max_hold=args.max_hold,
+                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

@@ -19,7 +19,7 @@ from levain.consent import auto_away, away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from levain.consent.auto_away import input_idle_seconds as real_idle_read
-from tests.test_consent_away import _cockpit, _queue
+from tests.test_consent_away import _cockpit, _key, _queue
 
 
 @pytest.fixture(scope="module")
@@ -90,7 +90,7 @@ def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, capsys):
         assert cli(["consent", "away", "on", "--hold", "15", "--agent", agent, "--queue-dir", str(qdir)]) == 0
         t, out, started = _hook(mod, event, qdir)
         _wait_pending(qdir)
-        assert cli(["consent", "away", "off", "--agent", agent, "--queue-dir", str(qdir)]) == 0
+        assert cli(["consent", "away", "off", "--agent", agent, "--signing-key", str(_key(qdir)), "--queue-dir", str(qdir)]) == 0
         flipped = time.monotonic()
         t.join(10)
         assert not t.is_alive() and time.monotonic() - flipped < cc.RECHECK_EVERY + 3
@@ -168,7 +168,8 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
     idle[0] = 0.0
     assert cli(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (True, "word")
-    assert cli(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert cli(["consent", "away", "auto", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
+                "--queue-dir", str(qdir)]) == 0
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "auto"
     assert auto_away.away_state(cc.load_settings(qdir))[:2] == (False, "idle")
     # run_h2: an integer too large for a float is refused by set_away itself (the CLI's float parse never gets there)

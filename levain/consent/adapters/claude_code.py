@@ -28,7 +28,9 @@ Settings live in ``<levain home>/consent/claude_code.json`` (:data:`SETTINGS_NAM
 
 plus, once ``levain consent away`` has written them, ``away_word`` (``"on"`` / ``"off"``, absent for input idle)
 and ``away_idle_seconds``. Missing or unreadable settings mean no explicit word and no authority (so no answer can
-verify, and nothing is held). :func:`install`
+verify, and nothing is held). An away mode set by ``levain consent away on`` is also an away mark in the queue store,
+and the hook reads it there (:func:`with_away_mark`): until a signed leave of it verifies, the agent is away whatever
+the file says. :func:`install`
 writes the hook script (:data:`HOOK_TEMPLATE`) and the ``PermissionRequest`` entry into ONE workspace's project
 settings; wiring into user settings is a later slice.
 """
@@ -46,7 +48,7 @@ import sysconfig
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import IO, Any
@@ -60,8 +62,10 @@ from levain.consent.policy import PolicyNotEligible as PolicyNotEligible
 from levain.consent.policy import guarded_policy as guarded_policy
 from levain.consent.policy import mcp_config_candidates
 from levain.consent.policy import targets as _targets
-from levain.consent.auto_away import IDLE_THRESHOLD, WORDS, away_state, hold_seconds
-from levain.consent.queue import ConsentQueue, Decision, authority_source, default_queue_dir, gap_label
+from levain.consent.auto_away import DEFAULT_HOLDS, IDLE_THRESHOLD, WORDS, away_state, hold_seconds
+from levain.consent.queue import (
+    DB_NAME, AwayMark, ConsentQueue, Decision, authority_source, default_queue_dir, gap_label,
+)
 from levain.consent.record import ExternalGateRequest
 
 AGENT = "claude_code"
@@ -103,6 +107,11 @@ class AdapterSettings:
     explicit_off: bool = False
     away_idle_seconds: float = IDLE_THRESHOLD
     legacy: bool = False
+    # away mode stands by the operator's away mark in the queue store (:func:`with_away_mark`), not by the file alone;
+    # away_unreadable: the store could not be read (:func:`store_unreadable`'s words, else empty): counted as such a
+    # mark, though a hook that cannot open the store can neither hold nor file a request
+    away_marked: bool = False
+    away_unreadable: str = ""
     # the PreToolUse gate (Q14 B2): its hold D; the notify command it pings the operator with (R-f: an argv, the
     # message appended as its last argument; None = no ping); the phone page's link the ping carries
     gate_hold_seconds: float = DEFAULT_GATE_HOLD
@@ -478,12 +487,59 @@ def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | 
     return hold_seconds(settings, agent, source) if away else 0.0
 
 
-def still_away_from(path: Path, started: AdapterSettings) -> Callable[[], tuple[bool, str, str]]:
+def store_unreadable(queue_dir: Path) -> str:
+    """What the operator is told when the consent queue store at ``queue_dir`` cannot be read."""
+    return (f"consent store unreadable at {Path(queue_dir) / DB_NAME}: levain can neither hold nor file requests "
+            "until it opens")
+
+
+def away_mark_of(queue_dir: Path, settings: AdapterSettings, agent: str, *, queue: Any = None) -> AwayMark | None:
+    """``agent``'s latest away mark in the queue store at ``queue_dir``, its leave re-verified against the authority
+    ``settings`` name (:meth:`ConsentQueue.away_mark`); ``None`` when there is no store or no mark. Read through
+    ``queue`` when it is a :class:`ConsentQueue` (the hook's own, whose schema is checked once, and which verifies
+    a stored leave once), else from the store as it is, never written (a store of the prior format: no mark).
+    Raises when the store cannot be read."""
+    if not os.path.lexists(Path(queue_dir) / DB_NAME):
+        return None
+    if isinstance(queue, ConsentQueue):
+        return queue.away_mark(agent)
+    return _queue_for(Path(queue_dir), settings).away_mark(agent, as_is=True)
+
+
+def with_away_mark(settings: AdapterSettings, queue_dir: Path, agent: str, *, queue: Any = None) -> AdapterSettings:
+    """``settings`` as the hook acts on them: when ``agent``'s latest away mark has no leave that verifies
+    (:func:`away_mark_of`, through ``queue`` when given), away mode is on by the operator's word whatever the file
+    says (``away_marked``), holding the file's hold when it is above zero, else the agent's :data:`DEFAULT_HOLDS`.
+    A store that cannot be read counts as such a mark, never as away off (``away_unreadable``: why, in
+    :func:`store_unreadable`'s words). An ``agent`` that is not one of :data:`DEFAULT_HOLDS` has no marks."""
+    if agent not in DEFAULT_HOLDS:
+        return settings
+    unreadable = ""
+    try:
+        mark = away_mark_of(queue_dir, settings, agent, queue=queue)
+    except Exception:  # noqa: BLE001 - an unreadable store is never read as away off
+        mark, unreadable = AwayMark(id="", agent=agent, set_at="", left=False), store_unreadable(queue_dir)
+    if mark is None or mark.left:
+        return settings
+    hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[agent]
+    return replace(settings, away_mode=True, explicit_off=False, legacy=False, away_marked=True,
+                   away_unreadable=unreadable, away_hold_seconds=hold)
+
+
+def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None = None, queue: Any = None
+                    ) -> Callable[[], tuple[bool, str, str]]:
     """The recheck a hook entry point holds with: :func:`effective_away` of a fresh read of the settings file at
-    ``path``, or of ``started`` (what the hold started with) when that read fails."""
+    ``path``, or of ``started`` (what the hold started with) when that read fails, with the away mark of ``agent``
+    (default: the file's name without ``.json``) read again from the store beside it (:func:`with_away_mark`,
+    through the hook's ``queue`` when given, so a recheck tick takes no write lock and reuses the leave verified at
+    the hold's start). Known edge: the hook's ``queue`` verifies leaves against the cockpit the settings named when
+    it opened, so a ``cockpit_data_root`` changed during a hold takes effect at the next hook call."""
+    agent = agent if agent is not None else path.stem
+
     def recheck() -> tuple[bool, str, str]:
         fresh = try_read_settings_file(path)
-        return effective_away(fresh if fresh is not None else started)
+        return effective_away(with_away_mark(fresh if fresh is not None else started, path.parent, agent,
+                                             queue=queue))
     return recheck
 
 
@@ -890,7 +946,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     except Exception:
         pass  # a re-ping is a ping: it never fails the gate
     if still_away is None:
-        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings)
+        still_away = still_away_from(Path(queue.directory) / SETTINGS_NAME, settings, queue=queue)
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, sleep=sleep,
                      still_away=still_away)
     try:
@@ -1068,12 +1124,14 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         args = parser.parse_args(argv)
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
+        queue = _queue_for(queue_dir, settings)   # one queue: the away mark, the hold and every recheck read it
+        settings = with_away_mark(settings, queue_dir, AGENT, queue=queue)
         event = json.loads(stdin.read())
         if isinstance(event, Mapping) and event.get("hook_event_name") == GATE_EVENT:
-            out = gate(event, _queue_for(queue_dir, settings), settings)
+            out = gate(event, queue, settings)
         else:
-            out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings))
+            out = decide(event, queue, settings, max_hold=args.max_hold,
+                         still_away=still_away_from(queue_dir / SETTINGS_NAME, settings, queue=queue))
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

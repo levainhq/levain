@@ -1,6 +1,7 @@
 """`levain consent away`: away mode set through the CLI is what the adapters' own load_settings reads."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
@@ -69,9 +70,93 @@ def test_on_then_off_is_what_both_adapters_read(qdir, capsys):
         assert s.away_mode is True and s.away_hold_seconds == 120.0
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["other"] == 1  # other keys kept
     assert oct((qdir / cc.SETTINGS_NAME).stat().st_mode & 0o777) == "0o600"
-    assert "claude_code: away mode ON, holds up to 120s" in capsys.readouterr().out
-    assert main(["consent", "away", "off", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
+    assert "claude_code: away mode ON (signed to leave), holds up to 120s" in capsys.readouterr().out
+    assert main(["consent", "away", "off", "--agent", "codex", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 0
     assert cx.load_settings(qdir).away_mode is False and cc.load_settings(qdir).away_mode is True
+
+
+def _key(qdir: Path) -> Path:
+    """The laptop key the queue's cockpit enrolled (:func:`_cockpit`)."""
+    return Path(json.loads((qdir / cc.SETTINGS_NAME).read_text())["cockpit_data_root"]).parent / "laptop"
+
+
+def test_off_without_a_signature_leaves_an_away_on_standing(qdir, capsys):
+    """AWAY-SIGN run (i), reproduced on the code before it: `away off` after `away on`, unsigned, exited 0 and
+    turned away mode off. It is refused now, and away stays on for the hook; a signed off leaves it."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    assert "leaving it takes a signature" in capsys.readouterr().err
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "on"   # the word was not written
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 0
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is False
+
+
+def test_a_hand_rewritten_off_does_not_end_a_marked_away_for_the_hook(qdir, tmp_path):
+    """AWAY-SIGN run (ii), reproduced on the code before it: after `away on`, the settings file rewritten by hand
+    to away_word off let a gated PreToolUse pass unheld. The hook reads the away mark in the store and holds."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cc.SETTINGS_NAME
+    data = json.loads(path.read_text())
+    data.update(away_word="off", away_mode=False, away_hold_seconds=0, gate_hold_seconds=0.5)
+    path.write_text(json.dumps(data))
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "S-ii", "cwd": str(ws), "permission_mode": "default",
+             "tool_name": "Edit", "tool_use_id": "tu-ii",
+             "tool_input": {"file_path": str(ws / ".claude" / "settings.json"), "old_string": "a", "new_string": "b"}}
+    out = io.StringIO()
+    assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
+    assert "UNDECIDED" in out.getvalue()                       # held to D and marked undecided, never passed
+    assert cc.still_away_from(path, cc.load_settings(qdir))()[0] is True
+
+
+
+
+def test_a_hand_rewritten_off_does_not_end_a_marked_away_for_the_codex_hook(qdir, tmp_path):
+    """AWAY-SIGN L1 #8, reproduced with the away-mark read taken out of the Codex hook's main: after `away on`, the
+    settings file rewritten by hand to away_word off let a gated Codex PreToolUse pass unheld. It holds now."""
+    assert main(["consent", "away", "on", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cx.SETTINGS_NAME
+    path.write_text(json.dumps({**json.loads(path.read_text()), "away_word": "off", "away_mode": False,
+                                "away_hold_seconds": 0, "gate_hold_seconds": 0.5}))
+    ws = tmp_path / "ws"
+    (ws / ".codex").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "S-cx", "turn_id": "t1", "transcript_path": None,
+             "cwd": str(ws), "model": "m", "permission_mode": "default", "tool_name": "apply_patch",
+             "tool_input": {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+             "tool_use_id": "call-cx"}
+    out = io.StringIO()
+    assert cx.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event)), stdout=out) == 0
+    assert "UNDECIDED" in out.getvalue()                       # held to D and marked undecided, never passed
+
+
+def test_a_replaced_mark_row_never_re_latests_a_left_mark(qdir):
+    """AWAY-SIGN L1 #1, reproduced on the code before it: after on / signed off / on again and the settings
+    file rewritten to off, a raw `INSERT OR REPLACE` of the first (left) mark's id re-ordered it latest, and its stored leave read the agent as
+    not away; so did a REPLACE onto the standing mark's rowid with another agent's row. Both are refused now."""
+    key = str(_key(qdir))
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", key,
+                 "--queue-dir", str(qdir)]) == 0
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    path = qdir / cc.SETTINGS_NAME
+    path.write_text(json.dumps({**json.loads(path.read_text()), "away_word": "off", "away_mode": False}))
+    conn = sqlite3.connect(qdir / "queue.db", isolation_level=None)
+    (first, first_at), (standing,) = (conn.execute("SELECT id, set_at FROM away_marks ORDER BY rowid").fetchone(),
+                                      conn.execute("SELECT rowid FROM away_marks ORDER BY rowid DESC").fetchone())
+    for stmt, args in (("INSERT OR REPLACE INTO away_marks (id, agent, set_at) VALUES (?, ?, ?)",
+                        (first, "claude_code", first_at)),
+                       ("INSERT OR REPLACE INTO away_marks (rowid, id, agent, set_at) VALUES (?, ?, ?, ?)",
+                        (standing, "am-other", "codex", first_at))):
+        try:
+            conn.execute(stmt, args)
+        except sqlite3.IntegrityError:
+            pass
+        assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+    conn.close()
 
 
 def test_on_without_hold_uses_the_default_and_show_writes_nothing(qdir, capsys):
@@ -209,3 +294,82 @@ def test_both_hooks_and_the_verb_share_one_reader(qdir):
 def test_a_huge_integer_hold_from_a_library_caller_is_a_value_error(qdir):
     with pytest.raises(ValueError):
         away.set_away(qdir, "claude_code", True, int("9" * 400))
+
+
+def test_a_verifier_that_cannot_run_is_a_refusal_not_a_traceback(qdir, monkeypatch, capsys):
+    """Fix r2 (codex MED), reproduced on 00152acb: with a mark standing, `off --signing-key` while ssh-keygen could
+    not fingerprint the key raised VerifierUnavailable out of the CLI. It is the normal refusal now."""
+    from levain.authority import VerifierUnavailable
+    from levain.cockpit import keys
+
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+
+    def no_verifier(*_a, **_k):
+        raise VerifierUnavailable("ssh-keygen could not fingerprint the key (FileNotFoundError)")
+    monkeypatch.setattr(keys, "fingerprint_of", no_verifier)
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
+                 "--queue-dir", str(qdir)]) == 1
+    assert "away mode not left: ssh-keygen could not fingerprint" in capsys.readouterr().err
+    assert cc.effective_away(away.settings(qdir, "claude_code"))[0] is True
+
+
+@pytest.mark.parametrize("damage", ["drop_leaves", "foreign"])
+def test_a_damaged_or_foreign_store_is_unreadable_never_no_mark(qdir, damage, capsys):
+    """Fix r2 (codex MED), reproduced on 00152acb: a current-format store that lost away_leaves, and an unrelated
+    SQLite file, read as "no mark", so an unsigned `off` exited 0. Both are unreadable now, and say what that costs."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    db = qdir / "queue.db"
+    if damage == "foreign":
+        db.unlink()
+    conn = sqlite3.connect(db, isolation_level=None)
+    if damage == "foreign":
+        conn.execute("CREATE TABLE notes (body TEXT)")
+    else:
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE "
+                                    "'%away_leaves%'").fetchall():
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("DROP TABLE away_leaves")
+    conn.close()
+    capsys.readouterr()
+    assert main(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    err = capsys.readouterr().err
+    assert "consent store unreadable at" in err and "neither hold nor file" in err and "move it aside" in err
+    assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "on"   # nothing written
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    assert "neither hold nor file requests" in capsys.readouterr().out
+
+
+def _drop(db: Path, *tables: str) -> None:
+    conn = sqlite3.connect(db, isolation_level=None)
+    for table in tables:
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                                    (table,)).fetchall():
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(f"DROP TABLE {table}")
+    conn.close()
+
+
+def test_a_store_from_before_away_marks_has_no_mark(qdir, capsys):
+    """Fix r3 (complement + codex MED), reproduced on 23a1458e: a current-format store made before the away
+    tables (neither one there) made `show` say the store is unreadable. It has no mark, and the queue adds them."""
+    assert main(["consent", "away", "auto", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    cc._queue_for(qdir, away.settings(qdir, "claude_code")).queue_id   # the store, in its current format
+    _drop(qdir / "queue.db", "away_marks", "away_leaves")
+    capsys.readouterr()
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert "unreadable" not in capsys.readouterr().out
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert away.settings(qdir, "claude_code").away_marked
+
+
+def test_the_hook_never_recreates_a_lost_away_table(qdir):
+    """Fix r3 (complement + codex MED), reproduced on 23a1458e: a current-format store that lost away_marks read
+    as unreadable to `show`, but the hook's own queue recreated the table empty and did not hold under the mark."""
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    _drop(qdir / "queue.db", "away_marks")
+    started = cc.settings_from(json.loads((qdir / cc.SETTINGS_NAME).read_text()))
+    got = cc.with_away_mark(started, qdir, "claude_code", queue=cc._queue_for(qdir, started))
+    assert got.away_marked and "consent store unreadable at" in got.away_unreadable
+    conn = sqlite3.connect(qdir / "queue.db")
+    assert "away_marks" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    conn.close()

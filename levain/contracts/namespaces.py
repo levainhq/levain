@@ -30,6 +30,8 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                               "a consent-queue answer to an external agent's gate (Q1)"),
     "levain-consent-ruling": ("shipped", "levain/consent/record.py",
                               "a late ruling on a consent-queue request that went undecided (Q14)"),
+    "levain-consent-away": ("shipped", "levain/consent/record.py",
+                            "leaving an away mode set by `levain consent away on` (its away mark)"),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

@@ -1527,7 +1527,23 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
                                "answer can reach it", hint, warn=True))
     qdir = _consent_queue_dir()
     settings = mod.load_settings(qdir)
-    if settings.explicit_off:
+    try:
+        mark, unread = claude_code.away_mark_of(qdir, settings, mod.AGENT), None
+    except Exception as e:  # noqa: BLE001 - a store the hook cannot open: say what that costs
+        mark, unread = None, e
+    if unread is not None:
+        out.append(CheckResult(f"{label} away mode", True,
+                               f"{claude_code.store_unreadable(qdir)} ({type(unread).__name__})",
+                               "Repair the store, or move it aside: a store moved aside reads as no away mark, "
+                               "which ends a standing `levain consent away on` too.", warn=True))
+    elif mark is not None and not mark.left:
+        detail = ("on (signed to leave): `levain consent away on` set it, and the hook holds until a signed "
+                  "`levain consent away off --signing-key <key>` leaves it, whatever the settings file says")
+        if mark.leave_refusal is not None:
+            detail += (f"; a leave signed by {mark.leave_by} does not verify ({mark.leave_refusal}), so the mark "
+                       "stands")
+        out.append(CheckResult(f"{label} away mode", True, detail, warn=mark.leave_refusal is not None))
+    elif settings.explicit_off:
         when = " (set before auto-away existed)" if settings.legacy else ""
         out.append(CheckResult(f"{label} away mode", True,
                                f"off by your word{when}: an unanswered request goes straight to {label}'s own "
