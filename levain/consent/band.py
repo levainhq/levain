@@ -29,6 +29,13 @@ Known edges (one line each, not built against):
   answer is recorded and listed, never delivered.
 - the hook claims the answer before Claude Code or Codex reads its output: a hook killed in between (its timeout
   after a long hold) loses that answer's text, as a ruling's.
+- a resume is never started while any running process's command line names the session id
+  (:func:`levain.consent.delivery.session_named_running`): an unrelated one that names it (``tail -f`` of its
+  transcript) keeps the answer waiting for the session's next hook. That check reads every process's command line
+  and keeps nothing but the yes or no.
+- the resume record is read from a transcript's first 1 MiB and a Codex rollout's first line up to 1 MiB: past that
+  no start directory is recorded and the answer waits for the next hook; so does a Codex session whose prompt or an
+  option value is exactly ``exec``, ``app-server`` or ``mcp-server`` (read as that subcommand).
 - Codex's hook gives a session id only (no subagent id is appended, as for its halts): if a Codex subagent's calls
   carry the parent's id, its hook can claim the answer [not measured].
 
@@ -44,6 +51,7 @@ import sqlite3
 import sys
 import unicodedata
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -512,6 +520,36 @@ def deliver_answer(store: QuestionStore, ref: Any, *, listing: Any = None, runni
     if state == "unconfirmed":
         return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
                                                         "it may have run, so it is not started again")
+    with _session_lock(store, q.agent, q.agent_session_id):
+        return _deliver_locked(store, q, out, listing=listing, running=running, launch=launch)
+
+
+@contextmanager
+def _session_lock(store: QuestionStore, agent: str, session: str) -> Iterator[None]:
+    """One delivery per session at a time, from the route through the resume's settle (an exclusive ``flock`` on
+    ``<store>/resumes/<digest of agent and session>.lock``): two answers delivered at once (the phone page delivers
+    each on its own thread) would otherwise both pass the route's checks and start two resumes; the second now
+    routes after the first resume has started, whose process names the session."""
+    import fcntl
+    import hashlib
+
+    folder = Path(store.directory) / "resumes"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    name = hashlib.sha256(f"{agent}\0{session}".encode()).hexdigest()[:32]
+    fd = os.open(folder / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _deliver_locked(store: QuestionStore, q: Question, out: Any, *, listing: Any, running: Any, launch: Any) -> Any:
+    from levain.consent import delivery as dv
+
+    state, when = store.delivery_state(q.id)
+    if state in ("delivered", "unconfirmed"):                       # settled meanwhile, under another's lock
+        return replace(out, route=state, reason=f"another delivery took it first ({state} at {when})")
     # a question asked with nothing recorded borrows the session's newest record: one resume carries every answer
     meta = store.resume_meta(q.id) or store.session_resume_meta(q.agent, q.agent_session_id) or {}
     where, why, argv, cwd = dv.route(q.agent, q.agent_session_id, meta, noun="answer", listing=listing,

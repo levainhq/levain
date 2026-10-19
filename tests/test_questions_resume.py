@@ -328,3 +328,44 @@ def test_l3r2_nineteen_digit_numbers_and_the_agent_names():
     assert _parse_ref("9223372036854775807") == ("n", 2 ** 63 - 1)
     assert _parse_ref("9223372036854775808") is None
     assert set(band._AGENT_NAMES) == set(band._agents())
+
+
+def test_l3r3_two_deliveries_of_one_session_start_one_resume(tmp_path, monkeypatch):
+    """codex r3 #2: answer B arriving between A's lease and A's launch passed the route too (A's resume not started
+    yet) and leased itself: two resumes. The per-session lock makes B route after A's resume started."""
+    import threading
+    import time
+
+    store = QuestionStore(tmp_path / "consent")
+    for n in (1, 2):
+        store.file(agent="codex", agent_session_id=SESSION, what=f"q{n}?", options=[("a", "x"), ("b", "y")],
+                   rec="a", blocks="z", cwd="/w")
+    store.answer(1, option="a", channel="phone")
+    started = threading.Event()
+    leased_a = threading.Event()
+
+    def route(*a, **k):
+        if started.is_set():                     # A's resume is running: its process names the session
+            return "hook", "a process naming this session may be running", (), None
+        return "resumed", "ended", ("/bin/codex", "exec", "resume", SESSION), str(tmp_path)
+
+    monkeypatch.setattr(dv, "route", route)
+    launches = []
+
+    def launch(*a):
+        leased_a.set()                           # A has leased; B's answer lands now, before A's launch returns
+        time.sleep(0.5)
+        launches.append(a)
+        started.set()
+
+    results = []
+    first = threading.Thread(target=lambda: results.append(band.deliver_answer(store, 1, launch=launch)))
+    first.start()
+    assert leased_a.wait(5)
+    store.answer(2, option="a", channel="phone")
+    second = threading.Thread(target=lambda: results.append(band.deliver_answer(store, 2, launch=launch)))
+    second.start()
+    first.join(10)
+    second.join(10)
+    assert len(launches) == 1
+    assert sorted(r.route for r in results) == ["hook", "resumed"]
