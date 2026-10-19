@@ -83,12 +83,22 @@ _CLAUDE = "claude_code"
 _CODEX = "codex"
 # the permission modes a resumed Claude Code session is started in
 _MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions", "auto", "dontAsk"})
-# the flags of an original Claude Code command line that a resume does not carry over: resumed without them, the
-# session would run with fewer constraints than it was started with (each also as ``--flag=value``)
-_UNRESTORED = ("--settings", "--mcp-config", "--strict-mcp-config", "--add-dir", "--allowedTools", "--allowed-tools",
-               "--disallowedTools", "--disallowed-tools", "--tools", "--append-system-prompt",
-               "--append-system-prompt-file", "--system-prompt", "--system-prompt-file", "--agents", "--plugin-dir",
-               "--permission-prompt-tool", "--setting-sources")
+# The options of an original Claude Code command line a resume may run without: each changes no tool set,
+# permission, setting, budget or confinement (or a resume without it is the stricter session), and a resume carries
+# the permission mode itself. Any other option refuses the resume: an allowlist, so an option a later Claude Code
+# adds is refused until it is judged here. It was a denylist until 1019+1 measured Claude Code 2.1.303's options
+# against it and found resumes that dropped --restricted (the code-running tools came back), --agent,
+# --disable-slash-commands, --max-budget-usd, --safe-mode and --bare (each also as ``--flag=value``).
+_CLAUDE_NEUTRAL = frozenset({
+    "-p", "--print", "--bg", "-r", "--resume", "-c", "--continue", "--session-id", "--fork-session",
+    "--permission-mode", "--allow-dangerously-skip-permissions", "--model", "--fallback-model", "--effort",
+    "--output-format", "--input-format", "--json-schema", "--include-partial-messages", "--include-hook-events",
+    "--replay-user-messages", "--forward-subagent-text", "--verbose", "-d", "--debug", "--debug-file", "-n",
+    "--name", "--prompt-suggestions", "--ax-screen-reader", "--ide", "--chrome", "--no-chrome", "--brief",
+    "--plugin-url", "--exclude-dynamic-system-prompt-sections", "--autocompact", "--system-prompt-snapshot",
+    "-w", "--worktree", "--tmux", "--remote-control", "--remote-control-session-name-prefix",
+    "--no-session-persistence", "-h", "--help", "-v", "--version",
+})
 # the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
 _BYPASS_FLAG = "--dangerously-skip-permissions"
 # Codex: `codex exec resume` takes no -s and runs under config.toml's sandbox_mode, not the original's [measured:
@@ -300,12 +310,13 @@ def option_names(argv_text: str) -> str:
 
 
 def unrestored_flags(flags: str, mode: str | None) -> list[str]:
-    """The flags of an original command line (:func:`option_names`) that a resume would not carry over."""
+    """The flags of an original command line (:func:`option_names`, the executable first) that a resume would not
+    carry over: any not in :data:`_CLAUDE_NEUTRAL`, except :data:`_BYPASS_FLAG` when the mode a resume sets IS that
+    flag's (``bypassPermissions``)."""
     out = []
-    for token in flags.split():
+    for token in flags.split()[1:]:
         name = token.partition("=")[0]
-        if name in _UNRESTORED or (name.startswith("--dangerously-")
-                                   and not (name == _BYPASS_FLAG and mode == "bypassPermissions")):
+        if name not in _CLAUDE_NEUTRAL and not (name == _BYPASS_FLAG and mode == "bypassPermissions"):
             out.append(name)
     return list(dict.fromkeys(out))
 

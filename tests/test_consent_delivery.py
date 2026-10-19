@@ -194,3 +194,16 @@ def test_the_tail_read_spans_blocks_and_finds_the_newest_record(tmp_path):
                                                          "note": "y" * 200_000}})
     _rollout(chome, ["danger-full-access"], tail=big + "\n" + filler)
     assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "workspace-write"]
+
+
+def test_a_claude_resume_is_refused_for_any_option_it_cannot_carry_and_runs_for_neutral_ones():
+    """The class sibling of the Codex sandbox (1019+1): the old denylist let a resume drop --restricted (Bash came
+    back), --agent, --disable-slash-commands, --max-budget-usd, --safe-mode, --bare and any option added later."""
+    for flag in ("--restricted", "--agent", "--disable-slash-commands", "--max-budget-usd", "--safe-mode", "--bare",
+                 "--permission-prompts", "--settings", "--tools", "--an-option-added-later",
+                 "--dangerously-bypass-something"):
+        assert dv.unrestored_flags(f"claude -p {flag}", "default") == [flag], flag
+    neutral = "/opt/bin/claude -p --model --output-format --verbose --permission-mode --resume=x --effort -n"
+    assert dv.unrestored_flags(neutral, "default") == []
+    assert dv.unrestored_flags("claude --dangerously-skip-permissions", "bypassPermissions") == []
+    assert dv.unrestored_flags("claude --dangerously-skip-permissions", "default") == ["--dangerously-skip-permissions"]
