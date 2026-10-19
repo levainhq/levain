@@ -1643,9 +1643,9 @@ def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
     except (AnswerRefused, OSError, QueueStoreError, sqlite3.Error, *_cockpit_refusals()) as exc:
         print(f"levain consent receipts verify: {_term_safe(exc)}", file=sys.stderr)
         return 1
-    if report.receipts is None:                     # no log to read: nothing else was read either
+    if report.receipts is None:                     # no log could be read: the store, or a receipt sqlite cannot decode
         print(_term_safe(f"UNREADABLE: {report.unreadable}"))
-        print("levain consent receipts verify: the store has no log to verify", file=sys.stderr)
+        print("levain consent receipts verify: no log could be read, so nothing was verified", file=sys.stderr)
         return 1
     print(f"receipts: {report.receipts}")
     last = report.last_signed
