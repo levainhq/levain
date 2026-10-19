@@ -30,6 +30,11 @@ Known edges (each stated, none built against):
     next apply and :func:`verify` are what see the rewrite;
   - recomputing a head reads and hashes every receipt up to its size: linear in the log, per signed answer
     applied and per distinct head verified (71-136 ms for a head over 10,000 receipts, measured 10-19);
+  - an answer signed by a key revoked WITHOUT ``compromised_since`` is listed as signed by a key revoked since,
+    whatever its ``signed_at`` says: ``signed_at`` is the signer's own claim, so a check on it cannot hold against
+    the key's holder. A lost or stolen key is revoked with ``compromised_since``, and then every answer it signed
+    fails :func:`verify`;
+  - a signed head of size 0 always matches (the empty tree's root is fixed): it attests nothing;
   - the authority ledger (:mod:`levain.consent.ledger`) is not part of this log;
   - a writer who also holds an enrolled key can sign a head over anything: the key is the root of trust.
 
@@ -47,20 +52,37 @@ from typing import Any
 
 from levain.contracts import merkle
 
-__all__ = ["HEAD_KEYS", "Report", "Revoked", "SignedHead", "head", "head_problem", "head_refusal", "leaf", "leaves",
-           "verify"]
+__all__ = ["HEAD_KEYS", "HEAD_SIZE_CEILING", "LogUnreadable", "Report", "Revoked", "SignedHead", "head",
+           "head_problem", "head_refusal", "leaf", "leaves", "verify"]
 
 HEAD_KEYS = frozenset({"size", "root"})
+# a head's size is a count below this, so it always fits the SQLite integer LIMIT it is read with
+HEAD_SIZE_CEILING = 2 ** 62
 _LEAF_SQL = "SELECT seq, request_id, state, created_at, face FROM receipts ORDER BY seq"
 _HEX = frozenset("0123456789abcdef")
+_TEXT_COLUMNS = ("request_id", "state", "created_at", "face")
+
+
+class LogUnreadable(ValueError):
+    """The receipts cannot be read as a log: a receipt row is not an integer ``seq`` and four UTF-8 texts."""
 
 
 def leaf(row: Sequence[Any]) -> bytes:
     """The canonical bytes of one receipt row ``(seq, request_id, state, created_at, face)``. Raises
-    ``UnicodeEncodeError`` for text that is not UTF-8 encodable (a lone surrogate a raw writer stored)."""
-    seq, request_id, state, created_at, face = row
-    return json.dumps({"seq": seq, "request_id": request_id, "state": state, "created_at": created_at, "face": face},
-                      sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    :class:`LogUnreadable` when ``seq`` is not an integer or another column is not text (a BLOB or a number a
+    raw writer stored) or not UTF-8 encodable (a lone surrogate)."""
+    seq, *texts = row
+    if type(seq) is not int:
+        raise LogUnreadable(f"a receipt's seq is not an integer: {seq!r}")
+    fields: dict[str, Any] = {"seq": seq}
+    for name, value in zip(_TEXT_COLUMNS, texts, strict=True):
+        if type(value) is not str:
+            raise LogUnreadable(f"receipt {seq}: its {name} is not text")
+        fields[name] = value
+    try:
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise LogUnreadable(f"receipt {seq}: it is not UTF-8 text") from None
 
 
 def _rows(conn: sqlite3.Connection, size: int | None) -> list[tuple[Any, ...]]:
@@ -81,7 +103,8 @@ def _head_of(data: list[bytes], size: int) -> dict[str, Any]:
 def head(source: Any, size: int | None = None) -> dict[str, Any]:
     """The head of the log of size ``size`` (default: every receipt). ``source`` is a connection inside the caller's
     transaction, or a :class:`~levain.consent.queue.ConsentQueue`, read in one read transaction of its own.
-    Raises ``ValueError`` when ``size`` exceeds the log."""
+    Raises ``ValueError`` when ``size`` exceeds the log, :class:`LogUnreadable` (a ``ValueError``) when a receipt it
+    reads cannot be a leaf."""
     if isinstance(source, sqlite3.Connection):
         data = leaves(source, size)
     else:
@@ -97,7 +120,7 @@ def head_problem(value: Any) -> str | None:
     if not isinstance(value, Mapping) or set(value) != HEAD_KEYS:
         return "receipts head is not a {size, root} record"
     size, root = value["size"], value["root"]
-    if type(size) is not int or size < 0:
+    if type(size) is not int or not 0 <= size < HEAD_SIZE_CEILING:
         return f"receipts head size {size!r} is not a count"
     if not isinstance(root, str) or len(root) != 2 * merkle.HASH_LEN or not set(root) <= _HEX:
         return "receipts head root is not a lowercase hex sha256"
@@ -111,8 +134,8 @@ def head_refusal(conn: sqlite3.Connection, signed: Mapping[str, Any], *, noun: s
     size = signed["size"]
     try:
         data = leaves(conn, size)
-    except UnicodeEncodeError:
-        return "the receipts cannot be read as a log (a receipt is not UTF-8 text)"
+    except LogUnreadable as exc:
+        return f"the receipts cannot be read as a log ({exc})"
     if len(data) < size:
         return f"the {noun} names more receipts than the queue holds"
     if _head_of(data, size)["root"] != signed["root"]:
@@ -143,15 +166,16 @@ class Revoked:
 
 @dataclass(frozen=True)
 class Report:
-    """What :func:`verify` found. ``receipts``: the log's size. ``last_signed``: the matching signed head of the
-    greatest size (the latest signed among equals) by a key still active, or ``None``. ``unsigned_tail``: receipts
-    after it. ``unchained``: requests answered in a format signed before the receipts were chained whose signature
+    """What :func:`verify` found. ``receipts``: the log's size, ``None`` when the store is not one whose log can be
+    read at all (``unreadable`` then says why, and nothing else was read). ``last_signed``: the matching signed
+    head of the greatest size (the latest signed among equals) by a key still active, or ``None``.
+    ``unsigned_tail``: receipts after it. ``unchained``: requests answered in a format signed before the receipts were chained whose signature
     still verifies (no head to check; listed, never failures). ``revoked``: signed answers whose signer was revoked
     since (:class:`Revoked`; listed, never failures, and never the last signed head). ``mismatches``:
     ``(request_id, reason)`` for every signed answer or ruling that does not verify now (a bad signature, a key never
     enrolled, a key marked compromised) or whose head does not match. ``unreadable``: why the receipts cannot be
     read as a log, or ``None``. ``ok`` only with no mismatch and a readable log."""
-    receipts: int
+    receipts: int | None
     last_signed: SignedHead | None
     unsigned_tail: int
     unchained: tuple[str, ...]
@@ -183,9 +207,13 @@ def verify(queue_dir: Path | str, *,
     :meth:`~levain.consent.queue.ConsentQueue._refusal` (an answer) or ``_ruling_refusal`` (a ruling, for the
     request's gap) must pass under a fresh replay of the authority log ``authority_for(request)`` returns (default:
     the cockpit the request's agent hook verifies against, :func:`levain.consent.answering.answer_root`). Then its
-    ``receipts_head`` must be the head of its size over the log as it stands."""
+    ``receipts_head`` must be the head of its size over the log as it stands. Only a current-format store holding
+    its ``requests`` and ``receipts`` tables (empty or not) has a log: an empty database, a store of
+    :data:`~levain.consent.queue.PRIOR_FORMAT` (not migrated: verify never migrates) or one lacking either table
+    is reported unreadable, ``receipts`` ``None``."""
     from levain.authority import AuthorityError, VerifierUnavailable, anchor_path
-    from levain.consent.queue import _FIELDS, AnswerRefused, ConsentQueue, QueueStoreError, authority_source
+    from levain.consent.queue import (_FIELDS, AnswerRefused, ConsentQueue, QueueStoreError, StoreNotCurrent,
+                                      authority_source)
     from levain.consent.record import UNCHAINED_FORMATS
 
     qdir = Path(queue_dir)
@@ -198,12 +226,8 @@ def verify(queue_dir: Path | str, *,
 
     reading = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
     cols = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
-    rows: list[tuple[Any, ...]] = []
-    signed_rows: list[dict[str, Any]] = []
-    gaps: dict[str, tuple[int, str] | None] = {}
-    queue_id = None
-    with reading._read_as_is(frozenset({"requests", "receipts"})) as conn:
-        if conn is not None:
+    try:
+        with reading._read_as_is(frozenset({"requests", "receipts"}), whole=True) as conn:
             rows = conn.execute(_LEAF_SQL).fetchall()
             got = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
             queue_id = None if got is None else got[0]
@@ -211,16 +235,17 @@ def verify(queue_dir: Path | str, *,
                                "ORDER BY decided_at, rowid")
             names = [d[0] for d in cur.description]
             signed_rows = [dict(zip(names, r)) for r in cur.fetchall()]
-            for r in signed_rows:
-                if r["via"] == "ruling":
-                    gaps[r["id"]] = ConsentQueue._gap_of(conn, r["id"])
+            gaps = {r["id"]: ConsentQueue._gap_of(conn, r["id"]) for r in signed_rows if r["via"] == "ruling"}
+    except StoreNotCurrent as exc:
+        return Report(receipts=None, last_signed=None, unsigned_tail=0, unchained=(), mismatches=(), signed=0,
+                      unreadable=str(exc))
     mismatches: list[tuple[str, str]] = []
     unreadable = None
     try:
         data: list[bytes] | None = [leaf(r) for r in rows]
-    except UnicodeEncodeError:
+    except LogUnreadable as exc:
         data = None
-        unreadable = "the receipts cannot be read as a log (a receipt is not UTF-8 text)"
+        unreadable = f"the receipts cannot be read as a log ({exc})"
     roots: dict[int, str] = {}
     snapshots: dict[str, Any] = {}
     unchained: list[str] = []
@@ -237,7 +262,8 @@ def verify(queue_dir: Path | str, *,
             mismatches.append((rid, "the stored answer is not its own canonical record"))
             continue
         noun = "ruling" if row["via"] == "ruling" else "answer"
-        is_unchained = payload.get("format") in UNCHAINED_FORMATS
+        fmt = payload.get("format")
+        is_unchained = isinstance(fmt, str) and fmt in UNCHAINED_FORMATS     # anything else: the refusal judges it
         named = payload.get("decision")
         if not isinstance(named, str) or {"allow": "allowed", "deny": "denied"}.get(named) != row["state"] \
                 or payload.get("signer_fp") != row["signer_fp"]:
@@ -282,7 +308,7 @@ def verify(queue_dir: Path | str, *,
         signed_head = payload["receipts_head"]
         size = signed_head["size"]
         if data is None:
-            mismatches.append((rid, "the receipts cannot be read as a log (a receipt is not UTF-8 text)"))
+            mismatches.append((rid, unreadable))
             continue
         if size > len(data):
             mismatches.append((rid, f"the {noun} names more receipts than the queue holds"))

@@ -1606,7 +1606,8 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
             "signed before chaining, any signer revoked since it signed, and each mismatch by request id. Exits "
             "0 when every signed head matches (an answer signed before chaining or by a key revoked since is "
             "listed, not failed); non-zero for a head that does not match, a signature that does not verify, a "
-            "key never enrolled, or a store that cannot be read. Reads the store read-only."))
+            "key never enrolled, or a store that cannot be read (a store from before the current format is "
+            "read only once migrated: `levain consent pending` migrates it). Reads the store read-only."))
     verify_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                           help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     verify_p.add_argument("--data-root", type=Path, default=None, dest="data_root",
@@ -1634,6 +1635,10 @@ def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
         report = verify(qdir, authority_for=authority_for)
     except (AnswerRefused, OSError, QueueStoreError, sqlite3.Error, *_cockpit_refusals()) as exc:
         print(f"levain consent receipts verify: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    if report.receipts is None:                     # no log to read: nothing else was read either
+        print(_term_safe(f"UNREADABLE: {report.unreadable}"))
+        print("levain consent receipts verify: the store has no log to verify", file=sys.stderr)
         return 1
     print(f"receipts: {report.receipts}")
     last = report.last_signed

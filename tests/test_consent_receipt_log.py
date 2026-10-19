@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -136,3 +137,201 @@ def test_a_signer_revoked_since_is_reported_not_failed(scratch, capsys, tmp_path
         conn.close()
     assert main(["consent", "receipts", "verify", "--queue-dir", str(queue.directory), "--data-root", str(root)]) == 1
     assert f"MISMATCH {request.id}: the receipts changed under this answer" in capsys.readouterr().out
+
+
+# --- L3 r1 (1019+24 triage F1-F5) -------------------------------------------------------------------------------
+
+def _verify_cli(queue, root, capsys):
+    capsys.readouterr()
+    rc = main(["consent", "receipts", "verify", "--queue-dir", str(queue.directory), "--data-root", str(root)])
+    got = capsys.readouterr()
+    return rc, got.out, got.err
+
+
+def _raw_sql(queue, *statements):
+    conn = sqlite3.connect(queue.path, isolation_level=None)
+    try:
+        for sql in statements:
+            conn.execute(sql)
+    finally:
+        conn.close()
+
+
+def test_verify_refuses_a_prior_format_store_and_names_the_command_that_migrates_it(scratch, tmp_path, capsys):
+    # F1. Seen red on a9a66aea: rc 0, "receipts: 0", a /3 store with receipts read as an empty, clean log
+    from levain.authority import anchor_path as _anchor
+    from levain.consent.queue import PRIOR_FORMAT, ConsentQueue, authority_source
+    from tests.test_consent_queue_v4 import _v3_module
+
+    queue, _, _, root = scratch
+    v3 = _v3_module()
+    old = v3.ConsentQueue(queue.directory, authority=v3.authority_source(root / "cockpit.db", anchor=_anchor(root)))
+    gone = old.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                    tool_input={"file_path": "/w/a.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5))
+    assert old.withdraw(gone.id)
+    rc, out, err = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert f"UNREADABLE: {queue.path} is in format {PRIOR_FORMAT!r}" in out and "levain consent pending" in out
+    assert "receipts:" not in out
+    conn = sqlite3.connect(queue.path)
+    try:                                                             # verify never migrates or writes
+        assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == PRIOR_FORMAT
+    finally:
+        conn.close()
+    # the advice is true: `levain consent pending` migrates it, and verify then reads the log
+    assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
+    rc, out, _ = _verify_cli(ConsentQueue(queue.directory, authority=authority_source(root / "cockpit.db",
+                                                                                      anchor=_anchor(root))),
+                             root, capsys)
+    assert rc == 0, out
+    assert "receipts: 1" in out and "UNREADABLE" not in out
+
+
+def test_verify_refuses_a_zero_byte_store(scratch, capsys):
+    # F1. Seen red on a9a66aea: rc 0, "receipts: 0"
+    queue, _, _, root = scratch
+    queue.path.touch(mode=0o600)
+    assert queue.path.stat().st_size == 0
+    rc, out, _ = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert "UNREADABLE:" in out and "an empty database" in out
+    assert queue.path.stat().st_size == 0                           # never set up by verify
+
+
+@pytest.mark.parametrize("dropped", [("receipts", "requests"), ("receipts",)])
+def test_verify_refuses_a_store_whose_log_tables_were_dropped(scratch, capsys, dropped):
+    # F1. Seen red on a9a66aea: both dropped -> rc 0, "receipts: 0"; one dropped -> a stderr refusal, not UNREADABLE
+    queue, laptop, _, root = scratch
+    _signed_over_one_receipt(queue, laptop, root, capsys)
+    _raw_sql(queue, *(f"DROP TABLE {t}" for t in dropped))
+    rc, out, _ = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert "UNREADABLE:" in out and "lacks receipts" in out
+
+
+def test_verify_reads_a_fresh_empty_current_store_as_an_empty_clean_log(scratch, capsys):
+    # F1's control: a current-format store with its tables and no rows is a readable (empty) log
+    queue, _, _, root = scratch
+    assert queue.pending() == []
+    rc, out, _ = _verify_cli(queue, root, capsys)
+    assert rc == 0, out
+    assert "receipts: 0" in out and "UNREADABLE" not in out
+
+
+def _non_text_receipt(queue, kind):
+    """A writer with the uid stores a receipt column that is not text: a BLOB face (TEXT affinity keeps a BLOB), or
+    an integer state (the table rebuilt with no type on ``state``, since TEXT affinity would store '7')."""
+    if kind == "blob face":
+        _raw_sql(queue, "DROP TRIGGER receipts_frozen",
+                 "UPDATE receipts SET face = x'00ff' WHERE seq = (SELECT MIN(seq) FROM receipts)")
+    else:
+        _raw_sql(queue, "DROP TRIGGER receipts_frozen", "DROP TRIGGER receipts_kept",
+                 "ALTER TABLE receipts RENAME TO receipts_old",
+                 "CREATE TABLE receipts (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, state, "
+                 "created_at TEXT NOT NULL, face TEXT NOT NULL)",
+                 "INSERT INTO receipts SELECT * FROM receipts_old", "DROP TABLE receipts_old",
+                 "UPDATE receipts SET state = 7 WHERE seq = (SELECT MIN(seq) FROM receipts)")
+    conn = sqlite3.connect(queue.path)
+    try:
+        got = conn.execute("SELECT typeof(face), typeof(state) FROM receipts ORDER BY seq LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert got == (("blob", "text") if kind == "blob face" else ("text", "integer"))
+
+
+@pytest.mark.parametrize("kind", ["blob face", "int state"])
+def test_a_non_text_receipt_refuses_the_apply_and_the_payload_and_verify_reports_it(scratch, capsys, kind):
+    # F2. Seen red on a9a66aea: TypeError (Object of type bytes / the int is not ... ) out of queue.answer,
+    # queue.answer_payload and the verify CLI, a crash in each, never a refusal
+    queue, laptop, fp, root = scratch
+    covered = _signed_over_one_receipt(queue, laptop, root, capsys)
+    later = _file(queue, "/w/b.txt", "e-b")
+    payload = queue.answer_payload(later.id, "deny", fp)
+    signature = _sign(laptop, answer_message(payload))
+    _non_text_receipt(queue, kind)
+    with pytest.raises(AnswerRefused, match="the receipts cannot be read as a log"):
+        queue.answer(later.id, payload, signature)
+    assert queue.get(later.id)[1] == "pending"
+    with pytest.raises(AnswerRefused, match="the receipts cannot be read as a log"):
+        queue.answer_payload(later.id, "allow", fp)
+    rc, out, err = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert "UNREADABLE: the receipts cannot be read as a log" in out and "receipts: 2" in out
+    assert f"MISMATCH {covered.id}: the receipts cannot be read as a log" in out
+
+
+def test_ruling_payload_refuses_on_a_non_text_receipt(scratch, capsys):
+    # F2 (the ruling's payload, the same head read). Seen red on a9a66aea: TypeError
+    queue, laptop, fp, root = scratch
+    request = _file(queue, "/w/u.txt", "e-u")
+    queue.mark_undecided(request.id)
+    _non_text_receipt(queue, "blob face")
+    with pytest.raises(AnswerRefused, match="the receipts cannot be read as a log"):
+        queue.ruling_payload(request.id, "allow", fp)
+
+
+def test_a_stored_answer_whose_format_is_not_text_is_a_mismatch_not_a_crash(scratch, capsys):
+    # F3. Seen red on a9a66aea: TypeError: unhashable type: 'list' out of the verify CLI
+    from levain.cockpit.consent import encode
+
+    queue, laptop, _, root = scratch
+    request = _signed_over_one_receipt(queue, laptop, root, capsys)
+    stored = _stored(queue, request.id)
+    stored["format"] = []
+    conn = sqlite3.connect(queue.path, isolation_level=None)
+    try:
+        conn.execute("DROP TRIGGER requests_frozen")
+        conn.execute("UPDATE requests SET answer = ? WHERE id = ?", (encode(stored).decode("utf-8"), request.id))
+    finally:
+        conn.close()
+    rc, out, _ = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert f"MISMATCH {request.id}: answer format [] is not" in out
+
+
+def test_a_head_size_at_the_ceiling_is_not_well_formed_and_never_reaches_sqlite(scratch):
+    # F4. Seen red on a9a66aea: head_problem passed 2**63 and head_refusal raised OverflowError (LIMIT ?).
+    # Through queue.answer the record's own integer domain (encode, I-JSON safe range) refuses it first.
+    from levain.consent.receipt_log import HEAD_SIZE_CEILING, head_problem, head_refusal
+
+    queue, _, _, _ = scratch
+    root_hex = "0" * 64
+    for size in (HEAD_SIZE_CEILING, 2 ** 63):
+        assert head_problem({"size": size, "root": root_hex}) == f"receipts head size {size!r} is not a count"
+    assert head_problem({"size": HEAD_SIZE_CEILING - 1, "root": root_hex}) is None
+    with queue._read() as conn:
+        assert head_refusal(conn, {"size": HEAD_SIZE_CEILING - 1, "root": root_hex}, noun="answer") == \
+            "the answer names more receipts than the queue holds"
+
+
+class _Flipping(Mapping):
+    """A payload whose ``decision`` reads ``first`` for its first ``after`` reads, then ``then``."""
+
+    def __init__(self, payload, first, then, after):
+        self.payload, self.first, self.then, self.after, self.reads = payload, first, then, after, 0
+
+    def __getitem__(self, key):
+        if key != "decision":
+            return self.payload[key]
+        self.reads += 1
+        return self.first if self.reads <= self.after else self.then
+
+    def __iter__(self):
+        return iter(self.payload)
+
+    def __len__(self):
+        return len(self.payload)
+
+
+def test_a_payload_changed_after_answer_starts_cannot_change_what_is_applied(scratch):
+    # F5. A deny signed; the mapping shows "deny" through every read the checks make (on a9a66aea: three, the
+    # last the signature's), then "allow". Seen red on a9a66aea: the request was ALLOWED (answer() re-read
+    # payload["decision"] after the signature check)
+    queue, laptop, fp, _ = scratch
+    request = _file(queue, "/w/a.txt", "e-a")
+    deny = queue.answer_payload(request.id, "deny", fp)
+    signature = _sign(laptop, answer_message(deny))
+    flipping = _Flipping(deny, "deny", "allow", after=3)
+    got = queue.answer(request.id, flipping, signature)
+    assert got.decision == "deny" and queue.get(request.id)[1] == "denied"
+    assert _stored(queue, request.id)["decision"] == "deny"
