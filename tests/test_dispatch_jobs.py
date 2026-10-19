@@ -256,8 +256,25 @@ def test_recommend_takes_the_capability_and_only_from_verified(store, repo):
 
 def test_recommend_from_filed_is_refused(store, repo):
     job, cap = file_job(store, repo)
-    with pytest.raises(TransitionRefused, match="from filed to recommended"):
+    with pytest.raises(TransitionRefused, match=r"recommend is only for a verified job \(job is filed\)"):
         store.recommend(job.id, cap)
+
+
+def test_recommend_names_the_state_on_every_non_verified_job(store, repo):
+    """L4 F5: 'a job cannot go from signed to recommended' did not tell the planner what recommend is for."""
+    for state in ("signed", "verifying"):
+        job, cap = at_state(store, repo, state)
+        with pytest.raises(TransitionRefused, match=rf"recommend is only for a verified job \(job is {state}\)"):
+            store.recommend(job.id, cap)
+        store.cancel_by_planner(job.id, cap)
+    job, cap = at_state(store, repo, "verified")
+    assert store.recommend(job.id, cap).state == "recommended"
+
+
+def test_recommend_with_a_wrong_capability_is_a_capability_refusal_first(store, repo):
+    job, _cap = file_job(store, repo)
+    with pytest.raises(CapabilityRefused):
+        store.recommend(job.id, "not-the-capability")
 
 
 def test_another_jobs_capability_is_refused(store, repo):
@@ -293,7 +310,7 @@ def test_sign_moves_filed_to_signed_and_stores_the_signature(store, repo, keys, 
     with sqlite3.connect(store.path) as conn:
         row = conn.execute("SELECT payload, signature FROM signatures").fetchone()
     assert row == (dsign.sign_message(payload).decode(), sig)
-    with pytest.raises(SignatureRefused, match="not filed; a contract is signed once"):
+    with pytest.raises(SignatureRefused, match="is signed; only a filed job can be signed"):
         store.sign(job.id, payload, sig, log.source)
 
 
@@ -322,7 +339,7 @@ def test_a_lapsed_job_cannot_be_signed(store, repo, keys, log, clock):
     job, _ = file_job(store, repo)
     payload, sig = signed(job, keys["phone"])
     clock.now = NOW + UNSIGNED_LEASE
-    with pytest.raises(SignatureRefused, match="is failed, not filed"):
+    with pytest.raises(SignatureRefused, match="is failed; only a filed job can be signed"):
         store.sign(job.id, payload, sig, log.source)
 
 
@@ -462,6 +479,33 @@ def test_overlap_compares_paths_without_case(store, repo):
         file_job(store, repo, write=["src/New.py"], resolver=wide)
 
 
+def test_overlap_counts_an_ancestor_or_descendant_write_path(store, repo):
+    """L4 F7: job A creating src/sub and job B creating src/sub/deep.py were both live; only one can land."""
+    wide = registry(template(write_paths=WRITE_SET | {"src/sub", "src/Sub/deep.py"}))
+    one, cap = file_job(store, repo, write=["src/sub"], resolver=wide)
+    with pytest.raises(ContractRefused, match=f"live job {one.id} already writes src/sub, and this contract's "
+                                              "src/sub/deep.py is under it; one live contract per write file"):
+        file_job(store, repo, write=["src/sub/deep.py"], resolver=wide)
+    with pytest.raises(ContractRefused, match=f"live job {one.id} already writes src/sub"):
+        file_job(store, repo, write=["src/Sub/deep.py"], resolver=wide)          # casefolded, as equal paths are
+    store.cancel_by_planner(one.id, cap)
+    two, _ = file_job(store, repo, write=["src/sub/deep.py"], resolver=wide)
+    with pytest.raises(ContractRefused, match=f"live job {two.id} already writes src/sub/deep.py, and this "
+                                              "contract's src/sub is a directory above it"):
+        file_job(store, repo, write=["src/sub"], resolver=wide)
+    # a shared name prefix is not an ancestor: src/subway.py is free while src/sub/deep.py is live
+    sib = registry(template(write_paths=WRITE_SET | {"src/subway.py"}))
+    assert file_job(store, repo, write=["src/subway.py"], resolver=sib)[0].state == "filed"
+
+
+def test_a_replay_with_another_digest_says_how_to_retry(store, repo, clock):
+    """L4 F2: a planner that rebuilt expires_at on retry was refused with no hint of what to resend."""
+    file_job(store, repo, idem_key="k1")
+    with pytest.raises(ContractRefused, match=r"resend the IDENTICAL submission \(the same expires_at included\), "
+                                              "and a lost capability cannot be re-issued"):
+        file_job(store, repo, idem_key="k1", expires_at=utc_stamp(NOW + timedelta(hours=2, seconds=1)))
+
+
 def test_an_idempotent_replay_after_expiry_returns_the_same_job(store, repo, clock):
     """L1 L2: the replay was refused 'expired' instead of returning the job it filed."""
     job, cap = file_job(store, repo, idem_key="k1", expires_at=utc_stamp(NOW + timedelta(minutes=5)))
@@ -523,7 +567,7 @@ def test_a_lock_wait_never_dates_a_signature_inside_a_lapsed_lease(store, repo, 
     job, _ = file_job(store, repo)
     payload, sig = signed(job, keys["phone"], at=NOW + UNSIGNED_LEASE - timedelta(seconds=2))
     store._clock = Sequence(NOW + UNSIGNED_LEASE - timedelta(seconds=1), NOW + UNSIGNED_LEASE + timedelta(seconds=10))
-    with pytest.raises(SignatureRefused, match="is failed, not filed"):
+    with pytest.raises(SignatureRefused, match="is failed; only a filed job can be signed"):
         store.sign(job.id, payload, sig, log.source)
     got = store.get(job.id)
     assert got.state == "failed" and got.history[-1].at == utc_stamp(NOW + UNSIGNED_LEASE + timedelta(seconds=10))

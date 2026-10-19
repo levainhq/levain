@@ -22,8 +22,9 @@ the past): a job past its lease that is not yet authorised moves to ``failed`` w
 ``lease_lapsed``. The sweep commits in its own write transaction before the operation's, so an operation that is then
 refused does not roll the lapse back; the operation's transaction sweeps again, so what it checks is current. One
 live contract per write file: filing is refused while a live job (not terminal, lease not lapsed) in the same repo
-writes a file in common, compared without case (a case-insensitive disk holds ``A.py`` and ``a.py`` as one file), so
-an abandoned or runaway planner cannot hold a file past its lease.
+writes the same place, compared without case (a case-insensitive disk holds ``A.py`` and ``a.py`` as one file): the
+same path, or one an ancestor of the other (``src/sub`` and ``src/sub/deep.py`` cannot both land), so an abandoned
+or runaway planner cannot hold a file past its lease.
 
 By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human
 signed for that result, and only a human releases it (adoption, or the human cancel, whose public method is slice
@@ -47,7 +48,7 @@ import re
 import secrets
 import sqlite3
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -239,6 +240,24 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ConsentError("the dispatch store's clock returned a naive datetime")
     return now
+
+
+def _write_clash(mine: Iterable[str], theirs: Iterable[str]) -> tuple[str, str] | None:
+    """The first ``(their path, my path)`` pair that names the same place, compared without case: equal, or one an
+    ancestor directory of the other (a job creating ``src/sub`` and a job creating ``src/sub/deep.py`` cannot both
+    land). ``None`` when the two write sets are disjoint."""
+    theirs_l = list(theirs)
+    for m in mine:
+        fm = m.casefold()
+        for t in theirs_l:
+            ft = t.casefold()
+            if fm == ft or fm.startswith(ft + "/") or ft.startswith(fm + "/"):
+                return t, m
+    return None
+
+
+def _relation(mine: str, theirs: str) -> str:
+    return "under" if mine.casefold().startswith(theirs.casefold() + "/") else "a directory above"
 
 
 def _capability_sha(capability: Any) -> str:
@@ -433,7 +452,7 @@ class JobStore:
         never mints a second token for one job. The key is looked up BEFORE the expiry is judged: a replay is
         resolved at its job's own filing time, so a replay after the contract expired still returns that job (in
         whatever state it is now). The same key with another digest is refused. Filing is refused while another live
-        job in the same repo writes a file in common, compared without case."""
+        job in the same repo writes the same path or an ancestor or descendant of one, compared without case."""
         filer_session = _label("filer_session", filer_session, _SESSION_MAX)
         if idem_key is not None:
             idem_key = _label("idem_key", idem_key, _IDEM_MAX)
@@ -450,8 +469,10 @@ class JobStore:
                                    (filer_session, idem_key)).fetchone()
                 if row is not None:
                     if row[1] != digest:
-                        raise ContractRefused(f"idem_key {idem_key!r} already filed job {row[0]} with another "
-                                              "contract digest")
+                        raise ContractRefused(
+                            f"idem_key {idem_key!r} already filed job {row[0]} with another contract digest; a "
+                            "replay must resend the IDENTICAL submission (the same expires_at included), and a "
+                            "lost capability cannot be re-issued")
                     job = self._load(conn, row[0])
                     assert job is not None
                     return job, None
@@ -462,7 +483,7 @@ class JobStore:
                 raise ContractRefused("the contract has expired; resolve it again")
             # the lease runs from the filing stamp (read under the lock), never from the clock read before resolving
             unsigned_until = min(utc_stamp(parse_stamp(stamp) + UNSIGNED_LEASE), parsed.expires_at)
-            mine = {p.casefold(): p for p in parsed.write_paths}
+            mine = sorted(parsed.write_paths)
             live = conn.execute(
                 f"SELECT j.id, j.contract FROM jobs j JOIN ({_CURRENT}) c ON c.job_id = j.id "
                 f"WHERE j.repo = ? AND c.to_state NOT IN ({','.join('?' * len(TERMINAL))}) ORDER BY j.id",
@@ -475,10 +496,14 @@ class JobStore:
                     # damaged store, not a refusal of the submission in hand
                     raise JobStoreError(f"live job {other_id} holds a stored contract that no longer parses; the "
                                         "dispatch store is damaged") from None
-                theirs = {p.casefold(): p for p in other.write_paths}
-                common = sorted(theirs[k] for k in mine.keys() & theirs.keys())
-                if common:
-                    raise ContractRefused(f"live job {other_id} already writes {common[0]}; one live contract per "
+                clash = _write_clash(mine, sorted(other.write_paths))
+                if clash is not None:
+                    theirs_p, mine_p = clash
+                    if theirs_p.casefold() == mine_p.casefold():
+                        raise ContractRefused(f"live job {other_id} already writes {theirs_p}; one live contract "
+                                              "per write file")
+                    raise ContractRefused(f"live job {other_id} already writes {theirs_p}, and this contract's "
+                                          f"{mine_p} is {_relation(mine_p, theirs_p)} it; one live contract per "
                                           "write file")
             job_id = "dj-" + secrets.token_hex(16)
             capability = secrets.token_urlsafe(32)
@@ -506,7 +531,7 @@ class JobStore:
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state != _FILED:
-                raise SignatureRefused(f"job {job.id} is {job.state}, not filed; a contract is signed once")
+                raise SignatureRefused(f"job {job.id} is {job.state}; only a filed job can be signed")
             try:
                 snapshot = authority()
             except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
@@ -532,6 +557,8 @@ class JobStore:
             stored = conn.execute("SELECT capability_sha256 FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
             if not hmac.compare_digest(_capability_sha(capability), stored):
                 raise CapabilityRefused(f"that capability is not job {job.id}'s")
+            if to_state == "recommended" and job.state != "verified":
+                raise TransitionRefused(f"recommend is only for a verified job (job is {job.state})")
             self._apply(conn, job.id, to_state, cause, stamp)
             out = self._load(conn, job.id)
         assert out is not None

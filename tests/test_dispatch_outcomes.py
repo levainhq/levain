@@ -121,6 +121,22 @@ def test_a_directory_others_can_reach_is_refused(tmp_path):
         OutcomeStore(d).append(row())
 
 
+def test_a_file_that_is_not_a_database_is_a_dispatch_error(store):
+    """L4 F6: rows() and append() on a non-database file raised a bare sqlite3.DatabaseError."""
+    store.directory.mkdir(mode=0o700)
+    store.path.write_bytes(b"this is not a database" * 100)
+    with pytest.raises(DispatchError, match="is not an outcome store"):
+        store.rows()
+    with pytest.raises(DispatchError, match="is not an outcome store"):
+        store.append(row())
+
+
+def test_the_append_only_trigger_keeps_its_own_error_type(store):
+    store.append(row())
+    with sqlite3.connect(store.path) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE outcomes SET label = 'adopted'")
+
+
 def test_a_store_of_another_format_is_refused(store):
     store.directory.mkdir(mode=0o700)
     conn = sqlite3.connect(store.path)

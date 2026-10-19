@@ -327,9 +327,10 @@ def test_base_must_be_a_full_commit_sha_that_resolves(repo):
     refused(repo, "full 40-hex", base=base[:12])
     refused(repo, "full 40-hex", base=base.upper())
     refused(repo, "full 40-hex", base="main")
-    refused(repo, "rev-parse failed", base="0" * 40)
+    # L4 F5: the planner reads this message, so it names the cause, never git's raw stderr
+    refused(repo, f"^base {'0' * 40} is not a commit in {path}$", base="0" * 40)
     blob = git(path, "rev-parse", f"{base}:src/a.py")
-    refused(repo, "rev-parse failed", base=blob)                  # a blob is not a commit
+    refused(repo, f"^base {blob} is not a commit in {path}$", base=blob)       # a blob is not a commit
 
 
 def test_repo_refusals(repo, tmp_path):
@@ -356,15 +357,43 @@ def test_git_environment_cannot_redirect_resolution(repo, monkeypatch, tmp_path)
 # --- refusals: template and data boundary --------------------------------------------------------------------------
 
 def test_an_unknown_template_is_r2_and_never_dispatched(repo):
-    refused(repo, "not registered; the contract is R2, and R2 is never dispatched", template="nope")
-    refused(repo, "R2 is never dispatched", template="Bad Id")
+    refused(repo, "^template nope is not registered, so the contract is R2, which is never dispatched$",
+            template="nope")
+    refused(repo, "is not a template id, so the contract is R2, which is never dispatched$", template="Bad Id")
 
 
 def test_a_write_outside_the_template_is_r2(repo):
     path, base = repo
     small = registry(template(write_paths=frozenset({"src/a.py"})))
-    with pytest.raises(ContractRefused, match="outside template fix-lint's write set.*R2 is never dispatched"):
+    with pytest.raises(ContractRefused, match="^write path src/new.py is not in template fix-lint's write set, so "
+                                              "the contract is R2, which is never dispatched$"):
         resolve(submission(path, base), resolver=small)
+
+
+def test_a_resolver_that_raises_is_a_refusal_naming_the_template(repo):
+    """L4 F6: the resolver is input to resolution; its ZeroDivisionError escaped file() as a crash."""
+    path, base = repo
+
+    def broken(tid):
+        raise ZeroDivisionError("division by zero")
+
+    with pytest.raises(ContractRefused,
+                       match=r"the template resolver failed on template fix-lint \(ZeroDivisionError\)"):
+        resolve(submission(path, base), resolver=broken)
+
+
+def test_a_paths_own_defect_is_named_before_the_data_boundary(repo):
+    """L4 F4: a directory as a read path was reported as outside the provider's allowlist; git resolution now runs
+    first, so the planner hears the defect it can fix. Both refuse the contract whole."""
+    path, base = repo
+    narrow = ProviderPolicy.from_mapping({"never": [], "providers": {"openrouter": {"read": ["src/*.py"]}}})
+    with pytest.raises(ContractRefused, match="read path src is a directory at base"):
+        resolve(submission(path, base, read=["src"]), policy=narrow)
+    with pytest.raises(ContractRefused, match="read path src/alias.py is a symlink at base"):
+        resolve(submission(path, base, read=["src/alias.py"]), policy=narrow)
+    # a sound path outside the allowlist is still the data boundary's refusal
+    with pytest.raises(ContractRefused, match="data boundary: docs/x.md is outside what provider openrouter"):
+        resolve(submission(path, base, read=["docs/x.md"]), policy=narrow)
 
 
 @pytest.mark.parametrize("over, match", [

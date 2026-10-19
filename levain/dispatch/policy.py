@@ -233,6 +233,9 @@ class ProviderPolicy:
         NEVER is checked first, against both sets; then the provider must be known and EVERY path, read or write,
         must match its read allowlist. A write path is held to the allowlist as well: an existing file the executor
         rewrites is in its worktree, so it ships. Anything malformed refuses."""
+        if isinstance(read, (str, bytes)) or isinstance(write, (str, bytes)):
+            # a str iterates as its characters, each a valid one-letter path: a str is never a path list
+            return "the read and write sets must be lists of paths, not a single string"
         try:
             read_l, write_l = list(read), list(write)
         except TypeError:

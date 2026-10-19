@@ -75,6 +75,14 @@ def test_allowlist_fails_closed_on_read_and_write(policy):
     assert policy.refusal("anthropic", ["docs/x.md"], ["games/g.py"]) is None
 
 
+def test_a_str_is_not_a_path_list(policy):
+    """L4 F8: a str iterated as one-letter paths and passed; it is refused, on either side."""
+    assert "not a single string" in policy.refusal("anthropic", "src", [])
+    assert "not a single string" in policy.refusal("anthropic", [], "src")
+    assert "not a single string" in policy.refusal("anthropic", b"src", [])
+    assert policy.refusal("anthropic", ("docs/x.md",), []) is None       # any iterable of paths still reads
+
+
 @pytest.mark.parametrize("read", [["/etc/passwd"], ["../x"], ["a//b"], [""], [None], ["a\x00b"], 7])
 def test_malformed_sets_refuse(policy, read):
     assert policy.refusal("anthropic", read, []) is not None

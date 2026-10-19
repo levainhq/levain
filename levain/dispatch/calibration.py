@@ -79,6 +79,8 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
     """The labels in the consent queue at ``directory`` (default: the queue's own directory) decided within ``span``
     of ``now``, plus every undecided request however old, up to the listing's cap: past it the set is marked
     ``incomplete``. Read-only through :func:`read_listing`; a missing queue is an empty set."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise DispatchError("read_labels needs an aware now (a naive datetime has no zone to compare stamps in)")
     listing = read_listing(directory, now=now, span=span, cap=_NO_CAP)
     labels: list[Label] = []
     grants = 0

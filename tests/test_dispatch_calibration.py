@@ -85,6 +85,14 @@ def test_a_standing_grant_answer_is_excluded_and_counted(tmp_path, keys):
     assert [lab.request_id for lab in got.labels] == [hand.id]
 
 
+def test_a_naive_now_is_refused_as_the_job_store_refuses_it(tmp_path):
+    """L4 F9: a naive now read an empty dir as an empty set; it is the same refusal the job store makes."""
+    with pytest.raises(DispatchError, match="aware now"):
+        read_labels(tmp_path / "nowhere", now=NOW.replace(tzinfo=None))
+    with pytest.raises(DispatchError, match="aware now"):
+        read_labels(tmp_path / "nowhere", now="2026-10-19T20:00:00Z")  # type: ignore[arg-type]
+
+
 def test_a_missing_queue_is_an_empty_label_set(tmp_path):
     got = read_labels(tmp_path / "nowhere", now=NOW)
     assert got.labels == () and got.excluded_grants == 0

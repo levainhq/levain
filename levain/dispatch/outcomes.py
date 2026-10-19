@@ -168,6 +168,19 @@ _SCHEMA = (
 )
 
 
+@contextmanager
+def _not_a_store(path: Path) -> Iterator[None]:
+    """A file that is not a SQLite database (or a damaged one) as :class:`DispatchError`. Only the bare
+    ``sqlite3.DatabaseError`` SQLite raises for NOTADB and CORRUPT is turned: its subclasses (a lock wait, an
+    append-only trigger's IntegrityError) keep their own type."""
+    try:
+        yield
+    except sqlite3.DatabaseError as exc:
+        if type(exc) is not sqlite3.DatabaseError:
+            raise
+        raise DispatchError(f"{path} is not an outcome store: {str(exc)[:200]}") from None
+
+
 class OutcomeStore:
     """``<directory>/outcomes.db``, ``directory`` the dispatch directory by default (the operator's alone, 0700,
     refused otherwise). Every write is one ``BEGIN IMMEDIATE``; every read is a read-only snapshot that never
@@ -229,7 +242,7 @@ class OutcomeStore:
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
-        with write_transaction(self._connect) as conn:
+        with _not_a_store(self.path), write_transaction(self._connect) as conn:
             yield conn
 
     def append(self, row: OutcomeRow) -> bool:
@@ -272,18 +285,20 @@ class OutcomeStore:
         if empty:
             return []
         self._check_directory()
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0,
-                               isolation_level=None)
-        try:
-            conn.execute("BEGIN")
-            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
-            if fmt is None or fmt[0] != FORMAT or "outcomes" not in have:
-                raise DispatchError(f"{self.path} is not an outcome store of format {FORMAT!r}")
-            got = conn.execute(f"SELECT {', '.join(_COLUMNS)} FROM outcomes ORDER BY n").fetchall()
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
+        with _not_a_store(self.path):
+            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0,
+                                   isolation_level=None)
+            try:
+                conn.execute("BEGIN")
+                have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                fmt = (conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+                       if "meta" in have else None)
+                if fmt is None or fmt[0] != FORMAT or "outcomes" not in have:
+                    raise DispatchError(f"{self.path} is not an outcome store of format {FORMAT!r}")
+                got = conn.execute(f"SELECT {', '.join(_COLUMNS)} FROM outcomes ORDER BY n").fetchall()
+                conn.execute("COMMIT")
+            finally:
+                conn.close()
         return [OutcomeRow(**dict(zip(_COLUMNS, r))) for r in got]
 
 

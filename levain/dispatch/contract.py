@@ -297,7 +297,11 @@ def _resolve_base(repo: str, base: Any) -> tuple[str, str]:
     """``(base, its tree's sha)``, both read under :func:`git_env`."""
     if not isinstance(base, str) or _SHA1.fullmatch(base) is None:
         raise _refuse("base must be a full 40-hex commit sha (lowercase)")
-    got = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode("ascii").strip()
+    try:
+        got = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode("ascii").strip()
+    except ContractRefused:
+        # git's own stderr is not a planner's message: the sha names no commit here (absent, or a blob or tree)
+        raise _refuse(f"base {base} is not a commit in {repo}") from None
     if got != base:
         raise _refuse(f"base {base} does not resolve to that commit (got {got[:40]})")
     tree = _git(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{tree}}").decode("ascii").strip()
@@ -419,6 +423,9 @@ class ResolvedContract:
         return frozenset(e.path for e in self.write)
 
 
+_R2 = "so the contract is R2, which is never dispatched"
+
+
 def _goal(raw: Any) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise _refuse("goal must be non-empty text")
@@ -495,11 +502,14 @@ def resolve_contract(submission: Any, *, resolve_template: Callable[[str], Resol
         raise _refuse(problem)
     template_id = submission["template"]
     if not isinstance(template_id, str) or _ID.fullmatch(template_id) is None:
-        raise _refuse(f"template {str(template_id)[:64]!r} is not a template id; the contract is R2, and R2 is "
-                      "never dispatched")
-    template = resolve_template(template_id)
+        raise _refuse(f"template {str(template_id)[:64]!r} is not a template id, {_R2}")
+    try:
+        template = resolve_template(template_id)
+    except Exception as exc:  # noqa: BLE001 - the resolver is input to resolution: its failure is a refusal
+        raise _refuse(f"the template resolver failed on template {template_id} ({type(exc).__name__}); nothing "
+                      "is filed") from None
     if template is None:
-        raise _refuse(f"template {template_id} is not registered; the contract is R2, and R2 is never dispatched")
+        raise _refuse(f"template {template_id} is not registered, {_R2}")
     if not isinstance(template, ResolvedTemplate):
         raise _refuse("the template resolver returned something other than a ResolvedTemplate")
     problem = template.problem()
@@ -509,14 +519,15 @@ def resolve_contract(submission: Any, *, resolve_template: Callable[[str], Resol
         raise _refuse(f"the resolver returned template {template.template_id} for {template_id}")
     outside = sorted(set(write) - template.write_paths)
     if outside:
-        raise _refuse(f"write path {outside[0]} is outside template {template_id}'s write set; the contract is R2, "
-                      "and R2 is never dispatched")
-    problem = policy.refusal(template.provider, read, write)
-    if problem is not None:
-        raise _refuse(f"data boundary: {problem}")
+        raise _refuse(f"write path {outside[0]} is not in template {template_id}'s write set, {_R2}")
+    # git resolution before the data boundary: a path's own defect (a directory, a symlink, missing at base) is the
+    # message the planner can act on. Both refuse the contract whole; the order changes only which reason is named.
     repo = _resolve_repo(submission["repo"])
     base, base_tree = _resolve_base(repo, submission["base"])
     reads, writes = _resolve_paths(_tree_at(repo, base_tree), read, write)
+    problem = policy.refusal(template.provider, read, write)
+    if problem is not None:
+        raise _refuse(f"data boundary: {problem}")
     return ResolvedContract(goal=goal, repo=repo, base=base, base_tree=base_tree, read=reads, write=writes, budget=budget, grant=grant,
                             expires_at=expires_at, template=template, policy_hash=policy.content_hash())
 
