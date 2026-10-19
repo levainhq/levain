@@ -72,7 +72,7 @@ def test_extend_doubles_and_repeat_window_doubles(tmp_path):
     for i in range(1, 4):
         v = _count(q, i, limits=lim)
     assert v.state == "crossed"
-    assert L.extend(q, "claude_code", "s1#agent:x", "calls") == 2
+    assert L.extend(q, "claude_code", "s1#agent:x", "calls", "req-a") == 2
     assert _count(q, 4, limits=lim).state == "ok"
     v = _count(q, 5, limits=lim)
     assert (v.state, v.limit) == ("crossed", 4)
@@ -80,7 +80,7 @@ def test_extend_doubles_and_repeat_window_doubles(tmp_path):
     for i in range(1, 9):
         v = _count(q2, i, inp={"p": 1})
     assert v.kind == "repeat"
-    L.extend(q2, "claude_code", "s1", "repeat")
+    L.extend(q2, "claude_code", "s1", "repeat", "req-b")
     for i in range(9, 16):
         v = _count(q2, i, inp={"p": 1})
     assert v.state == "ok" and v.limits["repeat"] == 16
@@ -193,3 +193,44 @@ def test_tokens_cross_through_the_counter(tmp_path):
     assert (v.state, v.kind, v.count) == ("crossed", "fresh_tokens", 60)
     os.unlink(t)                      # a missing transcript reads nothing and keeps the totals
     assert _count(q, 3, transcript=str(t), limits=lim).counts["fresh_tokens"] == 60
+
+
+# --- L1 r1 findings ------------------------------------------------------------------------------------------------
+
+def test_an_oversized_limit_value_keeps_the_defaults_and_counting(tmp_path):
+    q = _qdir(tmp_path)
+    (q / L.LIMITS_NAME).write_text('{"format": "%s", "default": {"calls": 1%s}}' % (L.LIMITS_FORMAT, "0" * 400))
+    got, src = L.load_limits(q, "claude_code")
+    assert got["calls"] == L.DEFAULTS["calls"] and "default.calls" in src
+    v = L.count_call(q, "claude_code", "s1", _ev(1), tool_name="Read", tool_input={})
+    assert v.state == "ok" and v.limits["calls"] == L.DEFAULTS["calls"]
+
+
+def test_switching_transcripts_never_recounts_a_file(tmp_path):
+    q = _qdir(tmp_path)
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_text(_asst("ma", 1000, 0, 0, 0))
+    b.write_text(_asst("mb", 500, 0, 0, 0))
+    for i in range(6):
+        v = _count(q, i, transcript=str(a if i % 2 == 0 else b))
+    assert v.counts["fresh_tokens"] == 1500
+
+
+def test_count_call_never_raises_on_an_unreadable_failure_dir(tmp_path):
+    q = _qdir(tmp_path)
+    _count(q, 1)
+    os.chmod(q / L.FAIL_DIR, 0)
+    try:
+        assert _count(q, 2).state == "ok"
+    finally:
+        os.chmod(q / L.FAIL_DIR, 0o700)
+
+
+def test_a_store_that_never_worked_is_still_capped(tmp_path, monkeypatch):
+    q = _qdir(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("the limits store is 'levain-limits-store/9'")
+    monkeypatch.setattr(L, "_count", boom)
+    states = [_count(q, i).state for i in range(L.FAIL_DENY_AFTER)]
+    assert states[-1] == "fail_deny" and "moves that file aside" in _count(q, 99).reason
