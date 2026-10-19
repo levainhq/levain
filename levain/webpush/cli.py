@@ -64,21 +64,24 @@ def _test(args: argparse.Namespace) -> int:
         print("no live subscription: turn notifications on from the phone page first")
         return 1
     for sub_id, status in results:
-        print(f"subscription {sub_id}: {status if status else 'no answer'}")
+        print(f"subscription {sub_id}: {'no answer in time' if status < 0 else status or 'no answer'}")
     return 0 if all(200 <= s < 300 for _, s in results) else 1
 
 
 def _record(args: argparse.Namespace) -> int:
+    from levain.webpush import record
     from levain.webpush.store import PushStore
 
-    pings = PushStore(_qdir(args)).record(args.limit)
+    qdir = _qdir(args)
+    pings = record.record(qdir, PushStore(qdir).record(args.limit))
     if args.json:
         print(json.dumps(pings, indent=2))
         return 0
     for p in pings:
         deliveries = ", ".join(f"sub {d['subscription_id']}: {d['status']}" for d in p["deliveries"]) or "no subscription"
         opened = f"opened {p['opens'][0]['at']}" if p["opens"] else "not opened"
-        print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}")
+        print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}; "
+              f"{p['outcome']['words']}")
     return 0
 
 
