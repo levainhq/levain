@@ -29,8 +29,8 @@ from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
 
-__all__ = ["CAP_MAX", "KINDS", "QUOTA_PER_RUN", "RECEIVED_SKEW", "RUN_KEYS", "Broker", "Resolved", "Resolver",
-           "resolved_from"]
+__all__ = ["CAP_MAX", "KINDS", "QUOTA_PER_RUN", "RECEIVED_SKEW", "RUN_KEYS", "SLOT_CLASS", "Broker", "Resolved",
+           "Resolver", "resolved_from", "slot_ref"]
 
 log = logging.getLogger("levain.qbroker")
 
@@ -44,6 +44,9 @@ QUOTA_PER_RUN = 200
 # drift and the trip to this socket separate the two
 RECEIVED_SKEW = timedelta(minutes=2)
 CAP_MAX = 1024
+# CONTRACT c5 §1.1: a slot is {class, index}, never the bare index; R/qb/slot<n>/ exists for the egress class only,
+# so a listener's n is egress index n
+SLOT_CLASS = "egress"
 _HOOK_REQUEST_KEYS = frozenset(ExternalGateRequest.__dataclass_fields__) - {"id"}
 _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 
@@ -57,8 +60,8 @@ class Resolved:
 
 
 class Resolver(Protocol):
-    def queue_resolve(self, slot: int, cap_digest: str) -> "Resolved | str":
-        """The session ``cap_digest`` belongs to on ``slot``, or a refusal name."""
+    def queue_resolve(self, slot: Mapping[str, Any], cap_digest: str) -> "Resolved | str":
+        """The session ``cap_digest`` belongs to on ``slot`` (a :func:`slot_ref`), or a refusal name."""
 
 
 def resolved_from(answer: Any) -> Resolved | None:
@@ -75,6 +78,11 @@ def resolved_from(answer: Any) -> Resolved | None:
     elif run is not None:
         return None
     return Resolved(session=session, kind=kind, run=None if run is None else dict(run))
+
+
+def slot_ref(index: int) -> dict[str, Any]:
+    """The slot a listener serves, as CONTROL names it: ``{class, index}``."""
+    return {"class": SLOT_CLASS, "index": index}
 
 
 def cap_digest(cap: Any) -> str | None:
@@ -125,7 +133,7 @@ class Broker:
         if digest is None:
             return "cap-malformed"
         try:
-            got = self._resolver.queue_resolve(slot, digest)
+            got = self._resolver.queue_resolve(slot_ref(slot), digest)
         except Exception:   # noqa: BLE001 - CONTROL unreachable: the hook fails closed on the refusal
             log.exception("qbroker: QUEUE-RESOLVE on slot %d failed", slot)
             return "control-unavailable"
@@ -154,7 +162,7 @@ class Broker:
         if expires <= now or expires - received > timedelta(seconds=MAX_HOLD):
             return wire.refusal(rid, "request-hold")
         row: dict[str, Any] = {"format": REQUEST_ROW_FORMAT, "queue_id": self._store.queue_id,
-                               "request": request.fields(), "session": who.session, "slot": slot, "kind": who.kind}
+                               "request": request.fields(), "session": who.session, "slot": slot_ref(slot), "kind": who.kind}
         if who.run is not None:
             row["run"] = dict(who.run)
         existing = self._store.read_request(request.id)
@@ -185,7 +193,7 @@ class Broker:
         except ValueError:
             row = None
         # one name for "no row" and "another session's row": a hook learns nothing about other sessions' ids
-        if row is None or row.get("session") != who.session or row.get("slot") != slot:
+        if row is None or row.get("session") != who.session or row.get("slot") != slot_ref(slot):
             return wire.refusal(rid, "no-such-request")
         request = request_of(row.get("request"))
         if request is None or row.get("queue_id") != self._store.queue_id:

@@ -61,16 +61,16 @@ def keys(tmp_path_factory):
 
 class FakeResolver:
     def __init__(self) -> None:
-        self.caps: dict[tuple[int, str], Resolved] = {}
-        self.calls: list[tuple[int, str]] = []
+        self.caps: dict[tuple[str, int, str], Resolved] = {}
+        self.calls: list[tuple[dict, str]] = []
 
     def add(self, slot: int, cap: str, resolved: Resolved) -> None:
         import hashlib
-        self.caps[(slot, hashlib.sha256(cap.encode()).hexdigest())] = resolved
+        self.caps[("egress", slot, hashlib.sha256(cap.encode()).hexdigest())] = resolved
 
     def queue_resolve(self, slot: int, cap_digest: str):
         self.calls.append((slot, cap_digest))
-        return self.caps.get((slot, cap_digest), "cap-unknown")
+        return self.caps.get((slot["class"], slot["index"], cap_digest), "cap-unknown")
 
 
 def write_signers(root: Path, keys, generation: int, signers=None, *, sign_with="trust") -> None:
@@ -174,18 +174,18 @@ def test_a_filed_request_takes_session_slot_kind_from_the_resolve_only(L, broker
     got = req(broker, session="forged", slot_claim=9, kind="dispatch", run={"run_id": "forged"})
     assert got["ok"] is True
     row = row_of(L, got["request_id"])
-    assert (row["session"], row["slot"], row["kind"]) == ("sess-a", 1, "interactive") and "run" not in row
+    assert (row["session"], row["slot"], row["kind"]) == ("sess-a", {"class": "egress", "index": 1}, "interactive") and "run" not in row
     assert row["queue_id"] == got["queue_id"] == QueueStore(L / "queue").queue_id
     assert oct((L / "queue" / "requests" / f"{got['request_id']}.json").stat().st_mode & 0o777) == "0o640"
     # the raw cap is nowhere on disk
     assert not any(b"cap-a" in p.read_bytes() for p in (L / "queue" / "requests").iterdir())
-    assert resolver.calls[-1][0] == 1 and resolver.calls[-1][1] != "cap-a"
+    assert resolver.calls[-1][0] == {"class": "egress", "index": 1} and resolver.calls[-1][1] != "cap-a"
 
 
 def test_a_dispatch_row_carries_the_resolved_run_verbatim(L, broker):
     rid = filed(broker, slot=2, cap="cap-two")
     row = row_of(L, rid)
-    assert (row["session"], row["slot"], row["kind"], row["run"]) == ("sess-2", 2, "dispatch", RUN)
+    assert (row["session"], row["slot"], row["kind"], row["run"]) == ("sess-2", {"class": "egress", "index": 2}, "dispatch", RUN)
 
 
 def test_the_row_id_is_the_sealed_id_never_the_hooks_claim(L, broker):
@@ -507,13 +507,13 @@ def test_the_control_resolver_speaks_queue_resolve(run_dir):
     t.start()
     try:
         r = ControlResolver(path)
-        assert r.queue_resolve(4, "d" * 64) == Resolved(session="s9", kind="dispatch", run=RUN)
-        assert r.queue_resolve(4, "d" * 64) == "revoked"
-        assert r.queue_resolve(4, "d" * 64) == "resolve-malformed"
+        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == Resolved(session="s9", kind="dispatch", run=RUN)
+        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "revoked"
+        assert r.queue_resolve({"class": "egress", "index": 4}, "d" * 64) == "resolve-malformed"
     finally:
         t.join(timeout=10)
         srv.close()
-    assert seen[0] == {"v": 1, "op": "QUEUE-RESOLVE", "id": 1, "slot": 4, "cap_digest": "d" * 64}
+    assert seen[0] == {"v": 1, "op": "QUEUE-RESOLVE", "id": 1, "slot": {"class": "egress", "index": 4}, "cap_digest": "d" * 64}
 
 
 def test_an_unreachable_control_fails_closed(L, clock, run_dir):

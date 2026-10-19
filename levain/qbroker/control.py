@@ -10,7 +10,9 @@ import itertools
 import re
 import socket
 import threading
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from levain.qbroker import wire
 from levain.qbroker.broker import Resolved, resolved_from
@@ -27,13 +29,13 @@ class ControlResolver:
         self._ids = itertools.count(1)
         self._ids_mutex = threading.Lock()
 
-    def queue_resolve(self, slot: int, cap_digest: str) -> Resolved | str:
+    def queue_resolve(self, slot: Mapping[str, Any], cap_digest: str) -> Resolved | str:
         with self._ids_mutex:
             rid = next(self._ids)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(self._timeout)
             sock.connect(self._path)
-            wire.write_frame(sock, {"v": wire.VERSION, "op": "QUEUE-RESOLVE", "id": rid, "slot": slot,
+            wire.write_frame(sock, {"v": wire.VERSION, "op": "QUEUE-RESOLVE", "id": rid, "slot": dict(slot),
                                     "cap_digest": cap_digest})
             got = wire.read_frame(sock)
         if not isinstance(got, dict) or got.get("id") != rid or got.get("ok") not in (True, False):
