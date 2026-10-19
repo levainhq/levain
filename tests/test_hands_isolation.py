@@ -130,7 +130,8 @@ def test_the_workspace_is_outside_home_owned_by_the_hands_user_and_never_entity_
     assert plan.workspace.is_relative_to(hands.WORKSPACE_ROOT[host])
     assert str(plan.entity_dir / "workspace") not in _joined(plan)
     chowns = [a for a in _argvs(plan) if a[0].endswith("chown") and str(plan.workspace) in a[-1]]
-    assert chowns == [(chowns[0][0], f"{plan.hands_user}:{plan.hands_id}", str(plan.workspace))]
+    assert (chowns[0][0], f"{plan.hands_user}:{plan.hands_id}", str(plan.workspace)) in chowns
+    assert {a[1] for a in chowns} == {f"{plan.hands_user}:{plan.hands_id}"}   # nothing in it is anyone else's
     # the entity's directory above it stays root's: the hands user cannot swap the workspace out
     assert not any(a[0].endswith("chown") and a[-1] == str(plan.workspace.parent) for a in _argvs(plan))
     assert "alice:20" not in _joined(plan) and not any(a[0].endswith("chown") and "alice" in a[1] for a in _argvs(plan))
@@ -951,4 +952,4 @@ def test_linux_undo_without_setfacl_skips_the_acl_step_instead_of_crashing(tmp_p
     ed = _entity(tmp_path)
     plan = _undo(ed, "linux", hands_user=hands_user_name(ed), hands_id=999)
     step = next(s for s in plan.steps if s.why == "remove the workspace ACLs")
-    assert step.call() == (True, "setfacl is not installed, so setup set no ACLs here")
+    assert step.call() == (True, "skipped: setfacl is not installed, so no ACL could be removed")

@@ -241,6 +241,21 @@ def linux_tool_missing() -> str | None:
     return None
 
 
+def _agent_dir_steps(ws: Path, owner: str) -> list["Step"]:
+    """The workspace's .claude and .codex, made before bash ever runs, so the bash floor always has a
+    directory to bind read-only over them: inside bash the hands user can then never put agent
+    configuration there that the operator's own Claude Code or Codex would load (an absent one, in a
+    workspace the operator cannot write, refuses bash). Given to the hands user like everything in
+    its workspace (Ruling A, Phill 2026-10-07); the hands user runs nothing outside the floor."""
+    steps: list[Step] = []
+    for name in (".claude", ".codex"):
+        d = str(ws / name)
+        steps += [Step(f"create the workspace's {name}, so bash finds it to bind read-only",
+                       (_abs("mkdir"), "-m", "755", d), skip_if=(_abs("test"), "-d", d)),
+                  Step(f"give the workspace's {name} to the hands user", (_abs("chown"), owner, d))]
+    return steps
+
+
 def egress_unavailable() -> str | None:
     """Why this Linux host cannot carry the boundary, or None. Setup refuses by this name rather
     than set up a hands user whose network nothing confines."""
@@ -707,6 +722,7 @@ def plan_setup(
                  (_abs("setfacl"), "-m", f"u:{operator}:rX", str(ws))),
             Step("make new files in the workspace inherit it (default ACL)",
                  (_abs("setfacl"), "-d", "-m", f"u:{operator}:rX", str(ws))),
+            *_agent_dir_steps(ws, f"{hands}:{hands_id}"),
             # Each Linux command runs in a cgroup leaf of its own, a transient scope of the operator's
             # systemd user manager (confinement `_cgroup_problem`); linger keeps that manager running
             # without a login session (cron, ssh without pam_systemd). --undo leaves it: it is the
@@ -855,8 +871,8 @@ def plan_undo(
              call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(tree)) if host == "darwin"
                                   else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)
              if host == "darwin" or shutil.which("setfacl", path=SECURE_PATH) is not None
-             # Setup's own ACL steps need setfacl, so with none installed it set none to remove.
-             else (True, "setfacl is not installed, so setup set no ACLs here")),
+             # With setfacl absent, setup (which refuses without it) set no ACLs; an ACL left from a setfacl since removed stays.
+             else (True, "skipped: setfacl is not installed, so no ACL could be removed")),
         Step("let your group read it, and empty the hooks and settings of the entity's repositories",
              call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
@@ -1497,6 +1513,8 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
                       write=(sudoers_path(hands), sudoers_text(operator, hands, net), 0o440),
                       validate=(_abs("visudo"), "-cf")))
     steps += egress_steps(hands, hands_id, ports, net_gid)
+    if cfg.hands_workspace is not None:
+        steps += _agent_dir_steps(Path(cfg.hands_workspace), f"{hands}:{hands_id}")
     plan = Plan("linux", operator, hands, hands_id, entity_dir, cfg.hands_workspace, tuple(steps))
     print(f"Repairing the setup recorded in {entity_dir} (user {hands}): linger, and the network boundary "
           + (f"(loopback ports {', '.join(map(str, ports))} allowed)." if ports else "(no port allowed)."))

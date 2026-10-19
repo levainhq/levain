@@ -6762,12 +6762,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     # read-only, and so is the parent of a link HOP outside them (a dotfile manager's chain): a mount
     # cannot pin a link, and replacing the hop would re-point what the operator's agent reads.
     # Emitted before step (2), so a jewel's tmpfs inside a tree still lands on top of it, and after
-    # the store and tool views, which it leaves alone (a view inside a tree binds back read-only).
+    # the store and tool views. A tree may sit INSIDE a view (a view inside a tree binds back
+    # read-only) but never CONTAINS a view, the entity's store or the workspace: a recursive host bind
+    # over one would re-expose what the view hides (L1 r1 CRITICAL: a hop parent ~/.config over the
+    # ~/.config/git credential view), so such a tree refuses bash by name.
     # ⚠ Not built, by the reachability line: a DANGLING link's missing target outside every tree
     # (macOS denies that literal; a mount needs a source). A dangling link the agent reads as config
     # is already broken config. Nor a hop outside $HOME (no read-only bind of a system directory).
     persist_create: list[str] = []
     ws_real = policy.workspace.resolve()
+    must_not_cover = [ws_real, *tool_views, *entity_store_dirs,
+                      *(Path(r) for r in (runtime_roots if runtime_roots is not None else _runtime_roots())),
+                      *(h.resolve() for h in _gnupg_homes())]
 
     def _in_persist_ro(q: Path) -> bool:
         return any(q == r or q.is_relative_to(r) for r in persist_ro)
@@ -6775,13 +6781,29 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     def _in_tool_view(q: Path) -> bool:
         return any(q == v or q.is_relative_to(v) for v in tool_views)
 
+    def _link_components(p: Path) -> list[Path]:
+        # Every symlink dentry the kernel would follow resolving ``p`` from the root (the policy keeps
+        # these for the agents' set; a static subtree's own path needs the same walk).
+        out: list[Path] = []
+        cur = Path(p.anchor)
+        for part in p.parts[1:]:
+            cand = cur / part
+            if cand.is_symlink():
+                out.append(cand)
+                cur = Path(os.path.realpath(cand))
+            else:
+                cur = cand
+            if not os.path.lexists(cur):
+                break
+        return out
+
     trees = {Path(os.path.realpath(t)) for t in (*policy.persistence_write_subtrees,
                                                    *policy.persistence_agent_roots,
                                                    *policy.persistence_agent_dirs)}
     existing_trees = [t for t in trees if t.is_dir()]
-    for q in sorted({Path(p) for p in policy.persistence_agent_pins}, key=str):
-        if not q.is_symlink():
-            continue
+    hops = {Path(p) for p in policy.persistence_agent_pins if Path(p).is_symlink()}
+    hops |= {q for t in policy.persistence_write_subtrees for q in _link_components(Path(t))}
+    for q in sorted(hops, key=str):
         parent = q.parent
         if (any(parent == t or parent.is_relative_to(t) for t in existing_trees)
                 or parent in ro_store_dirs or _in_tool_view(parent) or not os.access(parent, os.W_OK)):
@@ -6798,12 +6820,31 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     for real in sorted(trees, key=str):   # parent-first: a tree inside one already bound is skipped
         if _in_persist_ro(real) or _in_tool_view(real):
             continue
+        covered = next((v for v in must_not_cover if v != real and v.is_relative_to(real)), None)
+        if covered is not None or real == ws_real:
+            raise ConfinementError(
+                f"the Linux floor would bind {real} read-only to keep the agents' configuration and the "
+                f"shell's startup files out of bash's reach, and that would cover {covered or real}, "
+                "which bash needs as it is. Refusing to grant bash hands (fail-closed). This comes from "
+                "a symlink under ~/.claude or ~/.codex (or a startup directory) resolving into that "
+                "directory: replace the symlink with the real directory or file to use bash."
+            )
         if os.path.lexists(real):
             if real.is_dir() and not real.is_symlink():
                 argv += ["--ro-bind", str(real), str(real)]
                 persist_ro.append(real)
             continue   # a file where a tree would be holds nothing below it
         anc = _nearest_existing(real)
+        if anc == ws_real and not os.access(anc, os.W_OK):
+            # A hands workspace (owned by the hands user; this process has read access only): bash
+            # could create the agents' directory here and this process cannot pre-create it.
+            # `levain setup-isolation` makes both as root's; an install from before that has neither.
+            raise ConfinementError(
+                f"{real} does not exist, and in this hands workspace bash could create it with agent "
+                "configuration your own Claude Code or Codex would load. Refusing to grant bash hands "
+                "(fail-closed). Run `sudo levain setup-isolation` once more for this entity: it creates "
+                "the workspace's .claude and .codex as root's."
+            )
         if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not os.access(anc, os.W_OK):
             continue   # bash cannot create it either
         argv += ["--ro-bind", str(real), str(real)]

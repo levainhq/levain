@@ -2,7 +2,7 @@
 
 RUN 2026-10-19 in the b1c VM (kernel 7.2.6) on main f0bc6fde, before this step existed: confined bash
 planted ~/bin, ~/.local/bin, ~/.config/systemd/user, ~/.config/autostart, existing ~/.claude and
-~/.codex contents and the workspace's .claude/.codex (project_memory/1019-conf/linux/RESULT.md).
+~/.codex contents and the workspace's .claude/.codex (levain project_memory/1019-conf/linux/).
 These tests read the bwrap argv as data; nothing here runs a sandbox. Linux behaviour is selected by
 patching ``platform.system``, which is what the policy code consults.
 """
@@ -57,7 +57,8 @@ def test_existing_persistence_trees_are_bound_read_only_before_any_mask(home: Pa
     for t in trees:
         bound = [r for r in ro if t == Path(r) or t.is_relative_to(Path(r))]
         assert bound, f"{t} is not inside any read-only bind"
-        assert argv.index(bound[0]) < _first_mask(argv), "a host bind after a mask"
+        ro_at = next(i for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == bound[0])
+        assert ro_at < _first_mask(argv), "a host bind after a mask"
     # ~/.config/systemd covers its user/ subdirectory: one bind, not two.
     assert str(home / ".config" / "systemd" / "user") not in ro
     # The workspace itself stays writable.
@@ -113,7 +114,7 @@ def test_a_workspace_agent_dir_that_is_a_symlink_refuses_bash(home: Path) -> Non
     elsewhere = home / "shared-claude"
     elsewhere.mkdir()
     (ws / ".claude").symlink_to(elsewhere)
-    with pytest.raises(ConfinementError, match="Replace the symlink"):
+    with pytest.raises(ConfinementError, match="the agent.s configuration resolves through"):
         C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
 
 
@@ -178,3 +179,54 @@ def test_the_hardlink_check_covers_agent_config_surfaces_not_agent_data(home: Pa
     policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
     with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
         C._refuse_multiply_linked_jewels(policy)
+
+
+def test_a_hop_parent_that_would_cover_a_credential_view_refuses_bash(home: Path) -> None:
+    # L1 r1 CRITICAL: ~/.config/ai -> ~/dotfiles/ai with ~/.claude/CLAUDE.md -> ~/.config/ai/CLAUDE.md
+    # made ~/.config a hop parent; its read-only bind landed over the ~/.config/git view and put the
+    # host's ~/.config/git/credentials back in bash's sight.
+    ent, ws = _entity(home)
+    (home / "dotfiles" / "ai").mkdir(parents=True)
+    (home / "dotfiles" / "ai" / "CLAUDE.md").write_text("x")
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:token@host\n")
+    (home / ".config" / "ai").symlink_to(home / "dotfiles" / "ai")
+    (home / ".claude").mkdir()
+    (home / ".claude" / "CLAUDE.md").symlink_to(home / ".config" / "ai" / "CLAUDE.md")
+    with pytest.raises(ConfinementError, match="would cover"):
+        C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=True))
+
+
+def test_a_hop_parent_that_would_cover_the_entity_store_refuses_bash(home: Path) -> None:
+    ent, ws = _entity(home)                                   # entity and workspace under ~/proj
+    (home / "dotfiles" / "claude").mkdir(parents=True)
+    (home / "dotfiles" / "claude" / "s.json").write_text("{}")
+    (home / "proj" / "claude").symlink_to(home / "dotfiles" / "claude")
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").symlink_to(home / "proj" / "claude" / "s.json")
+    with pytest.raises(ConfinementError):   # ~/proj holds the workspace: the hop rule refuses
+        C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+
+
+def test_a_persistence_subtree_that_is_a_symlink_has_its_parent_bound_read_only(home: Path) -> None:
+    # L1 r1 HIGH: ~/.config/fish -> ~/dotfiles/fish; binding only the target left the link itself
+    # replaceable in the writable ~/.config.
+    ent, ws = _entity(home)
+    (home / "dotfiles" / "fish").mkdir(parents=True)
+    (home / ".config").mkdir()
+    (home / ".config" / "fish").symlink_to(home / "dotfiles" / "fish")
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    ro = _ro_binds(argv)
+    assert str(home / ".config") in ro and str(home / "dotfiles" / "fish") in ro
+
+
+def test_an_absent_agent_dir_in_a_workspace_this_process_cannot_write_refuses_bash(home: Path) -> None:
+    # L1 r1 MEDIUM, the hands case: the workspace is the hands user's (operator: read only), so the
+    # plan can neither create its .claude nor leave it creatable.
+    ent, ws = _entity(home)
+    ws.chmod(0o555)
+    try:
+        with pytest.raises(ConfinementError, match="setup-isolation"):
+            C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    finally:
+        ws.chmod(0o755)
