@@ -195,3 +195,24 @@ def test_a_governed_install_whose_log_cannot_be_read_takes_no_phone_writes(insta
         app.fire({"verb": "operator_state", "panel_id": "state", "params": {"text": "x"},
                   "panel_version": act["target"]["panel_version"]})
     assert (exc.value.status, exc.value.error) == (503, "authority_unreadable")
+
+
+def test_a_governed_install_with_no_authority_log_yet_takes_no_phone_writes(install, tmp_path: Path):
+    from levain.cockpit.install import marker_path
+
+    inst, qdir = install
+    root = inst / ".levain" / "cockpit"
+    root.mkdir(parents=True, exist_ok=True)
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    marker_path(root, markers).write_text("{}")
+    assert not (root / "cockpit.db").exists()
+    app = PhoneApp(qdir, marker_directory=markers)
+    act = app.state()["actions"][0]                     # reads unchanged
+    with pytest.raises(PhoneAppError) as exc:
+        app.fire({"verb": "operator_state", "panel_id": "state", "params": {"text": "x"},
+                  "panel_version": act["target"]["panel_version"]})
+    assert (exc.value.status, exc.value.error) == (503, "authority_absent")
+    assert "open the cockpit once on the laptop" in str(exc.value)
+    ctx = inst / ".levain" / "context.json"
+    assert not ctx.exists() or json.loads(ctx.read_text()).get("state") != "x"

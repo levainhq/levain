@@ -281,3 +281,41 @@ def test_redeems_count_only_failures_a_device_store_fault_is_503_and_app_reads_t
         finally:
             for _ in held:
                 httpd.request_gate.release()
+
+
+def test_a_device_store_that_cannot_be_stat_ed_is_503_never_an_unknown_token(tmp_path: Path) -> None:
+    import os
+
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    with _serving(qdir) as (url, _):
+        code = _call(url + "/webpush/pair", {"label": "p"})[1]["code"]
+        dev = _call(url + "/webpush/pair/redeem", {"code": code}, token=None)[1]
+        folder = qdir / "webpush"
+        os.chmod(folder, 0)
+        try:
+            status, body = _call(url + "/webpush/record", token=dev["token"])
+            assert status == 503 and body["error"] == "unavailable"
+        finally:
+            os.chmod(folder, 0o700)
+        assert _call(url + "/webpush/record", token=dev["token"])[0] == 200
+    empty = tmp_path / "empty"
+    empty.mkdir(mode=0o700)
+    with _serving(empty) as (url, _):
+        assert _call(url + "/webpush/record", token="z" * 32)[0] == 403              # no store at all: unknown
+
+
+def test_the_page_opened_from_another_app_loads_and_its_manifest_is_allowed(tmp_path: Path) -> None:
+    from levain.http_guards import _CSP
+
+    assert "manifest-src 'self'" in _CSP
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    nav = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    with _serving(qdir) as (url, _):
+        assert _call(url + "/", token=None, headers=nav)[0] == 200                 # a link opened from another app
+        assert _call(url + "/app/state.json", headers=nav)[0] == 403               # a data route stays refused
+        assert _call(url + "/phone.js", token=None, headers=nav)[0] == 403         # not a page: refused
+        assert _call(url + "/", token=None, headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors",
+                                                      "Sec-Fetch-Dest": "document"})[0] == 403
+        assert _call(url + "/", token=None, headers={**nav, "Host": "evil.example"})[0] == 403

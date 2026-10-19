@@ -15,6 +15,18 @@
   function keepToken(t) { memToken = t; store.set("sessionStorage", TOKEN_KEY, t); }
   function keepDevice(t) { memDevice = t; if (!store.set("localStorage", DEVICE_KEY, t)) forgets = true; }
   const deviceToken = () => memDevice || store.get("localStorage", DEVICE_KEY) || "";
+  // one unpaired state, said in the same words by every part of the page (Needs-you's status line included)
+  const UNPAIRED = "this phone was unpaired; pair it again from the laptop";
+  let unpaired = false;
+  function sayUnpaired() { const st = document.getElementById("status"); if (st && st.textContent !== UNPAIRED) st.textContent = UNPAIRED; }
+  function forgetDevice(dev) {
+    // the laptop revoked this device: forget it, so the page stops offering what it can no longer open
+    store.remove("localStorage", DEVICE_KEY); memDevice = "";
+    if (token() === dev) { store.remove("sessionStorage", TOKEN_KEY); memToken = ""; }
+    if (token()) return;
+    unpaired = true;
+    sayUnpaired(); renderState(); renderBoard(); renderPings(); renderRecord();
+  }
 
   // ---- BOOT: runs before phone.js reads its token ---------------------------------------------------------------
   // The pairing redeem is a synchronous request on purpose: phone.js runs right after this file and must find the
@@ -121,11 +133,8 @@
   function loadState() {
     const used = token();
     return api("GET", "/app/state.json").then((r) => {
-      if (r.status === 403 && used && used === deviceToken()) {
-        // the laptop revoked this device: forget it, so the page stops offering what it can no longer open
-        store.remove("localStorage", DEVICE_KEY); store.remove("sessionStorage", TOKEN_KEY); memToken = memDevice = "";
-        slData = { error: "this phone was unpaired; pair it again from the laptop" };
-      } else slData = r.ok ? r.body : { error: why(r) };
+      if (r.status === 403 && used && used === deviceToken()) return forgetDevice(used);
+      slData = r.ok ? r.body : { error: why(r) };
       renderState();
     });
   }
@@ -133,6 +142,7 @@
     const box = $("stateline");
     if (slEditing && box.querySelector("textarea")) return;       // a redraw would eat the words being typed
     box.replaceChildren();
+    if (unpaired) { box.append(h("div", { class: "meta", text: UNPAIRED })); return; }
     if (!slData) return;
     if (slData.error) { box.append(h("div", { class: "meta", text: "state line unavailable: " + slData.error })); return; }
     const lines = (slData.value && slData.value.lines) || [];
@@ -276,6 +286,7 @@
   function renderBoard() {
     const box = $("board");
     box.replaceChildren();
+    if (unpaired) { box.append(h("p", { class: "status", text: UNPAIRED })); return; }
     if (!boardData) { box.append(h("p", { class: "status", text: "reading the board…" })); return; }
     if (boardData.error) { box.append(h("p", { class: "status", text: "board unavailable: " + boardData.error })); return; }
     if (ui) {
@@ -333,17 +344,26 @@
     }).catch((e) => { pingNote = "could not turn pings on: " + ((e && e.message) || e); pingNoteKind = "bad"; renderPings(); });
   }
   function sendSub(sub) {
-    const j = sub.toJSON();
-    return api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }, deviceToken()).then((r) => {
+    const j = sub.toJSON(), body = { endpoint: j.endpoint, keys: j.keys }, dev = deviceToken();
+    const kept = (r) => {
       // on the run token the server pairs this page as a device, which owns the subscription from here on
       if (r.ok && typeof r.body.token === "string" && r.body.token) keepDevice(r.body.token);
       return r;
+    };
+    return api("POST", "/webpush/subscribe", body, dev).then((r) => {
+      if (r.status !== 403 || !dev) return kept(r);
+      // the device was revoked: forget it, then once more on the run token, when the page holds one
+      forgetDevice(dev);
+      return token() ? api("POST", "/webpush/subscribe", body, token()).then(kept) : r;
     });
   }
   function resync() {
     if (!token() && !deviceToken()) return;
     currentSub().then((s) => s ? sendSub(s).then((r) => {
-      if (!r.ok) { pingNote = "the laptop could not confirm this phone's pings: " + why(r); pingNoteKind = "bad"; renderPings(); }
+      if (r.ok) return;
+      // a 4xx is the laptop refusing to hold it, so the browser drops it too; a 503 or no answer keeps the phone's pings
+      if (r.status >= 400 && r.status < 500) return s.unsubscribe().catch(() => {}).then(refreshSub);
+      pingNote = "could not confirm with the laptop: " + why(r); pingNoteKind = "bad"; renderPings();
     }) : null);
   }
   function turnOff() {
@@ -370,6 +390,7 @@
     const box = $("pings");
     if (!box) return;
     box.replaceChildren(h("h2", { text: "Pings on this phone" }));
+    if (unpaired) { box.append(h("div", { class: "pstate bad", text: UNPAIRED })); return; }
     if (isIos && !standalone) {
       box.append(h("div", { class: "pstate", text: "Not set up yet" }), h("p", { class: "meta", text: IOS_STEPS }));
       if (installCode) box.append(h("ol", {}, h("li", { text: "Tap Share." }), h("li", { text: "Tap Add to Home Screen." }), h("li", { text: "Open Levain from the Home Screen." })));
@@ -405,12 +426,14 @@
   function loadRecord() {
     return api("GET", "/webpush/record").then((r) => { recData = r.ok ? r.body : { error: why(r) }; renderRecord(); });
   }
-  const delivery = (d) => d.status >= 200 && d.status < 300 ? "accepted" : (d.status === 404 || d.status === 410 ? "gone" : "refused " + d.status);
+  const delivery = (d) => d.status >= 200 && d.status < 300 ? "accepted" : (d.status === 404 || d.status === 410 ? "gone"
+    : d.status < 0 ? "no answer in time" : d.status === 0 ? "no answer" : "refused " + d.status);
   function renderRecord() {
     const box = $("record");
     if (!box) return;
     box.replaceChildren();
     const tab = $("tab-notes");
+    if (unpaired) { box.append(h("p", { class: "status", text: UNPAIRED })); return; }
     if (!recData) return;
     if (recData.error) { box.append(h("p", { class: "status", text: "the record is unavailable: " + recData.error })); return; }
     const pings = Array.isArray(recData.pings) ? recData.pings : [];
@@ -448,6 +471,9 @@
   }
   $("refresh").addEventListener("click", () => { tick(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+  if (window.MutationObserver && $("status")) {
+    new MutationObserver(() => { if (unpaired) sayUnpaired(); }).observe($("status"), { childList: true, characterData: true, subtree: true });
+  }
   if (pairFailed) $("stateline").append(h("p", { class: "note bad", text: "This install link was already used or has expired. Open the link the laptop printed to install." }));
   show(view);
   renderPings();

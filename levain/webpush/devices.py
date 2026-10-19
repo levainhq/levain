@@ -4,8 +4,8 @@ The phone link's token is minted per run of ``levain consent phone`` and travels
 iPhone's Home Screen opens its manifest's ``start_url`` with no address bar, so that token cannot reach it, and it would
 die at the next restart anyway. Pairing bridges the two: a page holding a live token mints a ONE-TIME code, the code rides
 the manifest's ``start_url`` into the installed app, and the app's first open trades it for a DEVICE token it keeps. A
-page on the run token that turns pings on is given a device the same way (:func:`mint_device`), so every push
-subscription belongs to a device a revoke can stop.
+page on the run token that turns pings on is given a device the same way, so every push subscription belongs to a
+device a revoke can stop.
 
 What a device token opens is what the run token opens (the phone server decides that, not this module): read the queue,
 start a passkey challenge, answer a question with words. It never signs; every answer that authorises still needs the
@@ -23,7 +23,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-__all__ = ["PAIRING_TTL", "OPEN_PAIRINGS_KEPT", "LABEL_MAX", "mint_pairing", "redeem", "mint_device", "verify", "revoke",
+__all__ = ["PAIRING_TTL", "OPEN_PAIRINGS_KEPT", "LABEL_MAX", "mint_pairing", "redeem", "verify", "revoke",
            "list_devices"]
 
 # Long enough to mint on the laptop's page, walk to the phone and add it to the Home Screen later in the day; short
@@ -79,12 +79,6 @@ def _insert_device(conn: sqlite3.Connection, label: Any, now: datetime) -> tuple
     conn.execute("INSERT INTO devices (id, label, token_hash, created, last_seen, revoked_at) VALUES (?, ?, ?, ?, ?, NULL)",
                  (device_id, _label(label), _hash(token), _stamp(now), _stamp(now)))
     return device_id, token
-
-
-def mint_device(conn: sqlite3.Connection, label: str | None, now: datetime) -> tuple[str, str]:
-    """A new device for a caller already holding the run token (no code to spend); ``(device_id, device_token)``."""
-    with conn:
-        return _insert_device(conn, label, now)
 
 
 def redeem(conn: sqlite3.Connection, code: Any, now: datetime) -> tuple[str, str] | None:

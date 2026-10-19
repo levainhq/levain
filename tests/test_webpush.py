@@ -181,3 +181,43 @@ def test_a_run_token_subscribe_is_owned_by_a_device_a_revoke_stops(tmp_path):
     finally:
         conn.close()
     assert PushStore(tmp_path).live_subscriptions() == []
+
+
+def test_a_run_token_resubscribe_of_a_live_devices_endpoint_mints_no_second_device(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from levain.webpush import devices
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    keys = {"p256dh": ece.b64e(ece.public_bytes(key)), "auth": ece.b64e(os.urandom(16))}
+
+    def post(endpoint="https://fcm.googleapis.com/run"):
+        status, data, _ = routes.handle("POST", "/webpush/subscribe", {}, json.dumps(
+            {"endpoint": endpoint, "keys": keys}).encode(), queue_dir=tmp_path, authorized=True, device_id=None)
+        assert status == 200
+        return json.loads(data)
+
+    first = post()
+    again = post()                                       # a run-token reload's resync: same owner, no token
+    assert "token" not in again and again["id"] == first["id"]
+    conn = PushStore(tmp_path).connection()
+    try:
+        assert [d["id"] for d in devices.list_devices(conn)] == [first["device_id"]]
+        assert devices.revoke(conn, first["device_id"], datetime.now(timezone.utc))
+    finally:
+        conn.close()
+    fresh = post()                                       # the owner is revoked: a new device owns it now
+    assert fresh["token"] and fresh["device_id"] != first["device_id"]
+    assert [r["device_id"] for r in PushStore(tmp_path).live_subscriptions()] == [fresh["device_id"]]
+
+    # a mint that fails part-way leaves no device behind: the device and its subscription are one transaction
+    def boom(*a, **k):
+        raise RuntimeError("store fault")
+    monkeypatch.setattr("levain.webpush.store._subscribe", boom)
+    with pytest.raises(RuntimeError):
+        post("https://fcm.googleapis.com/other")
+    conn = PushStore(tmp_path).connection()
+    try:
+        assert len(devices.list_devices(conn)) == 2
+    finally:
+        conn.close()

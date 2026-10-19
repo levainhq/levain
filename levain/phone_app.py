@@ -185,7 +185,10 @@ class PhoneApp:
             install_class = cockpit.install_class() or "none"
             if self._governed:
                 auth = cockpit.authority()
-                if auth.authority is None and not auth.log_empty:
+                if auth.authority is None and auth.log_empty:
+                    raise PhoneAppError(503, "authority_absent", "this install is governed and its authority log is "
+                                        "not there yet; open the cockpit once on the laptop. Reading still works")
+                if auth.authority is None:
                     raise PhoneAppError(503, "authority_unreadable", "this install is governed and its authority log "
                                         f"cannot be read now ({auth.authority_error}), so the phone takes no writes; "
                                         "reading still works")
