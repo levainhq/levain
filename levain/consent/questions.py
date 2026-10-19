@@ -1,0 +1,492 @@
+"""levain.consent.questions — the question band: an agent asks the operator something, the operator answers once.
+
+An agent files a question (:meth:`QuestionStore.file`): what it asks, two to six options (a key and a label each),
+the option it recommends, and what the answer blocks. Every one of those is required: a question with no
+recommendation or no stated block is refused, since the operator reads it between other things and needs both to
+rule fast. The operator answers once (:meth:`QuestionStore.answer`), by an option key or by free text kept
+VERBATIM, from the CLI, the phone or the cockpit. The answer's text is then delivered back to the agent's session
+exactly once, by the session's next hook (:meth:`QuestionStore.claim_answers_for`) or by a resume that carries it as
+its prompt (:meth:`QuestionStore.lease_answers_for`, settled by :meth:`QuestionStore.settle_resume`): the same claim
+model as a consent ruling's text, without any of its verification.
+
+NOTHING HERE IS SIGNED AND NOTHING HERE IS AUTHORITY. An answer authorises no action: it is information the agent
+is told, in the operator's words, and whatever the agent then wants to do still goes through the consent queue like
+any other action. For the same reason there is no key, no authority replay and no signature check anywhere in this
+module: a stored answer is what was written, delivered as written. Stated as known edges, none built against:
+  - any process of the operator's uid can file a question or answer one, since the store is the operator's own
+    file and an answer is not a decision; an answer a raw writer forges is text the agent reads, no more.
+  - there is no expiry in v1: an unanswered question stays open until it is answered.
+  - delivery is at most once per claim; a claimer that dies between its claim and the agent reading the text loses
+    it (a lease with no settle stays ``unconfirmed``, visible, never re-sent: the resume may have run).
+
+Tables are append-only beside each other: a question, its one answer, its one delivery claim and the resume steps
+of that claim are rows written once, never updated or deleted (SQL triggers refuse both, and an INSERT OR REPLACE
+that would drop a row without a delete trigger); the guard is against a buggy writer, since there is no authority
+to protect.
+
+It is its own file (``questions.db``, beside ``queue.db``) and not part of the consent queue store on purpose: a
+question carries no authority, so it stays out of the signed store whose triggers, format marker and receipts exist
+to guard consent. A bug or a raw write here can never touch a decision there, and the queue's format and
+migrations stay about consent alone.
+
+The directory is the operator's alone (0700, refused otherwise), as the queue's. A hook calls the reading and
+claiming methods on every tool call, so they never create the store: with no ``questions.db`` they answer empty.
+Stdlib only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import unicodedata
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import rollback as _rollback
+from levain.cockpit.consent import ConsentError, utc_stamp
+from levain.consent.queue import default_queue_dir
+from levain.consent.record import AGENTS
+
+__all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "Answer", "Question", "QuestionStore", "QuestionStoreError"]
+
+DB_NAME = "questions.db"
+FORMAT = "levain-questions/1"
+ANSWER_CHANNELS: tuple[str, ...] = ("cli", "phone", "cockpit")
+_ACCESS_BY_OTHERS = 0o077
+_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
+_OPTIONS_MIN, _OPTIONS_MAX = 2, 6
+_SESSION_MAX = 256
+_WHAT_MAX = 1000
+_LABEL_MAX = 200
+_BLOCKS_MAX = 300
+_TEXT_MAX = 4000
+
+
+class QuestionStoreError(RuntimeError):
+    """The store cannot be trusted: another format, a directory others can reach, one that vanished."""
+
+
+@dataclass(frozen=True)
+class Answer:
+    question_id: str
+    kind: str          # 'option' (value = an option key) or 'text' (value = the operator's words, verbatim)
+    value: str
+    channel: str
+    answered_at: str
+
+
+@dataclass(frozen=True)
+class Question:
+    n: int
+    id: str
+    agent: str
+    agent_session_id: str
+    what: str
+    options: tuple[tuple[str, str], ...]     # (key, label)
+    rec: str
+    blocks: str
+    cwd: str
+    filed_at: str
+    answer: Answer | None
+
+
+def _append_only(table: str, message: str) -> tuple[str, str]:
+    return (f"CREATE TRIGGER IF NOT EXISTS {table}_frozen BEFORE UPDATE ON {table} "
+            f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
+            f"CREATE TRIGGER IF NOT EXISTS {table}_kept BEFORE DELETE ON {table} "
+            f"BEGIN SELECT RAISE(ABORT, '{message}'); END")
+
+
+_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS questions (n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, "
+    "agent TEXT NOT NULL, agent_session_id TEXT NOT NULL, what TEXT NOT NULL, options TEXT NOT NULL, "
+    "rec TEXT NOT NULL, blocks TEXT NOT NULL, cwd TEXT NOT NULL, filed_at TEXT NOT NULL, resume TEXT)",
+    "CREATE INDEX IF NOT EXISTS questions_session ON questions (agent, agent_session_id)",
+    # one answer per question, written once; the operator's words are the value
+    "CREATE TABLE IF NOT EXISTS answers (question_id TEXT PRIMARY KEY REFERENCES questions(id), "
+    "kind TEXT NOT NULL CHECK (kind IN ('option','text')), value TEXT NOT NULL, "
+    "channel TEXT NOT NULL CHECK (channel IN ('cli','phone','cockpit')), answered_at TEXT NOT NULL)",
+    # an answer's text delivered to its session (a hook, or a resume claim): once
+    "CREATE TABLE IF NOT EXISTS answer_deliveries (question_id TEXT PRIMARY KEY REFERENCES answers(question_id), "
+    "agent_session_id TEXT NOT NULL, delivered_at TEXT NOT NULL)",
+    # what became of a claim made for a RESUME, one row per step, the latest counting: ``launching`` (unconfirmed
+    # while left alone), ``started`` (delivered), ``failed`` (deliverable again), ``hook`` (a failed one delivered
+    # by the session's next hook). A claim with no row here was delivered by a hook.
+    "CREATE TABLE IF NOT EXISTS answer_resume_steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, question_id TEXT NOT NULL "
+    "REFERENCES answer_deliveries(question_id), agent_session_id TEXT NOT NULL, "
+    "outcome TEXT NOT NULL CHECK (outcome IN ('launching','started','failed','hook')), argv TEXT, cwd TEXT, "
+    "detail TEXT, created_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS answer_resume_steps_question ON answer_resume_steps (question_id, seq)",
+    *_append_only("questions", "questions are append-only"),
+    *_append_only("answers", "an answer is written once"),
+    *_append_only("answer_deliveries", "an answer is delivered once"),
+    *_append_only("answer_resume_steps", "answer resume steps are append-only"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row that reuses a key or
+    # an explicit rowid (one not given reads as -1 here, never a real row)
+    "CREATE TRIGGER IF NOT EXISTS questions_no_replace BEFORE INSERT ON questions "
+    "WHEN EXISTS (SELECT 1 FROM questions WHERE id = NEW.id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a question is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS answers_no_replace BEFORE INSERT ON answers "
+    "WHEN EXISTS (SELECT 1 FROM answers WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an answer is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS answer_deliveries_no_replace BEFORE INSERT ON answer_deliveries "
+    "WHEN EXISTS (SELECT 1 FROM answer_deliveries WHERE question_id = NEW.question_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a delivery is never replaced'); END",
+)
+
+_Q_COLS = "q.n, q.id, q.agent, q.agent_session_id, q.what, q.options, q.rec, q.blocks, q.cwd, q.filed_at"
+_A_COLS = "a.question_id, a.kind, a.value, a.channel, a.answered_at"
+_SELECT = f"SELECT {_Q_COLS}, {_A_COLS} FROM questions q LEFT JOIN answers a ON a.question_id = q.id"
+# the latest resume step of an answered question ``q`` (NULL when it is unclaimed or a hook claimed it)
+_LAST_STEP = ("(SELECT e.outcome FROM answer_resume_steps e WHERE e.question_id = q.id ORDER BY e.seq DESC LIMIT 1)")
+# an answer whose text has not reached its session: never claimed, or claimed for a resume that failed
+_DELIVERABLE = ("(NOT EXISTS (SELECT 1 FROM answer_deliveries d WHERE d.question_id = q.id) OR "
+                + _LAST_STEP + " = 'failed')")
+
+
+def _now_utc(clock: Callable[[], datetime]) -> datetime:
+    now = clock()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ConsentError("the question store's clock returned a naive datetime")
+    return now
+
+
+def _has_control(text: str) -> bool:
+    return any(unicodedata.category(c).startswith("C") for c in text)
+
+
+def _line(name: str, value: Any, low: int, high: int) -> str:
+    if not isinstance(value, str):
+        raise ConsentError(f"{name} must be a string")
+    if _has_control(value):
+        raise ConsentError(f"{name} must be one line of plain text: no control characters")
+    value = value.strip()
+    if not low <= len(value) <= high:
+        raise ConsentError(f"{name} must be {low} to {high} characters")
+    return value
+
+
+def _options_of(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, (list, tuple)) or not _OPTIONS_MIN <= len(raw) <= _OPTIONS_MAX:
+        raise ConsentError(f"options must be a list of {_OPTIONS_MIN} to {_OPTIONS_MAX} options")
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            if set(item) != {"key", "label"}:
+                raise ConsentError("an option is exactly a key and a label")
+            key, label = item["key"], item["label"]
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            key, label = item
+        else:
+            raise ConsentError("an option is a {key, label} object or a (key, label) pair")
+        if not isinstance(key, str) or _KEY.fullmatch(key) is None:
+            raise ConsentError(f"option key {key!r} must match {_KEY.pattern}")
+        out.append({"key": key, "label": _line(f"the label of option {key}", label, 1, _LABEL_MAX)})
+    if len({o["key"] for o in out}) != len(out):
+        raise ConsentError("option keys must be unique")
+    return out
+
+
+def _parse_ref(ref: Any) -> tuple[str, Any] | None:
+    """``('id', 'q-…')`` or ``('n', int)`` for a question reference, else ``None``."""
+    if isinstance(ref, bool):
+        return None
+    if isinstance(ref, int):
+        return ("n", ref)
+    if isinstance(ref, str):
+        text = ref.strip()
+        if text.startswith("q-"):
+            return ("id", text)
+        digits = text[1:] if text.startswith("#") else text
+        if digits.isascii() and digits.isdigit():
+            return ("n", int(digits))
+    return None
+
+
+class QuestionStore:
+    """The question band's store: ``<directory>/questions.db``, ``directory`` the consent directory by default.
+    Every write is one ``BEGIN IMMEDIATE`` through :mod:`levain.autonomic.durable_sqlite`."""
+
+    def __init__(self, directory: Path | str | None = None, *,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+        self.directory = Path(directory) if directory is not None else default_queue_dir()
+        self.path = self.directory / DB_NAME
+        self._clock = clock
+        self._ready = False
+
+    # --- store ---------------------------------------------------------------------------------------
+    def _check_directory(self) -> None:
+        if not self.directory.exists():
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)   # the umask can only narrow it
+        st = os.lstat(self.directory)
+        if not os.path.isdir(self.directory) or os.path.islink(self.directory):
+            raise QuestionStoreError(f"question store directory {self.directory} is not a directory")
+        if st.st_uid != os.getuid():
+            raise QuestionStoreError(f"question store directory {self.directory} is not owned by uid {os.getuid()}")
+        if st.st_mode & _ACCESS_BY_OTHERS:
+            raise QuestionStoreError(f"question store directory {self.directory} is reachable by group or others "
+                                     f"(mode {st.st_mode & 0o777:o}); it must be 0700")
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._ready:
+            if not self.path.exists():
+                raise QuestionStoreError(f"question store {self.path} has disappeared")
+        else:
+            self._check_directory()
+        conn = open_durable(self.path)
+        try:
+            if not self._ready:
+                os.chmod(self.path, 0o600)
+                self._ensure_schema(conn)
+                self._ready = True
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if tables and ("meta" not in tables or conn.execute(
+                    "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is None):
+                raise QuestionStoreError("the database holds tables but no question-store format marker")
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
+            if row is not None and row[0] != FORMAT:
+                raise QuestionStoreError(f"store format {row[0]!r} is not {FORMAT!r}")
+            for stmt in _SCHEMA:
+                conn.execute(stmt)
+            if row is None:
+                conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (FORMAT,))
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('store_id', ?)",
+                         ("qs-" + os.urandom(16).hex(),))
+            conn.execute("COMMIT")
+        except BaseException:
+            _rollback(conn)
+            raise
+
+    @contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        with write_transaction(self._connect) as conn:
+            yield conn
+
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        with read_transaction(self._connect) as conn:
+            yield conn
+
+    def _exists(self) -> bool:
+        """Whether there is a store to read: a hook's reads never create one."""
+        return self.path.exists()
+
+    @property
+    def store_id(self) -> str:
+        with self._write() as conn:
+            return conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0]
+
+    @staticmethod
+    def _question_of(row: tuple[Any, ...]) -> Question:
+        options = tuple((o["key"], o["label"]) for o in json.loads(row[5]))
+        answer = None if row[10] is None else Answer(row[10], row[11], row[12], row[13], row[14])
+        return Question(row[0], row[1], row[2], row[3], row[4], options, row[6], row[7], row[8], row[9], answer)
+
+    @staticmethod
+    def _by_ref(conn: sqlite3.Connection, ref: Any) -> Question | None:
+        parsed = _parse_ref(ref)
+        if parsed is None:
+            return None
+        row = conn.execute(f"{_SELECT} WHERE q.{parsed[0]} = ?", (parsed[1],)).fetchone()
+        return None if row is None else QuestionStore._question_of(row)
+
+    # --- filing and reading --------------------------------------------------------------------------
+    def file(self, *, agent: str, agent_session_id: str, what: str, options: Any, rec: str, blocks: str, cwd: str,
+             resume: dict[str, Any] | None = None) -> Question:
+        """File a question, refusing anything malformed with nothing written. ``resume`` is what a later resume of
+        the agent's session needs, stored as given: unsigned, never authority."""
+        if agent not in AGENTS:
+            raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
+        if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
+                or _has_control(agent_session_id)):
+            raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters with no control characters")
+        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd):
+            raise ConsentError("cwd must be an absolute path")
+        what = _line("what", what, 1, _WHAT_MAX)
+        opts = _options_of(options)
+        if not isinstance(rec, str) or rec not in {o["key"] for o in opts}:
+            raise ConsentError("rec is required and must be one of the option keys")
+        blocks = _line("blocks", blocks, 1, _BLOCKS_MAX)
+        try:
+            resume_json = None if resume is None else json.dumps(resume, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ConsentError(f"resume must be JSON-serialisable: {exc}") from exc
+        if resume is not None and not isinstance(resume, dict):
+            raise ConsentError("resume must be an object or None")
+        qid = "q-" + os.urandom(12).hex()
+        stamp = utc_stamp(_now_utc(self._clock))
+        with self._write() as conn:
+            conn.execute("INSERT INTO questions (id, agent, agent_session_id, what, options, rec, blocks, cwd, "
+                         "filed_at, resume) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (qid, agent, agent_session_id, what, json.dumps(opts, ensure_ascii=False), rec, blocks,
+                          cwd, stamp, resume_json))
+            made = self._by_ref(conn, qid)
+        assert made is not None
+        return made
+
+    def get(self, ref: Any) -> Question | None:
+        """A question by its id (``q-…``), its number, or ``#n`` / ``n`` as a string; ``None`` if there is none."""
+        if not self._exists():
+            return None
+        with self._read() as conn:
+            return self._by_ref(conn, ref)
+
+    def open_questions(self, agent: str | None = None) -> list[Question]:
+        """The unanswered questions (of ``agent``, if given), oldest first."""
+        if not self._exists():
+            return []
+        where, args = ("AND q.agent = ?", (agent,)) if agent is not None else ("", ())
+        with self._read() as conn:
+            rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NULL {where} ORDER BY q.n", args).fetchall()
+        return [self._question_of(r) for r in rows]
+
+    def recent(self, limit: int = 50) -> list[Question]:
+        """The newest ``limit`` questions, answered or not, newest first."""
+        if not self._exists():
+            return []
+        with self._read() as conn:
+            rows = conn.execute(f"{_SELECT} ORDER BY q.n DESC LIMIT ?", (max(int(limit), 0),)).fetchall()
+        return [self._question_of(r) for r in rows]
+
+    # --- answering -----------------------------------------------------------------------------------
+    def answer(self, ref: Any, *, option: str | None = None, text: str | None = None, channel: str) -> Answer:
+        """Answer a question once: exactly one of ``option`` (one of its keys) or ``text`` (kept verbatim, any
+        characters but NUL). Nothing here authorises anything: it is what the agent will be told."""
+        if (option is None) == (text is None):
+            raise ConsentError("answer with exactly one of an option key or free text")
+        if channel not in ANSWER_CHANNELS:
+            raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
+        if text is not None and (not isinstance(text, str) or not 1 <= len(text) <= _TEXT_MAX or "\x00" in text):
+            raise ConsentError(f"text must be 1 to {_TEXT_MAX} characters, with no NUL")
+        if option is not None and not isinstance(option, str):
+            raise ConsentError("option must be a key")
+        with self._write() as conn:
+            q = self._by_ref(conn, ref)
+            if q is None:
+                raise ConsentError(f"no such question: {ref!r}")
+            if q.answer is not None:
+                raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}")
+            if option is not None and option not in {k for k, _ in q.options}:
+                raise ConsentError(f"{option!r} is not an option of question #{q.n}")
+            kind, value = ("option", option) if option is not None else ("text", text)
+            stamp = utc_stamp(_now_utc(self._clock))
+            conn.execute("INSERT INTO answers (question_id, kind, value, channel, answered_at) VALUES (?, ?, ?, ?, ?)",
+                         (q.id, kind, value, channel, stamp))
+        return Answer(q.id, kind, value, channel, stamp)  # type: ignore[arg-type]
+
+    # --- delivery ------------------------------------------------------------------------------------
+    def claim_answers_for(self, agent: str, agent_session_id: str) -> list[Question]:
+        """This session's answered questions whose text has not reached it yet (never claimed, or claimed for a
+        resume that failed: :meth:`settle_resume`), oldest answer first, each marked delivered under one write lock:
+        an answer's text reaches its session once. The session match is exact; the caller passes the base session.
+        With no store this is empty and creates nothing."""
+        return self._claim(agent, agent_session_id, step=None)
+
+    def lease_answers_for(self, agent: str, agent_session_id: str) -> list[Question]:
+        """As :meth:`claim_answers_for`, for a RESUME that carries the texts as its prompt: each is claimed with a
+        ``launching`` step, so the resumed session's own hooks find nothing to deliver again, and is delivered only
+        when :meth:`settle_resume` confirms the resume (``started``); a ``failed`` one is deliverable again. A
+        ``launching`` step nobody settles stays UNCONFIRMED (:meth:`delivery_state`): never counted delivered, never
+        retried, since the resume may have run."""
+        return self._claim(agent, agent_session_id, step="launching")
+
+    def _claim(self, agent: str, agent_session_id: str, *, step: str | None) -> list[Question]:
+        if not self._exists():
+            return []
+        key = (agent, agent_session_id)
+        sql = (f"{_SELECT} WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
+               + _DELIVERABLE + " ORDER BY a.rowid")
+        with self._read() as conn:
+            if not conn.execute(sql, key).fetchall():
+                return []
+        out: list[Question] = []
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            for row in conn.execute(sql, key).fetchall():      # re-read under the lock: a concurrent claimer won
+                q = self._question_of(row)
+                if conn.execute("SELECT 1 FROM answer_deliveries WHERE question_id = ?", (q.id,)).fetchone() is None:
+                    if conn.execute("INSERT OR IGNORE INTO answer_deliveries (question_id, agent_session_id, "
+                                    "delivered_at) VALUES (?, ?, ?)", (q.id, agent_session_id, stamp)).rowcount != 1:
+                        continue                              # another claimer delivered it first
+                    if step is not None:
+                        self._insert_step(conn, q.id, agent_session_id, step, stamp)
+                else:
+                    last = self._last_step(conn, q.id)
+                    if last is None or last[0] != "failed":
+                        continue
+                    self._insert_step(conn, q.id, agent_session_id, step or "hook", stamp)
+                out.append(q)
+        return out
+
+    @staticmethod
+    def _last_step(conn: sqlite3.Connection, question_id: str) -> tuple[str, str] | None:
+        return conn.execute("SELECT outcome, created_at FROM answer_resume_steps WHERE question_id = ? "
+                            "ORDER BY seq DESC LIMIT 1", (question_id,)).fetchone()
+
+    @staticmethod
+    def _insert_step(conn: sqlite3.Connection, question_id: str, agent_session_id: str, outcome: str, stamp: str,
+                     argv: list[str] | None = None, cwd: str | None = None, detail: str | None = None) -> None:
+        conn.execute("INSERT INTO answer_resume_steps (question_id, agent_session_id, outcome, argv, cwd, detail, "
+                     "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (question_id, agent_session_id, outcome,
+                      None if argv is None else json.dumps(argv, ensure_ascii=False), cwd, detail, stamp))
+
+    def settle_resume(self, question_ids: list[str], *, agent_session_id: str, outcome: str, argv: list[str],
+                      cwd: str, detail: str | None = None) -> None:
+        """Record what became of the resume that leased these answers (:meth:`lease_answers_for`): ``started``
+        (confirmed: the texts are delivered) or ``failed`` (deliverable again), with what was run. Only a question
+        whose latest step is still ``launching`` is settled. Unsigned."""
+        if outcome not in ("started", "failed"):
+            raise ConsentError(f"outcome must be started or failed: {outcome!r}")
+        with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
+            for qid in question_ids:
+                last = self._last_step(conn, qid)
+                if last is not None and last[0] == "launching":
+                    self._insert_step(conn, qid, agent_session_id, outcome, stamp, argv, cwd, detail)
+
+    def delivery_state(self, ref: Any) -> tuple[str, str | None]:
+        """Where the question's answer text is, with when it got there: ``undelivered`` (never claimed),
+        ``delivered`` (claimed by a hook, or by a resume that was confirmed), ``failed`` (its resume failed:
+        deliverable again) or ``unconfirmed`` (claimed for a resume that was never settled: it may have run)."""
+        if not self._exists():
+            return "undelivered", None
+        with self._read() as conn:
+            q = self._by_ref(conn, ref)
+            if q is None:
+                return "undelivered", None
+            claimed = conn.execute("SELECT delivered_at FROM answer_deliveries WHERE question_id = ?",
+                                   (q.id,)).fetchone()
+            last = None if claimed is None else self._last_step(conn, q.id)
+        if claimed is None:
+            return "undelivered", None
+        if last is None:
+            return "delivered", claimed[0]
+        return {"launching": "unconfirmed", "started": "delivered", "hook": "delivered"}.get(last[0], "failed"), last[1]
+
+    def undelivered(self) -> list[Question]:
+        """The answered questions whose text is not known to have reached their session (undelivered, failed or
+        unconfirmed: :meth:`delivery_state`), oldest answer first."""
+        if not self._exists():
+            return []
+        with self._read() as conn:
+            rows = conn.execute(f"{_SELECT} WHERE a.question_id IS NOT NULL AND (" + _DELIVERABLE + " OR "
+                                + _LAST_STEP + " = 'launching') ORDER BY a.rowid").fetchall()
+        return [self._question_of(r) for r in rows]
+
