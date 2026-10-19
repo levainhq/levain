@@ -1123,19 +1123,25 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     queue directory from the gate; the home directory when none is given), never the project the agent works in.
     The command is an absolute path or a bare name found on the child's ``PATH`` as an absolute path; a relative
     path (``bin/ping``) is refused, since it would resolve against a directory the agent can write. When ``cwd`` is
-    a queue directory with a paired phone's pings on, the same words also go out as a web push (``kind`` and ``ref``,
-    ``request:<id>`` or ``question:<n>``, name it in the notification record), started detached the same way.
-    True when either started; False when neither is configured or neither could start. A failed ping never fails
-    the gate."""
+    a queue directory, the ping is also written to the notification record (``kind`` and ``ref``, ``request:<id>``
+    or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
+    same child pushes it to each paired phone with pings on. With no ``cwd`` there is no queue directory, so
+    nothing is recorded and no push is sent.
+    True when the notify command or a push started; False when neither is configured or neither could start (a
+    command that did not start is still written to the record, as not started). A failed ping never fails the
+    gate."""
     started = _notify_argv(settings, message, cwd=cwd)
     pushed = False
     if cwd is not None:
         try:
             from levain.webpush import live, sender
 
-            if live(cwd):
+            phone = live(cwd)
+            if phone or settings.notify_argv:
                 body = message[len("levain: "):] if message.startswith("levain: ") else message
-                pushed = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body, url="/?view=needs")
+                recorded = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body, url="/?view=needs",
+                                        command=started if settings.notify_argv else None)
+                pushed = recorded and phone
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
             pushed = False
     return started or pushed

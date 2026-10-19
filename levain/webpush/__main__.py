@@ -44,13 +44,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         f = json.loads(sys.stdin.buffer.read(65536).decode("utf-8"))
         title, body, ref, url = f["title"], f["body"], f.get("ref"), f.get("url") or "/"
-        if not all(isinstance(x, str) for x in (title, body, url)) or not (ref is None or isinstance(ref, str)):
+        command = f.get("command")
+        if (not all(isinstance(x, str) for x in (title, body, url)) or not (ref is None or isinstance(ref, str))
+                or not (command is None or isinstance(command, bool))):
             raise ValueError("fields")
     except (ValueError, KeyError, TypeError, AttributeError):
-        print("levain.webpush send: expected a JSON object {title, body, ref, url} on stdin", file=sys.stderr)
+        print("levain.webpush send: expected a JSON object {title, body, ref, url, command} on stdin", file=sys.stderr)
         return 2
     try:
-        sender.send(a.queue_dir, kind=a.kind, ref=ref, title=title, body=body, url=url)
+        sender.send(a.queue_dir, kind=a.kind, ref=ref, title=title, body=body, url=url, command=command)
     except Exception as exc:  # noqa: BLE001 - the child's stderr is /dev/null: the failure is said in a bounded log
         _log_error(a.queue_dir, exc)
         return 1
