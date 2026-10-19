@@ -2131,7 +2131,8 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
     decides, :func:`levain.consent.auto_away.away_state`). CREATE-ONLY: an existing file is never
     written (its away word is the operator's, and repointing another install's cockpit would make that install's
     signed answers undeliverable); one naming another cockpit, or none, is reported. Never fails init: a hook with no
-    settings file gives no decision and the agent's own dialog answers."""
+    settings file gives no decision and the agent's own dialog answers, except the PreToolUse gate, which then refuses
+    an agent config or hook edit in every mode but ``default`` (the Q10 floor: nothing could approve it)."""
     from levain.consent.adapters import claude_code, codex
     from levain.consent.adapters.claude_code import _refuse_symlink
     from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
@@ -2178,7 +2179,8 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
                  f"the agent's own dialog).")
     except (OSError, ValueError, QueueStoreError) as e:
         emit(f"  WARN: consent settings not written ({e}); the consent hook gives no decision until "
-             f"{path} names a cockpit, so the agent's own dialog answers.")
+             f"{path} names a cockpit, so the agent's own dialog answers (an agent config or hook edit outside "
+             f"default mode is refused: nothing could approve it).")
 
 
 def _emit_consent_hook(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
