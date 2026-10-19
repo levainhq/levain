@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sqlite3
@@ -692,5 +693,14 @@ def test_ctrl_c_before_the_resume_starts_says_extended_and_exit_130(tmp_path, ke
     lines: list[str] = []
     code = C._cmd_extend(_args(q.directory), lines.append, queue=q)
     t.join()
-    assert code == 130 and "extended; the resume was interrupted" in lines[-1]
+    assert code == 130 and "extended; the resume was interrupted: check whether" in lines[-1]
     assert L.snapshot(q.directory)[0]["halt"] is None
+
+
+def test_ctrl_c_anywhere_in_extend_is_exit_130_never_a_traceback(tmp_path, monkeypatch):
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(C, "_find_halt", interrupted)
+    out = io.StringIO()
+    code = C.run(argparse.Namespace(limits_cmd="extend", queue_dir=tmp_path, session="s1", agent=None, hold=1.0), out)
+    assert code == 130 and "`levain consent pending` whether a request was filed" in out.getvalue()
