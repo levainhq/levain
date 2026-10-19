@@ -8,6 +8,13 @@ It answers two requests and refuses everything else:
 - `CONNECT host:port` -> `200 Connection Established`, then echoes every byte back until the client closes.
 - `POST /r/<route>/...` with a `Content-Length` body -> 200 with FIXED_BODY.
 Each answered request appends one JSON line to `log_path`: {peer_uid, slot, route, method, path}.
+
+What a green run means, and does not (L2 review, 10-19): a log record = the slot REACHED its gateway as the logged uid/slot.
+Never "the CLI worked": a real client's TLS handshake through the echo always fails, and a vendor may send several POSTs per
+prompt (retries, non-streaming fallback) plus non-essential CONNECTs, so assert "at least one record with the right slot and
+uid", never an exact count; give the slot a dummy API key so the vendor sends at all. Point only HTTPS_PROXY at the stub:
+an HTTP_PROXY makes plain-http base-URL calls absolute-form, which 404s here. Bodies: Content-Length only (chunked = 400),
+no Expect: 100-continue, no keep-alive, no streaming response; the real front (3a) owes all of those.
 """
 from __future__ import annotations
 
@@ -24,8 +31,8 @@ GWPORT_BASE = 47100
 FIXED_BODY = b'{"stub":"levain-gateway-stub/1"}'
 _HEAD_CAP = 64 * 1024
 _BODY_CAP = 1024 * 1024
-_ROUTE = re.compile(rb"^/r/([a-z0-9-]{1,48})(/[^?\s]*)?(\?\S*)?$")
-_XUCRED = struct.Struct("=IIh16I")  # macOS struct xucred: cr_version, cr_uid, cr_ngroups, cr_groups[16]
+_ROUTE = re.compile(rb"^/r/([a-z0-9-]{1,48})(/[^?\s]*)?(\?\S*)?\Z")
+_XUCRED = struct.Struct("@IIh16I")  # macOS struct xucred, native alignment: cr_version, cr_uid, cr_ngroups, cr_groups[16]
 
 
 def peer_uid(sock: socket.socket) -> int | None:
@@ -44,6 +51,7 @@ def peer_uid(sock: socket.socket) -> int | None:
 class Stub:
     def __init__(self, log_path: Path | str, slot: int | None = None) -> None:
         self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.slot = slot  # the unix-socket shape names its slot; the TCP shape derives it from the port
 
     def _log(self, rec: dict) -> None:
@@ -63,7 +71,8 @@ class Stub:
         uid = peer_uid(sock)
         slot = self.slot
         if sock.family != socket.AF_UNIX:
-            slot = writer.get_extra_info("sockname")[1] - GWPORT_BASE
+            n = writer.get_extra_info("sockname")[1] - GWPORT_BASE
+            slot = n if 0 <= n < 64 else None  # off the gateway range: no slot, never a made-up one
         try:
             head = await reader.readuntil(b"\r\n\r\n")
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):

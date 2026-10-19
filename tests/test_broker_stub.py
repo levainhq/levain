@@ -38,6 +38,7 @@ def _records(log: Path) -> list[dict]:
 def _free_gwport() -> int:
     for port in range(GWPORT_BASE, GWPORT_BASE + 64):
         with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # a prior run's TIME_WAIT must not skip the port
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:
@@ -70,6 +71,9 @@ def test_stub_answers_slot_request():
         r, w = await asyncio.open_connection("127.0.0.1", port)
         resp = await _post(r, w, "/r/openrouter-glm/api/v1/chat/completions")
         assert resp.endswith(FIXED_BODY)
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        head, echoed = await _connect_echo(r, w)
+        assert head.startswith(b"HTTP/1.1 200 ") and echoed == b"tunnel-bytes"
         tcp.close()
         await tcp.wait_closed()
 
@@ -80,7 +84,9 @@ def test_stub_answers_slot_request():
                            "path": "github.com:443"}
         assert recs[2] == {"peer_uid": None, "slot": port - GWPORT_BASE, "route": "openrouter-glm", "method": "POST",
                            "path": "/r/openrouter-glm/api/v1/chat/completions"}
-        assert len(recs) == 3  # the refused request logged nothing
+        assert recs[3] == {"peer_uid": None, "slot": port - GWPORT_BASE, "route": None, "method": "CONNECT",
+                           "path": "github.com:443"}
+        assert len(recs) == 4  # the refused request logged nothing
 
     # /tmp, not pytest's tmp_path: macOS caps a unix socket path at 104 bytes.
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
