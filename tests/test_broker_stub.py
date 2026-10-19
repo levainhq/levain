@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
 import tempfile
 from pathlib import Path
@@ -97,6 +98,21 @@ def test_stub_answers_slot_request():
         with pytest.raises(FileExistsError):
             await Stub(log, slot=0).serve_unix(plain)
         assert plain.read_text() == "keep me"
+
+        # never takes over a LIVE stub's socket; a stale one (nobody listening) is replaced
+        live = await Stub(log, slot=1).serve_unix(sock_path)
+        with pytest.raises(FileExistsError):
+            await Stub(log, slot=2).serve_unix(sock_path)
+        live.close()
+        await live.wait_closed()
+        stale = socket.socket(socket.AF_UNIX)
+        if sock_path.exists():
+            os.unlink(sock_path)
+        stale.bind(str(sock_path))
+        stale.close()  # a socket file with no listener
+        again = await Stub(log, slot=2).serve_unix(sock_path)
+        again.close()
+        await again.wait_closed()
 
     # /tmp, not pytest's tmp_path: macOS caps a unix socket path at 104 bytes.
     with tempfile.TemporaryDirectory(dir="/tmp") as d:

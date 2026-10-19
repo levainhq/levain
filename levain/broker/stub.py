@@ -57,18 +57,30 @@ class Stub:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.slot = slot  # the unix-socket shape names its slot; the TCP shape derives it from the port
         self.bound: tuple[str, int] | None = None
+        self.live: set[asyncio.StreamWriter] = set()
 
     def _log(self, rec: dict) -> None:
-        with self.log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        try:
+            with self.log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        except OSError as e:  # the record IS the evidence: never lose it silently
+            print(f"levain gateway stub: log write failed ({e}); record lost: {rec}", file=sys.stderr)
+            raise
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.live.add(writer)
         try:
             await self._serve(reader, writer)
         except (OSError, asyncio.IncompleteReadError):
             pass  # the client went away mid-request or mid-tunnel (incl. a peer-cred read on a dead socket)
         finally:
+            self.live.discard(writer)
             writer.close()
+
+    def close_live(self) -> None:
+        """Close every open connection (a CONNECT tunnel would otherwise hold the server's wait_closed forever)."""
+        for w in list(self.live):
+            w.close()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         sock = writer.get_extra_info("socket")
@@ -106,11 +118,11 @@ class Stub:
         # close an RST that can destroy the status). Chunked, or any framing but one plain Content-Length: 400.
         lengths = headers.get(b"content-length", [b"0"] if method != b"POST" else [])
         if b"transfer-encoding" in headers or len(lengths) != 1 or not lengths[0].isdigit():
-            await self._refuse(writer, 400)
+            await self._refuse(writer, 400, reader)
             return
         length = int(lengths[0])
         if length > _BODY_CAP:
-            await self._refuse(writer, 413)
+            await self._refuse(writer, 413, reader)
             return
         await reader.readexactly(length)
         m = _ROUTE.match(target)
@@ -123,9 +135,17 @@ class Stub:
                      b"Connection: close\r\n\r\n" % len(FIXED_BODY) + FIXED_BODY)
         await writer.drain()
 
-    async def _refuse(self, writer: asyncio.StreamWriter, status: int) -> None:
+    async def _refuse(self, writer: asyncio.StreamWriter, status: int,
+                      reader: asyncio.StreamReader | None = None) -> None:
         writer.write(b"HTTP/1.1 %d Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % status)
         await writer.drain()
+        if reader is not None:  # body length unknown or too big: drain a bounded amount so the close is not an RST
+            if writer.can_write_eof():
+                writer.write_eof()
+            try:
+                await asyncio.wait_for(reader.read(_BODY_CAP), timeout=1.0)
+            except (asyncio.TimeoutError, OSError):
+                pass
 
     async def serve_unix(self, path: Path | str) -> asyncio.base_events.Server:
         """Bind `path` mode 0660 (the slot reaches it through the socket's GROUP, contract §2.2), never over an
@@ -134,10 +154,17 @@ class Stub:
             raise ValueError(f"the unix shape needs a slot index in 0..{SLOTS - 1}")
         path = str(path)
         try:
-            if stat.S_ISSOCK(os.lstat(path).st_mode):
-                os.unlink(path)
-            else:
+            if not stat.S_ISSOCK(os.lstat(path).st_mode):
                 raise FileExistsError(path)
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(path)
+            except OSError:
+                os.unlink(path)  # stale: nobody is listening
+            else:
+                raise FileExistsError(f"{path}: a live server is listening there")
+            finally:
+                probe.close()
         except FileNotFoundError:
             pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -179,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--slot", type=int, help="slot index for the unix shape")
     ap.add_argument("--log", required=True)
     a = ap.parse_args(argv)
-    if a.unix and a.slot is None:
+    if a.unix is not None and a.slot is None:
         ap.error("--unix needs --slot")
     if a.port is not None and a.slot is not None:
         ap.error("--slot is the port's index in the TCP shape; do not pass it")
@@ -190,14 +217,17 @@ def main(argv: list[str] | None = None) -> int:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):  # a plain `kill` must clean up too, not only Ctrl-C
             loop.add_signal_handler(sig, stop.set)
-        server = await (stub.serve_unix(a.unix) if a.unix else stub.serve_tcp(a.port))
+        server = await (stub.serve_unix(a.unix) if a.unix is not None else stub.serve_tcp(a.port))
         async with server:
             await stop.wait()
+            server.close()
+            stub.close_live()
 
     try:
         asyncio.run(run())
     finally:
-        stub.unbind()
+        if a.unix is not None:
+            stub.unbind()
     return 0
 
 
