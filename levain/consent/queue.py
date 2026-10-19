@@ -127,7 +127,7 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.policy import grant_refusal
 from levain.consent.receipt_log import head as receipts_head
-from levain.consent.receipt_log import head_problem, head_refusal
+from levain.consent.receipt_log import LogUnreadable, head_problem, head_refusal
 from levain.consent.record import (
     AGENTS, ANSWER_FORMAT, ANSWER_FORMAT_UNCHAINED, ANSWER_NAMESPACE, AWAY_LEAVE_FORMAT, AWAY_NAMESPACE, DECISIONS,
     GRANT_ANSWER_FORMAT, RULING_FORMAT, RULING_FORMAT_UNCHAINED, RULING_NAMESPACE, ExternalGateRequest,
@@ -137,8 +137,8 @@ from levain.consent.record import (
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
-           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "authority_source", "default_queue_dir",
-           "gap_label", "session_handle"]
+           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent", "authority_source",
+           "default_queue_dir", "gap_label", "session_handle"]
 
 DB_NAME = "queue.db"
 STORE_FORMAT = "levain-consent-queue/4"
@@ -379,8 +379,24 @@ def _migrate_from_prior(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
 
 
+def _detached(value: Any) -> Any:
+    """A plain-data copy of a signed record as given, read once: every mapping a ``dict``, every list or tuple a
+    ``list``, recursively; any other value kept as it is (the checks refuse what a record cannot hold). A caller's
+    mapping that changes after this read changes nothing the queue checks or applies."""
+    if isinstance(value, Mapping):
+        return {k: _detached(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_detached(v) for v in value]
+    return value
+
+
 class QueueStoreError(RuntimeError):
     """The store cannot be trusted: another format, a directory others can reach, one that vanished."""
+
+
+class StoreNotCurrent(QueueStoreError):
+    """A read that needs the current store's tables found none to read: an empty database, a store of
+    :data:`PRIOR_FORMAT` not yet migrated, or one lacking a table (``_read_as_is`` with ``whole``)."""
 
 
 class AnswerRefused(Exception):
@@ -644,12 +660,14 @@ class ConsentQueue:
             yield conn
 
     @contextmanager
-    def _read_as_is(self, tables: frozenset[str]) -> Iterator[sqlite3.Connection | None]:
+    def _read_as_is(self, tables: frozenset[str], *, whole: bool = False) -> Iterator[sqlite3.Connection | None]:
         """A read snapshot of the store as it stands, opened read-only: never created, migrated or given its schema
         (no write lock, no sync). ``None`` for an empty database (one the queue has not set up yet), a store of
         :data:`PRIOR_FORMAT`, which predates ``tables``, or a current-format store holding none of ``tables`` (made
         before them); raises :class:`QueueStoreError` for any other format, a database with no format marker, and a
-        current-format store holding some of ``tables`` but not all (damaged, never read as holding nothing)."""
+        current-format store holding some of ``tables`` but not all (damaged, never read as holding nothing).
+        With ``whole`` (a reader that needs ``tables`` themselves, never their absence) each of those ``None``
+        cases and the damaged one raise :class:`StoreNotCurrent` instead, saying which it is."""
         self._check_directory()
         conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0,
                                isolation_level=None)
@@ -658,6 +676,12 @@ class ConsentQueue:
             conn.execute("BEGIN")
             have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
+            if whole and not have:
+                raise StoreNotCurrent(f"{self.path} holds no consent queue (an empty database)")
+            if whole and row is not None and row[0] == PRIOR_FORMAT:
+                raise StoreNotCurrent(
+                    f"{self.path} is in format {PRIOR_FORMAT!r}, from before {STORE_FORMAT!r}, and is read only "
+                    "once migrated: `levain consent pending` migrates it in place")
             if not have or (row is not None and row[0] == PRIOR_FORMAT):
                 conn.execute("COMMIT")
                 yield None
@@ -665,6 +689,8 @@ class ConsentQueue:
             if row is None or row[0] != STORE_FORMAT:
                 raise QueueStoreError(f"{self.path} is not a consent queue store: format "
                                       f"{None if row is None else row[0]!r} is not {STORE_FORMAT!r}")
+            if whole and not tables <= have:
+                raise StoreNotCurrent(f"{self.path} is damaged: it lacks {', '.join(sorted(tables - have))}")
             if not tables & have:
                 conn.execute("COMMIT")
                 yield None
@@ -1310,7 +1336,8 @@ class ConsentQueue:
         was: an answer after ``expires_at`` is refused, and the request stays pending until its grace ends). The answer is verified against a fresh
         replay from the queue's authority source, and its ``receipts_head`` must be the head of its size over the
         receipts as they stand inside the write transaction that applies it ("the receipts changed under this
-        answer" otherwise)."""
+        answer" otherwise). ``payload`` is read once, at entry: every check and the apply use that copy."""
+        payload = _detached(payload)
         got = self.get(request_id)                         # expires it first if it is due (UNDECIDED_GRACE)
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
@@ -1344,6 +1371,15 @@ class ConsentQueue:
         return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
                         request_digest=request.digest)
 
+    def _head_to_sign(self) -> dict[str, Any]:
+        """The head of every receipt in one read of them, for a record to sign; :class:`AnswerRefused` when the
+        receipts cannot be read as a log."""
+        with self._read() as conn:
+            try:
+                return receipts_head(conn)
+            except LogUnreadable as exc:
+                raise AnswerRefused(f"the receipts cannot be read as a log ({exc})") from None
+
     def answer_payload(self, request_id: str, decision: str, signer_fp: str) -> dict[str, str]:
         """The record to sign to answer ``request_id``, ``signed_at`` now by the queue's clock, ``receipts_head``
         the head of every receipt in one read of them (what every signer signs: the CLI, the phone page). Raises
@@ -1356,8 +1392,7 @@ class ConsentQueue:
             raise AnswerRefused(f"request {request_id} is already {state}")
         if request.expires_at <= utc_stamp(_now_utc(self._clock)):
             raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
-        with self._read() as conn:
-            head = receipts_head(conn)
+        head = self._head_to_sign()
         return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
                               signed_at=utc_stamp(_now_utc(self._clock)), receipts_head=head)
 
@@ -1544,8 +1579,7 @@ class ConsentQueue:
         ``receipts_head`` the head of every receipt in one read of them. Raises :class:`AnswerRefused` when there
         is no sealed undecided request."""
         request, gap, queue_id = self._undecided(request_id)
-        with self._read() as conn:
-            head = receipts_head(conn)
+        head = self._head_to_sign()
         return ruling_payload(queue_id=queue_id, request=request, gap=gap[0], decision=decision,
                               signer_fp=signer_fp, signed_at=utc_stamp(_now_utc(self._clock)), receipts_head=head)
 
@@ -1558,7 +1592,8 @@ class ConsentQueue:
         head of its size over the receipts as they stand under that lock. The move to ``allowed``/``denied``,
         its receipt and the release of a halt on this request are one transaction. Returns the :class:`Ruling`
         (information: applying a ruling delivers nothing; a ruled allow reaches the agent only through
-        :meth:`take_ruled_allow`)."""
+        :meth:`take_ruled_allow`). ``payload`` is read once, at entry, as :meth:`answer` reads it."""
+        payload = _detached(payload)
         request, gap, queue_id = self._undecided(request_id)
         authority = self._fresh_authority()
         if authority is None:
