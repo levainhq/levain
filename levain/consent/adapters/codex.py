@@ -201,15 +201,19 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             return True
     else:
         return False
-    return any(_header_is_config(target, cwd, home, codex_dir, protected) for target in targets)
+    git_cache: dict[Any, Any] = {}   # git asked once per directory for the whole patch
+    return any(_header_is_config(target, cwd, home, codex_dir, protected, git_cache) for target in targets)
 
 
-def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...]) -> bool:
-    """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to)."""
+def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...],
+                      git_cache: dict[Any, Any] | None = None) -> bool:
+    """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to). Where git runs
+    hooks from is asked of git (the Claude Code check), shared across one call's headers through ``git_cache``."""
     if not isinstance(target, str) or not target:
         return True
     try:
-        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected)
+        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected,
+                                             git_cache=git_cache)
                 or _in_codex_config(target, cwd, home, codex_dir))
     except (OSError, ValueError):
         return True
@@ -334,7 +338,8 @@ def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home:
             if cwd:
                 home = home if home is not None else Path.home()
                 codex_dir = codex_dir if codex_dir is not None else codex_home()
-                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected)]
+                git_cache: dict[Any, Any] = {}
+                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected, git_cache)]
             if tagged and len(tagged) < len(paths):
                 rest = len(paths) - len(tagged)
                 text = f"{PATCH_TOOL} of {', '.join(tagged)} (+{rest} other file{'s' if rest != 1 else ''})"

@@ -1501,17 +1501,19 @@ UNCONFINED_HOW = ("To allow them, enrol a key that can sign T3 (a laptop-presenc
 def _hooks_off_files(install: Path, adapter: str, *, home: Path | None = None,
                      codex_home: Path | None = None) -> list[Path]:
     """The workspace or user config files that turn the agent's hooks off, every hook levain wires with them, the
-    consent gate and its floor included (L3 r1 G5): for Claude Code, ``disableAllHooks: true`` in the workspace's
-    ``.claude/settings.json`` or ``.claude/settings.local.json`` or the user's settings (``$CLAUDE_CONFIG_DIR`` or
-    ``~/.claude``); for Codex, ``[features] hooks = false`` (or the older ``codex_hooks``) in the workspace's
-    ``.codex/config.toml`` or ``CODEX_HOME``'s. A file that is missing, unreadable or does not parse is not listed
-    here (the other rows report a broken settings file)."""
+    consent gate and its floor included (L3 r1 G5): for Claude Code, ``disableAllHooks: true`` in any settings file
+    a session started in the workspace loads (the consent adapter's
+    :func:`~levain.consent.adapters.claude_code._settings_files`, its JSON ones: the user's settings, the
+    machine-wide ones, and ``.claude/settings.json`` / ``.claude/settings.local.json`` in the workspace and every
+    ancestor directory, L3 r2); for Codex, ``[features] hooks = false`` (or the older ``codex_hooks``) in the
+    workspace's ``.codex/config.toml`` or ``CODEX_HOME``'s. A file that is missing, unreadable or does not parse is
+    not listed here (the other rows report a broken settings file)."""
     home = home if home is not None else Path.home()
     found: list[Path] = []
     if adapter == "claude-code":
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        files = [install / ".claude" / "settings.json", install / ".claude" / "settings.local.json",
-                 *([Path(config_dir) / "settings.json"] if config_dir else []), home / ".claude" / "settings.json"]
+        from levain.consent.adapters.claude_code import _settings_files
+
+        files = [p for kind, p in _settings_files(str(install), home, None) if kind == "json"]
         for f in dict.fromkeys(files):
             try:
                 data = json.loads(f.read_text())
