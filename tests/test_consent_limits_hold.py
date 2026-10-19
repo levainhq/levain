@@ -254,3 +254,16 @@ def test_a_stale_end_is_not_told_after_an_extend_and_codex_hears_a_live_end(tmp_
     spec = out["hookSpecificOutput"]
     assert spec["permissionDecision"] == "deny" and "ENDED this session" in spec.get("additionalContext", "")
     assert "continue" not in out
+
+
+def test_a_late_allow_that_itself_lifted_the_halt_still_plans_its_resume(tmp_path, keys, authority, monkeypatch):
+    from levain.consent import delivery
+
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    _check(q, 3, hold=0.4)                                   # silence: halted on r1's gap
+    rid = q.undecided_for("claude_code")[0].request.id
+    _answer_when_filed(q, keys["phone"], "allow", late=True).join()
+    assert L.release_if_extended(q, "claude_code", "s1")     # r1's own allow lifts it (as the gate would)
+    assert L.extended_by(q.directory, rid)
+    assert "already extended" not in delivery.plan(q, rid).reason
