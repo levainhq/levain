@@ -783,6 +783,34 @@ def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
     return read
 
 
+def _notifications() -> Callable[[ReadContext], Result]:
+    """P4, the notification record (Phill 10-19, c1): every ping Levain sent, where it went, whether it was opened, and
+    its outcome read from the consent queue now (:mod:`levain.webpush.record`). A display, never an authority."""
+    def read(ctx: ReadContext) -> Result:
+        from levain.consent.queue import default_queue_dir
+        from levain.webpush import record as rec_mod
+        from levain.webpush.store import PushStore
+
+        qdir = default_queue_dir()
+        if not (qdir / "webpush" / "webpush.db").exists():
+            return Read(rows=(), note="No phone has been paired for pings yet (`levain ping test` once one is).")
+        try:
+            pings = rec_mod.record(qdir, PushStore(qdir).record(limit=rec_mod.SHOWN))
+        except Exception as exc:  # noqa: BLE001 - an unreadable record is said, never a dark panel
+            return Fault(f"the notification record cannot be read: {type(exc).__name__}")
+        rows = []
+        for p in pings:
+            sent = ", ".join(str(d["status"]) for d in p.get("deliveries") or ()) or "no phone"
+            opened = f"opened {len(p['opens'])}x" if p.get("opens") else "not opened"
+            meta = f"{p['at']} · {p['kind']} · push {sent} · {opened} · {p['outcome']['words']}"
+            rows.append(RowIn(id=f"ping:{p['id']}", title=p["title"], body=p.get("body") or None,
+                              facets={"at": p["at"], "legacy_meta": meta},
+                              stored={"at": p["at"], "kind": p["kind"], "ref": p.get("ref"), "sent": sent,
+                                      "opened": len(p.get("opens") or ()), "outcome": p["outcome"]["state"]}))
+        return Read(rows=tuple(rows))
+    return read
+
+
 def _slug(heading: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-") or "section"
 
@@ -1108,6 +1136,10 @@ def build_default_cockpit(
             "jobs", "triage-list", "Recent jobs", "feed", _jobs(job_store), region="operate", rank=70,
             optional=True, order="time.desc", rowset="jobs",
             facets=frozenset({"job_status", "verb", "at"}), version_fields=("*",), empty="No jobs yet."))
+    ck.register(ProviderSpec(
+        "notifications", "triage-list", "Notification record", "feed", _notifications(), region="operate", rank=72,
+        optional=True, order="time.desc", facets=frozenset({"at", "legacy_meta"}), version_fields=("*",),
+        empty="No pings sent yet."))
     # Q7a: the sessions tile (a count of the Active ones) opening into the focus modal, like Decisions waiting
     ck.register(ProviderSpec(
         "sessions", "triage-list", "Sessions", "gauge", _sessions(source, lambda: ck.consent_reader), region="widgets",
