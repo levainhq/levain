@@ -132,3 +132,46 @@ def test_a_real_notify_command_ping_lands_in_the_record_through_the_detached_chi
     assert [(r["kind"], r["ref"], r["body"], r["command"], r["deliveries"]) for r in rows] == [
         ("consent", "request:r7", "claude waits on you: Bash (request r7).", 1, [])]
     assert marker.exists() and marker.read_text().strip() == "levain: claude waits on you: Bash (request r7)."
+
+
+def _cli_record(qdir, capsys):
+    import argparse
+
+    from levain.webpush import cli
+
+    assert cli._record(argparse.Namespace(queue_dir=qdir, json=False, limit=10)) == 0
+    return capsys.readouterr().out
+
+
+def test_the_record_says_whether_the_notify_command_started(tmp_path, capsys):
+    store = PushStore(tmp_path)
+    store.add_ping("consent", None, "levain", "a", True)
+    store.add_ping("reping", None, "levain", "b", False)
+    store.add_ping("test", None, "levain", "c")
+    lines = _cli_record(tmp_path, capsys).splitlines()
+    out = "\n".join(lines)
+    assert out.count("notify command started") == 1 and out.count("notify command did not start") == 1
+    assert [ln for ln in lines if " test " in ln and "notify command" in ln] == []
+
+
+def test_the_cockpit_panel_says_whether_the_notify_command_started(tmp_path, monkeypatch):
+    from levain.cockpit import providers
+    from levain.consent import queue as cqueue
+
+    PushStore(tmp_path).add_ping("consent", "request:r1", "levain", "a", True)
+    monkeypatch.setattr(cqueue, "default_queue_dir", lambda: tmp_path)
+    got = providers._notifications()(None)
+    assert [r.facets["legacy_meta"] for r in got.rows if "notify command started" in r.facets["legacy_meta"]]
+
+
+def test_the_child_refuses_a_command_that_is_not_a_bool(tmp_path, monkeypatch, capsys):
+    import io
+
+    from levain.webpush import __main__ as child
+
+    class In:
+        buffer = io.BytesIO(b'{"title":"t","body":"b","ref":null,"url":"/","command":"yes"}')
+
+    monkeypatch.setattr(child.sys, "stdin", In)
+    assert child.main(["send", "--queue-dir", str(tmp_path), "--kind", "consent"]) == 2
+    assert not (tmp_path / DIR_NAME).exists()
