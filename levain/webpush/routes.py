@@ -152,16 +152,12 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
                 raise ValueError("auth")
         except (TypeError, KeyError, ValueError):
             return _err(400, "bad_keys", "keys.p256dh must be a P-256 point and keys.auth 16 bytes, base64url")
-        minted = None
-        if device_id is None:
-            # the run token is not a device: the page that turns pings on becomes one, so a revoke can stop them
-            conn = store.connection()
-            try:
-                minted = devices.mint_device(conn, obj.get("label"), datetime.now(timezone.utc))
-            finally:
-                conn.close()
-            device_id = minted[0]
-        out: dict = {"id": store.add_subscription(endpoint, p256dh, auth, device_id)}
+        if device_id is not None:
+            return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id)})
+        # the run token is not a device: the page that turns pings on becomes one, so a revoke can stop them; an
+        # endpoint a live device already owns stays its own, and the page keeps the token it holds
+        sid, minted = store.subscribe_unowned(endpoint, p256dh, auth, obj.get("label"), datetime.now(timezone.utc))
+        out: dict = {"id": sid}
         if minted is not None:
             out.update(device_id=minted[0], token=minted[1])
         return _json(200, out)

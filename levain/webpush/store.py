@@ -169,26 +169,23 @@ class PushStore:
         if not isinstance(device_id, str) or not device_id:
             raise ValueError("a subscription is always stored under a device")
         with self.write() as c:
-            nxt = "(SELECT COALESCE(MAX(subscribed), 0) + 1 FROM subscriptions)"
-            c.execute(
-                "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created, subscribed) "
-                f"VALUES (?,?,?,?,?,{nxt}) "
-                "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, "
-                f"device_id = excluded.device_id, retired_at = NULL, subscribed = {nxt}",
-                (device_id, endpoint, p256dh, auth, now_stamp()))
-            row = c.execute("SELECT id, device_id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()
-            sid, owner = int(row[0]), row[1]
-            at = now_stamp()
-            c.execute(
-                "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND device_id IS ? AND id != ? "
-                "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND device_id IS ? "
-                "AND id != ? ORDER BY subscribed DESC LIMIT ?)",
-                (at, owner, sid, owner, sid, MAX_SUBSCRIPTIONS_PER_DEVICE - 1))
-            c.execute(
-                "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND id != ? "
-                "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND id != ? "
-                "ORDER BY subscribed DESC LIMIT ?)", (at, sid, sid, MAX_SUBSCRIPTIONS - 1))
-            return sid
+            return _subscribe(c, endpoint, p256dh, auth, device_id)
+
+    def subscribe_unowned(self, endpoint: str, p256dh: str, auth: str, label: Any,
+                          now: datetime) -> tuple[int, tuple[str, str] | None]:
+        """A run-token subscribe, in one transaction: an endpoint a live device already owns stays that device's and
+        nothing is minted; otherwise a new device is minted and owns it. Returns ``(subscription id, (device_id,
+        device_token) or None)``."""
+        from levain.webpush import devices
+
+        with self.write() as c:
+            row = c.execute("SELECT s.device_id FROM subscriptions s JOIN devices d ON d.id = s.device_id "
+                            "WHERE s.endpoint = ? AND d.revoked_at IS NULL", (endpoint,)).fetchone()
+            minted = None
+            if row is None:
+                minted = devices._insert_device(c, label, now)
+            owner = row[0] if row is not None else minted[0]
+            return _subscribe(c, endpoint, p256dh, auth, owner), minted
 
     def retire_subscription(self, endpoint: str) -> bool:
         with self.write() as c:
@@ -231,6 +228,30 @@ class PushStore:
                 p["opens"] = [dict(r) for r in c.execute(
                     "SELECT device_id, at FROM opens WHERE ping_id = ? ORDER BY id", (p["id"],))]
             return pings
+
+
+def _subscribe(c: sqlite3.Connection, endpoint: str, p256dh: str, auth: str, device_id: str) -> int:
+    """The body of :meth:`PushStore.add_subscription`, in the caller's write transaction."""
+    nxt = "(SELECT COALESCE(MAX(subscribed), 0) + 1 FROM subscriptions)"
+    c.execute(
+        "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created, subscribed) "
+        f"VALUES (?,?,?,?,?,{nxt}) "
+        "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, "
+        f"device_id = excluded.device_id, retired_at = NULL, subscribed = {nxt}",
+        (device_id, endpoint, p256dh, auth, now_stamp()))
+    row = c.execute("SELECT id, device_id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()
+    sid, owner = int(row[0]), row[1]
+    at = now_stamp()
+    c.execute(
+        "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND device_id IS ? AND id != ? "
+        "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND device_id IS ? "
+        "AND id != ? ORDER BY subscribed DESC LIMIT ?)",
+        (at, owner, sid, owner, sid, MAX_SUBSCRIPTIONS_PER_DEVICE - 1))
+    c.execute(
+        "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND id != ? "
+        "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND id != ? "
+        "ORDER BY subscribed DESC LIMIT ?)", (at, sid, sid, MAX_SUBSCRIPTIONS - 1))
+    return sid
 
 
 def retire_device_subscriptions(conn: sqlite3.Connection, device_id: str, now: datetime) -> int:

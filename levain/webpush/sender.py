@@ -169,12 +169,14 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
     while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
         fields["body"] = fields["body"][: len(fields["body"]) // 2]
         data = json.dumps(fields).encode("utf-8", "replace")
-    argv = [sys.executable, "-P", "-m", "levain.webpush", "send", "--queue-dir", str(queue_dir), "--kind", kind]
     env = child_env()
     root = str(Path(__file__).resolve().parents[2])   # a source checkout: -P leaves the child no other way to import levain
     if not any(root == str(Path(d).resolve()) for d in site.getsitepackages() + [site.getusersitepackages()]):
-        env["PYTHONPATH"] = root
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH")) if p)
     try:
+        # the child runs in "/", so a relative queue dir is resolved here, against this process's cwd
+        argv = [sys.executable, "-P", "-m", "levain.webpush", "send", "--queue-dir",
+                str(Path(queue_dir).resolve()), "--kind", kind]
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True, close_fds=True, env=env, cwd=os.sep)
         try:

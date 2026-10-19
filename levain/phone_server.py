@@ -149,6 +149,16 @@ class _PhoneHandler(GuardedHandler):
     def _token_ok(self) -> bool:
         return self._credential() is not None
 
+    def _cross_site_read(self) -> bool:
+        """The cross-site refusal, less a top-level navigation to a page: the phone link opened from another app
+        arrives cross-site. A page carries no data (the token gates every data route), and framing is still refused."""
+        if not super()._cross_site_read():
+            return False
+        static = _STATIC.get(self.path.split("?", 1)[0])
+        return not (self.command == "GET" and static is not None and static[1].startswith("text/html")
+                    and self.headers.get("Sec-Fetch-Mode") == "navigate"
+                    and self.headers.get("Sec-Fetch-Dest") == "document")
+
     def _json(self, payload: dict[str, Any], status: int = 200, *, head: bool = False) -> None:
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", PHONE_TOKEN_HEADER)], cache_control="private, no-store")
@@ -383,7 +393,9 @@ class _PhoneServer(ThreadingHTTPServer):
                 self._push_store = PushStore(self.queue_dir)
             store = self._push_store
         try:
-            if not store.path.is_file():
+            try:
+                store.path.lstat()
+            except FileNotFoundError:
                 return None
             conn = store.connection()
             try:

@@ -151,7 +151,7 @@ def test_s5_a_send_child_exception_lands_in_a_bounded_log_and_exits_nonzero(tmp_
         json.dumps({"title": "t", "body": "b", "ref": None, "url": "/"}).encode())})())
     log = tmp_path / "webpush" / "send-errors.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text("".join(f"old {i}\n" for i in range(300)))
+    log.write_text("".join(f"old {i} {'x' * 300}\n" for i in range(300)))      # past the size bound
     assert child.main(["send", "--queue-dir", str(tmp_path), "--kind", "test"]) != 0
     lines = log.read_text().splitlines()
     assert len(lines) == 200 and "store exploded" in lines[-1]
@@ -192,3 +192,61 @@ def test_s9_a_ping_without_an_outcome_does_not_kill_the_panel(tmp_path, monkeypa
     monkeypatch.setattr(record, "record", lambda q, rows: [ping])   # no "outcome" key
     got = providers._notifications()(None)
     assert isinstance(got, Read) and len(got.rows) == 1
+
+
+def test_spawn_keeps_the_inherited_pythonpath_and_hands_the_child_an_absolute_queue_dir(tmp_path, monkeypatch):
+    seen = {}
+
+    class P:
+        def __init__(self, argv, **kw):
+            seen.update(argv=argv, kw=kw)
+            self.stdin = type("S", (), {"write": lambda s, d: None, "close": lambda s: None})()
+
+    monkeypatch.setenv("PYTHONPATH", "/kept/one")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sender.site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(sender.subprocess, "Popen", P)
+    assert sender.spawn("q", kind="consent", ref="r", title="t", body="b")
+    parts = seen["kw"]["env"]["PYTHONPATH"].split(os.pathsep)
+    assert parts[0] == str(__import__("pathlib").Path(sender.__file__).resolve().parents[2]) and "/kept/one" in parts
+    qd = seen["argv"][seen["argv"].index("--queue-dir") + 1]
+    assert qd == str((tmp_path / "q").resolve())
+
+
+def test_two_failing_children_each_keep_their_log_line(tmp_path):
+    from levain.webpush import __main__ as child
+
+    (tmp_path / "webpush").mkdir()
+
+    def fail(n):
+        for i in range(50):
+            child._log_error(tmp_path, RuntimeError(f"child {n} line {i}"))
+
+    threads = [threading.Thread(target=fail, args=(n,)) for n in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = (tmp_path / "webpush" / "send-errors.log").read_text().splitlines()
+    assert len(lines) == 100 and all(any(f"child {n} line {i}" in ln for ln in lines) for n in (1, 2) for i in range(50))
+
+
+def test_an_unknown_or_unanswered_delivery_reads_as_words_in_the_record_and_the_panel(tmp_path, monkeypatch, capsys):
+    from levain.cli import main
+    from levain.cockpit import providers
+    from levain.consent import queue as cq
+
+    store = PushStore(tmp_path)
+    p, a = _ua_keys()
+    late = store.add_subscription(FCM, p, a, "d")
+    mute = store.add_subscription(FCM + "2", p, a, "d")
+    ping = store.add_ping("test", None, "t", "b")
+    store.add_delivery(ping, late, sender.UNKNOWN)
+    store.add_delivery(ping, mute, 0)
+    assert main(["ping", "record", "--queue-dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"sub {late}: no answer in time" in out and f"sub {mute}: no answer]" in out
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path.parent / "home"))
+    monkeypatch.setattr(cq, "default_queue_dir", lambda: tmp_path)
+    sent = providers._notifications()(None).rows[0].stored["sent"]
+    assert sent == "no answer in time, no answer"

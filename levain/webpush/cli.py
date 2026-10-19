@@ -64,8 +64,13 @@ def _test(args: argparse.Namespace) -> int:
         print("no live subscription: turn notifications on from the phone page first")
         return 1
     for sub_id, status in results:
-        print(f"subscription {sub_id}: {'no answer in time' if status < 0 else status or 'no answer'}")
+        print(f"subscription {sub_id}: {_said(status)}")
     return 0 if all(200 <= s < 300 for _, s in results) else 1
+
+
+def _said(status: int) -> str:
+    """A delivery status in words where it is not an HTTP answer: below 0 none came within the budget, 0 none came."""
+    return "no answer in time" if status < 0 else str(status) if status else "no answer"
 
 
 def _record(args: argparse.Namespace) -> int:
@@ -78,7 +83,8 @@ def _record(args: argparse.Namespace) -> int:
         print(json.dumps(pings, indent=2))
         return 0
     for p in pings:
-        deliveries = ", ".join(f"sub {d['subscription_id']}: {d['status']}" for d in p["deliveries"]) or "no subscription"
+        deliveries = ", ".join(f"sub {d['subscription_id']}: {_said(d['status'])}" for d in p["deliveries"]) \
+            or "no subscription"
         opened = f"opened {p['opens'][0]['at']}" if p["opens"] else "not opened"
         print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}; "
               f"{p['outcome']['words']}")

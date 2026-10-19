@@ -798,7 +798,8 @@ def _notifications() -> Callable[[ReadContext], Result]:
         try:
             for p in rec_mod.record(qdir, PushStore(qdir).record(limit=rec_mod.SHOWN)):
                 outcome = p.get("outcome") or {}
-                sent = ", ".join(str(d["status"]) for d in p.get("deliveries") or ()) or "no phone"
+                sent = ", ".join("no answer in time" if d["status"] < 0 else str(d["status"]) if d["status"] else
+                                 "no answer" for d in p.get("deliveries") or ()) or "no phone"
                 opened = f"opened {len(p['opens'])}x" if p.get("opens") else "not opened"
                 meta = f"{p['at']} · {p['kind']} · push {sent} · {opened} · {outcome.get('words', 'outcome not read')}"
                 rows.append(RowIn(id=f"ping:{p['id']}", title=p["title"], body=p.get("body") or None,
