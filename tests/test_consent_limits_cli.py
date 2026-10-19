@@ -303,7 +303,7 @@ def test_extend_without_a_resume_record_says_where_it_lands(tmp_path, keys, auth
                          launch=lambda *a: pytest.fail("launched"), listing=lambda m: {},
                          running=lambda *a, **k: False)
     t.join()
-    assert code == 0 and "not resumed" in lines[-1] and "next step" in lines[-1]
+    assert code == 0 and "nothing was resumed" in lines[-1] and "when it next runs" in lines[-1]
     assert L.snapshot(q.directory)[0]["halt"] is None
 
 
@@ -326,7 +326,7 @@ def test_doctor_row_reports_limits_sessions_and_halts(tmp_path, monkeypatch):
     qdir = tmp_path / "consent"
     monkeypatch.setattr("levain.install._consent_queue_dir", lambda: qdir)
     (r,) = doctor._check_consent_limits()
-    assert r.ok and not r.warn and "claude_code: calls 3000" in r.detail and "[defaults]" in r.detail
+    assert r.ok and not r.warn and "claude_code: calls 3,000" in r.detail and "[defaults]" in r.detail
     assert "0 session(s) counted, 0 halted" in r.detail
     _run(["set", "calls", "9"], qdir)
     _count(qdir, 3, limits=dict(L.DEFAULTS, calls=2))
@@ -342,3 +342,258 @@ def test_doctor_row_says_not_counting_when_a_failure_file_reads_nonzero(tmp_path
     L._fail_write(L._fail_path(qdir, "claude_code", "s1"), 2, create=False)
     (r,) = doctor._check_consent_limits()
     assert r.ok and r.warn and "NOT COUNTING: s1" in r.detail and r.hint
+
+
+# --- S3 L1/L2 round 1 ------------------------------------------------------------------------------------------------
+
+def _late_allow(q, key, request_id):
+    from levain.consent.record import RULING_NAMESPACE, ruling_message
+
+    payload = q.ruling_payload(request_id, "allow", key.fp)
+    return q.answer_late(request_id, payload, key.sign(ruling_message(payload), RULING_NAMESPACE))
+
+
+def _halt_by_silence(q, cwd, session="s1"):
+    for i in (1, 2):
+        L.check("claude_code", {"tool_use_id": f"t{i}"}, q, session, "Read", {"p": i}, hold=2.0,
+                notify=lambda _t: None, cwd=cwd)
+    out = L.check("claude_code", {"tool_use_id": "t3"}, q, session, "Read", {"p": 3}, hold=0.4,
+                  notify=lambda _t: None, cwd=cwd,
+                  resume={"cwd": cwd, "permission_mode": "default", "invocation": "interactive", "claude_pid": 999999})
+    assert out.stop
+    return q.undecided_for("claude_code")[0].request.id
+
+
+def _extend_id(q):
+    conn = L._connect(q.directory)
+    try:
+        return conn.execute("SELECT request_id FROM requests WHERE purpose = 'extend' ORDER BY at DESC").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_extend_with_no_answer_gets_a_gap_and_a_late_allow_ruling_releases_at_the_next_call(tmp_path, keys,
+                                                                                            authority, limited):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory, hold=0.4), lines.append, queue=q,
+                         launch=lambda *a: pytest.fail("launched"), listing=lambda m: {})
+    assert code == 1
+    eid = _extend_id(q)
+    assert q.get(eid)[1] == "undecided"
+    gap = q.gap(eid)
+    assert gap is not None and f"gap #{gap}" in lines[-1] and "levain consent rule" in lines[-1]
+    _late_allow(q, keys["phone"], eid)                    # a late RULING is possible on it now
+    assert L.snapshot(q.directory)[0]["halt"] is not None
+    assert L.check("claude_code", {"tool_use_id": "t9"}, q, "s1", "Read", {"file_path": "/x/9"}, hold=1.0,
+                   notify=lambda _t: None, cwd=str(tmp_path)).go
+    assert L.snapshot(q.directory)[0]["halt"] is None and L.snapshot(q.directory)[0]["limits"]["calls"] == 4
+
+
+def test_a_stale_allow_on_the_halting_request_starts_no_second_resume_after_a_cli_extend(tmp_path, keys, authority,
+                                                                                          limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    r1 = _halt_by_silence(q, str(work))
+    launches: list = []
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude", "--resume", "s1"), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q,
+                         launch=lambda a, c, e, lg: launches.append(a) or None, listing=lambda m: {},
+                         running=lambda *a, **k: False)
+    t.join()
+    assert code == 0 and len(launches) == 1, lines
+    _late_allow(q, keys["phone"], r1)                     # the old gap card, cleared later with an allow
+    got = dv.plan(q, r1)
+    assert got.route == "hook" and "already extended" in got.reason
+    got = dv.deliver(q, r1, listing=lambda m: {}, running=lambda *a, **k: False,
+                     launch=lambda a, c, e, lg: launches.append(a) or None)
+    assert len(launches) == 1 and got.route == "hook"
+    assert L.snapshot(q.directory)[0]["limits"]["calls"] == 4          # doubled once
+    disp = q.get(r1)[0].display
+    assert L.ruling_text("allow", q.gap(r1), disp, queue_dir=q.directory, request_id=r1) is None
+
+
+def test_an_allow_whose_root_is_still_halted_is_planned_as_before(tmp_path, keys, authority, limited):
+    q = _q(tmp_path, authority)
+    r1 = _halt_by_silence(q, str(tmp_path))
+    _late_allow(q, keys["phone"], r1)
+    assert L.root_halted(q.directory, "claude_code", "s1") is True
+    assert "already extended" not in dv.plan(q, r1).reason
+    disp = q.get(r1)[0].display
+    assert "EXTENDED" in L.ruling_text("allow", q.gap(r1), disp, queue_dir=q.directory, request_id=r1)
+
+
+def _unreadable_store(tmp_path, how):
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    if how == "corrupt":
+        (qdir / L.DB_NAME).write_bytes(b"this is not a sqlite database at all " * 200)
+    else:
+        _count(qdir, 1)
+        os.chmod(qdir, 0o755)
+    return qdir
+
+
+@pytest.mark.parametrize("how", ["corrupt", "mode"])
+@pytest.mark.parametrize("argv", [["show"], ["show", "--json"], ["extend", "s1"]])
+def test_an_unreadable_store_is_one_line_and_exit_1(tmp_path, how, argv):
+    qdir = _unreadable_store(tmp_path, how)
+    try:
+        code, text = _run(argv, qdir)
+    finally:
+        os.chmod(qdir, 0o700)
+    assert code == 1 and text.count("\n") == 1 and "levain limits" in text and "Traceback" not in text
+
+
+def test_ruling_text_names_a_gap_only_when_there_is_one():
+    disp = "levain_limit " + json.dumps(L.limit_call("claude_code", "s1", "calls", 0, 2, purpose="extend"))
+    for ruling in ("allow", "deny"):
+        text = L.ruling_text(ruling, None, disp)
+        assert text and "gap" not in text and "None" not in text
+        assert "(gap #3)" in L.ruling_text(ruling, 3, disp)
+
+
+def test_extend_after_an_end_resumes_with_no_gap_none(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    _halt_by_end(q, keys["phone"], str(work))
+    launches: list = []
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude",), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+    t = _phone_signs(q, keys["phone"], "allow")
+    C._cmd_extend(_args(q.directory), lambda s: None, queue=q, launch=lambda a, c, e, lg: launches.append(a) or None,
+                  listing=lambda m: {}, running=lambda *a, **k: False)
+    t.join()
+    assert len(launches) == 1 and "None" not in launches[0][-1] and "EXTENDED" in launches[0][-1]
+
+
+def test_extend_resumes_only_when_its_own_allow_lifted_the_halt(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    r1 = _halt_by_silence(q, str(work))
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude",), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+
+    def phone():   # the old gap card is ruled allow first, then the extend request is allowed too
+        for _ in range(200):
+            time.sleep(0.05)
+            for r in q.pending():
+                if r.tool_name == L.LIMIT_TOOL:
+                    _late_allow(q, keys["phone"], r1)
+                    payload, sig = signed(q, r, keys["phone"], "allow")
+                    q.answer(r.id, payload, sig)
+                    return
+    t = threading.Thread(target=phone, daemon=True)
+    t.start()
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"),
+                         listing=lambda m: {}, running=lambda *a, **k: False)
+    t.join()
+    text = "\n".join(lines)
+    assert code == 0 and "another" in text, text
+    assert L.snapshot(q.directory)[0]["halt"] is None and L.snapshot(q.directory)[0]["limits"]["calls"] == 4
+
+
+def test_a_resume_that_raises_after_the_halt_is_lifted_says_extended_resume_failed(tmp_path, keys, authority, limited,
+                                                                                   monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def boom(*a, **k):
+        raise RuntimeError("route blew up")
+    monkeypatch.setattr(dv, "route", boom)
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"),
+                         listing=lambda m: {}, running=lambda *a, **k: False)
+    t.join()
+    assert code == 0 and "extended; resume failed: RuntimeError: route blew up" in lines[-1]
+    assert L.snapshot(q.directory)[0]["halt"] is None
+
+
+def test_a_launch_that_raises_is_reported_unknown_with_exit_4(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    _halt_by_end(q, keys["phone"], str(work))
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude",), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+
+    def boom(*a):
+        raise OSError("close failed after Popen")
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=boom, listing=lambda m: {},
+                         running=lambda *a, **k: False)
+    t.join()
+    assert code == 4 and "may have started (unknown" in lines[-1] and "check before resuming by hand" in lines[-1]
+
+
+def test_extend_resume_waits_on_the_band_session_lock(tmp_path, keys, authority, limited, monkeypatch):
+    from levain.consent import band
+
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    _halt_by_end(q, keys["phone"], str(work))
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude",), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+    monkeypatch.setattr(band, "SESSION_LOCK_WAIT", 0.3)
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    with band._session_lock(q, "claude_code", "s1") as held:
+        assert held
+        code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"),
+                             listing=lambda m: {}, running=lambda *a, **k: False)
+    t.join()
+    assert code == 0 and "held its lock" in lines[-1] and "nothing was resumed" in lines[-1]
+
+
+def test_ctrl_c_during_the_hold_leaves_the_request_pending_exit_130(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(q, "await_decision", interrupted)
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"))
+    eid = _extend_id(q)
+    assert code == 130 and f"interrupted; request {eid} stays pending until its hold ends" in lines[-1]
+    assert q.get(eid)[1] == "pending"
+
+
+def test_set_refuses_an_oversized_limits_json_and_a_document_that_would_be_one(tmp_path):
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    big = {"format": L.LIMITS_FORMAT, "default": {}, "pad": "x" * (L.LIMITS_MAX + 1)}
+    (qdir / L.LIMITS_NAME).write_text(json.dumps(big))
+    code, text = _run(["set", "calls", "5"], qdir)
+    assert code == 1 and "KiB" in text
+    with pytest.raises(ValueError, match="KiB"):
+        C._write_doc(tmp_path / "other" / L.LIMITS_NAME, big)
+    assert not (tmp_path / "other" / L.LIMITS_NAME).exists()
+
+
+def test_set_caps_values_and_stores_the_typed_whole_number_exactly(tmp_path):
+    qdir = tmp_path / "consent"
+    assert _run(["set", "fresh_tokens", "999999999999"], qdir)[0] == 0
+    assert json.loads((qdir / L.LIMITS_NAME).read_text())["default"]["fresh_tokens"] == 999999999999
+    assert _run(["set", "fresh_tokens", str(10 ** 12)], qdir)[0] == 0
+    for kind, value in [("fresh_tokens", str(10 ** 12 + 1)), ("calls", "1e3"), ("active_hours", "10001"),
+                        ("repeat", "9" * 30)]:
+        code, text = _run(["set", kind, value], qdir)
+        assert code == 1 and "at most" in text, (kind, value)
+    assert _run(["set", "active_hours", "10000"], qdir)[0] == 0
+
+
+def test_no_subcommand_names_where_queue_dir_goes(tmp_path):
+    code, text = _run([], tmp_path / "consent")
+    assert code == 2 and "levain limits --queue-dir D <cmd>" in text

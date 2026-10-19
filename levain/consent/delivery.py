@@ -492,6 +492,12 @@ def plan(queue: ConsentQueue, request_id: str, *,
     if request.tool_name == "levain_limit" and ruling.ruling == "deny":
         # Q13: a late End leaves the session stopped; resuming it would spend a turn only to be stopped again
         return replace(out, reason="a limit's End: the session stays stopped and no resume is started for it")
+    if request.tool_name == "levain_limit" and ruling.ruling == "allow":
+        from levain.consent.limits import root_halted
+
+        if root_halted(queue.directory, agent, session) is False:
+            # Q13: an Extend already lifted the halt (whoever lifted it resumed it, if it could): never a second resume
+            return replace(out, reason="the limit was already extended; no resume")
     state, when = queue.delivery_state(request_id)
     if state == "delivered":
         return replace(out, route="delivered", reason=f"its text reached the session at {when}")
