@@ -1874,7 +1874,10 @@
       const shape = (board && n <= 4) || n < 4 ? "strip" : "tiles";
       // ...and never so many that a tile is narrower than MIN_TILE_PX: the 720px rule covers the phone, this covers the half-screen laptop in between
       const room = w.clientWidth;
-      if (shape === "tiles" && room > 0) cols = Math.max(2, Math.min(cols, Math.floor(room / MIN_TILE_PX)));
+      w.dataset.shape = shape;   // before the gap is read: only the tiles shape is a grid with a gap
+      // the grid's column gap is room no tile gets: c columns need c * MIN_TILE_PX + (c - 1) * gap
+      const gap = parseFloat(getComputedStyle(w).columnGap) || 0;
+      if (shape === "tiles" && room > 0) cols = Math.max(2, Math.min(cols, Math.floor((room + gap) / (MIN_TILE_PX + gap))));
       w.style.setProperty("--ck-n", String(cols));
       w.dataset.shape = shape;
       w.dataset.n = String(n);
