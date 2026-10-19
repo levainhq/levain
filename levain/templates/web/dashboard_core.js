@@ -3360,9 +3360,12 @@
       let res;
       try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
       if (res && res.ok) { words.value = ""; return; }   // the board re-reads and redraws this row as answered
-      if (res && res.error === "stale" && words.value.trim()) { questionDrafts.set(q.id, words.value); words.value = ""; }
+      const kept = res && res.error === "stale" && words.value.trim() !== "";
+      if (kept) { questionDrafts.set(q.id, words.value); words.value = ""; }
       for (const c of controls) c.disabled = false;
-      msg.textContent = (res && (res.message || res.error)) || "failed";
+      msg.textContent = ((res && (res.message || res.error)) || "failed") +
+        (kept ? " (your words are kept: they come back here while the question is still open)" : "");
+      if (kept) document.dispatchEvent(new CustomEvent("levain:editor-closed"));   // the re-read the refusal owes may land now
     };
     for (const o of options) {
       const key = sv(o && o.key);
