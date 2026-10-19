@@ -441,7 +441,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     verified decision (delivered), and at D marked undecided (the irreversible tier halting its session) and denied
     (:func:`undecided_output`). Every allow is re-checked against the halt just before it is returned: a halt set
     meanwhile wins. Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
-    rulings for the session ride whatever is returned, as ``additionalContext``."""
+    rulings for the session, and the answers to its questions not yet delivered
+    (:func:`levain.consent.band.question_context`), ride whatever is returned, as ``additionalContext``."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
@@ -482,6 +483,13 @@ def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str)
         context = ruling_context(queue, session)
     except Exception:
         context = None  # undelivered rulings stay for the next hook
+    try:
+        from levain.consent.band import question_context
+
+        answers = question_context(queue.directory, AGENT, session)
+    except Exception:
+        answers = None  # undelivered answers stay for the next hook
+    context = "\n".join(c for c in (context, answers) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         spec = out["hookSpecificOutput"]

@@ -565,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_away_parser(cs_sub)
     _add_consent_rule_parser(cs_sub)
     _add_push_parser(subparsers)
+    _add_band_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -2292,6 +2293,13 @@ def _add_push_parser(subparsers: argparse._SubParsersAction) -> None:
     from levain.consent.push_gate import add_parser
 
     add_parser(subparsers)
+
+
+def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
+    from levain.consent.band import add_parsers
+
+    add_parsers(subparsers)
 
 
 def _phone_port_default() -> int:

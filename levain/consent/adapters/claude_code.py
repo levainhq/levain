@@ -680,7 +680,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 #    (runs2 RUN B, 3/3 ``terminal_reason: hook_stopped``).
 #
 # Every PreToolUse also carries this session's late rulings, not yet delivered, as ``additionalContext`` (DESIGN
-# §3.6; :meth:`ConsentQueue.claim_rulings_for`), and, when a notify command is configured, the snoozed re-pings that
+# §3.6; :meth:`ConsentQueue.claim_rulings_for`), its question answers not yet delivered (Q17,
+# :func:`levain.consent.band.question_context`), and, when a notify command is configured, the snoozed re-pings that
 # are due (R-e). The entry is installed with ``"onFailure": "block"`` and ``timeout`` = :data:`GATE_TIMEOUT`, the
 # timeout of the CEILING, never of the D set at install: D is re-read from the settings file at every run, so a D
 # raised after install would otherwise outlive a timeout frozen at the old one (Claude Code would kill the hook
@@ -930,7 +931,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     (:func:`hold_for_answer`): when away ends the request is withdrawn and Claude Code's dialog asks. Anything
     that fails after the call is known gated is a deny (with the hard stop for
     the irreversible tier), never an allow: the request it filed stays pending until a read or sweep expires it.
-    Late rulings for the session (:func:`ruling_context`) ride whatever is returned, as ``additionalContext``."""
+    Late rulings for the session (:func:`ruling_context`), and the answers to its questions not yet delivered
+    (:func:`levain.consent.band.question_context`), ride whatever is returned, as ``additionalContext``."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
     if not isinstance(event, Mapping) or event.get("hook_event_name") != GATE_EVENT:
@@ -953,6 +955,13 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         context = ruling_context(queue, session)
     except Exception:
         context = None  # undelivered rulings stay for the next hook
+    try:
+        from levain.consent.band import question_context
+
+        answers = question_context(queue.directory, AGENT, session)
+    except Exception:
+        answers = None  # undelivered answers stay for the next hook
+    context = "\n".join(c for c in (context, answers) if c) or None
     if context:
         out = out if out is not None else {"hookSpecificOutput": {"hookEventName": GATE_EVENT}}
         out["hookSpecificOutput"]["additionalContext"] = context

@@ -1,0 +1,184 @@
+"""The question band (Q17 Q-1a): ``levain ask`` / ``levain question`` and the answer's way back through the gate hook.
+An answer is delivered to the asking session's main thread once, as fixed text that names its channel and says it
+authorises nothing; a subagent's hook, another session or a store that does not exist yet gets nothing."""
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+
+import pytest
+
+from levain.cli import main as cli_main
+from levain.consent import band
+from levain.consent.adapters import claude_code as cc
+from levain.consent.adapters import codex as cx
+from levain.consent.questions import QuestionStore
+from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared queue fixtures
+
+SESSION = "ceedbaa9-2e6d-433f-b374-0ad96dd5f62d"
+OPTS = [("a", "merge now"), ("b", "wait for the run")]
+
+
+def _file(store, session=SESSION, agent="claude_code", **kw):
+    args = {"what": "merge the branch?", "options": OPTS, "rec": "a", "blocks": "the merge"}
+    args.update(kw)
+    return store.file(agent=agent, agent_session_id=session, cwd="/work/proj", **args)
+
+
+def _run(argv, monkeypatch, env=None):
+    for k in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SANDBOX"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    code = cli_main(argv)
+    return code, out.getvalue()
+
+
+def test_answer_line_option_and_free_text(tmp_path):
+    store = QuestionStore(tmp_path / "consent")
+    q = _file(store, what="merge «it»» now?")
+    store.answer(q.id, option="b", channel="cli")
+    line = band.answer_line(store.get(q.id))
+    assert line == ("levain: the operator answered question #1 «merge it now?» (by cli): option b «wait for the "
+                    "run».")
+    q2 = _file(store)
+    words = 'no — "wait"\nthen merge'
+    store.answer(q2.id, text=words, channel="phone")
+    line2 = band.answer_line(store.get(q2.id))
+    assert line2.startswith("levain: the operator answered question #2 «merge the branch?» (by phone) in their own "
+                            "words: ")
+    assert json.loads(line2.split("own words: ", 1)[1]) == words      # verbatim, and nothing in it ends the line
+    assert "\n" not in line2
+    assert band.answer_line(_file(store)) is None
+
+
+def test_question_context_claims_once_for_the_main_thread_only(tmp_path):
+    qdir = tmp_path / "consent"
+    store = QuestionStore(qdir)
+    q = _file(store)
+    store.answer(q.id, option="a", channel="cli")
+    assert band.question_context(qdir, "claude_code", f"{SESSION}#agent:abc") is None   # a subagent never claims
+    assert band.question_context(qdir, "codex", SESSION) is None                       # another agent
+    assert band.question_context(qdir, "claude_code", "other") is None                 # another session
+    got = band.question_context(qdir, "claude_code", SESSION)
+    assert got.splitlines()[-1] == band.ANSWER_TAIL
+    assert "question #1" in got.splitlines()[0]
+    assert band.question_context(qdir, "claude_code", SESSION) is None                 # once
+
+
+def test_question_context_never_creates_a_store(tmp_path):
+    qdir = tmp_path / "consent"
+    assert band.question_context(qdir, "claude_code", SESSION) is None
+    assert not qdir.exists()
+    assert band.question_context(qdir, "claude_code", None) is None
+
+
+def test_ask_files_and_returns_at_once(tmp_path, monkeypatch):
+    qdir = tmp_path / "consent"
+    code, out = _run(["ask", "--what", "merge the branch?", "--option", "a=merge now", "--option",
+                      "b=wait for the run", "--rec", "a", "--blocks", "the merge", "--queue-dir", str(qdir)],
+                     monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})
+    assert code == 0
+    assert "question #1 filed" in out and "NOT pinged" in out and "the merge" in out
+    q = QuestionStore(qdir).get(1)
+    assert (q.agent, q.agent_session_id, q.options, q.rec) == ("claude_code", SESSION, tuple(OPTS), "a")
+
+
+@pytest.mark.parametrize("argv", [
+    ["--option", "a=x", "--option", "b=y", "--rec", "c", "--blocks", "z"],          # rec not an option
+    ["--option", "a=x", "--rec", "a", "--blocks", "z"],                             # one option
+    ["--option", "ax", "--option", "b=y", "--rec", "b", "--blocks", "z"],           # no KEY=LABEL
+])
+def test_ask_refuses_and_files_nothing(tmp_path, monkeypatch, argv):
+    qdir = tmp_path / "consent"
+    code, out = _run(["ask", "--what", "q?", *argv, "--queue-dir", str(qdir)], monkeypatch,
+                     env={"CLAUDE_CODE_SESSION_ID": SESSION})
+    assert code == 2 and "refused, nothing was filed" in out
+    assert QuestionStore(qdir).recent() == []
+
+
+def test_ask_needs_an_agent(tmp_path, monkeypatch):
+    code, out = _run(["ask", "--what", "q?", "--option", "a=x", "--option", "b=y", "--rec", "a", "--blocks", "z",
+                      "--queue-dir", str(tmp_path / "consent")], monkeypatch)
+    assert code == 2 and "cannot tell which agent" in out
+
+
+def test_ask_without_a_session_says_it_will_not_be_delivered(tmp_path, monkeypatch):
+    code, out = _run(["ask", "--agent", "codex", "--what", "q?", "--option", "a=x", "--option", "b=y", "--rec", "a",
+                      "--blocks", "z", "--queue-dir", str(tmp_path / "consent")], monkeypatch)
+    assert code == 0 and "not delivered to you" in out
+    assert QuestionStore(tmp_path / "consent").get(1).agent_session_id == band.NO_SESSION
+
+
+def test_ask_pings_through_the_agents_notify_seam(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None: sent.append(text) or True)
+    code, out = _run(["ask", "--what", "merge?", "--option", "a=yes", "--option", "b=no", "--rec", "a", "--blocks",
+                      "the merge", "--queue-dir", str(tmp_path / "consent")], monkeypatch,
+                     env={"CLAUDE_CODE_SESSION_ID": SESSION})
+    assert code == 0 and "was pinged" in out
+    assert sent[0].splitlines()[0] == "levain: claude_code asks (question #1): merge?"
+    assert "a) yes (rec)" in sent[0]
+
+
+def test_question_list_show_answer(tmp_path, monkeypatch):
+    qdir = tmp_path / "consent"
+    store = QuestionStore(qdir)
+    _file(store)
+    code, out = _run(["question", "list", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 0 and "#1 [claude_code] merge the branch?" in out and "<- rec" in out
+    code, out = _run(["question", "answer", "#1", "--option", "b", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 0 and "authorises nothing" in out
+    assert store.get(1).answer.channel == "cli"
+    code, out = _run(["question", "answer", "1", "--text", "again", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 2 and "already answered" in out
+    code, out = _run(["question", "list", "--queue-dir", str(qdir)], monkeypatch)
+    assert "no open questions" in out
+    code, out = _run(["question", "show", "1", "--json", "--queue-dir", str(qdir)], monkeypatch)
+    assert json.loads(out)["answer"]["value"] == "b"
+    code, out = _run(["question", "answer", "1", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 2 and "exactly one of" in out
+    code, out = _run(["question", "show", "9", "--queue-dir", str(qdir)], monkeypatch)
+    assert code == 2 and "no question" in out
+
+
+def _pre(tool="Read", session=SESSION, **extra):
+    return {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"file_path": "/work/proj/a.txt"},
+            "cwd": "/work/proj", "session_id": session, "permission_mode": "default", "tool_use_id": "toolu_1",
+            **extra}
+
+
+def test_claude_code_gate_carries_the_answer_on_an_ungated_call(queue):
+    store = QuestionStore(queue.directory)
+    q = _file(store)
+    store.answer(q.id, option="a", channel="phone")
+    out = cc.gate(_pre(agent_id="sub1"), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    assert out is None                                          # a subagent's call: nothing delivered
+    out = cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u"))
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "question #1" in ctx and ctx.endswith(band.ANSWER_TAIL)
+    assert "permissionDecision" not in out["hookSpecificOutput"]   # information only: no decision
+    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
+
+
+def test_codex_gate_carries_the_answer(queue):
+    store = QuestionStore(queue.directory)
+    q = _file(store, agent="codex")
+    store.answer(q.id, text="go ahead", channel="cli")
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"},
+             "cwd": "/work/proj", "session_id": SESSION, "turn_id": "t1", "tool_use_id": "c1"}
+    out = cx.gate(event, queue, cx.AdapterSettings(), home=Path("/home/u"), codex_dir=Path("/home/u/.codex"))
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert '"go ahead"' in ctx and ctx.endswith(band.ANSWER_TAIL)
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+
+
+def test_a_broken_question_store_never_changes_the_gate(queue, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("store gone")
+
+    monkeypatch.setattr(band, "question_context", boom)
+    assert cc.gate(_pre(), queue, cc.AdapterSettings(), home=Path("/home/u")) is None
