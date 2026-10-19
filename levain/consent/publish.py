@@ -461,7 +461,7 @@ def _sha256(path: Path) -> tuple[str, int]:
     return h.hexdigest(), size
 
 
-def _copy_in(src: str, dst: Path) -> None:
+def _copy_in(src: str, dst: Path, limit: int = MAX_ARTIFACT) -> int:
     """Copy the regular file ``src`` (not a link, at most :data:`MAX_ARTIFACT`) to the new file ``dst`` (0600)."""
     try:
         fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -471,15 +471,16 @@ def _copy_in(src: str, dst: Path) -> None:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise PublishRefused(f"{src} is not a regular file")
-        if st.st_size > MAX_ARTIFACT:
-            raise PublishRefused(f"{src} is over {MAX_ARTIFACT} bytes")
+        if st.st_size > limit:
+            raise PublishRefused(f"{src} is over {limit} bytes (the per-file or the remaining total cap)")
         out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             copied = 0
             while chunk := os.read(fd, 1 << 20):
                 copied += len(chunk)
-                if copied > MAX_ARTIFACT:
-                    raise PublishRefused(f"{src} grew past {MAX_ARTIFACT} bytes while it was copied")
+                if copied > limit:
+                    raise PublishRefused(f"{src} grew past {limit} bytes while it was copied (the per-file or "
+                                         "the remaining total cap)")
                 view = memoryview(chunk)
                 while view:
                     view = view[os.write(out, view):]
@@ -488,6 +489,7 @@ def _copy_in(src: str, dst: Path) -> None:
             os.close(out)
     finally:
         os.close(fd)
+    return copied
 
 
 def _sweep(publish_dir: Path) -> None:
@@ -551,9 +553,10 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
     _private_dir(snap)
     try:
         files, idents = [], set()
+        left = MAX_TOTAL          # counted from the bytes actually copied: a file that grows after the check spends it
         for src, name in zip(paths, names):
             dst = snap / name
-            _copy_in(src, dst)
+            left -= _copy_in(src, dst, min(MAX_ARTIFACT, left))
             # the identity is read between two hashes of the copy, so what is shown is what is filed
             digest, size = _sha256(dst)
             idents.add(_identity(index, dst, name))
@@ -608,9 +611,9 @@ def pypi_credentials(target: str) -> dict[str, str]:
             canon = canonical_target(repository.strip())
         except PublishRefused:
             continue
-        if canon == target:
-            found.add((parser.get(section, "username", fallback="").strip(),
-                       parser.get(section, "password", fallback="")))
+        if canon == target:   # only the halves the environment lacks can conflict
+            found.add(("" if env_user else parser.get(section, "username", fallback="").strip(),
+                       "" if env_pass else parser.get(section, "password", fallback="")))
     if len(found) > 1:
         raise PublishRefused(f"two sections of {path} give {target} different credentials; keep one, or set "
                              "TWINE_USERNAME / TWINE_PASSWORD in the environment")
@@ -758,6 +761,10 @@ def _upload(call: dict[str, Any], base: dict[str, Any], argv: list[str], env: di
                 encoding="utf-8", errors="replace", timeout=UPLOAD_TIMEOUT)
         result = _outcome(call, base, p)
         errs = _record(home, key, result, receipt, done)
+        final: Exception | None = (_unknown(call, result, errs) if result.status == "unknown" else
+                                   PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is "
+                                                           f"incomplete: {'; '.join(errs)}", result, errs)
+                                   if errs else None)
     except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is reported, never raw
         if not intent and isinstance(exc, OSError):
             raise                                       # the intent line could not be written; nothing ran
@@ -774,11 +781,8 @@ def _upload(call: dict[str, Any], base: dict[str, Any], argv: list[str], env: di
             raise _unknown(call, result, errs) from exc
         raise PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is incomplete: "
                                       f"{'; '.join(errs)}", result, errs) from exc
-    if result.status == "unknown":
-        raise _unknown(call, result, errs)
-    if errs:
-        raise PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is incomplete: "
-                                      f"{'; '.join(errs)}", result, errs)
+    if final is not None:     # built inside the try: only the raise or the return is left outside it
+        raise final
     return result
 
 
@@ -819,12 +823,12 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
     lock_fd = os.open(home / "publish" / f"{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        _touch(snap)
-        if (why := refusal(call)) is not None:
-            raise PublishRefused(why)
         st = os.lstat(snap)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
             raise PublishRefused(f"the snapshot {snap} is not levain's own private directory")
+        _touch(snap)              # live: a sweep by another run leaves it
+        if (why := refusal(call)) is not None:
+            raise PublishRefused(why)
         for f in call["files"]:
             if _sha256(snap / f["name"]) != (f["sha256"], f["size"]):
                 raise PublishRefused(f"{f['name']} in the snapshot is not the file that was allowed (its bytes changed)")

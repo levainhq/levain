@@ -976,3 +976,24 @@ def test_l_known_edges_a_bare_dot_entry_and_a_metadata_named_file_are_refused(ho
         dot.type = tarfile.DIRTYPE
         _refuse(home, "npm", [npm_tgz(d, extra=[dot])], "member path")
     _refuse(home, "pypi", [wheel(art, extra=[("demo_pkg/METADATA_helpers.py", b"")])], "METADATA")
+
+
+def test_r2_only_the_halves_the_environment_lacks_can_conflict(operator_env, monkeypatch):
+    monkeypatch.delenv("TWINE_USERNAME")
+    _pypirc(operator_env, "[a]\nrepository = http://127.0.0.1:8080\nusername = u\npassword = p1\n\n"
+                          "[b]\nrepository = http://127.0.0.1:8080\nusername = u\npassword = p2\n")
+    assert publish.pypi_credentials(publish.canonical_target("http://127.0.0.1:8080")) == {"TWINE_USERNAME": "u"}
+
+
+def test_r2_the_total_cap_counts_bytes_actually_copied(home, art, monkeypatch):
+    a, b = wheel(art), art / "big.bin"
+    monkeypatch.setattr(publish, "MAX_TOTAL", a.stat().st_size + 10)
+    b.write_bytes(b"x" * 64)
+    left = publish.MAX_TOTAL
+    left -= publish._copy_in(str(a), home / "a.whl", min(publish.MAX_ARTIFACT, left))
+    try:
+        publish._copy_in(str(b), home / "b.bin", min(publish.MAX_ARTIFACT, left))
+    except publish.PublishRefused as exc:
+        assert "remaining total cap" in str(exc)
+    else:
+        raise AssertionError("the second file passed the remaining total")
