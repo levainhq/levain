@@ -10,7 +10,7 @@ import pytest
 
 from levain.dispatch import DispatchError
 from levain.dispatch.outcomes import (BELOW_MIN_N, DENOMINATORS, LABELS, REVERTED_CAVEAT, SOURCES, OutcomeRow,
-                                      OutcomeStore, cell_line, finest_reporting, panel, rollup)
+                                      OutcomeStore, STATS, cell_line, finest_reporting, panel, rollup)
 
 AT = "2026-10-19T12:00:00.000000Z"
 
@@ -31,7 +31,7 @@ def store(tmp_path):
 # --- the row ----------------------------------------------------------------------------------------------------
 
 def test_every_label_has_one_source_and_the_other_is_refused():
-    assert set(SOURCES) == set(LABELS) and len(LABELS) == 14
+    assert set(SOURCES) == set(LABELS) and len(LABELS) == 15
     for label, source in SOURCES.items():
         row(label=label)                                            # its own source is accepted
         other = "human" if source == "machine" else "machine"
@@ -273,9 +273,10 @@ def test_a_failed_run_with_no_verifier_label_is_not_in_the_verifier_n():
     rows += [row(job=f"v{i}", label="verifier_fail") for i in range(2)]
     rows += [row(job=f"f{i}", label="closed_without_adoption") for i in range(12)]   # failed before any verifier
     cell = rollup(rows, min_n=5, now=NOW)[(M,)]
-    assert cell.n == 20 and cell.denominator("verifier_pass") == 8
-    assert cell.rate("verifier_pass") == Fraction(6, 8) and cell.rate("verifier_fail") == Fraction(2, 8)
-    assert "6/8 verifier pass (N=8 with a final verifier label)" in cell_line(cell, "verifier_pass")
+    assert cell.n == 20 and cell.denominator("verifier_pass:black-box") == 8
+    assert cell.rate("verifier_pass:black-box") == Fraction(6, 8) and cell.rate("verifier_fail:black-box") == Fraction(2, 8)
+    assert "6/8 verifier pass (black-box) (N=8 with a final verifier label (black-box))" in cell_line(
+        cell, "verifier_pass:black-box")
 
 
 def test_contrast_planner_and_gated_have_their_own_n():
@@ -287,35 +288,36 @@ def test_contrast_planner_and_gated_have_their_own_n():
     cell = rollup(rows, min_n=3, now=NOW)[(M,)]
     assert (cell.denominator("contrast_clean"), cell.rate("contrast_clean")) == (5, Fraction(3, 5))
     assert (cell.denominator("planner_recommends"), cell.rate("planner_recommends")) == (4, 1)
-    assert (cell.denominator("gated_filed"), cell.rate("gated_allowed")) == (6, Fraction(2, 6))
+    assert (cell.denominator("gated_filed"), cell.denominator("gated_allowed"), cell.counts["gated_allowed"]) == (6, 2, 2)
 
 
 def test_a_label_outside_its_denominator_is_not_counted_in_the_numerator():
-    rows = [row(job="a", label="gated_allowed"), row(job="b", label="gated_filed"), row(job="c", label="adopted")]
+    young = "2026-10-15T12:00:00.000000Z"
+    rows = [at_row(young, job="a"), at_row(young, job="a", label="reverted_14d"), row(job="c", label="adopted")]
     cell = rollup(rows, min_n=1, now=NOW)[(M,)]
-    assert cell.denominator("gated_allowed") == 1 and cell.counts.get("gated_allowed", 0) == 0
-    assert cell.rate("gated_allowed") == 0
+    assert cell.denominator("reverted_14d") == 0 and cell.counts.get("reverted_14d", 0) == 0
 
 
 def test_reverted_n_is_the_adoptions_at_least_14_days_old():
     old, edge, young = "2026-10-01T12:00:00.000000Z", "2026-10-05T12:00:00.000000Z", "2026-10-06T12:00:00.000000Z"
     rows = [at_row(old, job="o1"), at_row(old, job="o2"), at_row(edge, job="e"), at_row(young, job="y"),
             at_row(old, job="o1", label="reverted_14d"), at_row(young, job="y", label="reverted_14d")]
+    rows += [at_row(old, job=j, label="revert_scanned") for j in ("o1", "o2", "e", "y")]
     cell = rollup(rows, min_n=1, now=NOW)[(M,)]
     assert cell.denominator("reverted_14d") == 3                       # exactly 14 days old counts; the younger does not
     assert cell.counts["reverted_14d"] == 1 and cell.rate("reverted_14d") == Fraction(1, 3)
     assert cell_line(cell, "reverted_14d").endswith(REVERTED_CAVEAT)
-    assert "adopted 14 or more days ago" in cell_line(cell, "reverted_14d")
+    assert "adopted 14 or more days ago and revert-scanned" in cell_line(cell, "reverted_14d")
 
 
 def test_min_n_applies_to_each_labels_own_n():
     rows = [row(job=f"a{i}", label="adopted") for i in range(10)] + [row(job="v", label="verifier_pass")]
     cell = rollup(rows, min_n=5, now=NOW)[(M,)]
     assert cell.reporting and cell.rate("adopted") == 1
-    assert cell.rate("verifier_pass") is None and not cell.reporting_for("verifier_pass")
-    assert "N=1 with a final verifier label, below min_n=5" in cell_line(cell, "verifier_pass")
+    assert cell.rate("verifier_pass:black-box") is None and not cell.reporting_for("verifier_pass:black-box")
+    assert "N=1 with a final verifier label (black-box), below min_n=5" in cell_line(cell, "verifier_pass:black-box")
     cells = rollup(rows, min_n=5, now=NOW)
-    assert finest_reporting(cells, (M, "R0"), "verifier_pass") is None
+    assert finest_reporting(cells, (M, "R0"), "verifier_pass:black-box") is None
     assert finest_reporting(cells, (M, "R0"), "adopted").key == (M, "R0")
 
 
@@ -325,14 +327,16 @@ def test_the_rollup_refuses_a_naive_now():
 
 
 def test_every_label_names_its_denominator():
-    assert set(DENOMINATORS) == set(LABELS) and all(DENOMINATORS.values())
+    assert set(DENOMINATORS) == set(STATS) and all(DENOMINATORS.values())
+    assert {s.split(":")[0] for s in STATS} == set(LABELS) - {"revert_scanned"}   # a machine fact, not a rate
 
 
 # --- the panel's data -------------------------------------------------------------------------------------------
 
 def test_panel_shape_counts_n_rate_and_caveats():
     old = "2026-10-01T12:00:00.000000Z"
-    rows = [r for r in runs(12, 9) if r.job_id != "j0"] + [at_row(old, job="j0"), at_row(old, job="j0", label="reverted_14d")]
+    rows = [r for r in runs(12, 9) if r.job_id != "j0"] + [at_row(old, job="j0"), at_row(old, job="j0", label="reverted_14d"),
+                                                           at_row(old, job="j0", label="revert_scanned")]
     cells = rollup(rows, min_n=5, now=NOW)
     p = panel(cells, min_n=5)
     assert p.min_n == 5 and len(p.rows) == 1
@@ -342,7 +346,7 @@ def test_panel_shape_counts_n_rate_and_caveats():
     assert (by["adopted"].count, by["adopted"].n, by["adopted"].rate) == (9, 12, Fraction(3, 4))
     assert by["adopted"].words == "with a final decision" and not by["adopted"].fell_back
     assert by["reverted_14d"].rate == BELOW_MIN_N and (by["reverted_14d"].count, by["reverted_14d"].n) == (1, 1)
-    assert "verifier_pass" not in by                                    # nothing on the path could carry it
+    assert "verifier_pass:black-box" not in by                          # nothing on the path could carry it
     assert REVERTED_CAVEAT in p.caveats
 
 
@@ -353,7 +357,7 @@ def test_panel_falls_back_per_label_and_says_below_min_n_where_no_cell_reaches()
     by = {r.key[3]: {e.label: e for e in r.entries} for r in panel(cells, min_n=10).rows}
     thin = by["rename"]["adopted"]
     assert thin.fell_back and thin.cell == (M, "R0", "codex 0.5") and (thin.count, thin.n) == (23, 33)
-    assert by["rename"]["verifier_pass"].rate == BELOW_MIN_N and by["rename"]["verifier_pass"].n == 1
+    assert by["rename"]["verifier_pass:black-box"].rate == BELOW_MIN_N and by["rename"]["verifier_pass:black-box"].n == 1
 
 
 def test_panel_groups_unknown_answer_rows_apart_and_says_so():
@@ -366,3 +370,91 @@ def test_panel_groups_unknown_answer_rows_apart_and_says_so():
 def test_panel_refuses_a_min_n_other_than_the_rollups():
     with pytest.raises(DispatchError, match="min_n"):
         panel(rollup(runs(6, 3), min_n=5, now=NOW), min_n=2)
+
+
+# --- F7 slice b, fix round 1 ------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("first, second", [("verifier_pass", "verifier_fail"), ("contrast_clean", "contrast_divergent"),
+                                           ("adopted", "closed_without_adoption"),
+                                           ("planner_recommends", "planner_refiles")])
+def test_a_run_cannot_carry_both_labels_of_an_exclusive_pair(store, first, second):
+    assert store.append(row(label=first))
+    assert store.append(row(label=first)) is False                      # the same label again is still a retry
+    for a, b in ((first, second), (second, first)):
+        s = OutcomeStore(store.directory.parent / f"d-{a}")
+        s.append(row(label=a))
+        with pytest.raises(DispatchError, match="new run_index"):
+            s.append(row(label=b))
+        assert len(s.rows()) == 1
+        assert s.append(row(run=1, label=b))                            # a retry is a new run
+
+
+def test_verifier_rates_are_split_by_kind_and_the_in_process_entry_says_it_is_forgeable():
+    rows = [row(job=f"b{i}", label="verifier_pass") for i in range(4)]
+    rows += [row(job=f"i{i}", label="verifier_pass", verifier_kind="in-process") for i in range(6)]
+    rows += [row(job="i9", label="verifier_fail", verifier_kind="in-process")]
+    cell = rollup(rows, min_n=1, now=NOW)[(M,)]
+    assert (cell.denominator("verifier_pass:black-box"), cell.rate("verifier_pass:black-box")) == (4, 1)
+    assert (cell.denominator("verifier_pass:in-process"), cell.rate("verifier_pass:in-process")) == (7, Fraction(6, 7))
+    assert "forgeable by the code under test" in DENOMINATORS["verifier_pass:in-process"]
+    assert "forgeable" not in DENOMINATORS["verifier_pass:black-box"]
+    with pytest.raises(DispatchError, match="per verifier kind"):
+        cell.rate("verifier_pass")                                      # a pooled rate no longer exists
+
+
+def test_gated_rates_divide_by_runs_with_a_gated_call_never_by_calls():
+    """The L1 probe: three runs with a filed gated call, one allowed, two undecided."""
+    rows = [row(job="b", label="gated_filed"), row(job="b", label="gated_undecided"),
+            row(job="c", label="gated_filed"), row(job="c", label="gated_allowed"),
+            row(job="d", label="gated_filed"), row(job="d", label="gated_undecided")]
+    cell = rollup(rows, min_n=1, now=NOW)[(M,)]
+    assert cell.denominator("gated_filed") == 3 and cell.denominator("gated_undecided") == 3
+    assert cell.rate("gated_undecided") == Fraction(2, 3)
+    assert (cell.denominator("gated_allowed"), cell.rate("gated_allowed")) == (1, 1)    # of runs with a decided call
+    assert "runs with a gated call" in cell_line(cell, "gated_filed")
+    assert "calls" not in DENOMINATORS["gated_allowed"] and "calls" not in DENOMINATORS["gated_undecided"]
+
+
+def test_a_run_with_a_decided_gated_call_is_not_also_undecided():
+    rows = [row(job="m", label="gated_filed"), row(job="m", label="gated_undecided"), row(job="m", label="gated_allowed"),
+            row(job="m", label="gated_denied"), row(job="u", label="gated_filed"), row(job="u", label="gated_undecided")]
+    cell = rollup(rows, min_n=1, now=NOW)[(M,)]
+    assert cell.counts["gated_undecided"] == 1 and cell.denominator("gated_undecided") == 2
+    assert cell.denominator("gated_allowed") == 1 and cell.counts["gated_allowed"] == 1
+    assert cell.counts["gated_denied"] == 1          # allowed and denied overlap for a run with mixed calls
+
+
+def test_reverted_divides_by_scanned_adoptions_and_counts_the_unscanned():
+    """Absence of a scan is not health: an old adoption nobody scanned is not a denominator run."""
+    old = "2026-10-01T12:00:00.000000Z"
+    rows = [at_row(old, job=f"s{i}") for i in range(2)] + [at_row(old, job=f"u{i}") for i in range(3)]
+    rows += [at_row(old, job=f"s{i}", label="revert_scanned") for i in range(2)]
+    cell = rollup(rows, min_n=1, now=NOW)[(M,)]
+    assert cell.denominator("reverted_14d") == 2 and cell.unscanned == 3 and cell.rate("reverted_14d") == 0
+    none_scanned = rollup(rows[:5], min_n=1, now=NOW)[(M,)]
+    assert none_scanned.denominator("reverted_14d") == 0 and none_scanned.unscanned == 5
+    assert SOURCES["revert_scanned"] == "machine"
+    e = {e.label: e for e in panel(rollup(rows[:5], min_n=1, now=NOW), min_n=1).rows[0].entries}["reverted_14d"]
+    assert e.unscanned == 5 and e.n == 0
+
+
+def test_panel_entries_carry_runs_awaiting_a_decision():
+    rows = runs(10, 6) + [row(job=f"w{i}", label="verifier_pass") for i in range(4)]
+    e = {e.label: e for e in panel(rollup(rows, min_n=3, now=NOW), min_n=3).rows[0].entries}
+    assert (e["adopted"].n, e["adopted"].pending) == (10, 4) and e["closed_without_adoption"].pending == 4
+    assert e["verifier_pass:black-box"].pending == 0
+
+
+def test_panel_standing_caveat_says_rates_are_not_model_quality():
+    p = panel(rollup(runs(6, 3), min_n=3, now=NOW), min_n=3)
+    assert any("not model quality" in c and "template" in c for c in p.caveats)
+    assert any("not model quality" in c for c in panel({}, min_n=3).caveats)
+
+
+def test_a_below_min_entry_reports_the_coarsest_nonzero_n_on_its_path():
+    rows = runs(30, 20, tag="a") + [row(job="v1", label="verifier_pass", template="rename"),
+                                    row(job="v2", label="verifier_pass", template="other", route="R1")]
+    cells = rollup(rows, min_n=10, now=NOW)
+    by = {r.key[1:]: {e.label: e for e in r.entries} for r in panel(cells, min_n=10).rows}
+    e = by[("R0", "codex 0.5", "rename")]["verifier_pass:black-box"]
+    assert e.rate == BELOW_MIN_N and e.n == 2 and e.cell == (M,)        # the model's own cell, not the 1-run leaf

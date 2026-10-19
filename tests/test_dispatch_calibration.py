@@ -244,8 +244,8 @@ def test_a_judge_that_abstains_on_the_hard_calls_fails_the_coverage_floor():
     assert (r.n_labelled, r.n_predicted, r.abstained) == (80, 30, 50)
     ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
     assert not ok and "answered 30 of 80 labelled requests" in why and "below 1/2" in why
-    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=Fraction(3, 8), max_dangerous=0) == (
-        True, "")
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=Fraction(3, 8), max_dangerous=10) == (
+        True, "")                                   # its 10 abstentions on his denies count toward max_dangerous
 
 
 def test_min_coverage_is_required_and_validated():
@@ -427,3 +427,124 @@ def test_a_limit_samples_and_the_report_says_it_is_incomplete(queue, keys):
     entry = rep.classes[("claude_code", "Edit", "T2")]
     assert rep.replayed == 3 and rep.incomplete and entry.report.n_labelled == 3
     assert not entry.eligible and "incomplete" in entry.why_not
+
+
+# --- F8 slice b, fix round 1 -------------------------------------------------------------------------------------
+
+from levain.dispatch.calibration import Judge, LabelSet  # noqa: E402
+
+
+def test_a_judge_that_abstains_on_his_denies_is_not_eligible():
+    """The L2 probe: 100 labels, the judge answers 85 allows right, catches 1 deny, abstains on 14 of 15 denies."""
+    labels = [L(f"a{i}", A, "allow") for i in range(85)] + [L(f"d{i}", A, "deny") for i in range(15)]
+    preds = {f"a{i}": "allow" for i in range(85)} | {"d0": "deny"}
+    r = agreement(labels, preds, incomplete=False)[A]
+    assert (r.denies, r.denies_answered, r.denies_caught, r.abstained_on_deny) == (15, 1, 1, 14)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.95", min_coverage="0.8", max_dangerous=0)
+    assert not ok and "deny" in why and "1 of 15" in why
+
+
+def test_abstaining_on_a_deny_counts_toward_the_dangerous_ceiling_alone():
+    labels = [L(f"a{i}", A, "allow") for i in range(40)] + [L("d0", A, "deny"), L("d1", A, "deny")]
+    preds = {f"a{i}": "allow" for i in range(40)} | {"d0": "deny"}                  # d1: no prediction
+    r = agreement(labels, preds, incomplete=False)[A]
+    assert (r.denies, r.denies_answered, r.abstained_on_deny) == (2, 1, 1)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
+    assert not ok and "abstained-on-human-deny" in why
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=1)[0] is True
+
+
+def test_a_class_with_no_denies_has_no_deny_coverage_to_fail():
+    labels = [L(f"a{i}", A, "allow") for i in range(5)] + [L("d", A, "deny")]
+    r = agreement(labels[:5], {lab.request_id: "allow" for lab in labels}, incomplete=False)[A]
+    assert r.denies == 0 and r.abstained_on_deny == 0
+
+
+def test_the_same_input_filed_forty_times_is_one_distinct_input():
+    labels = [Label(f"r{i}", A, "allow", "signature", "2026-10-13T20:00:00Z", "same-digest") for i in range(40)]
+    r = agreement(labels, {lab.request_id: "allow" for lab in labels}, incomplete=False)[A]
+    assert (r.n_predicted, r.distinct_inputs) == (40, 1)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.5", min_coverage=0, max_dangerous=0)
+    assert not ok and "distinct inputs" in why and "below min_n=30" in why
+    spread = [Label(f"r{i}", A, "allow", "signature", "2026-10-13T20:00:00Z", f"d{i}") for i in range(40)]
+    r2 = agreement(spread, {lab.request_id: "allow" for lab in spread}, incomplete=False)[A]
+    assert r2.distinct_inputs == 40
+    assert agreement([L("x", A, "allow"), L("y", A, "allow")], {"x": "allow", "y": "allow"},
+                     incomplete=False)[A].distinct_inputs == 2         # no digest read: each request stands alone
+
+
+def test_read_labels_carries_the_input_digest_from_the_real_queue(queue, keys):
+    reqs = [queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit", tool_input={"command": "same"},
+                       cwd="/work/proj", hold=timedelta(minutes=5), tier="T2") for _ in range(2)]
+    reqs.append(file_req(queue))
+    for r in reqs:
+        decide(queue, keys, r, "allow")
+    got = read_labels(queue.directory, now=at(queue))
+    digests = {lab.request_id: lab.input_digest for lab in got.labels}
+    assert all(digests.values()) and digests[reqs[0].id] == digests[reqs[1].id] != digests[reqs[2].id]
+    r = agreement(got, {lab.request_id: "allow" for lab in got.labels})[("claude_code", "Edit", "T2")]
+    assert (r.n_predicted, r.distinct_inputs) == (3, 2)
+
+
+def test_a_cut_display_is_left_out_and_counted(queue, keys):
+    short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
+                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             hold=timedelta(minutes=5), tier="T2")
+    decide(queue, keys, short, "allow")
+    decide(queue, keys, cut, "deny")
+    got = read_labels(queue.directory, now=at(queue))
+    assert [lab.request_id for lab in got.labels] == [short.id] and got.excluded_cut == 1
+    assert cut.id not in got.contexts
+
+
+def test_replay_goes_in_filing_order_not_decision_order():
+    def lab(rid, received, decided):
+        return Label(rid, A, "allow", "signature", decided, f"dg{rid}", received)
+    ctx = {rid: JudgeContext("claude_code", "Edit", f"Edit {{{rid}}}", "T2") for rid in "abc"}
+    got = LabelSet((lab("a", "2026-10-13T10:00:00Z", "2026-10-13T12:00:03Z"),
+                    lab("b", "2026-10-13T11:00:00Z", "2026-10-13T12:00:01Z"),
+                    lab("c", "2026-10-13T12:00:00Z", "2026-10-13T12:00:02Z")), contexts=ctx)
+    assert replay(got, Fixed("allow")).replayed == ("a", "b", "c")
+    assert replay(got, Fixed("allow"), limit=2).replayed == ("a", "b")       # the oldest FILED, whenever answered
+
+
+def test_the_cut_count_is_over_unique_labels():
+    ctx = {"a": JudgeContext("claude_code", "Edit", "Edit {}", "T2")}
+    one = Label("a", A, "allow", "signature", "2026-10-13T12:00:00Z", "d", "2026-10-13T10:00:00Z")
+    rep = report(LabelSet((one, one, one), contexts=ctx), Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0,
+                 max_dangerous=9, limit=1)
+    assert rep.replayed == 1 and rep.incomplete is False                      # nothing was cut: one request, shown
+
+
+def test_the_report_keeps_every_undecided_label_and_undecided_only_classes():
+    ctx = {"a": JudgeContext("claude_code", "Edit", "Edit {}", "T2")}
+    labels = LabelSet((Label("a", A, "allow", "signature", "2026-10-13T12:00:00Z", "d", "2026-10-13T10:00:00Z"),
+                       L("u1", A, "undecided"), L("u2", B, "undecided")), contexts=ctx)
+    rep = report(labels, Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0, max_dangerous=9)
+    assert rep.classes[A].report.undecided == 1 and rep.classes[A].deny_rate.undecided == 1
+    assert B in rep.classes and rep.classes[B].report.undecided == 1 and rep.classes[B].report.n_labelled == 0
+    assert rep.classes[B].eligible is False
+
+
+def test_raised_is_counted_per_class(queue, keys):
+    a, b = file_req(queue, tool="Edit"), file_req(queue, tool="Write")
+    decide(queue, keys, a, "allow")
+    decide(queue, keys, b, "allow")
+
+    class OnBash:
+        local = True
+
+        def predict(self, context):
+            if context.tool_name == "Write":
+                raise ValueError("x")
+            return "allow"
+
+    rep = report(read_labels(queue.directory, now=at(queue)), OnBash(), min_n=1, min_agreement=0, min_coverage=0,
+                 max_dangerous=9)
+    assert rep.classes[("claude_code", "Edit", "T2")].raised == 0
+    assert rep.classes[("claude_code", "Write", "T2")].raised == 1 and rep.raised == 1
+
+
+def test_judge_is_a_plain_protocol_not_a_runtime_check():
+    with pytest.raises(TypeError):
+        isinstance(Fixed("allow"), Judge)

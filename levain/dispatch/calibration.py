@@ -28,6 +28,12 @@ belongs to that gateway, not to this layer. So :func:`replay` refuses any judge 
 API client from being wired in by accident until a gateway-backed judge exists.
 
 The honest limit is stated once, in :data:`CAVEAT`, and repeated by every report that prints a number. Stdlib only.
+
+Known edges, by design here: a late ruling is pooled with the answers given at the gate, though it is a judgment made
+with more time and the outcome in view; the action class is (agent, tool, tier), which can be wider than the grant the
+M17 card would propose, so check the class against the grant before the card consumes ``eligible``; requests whose
+display was cut at its limit are left out and counted, since neither a judge nor the operator could see their whole
+input.
 """
 from __future__ import annotations
 
@@ -36,9 +42,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
-from levain.consent.listing import ConsentEntry, read_listing
+from levain.consent.listing import UNSHOWN, ConsentEntry, filed_input, read_listing
 from levain.dispatch import DispatchError
 
 __all__ = ["ActionClass", "CAVEAT", "ClassReport", "DEFAULT_SPAN", "Judge", "JudgeContext", "Label", "LabelSet",
@@ -58,12 +64,16 @@ ActionClass = tuple[str, str, str]      # (agent, tool_name, tier)
 @dataclass(frozen=True)
 class Label:
     """One decided (or undecided) request. ``decision`` is ``allow``, ``deny`` or ``undecided``; ``via`` is
-    ``signature`` (an answer) or ``ruling`` (a late ruling), ``None`` for an undecided one."""
+    ``signature`` (an answer) or ``ruling`` (a late ruling), ``None`` for an undecided one. ``input_digest`` is the
+    request's tool-input digest (``None`` when unknown), the identity of what was asked; ``received_at`` is when it
+    was filed, the order a replay goes in."""
     request_id: str
     action_class: ActionClass
     decision: str
     via: str | None
     decided_at: str | None
+    input_digest: str | None = None
+    received_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,12 +82,13 @@ class LabelSet:
     (see the module docstring), how many rows the reader skipped because they did not check out, and whether the set
     is ``incomplete``: the queue listing overflowed its cap (more undecided requests than it reads, or more pending,
     which it does not tell apart), so some requests were not read at all. Every report built from an incomplete set
-    says so, and :func:`proposal_eligible` refuses it. ``contexts`` maps a request id to what a judge may see of it
-    (:class:`JudgeContext`)."""
+    says so, and :func:`proposal_eligible` refuses it. ``excluded_cut`` counts requests left out because their display
+    was cut at its limit. ``contexts`` maps a request id to what a judge may see of it (:class:`JudgeContext`)."""
     labels: tuple[Label, ...] = ()
     excluded_grants: int = 0
     skipped: int = 0
     incomplete: bool = False
+    excluded_cut: int = 0
     contexts: Mapping[str, "JudgeContext"] = field(default_factory=dict, compare=False)
 
 
@@ -111,20 +122,28 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
     listing = read_listing(directory, now=now, span=span, cap=_NO_CAP)
     labels: list[Label] = []
     contexts: dict[str, JudgeContext] = {}
-    grants = 0
+    grants = cut = 0
     for entry in (*listing.recent, *listing.undecided):
+        if entry.state not in ("undecided", "allowed", "denied") or entry.via == "grant":
+            grants += entry.state in ("allowed", "denied")
+            continue
+        # an allowed or denied row with any via other than signature or ruling carries no signed judgment this layer
+        # can name: left out
+        if entry.state != "undecided" and entry.via not in ("signature", "ruling"):
+            continue
+        if filed_input(entry.request) is UNSHOWN:
+            cut += 1                                    # nobody saw the whole input: not a label a judge can be scored on
+            continue
+        r = entry.request
         if entry.state == "undecided":
-            labels.append(Label(entry.request.id, _class_of(entry), "undecided", None, entry.decided_at))
-        elif entry.state in ("allowed", "denied"):
-            if entry.via == "grant":
-                grants += 1
-            elif entry.via in ("signature", "ruling"):
-                contexts[entry.request.id] = _context_of(entry)
-                labels.append(Label(entry.request.id, _class_of(entry), "allow" if entry.state == "allowed" else "deny",
-                                    entry.via, entry.decided_at))
-            # an allowed or denied row with any other via carries no signed judgment this layer can name: left out
-    labels.sort(key=lambda lab: (lab.decided_at or "", lab.request_id))
-    return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow, contexts)
+            labels.append(Label(r.id, _class_of(entry), "undecided", None, entry.decided_at, r.tool_input_digest,
+                                r.received_at))
+        else:
+            contexts[r.id] = _context_of(entry)
+            labels.append(Label(r.id, _class_of(entry), "allow" if entry.state == "allowed" else "deny", entry.via,
+                                entry.decided_at, r.tool_input_digest, r.received_at))
+    labels.sort(key=lambda lab: (lab.received_at or "", lab.request_id))
+    return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow, cut, contexts)
 
 
 def _unique(labels: Iterable[Label] | LabelSet, incomplete: bool | None) -> tuple[list[Label], bool]:
@@ -195,7 +214,12 @@ class ClassReport:
     ``deny_rate`` his rate over every labelled request of the class. ``baseline_agreement`` is what an always-allow judge
     would have scored over the SAME predicted requests (his allows among them over ``n_predicted``), which is the
     number the judge has to beat; over all labels that is ``1 - deny_rate``. ``incomplete``: the labels came from a
-    set that did not read every request, so the counts may be short; :func:`proposal_eligible` refuses it."""
+    set that did not read every request, so the counts may be short; :func:`proposal_eligible` refuses it.
+
+    The deny side of his record: ``denies`` of the labelled requests, ``denies_answered`` of those the judge answered,
+    ``denies_caught`` the ones it denied too, ``abstained_on_deny`` the ones it passed on (each one a call it would
+    not have stopped). ``distinct_inputs`` the distinct tool inputs among the predicted requests: the same input filed
+    forty times is forty requests and one input, and a request with no digest read stands alone."""
     action_class: ActionClass
     n_labelled: int
     n_predicted: int
@@ -208,6 +232,11 @@ class ClassReport:
     undecided: int = 0
     caveat: str = field(default=CAVEAT, compare=False)
     incomplete: bool = False
+    denies: int = 0
+    denies_answered: int = 0
+    denies_caught: int = 0
+    abstained_on_deny: int = 0
+    distinct_inputs: int = 0
 
     @property
     def agreement(self) -> Fraction | None:
@@ -229,10 +258,11 @@ def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str]
             raise DispatchError(f"prediction for {rid!r} must be one of {', '.join(PREDICTIONS)}: {said!r}")
     unique, incomplete = _unique(labels, incomplete)
     seen: dict[ActionClass, dict[str, int]] = {}
+    inputs: dict[ActionClass, set[str]] = {}
     for lab in unique:
         t = seen.setdefault(lab.action_class, dict.fromkeys(
             ("labelled", "denied", "predicted", "agree", "dangerous", "costly", "abstained", "undecided",
-             "predicted_allowed"), 0))
+             "predicted_allowed", "denies_answered", "denies_caught", "abstained_on_deny"), 0))
         if lab.decision == "undecided":
             t["undecided"] += 1
             continue
@@ -241,8 +271,13 @@ def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str]
         said = predictions.get(lab.request_id, "abstain")
         if said == "abstain":
             t["abstained"] += 1
+            t["abstained_on_deny"] += lab.decision == "deny"
             continue
         t["predicted"] += 1
+        inputs.setdefault(lab.action_class, set()).add(lab.input_digest or f"request:{lab.request_id}")
+        if lab.decision == "deny":
+            t["denies_answered"] += 1
+            t["denies_caught"] += said == "deny"
         t["predicted_allowed"] += lab.decision == "allow"
         if said == lab.decision:
             t["agree"] += 1
@@ -256,7 +291,9 @@ def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str]
             cls, t["labelled"], t["predicted"], t["agree"], t["dangerous"], t["costly"], t["abstained"],
             Fraction(t["denied"], t["labelled"]) if t["labelled"] else None,
             Fraction(t["predicted_allowed"], t["predicted"]) if t["predicted"] else None, t["undecided"],
-            incomplete=incomplete)
+            incomplete=incomplete, denies=t["denied"], denies_answered=t["denies_answered"],
+            denies_caught=t["denies_caught"], abstained_on_deny=t["abstained_on_deny"],
+            distinct_inputs=len(inputs.get(cls, ())))
     return out
 
 
@@ -272,13 +309,14 @@ def _fraction(name: str, value: object) -> Fraction:
 def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fraction | int | float | str,
                       min_coverage: Fraction | int | float | str, max_dangerous: int) -> tuple[bool, str]:
     """Whether a class's measured agreement is enough for the M17 card to PROPOSE a grant for that class:
-    ``(True, "")``, or ``(False, reason)`` naming every test that failed. All must hold: at least ``min_n`` predicted
-    requests, agreement over those at least ``min_agreement``, coverage (predicted over labelled: how much of his
-    record the judge was willing to answer) at least ``min_coverage``, a COMPLETE label set (not ``incomplete``), at
-    most ``max_dangerous``
-    judge-allow-human-deny disagreements, and agreement strictly above the always-allow baseline (a judge that merely
-    says allow scores the same without reading anything). The coverage floor is required: without it a judge that
-    abstains on every hard call can pass on the easy ones.
+    ``(True, "")``, or ``(False, reason)`` naming every test that failed. All must hold: at least ``min_n`` DISTINCT
+    inputs among the predicted requests, agreement over those at least ``min_agreement``, coverage (predicted over
+    labelled: how much of his record the judge was willing to answer) at least ``min_coverage``, deny coverage (his
+    denies the judge answered, over his denies) at least ``min_coverage`` too, a COMPLETE label set (not
+    ``incomplete``), at most ``max_dangerous`` of judge-allow-human-deny disagreements plus abstentions on his denies
+    (a deny the judge would not stop is as open as one it would allow), and agreement strictly above the always-allow
+    baseline (a judge that merely says allow scores the same without reading anything). The coverage floors are
+    required: without them a judge that abstains on every hard call can pass on the easy ones.
 
     This PROPOSES only. It signs nothing and grants nothing: the operator signs any grant, with the report and
     :data:`CAVEAT` in front of him, and a ``True`` here is only the card's permission to show the offer."""
@@ -293,18 +331,24 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
     why: list[str] = []
     if report.incomplete:
         why.append("the label set is incomplete (the queue listing overflowed its cap), so its counts may be short")
-    if report.n_predicted < min_n:
-        why.append(f"only {report.n_predicted} predicted requests, below min_n={min_n}")
+    if report.distinct_inputs < min_n:
+        why.append(f"only {report.distinct_inputs} distinct inputs among {report.n_predicted} predicted requests, "
+                   f"below min_n={min_n}")
     coverage = Fraction(report.n_predicted, report.n_labelled) if report.n_labelled else None
     if coverage is None or coverage < coverage_floor:
         why.append(f"the judge answered {report.n_predicted} of {report.n_labelled} labelled requests, coverage "
+                   f"below {coverage_floor}")
+    if report.denies and Fraction(report.denies_answered, report.denies) < coverage_floor:
+        why.append(f"the judge answered {report.denies_answered} of {report.denies} of his denies, deny coverage "
                    f"below {coverage_floor}")
     got = report.agreement
     if got is None or got < floor:
         shown = "no agreement measurable" if got is None else f"agreement {got} is below {floor}"
         why.append(shown)
-    if report.judge_allow_human_deny > max_dangerous:
-        why.append(f"{report.judge_allow_human_deny} judge-allow-human-deny disagreements, above {max_dangerous}")
+    open_denies = report.judge_allow_human_deny + report.abstained_on_deny
+    if open_denies > max_dangerous:
+        why.append(f"{report.judge_allow_human_deny} judge-allow-human-deny disagreements and "
+                   f"{report.abstained_on_deny} abstained-on-human-deny, above {max_dangerous}")
     base = report.baseline_agreement
     if got is None or base is None or got <= base:
         why.append(f"does not beat the always-allow baseline ({base}) over the same requests")
@@ -313,7 +357,6 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
 
 # --- the judge replay ------------------------------------------------------------------------------------------
 
-@runtime_checkable
 class Judge(Protocol):
     """A candidate decision model. ``local`` must be ``True`` for :func:`replay` to run it (see the module
     docstring). ``predict`` gets the request as a :class:`JudgeContext` and returns ``"allow"``, ``"deny"`` or
@@ -335,8 +378,9 @@ class Replay:
 
 
 def replay(labels: LabelSet, judge: Judge, *, limit: int | None = None) -> Replay:
-    """Show ``judge`` each allow/deny request in ``labels`` (oldest decision first; at most ``limit``) and record its
-    answer. Undecided requests are not shown: there is no human judgment to score. A judge exception is an
+    """Show ``judge`` each allow/deny request in ``labels`` (oldest FILED first, by ``received_at``; at most
+    ``limit``) and record its answer. The order is filing order, never decision order: a limit that took the earliest
+    decisions would sample the requests he answered fastest, which are not a fair sample of the record. Undecided requests are not shown: there is no human judgment to score. A judge exception is an
     ``abstain`` recorded with its class name, never a crash and never a guess. ``labels`` must be a
     :class:`LabelSet` from :func:`read_labels`: a bare list carries no request content to show."""
     if getattr(judge, "local", None) is not True or not callable(getattr(judge, "predict", None)):
@@ -347,7 +391,8 @@ def replay(labels: LabelSet, judge: Judge, *, limit: int | None = None) -> Repla
     if limit is not None and (type(limit) is not int or limit < 0):
         raise DispatchError("limit must be a non-negative integer")
     unique, _ = _unique(labels, None)
-    todo = [lab for lab in unique if lab.decision != "undecided"]
+    todo = sorted((lab for lab in unique if lab.decision != "undecided"),
+                  key=lambda lab: (lab.received_at or "", lab.request_id))
     if limit is not None:
         todo = todo[:limit]
     predictions: dict[str, str] = {}
@@ -371,11 +416,13 @@ def replay(labels: LabelSet, judge: Judge, *, limit: int | None = None) -> Repla
 @dataclass(frozen=True)
 class ClassEntry:
     """One action class in a :class:`ReplayReport`: the agreement report, his deny rate, and the proposal verdict
-    (``eligible`` and ``why_not``; the card may show an offer only on ``True``)."""
+    (``eligible`` and ``why_not``; the card may show an offer only on ``True``), and ``raised``: this class's requests
+    where the judge raised or answered outside the three words."""
     report: ClassReport
     deny_rate: DenyRate
     eligible: bool
     why_not: str
+    raised: int = 0
 
 
 @dataclass(frozen=True)
@@ -394,11 +441,17 @@ def report(labels: LabelSet, judge: Judge, *, min_n: int, min_agreement: Fractio
            min_coverage: Fraction | int | float | str, max_dangerous: int, limit: int | None = None) -> ReplayReport:
     """:func:`replay` + :func:`agreement` + :func:`deny_rate` + :data:`CAVEAT` + :func:`proposal_eligible`, per action
     class. The thresholds are required: this layer owns no default for what is enough. A ``limit`` that cut the
-    replay marks the report incomplete, since the unreplayed requests would otherwise read as abstentions."""
+    replay marks the report incomplete, since the unreplayed requests would otherwise read as abstentions. Every
+    undecided label is kept in the sample (none is replayed), so a class with only undecided requests still appears."""
     run = replay(labels, judge, limit=limit)
     shown = set(run.replayed)
-    sample = [lab for lab in labels.labels if lab.request_id in shown]
-    cut = limit is not None and len(run.replayed) < sum(1 for lab in labels.labels if lab.decision != "undecided")
+    unique, _ = _unique(labels, None)
+    sample = [lab for lab in unique if lab.request_id in shown or lab.decision == "undecided"]
+    cut = limit is not None and len(run.replayed) < sum(1 for lab in unique if lab.decision != "undecided")
+    class_of = {lab.request_id: lab.action_class for lab in unique}
+    raised_in: dict[ActionClass, int] = {}
+    for rid in run.raised:
+        raised_in[class_of[rid]] = raised_in.get(class_of[rid], 0) + 1
     incomplete = labels.incomplete or cut
     agreed = agreement(sample, run.predictions, incomplete=incomplete)
     rates = deny_rate(sample, incomplete=incomplete)
@@ -406,5 +459,5 @@ def report(labels: LabelSet, judge: Judge, *, min_n: int, min_agreement: Fractio
     for cls, rep_ in agreed.items():
         ok, why = proposal_eligible(rep_, min_n=min_n, min_agreement=min_agreement, min_coverage=min_coverage,
                                     max_dangerous=max_dangerous)
-        classes[cls] = ClassEntry(rep_, rates[cls], ok, why)
+        classes[cls] = ClassEntry(rep_, rates[cls], ok, why, raised_in.get(cls, 0))
     return ReplayReport(classes, len(run.replayed), len(run.raised), incomplete)
