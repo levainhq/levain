@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Context meter in the Sessions view.** Each Claude Code and Codex session shows how much context it holds now ("context
+  142K"; Codex "context 80K of 258K"), and says when it passes 200K (a fixed warn line, not the model's window). Read from
+  the session's own transcript; a display, it decides nothing.
+
+### Known edges
+- Claude Code's transcript does not say which context window a session has, so the meter shows tokens and the 200K warn
+  line, never a percentage, for Claude Code.
+- A session started by an older install's hooks, under a relocated `CLAUDE_CONFIG_DIR`, shows "context not read" until its
+  hooks are updated (`levain update`).
+
 ## [0.11.8] — 2026-10-19
 
 ### Added
