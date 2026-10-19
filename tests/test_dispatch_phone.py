@@ -393,3 +393,31 @@ def test_a_lease_that_lapses_between_challenge_and_answer_is_409(world) -> None:
         err = refused(dp.step, job2.id, "answer", {"payload": c["payload"], **world["phone"].assertion(c["challenge"])})
     assert (err.status, err.error) == (409, "conflict") and "nothing was signed" in err.message
     assert JobStore(world["qdir"]).get(job2.id).state == "failed"
+
+
+# --- fix round 2 -----------------------------------------------------------------------------------------------------
+
+def test_a_job_with_no_history_is_skipped_and_counted_never_blanks_the_listing(world) -> None:
+    good = file_job(world, write=("src/a.py",))
+    bad = file_job(world, write=("src/new.py",))
+    conn = sqlite3.connect(world["qdir"] / DB_NAME)
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'transitions'").fetchall():
+        conn.execute(f'DROP TRIGGER "{name}"')                # append-only in the store; a damaged file is not
+    conn.execute("DELETE FROM transitions WHERE job_id = ?", (bad.id,))
+    conn.commit()
+    conn.close()
+    records, note, overflow = phone_for(world).pending()
+    assert [r["id"] for r in records] == [good.id] and overflow == 0
+    assert note and "1 dispatch job" in note and bad.id in note and "not shown" in note
+
+
+def test_a_signer_lookup_that_hits_the_authority_or_the_disk_is_a_note_never_a_raise(world) -> None:
+    from levain.authority import AuthorityError
+
+    file_job(world)
+    for exc in (AuthorityError("the anchor cannot be read"), OSError("disk gone")):
+        def broken(exc=exc):
+            raise exc
+
+        (r,) = phone_for(world, keys=broken).pending()[0]
+        assert r["signers"] == [] and str(exc) in r["signer_note"]

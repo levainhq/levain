@@ -73,13 +73,14 @@ class DispatchPhone:
 
     def _signers(self) -> tuple[dict[str, Any], str]:
         """The passkeys that may sign here (class covering SIGN_TIER), by fingerprint, and a note when there are none."""
+        from levain.authority import AuthorityError
         from levain.consent.queue import class_covers
         from levain.consent.sign import SignRefused
         from levain.dispatch.sign import SIGN_TIER
 
         try:
             keys = self._keys()
-        except SignRefused as exc:
+        except (SignRefused, AuthorityError, OSError) as exc:
             return {}, str(exc)
         ok = {fp: k for fp, k in keys.items() if class_covers(k.key_class, SIGN_TIER)}
         if not ok:
@@ -115,19 +116,30 @@ class DispatchPhone:
             store = self._store()
             if store is None:
                 return [], None, 0
-            live = [j for j in store.list() if j.state not in TERMINAL]
-            live.sort(key=lambda j: (j.filed_at, j.id), reverse=True)
-            shown = live[:PENDING_CAP]
-            signers, note = self._signers() if shown else ({}, "")
+            jobs = store.list()
             now = utc_stamp(self._clock())
         except (DispatchError, OSError, sqlite3.Error) as exc:
             return [], f"the dispatch store cannot be read: {type(exc).__name__}: {exc}", 0
-        rows: list[dict[str, Any]] = []
+        # state, filtering and sorting are per job: a row with no history is left off and counted, never the listing
         bad: list[str] = []
+        live: list[Any] = []
+        for j in jobs:
+            try:
+                if j.state not in TERMINAL:
+                    live.append((j.filed_at, j.id, j))
+            except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+                bad.append(f"{getattr(j, 'id', '?')} ({type(exc).__name__})")
+        live = [j for _f, _i, j in sorted(live, key=lambda t: (t[0], t[1]), reverse=True)]
+        shown = live[:PENDING_CAP]
+        try:
+            signers, note = self._signers() if shown else ({}, "")
+        except (DispatchError, OSError, sqlite3.Error) as exc:
+            return [], f"the dispatch store cannot be read: {type(exc).__name__}: {exc}", 0
+        rows: list[dict[str, Any]] = []
         for j in shown:
             try:
                 rows.append(self.record(j, now, list(signers), note))
-            except (DispatchError, ValueError, KeyError, TypeError) as exc:
+            except (DispatchError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
                 bad.append(f"{j.id} ({type(exc).__name__})")
         skipped = None if not bad else (f"{len(bad)} dispatch job{'s' if len(bad) != 1 else ''} could not be read "
                                         f"and {'are' if len(bad) != 1 else 'is'} not shown: {', '.join(bad)}")

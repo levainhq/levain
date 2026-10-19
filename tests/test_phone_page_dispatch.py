@@ -157,3 +157,67 @@ def test_the_passkey_picker_names_the_act_it_signs(world, tmp_path: Path) -> Non
     assert sign_pick.startswith(f"pick a passkey to SIGN job {job.id}"), sign_pick
     assert cancel_pick.startswith(f"pick a passkey to CANCEL job {job.id}"), cancel_pick
     assert out["posts"] == []                                   # a pick is asked for before anything is sent
+
+
+# --- fix round 2 -----------------------------------------------------------------------------------------------------
+
+@needs_browser
+def test_the_closed_card_shows_the_job_id_and_state_and_a_whole_blob_is_one_tap_away(world, tmp_path: Path) -> None:
+    job = file_job(world)
+    blob = next(e.blob for e in job.contract.read + job.contract.write if e.mode != "new")
+    assert len(blob) >= 40
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"until": CARD + " && 1"},
+            {"eval": "[...document.querySelectorAll('article.dispatch .chips .chip')].map(x => x.textContent)"},
+            {"eval": "[...document.querySelectorAll('article.dispatch details li')].map(x => x.textContent)"},
+            {"eval": "(() => { const t = document.querySelector('article.dispatch details li [role=button]'); t.click();"
+                     " return document.querySelector('article.dispatch details').textContent; })()"},
+        ])
+    chips, lis, opened = out["values"][1], out["values"][2], out["values"][3]
+    assert f"job {job.id}" in chips and "state filed" in chips, chips            # visible on the closed card
+    assert not any(blob in x for x in lis)                                  # the closed form is the short one
+    assert blob in opened, opened                                           # a tap shows it whole
+
+
+FETCH_HOOK = """(() => { const f = window.fetch; window.__gets = 0; window.fetch = (u, o) => {
+  if (String(u).includes('consent.json')) window.__gets++; return f(u, o); }; return 1; })()"""
+
+
+@needs_browser
+def test_a_missing_template_or_budget_field_draws_a_question_mark_never_undefined(world, tmp_path: Path) -> None:
+    file_job(world)
+    strip = """(() => { const f = window.fetch; window.fetch = (u, o) => f(u, o).then(r => !String(u).includes('consent.json') ? r :
+      r.json().then(j => { for (const d of j.dispatch_pending) { delete d.template.k; delete d.template.tier;
+        delete d.budget.tokens; delete d.budget.tool_calls; delete d.budget.dollars_cents; }
+        return new Response(JSON.stringify(j), { status: 200 }); })); document.getElementById('refresh').click(); return 1; })()"""
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": strip},
+            {"until": CARD + ".querySelector('.facts').textContent.includes('?') && " + CARD + ".textContent"},
+        ])
+    text = out["values"][2]
+    assert isinstance(text, str), out                                       # the redrawn card, not a timeout
+    assert "undefined" not in text and "NaN" not in text and "null" not in text, text
+
+
+@needs_browser
+def test_leaving_the_reason_box_redraws_the_card(world, tmp_path: Path) -> None:
+    file_job(world)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": FETCH_HOOK},
+            {"eval": CANCEL_TAP},                                           # opens and focuses the reason box
+            {"eval": "document.querySelector('article.dispatch input.reason').focus() || 1"},
+            # a headless page may not hold window focus, so the blur is sent as the event too
+            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.blur();"
+                     " i.dispatchEvent(new Event('blur')); return window.__gets; })()"},
+            {"until": "window.__gets >= 1 && window.__gets", "ms": 4000},
+        ])
+    assert out["values"][5] >= 1, out

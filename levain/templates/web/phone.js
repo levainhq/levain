@@ -438,6 +438,20 @@
     return d.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   }
 
+  // a blob hash: the 12-char head, the whole hash on a tap (what the signature binds is reachable in full)
+  function blobTap(full) {
+    const short = full.slice(0, 12);
+    if (full.length <= 12) return el("code", "dg-val", full);
+    const code = el("code", "dg-val", short);
+    code.tabIndex = 0;
+    code.setAttribute("role", "button");
+    let open = false;
+    const flip = () => { open = !open; code.textContent = open ? full : short; };
+    code.addEventListener("click", flip);
+    code.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); flip(); } });
+    return code;
+  }
+
   const reasons = new Map();  // job id -> the cancel reason being typed, kept across redraws (open while present)
 
   // a dispatch job (levain.dispatch.phone): built with the phone app's card markup (row, title, chips, acts) so one
@@ -455,13 +469,15 @@
     card.appendChild(el("div", "title", (t.id || "dispatch job") + (repo ? " in " + repo : "")));
     const chips = el("div", "chips");
     const filed = r.state === "filed";
-    for (const text of ["dispatch", r.agent || "no agent named", filed ? "sign by " + readable(r.lease_end) : r.state,
+    // the job id and its state are on the closed card (the id is what the picker and the laptop's `levain dispatch show` name)
+    for (const text of ["dispatch", "job " + r.id, "state " + r.state, r.agent || "no agent named", filed ? "sign by " + readable(r.lease_end) : r.state,
                         "contract expires " + readable(r.expires_at)]) chips.appendChild(el("span", "chip", text));
     card.appendChild(chips);
     card.appendChild(el("pre", "display", typeof r.goal === "string" ? r.goal : ""));
     const models = Array.isArray(t.models) ? t.models.join(", ") : "";
-    card.appendChild(el("div", "where facts", [t.id, t.tier, models + " (k=" + t.k + ")",
-      b.tool_calls + " tool calls, " + b.tokens + " tokens, " + b.dollars_cents + " cents",
+    const q = (v) => (v === undefined || v === null || v === "" ? "?" : String(v));   // a missing field is "?", never "undefined"
+    card.appendChild(el("div", "where facts", [q(t.id), q(t.tier), models + " (k=" + q(t.k) + ")",
+      q(b.tool_calls) + " tool calls, " + q(b.tokens) + " tokens, " + q(b.dollars_cents) + " cents",
       (t.verifier_kind || "") + " verifier " + (t.verifier_id || "")].join(" \u00b7 ")));
     // where the read files leave this machine, on the closed card
     card.appendChild(el("div", "where sent", "sent to " + (t.provider || "?") + " via " + (t.route || "?") + " \u00b7 executor " + (t.executor || "?")));
@@ -473,8 +489,12 @@
     for (const [label, entries] of [["read", r.read], ["write", r.write]]) {
       det.appendChild(el("div", "where", label));
       const ul = el("ul", "where");
-      for (const e of (Array.isArray(entries) ? entries : []))
-        ul.appendChild(el("li", null, e.path + "  " + (e.mode === "new" ? "(new file)" : e.mode + " " + String(e.blob || "").slice(0, 12))));
+      for (const e of (Array.isArray(entries) ? entries : [])) {
+        const li = el("li", null, e.path + "  ");
+        if (e.mode === "new") li.append("(new file)");
+        else li.append(e.mode + " ", blobTap(String(e.blob || "")));
+        ul.appendChild(li);
+      }
       det.appendChild(ul);
     }
     const tools = Array.isArray(t.tool_versions) ? t.tool_versions.map((p) => (Array.isArray(p) ? p.join(" ") : String(p))).join(", ") : "";
@@ -506,6 +526,8 @@
     reasonBox.hidden = !reasons.has(r.id);
     reasonBox.value = reasons.get(r.id) || "";
     reasonBox.addEventListener("input", () => reasons.set(r.id, reasonBox.value));
+    // load() holds still while the box has focus; leaving it redraws, after a beat so a tap on a button is not eaten
+    reasonBox.addEventListener("blur", () => setTimeout(load, 600));
     const offer = (label, cancel) => {
       const btn = el("button", "dact", label);
       btn.type = "button";
