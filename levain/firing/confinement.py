@@ -4780,11 +4780,16 @@ def _sbpl_regex(value: str) -> str:
 
 
 def _agent_root_regex(path: Path) -> str:
-    """An anchored SBPL regex for one whole `.claude`/`.codex` root, ASCII-case-insensitive."""
-    name = path.name.casefold()
-    if name not in _PERSISTENCE_AGENT_NAMES:
+    """An anchored SBPL regex for one whole agent root, its last component ASCII-case-insensitive.
+
+    A root is `.claude` / `.codex`, or an absolute CLAUDE_CONFIG_DIR / CODEX_HOME, whose last component
+    can be any name (`~/.config/claude`): the macOS VM run of 10-19 (1019-conf/mac-final) measured a
+    non-dot override refusing the whole shell here."""
+    name = path.name
+    if not name or name in (".", ".."):
         raise ConfinementError(f"invalid protected agent-directory root {path} — refusing fail-closed")
-    folded = "\\." + "".join(f"[{ch.lower()}{ch.upper()}]" for ch in name[1:])
+    folded = "".join(f"[{ch.lower()}{ch.upper()}]" if ch.isascii() and ch.isalpha() else _sbpl_regex(ch)
+                     for ch in name)
     return f'^{_sbpl_regex(str(path.parent))}\\/{folded}($|\\/.*)'
 
 
