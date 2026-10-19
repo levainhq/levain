@@ -404,7 +404,9 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
         if got is not None and got[0].tool_name == "levain_limit":   # Q13: a limit has no action to do
             from levain.consent.limits import ruling_text
 
-            lines.append(ruling_text(ruling.ruling, ruling.gap, got[0].display))
+            text = ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory, agent=AGENT)
+            if text:
+                lines.append(text)
             continue
         what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
         text = RULING_TEXT.get(ruling.ruling)
@@ -505,7 +507,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         tool_input = {}
     limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir)
     if limited is not None:
-        return limited
+        return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
     try:
         send_repings(queue, settings)
     except Exception:
