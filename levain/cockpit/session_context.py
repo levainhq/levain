@@ -3,8 +3,8 @@
 A DISPLAY, never an authority: nothing here decides anything. Reads are bounded, never follow a symlink at the file itself,
 never write.
 
-One reusable token reader: :func:`last_context` (the meter) and :func:`iter_usage` (spend totals, for a later per-session
-budget). Both read the transcript the agent already writes, so the session needs nothing installed to be measured.
+One reusable token reader: :func:`last_context` (the meter), :func:`iter_usage` (spend totals, read whole) and
+:func:`spend_step` (the same totals read incrementally, for Q13's per-session limits in :mod:`levain.consent.limits`). Both read the transcript the agent already writes, so the session needs nothing installed to be measured.
 
 Claude Code. Every assistant record carries ``message.usage``; the live context is
 ``input_tokens + cache_read_input_tokens + cache_creation_input_tokens`` of the LAST one (the prompt that call sent).
@@ -35,7 +35,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, NamedTuple
 
-__all__ = ["CONTEXT_WARN_TOKENS", "Context", "find_transcript", "last_context", "iter_usage", "context_chip"]
+__all__ = ["CONTEXT_WARN_TOKENS", "Context", "find_transcript", "last_context", "iter_usage", "spend_step",
+           "context_chip"]
 
 # The operator's rotation line for a lane, not any model's window: past it a session is dearer per turn than it is worth.
 CONTEXT_WARN_TOKENS = 200_000
@@ -339,6 +340,125 @@ def iter_usage(path: Path | str, include_subagents: bool = False,
     if stats is not None:
         stats["skipped_files"] = skipped
     yield from best.values()
+
+
+_STEP_BYTES = 32 << 20      # bytes read per spend_step call, all files together; the rest is read by later calls
+_RECENT_IDS = 512           # message ids whose counted usage is remembered, so a message written as several records adds once
+_SPEND_FILES = 256          # subagent transcripts followed for spend; more are counted in state["skipped"]
+
+
+def _spend_lines(fd: int, size: int, offset: int, budget: int) -> tuple[list[bytes], int]:
+    """The whole lines from ``offset`` within ``budget`` bytes, and the offset after the last one. An unterminated
+    tail is left for a later call; a single line longer than ``_LINE_CAP`` is skipped to its end, never held whole."""
+    want = min(size - offset, budget)
+    if want <= 0:
+        return [], offset
+    raw = os.pread(fd, want, offset)
+    end = raw.rfind(b"\n")
+    if end >= 0:
+        return raw[:end + 1].split(b"\n"), offset + end + 1
+    if len(raw) < _LINE_CAP:
+        return [], offset                   # an unfinished line: read again once it ends
+    at = offset + len(raw)
+    while at < size:                        # an over-long line: find its end without keeping it
+        chunk = os.pread(fd, min(1 << 20, size - at), at)
+        if not chunk:
+            break
+        nl = chunk.find(b"\n")
+        if nl >= 0:
+            return [], at + nl + 1
+        at += len(chunk)
+    return [], offset
+
+
+def spend_step(path: Path | str, agent: str = "claude_code", state: dict[str, Any] | None = None, *,
+               step_bytes: int = _STEP_BYTES) -> dict[str, Any]:
+    """Spend so far, read INCREMENTALLY: the caller keeps ``state`` (JSON-safe) between calls and each call reads only
+    what was appended since, at most ``step_bytes`` in all. Returns the updated state, whose ``fresh`` and
+    ``cache_read`` are the running totals.
+
+    Claude Code: the transcript and its ``<sid>/subagents/*.jsonl``; per message id, each usage field is counted at its
+    MAX across the records that carry it (as :func:`iter_usage`); fresh = input + output + cache write. Codex: the
+    rollout's newest ``token_count`` ``info.total_token_usage`` (cumulative); cached input is inside ``input_tokens``,
+    so fresh = input - cached + output and cache_read = cached. A file replaced or shortened since the last call is
+    read again from its start, its earlier usage kept (it may count twice: an over-count, never an under-count)."""
+    st_: dict[str, Any] = dict(state) if isinstance(state, dict) else {}
+    files = dict(st_.get("files") or {})
+    recent = dict(st_.get("recent") or {})
+    fresh, cache_read = _num(st_.get("fresh")), _num(st_.get("cache_read"))
+    p = Path(path)
+    todo = [("", p)]
+    if agent != "codex":
+        try:
+            found = sorted((p.with_suffix("") / "subagents").glob("*.jsonl"))
+        except (OSError, ValueError):
+            found = []
+        todo += [(f.name, f) for f in found[:_SPEND_FILES]]
+        st_["skipped"] = max(0, len(found) - _SPEND_FILES)
+    budget = max(0, step_bytes)
+    best = list(st_.get("codex") or [0, 0, 0])
+    behind = False
+    for key, f in todo:
+        if budget <= 0:
+            behind = True
+            break
+        opened = _open_regular(f)
+        if opened is None:
+            continue
+        fd, st = opened
+        try:
+            dev, ino, offset = (files.get(key) or [None, None, 0])[:3]
+            if (dev, ino) != (st.st_dev, st.st_ino) or not isinstance(offset, int) or offset > st.st_size:
+                offset = 0
+            lines, new = _spend_lines(fd, st.st_size, offset, budget)
+            behind = behind or st.st_size - offset > budget
+            budget -= new - offset
+            files[key] = [st.st_dev, st.st_ino, new]
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        for line in lines:
+            if agent == "codex":
+                if b'"token_count"' not in line:
+                    continue
+                d = _json(line)
+                pl = d.get("payload") if d else None
+                info = pl.get("info") if isinstance(pl, dict) and pl.get("type") == "token_count" else None
+                tot = info.get("total_token_usage") if isinstance(info, dict) else None
+                if isinstance(tot, dict):
+                    got = [_num(tot.get("input_tokens")), _num(tot.get("cached_input_tokens")),
+                           _num(tot.get("output_tokens"))]
+                    best = [max(a, b) for a, b in zip(best, got)]
+                continue
+            if b'"usage"' not in line:
+                continue
+            d = _json(line)
+            m = d.get("message") if d else None
+            if not (d and d.get("type") == "assistant" and isinstance(m, dict) and isinstance(m.get("usage"), dict)):
+                continue
+            u = m["usage"]
+            uuid = d.get("uuid")
+            mid = m["id"] if isinstance(m.get("id"), str) else f"{key}:{uuid}" if isinstance(uuid, str) else None
+            now = [_num(u.get("input_tokens")), _num(u.get("cache_read_input_tokens")),
+                   _num(u.get("cache_creation_input_tokens")), _num(u.get("output_tokens"))]
+            if mid is None:                 # nothing to tell its records apart: each counts once
+                fresh += now[0] + now[2] + now[3]
+                cache_read += now[1]
+                continue
+            old = recent.pop(mid, None) or [0, 0, 0, 0]
+            top = [max(a, b) for a, b in zip(old, now)]
+            fresh += (top[0] - old[0]) + (top[2] - old[2]) + (top[3] - old[3])
+            cache_read += top[1] - old[1]
+            recent[mid] = top
+            while len(recent) > _RECENT_IDS:
+                recent.pop(next(iter(recent)))
+    if agent == "codex":
+        fresh, cache_read = max(best[0] - best[1], 0) + best[2], best[1]
+        st_["codex"] = best
+    st_.update(files=files, recent=recent, fresh=fresh, cache_read=cache_read,
+               behind=behind)
+    return st_
 
 
 def _k(n: int) -> str:
