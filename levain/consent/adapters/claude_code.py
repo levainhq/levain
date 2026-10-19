@@ -1057,7 +1057,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
             if posture == "default":
-                return None  # Claude Code's own dialog (or the operator's own allow rule) decides while he is present
+                return None  # Claude Code's own dialog (or the operator's own allow rule) decides while they are present
             # no dialog asks in this mode (an absent or unknown mode counts as none) and no key could answer a
             # request: the floor denies, files nothing (Q10 D1)
             note(refused="floor")
