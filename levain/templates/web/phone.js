@@ -137,6 +137,7 @@
                 el("span", "meta", (push.agent || "") + " \u00b7 undecided, gap " + (push.gap_label || "#" + push.gap)));
       leads.append(ph, el("pre", "display", typeof push.display === "string" ? push.display : ""));
       if (push.cwd) leads.appendChild(el("div", "where", "in " + push.cwd));
+      for (const n of checkLines(push)) leads.appendChild(n);   // the same two digests and hint the push shows as its own card
     }
     leads.hidden = !(link && push);
     // shown, never kept in `notes`: it is about this listing, and the next one may make the option signable
@@ -179,15 +180,18 @@
     line.append(el("span", "dg-label", label + " "), code);
     return line;
   }
+  const NO_PATTERN = "no pattern matched: read the command";
   function checkLines(r) {
-    const out = [digestLine("input digest", r.tool_input_digest), digestLine("request digest", r.digest)];
+    const out = [];
+    // the hint comes first, with a rule at its left, so it reads apart from the metadata; a shell request always has one
     const hints = Array.isArray(r.hints) ? r.hints.filter((h) => typeof h === "string" && h) : [];
     if (hints.length) {
       const box = el("div", "dg hint");
-      box.appendChild(el("span", "dg-label", "hint (informs, never authorises)"));
-      for (const h of hints) box.appendChild(el("div", "dg-hint", "\u2022 " + h));
+      box.appendChild(el("span", "dg-label", "hint (a few patterns only; informs, never authorises)"));
+      for (const h of hints) box.appendChild(el("div", h === NO_PATTERN ? "dg-hint dg-none" : "dg-hint", "\u2022 " + h));
       out.push(box);
     }
+    out.push(digestLine("input digest", r.tool_input_digest), digestLine("request digest", r.digest));
     return out.filter(Boolean);
   }
 

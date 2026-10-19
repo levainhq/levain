@@ -1,42 +1,64 @@
 """levain.cockpit.hintview (Q16): the one place a decision surface asks for shell hints.
 
 Rendering only. ``levain.consent.listing.entry_body`` calls :func:`hints_for` to put a ``hints`` list on the body both
-the cockpit row and the phone page draw; nothing that decides a request (queue, policy, grants, adapters, sign,
-answering, push_gate) imports this module or ``levain.consent.hints``. A hint informs; it never authorises.
+the cockpit row and the phone page draw (the phone page draws it for a request listed on its own and for the push an
+open question's option leads to, which is the same body); nothing that decides a request (queue, policy, grants,
+adapters, sign, answering, push_gate) imports this module or ``levain.consent.hints``. A hint informs; it never
+authorises. :func:`visible` is the same layer's guard on agent-controlled text: invisible format characters are shown as
+markers, so a bidi override cannot reorder what the human reads.
 """
 from __future__ import annotations
 
+import re
+import shlex
+import unicodedata
 from typing import Any
 
-from levain.consent.hints import CUT_HINT, UNREAD_HINT, shell_hints
+from levain.authority import _consent_shell_name
+from levain.consent.hints import CUT_HINT, NONE_HINT, UNREAD_HINT, shell_hints
 
-__all__ = ["BASH_LIKE", "hints_for"]
+__all__ = ["hints_for", "is_bash_like", "visible"]
 
-BASH_LIKE = frozenset({"Bash", "exec_command", "shell", "local_shell", "shell_command"})
 _KEYS = ("command", "cmd")
+_CUT_FIELD = re.compile(r'"(?:command|cmd)": "((?:[^"\\]|\\.)*)')
+_UNESCAPE = re.compile(r'\\(["\\nt])')
+_UNESCAPED = {'"': '"', "\\": "\\", "n": "\n", "t": "\t"}
+
+
+def is_bash_like(tool: str) -> bool:
+    """A shell request by the authority's own judgement (``CONSENT_SHELL_TOOLS``, any case, bare or an MCP tool's name)."""
+    return isinstance(tool, str) and _consent_shell_name(tool)
+
+
+def visible(text: Any) -> Any:
+    """``text`` with every Unicode format or control character (Cf, Cc except newline and tab, U+2028/2029) shown as a
+    visible ``<U+XXXX>`` marker. Not a string: returned as is."""
+    if not isinstance(text, str):
+        return text
+    return "".join(
+        f"⟨U+{ord(ch):04X}⟩"
+        if (unicodedata.category(ch) in ("Cf", "Cc") and ch not in "\n\t") or ch in "  " else ch
+        for ch in text)
 
 
 def _from_cut_display(display: str, tool: str) -> str:
-    """The shown part of a cut display: the text after the tool name, un-quoted by the common JSON escapes. A hint
-    reading aid only, so a crude read is enough."""
-    body = display[len(tool) + 1:].rstrip("…")
-    for key in _KEYS:
-        marker = f'"{key}": "'
-        at = body.find(marker)
-        if at >= 0:
-            text = body[at + len(marker):]
-            return text.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
-    return ""
+    """The shown part of a cut display: the command's JSON string, up to its closing quote (or the cut), un-escaped in one
+    pass. A hint reading aid only, so a crude read is enough."""
+    m = _CUT_FIELD.search(display[len(tool) + 1:].rstrip("…"))
+    return _UNESCAPE.sub(lambda g: _UNESCAPED[g.group(1)], m.group(1)) if m else ""
 
 
 def hints_for(request: Any, tool_input: Any, cut: bool) -> list[str]:
-    """Hint lines for a Bash-like request, ``[]`` for any other tool."""
-    if request.tool_name not in BASH_LIKE:
+    """Hint lines for a shell request (never empty: "no pattern matched" when nothing did), ``[]`` for any other tool."""
+    if not is_bash_like(request.tool_name):
         return []
     if cut:
         shown = _from_cut_display(request.display, request.tool_name)
-        return [CUT_HINT, *shell_hints(shown, request.cwd)] if shown else [CUT_HINT]
-    command = next((tool_input[k] for k in _KEYS if isinstance(tool_input, dict) and isinstance(tool_input.get(k), str)), None)
-    if command is None:
+        got = shell_hints(shown, request.cwd) if shown else []
+        return [CUT_HINT, *(got or ([NONE_HINT] if shown else []))]
+    command = next((tool_input[k] for k in _KEYS if isinstance(tool_input, dict) and tool_input.get(k) is not None), None)
+    if isinstance(command, list) and command and all(isinstance(x, str) for x in command):
+        command = shlex.join(command)
+    if not isinstance(command, str):
         return [UNREAD_HINT]
-    return shell_hints(command, request.cwd)
+    return shell_hints(command, request.cwd) or [NONE_HINT]

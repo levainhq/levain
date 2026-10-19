@@ -327,7 +327,8 @@
   .consent-dg { align-items: baseline; }
   .consent-dgval, .consent-dgtext { overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--label); }
   .consent-dgval { cursor: pointer; user-select: all; }
-  .consent-hint { flex-direction: column; align-items: flex-start; gap: var(--sp-1); }
+  .consent-hint { flex-direction: column; align-items: flex-start; gap: var(--sp-1); padding-left: var(--sp-3); border-left: 2px solid var(--line); }   /* a rule, not a colour: it separates the hint from the metadata and is no verdict */
+  .consent-none { font-style: italic; }
   .consent-cmd { display: flex; gap: var(--sp-3); align-items: center; margin-top: var(--sp-2); }
   .consent-code { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; user-select: all; font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--label); }
   .consent-copy { margin-left: 0; flex: 0 0 auto; min-width: 7em; text-align: center; }
