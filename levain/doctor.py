@@ -1498,6 +1498,56 @@ UNCONFINED_HOW = ("To allow them, enrol a key that can sign T3 (a laptop-presenc
                   "(a settings file that sets it is ignored).")
 
 
+def _hooks_off_files(install: Path, adapter: str, *, home: Path | None = None,
+                     codex_home: Path | None = None) -> list[Path]:
+    """The workspace or user config files that turn the agent's hooks off, every hook levain wires with them, the
+    consent gate and its floor included (L3 r1 G5): for Claude Code, ``disableAllHooks: true`` in the workspace's
+    ``.claude/settings.json`` or ``.claude/settings.local.json`` or the user's settings (``$CLAUDE_CONFIG_DIR`` or
+    ``~/.claude``); for Codex, ``[features] hooks = false`` (or the older ``codex_hooks``) in the workspace's
+    ``.codex/config.toml`` or ``CODEX_HOME``'s. A file that is missing, unreadable or does not parse is not listed
+    here (the other rows report a broken settings file)."""
+    home = home if home is not None else Path.home()
+    found: list[Path] = []
+    if adapter == "claude-code":
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        files = [install / ".claude" / "settings.json", install / ".claude" / "settings.local.json",
+                 *([Path(config_dir) / "settings.json"] if config_dir else []), home / ".claude" / "settings.json"]
+        for f in dict.fromkeys(files):
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("disableAllHooks") is True:
+                found.append(f)
+        return found
+    if codex_home is None:
+        codex_home = Path(os.environ.get("CODEX_HOME") or home / ".codex")
+    for f in dict.fromkeys([install / ".codex" / "config.toml", codex_home / "config.toml"]):
+        try:
+            data = tomllib.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        features = data.get("features")
+        if isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks")):
+            found.append(f)
+    return found
+
+
+def _check_hooks_off(install: Path, adapter: str, *, home: Path | None = None,
+                     codex_home: Path | None = None) -> list[CheckResult]:
+    """A FAIL naming each config file that turns the agent's hooks off (:func:`_hooks_off_files`): no levain hook
+    runs there, so the consent gate's floor cannot refuse anything."""
+    label = "Claude Code" if adapter == "claude-code" else "Codex"
+    files = _hooks_off_files(install, adapter, home=home, codex_home=codex_home)
+    if not files:
+        return []
+    how = ("`disableAllHooks: true`" if adapter == "claude-code" else "`[features] hooks = false`")
+    return [CheckResult(f"{label} hooks", False,
+                        f"turned off by {how} in {', '.join(str(f) for f in files)}: no levain hook runs, so the "
+                        "consent gate cannot refuse an edit of agent config or hooks in this workspace",
+                        "Remove that setting (a repository you cloned may have set it).")]
+
+
 def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[CheckResult]:
     """The consent hook `levain init` wires (S1436): whether the PermissionRequest entry runs this install's
     script, the away mode the hook will read, and which cockpit its grants and signed answers verify against.
@@ -2917,6 +2967,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             results.extend(_check_transcript_hooks(
                 install, hooks, ("Stop", "PostToolUse", "PostToolUseFailure"), "Claude Code"))
             results.extend(_check_consent_wiring(install, hooks, "claude-code"))
+            results.extend(_check_hooks_off(install, "claude-code"))
             results.extend(_check_consent_ledger(install, hooks, "claude-code"))
 
             allow = settings.get("permissions", {}).get("allow", [])
@@ -3270,6 +3321,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
                 results.extend(_check_consent_wiring(install, hh, "codex"))
                 results.extend(_check_consent_ledger(install, hh, "codex"))
                 results.extend(_check_codex_gate_trust(install, hooks_path, codex_home))
+                results.extend(_check_hooks_off(install, "codex", codex_home=codex_home))
 
     if not config_path.is_file():
         results.append(

@@ -456,8 +456,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     when something could decide it and, in ``default`` mode (approvals
     on), only while the operator is away, filed with its hold = D (``gate_hold_seconds``), pinged, held for a
     verified decision (delivered), and at D marked undecided (the irreversible tier halting its session) and denied
-    (:func:`undecided_output`). Every allow is re-checked against the halt just before it is returned: a halt set
-    meanwhile wins. Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
+    (:func:`undecided_output`). Every allow, and every no-decision return of a gated call (unconfined, the floor's
+    ``default``/``plan`` pass, the attended pass), is re-checked against the halt just before it is returned: a
+    halt set meanwhile wins (a sibling call that halts the session after that check still races it). Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
     rulings for the session, and the answers to its questions not yet delivered
     (:func:`levain.consent.band.question_context`), ride whatever is returned, as ``additionalContext``."""
     if getattr(queue, "directory", None) is None:
@@ -563,13 +564,13 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow is spent. A
             # halt was read before this call reached here (:func:`gate`): the env var never releases one. A
             # settings file that sets the variable makes it ignored (L2-1, :func:`unconfined_state`)
-            return None
+            return halt_wins(None)  # and a halt set since the gate read it still wins (L3 r1 G2)
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
             if posture in (*ATTENDED_POSTURES, "plan"):
-                return None  # Codex's own approval asks (default), or the mode runs nothing (plan)
+                return halt_wins(None)  # Codex's own approval asks (default), or the mode runs nothing (plan)
             # no approval asks in this mode (an absent or unknown mode counts as none) and no key could answer a
             # request: the floor denies, files nothing (Q10 D1); a plain deny, never ``continue: false`` (above)
             note(refused="floor")
@@ -577,7 +578,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
             # approvals on and the operator present: Codex's own approval asks for an agent-config write (measured
             # B5-fix1, MEASURE_away), so the gate holds only while he is away, as Claude Code's does (head ruling 10-18)
-            return None
+            return halt_wins(None)
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,

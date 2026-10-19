@@ -229,7 +229,8 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 # MCP server definitions: a ``.mcp.json`` anywhere (a workspace's). The user's ``~/.claude.json`` is matched by
 # its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
-# directly in a ``.git/`` directory (or a linked worktree's ``.git/worktrees/<name>/``): the config files git reads
+# directly in a ``.git/`` directory (or a linked worktree's ``.git/worktrees/<name>/``, a submodule's
+# ``.git/modules/<name>/``): the config files git reads
 # executables from (``core.hooksPath``, ``core.fsmonitor``, aliases, filters)
 GIT_CONFIG_NAMES = frozenset({"config", "config.worktree"})
 USER_CONFIG_NAME = ".claude.json"
@@ -244,7 +245,7 @@ _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NA
 
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
-                     user_configs: frozenset[str]) -> bool:
+                     user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
@@ -258,29 +259,201 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
+    git_cache = git_cache if git_cache is not None else {}
     parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, roots, sites, user_configs):
+            if _tags_path(p / probe, roots, sites, user_configs, home, git_cache):
                 return True
     return False
 
 
-def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str]) -> bool:
+def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str],
+               home: Path, git_cache: dict[Any, Any] | None = None) -> bool:
     """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
     return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
-            or _redirects_the_import(path, sites))
+            or _redirects_the_import(path, sites) or _under_hooks_path(path, home, git_cache))
 
 
 def _is_git_exec_config(rest: list[str]) -> bool:
     """What follows a ``.git`` directory component names a file git executes from or reads executables out of:
     anything under its ``hooks/``, its ``config`` or ``config.worktree``, and the same in a linked worktree's git
-    directory (``worktrees/<name>/``). Never objects, refs or anything else under ``.git/``."""
-    if len(rest) >= 3 and rest[0] == "worktrees":
-        rest = rest[2:]
-    return (len(rest) > 1 and rest[0] == "hooks") or (len(rest) == 1 and rest[0] in GIT_CONFIG_NAMES)
+    directory (``worktrees/<name>/``) or a submodule's (``modules/<name>/``, where the name may hold slashes),
+    nested to any depth (a submodule's own worktrees and submodules). Never objects, refs or anything else."""
+    if (len(rest) > 1 and rest[0] == "hooks") or (len(rest) == 1 and rest[0] in GIT_CONFIG_NAMES):
+        return True
+    if len(rest) >= 3 and rest[0] in ("worktrees", "modules"):
+        # a worktree's name is one component; a submodule's may be several (``modules/libs/foo/``)
+        ends = range(2, len(rest)) if rest[0] == "modules" else (2,)
+        return any(_is_git_exec_config(rest[j:]) for j in ends)
+    return False
+
+
+# --- git's effective core.hooksPath (L3 r1 G1b): read from the config files, never by running git ----------------
+
+GIT_WALK_LIMIT = 64          # ancestors searched for the directory holding a target's ``.git``
+GIT_READ_MAX = 1 << 20       # bytes read of one git config file (or gitfile, commondir)
+
+
+def global_git_configs(home: Path) -> tuple[Path, ...]:
+    """The user-level git config files every repository reads: ``~/.gitconfig`` and ``$XDG_CONFIG_HOME/git/config``
+    (``~/.config/git/config`` when the variable is unset or empty), as git itself resolves them."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path(home) / ".config"
+    return (Path(home) / ".gitconfig", base / "git" / "config")
+
+
+def _read_small(path: Path) -> str | None:
+    """A file's text (at most :data:`GIT_READ_MAX` bytes), or ``None`` when it cannot be read: git would not read
+    it either, so nothing is tagged on its account."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(GIT_READ_MAX).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def _git_value(raw: str) -> str:
+    """A git config value as git reads it: double quotes removed, ``\\"`` ``\\\\`` ``\\n`` ``\\t`` ``\\b``
+    unescaped, a ``#`` or ``;`` outside quotes starting a comment, unquoted outer whitespace dropped."""
+    out: list[str] = []
+    quoted, kept, i = False, 0, 0   # ``kept``: ``out``'s length up to its last char that was quoted or not a space
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw):
+            out.append({"n": "\n", "t": "\t", "b": "\b"}.get(raw[i + 1], raw[i + 1]))
+            kept, i = len(out), i + 2
+            continue
+        i += 1
+        if c == '"':
+            quoted = not quoted
+        elif not quoted and c in "#;":
+            break
+        elif quoted or not c.isspace():
+            out.append(c)
+            kept = len(out)
+        elif out:
+            out.append(c)   # inner unquoted space: kept only if something follows it
+    return "".join(out[:kept])
+
+
+def git_hooks_paths(text: str) -> list[str]:
+    """Every ``core.hooksPath`` value in one git config file's text, in file order: a ``[core]`` section (the name
+    case-insensitive; ``[core "x"]`` is another section), a ``hooksPath`` key in any case, a line continued by a
+    trailing backslash, a key on the header's own line. A key with no ``=`` (a boolean) or an empty value is none."""
+    out: list[str] = []
+    section: str | None = None
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        while (len(line) - len(line.rstrip("\\"))) % 2 == 1 and i < len(lines):
+            line = line[:-1] + lines[i]   # an odd count of trailing backslashes continues the line
+            i += 1
+        s = line.strip()
+        if s.startswith("["):
+            end = s.find("]")
+            if end < 0:
+                section = None
+                continue
+            section = s[1:end].strip().lower()
+            s = s[end + 1:].strip()
+        if section != "core" or not s or s[0] in "#;":
+            continue
+        key, eq, value = s.partition("=")
+        if eq and key.strip().lower() == "hookspath":
+            got = _git_value(value)
+            if got:
+                out.append(got)
+    return out
+
+
+def _git_root(start: Path, seen: dict[str, Path | None]) -> Path | None:
+    """The nearest of ``start`` and its ancestors (at most :data:`GIT_WALK_LIMIT`) holding a ``.git`` (a directory
+    or a gitfile): the worktree root, where git runs hooks. ``None`` when none does. Every directory a walk that
+    ended (found one, or reached ``/``) visited is cached in ``seen``, so one call's many candidates walk once."""
+    visited: list[str] = []
+    d, found, ended = start, None, False
+    for _ in range(GIT_WALK_LIMIT):
+        key = str(d)
+        if key in seen:
+            found, ended = seen[key], True
+            break
+        visited.append(key)
+        dotgit = d / ".git"
+        try:
+            here = dotgit.is_dir() or dotgit.is_file()
+        except OSError:
+            here = False
+        if here:
+            found, ended = d, True
+            break
+        if d.parent == d:
+            ended = True
+            break
+        d = d.parent
+    if ended:
+        seen.update(dict.fromkeys(visited, found))
+    return found
+
+
+def _git_config_files(root: Path) -> list[Path]:
+    """The repository's own config files for the worktree ``root`` (:func:`_git_root`): its git directory's
+    ``config`` and ``config.worktree`` and its ``commondir``'s (a linked worktree's main git directory). The git
+    directory is ``root/.git``, or what a gitfile there names (``gitdir:``, relative to ``root``: a linked
+    worktree's or a submodule's). A gitfile that does not name one gives none."""
+    dotgit = root / ".git"
+    gitdir: Path | None = dotgit
+    if dotgit.is_file():
+        text = _read_small(dotgit) or ""
+        first = text.splitlines()[0].strip() if text.strip() else ""
+        gitdir = root / first[7:].strip() if first.lower().startswith("gitdir:") and first[7:].strip() else None
+    if gitdir is None:
+        return []
+    files = [gitdir / "config", gitdir / "config.worktree"]
+    common = (_read_small(gitdir / "commondir") or "").strip()
+    if common:   # an absolute value replaces ``gitdir``
+        files += [gitdir / common / "config", gitdir / common / "config.worktree"]
+    return files
+
+
+def _hooks_dirs(root: Path | None, home: Path, cache: dict[Any, Any]) -> tuple[str, ...]:
+    """Every ``core.hooksPath`` set in the repository's config files (``root``'s, :func:`_git_config_files`) or the
+    user's (:func:`global_git_configs`), ``~`` expanded, a relative one joined to ``root`` (none without a root),
+    each as written and resolved, lower-cased. Cached per root in ``cache``."""
+    key = ("hooks", str(root) if root is not None else None)
+    if key not in cache:
+        out: set[str] = set()
+        for f in [*(_git_config_files(root) if root is not None else []), *global_git_configs(home)]:
+            text = _read_small(f)
+            for value in git_hooks_paths(text) if text is not None else ():
+                if value == "~" or value.startswith("~/"):
+                    hp = Path(str(home) + value[1:])
+                elif os.path.isabs(value):
+                    hp = Path(value)
+                elif root is not None:
+                    hp = root / value
+                else:
+                    continue
+                out |= {os.path.normpath(hp).lower(), os.path.realpath(hp).lower()}
+        cache[key] = tuple(out)
+    return cache[key]
+
+
+def _under_hooks_path(path: Path, home: Path, cache: dict[Any, Any] | None = None) -> bool:
+    """``path`` lies under a ``core.hooksPath`` git would run hooks from (husky's ``.husky/``, a ``.githooks/``) for
+    the repository holding it (:func:`_git_root`, :func:`_hooks_dirs`). Every value found counts, not only the one
+    git would use last: an over-match costs a gated call. Git is never run; an unreadable config file tags nothing
+    (git would not read it either). ``cache`` is one call's, shared by its candidates."""
+    cache = cache if cache is not None else {}
+    try:
+        root = _git_root(path.parent, cache.setdefault("roots", {}))
+        return _under(path, _hooks_dirs(root, home, cache))
+    except (OSError, ValueError):
+        return True   # a path that cannot be examined is tagged, as the other checks do
 
 
 def _is_config_path(path: Path) -> bool:
@@ -402,8 +575,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     ``.claude/hooks/``, the one `levain init` wires under the install's ``activation/hooks/``, below); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
     ``.codex/config.toml``; git's executable config: anything under a ``.git/hooks/`` directory, a ``config`` or
     ``config.worktree`` directly in a ``.git/`` directory, the same under a linked worktree's
-    ``.git/worktrees/<name>/``, and a file named ``.git`` (a gitfile, which names the git directory), never
-    ``.gitignore``, ``.gitattributes`` or objects and refs; anything under a ``.claude-plugin/`` directory, or
+    ``.git/worktrees/<name>/`` or a submodule's ``.git/modules/<name>/`` (nested), a file named ``.git`` (a
+    gitfile, which names the git directory), anything under a ``core.hooksPath`` the repository's or the user's git
+    config sets (:func:`_under_hooks_path`), and the user's ``~/.gitconfig`` and XDG ``git/config``
+    (:func:`global_git_configs`), never ``.gitignore``, ``.gitattributes`` or objects and refs; anything under a ``.claude-plugin/`` directory, or
     under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
@@ -429,8 +604,12 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
-        user_config = Path(home) / USER_CONFIG_NAME
-        user_configs = frozenset({os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()})
+        git_cache: dict[Any, Any] = {}   # one walk per directory and one read per git config file, per call
+        home = Path(home)
+        # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``, the XDG one),
+        # which every repository reads executables from as it does its own ``.git/config`` (L3 r1 G1c)
+        user_configs = frozenset({s for f in (home / USER_CONFIG_NAME, *global_git_configs(home))
+                                  for s in (os.path.normpath(f).lower(), os.path.realpath(f).lower())})
     except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
@@ -444,10 +623,11 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if _tags_path(written, roots, sites, user_configs) or _tags_path(resolved, roots, sites, user_configs):
+        if (_tags_path(written, roots, sites, user_configs, home, git_cache)
+                or _tags_path(resolved, roots, sites, user_configs, home, git_cache)):
             return True
     try:
-        return any(names_config_dir(target, cwd, Path(home), roots, sites, user_configs) for target in extra)
+        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache) for target in extra)
     except (OSError, ValueError):
         return True
 
@@ -765,12 +945,19 @@ UNCONFINED_ENV = "LEVAIN_UNCONFINED"
 # 10-19, Q10 run 4 case C5: a Write of ``.codex/config.toml`` ran with no question), so it is floored/held like any
 # no-dialog mode
 ATTENDED_POSTURES = ("default",)
+# the machine-wide settings every session loads too (L3 r1 G3): Codex's system config, Claude Code's managed
+# settings (macOS, Linux). A missing one sets nothing
+SYSTEM_SETTINGS_FILES: tuple[tuple[str, Path], ...] = (
+    ("toml", Path("/etc/codex/config.toml")),
+    ("json", Path("/Library/Application Support/ClaudeCode/managed-settings.json")),
+    ("json", Path("/etc/claude-code/managed-settings.json")),
+)
 
 
 def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None) -> list[tuple[str, Path]]:
     """Every settings file an agent session started in ``cwd`` can load an environment from, as (``json`` | ``toml``,
     path): Claude Code's user settings (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``), Codex's ``config.toml`` (its home),
-    and in ``cwd``, ``$CLAUDE_PROJECT_DIR`` and each of their ancestors up to ``/`` (as written and resolved: Claude
+    the machine-wide :data:`SYSTEM_SETTINGS_FILES`, and in ``cwd``, ``$CLAUDE_PROJECT_DIR`` and each of their ancestors up to ``/`` (as written and resolved: Claude
     Code reads a project's settings at its repository root) ``.claude/settings.json``, ``.claude/settings.local.json``
     and ``.codex/config.toml``."""
     home = home if home is not None else Path.home()
@@ -782,6 +969,7 @@ def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None)
     for d in ([codex_home] if codex_home is not None else []) + ([Path(env_codex)] if env_codex else []) \
             + [home / ".codex"]:
         out.append(("toml", d / "config.toml"))
+    out += list(SYSTEM_SETTINGS_FILES)
     for start in (cwd, os.environ.get("CLAUDE_PROJECT_DIR")):
         if not isinstance(start, str) or not start:
             continue
@@ -794,23 +982,28 @@ def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None)
 
 
 def _key_anywhere(value: Any) -> bool:
+    """:data:`UNCONFINED_ENV` inside any key or string value, at any depth."""
+    if isinstance(value, str):
+        return UNCONFINED_ENV in value
     if isinstance(value, Mapping):
-        return UNCONFINED_ENV in value or any(_key_anywhere(v) for v in value.values())
+        return any(_key_anywhere(k) or _key_anywhere(v) for k, v in value.items())
     if isinstance(value, list):
         return any(_key_anywhere(v) for v in value)
     return False
 
 
 def _sets_unconfined(kind: str, path: Path) -> bool:
-    """True when the settings file sets :data:`UNCONFINED_ENV` or that cannot be ruled out: an unreadable file, one
-    that does not parse, a Claude Code ``env`` that is not an object. A Claude Code file counts by its ``env`` block;
-    a Codex ``config.toml`` by the key anywhere in it (no Codex key is known to reach a hook's environment, but
-    ``shell_environment_policy.set`` reaches its subprocesses). A missing file sets nothing."""
+    """True when the settings file mentions :data:`UNCONFINED_ENV` anywhere (L3 r1 G3: in its raw text, or, once
+    parsed, in any key or string value at any depth, which also catches an escaped spelling; JSON or TOML alike,
+    an ``env`` block or not) or that cannot be ruled out: an unreadable file, one that does not parse, a JSON file
+    that is not an object, a Claude Code ``env`` that is not an object. A missing file sets nothing."""
     try:
         raw = path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
         return False
     except Exception:  # noqa: BLE001 - unreadable: it cannot be ruled out
+        return True
+    if UNCONFINED_ENV.encode() in raw:
         return True
     try:
         if kind == "toml":
@@ -821,7 +1014,7 @@ def _sets_unconfined(kind: str, path: Path) -> bool:
         if not isinstance(data, Mapping):
             return True
         env = data.get("env")
-        return env is not None and (not isinstance(env, Mapping) or UNCONFINED_ENV in env)
+        return (env is not None and not isinstance(env, Mapping)) or _key_anywhere(data)
     except Exception:  # noqa: BLE001 - a file that does not parse cannot be ruled out
         return True
 
@@ -1057,7 +1250,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
+    An event with no valid ``tool_name``, ``cwd`` or session id is denied when its call could be gated
+    (:func:`_malformed`). A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
     or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
     allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
     ``default`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
@@ -1078,7 +1272,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = _session_of(event)
     if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd or session is None:
-        return None
+        return _malformed(event, queue, settings, home=home)
     if tool_input is None:
         tool_input = {}
     try:
@@ -1108,6 +1302,35 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         spec["additionalContext"] = f"{spec['additionalContext']}\n{context}" if spec.get("additionalContext") \
             else context
     return out
+
+
+def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, *,
+               home: Path | None) -> dict[str, Any] | None:
+    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, ``cwd`` or session id (L3 r1 G4):
+    fail closed, as Codex's gate does, whenever the call could be gated: a deny with the irreversible tier's hard
+    stop when the tool is unnamed (it cannot be classified), or when :func:`gate_class` (``cwd`` taken as ``""``
+    when it is not a string) tags it, or that classification fails. A call that is not gated goes on (``None``):
+    nothing here was ever the gate's to answer. Nothing is filed or ledgered: there is no session to file under."""
+    tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
+    missing = [k for k, ok in (("session_id", _session_of(event) is not None),
+                               ("tool_name", isinstance(tool_name, str) and bool(tool_name)),
+                               ("cwd", isinstance(cwd, str) and bool(cwd))) if not ok]
+    what = "this call"
+    if isinstance(tool_name, str) and tool_name:
+        try:
+            what = _what(tool_name, tool_input)
+            tier = gate_class(tool_name, tool_input if tool_input is not None else {},
+                              cwd if isinstance(cwd, str) else "", home=home,
+                              protected=protected_paths(Path(queue.directory), settings))
+        except Exception:  # noqa: BLE001 - a call that cannot be classified is treated as gated
+            tier = "irreversible"
+        if tier is None:
+            return None
+    else:
+        tier = "irreversible"
+    return _pre("deny", f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken: "
+                f"{what}. Do not retry it and do not achieve it another way.",
+                **_stop(tier, what, "the hook event was malformed."))
 
 
 def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
