@@ -10,7 +10,7 @@
      LevainSky.legendNode() -> a DOM key for the Levain marks (the host may place it, as the hero does with its own).
 
    A feed is Levain-shaped when it carries a session or question, a decision with an outcome of allowed / denied / waiting
-   / failed, or a labelled memory write; it then gets the lanes repos, sessions, decisions, memory, questions. Any other
+   (never `failed` alone: flow's feed carries it), or any labelled event; it then gets the lanes repos, sessions, decisions, memory, questions. Any other
    feed (flow's) keeps its rows and its marks exactly.
 
    Design rules this file keeps:
@@ -89,7 +89,7 @@
     return Date.parse(NAIVE.test(s) ? s.replace(' ', 'T') + 'Z' : s);
   }
 
-  var LEVAIN_OUT = { allowed: 1, denied: 1, waiting: 1 };   // not 'failed': flow's feed carries that outcome too
+  var LEVAIN_OUT = Object.assign(Object.create(null), { allowed: 1, denied: 1, waiting: 1 });   // not 'failed': flow's feed carries that outcome too
   function normalise(value) {
     var out = [];
     var src = (value && value.events) || [];
@@ -563,7 +563,7 @@
       }
       var t = eventTip(h.e, clock(), model.lev);
       var also = h.e.kind === 'session' ? model.sharedWith.get(h.e) : 0;
-      if (also) t += ' · this row also holds ' + also + (also === 1 ? ' later session' : ' later sessions');
+      if (also) t += ' · this row also holds ' + also + (also === 1 ? ' other session' : ' other sessions');
       return t;
     }
     cv.addEventListener('mousemove', function (ev) {
