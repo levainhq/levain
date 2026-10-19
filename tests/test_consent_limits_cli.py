@@ -666,3 +666,31 @@ def test_extended_by_never_creates_the_store(tmp_path):
     with pytest.raises(sqlite3.Error):
         L.extended_by(qdir, "r1")
     assert not (qdir / L.DB_NAME).exists()
+
+
+def test_ctrl_c_during_the_ping_leaves_the_request_pending_exit_130(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(C.claude_code, "notify", interrupted)
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"))
+    eid = _extend_id(q)
+    assert code == 130 and f"interrupted; request {eid} stays pending" in lines[-1]
+
+
+def test_ctrl_c_before_the_resume_starts_says_extended_and_exit_130(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(C, "_resume", interrupted)
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q)
+    t.join()
+    assert code == 130 and "extended; the resume was interrupted" in lines[-1]
+    assert L.snapshot(q.directory)[0]["halt"] is None

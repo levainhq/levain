@@ -353,11 +353,11 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
     say(f"levain limits: filed request {request_id}: {L.limit_what(call)}. Sign it on the phone card, or "
         f"`levain consent answer {request_id} allow`. Waiting up to {hold:g} s.")
     try:
-        claude_code.notify(settings, f"levain: {L.limit_what(call)}? (request {request_id}, held up to {hold:g} s)",
-                           cwd=qdir)
-    except Exception:  # noqa: BLE001 - a ping never fails the command
-        pass
-    try:
+        try:
+            claude_code.notify(settings, f"levain: {L.limit_what(call)}? (request {request_id}, held up to {hold:g} s)",
+                               cwd=qdir)
+        except Exception:  # noqa: BLE001 - a ping never fails the command
+            pass
         queue.await_decision(request_id, hold + 5.0, poll=0.25)
     except KeyboardInterrupt:
         say(f"levain limits: interrupted; request {request_id} stays pending until its hold ends.")
@@ -397,6 +397,10 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
                        listing=listing if listing is not None else dv.claude_listing,
                        running=running if running is not None else dv.process_running,
                        launch=launch if launch is not None else dv._launch)
+    except KeyboardInterrupt:
+        say("levain limits: extended; the resume was interrupted before it started: check the session before resuming "
+            "it by hand.")
+        return 130
     except Exception as exc:  # noqa: BLE001 - the halt is lifted already: say so, never a traceback
         say(f"levain limits: extended; resume failed: {type(exc).__name__}: {exc}")
         return 0
