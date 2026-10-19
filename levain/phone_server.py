@@ -174,7 +174,7 @@ class _PhoneHandler(GuardedHandler):
         except (UnicodeDecodeError, ValueError):
             self._json({"error": "bad_request", "message": "the body is not JSON"}, 400)
             return
-        # an answer carries a signature the person just made with Face ID: it waits a moment for a slot rather than
+        # an answer carries a signature the person just made with a passkey: it waits a moment for a slot rather than
         # throw that ceremony away; everything else answers busy at once
         waits = (consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
@@ -311,7 +311,8 @@ class _PhoneServer(ThreadingHTTPServer):
 
         roots = hook_roots(self.queue_dir)
         if not roots:
-            raise SignRefused("no consent hook names a cockpit, so no passkey can sign here", 503)
+            raise SignRefused("no consent hook names a cockpit, so no passkey can sign here: this queue dir names no "
+                              "cockpit: write claude_code.json with cockpit_data_root", 503)
         if len(roots) > 1:
             raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
                               "answer: nothing is signed", 503)

@@ -155,8 +155,10 @@
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
-  // a sign request: the whole message is shown as text (never HTML) and is exactly what the passkey signs; a request
-  // the server refused (a character that can show differently from its bytes) shows only why, and can be denied
+  // a sign request: the whole message is shown as text (never HTML) and is exactly what the passkey signs (the
+  // challenge sends back the sha256 of the file this card was built from, so a file changed since is refused); a
+  // request the server refused (a character that can show differently from its bytes, a malformed file) shows only
+  // why, and can be denied
   function signCard(r, signNote) {
     const card = el("article", "req sign");
     const head = el("div", "req-head");
@@ -213,7 +215,7 @@
     busy++;
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
     say("asking for the challenge…");
-    call("POST", base + "challenge", { signer_fp: fp }).then((c) => {
+    call("POST", base + "challenge", { signer_fp: fp, request_sha256: r.sha256 }).then((c) => {
       if (!c.ok) return say(why(c), "bad");
       say("confirm with your passkey to sign…");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };

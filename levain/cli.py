@@ -2224,8 +2224,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
     cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
                           type=_sign_namespace, metavar="NS",
                           help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "
-                               "(repeatable), for the phone's passkey to sign with Face ID; a caller verifies the "
-                               "result with `ssh-keygen -Y verify -n NS`. A namespace beginning 'levain' is refused.")
+                               "(repeatable), for a user-verified passkey signature (Face ID, Touch ID or the device "
+                               "passcode, as the authenticator reports it). levain checks user verification; a "
+                               "caller's `ssh-keygen -Y verify -n NS` checks the key, the message and the namespace "
+                               "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
+                               "namespace beginning 'levain', one levain verifies in, or git, file or email is "
+                               "refused.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
 
