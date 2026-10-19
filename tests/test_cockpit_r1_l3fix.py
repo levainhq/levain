@@ -139,5 +139,6 @@ def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_pa
                 install_class="reported") as (url, _httpd):
         default = _dump(f"{url}/#write_token=T")
         legacy = _dump(f"{url}/?source=substrate#write_token=T")
-    assert "<h2>Now (" in default and 'aria-label="message"' in default, default[:400]
-    assert "<h2>Now (" not in legacy and 'aria-label="message"' not in legacy
+    # the shell draws a card's count as its own chip beside the title (`<h2>Now</h2><span class="ck-count">1`), not inside it
+    assert '<h2>Now</h2><span class="ck-count">' in default and 'aria-label="message"' in default, default[:400]
+    assert "<h2>Now (" not in legacy and '<h2>Now</h2><span class="ck-count">' not in legacy and 'aria-label="message"' not in legacy

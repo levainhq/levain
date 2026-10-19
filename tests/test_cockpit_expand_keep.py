@@ -61,6 +61,8 @@ SCROLLER = ("(r) => { for (let n = r.parentElement; n; n = n.parentElement) "
 COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render; "
                  "L.render = function () { try { return o.apply(this, arguments); } finally { window.__r++; } }; 1")
 BOARD = "#board"
+# the fixture rows are capped to a 160-character title: they clamp only on a narrow card (a lone card now stretches to the page width)
+NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 
 
 def _assert_held(v: list[Any], opened: list[Any], held: list[Any], scroll: Any, why: str) -> None:
@@ -157,6 +159,7 @@ def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> Non
     rows = f"[...{panel}.querySelectorAll('.row')]"
     with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
         out = _drive(tmp_path, f"{url}/", [
+            NARROW,
             {"until": f"{panel} && {rows}.filter(r => r.classList.contains('has-more')).length === 2 && 1"},
             {"eval": _open_in("[data-ck-panel=things]", key="beta")},
             {"eval": COUNT_RENDERS},
@@ -184,6 +187,7 @@ def test_a_store_search_answer_keeps_an_expanded_row(tmp_path: Path) -> None:
     panel = f"document.querySelector('{sel}')"
     with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
         out = _drive(tmp_path, f"{url}/", [
+            NARROW,
             {"until": f"{panel} && {panel}.querySelector('.xfilter-input') && 1"},
             {"eval": f"(() => {{ const i = {panel}.querySelector('.xfilter-input'); i.value = 'old'; i.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"},
             {"until": f"{panel}.querySelectorAll('.row.has-more[data-keep-key^=old]').length > 0 && 1", "ms": 20000},

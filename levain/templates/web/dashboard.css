@@ -1536,9 +1536,9 @@ body.ke .ck-widgets .wbody { flex-direction: row; align-items: baseline; gap: va
 body.ke .ck-widgets .w .big { font-size: 20px; }
 body.ke .ck-widgets .w .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 body.ke .ck-widgets .w .sub ~ .sub, body.ke .ck-widgets .w .xnote { display: none; }
-body.ke .ck-widgets .w .row { flex-wrap: nowrap; white-space: nowrap; }
+body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: nowrap; min-width: 0; }   /* each figure stays whole; a row too wide for the strip tile wraps its figures instead of running past the edge */
 body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex-wrap: nowrap; min-width: 0; }
-body.ke .ck-widgets .w .dots { flex-direction: row; gap: var(--sp-5); }
+body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
 body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
 body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
 body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 3px 0 0 var(--accent); }
