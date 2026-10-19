@@ -59,18 +59,26 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     request = file("grant", "Edit", edit)
     assert queue.answer_by_grant(request.id, tool_input=edit, posture="default") is not None
     request = file("signed_allow", "Bash", {"command": "touch /tmp/x"})
-    queue.answer(request.id, *signed(queue, request, laptop, "allow"))
+    answer = signed(queue, request, laptop, "allow")
+    clock.now += timedelta(seconds=2)                      # the queue applies the answer after the signer signed it
+    queue.answer(request.id, *answer)
+    request = file("signed_same", "Bash", {"command": "touch /tmp/same"})
+    queue.answer(request.id, *signed(queue, request, laptop, "allow"))     # applied in the stamp it was signed in
     request = file("denied", "Write", {"file_path": "/tmp/y"}, agent="codex")
-    queue.answer(request.id, *signed(queue, request, laptop, "deny"))
+    answer = signed(queue, request, laptop, "deny")
+    clock.now += timedelta(seconds=2)
+    queue.answer(request.id, *answer)
     request = file("undecided", "Bash", {"command": "rm -r build"})
     assert queue.mark_undecided(request.id).state == "undecided"
     request = file("ruled_allow", "Bash", {"command": "make"}, tier="T3")
     assert queue.mark_undecided(request.id).gap == 1
     payload = queue.ruling_payload(request.id, "allow", laptop.fp)
+    clock.now += timedelta(seconds=2)
     queue.answer_late(request.id, payload, laptop.sign(ruling_message(payload), RULING_NAMESPACE))
     request = file("ruled_deny", "Bash", {"command": "make clean"})
     assert queue.mark_undecided(request.id).gap == 1
     payload = queue.ruling_payload(request.id, "deny", laptop.fp)
+    clock.now += timedelta(seconds=2)
     queue.answer_late(request.id, payload, laptop.sign(ruling_message(payload), RULING_NAMESPACE))
     request = file("withdrawn", "Bash", {"command": "ls"})
     assert queue.withdraw(request.id)
@@ -93,10 +101,15 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     return queue, ids
 
 
+def later(queue, days=2):
+    """An export clock past SETTLE for everything the scratch queue holds."""
+    return queue._clock.now + timedelta(days=days)
+
+
 @pytest.fixture(scope="module")
 def scratch(tmp_path_factory):
     queue, ids = build_scratch(tmp_path_factory.mktemp("ab"))
-    return queue, ids, ab.export(queue.directory, levain_version="9.9.9")
+    return queue, ids, ab.export(queue.directory, now=later(queue))
 
 
 def _by_request(queue, exported):
@@ -129,13 +142,13 @@ def test_every_terminal_row_is_one_receipt_in_seq_order_and_pending_is_not_expor
     # an undecided request that was ruled has two rows, so two receipts
     assert len([1 for r in terminal if r[1] == "undecided"]) == 3
     assert exported.report.receipts == len(terminal) == len(exported.receipts)
-    assert exported.report.by_state == {"allowed": 3, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 4}
+    assert exported.report.by_state == {"allowed": 4, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 4}
     assert exported.report.pending_skipped == len(rows) - len(terminal)
 
 
 def test_ids_are_deterministic_and_the_chain_links_each_receipt_to_the_one_before(scratch):
     queue, ids, exported = scratch
-    again = ab.export(queue.directory, levain_version="9.9.9")
+    again = ab.export(queue.directory, now=later(queue))
     assert again.receipts == exported.receipts and again.report == exported.report
     assert json.dumps(again.receipts, sort_keys=True) == json.dumps(exported.receipts, sort_keys=True)
     qid = queue.queue_id
@@ -182,7 +195,7 @@ def test_a_grant_allow_is_allow_success_with_no_approval_and_no_refusal(scratch)
     assert "approval" not in r and "refusal" not in r
     assert r["tool"] == {"name": "Edit", "capability": "claude-code.edit"}
     assert r["actor"] == {"type": "agent", "id": "agent:claude_code:session/sess-grant"}
-    assert r["policy"]["name"] == "levain.consent.T2" and r["policy"]["version"] == "9.9.9"
+    assert r["policy"]["name"] == "levain.consent.T2" and r["policy"]["version"] == "unknown"
     assert r["target"]["system"] == "levain-workspace" and r["target"]["environment"] == "dev"
     assert r["agent"] == {"framework": "claude-code", "framework_version": "unknown", "model": "unknown"}
     assert r["provenance"]["agent.model"] == "synthesized" and r["provenance"]["tool.name"] == "observed"
@@ -195,16 +208,46 @@ def test_a_signed_allow_requires_approval_and_carries_the_operators_approval(scr
     assert "refusal" not in r
     approval = r["approval"]
     assert approval["approver"]["id"].startswith("ssh-key:SHA256:") and approval["approver"]["role"] == "operator"
-    assert approval["approved_at"] == r["execution"]["completed_at"] == r["issued_at"]
+    assert approval["approved_at"] < r["execution"]["completed_at"] == r["issued_at"]
+    assert approval["approved_at"] == _signed_at(queue, ids["signed_allow"])
+    assert r["provenance"]["approval.approved_at"] == "inferred"
+    assert r["provenance"]["execution.status"] == "synthesized"      # permitted, never known to have run
     assert json.loads(approval["context"]) == {"queue": queue.queue_id, "request_id": ids["signed_allow"],
                                                "via": "signature", "verify": "levain consent receipts verify"}
 
 
-def test_a_denied_request_is_a_refusal_deny_that_keeps_its_approval(scratch):
+def _signed_at(queue, request_id):
+    conn = sqlite3.connect(queue.path)
+    try:
+        return json.loads(conn.execute("SELECT answer FROM requests WHERE id = ?", (request_id,)).fetchone()[0])["signed_at"]
+    finally:
+        conn.close()
+
+
+def test_a_signed_answer_in_the_stamp_it_was_applied_falls_back_to_the_decision_time_and_is_counted(scratch):
+    r = _row(scratch, "signed_same", "allowed")
+    assert r["approval"]["approved_at"] == r["execution"]["completed_at"]
+    assert r["provenance"]["approval.approved_at"] == "synthesized"
+    assert scratch[2].report.approved_at_fallback == 1
+
+
+def test_approved_at_precedes_completed_at_for_every_signed_allow_but_the_counted_fallback(scratch):
+    _, ids, exported = scratch
+    seen = 0
+    for r in exported.receipts:
+        if "approval" in r and r["approval"]["approver"]["id"].startswith("ssh-key:"):
+            seen += 1
+            if r["provenance"]["approval.approved_at"] == "inferred":
+                assert r["approval"]["approved_at"] < r["execution"]["completed_at"]
+    assert seen == 3 + 0           # signed_allow, signed_same, ruled_allow
+
+
+def test_a_denied_request_is_a_refusal_deny_with_no_approval_block(scratch):
     r = _row(scratch, "denied", "denied")
     assert r["policy"]["decision"] == "require-approval" and r["execution"]["status"] == "blocked"
     assert r["refusal"] == {"verdict": "deny", "reason_code": "operator-denied"}
-    assert r["approval"]["approver"]["id"].startswith("ssh-key:") and r["tool"]["capability"] == "codex.write"
+    assert "approval" not in r and not any(p.startswith("approval") for p in r["provenance"])
+    assert r["tool"]["capability"] == "codex.write"
     assert r["agent"]["framework"] == "codex"
 
 
@@ -222,11 +265,12 @@ def test_undecided_then_ruled_is_two_receipts_the_first_a_refusal_the_second_the
     second = _row(scratch, "ruled_allow", "allowed")
     assert second["policy"]["decision"] == "require-approval" and second["execution"]["status"] == "success"
     assert json.loads(second["approval"]["context"])["via"] == "ruling" and "refusal" not in second
+    assert second["approval"]["approved_at"] < second["execution"]["completed_at"]
     assert second["policy"]["name"] == "levain.consent.T3"
     denied = _row(scratch, "ruled_deny", "denied")
-    assert denied["refusal"]["verdict"] == "deny" and json.loads(denied["approval"]["context"])["via"] == "ruling"
+    assert denied["refusal"]["verdict"] == "deny" and "approval" not in denied
     # the undecided receipt keeps its own stamp, not the later ruling's decision time
-    assert first["execution"]["completed_at"] == first["issued_at"] and first["provenance"]["execution.completed_at"] == "observed"
+    assert first["execution"]["completed_at"] == first["issued_at"] and first["provenance"]["execution.completed_at"] == "inferred"
     assert _row(scratch, "undecided", "undecided")["refusal"]["reason_code"] == "undecided"
 
 
@@ -236,7 +280,7 @@ def test_withdrawn_and_dialog_outcomes(scratch):
     assert withdrawn["execution"]["status"] == "blocked"
     did_not_run = _row(scratch, "did_not_run", "withdrawn")
     assert did_not_run["execution"]["status"] == "blocked" and "refusal" not in did_not_run
-    assert did_not_run["provenance"]["execution.status"] == "observed"
+    assert did_not_run["provenance"]["execution.status"] == "inferred"
     _, _, exported = scratch
     assert (exported.report.dialog_ran, exported.report.dialog_ran_unasked,
             exported.report.dialog_did_not_run) == (1, 1, 1)
@@ -258,7 +302,8 @@ def test_a_ran_outcome_is_a_success_with_an_unsigned_native_dialog_approval(scra
     assert ran["execution"]["status"] == "success" and ran["execution"]["completed_at"] == at
     approval = ran["approval"]
     assert approval["approver"] == {"id": "native-dialog:operator", "role": "operator"}
-    assert approval["approved_at"] == at
+    assert approval["approved_at"] == ran["issued_at"] <= at          # the moment the dialog opened: a lower bound
+    assert ran["provenance"]["approval.approved_at"] == "synthesized"
     context = json.loads(approval["context"])
     assert context["via"] == "native-dialog" and context["signed"] is False
     assert context["request_id"] == scratch[1]["ran"] and context["queue"] == scratch[0].queue_id
@@ -279,13 +324,9 @@ def test_a_ran_unasked_outcome_is_an_allow_under_the_agents_own_permissions_with
 
 
 def ab_validate(receipt):
-    """The spec's own validator when it is installed (the S1 venv); otherwise the schema rule the exporter relies on."""
-    try:
-        from agentboundary import validate_receipt
-    except ImportError:
-        needs = receipt["policy"]["decision"] == "require-approval" and receipt["execution"]["status"] == "success"
-        return [] if not needs or "approval" in receipt else ["success under require-approval needs an approval"]
-    return validate_receipt(receipt)
+    """The spec's own validator; its tests are skipped where agentboundary is not installed (the S1 venv has it)."""
+    agentboundary = pytest.importorskip("agentboundary")
+    return agentboundary.validate_receipt(receipt)
 
 
 def test_refusal_and_decision_are_always_consistent_and_approval_follows_the_schema_rule(scratch):
@@ -305,7 +346,7 @@ def test_refusal_and_decision_are_always_consistent_and_approval_follows_the_sch
 def test_a_json_digest_on_a_terminal_row_is_counted_and_marked(tmp_path):
     queue, ids = build_scratch(tmp_path)
     assert queue.withdraw(ids["float"])
-    exported = ab.export(queue.directory, levain_version="1")
+    exported = ab.export(queue.directory, now=later(queue))
     assert exported.report.synthesized_arguments_hash == 1
     r = next(r for r in exported.receipts if r["actor"]["id"].endswith("sess-float"))
     assert r["provenance"]["arguments_hash"] == "synthesized" and HEX64.match(r["arguments_hash"])
@@ -326,7 +367,7 @@ def _stored_digest(queue, request_id):
 def test_a_decomposed_working_directory_is_normalised_and_hashes_under_both_canonical_forms(tmp_path):
     queue, ids = build_scratch(tmp_path)
     assert queue.withdraw(ids["decomposed"])
-    exported = ab.export(queue.directory, levain_version="1")
+    exported = ab.export(queue.directory, now=later(queue))
     r = next(r for r in exported.receipts if r["actor"]["id"].endswith("sess-decomposed"))
     assert r["target"]["resource_id"] == unicodedata.normalize("NFC", "/w/café") == "/w/café"
     assert exported.report.nfc_normalised == 1
@@ -336,19 +377,115 @@ def test_a_decomposed_working_directory_is_normalised_and_hashes_under_both_cano
 def test_export_never_writes_the_store(tmp_path):
     queue, _ = build_scratch(tmp_path)
     before = (queue.path.read_bytes(), os.stat(queue.path).st_mtime_ns)
-    ab.export(queue.directory, levain_version="1")
+    ab.export(queue.directory, now=later(queue))
     assert (queue.path.read_bytes(), os.stat(queue.path).st_mtime_ns) == before
     # nothing is created beside the database either
     names = sorted(p.name for p in queue.directory.iterdir())
-    ab.export(queue.directory, levain_version="1")
+    ab.export(queue.directory, now=later(queue))
     assert sorted(p.name for p in queue.directory.iterdir()) == names
 
 
-def test_the_default_policy_version_is_the_running_levain(scratch):
-    from levain import __version__
-    queue, _, _ = scratch
-    assert {r["policy"]["version"] for r in ab.export(queue.directory).receipts
-            if not r["policy"]["name"].endswith(".native-permissions")} == {__version__}
+def test_the_read_connection_refuses_a_write(tmp_path):
+    queue, _ = build_scratch(tmp_path)
+    conn = ab._open(queue.directory)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("CREATE TABLE zz (a)")
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM receipts")
+    finally:
+        conn.close()
+
+
+def test_policy_version_is_unknown_and_synthesized_on_every_receipt(scratch):
+    _, _, exported = scratch
+    assert {r["policy"]["version"] for r in exported.receipts} == {"unknown"}
+    assert {r["provenance"]["policy.version"] for r in exported.receipts} == {"synthesized"}
+    assert not hasattr(ab, "_levain_version")
+
+
+def test_an_empty_queue_exports_nothing(tmp_path):
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", {"laptop": Key(tmp_path / "keys", "laptop")})
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source)
+    queue.sweep()                                                       # opens the store, creating the schema
+    exported = ab.export(queue.directory)
+    assert exported.receipts == [] and exported.policy_store() == set()
+    assert exported.report.receipts == 0 and exported.report.held_unsettled == 0 and exported.report.pending_skipped == 0
+
+
+def _late_world(tmp_path):
+    """A bare queue holding one request withdrawn at T0, whose PostToolUse comes later."""
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", {"laptop": Key(tmp_path / "keys", "laptop")})
+    clock = Clock(datetime.now(timezone.utc))
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request = queue.file(agent="claude_code", agent_session_id="s-late", tool_name="Bash", tool_input={"command": "late"},
+                         cwd=str(tmp_path), hold=timedelta(minutes=5), tier="T2")
+    assert queue.withdraw(request.id)
+    t0 = clock.now
+    return queue, clock, t0
+
+
+def _ran_late(queue):
+    return queue.record_ran(agent="claude_code", agent_session_id="s-late", tool_name="Bash",
+                            tool_input={"command": "late"}, event="post")
+
+
+def test_a_late_outcome_inside_settle_is_held_back_then_exported_with_an_identical_prefix(tmp_path):
+    queue, clock, t0 = _late_world(tmp_path)
+    first = ab.export(queue.directory, now=t0 + timedelta(minutes=1))
+    assert first.report.held_unsettled == 1
+    assert not any(r["actor"]["id"].endswith("session/s-late") for r in first.receipts)
+    clock.now = t0 + timedelta(minutes=2)
+    assert _ran_late(queue)[1] == "ran"
+    second = ab.export(queue.directory, now=t0 + timedelta(minutes=3))
+    n = len(first.receipts)
+    assert second.receipts[:n] == first.receipts and second.report.held_unsettled == 0
+    late = second.receipts[n]
+    assert late["actor"]["id"].endswith("session/s-late") and late["execution"]["status"] == "success"
+    assert late["approval"]["approved_at"] < late["execution"]["completed_at"]       # withdrawn stamp < PostToolUse
+
+
+def test_the_export_stops_at_the_first_unsettled_row_and_counts_what_it_held(tmp_path):
+    queue, clock, t0 = _late_world(tmp_path)
+    request = queue.file(agent="claude_code", agent_session_id="s-after", tool_name="Bash", tool_input={"command": "z"},
+                         cwd=str(tmp_path), hold=timedelta(minutes=5), tier="T2")
+    assert queue.mark_undecided(request.id).state == "undecided"        # a terminal row AFTER the unsettled one
+    held = ab.export(queue.directory, now=t0 + timedelta(minutes=1))
+    assert held.report.held_unsettled == 2
+    assert held.report.receipts == 0 and held.receipts == []
+    assert ab.export(queue.directory, now=t0 + ab.SETTLE * 2).report.receipts == 2
+    assert all("s-after" not in r["actor"]["id"] for r in held.receipts)
+
+
+def test_a_row_older_than_settle_exports_by_state_and_a_later_outcome_changes_nothing(tmp_path):
+    queue, clock, t0 = _late_world(tmp_path)
+    now = t0 + ab.SETTLE + timedelta(seconds=1)
+    first = ab.export(queue.directory, now=now)
+    assert first.report.held_unsettled == 0
+    late = first.receipts[-1]
+    assert late["actor"]["id"].endswith("session/s-late")
+    assert late["execution"]["status"] == "blocked" and late["refusal"]["reason_code"] == "withdrawn"
+    clock.now = now                                                     # the PostToolUse lands past the window
+    assert _ran_late(queue)[1] == "ran"
+    second = ab.export(queue.directory, now=now + timedelta(minutes=1))
+    assert second.receipts == first.receipts
+    # inside the window the same outcome counts
+    (tmp_path / "b").mkdir()
+    q2, c2, t2 = _late_world(tmp_path / "b")
+    c2.now = t2 + ab.SETTLE - timedelta(seconds=1)
+    assert _ran_late(q2)[1] == "ran"
+    counted = ab.export(q2.directory, now=t2 + ab.SETTLE + timedelta(minutes=1)).receipts[-1]
+    assert counted["execution"]["status"] == "success"
+
+
+def test_an_aware_clock_is_required(tmp_path):
+    queue, _ = build_scratch(tmp_path)
+    with pytest.raises(ab.ExportError, match="aware"):
+        ab.export(queue.directory, now=datetime(2026, 1, 1))
 
 
 def test_a_store_that_is_not_a_queue_is_refused(tmp_path):
@@ -378,7 +515,7 @@ def test_a_receipt_row_whose_request_is_missing_is_refused_not_dropped(tmp_path)
     finally:
         conn.close()
     with pytest.raises(ab.ExportError, match="does not hold"):
-        ab.export(queue.directory, levain_version="1")
+        ab.export(queue.directory, now=later(queue))
 
 
 def test_an_integer_past_the_safe_range_cannot_be_hashed():

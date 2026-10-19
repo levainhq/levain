@@ -23,26 +23,45 @@ read-only and never created, migrated or written.
 
 What each queue state becomes (``policy.decision`` / ``execution.status`` / ``refusal``):
   allowed by a standing grant: allow / success / none · allowed by a signed answer or ruling: require-approval /
-  success / none, with the ``approval`` block · denied: require-approval / blocked / deny ``operator-denied``, the
-  approval block present (the spec's refusal rule 3) · expired: require-approval / blocked / expired
-  ``approval-window-elapsed`` · undecided and withdrawn: require-approval / blocked / require-approval with the reason
-  ``undecided`` or ``withdrawn``. A request left to the agent's own dialog gets its ``dialog_outcomes`` row mapped
-  over the queue's state, because the queue's state then describes a request the agent answered, not levain, and
-  ``blocked`` for a tool that ran would be a false record:
-  ``did_not_run``: blocked with no refusal · ``ran`` (a yes in the agent's dialog, unsigned): require-approval /
-  success, with an ``approval`` block whose approver is ``native-dialog:operator`` (provenance inferred),
-  ``approved_at`` the outcome's own ``closed_at`` and a context of ``via: native-dialog, signed: false``, so it is
-  never read as levain's signed answer · ``ran_unasked`` (the agent's own standing permission): policy
+  success / none, with the ``approval`` block · denied: require-approval / blocked / deny ``operator-denied``, with NO
+  approval block (a denial is not an approval; the signer stays findable through ``execution.result_ref``) ·
+  expired: require-approval / blocked / expired ``approval-window-elapsed`` · undecided and withdrawn:
+  require-approval / blocked / require-approval with the reason ``undecided`` or ``withdrawn``.
+  An ``allowed`` request with no ``dialog_outcomes`` row has ``execution.status`` ``success`` marked ``synthesized``:
+  the queue knows the tool was permitted, never that it ran. Where an outcome row counts (below), ``ran`` and
+  ``ran_unasked`` give ``success`` and ``did_not_run`` gives ``blocked``, marked ``inferred``.
+  A withdrawn or expired request left to the agent's own dialog gets its counted ``dialog_outcomes`` row mapped over
+  the queue's state, because the queue's state then describes a request the agent answered, not levain, and
+  ``blocked`` for a tool that ran would be a false record: ``did_not_run``: blocked with no refusal · ``ran`` (a yes
+  in the agent's dialog, unsigned): require-approval / success, with an ``approval`` block whose approver is
+  ``native-dialog:operator`` (provenance inferred), ``approved_at`` the withdrawn or expired row's own stamp (the
+  moment the dialog opened, a lower bound, ``synthesized``) and a context of ``via: native-dialog, signed: false``,
+  so it is never read as levain's signed answer · ``ran_unasked`` (the agent's own standing permission): policy
   ``<framework>.native-permissions`` version ``unknown`` (inferred / synthesized), allow / success, no approval. For
   both ``completed_at`` is the outcome's ``closed_at``, the moment the tool ran as levain learned it.
+  ``approval.approved_at`` of a signed allow is the signed answer's own ``signed_at`` (``inferred``: the signer's
+  claim), so the approval precedes ``completed_at``, the decision time. When the answer holds no ``signed_at`` or it is
+  not before the decision time, ``approved_at`` is the decision time, marked ``synthesized`` and counted in the report.
+  ``policy.version`` is ``unknown`` (``synthesized``): the queue never recorded which code decided, and the version of
+  the levain that happens to export is not it.
+
+Why an exported receipt never changes (the settle rule). A ``dialog_outcomes`` row is written AFTER the terminal row
+it describes, so reading it at export time could turn ``blocked`` into ``success`` under one ``receipt_id``. Two
+rules, both over row values and the export's clock (``now``, a parameter), make that impossible. An outcome counts
+only when its ``closed_at`` is less than ``SETTLE`` (24 h) after the terminal row's ``created_at``. A withdrawn or
+expired row that has no counted outcome and is younger than ``SETTLE`` is UNSETTLED: the export stops at the first
+such row and reports how many terminal rows it held back (``held_unsettled``). A row at least ``SETTLE`` old exports
+by its queue state, and an outcome that arrives later is past the window and changes nothing. So an exported prefix
+is the same at every later export, ids, hashes and links.
 
 Known edges (each stated, none built against):
   - NO signature and NO COSE envelope. The spec's envelope is Ed25519 only, while an operator key may be a security
     key or a passkey (P-256), and a key Levain held itself would be the mediator's signature Q11 refused. Authenticity
     stays Levain's own: the operator's signed answer and the Q11 head, checked by ``levain consent receipts verify``.
     A receipt here proves its content is intact against its hash and its neighbours, never who produced it;
-  - ``agent.framework_version`` and ``agent.model`` are ``"unknown"`` (the hook event carries neither), and
-    ``target.system`` and ``target.environment`` are fixed words; all four are ``synthesized``, which lowers the score;
+  - ``agent.framework_version``, ``agent.model`` and ``policy.version`` are ``"unknown"`` (the hook event carries
+    none of them), and ``target.system`` and ``target.environment`` are fixed words; all of them are ``synthesized``,
+    which lowers the score;
   - ``arguments_hash`` is the stored ``tool_input_digest`` without its ``jcs:`` prefix. Levain's canonical form
     NFC-normalises strings and the spec's does not, so a verifier handed arguments holding a non-NFC string computes
     another hash than the one stored. A digest under the ``json:`` prefix (a tool input holding a float, outside JCS's
@@ -50,13 +69,12 @@ Known edges (each stated, none built against):
   - the receipt's own strings are NFC-normalised for the same reason (a decomposed working directory would otherwise
     hash differently under the two forms); the count is in the report. ``resource_id`` can then differ from the
     stored ``cwd`` in its byte form, never in its characters;
-  - ``approval.approved_at`` and ``execution.completed_at`` are the same instant (the queue stamps one moment for a
-    decision), so ``approved_at`` equals, and does not precede, ``completed_at``;
   - ``actor.id`` carries the session id and ``resource_id`` the working directory because the closed schema has no
     field for either; a reader of an exported receipt learns both;
-  - ``completed_at`` is the decision time or, for a state with no decision, the receipt's own stamp: AgentBoundary
-    timestamps are the emitter's own, and so are these;
-  - a re-export after more receipts were written yields the same prefix (ids, hashes and links), then the new ones.
+  - ``completed_at`` is the decision time or, for a state with no decision, the receipt's own stamp (``inferred``):
+    AgentBoundary timestamps are the emitter's own, and so are these;
+  - the database is opened ``mode=ro``, and a WAL store needs a writable directory or an existing ``-shm`` file for
+    that: an export against a store whose directory the exporting user cannot write fails with ``ExportError``.
 
 Stdlib only.
 """
@@ -68,13 +86,14 @@ import unicodedata
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.cockpit.consent import ConsentError, record_sha256
+from levain.cockpit.consent import ConsentError, parse_stamp, record_sha256
 from levain.cockpit.consent import encode as jcs_encode
 
-__all__ = ["AB_VERSION", "Export", "ExportError", "Report", "export", "policy_identity", "receipt_hash"]
+__all__ = ["AB_VERSION", "Export", "ExportError", "Report", "SETTLE", "export", "policy_identity", "receipt_hash"]
 
 AB_VERSION = "agentboundary/v0.2-alpha"
 # fixed, so a re-export reproduces every receipt_id; it is uuid5(NAMESPACE_URL, _NS_NAME), written out so an edit to
@@ -82,6 +101,9 @@ AB_VERSION = "agentboundary/v0.2-alpha"
 LEVAIN_AB_NS = uuid.UUID("61dad17c-6f1f-5c59-988c-3035a88ad44e")
 _NS_NAME = "https://levain.dev/consent/agentboundary-export/v0.2-alpha"
 
+# an outcome row counts only inside this window after its terminal row, and a withdrawn / expired row younger than it
+# is not exported yet (the settle rule in the module docstring)
+SETTLE = timedelta(hours=24)
 _TERMINAL = frozenset({"allowed", "denied", "expired", "withdrawn", "undecided"})
 _UNKNOWN = "unknown"
 _FRAMEWORKS = {"claude_code": "claude-code", "codex": "codex"}
@@ -99,7 +121,7 @@ _CONDITIONAL_PATHS = ("actor.display_name", "agent.model_version", "tool.version
                       "refusal.reason_code")
 
 _SQL = ("SELECT r.seq, r.request_id, r.state, r.created_at, q.id, q.agent, q.agent_session_id, q.tool_name, "
-        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, {outcome}, {closed} "
+        "q.tool_input_digest, q.cwd, q.tier, q.state, q.decided_at, q.signer_fp, q.via, q.answer, {outcome}, {closed} "
         "FROM receipts r LEFT JOIN requests q ON q.id = r.request_id {join} ORDER BY r.seq")
 _REQUEST_TEXT = (4, 5, 6, 7, 8, 9, 10, 11)     # the request columns every exported row must hold as text
 
@@ -115,7 +137,9 @@ class Report:
     JCS hash (the spec's verifier given the arguments would flag them). ``dialog_ran`` / ``dialog_ran_unasked``:
     receipts whose queue-state mapping a ``ran`` / ``ran_unasked`` dialog outcome overrode.
     ``dialog_did_not_run``: receipts mapped ``blocked`` with no refusal for that outcome. ``nfc_normalised``:
-    receipts whose own strings were changed by NFC."""
+    receipts whose own strings were changed by NFC. ``approved_at_fallback``: signed allows whose answer gave no
+    ``signed_at`` before the decision time, so ``approved_at`` is the decision time (``synthesized``).
+    ``held_unsettled``: terminal rows not exported because the first unsettled row and all after it were held back."""
     receipts: int
     by_state: Mapping[str, int]
     pending_skipped: int
@@ -124,6 +148,8 @@ class Report:
     dialog_ran_unasked: int
     dialog_did_not_run: int
     nfc_normalised: int
+    approved_at_fallback: int
+    held_unsettled: int
 
 
 @dataclass(frozen=True)
@@ -188,14 +214,10 @@ def receipt_hash(receipt: Mapping[str, Any]) -> str:
         raise ExportError(f"the receipt cannot be canonically encoded: {exc}") from None
 
 
-def policy_identity(tier: str, levain_version: str) -> tuple[str, str]:
-    """The ``(policy.name, policy.version)`` a receipt of a request in ``tier`` names."""
-    return f"levain.consent.{tier}", levain_version
-
-
-def _levain_version() -> str:
-    from levain import __version__
-    return __version__
+def policy_identity(tier: str) -> tuple[str, str]:
+    """The ``(policy.name, policy.version)`` a receipt of a request in ``tier`` names: the queue never recorded which
+    code decided, so the version is ``"unknown"``."""
+    return f"levain.consent.{tier}", _UNKNOWN
 
 
 def _open(queue_dir: Path) -> sqlite3.Connection:
@@ -231,10 +253,8 @@ def _read(queue_dir: Path) -> tuple[str, list[tuple[Any, ...]]]:
             rows = conn.execute(sql).fetchall()
         except sqlite3.Error as exc:
             raise ExportError(f"the store cannot be read: {exc}") from None
-        finally:
-            conn.execute("COMMIT")
     finally:
-        conn.close()
+        conn.close()                # ends the read transaction with it; nothing here can replace an ExportError
     return meta["queue_id"], rows
 
 
@@ -251,18 +271,49 @@ def _row_problem(row: tuple[Any, ...]) -> str | None:
     return None
 
 
-def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dict[str, int]
+def _stamp(text: Any, what: str, seq: int) -> datetime:
+    try:
+        return parse_stamp(text)
+    except ConsentError:
+        raise ExportError(f"receipt {seq}: its {what} is not a timestamp") from None
+
+
+def _counted_outcome(row: tuple[Any, ...]) -> str | None:
+    """The row's dialog outcome when it counts (closed less than ``SETTLE`` after the terminal row), else ``None``."""
+    seq, outcome, closed = row[0], row[-2], row[-1]
+    if outcome is None:
+        return None
+    closed_at = _stamp(closed, "dialog outcome time", seq)
+    if closed_at - _stamp(row[3], "stamp", seq) < SETTLE:
+        return outcome if isinstance(outcome, str) else None
+    return None
+
+
+def _approved_at(answer: Any, decided: str) -> tuple[str, bool]:
+    """``(approved_at, from the answer)``: the signed answer's ``signed_at`` when it is before the decision time."""
+    try:
+        signed = json.loads(answer)["signed_at"]
+        if parse_stamp(signed) < parse_stamp(decided):
+            return signed, True
+    except (TypeError, ValueError, KeyError, ConsentError):
+        pass
+    return decided, False
+
+
+def _map(queue_id: str, row: tuple[Any, ...], outcome: str | None, counters: dict[str, int]
          ) -> tuple[dict[str, Any], dict[str, str]]:
-    """The receipt (without ``prior_receipt``, ``provenance``, score and hash) and its provenance entries."""
-    (seq, _rid, rstate, created, _qid, agent, session, tool, digest, cwd, tier, qstate, decided, signer, via,
-     outcome, outcome_at) = row
+    """The receipt (without ``prior_receipt``, ``provenance``, score and hash) and its provenance entries.
+    ``outcome`` is the row's dialog outcome when it counts (:func:`_counted_outcome`), else ``None``."""
+    (seq, _rid, rstate, created, _qid, agent, session, tool, digest, cwd, tier, qstate, decided, signer, via, answer,
+     _outcome, outcome_at) = row
     framework = _FRAMEWORKS.get(agent, agent.replace("_", "-"))
     prov: dict[str, str] = {
         "receipt_id": "inferred", "issued_at": "observed", "actor.type": "inferred", "actor.id": "observed",
         "agent.framework": "observed", "agent.framework_version": "synthesized", "agent.model": "synthesized",
         "tool.name": "observed", "tool.capability": "inferred", "target.system": "synthesized",
         "target.environment": "synthesized", "target.resource_id": "observed", "policy.name": "observed",
-        "policy.version": "inferred", "policy.decision": "inferred", "execution.result_ref": "inferred"}
+        "policy.version": "synthesized", "policy.decision": "inferred", "execution.result_ref": "inferred",
+        "execution.completed_at": "inferred", "execution.status": "inferred"}
     if digest.startswith("jcs:") and len(digest) == 68:
         arguments_hash = digest[4:]
         prov["arguments_hash"] = "observed"
@@ -272,12 +323,13 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
         counters["synthesized_arguments_hash"] += 1
     else:
         raise ExportError(f"receipt {seq}: its tool input digest has no known scheme")
-    name, version = policy_identity(tier, levain_version)
+    name, version = policy_identity(tier)
     leaf = f"levain-receipt:{queue_id}:{seq}"
     # the request's own decision time belongs to the row that IS its final state; any other row is stamped by itself
     decision_row = decided is not None and rstate == qstate
+    if decision_row and type(decided) is not str:
+        raise ExportError(f"receipt {seq}: its decision time is not text")
     completed = decided if decision_row else created
-    prov["execution.completed_at"] = "inferred" if decision_row else "observed"
 
     decision, status, refusal, approval = "require-approval", "blocked", None, None
     if rstate == "allowed":
@@ -287,18 +339,25 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
             status = "success"
         else:
             raise ExportError(f"receipt {seq}: an allowed request with via {via!r}")
-        prov["execution.status"] = "inferred"
-    else:
-        prov["execution.status"] = "inferred"
+        if outcome is None:
+            prov["execution.status"] = "synthesized"       # permitted is all the queue knows, never that it ran
+        elif outcome == "did_not_run":
+            status = "blocked"
     if rstate in ("allowed", "denied") and via in ("signature", "ruling"):
         if type(signer) is not str or not signer:
             raise ExportError(f"receipt {seq}: a signed {rstate} request with no signer")
-        approval = {"approver": {"id": f"ssh-key:{signer}", "role": "operator"}, "approved_at": completed,
+    if rstate == "allowed" and via in ("signature", "ruling"):
+        if not decision_row:
+            raise ExportError(f"receipt {seq}: a signed allow with no decision time")
+        approved, from_answer = _approved_at(answer, completed)
+        if not from_answer:
+            counters["approved_at_fallback"] += 1
+        approval = {"approver": {"id": f"ssh-key:{signer}", "role": "operator"}, "approved_at": approved,
                     "context": json.dumps({"queue": queue_id, "request_id": row[1], "via": via,
                                            "verify": "levain consent receipts verify"},
                                           sort_keys=True, separators=(",", ":"))}
         prov.update({"approval.approver.id": "observed", "approval.approver.role": "synthesized",
-                     "approval.approved_at": "observed" if decision_row else "inferred",
+                     "approval.approved_at": "inferred" if from_answer else "synthesized",
                      "approval.context": "inferred"})
     if rstate == "denied":
         if via not in ("signature", "ruling"):
@@ -310,30 +369,25 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
         refusal = ("require-approval", rstate)
     if rstate in ("withdrawn", "expired") and outcome == "did_not_run":
         refusal = None
-        prov["execution.status"] = "observed"
         counters["dialog_did_not_run"] += 1
     elif rstate in ("withdrawn", "expired") and outcome in ("ran", "ran_unasked"):
         # the agent's own dialog or standing permission ran the tool: the queue's state describes a request levain
         # did not decide, so the outcome row overrides it (a receipt of `blocked` for a tool that ran is a false record)
-        if type(outcome_at) is not str:
-            raise ExportError(f"receipt {seq}: its dialog outcome has no time")
         refusal = None
         status = "success"
         completed = outcome_at
-        prov["execution.completed_at"] = "inferred"
-        prov["execution.status"] = "inferred"
         if outcome == "ran":
-            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": outcome_at,
+            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": created,
                         "context": json.dumps({"queue": queue_id, "request_id": row[1], "via": "native-dialog",
                                                "signed": False}, sort_keys=True, separators=(",", ":"))}
             prov.update({"approval.approver.id": "inferred", "approval.approver.role": "synthesized",
-                         "approval.approved_at": "observed", "approval.context": "inferred"})
+                         "approval.approved_at": "synthesized", "approval.context": "inferred"})
             decision = "require-approval"
             counters["dialog_ran"] += 1
         else:
             name, version = f"{framework}.native-permissions", _UNKNOWN
             decision = "allow"
-            prov["policy.name"], prov["policy.version"] = "inferred", "synthesized"
+            prov["policy.name"] = "inferred"
             counters["dialog_ran_unasked"] += 1
     receipt: dict[str, Any] = {
         "version": AB_VERSION,
@@ -355,21 +409,24 @@ def _map(queue_id: str, row: tuple[Any, ...], levain_version: str, counters: dic
     return receipt, prov
 
 
-def export(queue_dir: Path | str, *, levain_version: str | None = None) -> Export:
+def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
     """The AgentBoundary receipts of the consent queue in ``queue_dir``, one per terminal receipt row in ``seq``
-    order, chained by ``prior_receipt``. ``levain_version`` is the ``policy.version`` the receipts name (default:
-    the running levain's). The same queue yields the same receipts every time. Raises :class:`ExportError` when the
+    order, chained by ``prior_receipt``, up to the first unsettled row (the settle rule in the module docstring).
+    ``now`` is the export's clock (an aware datetime; default the current UTC time); the same queue and ``now``
+    yield the same receipts, and any later ``now`` yields them as a prefix. Raises :class:`ExportError` when the
     store is not a readable current-format queue or a row cannot be made into a receipt."""
-    version = levain_version or _levain_version()
-    if not isinstance(version, str) or not version:
-        raise ExportError("levain_version must be a non-empty string")
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ExportError("now must be an aware datetime")
     queue_id, rows = _read(Path(queue_dir))
     counters = {"synthesized_arguments_hash": 0, "dialog_ran": 0, "dialog_ran_unasked": 0,
-                "dialog_did_not_run": 0}
+                "dialog_did_not_run": 0, "approved_at_fallback": 0}
     by_state: dict[str, int] = {}
     receipts: list[dict[str, Any]] = []
-    pending = normalised = 0
+    pending = normalised = held = 0
     prior: dict[str, str] | None = None
+    stopped = False
     for row in rows:
         problem = _row_problem(row)
         if problem is not None:
@@ -379,7 +436,14 @@ def export(queue_dir: Path | str, *, levain_version: str | None = None) -> Expor
             continue
         if row[2] not in _TERMINAL:
             raise ExportError(f"receipt {row[0]}: its state {row[2]!r} is not a queue state")
-        receipt, prov = _map(queue_id, row, version, counters)
+        if not stopped:
+            outcome = _counted_outcome(row)
+            stopped = (row[2] in ("withdrawn", "expired") and outcome is None
+                       and now - _stamp(row[3], "stamp", row[0]) < SETTLE)
+        if stopped:
+            held += 1
+            continue
+        receipt, prov = _map(queue_id, row, outcome, counters)
         clean = _nfc(receipt)
         if clean != receipt:
             normalised += 1
@@ -395,4 +459,4 @@ def export(queue_dir: Path | str, *, levain_version: str | None = None) -> Expor
         receipts.append(receipt)
     return Export(receipts=receipts,
                   report=Report(receipts=len(receipts), by_state=dict(sorted(by_state.items())),
-                                pending_skipped=pending, nfc_normalised=normalised, **counters))
+                                pending_skipped=pending, nfc_normalised=normalised, held_unsettled=held, **counters))
