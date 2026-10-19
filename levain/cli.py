@@ -1606,8 +1606,10 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
         description=(
             "Prints the number of receipts, the last signed head that matches (its size, root, signer and when it "
             "was signed), the unsigned tail (receipts after it, which no signature covers yet), the answers "
-            "signed before chaining, and each mismatch by request id. Exits 0 only when every signed head "
-            "matches. Reads the store read-only."))
+            "signed before chaining, any signer revoked since it signed, and each mismatch by request id. Exits "
+            "0 when every signed head matches (an answer signed before chaining or by a key revoked since is "
+            "listed, not failed); non-zero for a head that does not match, a signature that does not verify, a "
+            "key never enrolled, or a store that cannot be read. Reads the store read-only."))
     verify_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                           help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     verify_p.add_argument("--data-root", type=Path, default=None, dest="data_root",
@@ -1647,11 +1649,18 @@ def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
     print(f"signed heads matching: {report.signed}")
     for rid in report.unchained:
         print(_term_safe(f"signed before chaining: {rid}"))
+    for rev in report.revoked:
+        print(_term_safe(f"signer revoked since: {rev.signer_fp} (request {rev.request_id}; "
+                         + ("its head matches" if rev.head_checked else "signed before chaining")
+                         + "; it delivers nothing now)"))
     for rid, why in report.mismatches:
         print(_term_safe(f"MISMATCH {rid}: {why}"))
+    if report.unreadable is not None:
+        print(_term_safe(f"UNREADABLE: {report.unreadable}"))
     if not report.ok:
-        print(f"levain consent receipts verify: {len(report.mismatches)} signed answer(s) do not match the log",
-              file=sys.stderr)
+        what = (f"{len(report.mismatches)} signed answer(s) do not match the log" if report.mismatches
+                else "the receipts cannot be read as a log")
+        print(f"levain consent receipts verify: {what}", file=sys.stderr)
         return 1
     return 0
 

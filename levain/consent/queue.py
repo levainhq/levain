@@ -81,8 +81,9 @@ and the queue applies a signed one only when that head is still the head of its 
 in the write transaction that applies it. So each signature attests every receipt before it under the signer's own
 key, and a later rewrite of them (triggers dropped) refuses the next answer and fails
 ``levain consent receipts verify``. A record in the format from before the chaining (``.../1``) is refused when
-applied and when delivered: the request is answered again. Delivery checks the head's shape, never the log (that
-is the apply's and the verifier's).
+applied (the request is answered again); one the queue APPLIED before the upgrade still delivers, its signature
+re-verified exactly as before and only the head check skipped, and the verifier lists it as signed before
+chaining. Delivery checks the head's shape, never the log (that is the apply's and the verifier's).
 
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
@@ -151,6 +152,11 @@ _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_dig
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
                           "signed_at", "receipts_head"})
+# an answer / ruling APPLIED in the format from before the receipts were chained (``.../1``, Q11) has no
+# ``receipts_head``: it is never applied now, but one applied before the upgrade still delivers (its signature
+# re-verified exactly as before; only the head check, which it cannot have, is skipped)
+_ANSWER_KEYS_UNCHAINED = _ANSWER_KEYS - {"receipts_head"}
+_RULING_KEYS_UNCHAINED = _RULING_KEYS - {"receipts_head"}
 _LEAVE_KEYS = frozenset({"format", "queue_id", "mark_id", "agent", "decision", "signer_fp", "signed_at"})
 # how a decided request was answered: a signed answer, a standing consent grant, or a late ruling on an undecided one
 VIA: tuple[str, ...] = ("signature", "grant", "ruling")
@@ -1177,21 +1183,26 @@ class ConsentQueue:
 
     # --- answers -------------------------------------------------------------------------------------
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
-                 authority: AuthoritySnapshot) -> str | None:
+                 authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
         """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
         verifies. The one check an answer passes to be stored AND again every time it is delivered; applying it
         also checks its ``receipts_head`` against the log (:func:`~levain.consent.receipt_log.head_refusal`, in
-        :meth:`answer`'s write transaction), which this does not."""
-        if isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED:
+        :meth:`answer`'s write transaction), which this does not. ``unchained_ok`` (delivery and the verifier,
+        never the apply): an answer in the format from before the chaining is checked as that format, every
+        check but the head's, since it has none."""
+        unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
+        if unchained and not unchained_ok:
             return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
                     "chained: it covers no receipts head; answer the request again")
-        if not isinstance(payload, Mapping) or set(payload) != _ANSWER_KEYS:
+        if not isinstance(payload, Mapping) \
+                or set(payload) != (_ANSWER_KEYS_UNCHAINED if unchained else _ANSWER_KEYS):
             return "the answer is not an answer record"
-        if payload["format"] != ANSWER_FORMAT:
-            return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
-        problem = head_problem(payload["receipts_head"])
-        if problem is not None:
-            return f"the answer's {problem}"
+        if not unchained:
+            if payload["format"] != ANSWER_FORMAT:
+                return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
+            problem = head_problem(payload["receipts_head"])
+            if problem is not None:
+                return f"the answer's {problem}"
         if payload["queue_id"] != queue_id:
             return "the answer names another queue"
         if payload["request_id"] != request.id:
@@ -1255,21 +1266,25 @@ class ConsentQueue:
         return None if ok else f"the {noun}'s signature does not verify"
 
     def _ruling_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any,
-                        signature: Any, authority: AuthoritySnapshot) -> str | None:
+                        signature: Any, authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
         """Why ``payload``/``signature`` is not a ruling on ``request`` (gap number and the time it went undecided
         in ``gap``) under ``authority``; ``None`` when it verifies. Checked when it is applied and again every time
         it is delivered or taken; applying it also checks its ``receipts_head`` against the log (in
-        :meth:`answer_late`'s write transaction), which this does not."""
-        if isinstance(payload, Mapping) and payload.get("format") == RULING_FORMAT_UNCHAINED:
+        :meth:`answer_late`'s write transaction), which this does not. ``unchained_ok`` as :meth:`_refusal`'s: a
+        ruling applied before the chaining is still delivered and taken, every check but the head's."""
+        unchained = isinstance(payload, Mapping) and payload.get("format") == RULING_FORMAT_UNCHAINED
+        if unchained and not unchained_ok:
             return (f"the ruling is in format {RULING_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
                     "chained: it covers no receipts head; rule on the request again")
-        if not isinstance(payload, Mapping) or set(payload) != _RULING_KEYS:
+        if not isinstance(payload, Mapping) \
+                or set(payload) != (_RULING_KEYS_UNCHAINED if unchained else _RULING_KEYS):
             return "the ruling is not a ruling record"
-        if payload["format"] != RULING_FORMAT:
-            return f"ruling format {payload['format']!r} is not {RULING_FORMAT!r}"
-        problem = head_problem(payload["receipts_head"])
-        if problem is not None:
-            return f"the ruling's {problem}"
+        if not unchained:
+            if payload["format"] != RULING_FORMAT:
+                return f"ruling format {payload['format']!r} is not {RULING_FORMAT!r}"
+            problem = head_problem(payload["receipts_head"])
+            if problem is not None:
+                return f"the ruling's {problem}"
         if payload["queue_id"] != queue_id:
             return "the ruling names another queue"
         if payload["request_id"] != request.id:
@@ -1590,7 +1605,8 @@ class ConsentQueue:
         if gap is None or authority is None or not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
                 or payload.get("signer_fp") != row["signer_fp"] or not isinstance(row["decided_at"], str):
             return None
-        if self._ruling_refusal(request, queue_id, gap, payload, row["signature"], authority) is not None:
+        if self._ruling_refusal(request, queue_id, gap, payload, row["signature"], authority,
+                                unchained_ok=True) is not None:
             return None
         try:
             if parse_stamp(payload["signed_at"]) > parse_stamp(row["decided_at"]) + RULING_SKEW:
@@ -2005,7 +2021,8 @@ class ConsentQueue:
                 or payload.get("signer_fp") != row["signer_fp"]:
             return None
         authority = self._fresh_authority()
-        if authority is None or self._refusal(request, queue_id[0], payload, row["signature"], authority) is not None:
+        if authority is None or self._refusal(request, queue_id[0], payload, row["signature"], authority,
+                                              unchained_ok=True) is not None:
             return None
         return Decision(request_id=request.id, decision=payload["decision"], signer_fp=payload["signer_fp"],
                         decided_at=decided_at, request_digest=request.digest)
