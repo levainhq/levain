@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -597,3 +598,71 @@ def test_set_caps_values_and_stores_the_typed_whole_number_exactly(tmp_path):
 def test_no_subcommand_names_where_queue_dir_goes(tmp_path):
     code, text = _run([], tmp_path / "consent")
     assert code == 2 and "levain limits --queue-dir D <cmd>" in text
+
+
+def test_an_unreadable_consent_queue_before_filing_is_one_line_and_files_nothing(tmp_path, keys, authority, limited,
+                                                                                monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+    before = len(q.pending())
+
+    def broken(*_a, **_k):
+        raise sqlite3.DatabaseError("file is not a database")
+    monkeypatch.setattr(q, "resume_meta", broken)
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"))
+    assert code == 1 and "refused, nothing was filed: DatabaseError" in lines[-1]
+    assert len(q.pending()) == before
+
+
+def test_a_queue_failure_while_waiting_says_the_request_was_filed(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def broken(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(q, "await_decision", broken)
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"))
+    eid = _extend_id(q)
+    assert code == 1 and f"request {eid} was filed, but its answer could not be read" in lines[-1]
+
+
+def test_ctrl_c_after_the_answer_is_exit_130_not_a_traceback(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    _halt_by_end(q, keys["phone"], str(tmp_path))
+
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(L, "verified_allow", interrupted)
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=lambda *a: pytest.fail("launched"))
+    t.join()
+    assert code == 130 and "interrupted after the answer" in lines[-1]
+
+
+def test_ctrl_c_during_the_launch_is_reported_unknown_with_exit_4(tmp_path, keys, authority, limited, monkeypatch):
+    q = _q(tmp_path, authority)
+    work = tmp_path / "w"
+    work.mkdir()
+    _halt_by_end(q, keys["phone"], str(work))
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("claude",), str(work)))
+    monkeypatch.setattr("levain.consent.band._claude_facts", lambda *_a: (str(work), "default"))
+
+    def interrupted(*a):
+        raise KeyboardInterrupt
+    t = _phone_signs(q, keys["phone"], "allow")
+    lines: list[str] = []
+    code = C._cmd_extend(_args(q.directory), lines.append, queue=q, launch=interrupted, listing=lambda m: {},
+                         running=lambda *a, **k: False)
+    t.join()
+    assert code == 4 and "may have started (unknown: KeyboardInterrupt" in lines[-1]
+
+
+def test_extended_by_never_creates_the_store(tmp_path):
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    with pytest.raises(sqlite3.Error):
+        L.extended_by(qdir, "r1")
+    assert not (qdir / L.DB_NAME).exists()

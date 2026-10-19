@@ -14,6 +14,10 @@ Known edges (one line each):
 
 - an extend's resume writes no lease or settle record (its allow is a timely answer, not a leased ruling).
 - ``set`` / ``unset`` take no lock: two at once can lose one of the two edits.
+- two allows landing within the same moment (a late ruling on the halting request and this extend's allow) can each
+  plan a resume: delivery does not hold this command's session lock.
+- a halt released and a NEW limit crossed between reading the halt and filing: the allow is verified against the
+  first kind and refused; the session stays stopped and `extend` can be run again.
 
 Stdlib only.
 """
@@ -281,7 +285,7 @@ def _resume(queue: ConsentQueue, agent: str, root: str, halt_request: str, text:
         env = dv._env(agent, meta)
         try:
             failed = launch(full, cwd or "", env, logdir / f"limits-{halt_request}.log")
-        except Exception as exc:  # noqa: BLE001 - raised after the child may have been spawned: never "did not start"
+        except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - after a spawn: never "did not start"
             say(f"levain limits: the resume may have started (unknown: {type(exc).__name__}: {exc}): check before "
                 "resuming by hand.")
             return 4
@@ -328,14 +332,18 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
         return 1
     root = L.session_root(args.session)
     adapter = _ADAPTERS[agent]
-    settings = adapter.load_settings(qdir)
-    if queue is None:
-        if not _signable(settings):
-            say("levain limits: NOT filed. No enrolled key can answer (the queue's "
-                f"{adapter.SETTINGS_NAME} names no cockpit with an active key), so nothing can allow it.")
-            return 1
-        queue = _make_queue(qdir, settings)
-    old = queue.resume_meta(halt["request_id"]) if halt.get("request_id") else None
+    try:
+        settings = adapter.load_settings(qdir)
+        if queue is None:
+            if not _signable(settings):
+                say("levain limits: NOT filed. No enrolled key can answer (the queue's "
+                    f"{adapter.SETTINGS_NAME} names no cockpit with an active key), so nothing can allow it.")
+                return 1
+            queue = _make_queue(qdir, settings)
+        old = queue.resume_meta(halt["request_id"]) if halt.get("request_id") else None
+    except _STORE_ERRORS as exc:
+        say(f"levain limits: refused, nothing was filed: {type(exc).__name__}: {exc}")
+        return 1
     try:
         request_id, call = L.file_extend(queue, agent, root, hold=hold, cwd=(old or {}).get("cwd") or os.getcwd(),
                                          resume=old)
@@ -354,6 +362,10 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
     except KeyboardInterrupt:
         say(f"levain limits: interrupted; request {request_id} stays pending until its hold ends.")
         return 130
+    except _STORE_ERRORS as exc:
+        say(f"levain limits: request {request_id} was filed, but its answer could not be read ({type(exc).__name__}: "
+            f"{exc}); `levain limits show` says whether the session is still halted.")
+        return 1
     try:
         if not L.verified_allow(queue, request_id, root=root, kind=halt["kind"]):
             code = _no_allow(queue, request_id, root, halt["kind"], say)
@@ -363,6 +375,10 @@ def _cmd_extend(args: argparse.Namespace, say: Callable[[str], None], *, queue: 
             say("levain limits: the allow verified but the halt was not lifted; the session stays stopped.")
             return 1
         ours = L.extended_by(queue.directory, request_id)
+    except KeyboardInterrupt:
+        say(f"levain limits: interrupted after the answer to request {request_id}; `levain limits show` says whether "
+            "the session is still halted.")
+        return 130
     except _STORE_ERRORS as exc:
         say(f"levain limits: the limits store failed after the answer ({type(exc).__name__}: {exc}); "
             "`levain limits show` says whether the session is still halted.")
