@@ -60,6 +60,7 @@ from levain.cockpit.registry import (
     parse_date,
     validate_facets,
 )
+from levain.cockpit.display_safe import visible
 from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
@@ -455,14 +456,15 @@ def _consent_rows_in(got: Any) -> tuple[list[RowIn], int]:
         try:
             r = e.request
             pending = e.state == "pending"
+            agent, tool = visible(r.agent), visible(r.tool_name)     # agent-controlled: invisible characters show as markers
             facets: dict[str, Any] = {
-                "agent": r.agent, "tool": r.tool_name, "consent_state": e.state, "consent_tier": r.tier,
+                "agent": agent, "tool": tool, "consent_state": e.state, "consent_tier": r.tier,
                 "expires_at": r.expires_at, "due": _due_of(r.expires_at),
                 "at": r.received_at}
             if e.decided_at is not None:
                 facets["decided_at"] = e.decided_at
             rows.append(RowIn(
-                id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{r.agent} \u00b7 {r.tool_name}", facets=facets,
+                id=f"{CONSENT_ROW_PREFIX}{r.id}", title=f"{agent} \u00b7 {tool}", facets=facets,
                 stored={"state": e.state, "expires_at": r.expires_at, "decided_at": e.decided_at, "request": r.id}))
         except Exception:  # noqa: BLE001 - one entry that does not build is skipped and counted
             bad += 1
@@ -476,12 +478,13 @@ def _question_row_in(q: Any) -> RowIn:
     holder (``/cockpit/question/<n>.json``). Its version is its number and its answered-ness, read from the source,
     so an answer that landed elsewhere (the phone, the CLI) makes a stale row a 409, never a second answer."""
     answered = q.answer is not None
-    facets: dict[str, Any] = {"agent": q.agent, "at": q.filed_at, "question_n": q.n,
+    agent = visible(q.agent)
+    facets: dict[str, Any] = {"agent": agent, "at": q.filed_at, "question_n": q.n,
                               "question_state": "answered" if answered else "open",
                               "question_options": len(q.options)}
     if answered:
         facets["decided_at"] = q.answer.answered_at
-    return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{q.agent} · question #{q.n}", facets=facets,
+    return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
 
 
