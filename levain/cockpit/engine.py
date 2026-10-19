@@ -521,6 +521,7 @@ class Cockpit:
         self._discovery_states: list[_State] = []
         self._retiring: frozenset[int] | set[int] = frozenset()   # discoverers whose vanished panels are unregistered
         self._discovered: dict[str, int] = {}   # panel id -> the index of the discoverer that registered it
+        self._hero_yields: set[str] = set()     # hero panels a later hero panel of their kind replaces (yield_hero)
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -664,7 +665,18 @@ class Cockpit:
         self._register_locked(spec)
         self._dec.spec = spec
 
+    def yield_hero(self, panel_id: str) -> None:
+        """Mark a registered hero panel as the kernel's default for its slot: a later hero panel of the same kind
+        replaces it (it is unregistered, no error) instead of being refused. Levain's own ``activity`` ambient
+        yields this way, so a downstream's own hero ambient (flow's ``sky``) needs no opt-out."""
+        with self._lock:
+            spec = self._specs.get(panel_id)
+            if spec is None or spec.region != HERO:
+                raise CockpitRegistrationError(f"{panel_id!r} is not a registered hero panel")
+            self._hero_yields.add(panel_id)
+
     def _unregister_locked(self, sid: str) -> None:
+        self._hero_yields.discard(sid)
         specs = dict(self._specs)
         old = specs.pop(sid)
         if old.rowset is not None and self._rowsets.get(old.rowset) == sid:
@@ -817,6 +829,10 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
+        if spec.region == HERO:          # validated whole: only now does a yielding default leave the slot
+            for o in [o.id for o in self._specs.values()
+                      if o.region == HERO and o.kind == spec.kind and o.id in self._hero_yields]:
+                self._unregister_locked(o)
         states = dict(self._state)
         states[sid] = _State(read=spec.read)
         specs = dict(self._specs)
@@ -850,7 +866,8 @@ class Cockpit:
             if kind not in HERO_KINDS:
                 raise CockpitRegistrationError(
                     f"{sid}: the hero holds a reading and an ambient, not a {kind!r}")
-            if any(o.region == HERO and o.kind == kind for o in self._specs.values()):
+            if any(o.region == HERO and o.kind == kind and o.id not in self._hero_yields
+                   for o in self._specs.values()):
                 if spec.legacy_region != HEADER:
                     raise CockpitRegistrationError(f"{sid}: the hero holds at most one {kind}")
                 return spec.replaced(region="operate")
@@ -2396,6 +2413,9 @@ def _v_metric_grid(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
 
 EVENT_OUTCOMES = ("ok", "failed")
+# an ambient event's outcome: flow's two, then the Levain-native activity feed's (K1_DESIGN §1): a session live, a
+# decision's outcome, a question's state. A roster's last_call keeps the two.
+AMBIENT_OUTCOMES = EVENT_OUTCOMES + ("live", "allowed", "denied", "waiting", "open", "answered")
 
 
 def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -2419,8 +2439,8 @@ def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         for k in ("repo", "agent"):
             if e[k] is not None and not _is_str(e[k]):
                 raise _bad(spec, f"value.events[{i}].{k}", "must be a string or null")
-        if e["outcome"] not in EVENT_OUTCOMES:
-            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(EVENT_OUTCOMES)}, got {e['outcome']!r}")
+        if e["outcome"] not in AMBIENT_OUTCOMES:
+            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(AMBIENT_OUTCOMES)}, got {e['outcome']!r}")
     if not _is_str(v.get("legend")) or not v["legend"].strip():
         raise _bad(spec, "value.legend", "must be a non-empty string (one line saying what the encoding means)")
     return v
