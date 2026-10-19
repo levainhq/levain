@@ -91,7 +91,7 @@
   const swOk = "serviceWorker" in navigator;
   let swReg = null;
   function giveToken() {
-    const t = token();
+    const t = deviceToken() || token();     // the run token dies with the port; an open should still name the phone
     if (!swOk || !t) return;
     navigator.serviceWorker.ready.then((reg) => {
       const w = reg.active || navigator.serviceWorker.controller;
