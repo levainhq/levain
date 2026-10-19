@@ -1,0 +1,76 @@
+/* The phone app's added views (state strip, tabs, Board, Notifications), in phone.css's own tokens: nothing here
+   re-declares a colour, so light and dark follow the page. Cards, the warm top rule and the buttons are the consent
+   page's. */
+[hidden] { display: none !important; }
+
+.stateline { margin: var(--sp-4) 0 0; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg);
+             padding: var(--sp-4) var(--sp-5); min-width: 0; }
+.stateline .sl-row { display: flex; align-items: flex-start; gap: var(--sp-4); }
+.stateline .sl-text { flex: 1 1 auto; min-width: 0; font: 600 15px/1.35 var(--round); overflow-wrap: anywhere; }
+.stateline .sl-text.none { color: var(--meta); font-weight: 400; }
+.stateline .sl-age { display: block; margin-top: 2px; font: 12px/1.3 var(--sans); color: var(--meta); font-weight: 400; }
+.stateline .sl-edit { margin-top: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3); }
+.stateline textarea { width: 100%; font: 15px/1.4 var(--round); color: inherit; background: var(--card-2);
+                      border: 1px solid var(--hair-2); border-radius: var(--r-md); padding: 10px; resize: vertical; min-height: 4.5em; }
+.stateline .sl-count { font: 12px/1 var(--mono); color: var(--meta); text-align: right; }
+
+.tabs { display: flex; gap: var(--sp-3); margin: var(--sp-4) 0 var(--sp-2); position: sticky; top: 0; z-index: 2;
+        background: var(--base); padding-block: var(--sp-3); border-bottom: 1px solid var(--hair); }
+.tabs button { flex: 1 1 0; min-width: 0; font-size: 14px; padding: 10px 6px; background: var(--card); color: var(--label);
+               overflow-wrap: anywhere; }
+.tabs button[aria-selected="true"] { background: var(--card-2); color: var(--text); border-color: var(--accent);
+                                     box-shadow: inset 0 -2px 0 var(--accent); }
+.tabs .badge { display: inline-block; min-width: 1.4em; margin-left: 4px; padding: 1px 5px; border-radius: var(--r-pill);
+               background: var(--accent); color: var(--on-accent); font: 700 11px/1.4 var(--mono); }
+
+.view { padding-top: var(--sp-4); }
+.card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: var(--sp-5);
+        margin: 0 0 var(--sp-5); min-width: 0; }
+.card.warm { border-top: 2px solid var(--accent); }
+.card.empty { color: var(--meta); font-size: 13px; }
+
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); margin: var(--sp-6) 0 var(--sp-3); }
+.panel-head h2 { margin: 0; }
+.panel-head .meta { font-size: 12px; }
+details.panel > summary { list-style: none; cursor: pointer; min-height: var(--hit-min); display: flex; align-items: center; }
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary h2 { margin: 0; }
+details.panel > summary::after { content: "show"; margin-left: auto; font: 600 12px/1 var(--round); color: var(--meta); }
+details.panel[open] > summary::after { content: "hide"; }
+.group-title { margin: var(--sp-4) 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var(--track-caps);
+               text-transform: uppercase; color: var(--meta); }
+
+.row { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5);
+       margin: 0 0 var(--sp-3); min-width: 0; }
+.row.overdue { border-left: 3px solid var(--warn); }
+.row .title { font: 600 15px/1.35 var(--round); overflow-wrap: anywhere; }
+.row .body { margin-top: var(--sp-2); font-size: 13px; color: var(--label); overflow-wrap: anywhere; white-space: pre-wrap;
+             display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.row.open .body { display: block; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--sp-3); }
+.chip { font: 600 11px/1 var(--mono); border: 1px solid var(--hair-2); color: var(--label); border-radius: var(--r-sm); padding: 4px 6px; }
+.chip.warn { color: var(--warn); border-color: var(--warn); }
+.row .acts { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
+.row .acts button { flex: 1 1 6rem; }
+.row .laptop { margin-top: var(--sp-3); font-size: 12px; color: var(--meta); }
+.choices { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
+.choices button { flex: 1 1 5rem; }
+.choices button[aria-pressed="true"] { border-color: var(--accent); background: var(--card); box-shadow: inset 0 0 0 1px var(--accent); }
+.confirm-line { margin-top: var(--sp-3); font-size: 13px; color: var(--label); }
+button.go { background: var(--accent); color: var(--on-accent); border-color: var(--accent); flex: 1 1 8rem; }
+
+.pings h2 { margin-bottom: var(--sp-4); }
+.pings .pstate { font: 600 15px/1.35 var(--round); margin-bottom: var(--sp-3); }
+.pings .pstate.on { color: var(--ok); }
+.pings .pstate.bad { color: var(--bad); }
+.pings ol { margin: var(--sp-3) 0 var(--sp-4); padding-left: 1.3em; font-size: 14px; }
+.pings .btnrow { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
+.pings .btnrow button { flex: 1 1 10rem; }
+
+.ping .when { font: 12px/1.3 var(--mono); color: var(--meta); }
+.ping .kind { font: 600 11px/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+.ping .head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; justify-content: space-between; }
+.ping .outcome { margin-top: var(--sp-3); font-size: 13px; }
+.ping .outcome.wait { color: var(--warn); }
+.ping .outcome.done { color: var(--ok); }
+.ping .title { margin-top: var(--sp-2); }

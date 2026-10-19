@@ -246,3 +246,76 @@ def test_a_passkey_answer_that_is_a_plain_ssh_signature_is_refused(tmp_path: Pat
     sig = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(plain), "-n", "levain-consent"],
                          input=b"x", capture_output=True, check=True).stdout.decode()
     assert "WebAuthn" in answer_signature_problem(sig, public_key_line(_SPKI, "localhost"))
+
+
+def test_redeems_count_only_failures_a_device_store_fault_is_503_and_app_reads_take_the_gate(tmp_path: Path) -> None:
+    import os
+
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    with _serving(qdir) as (url, httpd):
+        for _ in range(25):                                           # a GET never charges the pairing limiter
+            assert _call(url + "/webpush/pair/redeem", token=None)[0] == 403
+        code = _call(url + "/webpush/pair", {"label": "p"})[1]["code"]
+        status, dev = _call(url + "/webpush/pair/redeem", {"code": code}, token=None)
+        assert status == 200
+        for _ in range(20):
+            assert _call(url + "/webpush/pair/redeem", {"code": "x" * 16}, token=None)[0] == 403
+        assert _call(url + "/webpush/pair/redeem", {"code": "y" * 16}, token=None)[0] == 429
+
+        assert _call(url + "/webpush/record", token="z" * 32)[0] == 403              # a token no device holds
+        db = qdir / "webpush" / "webpush.db"
+        os.chmod(db, 0)
+        try:
+            status, body = _call(url + "/webpush/record", token=dev["token"])     # a paired phone hears "try again"
+            assert status == 503 and body["error"] == "unavailable"
+        finally:
+            os.chmod(db, 0o600)
+        assert _call(url + "/webpush/record", token=dev["token"])[0] == 200
+
+        held = [httpd.request_gate.acquire(blocking=False) for _ in range(4)]
+        try:
+            assert all(held)
+            assert _call(url + "/webpush/record")[0] == 503 and _call(url + "/app/state.json")[0] == 503
+            assert _call(url + "/sw.js", token=None)[0] == 200                       # static stays ungated
+        finally:
+            for _ in held:
+                httpd.request_gate.release()
+
+
+def test_a_device_store_that_cannot_be_stat_ed_is_503_never_an_unknown_token(tmp_path: Path) -> None:
+    import os
+
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    with _serving(qdir) as (url, _):
+        code = _call(url + "/webpush/pair", {"label": "p"})[1]["code"]
+        dev = _call(url + "/webpush/pair/redeem", {"code": code}, token=None)[1]
+        folder = qdir / "webpush"
+        os.chmod(folder, 0)
+        try:
+            status, body = _call(url + "/webpush/record", token=dev["token"])
+            assert status == 503 and body["error"] == "unavailable"
+        finally:
+            os.chmod(folder, 0o700)
+        assert _call(url + "/webpush/record", token=dev["token"])[0] == 200
+    empty = tmp_path / "empty"
+    empty.mkdir(mode=0o700)
+    with _serving(empty) as (url, _):
+        assert _call(url + "/webpush/record", token="z" * 32)[0] == 403              # no store at all: unknown
+
+
+def test_the_page_opened_from_another_app_loads_and_its_manifest_is_allowed(tmp_path: Path) -> None:
+    from levain.http_guards import _CSP
+
+    assert "manifest-src 'self'" in _CSP
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    nav = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    with _serving(qdir) as (url, _):
+        assert _call(url + "/", token=None, headers=nav)[0] == 200                 # a link opened from another app
+        assert _call(url + "/app/state.json", headers=nav)[0] == 403               # a data route stays refused
+        assert _call(url + "/phone.js", token=None, headers=nav)[0] == 403         # not a page: refused
+        assert _call(url + "/", token=None, headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors",
+                                                      "Sec-Fetch-Dest": "document"})[0] == 403
+        assert _call(url + "/", token=None, headers={**nav, "Host": "evil.example"})[0] == 403

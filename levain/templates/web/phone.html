@@ -5,13 +5,27 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>levain · consent</title>
+<link rel="manifest" id="manifest" href="/app.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f6fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0e18" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/phone.css">
+<link rel="stylesheet" href="/phone_app.css">
 </head>
 <body>
 <header class="top">
   <h1>levain <span class="sub">consent</span></h1>
   <button type="button" id="refresh" class="quiet">refresh</button>
 </header>
+<section id="stateline" class="stateline" aria-label="state line"></section>
+<nav id="tabs" class="tabs" role="tablist" aria-label="views">
+  <button type="button" role="tab" id="tab-needs" data-view="needs" aria-selected="true">Needs you</button>
+  <button type="button" role="tab" id="tab-board" data-view="board" aria-selected="false">Board</button>
+  <button type="button" role="tab" id="tab-notes" data-view="notes" aria-selected="false">Notifications</button>
+</nav>
+<div id="view-needs">
 <p id="status" class="status" role="status">reading the queue…</p>
 <main id="requests"></main>
 <section id="enrol" class="enrol" hidden>
@@ -20,6 +34,13 @@
   <button type="button" id="enrol-btn">make a passkey here</button>
   <div id="enrol-out"></div>
 </section>
+</div>
+<section id="board" class="view" hidden></section>
+<section id="notes" class="view" hidden>
+  <div id="pings" class="card pings"></div>
+  <div id="record"></div>
+</section>
+<script src="/phone_app.js"></script>
 <script src="/phone.js"></script>
 </body>
 </html>

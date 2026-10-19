@@ -1417,6 +1417,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_team(subparsers)
 
+    from levain.webpush.cli import register as _register_webpush
+
+    _register_webpush(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 
@@ -2653,7 +2657,7 @@ def _cmd_consent_rule(args: argparse.Namespace) -> int:
         print("  delivery: not attempted (--no-deliver); `levain consent deliver` delivers it")
         return 0
     try:
-        got = deliver(queue, ruling.request_id, notify=agent_notify(qdir, request.agent))
+        got = deliver(queue, ruling.request_id, notify=agent_notify(qdir, request.agent, ruling.request_id))
     except Exception as exc:  # noqa: BLE001 - the ruling stands; its next hook or `consent deliver` delivers it
         print(f"  delivery: failed ({_term_safe(type(exc).__name__)}: {_term_safe(exc)}); the ruling stands and "
               "lands at the session's next step, or `levain consent deliver`")
@@ -2684,7 +2688,7 @@ def _cmd_consent_deliver(args: argparse.Namespace) -> int:
             if queue.ruling_delivered(g.request.id) is not None:
                 print("  delivery: delivered: an earlier resume in this run carried it")
                 continue
-            d = deliver(queue, g.request.id, notify=agent_notify(qdir, g.request.agent))
+            d = deliver(queue, g.request.id, notify=agent_notify(qdir, g.request.agent, g.request.id))
         except Exception as exc:  # noqa: BLE001 - one ruling's error never stops the rest
             print(f"  delivery: failed ({_term_safe(type(exc).__name__)}: {_term_safe(exc)})")
             failed += 1

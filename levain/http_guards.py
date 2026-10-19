@@ -55,7 +55,7 @@ def _redact_query(text: str) -> str:
 # clickjacking / hostile-iframe embedding (paired with X-Frame-Options below).
 _CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; "
+    "connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'"
 )
 

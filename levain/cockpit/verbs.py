@@ -280,7 +280,7 @@ def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
 
 
 # the surface a credential names, recorded as the line's source (never a caller-chosen label)
-_SURFACE_SOURCE = {"browser": "web", "flowconnect": "app"}
+_SURFACE_SOURCE = {"browser": "web", "flowconnect": "app", "phone": "phone"}
 
 
 def _operator_state_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],

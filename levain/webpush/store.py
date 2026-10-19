@@ -1,0 +1,260 @@
+"""The push store: ``<queue_dir>/webpush/webpush.db``, beside the consent queue and opened the way the queue opens its own.
+
+The directory is 0700 and the file 0600; a symlinked directory or file is refused, and the file is created with
+``O_NOFOLLOW`` so a link planted between the check and the open is not followed. Under a sandboxed agent the
+queue directory is outside its write reach, which is where the VAPID private key belongs.
+
+``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, rollback, write_transaction
+
+DIR_NAME = "webpush"
+DB_NAME = "webpush.db"
+STORE_FORMAT = "levain-push-store/1"
+MAX_SUBSCRIPTIONS_PER_DEVICE = 5
+MAX_SUBSCRIPTIONS = 20
+STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
+
+
+class PushStoreError(RuntimeError):
+    """The push store cannot be opened safely."""
+
+
+def now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime(STAMP)
+
+
+def _records(table: str) -> tuple[str, str]:
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {table}_frozen BEFORE UPDATE ON {table} "
+        f"BEGIN SELECT RAISE(ABORT, '{table} rows never change'); END",
+        f"CREATE TRIGGER IF NOT EXISTS {table}_kept BEFORE DELETE ON {table} "
+        f"BEGIN SELECT RAISE(ABORT, '{table} rows are never deleted'); END",
+    )
+
+
+_SCHEMA: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    # one key pair; ``private_der`` is PKCS8 DER of the P-256 private key
+    "CREATE TABLE IF NOT EXISTS vapid (id INTEGER PRIMARY KEY CHECK (id = 1), private_der BLOB NOT NULL, "
+    "public_b64 TEXT NOT NULL, sub TEXT NOT NULL, created TEXT NOT NULL)",
+    # a signed VAPID token per push-service origin, reused until it nears expiry (Apple asks for no more than
+    # one new token an hour)
+    "CREATE TABLE IF NOT EXISTS vapid_tokens (aud TEXT PRIMARY KEY, jwt TEXT NOT NULL, exp INTEGER NOT NULL)",
+    # the pairing/device logic is levain.webpush.devices; this module only creates the tables
+    "CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, label TEXT, token_hash TEXT UNIQUE NOT NULL, "
+    "created TEXT, last_seen TEXT, revoked_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
+    "used_at TEXT)",
+    # ``subscribed`` is the subscribe order, moved up on every re-subscribe: the caps retire by it
+    "CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, "
+    "endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created TEXT NOT NULL, "
+    "last_status INTEGER, last_at TEXT, retired_at TEXT, subscribed INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS pings (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, "
+    "ref TEXT, title TEXT NOT NULL, body TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
+    "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL, "
+    "status INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS opens (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
+    "REFERENCES pings(id), device_id TEXT, at TEXT NOT NULL)",
+    *_records("pings"), *_records("deliveries"), *_records("opens"),
+)
+
+
+def _check_dir(directory: Path) -> None:
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(directory)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise PushStoreError(f"push directory {directory} is not a plain directory")
+    if st.st_uid != os.getuid():
+        raise PushStoreError(f"push directory {directory} is not owned by uid {os.getuid()}")
+    if st.st_mode & 0o077:
+        os.chmod(directory, 0o700)
+
+
+def _check_file(path: Path) -> None:
+    if not os.path.lexists(path):
+        # created here, not by sqlite, so O_NOFOLLOW applies to the file the database will then open
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.close(fd)
+            return
+        except FileExistsError:
+            pass                  # another opener created it first: checked below like any existing file
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise PushStoreError(f"push database {path} is not a regular file")
+
+
+class PushStore:
+    def __init__(self, queue_dir: Path | str) -> None:
+        self.directory = Path(queue_dir) / DIR_NAME
+        self.path = self.directory / DB_NAME
+        self._ready = False
+
+    def _connect(self) -> sqlite3.Connection:
+        if not self._ready:
+            _check_dir(self.directory)
+            _check_file(self.path)
+        conn = open_durable(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            if not self._ready:
+                os.chmod(self.path, 0o600)
+                self._ensure_schema(conn)
+                self._ready = True
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() \
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'meta'").fetchone() else None
+            if row is not None and row[0] != STORE_FORMAT:
+                raise PushStoreError(f"push store format {row[0]!r} is not {STORE_FORMAT!r}")
+            for stmt in _SCHEMA:
+                conn.execute(stmt)
+            if "subscribed" not in {r[1] for r in conn.execute("PRAGMA table_info(subscriptions)")}:
+                conn.execute("ALTER TABLE subscriptions ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0")
+                conn.execute("UPDATE subscriptions SET subscribed = id")
+            # a subscription with no device is one no revoke can stop: none is stored any more, and any left is retired
+            conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id IS NULL AND retired_at IS NULL",
+                         (now_stamp(),))
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback(conn)
+            raise
+
+    def connection(self) -> sqlite3.Connection:
+        """A plain connection for ``levain.webpush.devices``: default isolation (``with conn:`` commits), the
+        store's durability PRAGMAs, schema ensured. The caller closes it."""
+        self._connect().close()
+        conn = open_durable(self.path)
+        conn.isolation_level = ""
+        return conn
+
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        with write_transaction(self._connect) as conn:
+            yield conn
+
+    @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        with read_transaction(self._connect) as conn:
+            yield conn
+
+    # --- subscriptions -------------------------------------------------------------------------------
+    def add_subscription(self, endpoint: str, p256dh: str, auth: str, device_id: str) -> int:
+        """Store (or revive, with fresh keys) the subscription for ``endpoint`` under ``device_id``; returns its id.
+        A revived row takes the device that subscribed it now, so it is never live under a device revoked before.
+        Live subscriptions are capped per device and overall: the least recently subscribed retire first, never the
+        one just stored."""
+        if not isinstance(device_id, str) or not device_id:
+            raise ValueError("a subscription is always stored under a device")
+        with self.write() as c:
+            return _subscribe(c, endpoint, p256dh, auth, device_id)
+
+    def subscribe_unowned(self, endpoint: str, p256dh: str, auth: str, label: Any,
+                          now: datetime) -> tuple[int, tuple[str, str] | None]:
+        """A run-token subscribe, in one transaction: an endpoint a live device already owns stays that device's and
+        nothing is minted; otherwise a new device is minted and owns it. Returns ``(subscription id, (device_id,
+        device_token) or None)``."""
+        from levain.webpush import devices
+
+        with self.write() as c:
+            row = c.execute("SELECT s.device_id FROM subscriptions s JOIN devices d ON d.id = s.device_id "
+                            "WHERE s.endpoint = ? AND d.revoked_at IS NULL", (endpoint,)).fetchone()
+            minted = None
+            if row is None:
+                minted = devices._insert_device(c, label, now)
+            owner = row[0] if row is not None else minted[0]
+            return _subscribe(c, endpoint, p256dh, auth, owner), minted
+
+    def retire_subscription(self, endpoint: str) -> bool:
+        with self.write() as c:
+            return c.execute("UPDATE subscriptions SET retired_at = ? WHERE endpoint = ? AND retired_at IS NULL",
+                             (now_stamp(), endpoint)).rowcount > 0
+
+    def live_subscriptions(self) -> list[dict[str, Any]]:
+        with self.read() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM subscriptions WHERE retired_at IS NULL ORDER BY id")]
+
+    # --- the record ----------------------------------------------------------------------------------
+    def add_ping(self, kind: str, ref: str | None, title: str, body: str) -> int:
+        with self.write() as c:
+            return int(c.execute("INSERT INTO pings (at, kind, ref, title, body) VALUES (?,?,?,?,?)",
+                                 (now_stamp(), kind, ref, title, body)).lastrowid)
+
+    def add_delivery(self, ping_id: int, subscription_id: int, status: int, *, retire: bool = False) -> None:
+        with self.write() as c:
+            at = now_stamp()
+            c.execute("INSERT INTO deliveries (ping_id, subscription_id, at, status) VALUES (?,?,?,?)",
+                      (ping_id, subscription_id, at, status))
+            c.execute("UPDATE subscriptions SET last_status = ?, last_at = ?, "
+                      "retired_at = CASE WHEN ? THEN ? ELSE retired_at END WHERE id = ?",
+                      (status, at, 1 if retire else 0, at, subscription_id))
+
+    def add_open(self, ping_id: int, device_id: str | None) -> bool:
+        with self.write() as c:
+            if c.execute("SELECT 1 FROM pings WHERE id = ?", (ping_id,)).fetchone() is None:
+                return False
+            c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
+            return True
+
+    def record(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The newest ``limit`` pings, each with its deliveries and opens."""
+        with self.read() as c:
+            pings = [dict(r) for r in c.execute("SELECT * FROM pings ORDER BY id DESC LIMIT ?", (limit,))]
+            for p in pings:
+                p["deliveries"] = [dict(r) for r in c.execute(
+                    "SELECT subscription_id, at, status FROM deliveries WHERE ping_id = ? ORDER BY id", (p["id"],))]
+                p["opens"] = [dict(r) for r in c.execute(
+                    "SELECT device_id, at FROM opens WHERE ping_id = ? ORDER BY id", (p["id"],))]
+            return pings
+
+
+def _subscribe(c: sqlite3.Connection, endpoint: str, p256dh: str, auth: str, device_id: str) -> int:
+    """The body of :meth:`PushStore.add_subscription`, in the caller's write transaction."""
+    nxt = "(SELECT COALESCE(MAX(subscribed), 0) + 1 FROM subscriptions)"
+    c.execute(
+        "INSERT INTO subscriptions (device_id, endpoint, p256dh, auth, created, subscribed) "
+        f"VALUES (?,?,?,?,?,{nxt}) "
+        "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, "
+        f"device_id = excluded.device_id, retired_at = NULL, subscribed = {nxt}",
+        (device_id, endpoint, p256dh, auth, now_stamp()))
+    row = c.execute("SELECT id, device_id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()
+    sid, owner = int(row[0]), row[1]
+    at = now_stamp()
+    c.execute(
+        "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND device_id IS ? AND id != ? "
+        "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND device_id IS ? "
+        "AND id != ? ORDER BY subscribed DESC LIMIT ?)",
+        (at, owner, sid, owner, sid, MAX_SUBSCRIPTIONS_PER_DEVICE - 1))
+    c.execute(
+        "UPDATE subscriptions SET retired_at = ? WHERE retired_at IS NULL AND id != ? "
+        "AND id NOT IN (SELECT id FROM subscriptions WHERE retired_at IS NULL AND id != ? "
+        "ORDER BY subscribed DESC LIMIT ?)", (at, sid, sid, MAX_SUBSCRIPTIONS - 1))
+    return sid
+
+
+def retire_device_subscriptions(conn: sqlite3.Connection, device_id: str, now: datetime) -> int:
+    """Mark ``device_id``'s live subscriptions retired; the caller's transaction commits it."""
+    return conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id = ? AND retired_at IS NULL",
+                        (now.astimezone(timezone.utc).strftime(STAMP), device_id)).rowcount

@@ -351,14 +351,15 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
         if state == "undecided":                 # the ping claims the tap only on a state actually read
             ping_text += (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
                           "passkey also allows that push (or rule it with `levain consent rule`).")
-        pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
+        pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir, kind="question", ref=f"question:{q.n}")
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
         pinged = False
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              + no_session_hint)
     ping = ("pinged" if pinged else
-            "NOT pinged (no notify command is configured; the question is listed in `levain question list`)")
+            "NOT pinged (no notify command is configured and no phone has pings on; the question is listed in "
+            "`levain question list`)")
     text = (f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does "
             f"not block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
     if link is not None:

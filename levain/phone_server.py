@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from levain.http_guards import GuardedHandler
 
@@ -59,7 +60,9 @@ PHONE_TOKEN_HEADER = "X-Levain-Phone-Token"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
            "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
-           "/phone.css": ("phone.css", "text/css; charset=utf-8")}
+           "/phone.css": ("phone.css", "text/css; charset=utf-8"),
+           "/phone_app.js": ("phone_app.js", "text/javascript; charset=utf-8"),
+           "/phone_app.css": ("phone_app.css", "text/css; charset=utf-8")}
 _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
@@ -107,6 +110,20 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
     return rid, action
 
 
+# the phone app's own routes (levain.phone_app), each with the one method it answers
+_APP_ROUTES = {"/app/state.json": "GET", "/app/board.json": "GET", "/app/verb": "POST"}
+# failed unauthenticated pairing redeems a single process takes per minute: a code is 128 bits, so this only keeps a
+# caller from holding the push store's write lock with a stream of guesses
+_REDEEMS_PER_MINUTE = 20
+
+
+def _json_or_none(body: bytes) -> Any:
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
 def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -116,10 +133,31 @@ class _PhoneHandler(GuardedHandler):
 
     # -- the gates ---------------------------------------------------------------------------------------
 
-    def _token_ok(self) -> bool:
+    def _credential(self) -> "tuple[str, str | None] | None":
+        """``("run", None)`` for this run's phone token, ``("device", id)`` for a live paired device token
+        (:mod:`levain.webpush.devices`), else None. Either is only the transport gate the page needs to load the
+        queue and carry a passkey ceremony: the authority for an answer is the passkey's signature, which the queue
+        verifies whoever carried it. A device store that cannot be read raises :class:`PhoneError` (503)."""
         supplied = self.headers.get(PHONE_TOKEN_HEADER)
-        return supplied is not None and hmac.compare_digest(supplied.encode("utf-8", "replace"),
-                                                            self.server.phone_token.encode("utf-8"))
+        if supplied is None:
+            return None
+        if hmac.compare_digest(supplied.encode("utf-8", "replace"), self.server.phone_token.encode("utf-8")):
+            return ("run", None)
+        device = self.server.device_for(supplied)
+        return ("device", device) if device is not None else None
+
+    def _token_ok(self) -> bool:
+        return self._credential() is not None
+
+    def _cross_site_read(self) -> bool:
+        """The cross-site refusal, less a top-level navigation to a page: the phone link opened from another app
+        arrives cross-site. A page carries no data (the token gates every data route), and framing is still refused."""
+        if not super()._cross_site_read():
+            return False
+        static = _STATIC.get(self.path.split("?", 1)[0])
+        return not (self.command == "GET" and static is not None and static[1].startswith("text/html")
+                    and self.headers.get("Sec-Fetch-Mode") == "navigate"
+                    and self.headers.get("Sec-Fetch-Dest") == "document")
 
     def _json(self, payload: dict[str, Any], status: int = 200, *, head: bool = False) -> None:
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
@@ -128,6 +166,8 @@ class _PhoneHandler(GuardedHandler):
     # -- reads -------------------------------------------------------------------------------------------
 
     def _route(self, *, head: bool) -> None:
+        from levain.webpush.routes import STATIC_PATHS
+
         if self._refuse_read(head=head):
             return
         route = self.path.split("?", 1)[0]
@@ -137,20 +177,104 @@ class _PhoneHandler(GuardedHandler):
 
             self._send(load_web_asset(static[0]).encode("utf-8"), static[1], head=head)
             return
-        if route != "/consent.json":
-            self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
-            return
-        if not self._token_ok():
-            self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
-                       403, head=head)
+        if route in STATIC_PATHS:
+            self._app_route("GET", route, b"", head=head)
             return
         if not self.server.request_gate.acquire(blocking=False):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503, head=head)
             return
         try:
+            if route != "/consent.json":
+                if not self._app_route("GET", route, b"", head=head):
+                    self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
+                return
+            try:
+                ok = self._token_ok()
+            except PhoneError as exc:
+                self._json({"error": exc.error, "message": exc.message}, exc.status, head=head)
+                return
+            if not ok:
+                self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
+                           403, head=head)
+                return
             self._json(self.server.listing(), head=head)
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             self._json({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}, 500, head=head)
+        finally:
+            self.server.request_gate.release()
+
+    # -- the phone app: web push, the state line and the board (P1-P4) ----------------------------------------
+
+    def _app_route(self, method: str, route: str, body: bytes, *, head: bool = False) -> bool:
+        """Serve one phone-app route (:mod:`levain.webpush.routes`, :mod:`levain.phone_app`); False when the path is
+        not one of them. Every fault is an answer, never a dead connection."""
+        from levain.phone_app import PhoneAppError
+        from levain.webpush import routes as push_routes
+
+        try:
+            cred = None if route in push_routes.STATIC_PATHS else self._credential()
+            if route.startswith("/app/"):
+                if route not in _APP_ROUTES or _APP_ROUTES[route] != method:
+                    return False
+                if cred is None:
+                    self._json({"error": "forbidden", "message": f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}"},
+                               403, head=head)
+                    return True
+                if route == "/app/state.json":
+                    self._json(self.server.phone_app().state(), head=head)
+                elif route == "/app/board.json":
+                    self._json(self.server.phone_app().board(), head=head)
+                else:
+                    self._json(self.server.phone_app().fire(_json_or_none(body)))
+                return True
+            if route == "/webpush/pair" and (cred is None or cred[0] != "run"):
+                # a device never mints another device: revoking a phone must be the end of what it holds
+                self._json({"error": "forbidden", "message": "pairing a phone takes this run's phone link"}, 403)
+                return True
+            redeem = method == "POST" and route == "/webpush/pair/redeem"
+            if redeem and not self.server.redeem_allowed():
+                self._json({"error": "busy", "message": "too many pairing attempts; try again in a minute"}, 429)
+                return True
+            query = parse_qs(self.path.partition("?")[2])
+            got = push_routes.handle(method, route, query, body, queue_dir=self.server.queue_dir,
+                                     authorized=cred is not None, device_id=cred[1] if cred else None)
+            if redeem and (got is None or got[0] != 200):
+                self.server.redeem_failed()
+        except PhoneAppError as exc:
+            self._json({"error": exc.error, "message": str(exc)}, exc.status, head=head)
+            return True
+        except PhoneError as exc:
+            self._json({"error": exc.error, "message": exc.message}, exc.status, head=head)
+            return True
+        except Exception as exc:  # noqa: BLE001 - every failure is an answer the page can show
+            self._json({"error": "internal", "message": type(exc).__name__}, 500, head=head)
+            return True
+        if got is None:
+            return False
+        status, payload, ctype = got
+        if ctype.startswith("application/json"):
+            self._send(payload, ctype, status=status, head=head, headers=[("Vary", PHONE_TOKEN_HEADER)],
+                       cache_control="private, no-store")
+        else:
+            self._send(payload, ctype, status=status, head=head, cache_control="no-cache")
+        return True
+
+    def _app_post(self, route: str) -> bool:
+        """A POST to a phone-app route: the same origin, JSON and size gates as the consent routes, then
+        :meth:`_app_route`. False when the path is not one of them (nothing of the body is read)."""
+        if not (route.startswith("/webpush/") or route in _APP_ROUTES):
+            return False
+        if self._refuse_non_json():
+            return True
+        clen = self._declared_length()
+        if clen is None or self._refuse_oversize(clen, _MAX_BODY, _MAX_BODY * 4):
+            return True
+        body = self.rfile.read(clen)
+        if not self.server.request_gate.acquire(blocking=False):
+            self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
+            return True
+        try:
+            return self._app_route("POST", route, body)
         finally:
             self.server.request_gate.release()
 
@@ -164,9 +288,15 @@ class _PhoneHandler(GuardedHandler):
         sign = _sign_route(route)
         question = _QUESTION_ROUTE.fullmatch(route)
         if consent is None and sign is None and question is None and route != _KEY_LINE:
-            self._reject(404, "not_found", "no such route")
+            if not self._app_post(route):
+                self._reject(404, "not_found", "no such route")
             return
-        if not self._token_ok():
+        try:
+            ok = self._token_ok()
+        except PhoneError as exc:
+            self._json({"error": exc.error, "message": exc.message}, exc.status)
+            return
+        if not ok:
             # refused before a byte of the body is read
             self._reject(403, "credential_required", f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}")
             return
@@ -237,6 +367,62 @@ class _PhoneServer(ThreadingHTTPServer):
         self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
         signer.page_origin = self.page_origin
         self.signer = signer
+        self._phone_app: Any = None
+        self._app_lock = threading.Lock()
+        self._redeems: list[float] = []
+        self._push_store: Any = None
+
+    def phone_app(self) -> Any:
+        """The state line and board over the install this queue's consent hook names (built on first use)."""
+        from levain.phone_app import PhoneApp
+
+        with self._app_lock:
+            if self._phone_app is None:
+                self._phone_app = PhoneApp(self.queue_dir)
+            return self._phone_app
+
+    def device_for(self, token: str) -> "str | None":
+        """The paired device a token belongs to, or None for a token no live device holds. No push store yet means no
+        device was ever paired, and none is created here. A store that cannot be read raises :class:`PhoneError`
+        (503), so a paired phone hears "try again", never "unpaired"."""
+        from levain.webpush import devices
+        from levain.webpush.store import PushStore
+
+        with self._app_lock:
+            if self._push_store is None:
+                self._push_store = PushStore(self.queue_dir)
+            store = self._push_store
+        try:
+            try:
+                store.path.lstat()
+            except FileNotFoundError:
+                return None
+            conn = store.connection()
+            try:
+                return devices.verify(conn, token, datetime.now(timezone.utc))
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - every store fault is the same answer to the page
+            raise PhoneError(503, "unavailable", f"the paired-device store cannot be read now ({type(exc).__name__}); "
+                             "try again") from None
+
+    def _recent_redeems(self) -> list[float]:
+        import time
+
+        now = time.monotonic()
+        self._redeems = [t for t in self._redeems if now - t < 60.0]
+        return self._redeems
+
+    def redeem_allowed(self) -> bool:
+        """Whether a pairing redeem may try now: only failed redeems count against the minute's allowance."""
+        with self._app_lock:
+            return len(self._recent_redeems()) < _REDEEMS_PER_MINUTE
+
+    def redeem_failed(self) -> None:
+        import time
+
+        with self._app_lock:
+            self._recent_redeems().append(time.monotonic())
 
     # -- what the routes do (here, not on the handler, so tests can drive them without a socket) --------------
 
@@ -643,7 +829,7 @@ class _PhoneServer(ThreadingHTTPServer):
 
         def run() -> None:
             try:
-                d = deliver(queue, request_id, notify=agent_notify(self.queue_dir, agent))
+                d = deliver(queue, request_id, notify=agent_notify(self.queue_dir, agent, request_id))
                 box["d"] = {"route": d.route, "reason": d.reason}
             except Exception as exc:  # noqa: BLE001 - the ruling stands; `levain consent deliver` retries it
                 box["d"] = {"route": "failed", "reason": f"delivery raised {type(exc).__name__}; the ruling stands: "
