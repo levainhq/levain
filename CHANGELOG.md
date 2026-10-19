@@ -20,6 +20,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   what is signed or allowed.
 - Invisible and direction-changing characters in an agent's text (the command, its path, a tool or agent name) are shown as
   visible markers such as ⟨U+202E⟩ on both surfaces.
+- **Every answer you sign now also signs the queue's history.** The consent queue already wrote one receipt per step
+  (filed, answered, expired, ruled), kept append-only by the database. Levain now reads those receipts as a Merkle log
+  (RFC 6962, computed from the rows, nothing new stored), and every answer and late ruling you sign carries that log's
+  head: how many receipts there were and their root hash. The queue applies your answer only if the receipts it covers
+  are still exactly what you signed over. So a later rewrite of the history, even by something that removed the
+  database's guards, shows up under your own key, not a signature Levain made for itself. `levain consent receipts
+  verify` recomputes the log, re-checks every signed answer, and names any request whose receipts changed under it (exit
+  1), and refuses a store it cannot read as the current log (a queue from before the upgrade that no levain command has
+  opened yet, an empty file) with "UNREADABLE", exit 1; it lists answers from before this release as "signed before
+  chaining" and an answer by a key you revoked since as "signer revoked since", neither a failure. `levain consent
+  answer` and the phone page sign the queue's own record, so they carry the head with no change on your side. Answer and
+  ruling formats move to `levain-consent-answer/2` and `levain-consent-ruling/2`; an old-format answer is refused when
+  applied (answer the request again), and one already applied before the upgrade still delivers.
 
 ### Changed
 - **Agent config and hooks are refused when nothing can approve the edit.** Until now, with no enrolled key that could
@@ -70,6 +83,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   and an agent that can write that file could make levain misread where hooks run.
 - A single Codex patch touching more than 4 repositories can have the agent-config path cut from its description in the
   ledger; the call is still gated.
+- A rewrite of the receipts after the last signed answer (the unsigned tail: grant answers, expiries, undecided marks)
+  is not evident until your next signed answer covers it, or ever if no one signs again.
+- Delivery checks only the head's shape: an answer applied before a rewrite still delivers after it; the next apply and
+  `receipts verify` are what recompute the log and see the rewrite.
+- `receipts verify` costs grow with the number of distinct signed sizes times the receipts (71-136 ms per head over
+  10,000 receipts, measured 10-19).
+- A raw writer who drops the triggers and deletes the newest rows (receipts, or the request rows holding the latest
+  signed answers) only lengthens the unsigned tail that `verify` reports; it cannot make an earlier signed head match a
+  rewritten history.
+- The authority ledger is not part of this log, and a writer who also holds an enrolled key can sign a head over
+  anything: the key is the root of trust.
+- An answer signed by a key you revoked without marking it compromised is listed as "signer revoked since", whatever its
+  own signed time says: that time is the signer's claim, so it cannot be checked against the key's holder. Revoke a lost
+  or stolen key with `levain cockpit revoke <key> --compromised-since <seq>` (the seq from `levain cockpit keys`), and
+  every answer it signed then fails `verify`.
+- A signed head over zero receipts always matches (the empty log's root is fixed): it attests nothing.
+- An answer signed from the phone page (passkey) carrying the head has not been run on a phone yet.
 
 ## [0.11.9] — 2026-10-19
 
