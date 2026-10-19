@@ -2437,8 +2437,8 @@ def build_policy(
         own_memory_files_l.append(_lexical)
     own_memory_files_t = _dedup(own_memory_files_l)
 
-    # macOS persistence floor, represented in the shared policy so the Seatbelt hand and the
-    # in-process editor consume one source. Every path keeps its lexical and canonical spellings;
+    # The persistence floor, one source for the Seatbelt hand, the bwrap plan's step (2p) and the
+    # in-process editor. Every path keeps its lexical and canonical spellings;
     # unlike ordinary jewels, an unresolvable spelling refuses the floor because Seatbelt's
     # canonical data-write matching would make a lexical-only deny inert.
     persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
@@ -2449,6 +2449,16 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
+            # Linux's own: the systemd user manager reads units and environment from these, a
+            # desktop session starts autostart entries, Fedora's .bashrc sources ~/.bashrc.d, and
+            # fish runs its config. Bound read-only by the bwrap plan's step (2p).
+            *(((home / ".config" / "systemd", "operator systemd user config"),
+               (home / ".local" / "share" / "systemd", "operator systemd user units"),
+               (home / ".config" / "environment.d", "operator user environment"),
+               (home / ".config" / "autostart", "operator autostart"),
+               (home / ".bashrc.d", "operator bashrc.d"),
+               (home / ".config" / "fish", "operator fish config"))
+              if platform.system() == "Linux" else ()),
         )
         for p in _required_spellings(root, label)
     ])
@@ -6654,6 +6664,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                                                *policy.deny_sockets)}
     tool_views: list[Path] = []
     tool_windows: list[Path] = []
+    # The trees step (2p) binds read-only, filled there. Declared here because the absent-path test
+    # below must already see them: nothing at all can be created anywhere inside one.
+    persist_ro: list[Path] = []
+    # A tool directory that is also a persistence subtree (~/.config/git, with the standard cred
+    # floor on) keeps its view; only its subdirectories come back read-only instead of read-write.
+    persist_subtrees = [Path(os.path.realpath(t)) for t in policy.persistence_write_subtrees]
     for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
         real = t.parent.resolve() / t.name
         if real.is_symlink():
@@ -6676,7 +6692,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
                 continue
             if child.is_symlink():
                 argv += ["--symlink", os.readlink(child), str(child)]
-            elif child.is_dir():
+            elif child.is_dir() and not any(real == r or real.is_relative_to(r) for r in persist_subtrees):
                 argv += ["--bind-try", str(child), str(child)]
                 tool_windows.append(child)
             else:
@@ -6684,6 +6700,73 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     argv += store_argv
     # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
     ro_store_dirs += list(frozen_home)
+
+    # (2p) THE PERSISTENCE TREES ARE READ-ONLY (ledger #2 on Linux, RUN 2026-10-19 in the b1c VM:
+    # on main f0bc6fde bash planted ~/bin, ~/.local/bin, ~/.config/systemd/user, ~/.config/autostart,
+    # existing ~/.claude and ~/.codex contents and the workspace's .claude/.codex). Step (0) freezes
+    # only $HOME's own entries; below a subdirectory everything stayed writable, and that is where a
+    # program the operator runs later picks up what bash leaves. The trees are the policy's own
+    # (``persistence_write_subtrees`` and the agents' one resolved set, which the in-process editor
+    # and macOS read too). An existing tree is bound read-only over itself. An absent tree bash could
+    # create is created first (0700, by the provider, in the placeholder ledger like every other
+    # placeholder) so the bind has a source. A file a link resolves to outside every tree is bound
+    # read-only, and so is the parent of a link HOP outside them (a dotfile manager's chain): a mount
+    # cannot pin a link, and replacing the hop would re-point what the operator's agent reads.
+    # Emitted before step (2), so a jewel's tmpfs inside a tree still lands on top of it, and after
+    # the store and tool views, which it leaves alone (a view inside a tree binds back read-only).
+    # ⚠ Not built, by the reachability line: a DANGLING link's missing target outside every tree
+    # (macOS denies that literal; a mount needs a source). A dangling link the agent reads as config
+    # is already broken config. Nor a hop outside $HOME (no read-only bind of a system directory).
+    persist_create: list[str] = []
+    ws_real = policy.workspace.resolve()
+
+    def _in_persist_ro(q: Path) -> bool:
+        return any(q == r or q.is_relative_to(r) for r in persist_ro)
+
+    def _in_tool_view(q: Path) -> bool:
+        return any(q == v or q.is_relative_to(v) for v in tool_views)
+
+    trees = {Path(os.path.realpath(t)) for t in (*policy.persistence_write_subtrees,
+                                                   *policy.persistence_agent_roots,
+                                                   *policy.persistence_agent_dirs)}
+    existing_trees = [t for t in trees if t.is_dir()]
+    for q in sorted({Path(p) for p in policy.persistence_agent_pins}, key=str):
+        if not q.is_symlink():
+            continue
+        parent = q.parent
+        if (any(parent == t or parent.is_relative_to(t) for t in existing_trees)
+                or parent in ro_store_dirs or _in_tool_view(parent) or not os.access(parent, os.W_OK)):
+            continue   # frozen by a tree, $HOME's view, the store or a tool view; or not this user's
+        if parent == ws_real or ws_real.is_relative_to(parent):
+            raise ConfinementError(
+                f"{q} is a symlink the agent's configuration resolves through, in {parent}, which "
+                "bash can write. The Linux floor cannot pin a link, and binding that directory "
+                "read-only would take the workspace with it. Refusing to grant bash hands "
+                "(fail-closed). Replace the symlink with the real directory or file to use bash."
+            )
+        if home_ro is not None and parent.is_relative_to(home_ro):
+            trees.add(parent)
+    for real in sorted(trees, key=str):   # parent-first: a tree inside one already bound is skipped
+        if _in_persist_ro(real) or _in_tool_view(real):
+            continue
+        if os.path.lexists(real):
+            if real.is_dir() and not real.is_symlink():
+                argv += ["--ro-bind", str(real), str(real)]
+                persist_ro.append(real)
+            continue   # a file where a tree would be holds nothing below it
+        anc = _nearest_existing(real)
+        if anc in ro_store_dirs or _in_tool_view(anc) or _in_persist_ro(anc) or not os.access(anc, os.W_OK):
+            continue   # bash cannot create it either
+        argv += ["--ro-bind", str(real), str(real)]
+        persist_ro.append(real)
+        persist_create.append(str(real))
+    for f in sorted({Path(p) for p in policy.persistence_agent_files}, key=str):
+        if not os.path.lexists(f) or f.is_symlink() or f.is_dir():
+            continue   # dangling (not built, above), or a tree
+        if _in_persist_ro(f) or f.parent in ro_store_dirs or _in_tool_view(f):
+            continue
+        if os.access(f, os.W_OK) or os.access(f.parent, os.W_OK):
+            argv += ["--ro-bind", str(f), str(f)]
 
     view_roots = {*tool_views, *frozen_home}
 
@@ -6712,7 +6795,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         anc = f.parent.resolve()
         while anc not in dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
-        return anc in dirs
+        return anc in dirs or any(anc == r or anc.is_relative_to(r) for r in persist_ro)
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -7156,6 +7239,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
+    # The agents' resolved set pins its own ancestors (``persistence_agent_pins``): renaming one aside
+    # and planting below the old name would re-point what the operator's agent reads. A directory
+    # inside a step (2p) tree, $HOME itself, or one whose parent this user cannot write needs none.
+    for q in sorted({Path(p) for p in policy.persistence_agent_pins}, key=str):
+        if q.is_symlink() or not q.is_dir():
+            continue   # links: step (2p); an absent root: created there when bash could create it
+        r = q.resolve()
+        if _in_persist_ro(r) or r in frozen_home or not os.access(r.parent, os.W_OK):
+            continue
+        if _in_tool_view(r) or any(r == rr or r.is_relative_to(rr) for rr in runtime_roots):
+            continue
+        if str(r) not in [p for p, _ in pins]:
+            pins.append((str(r), False))
     # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
     # ruling, same day, (b)). $HOME is a read-only tmpfs holding its existing entries except the
     # credential names: each subdirectory bound back read-write, each file read-only, each link as
@@ -7204,6 +7300,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             outer += ["--bind", path, path]
         else:
             ancestors += ["--bind", path, path]
+    # After the pins, which create the absent ancestors parent-first: each tree mkdir has its parent.
+    create_first += [p for p in persist_create if p not in create_first]
 
     # The runtime views after every pin (an ancestor's bind would cover a view) and before the body.
     out = head + outer + home_ops + ancestors + runtime_ops + argv
