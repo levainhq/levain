@@ -364,3 +364,17 @@ out.calls = calls;
 """, tmp_path, fn)
     assert out["calls"] == 1
     assert "scheduleLayout" in re.search(r"new MutationObserver\([^\n]*", CORE).group(0)
+
+
+def test_the_band_wrap_cap_is_the_kernels_wrap_history_limit():
+    """dashboard_core.js reads a full wraps list as "N+ wraps"; its cap must be the kernel's default history length."""
+    import re
+    from pathlib import Path
+
+    from levain import dashboard
+
+    js = (Path(dashboard.__file__).parent / "templates" / "web" / "dashboard_core.js").read_text()
+    page_cap = int(re.search(r"const WRAP_LIST_CAP = (\d+);", js).group(1))
+    src = Path(dashboard.__file__).read_text()
+    kernel_cap = int(re.search(r"max_wraps: int = (\d+)", src).group(1))
+    assert page_cap == kernel_cap
