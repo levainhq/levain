@@ -4087,7 +4087,7 @@
       if (ta.value !== ta.dataset.orig) return true;
     }
     for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref, .question-words")) {
-      if (ta.closest(".text-editor") || ta.disabled) continue;
+      if (ta.closest(".text-editor")) continue;
       if (ta.value.trim() !== "") return true;
     }
     return false;

@@ -108,7 +108,7 @@
         last = "answered question #" + q.n;
         const d = a.body.delivery || {};
         say("answered \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""), d.route === "failed" || d.route === "none" ? "bad" : "ok");
-      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"); })
+      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); " + (words.value.trim() ? "your words are kept: " : "") + "answer again, and if it was already recorded the page says so", "bad"); })
         .finally(() => { busy--; setTimeout(load, 1500); });
     };
     for (const o of (Array.isArray(q.options) ? q.options : [])) {
