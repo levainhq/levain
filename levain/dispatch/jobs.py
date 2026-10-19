@@ -30,7 +30,7 @@ By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps 
 signed for that result, and only a human releases it (adoption, or the human cancel, whose public method is slice
 b's). The lease protects against a planner that abandons a job, and an authorised job is no longer the planner's.
 
-The store is ``<directory>/dispatch.db``, ``<levain home>/dispatch`` by default, in a directory that is the
+The store is ``<directory>/dispatch.db``, the consent directory by default (:func:`default_dispatch_dir`), in a directory that is the
 operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse UPDATE, DELETE and an
 INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature and the store's own
 metadata are rows written once, and a job's state is its latest transition. Every connection the store opens turns
@@ -178,10 +178,12 @@ class Job:
 
 
 def default_dispatch_dir() -> Path:
-    """``<levain home>/dispatch``: ``$LEVAIN_HOME/dispatch`` if set, else ``~/.levain/dispatch``, made absolute (the
-    rule the consent store's default directory is meant to follow too)."""
-    home = os.environ.get("LEVAIN_HOME")
-    return ((Path(home).expanduser() if home else Path.home() / ".levain") / "dispatch").resolve()
+    """the consent directory (:func:`levain.consent.queue.default_queue_dir`), beside ``questions.db``: dispatch
+    reads no ``$LEVAIN_HOME`` of its own, so the confinement floor that keeps every agent out of that directory
+    covers dispatch control state too, with no second name for it to learn."""
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
 
 
 def _append_only(table: str, message: str) -> tuple[str, str]:

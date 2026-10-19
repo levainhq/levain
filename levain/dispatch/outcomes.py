@@ -75,9 +75,12 @@ REVERTED_CAVEAT = ("reverted_14d is survivor-biased: only a commit someone looke
 
 
 def default_directory() -> Path:
-    """``<levain home>/dispatch``: ``$LEVAIN_HOME/dispatch`` if set, else ``~/.levain/dispatch``, made absolute."""
-    home = os.environ.get("LEVAIN_HOME")
-    return ((Path(home).expanduser() if home else Path.home() / ".levain") / "dispatch").resolve()
+    """the consent directory (:func:`levain.consent.queue.default_queue_dir`), beside ``questions.db``: dispatch
+    reads no ``$LEVAIN_HOME`` of its own, so the confinement floor that keeps every agent out of that directory
+    covers dispatch control state too, with no second name for it to learn."""
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
 
 
 def _one_line(name: str, value: object) -> str:

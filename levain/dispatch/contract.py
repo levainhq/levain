@@ -252,7 +252,9 @@ def git_env() -> dict[str, str]:
     later): no inherited ``GIT_*`` variable may redirect the repository, its object store or its index; replace
     objects are off (a ``refs/replace/`` entry would swap the tree a commit sha names) and the graft file is a path
     that cannot exist (a graft rewrites a commit's parents)."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    from levain.launch import child_env
+
+    env = {k: v for k, v in child_env().items() if not k.startswith("GIT_")}
     env.update({"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": _NO_GRAFT_FILE})
     return env

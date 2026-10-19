@@ -399,7 +399,7 @@ def test_another_database_is_refused(tmp_path, clock):
 
 def test_the_default_directory_is_under_levain_home(monkeypatch, tmp_path):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
-    assert JobStore().directory == (tmp_path / "home" / "dispatch").resolve()
+    assert JobStore().directory == (tmp_path / "home" / "consent").resolve()
 
 
 def test_a_naive_clock_is_refused(tmp_path, repo):
