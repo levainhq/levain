@@ -71,6 +71,11 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .req { border-top: 2px solid var(--accent); }   /* the one warm colour marks what is waiting on you */
 .req:has(.tier.t3) { border-top-color: var(--warn); }
 .req.sign .display { user-select: text; }   /* a statement to be signed: selectable, so it can be copied out and checked */
+.row.dispatch { border-top: 2px solid var(--accent); }   /* a dispatch job waits on you as a request does */
+.row.dispatch .display { user-select: text; }
+.row.dispatch summary { min-height: var(--hit-min); padding: var(--sp-3) 0; box-sizing: border-box; cursor: pointer;
+                        font: 600 13px/1.4 var(--round); color: var(--label); }
+.row.dispatch ul { margin: var(--sp-2) 0 var(--sp-3); padding-left: var(--sp-5); }
 .req-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .tool { font: 700 16px/1.25 var(--round); letter-spacing: -.01em; overflow-wrap: anywhere; }
 .tier { font: 600 11px/1 var(--mono); letter-spacing: var(--track-caps); border: 1px solid var(--hair-2); color: var(--label);

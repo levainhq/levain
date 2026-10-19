@@ -56,15 +56,20 @@
     const signs = Array.isArray(data.sign_pending) ? data.sign_pending : [];
     // questions an agent filed: answered by a tap or words, unsigned (an answer authorises nothing)
     const asks = Array.isArray(data.questions) ? data.questions : [];
-    const waiting = rows.length + gaps.length + signs.length + asks.length;
+    // dispatch jobs a planner filed (levain dispatch): a contract to sign with a passkey, or a live job to cancel
+    const jobs = Array.isArray(data.dispatch_pending) ? data.dispatch_pending : [];
+    const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
-      + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "");
+      + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "")
+      + (Number(data.dispatch_overflow) > 0 ? " \u00b7 " + Number(data.dispatch_overflow) + " more dispatch jobs not shown" : "");
     const qnote = typeof data.questions_note === "string" && data.questions_note ? data.questions_note : "";
-    // a store fault is never "nothing waiting": the page says it cannot see the agents' questions
-    $("status").textContent = (waiting ? waiting + " waiting on you" : qnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
-      + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + unread + (last ? " \u00b7 last: " + last : "");
-    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
-                         ...gaps.map((r) => row(r, true)));
+    const dnote = typeof data.dispatch_note === "string" && data.dispatch_note ? data.dispatch_note : "";
+    // a store fault is never "nothing waiting": the page says it cannot see the agents' questions or dispatch jobs
+    $("status").textContent = (waiting ? waiting + " waiting on you" : qnote || dnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
+      + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + (dnote ? " \u00b7 dispatch jobs unavailable: " + dnote : "")
+      + unread + (last ? " \u00b7 last: " + last : "");
+    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
+                         ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
     const ours = enrolled.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -420,6 +425,87 @@
       last = "denied " + (r.title || r.id);
       say("denied", "ok");
     }).catch((e) => say("the deny failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
+      .finally(() => { busy--; setTimeout(load, 1500); });
+  }
+
+  // a dispatch job (levain.dispatch.phone): built with the phone app's card markup (row, title, chips, acts) so one
+  // restyle covers both. It shows what the passkey signs: the contract's goal in full (exactly what the executor is
+  // sent), its facts and digest, and the read and write lists behind "details" with their counts on the closed card.
+  // Sign signs the DIGEST (T2); Cancel is the human cancel, signed in its own namespace. The two are equal weight and
+  // nothing here recommends either: the server's words are the only verdicts shown
+  function dispatchCard(r) {
+    const t = r.template && typeof r.template === "object" ? r.template : {};
+    const b = r.budget && typeof r.budget === "object" ? r.budget : {};
+    const card = el("article", "row dispatch");
+    card.dataset.job = r.id;
+    const repo = typeof r.repo === "string" ? r.repo.replace(/\/+$/, "").split("/").pop() : "";
+    card.appendChild(el("div", "title", (t.id || "dispatch job") + (repo ? " in " + repo : "")));
+    const chips = el("div", "chips");
+    const filed = r.state === "filed";
+    for (const text of ["dispatch", r.agent || "no agent named", filed ? "lapses " + (r.lease_end || "") : r.state,
+                        "expires " + (r.expires_at || "")]) chips.appendChild(el("span", "chip", text));
+    card.appendChild(chips);
+    card.appendChild(el("pre", "display", typeof r.goal === "string" ? r.goal : ""));
+    const models = Array.isArray(t.models) ? t.models.join(", ") : "";
+    card.appendChild(el("div", "where facts", [t.id, t.tier, models + " (k=" + t.k + ")",
+      b.tool_calls + " tool calls, " + b.tokens + " tokens, " + b.dollars_cents + " cents",
+      (t.verifier_kind || "") + " verifier " + (t.verifier_id || "")].join(" \u00b7 ")));
+    card.appendChild(el("div", "where", "grant " + (Array.isArray(r.grant) ? r.grant.join(", ") : "") + " over the write list, from "
+                        + (r.session || "") + " in " + (r.repo || "") + " at " + (typeof r.base === "string" ? r.base.slice(0, 12) : "")));
+    card.appendChild(digestLine("contract digest", r.digest));
+    const det = el("details", "lists");
+    det.appendChild(el("summary", null, "details \u00b7 reads " + Number(r.read_count) + " files \u00b7 writes " + Number(r.write_count) + " files"));
+    for (const [label, entries] of [["read", r.read], ["write", r.write]]) {
+      det.appendChild(el("div", "where", label));
+      const ul = el("ul", "where");
+      for (const e of (Array.isArray(entries) ? entries : []))
+        ul.appendChild(el("li", null, e.path + "  " + (e.mode === "new" ? "(new file)" : e.mode + " " + String(e.blob || "").slice(0, 12))));
+      det.appendChild(ul);
+    }
+    card.appendChild(det);
+    const note = el("div", "note");
+    const key = "dispatch\u0000" + r.id;   // never a consent id
+    const say = (text, kind) => { notes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
+    const signers = Array.isArray(r.signers) ? r.signers : [];
+    if (!signers.length && !notes.has(key)) say(r.signer_note || "no passkey enrolled for this name can sign a dispatch job");
+    const acts = el("div", "acts");
+    const offer = (label, cancel) => {
+      const btn = el("button", "dact", label);
+      btn.type = "button";
+      btn.disabled = !usable || !signers.length;
+      btn.addEventListener("click", () => start(r, null, signers, say, acts, false, (fp, rawId) => dispatchRun(r, fp, rawId, say, cancel)));
+      acts.appendChild(btn);
+    };
+    if (r.can_sign) offer("Sign with passkey", false);
+    if (r.can_cancel) offer("Cancel with passkey", true);
+    card.append(acts, note);
+    return card;
+  }
+
+  function dispatchRun(r, fp, rawId, say, cancel) {
+    if (busy) return;
+    busy++;
+    const base = "/dispatch/" + encodeURIComponent(r.id) + "/";
+    say("asking for the " + (cancel ? "cancel" : "signature") + " to sign\u2026");
+    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: "" } : { signer_fp: fp }).then((c) => {
+      if (!c.ok) return say(why(c), "bad");
+      say("confirm with your passkey to " + (cancel ? "cancel the job" : "sign the contract") + "\u2026");
+      const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + (cancel ? "cancel" : "answer"), {
+        payload: c.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+        client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }).then((a) => {
+        // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing changed
+        if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where the job stands", "bad");
+        if (!a.ok) return say((cancel ? "not cancelled: " : "not signed: ") + why(a), "bad");
+        last = (cancel ? "cancelled " : "signed ") + (r.template && r.template.id || r.id);
+        say((cancel ? "cancelled" : "signed") + " \u00b7 by " + a.body.signer_fp + " \u00b7 job " + a.body.state, "ok");
+      }), (e) => {
+        if (rawId && e && e.name === "NotAllowedError") forget(fp);
+        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + (cancel ? "the job is not cancelled" : "nothing was signed"), "bad");
+      });
+    }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
