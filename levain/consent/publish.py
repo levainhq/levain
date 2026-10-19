@@ -22,8 +22,9 @@ a local target gets no proxy at all. npm is also told, on its command line, the 
 empty default scope, the dist-tag and access the card shows, ``--dry-run=false`` and ``--strict-ssl=true``, since
 each of those in ``~/.npmrc``, the global npmrc or the tarball's ``publishConfig`` beats the default otherwise (npm
 11.19.0, ``pickRegistry``; command-line flags beat ``publishConfig``). With ``--repository-url`` twine does not read
-``~/.pypirc`` (twine 6.2.0, ``get_repository_from_config``), so :func:`pypi_credentials` reads the username and
-password of the section naming the card's target and hands only those to twine.
+``~/.pypirc`` (twine 6.2.0, ``get_repository_from_config``), so :func:`pypi_credentials` fills whichever of the
+username and password the environment lacks from the section naming exactly the card's target, and hands only those
+to twine; a pair still incomplete is refused before anything is filed.
 
 Known edges (one line each, not built against):
 
@@ -44,6 +45,11 @@ Known edges (one line each, not built against):
   them is not caught (R-k).
 - a non-zero twine exit on a multi-file publish is reported unknown (exit 4), even when it failed before the first file.
 - ``levain publish`` removes the snapshot after every run, so an interrupted upload leaves only its journal and receipt lines.
+- a second signal while the first one's unknown outcome is being recorded can still end the run before it reports.
+- a run that waits on the per-package lock behind uploads totalling over :data:`SNAP_STALE` can have its snapshot
+  swept meanwhile: it is then refused before the upload ("not levain's own private directory"), nothing published.
+- a tarball holding a bare ``.`` or ``./`` entry (``tar -C dir .``) is refused, as is a wheel file whose name merely
+  contains ``METADATA`` (``pkg/METADATA_helpers.py``): twine would weigh it as the metadata. Repack without them.
 
 Stdlib only.
 """
@@ -85,6 +91,8 @@ DEFAULT_TARGETS = {"pypi": "https://upload.pypi.org/legacy/", "npm": "https://re
 # The largest artifact levain copies (PyPI's default upload limit is 100 MB), and the most bytes an archive may unpack to
 # while its members are checked: a gzip bomb stops here instead of at the disk.
 MAX_ARTIFACT = 100 * 1024 * 1024
+# The most all of one publish's files may total, checked before anything is copied.
+MAX_TOTAL = 300 * 1024 * 1024
 MAX_UNPACKED = 1024 * 1024 * 1024
 MAX_MEMBERS = 100_000
 # The most files one publish names: what the operator's card shows whole (a wheel per platform is published in batches).
@@ -93,9 +101,10 @@ MAX_FILES = 8
 MAX_MANIFEST = 1024 * 1024
 # The most an upload may run before it is reported unknown.
 UPLOAD_TIMEOUT = 1800
-# A snapshot directory older than this is a run that was killed (SIGKILL, a crash) and is swept at the next snapshot: the
-# longest live run is the hold ceiling (840 s) + a wait on the per-package lock behind another upload + its own upload.
-SNAP_STALE = 2 * 3600
+# A snapshot directory older than this is a run that was killed (SIGKILL, a crash) and is swept at the next snapshot. A
+# live run is younger: the hold ceiling (840 s) and a wait on the per-package lock come before :func:`execute`, which
+# touches the directory when it takes the lock and again just before the upload (at most UPLOAD_TIMEOUT).
+SNAP_STALE = 3600
 # Where twine and npm are looked up, and the PATH their children see: the system's, then Homebrew's and pipx's.
 PUBLISH_PATH = ":".join((TRUSTED_PATH, "/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")))
 # The credential names each tool reads, carried past the allowlist.
@@ -502,7 +511,7 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
     """Copy ``paths`` into a new ``<levain home>/publish/<id>/`` and read them there: ``(call, snapshot dir)``,
     ``call`` being the request's ``tool_input`` (index, canonical target, package, version, and each file's name,
     sha256 and size, sorted by name; for npm also the dist-tag and access). Every file of one publish names the same
-    project and version. The count and each size are checked before anything is copied; a snapshot directory a killed
+    project and version. The count, each size and the total are checked before anything is copied; a snapshot directory a killed
     run left (older than :data:`SNAP_STALE`) is swept first. The directory is removed when anything is refused."""
     if index not in INDEXES:
         raise PublishRefused(f"the index must be one of {INDEXES}")
@@ -518,6 +527,7 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
             raise PublishRefused(f"the file name {n[:80]!r} is not plain (letters, digits, . _ + -)")
     if len(set(names)) != len(names):
         raise PublishRefused("two files share a name")
+    total = 0
     for src in paths:
         try:
             st = os.lstat(src)
@@ -529,6 +539,9 @@ def snapshot(index: str, paths: list[str], target: str, levain_home: str | os.Pa
             raise PublishRefused(f"{src} is not a regular file")
         if st.st_size > MAX_ARTIFACT:
             raise PublishRefused(f"{src} is over {MAX_ARTIFACT} bytes")
+        total += st.st_size
+    if total > MAX_TOTAL:
+        raise PublishRefused(f"the files are over {MAX_TOTAL} bytes together; publish them in batches")
     home = Path(os.path.abspath(os.fspath(levain_home)))
     if not os.path.isdir(home):
         raise PublishRefused(f"levain home {home} is not a directory")
@@ -570,14 +583,15 @@ def _is_local(target: str) -> bool:
 
 
 def pypi_credentials(target: str) -> dict[str, str]:
-    """The PyPI credentials the upload to ``target`` gets beyond the environment's own. ``TWINE_PASSWORD`` in the
-    environment wins (with ``TWINE_USERNAME`` beside it): nothing is added. Else the ``~/.pypirc`` section whose
-    ``repository`` is ``target`` (``[pypi]`` / ``[testpypi]`` without one name twine's defaults) gives its
-    ``username`` (unless the environment names one) and ``password``. Only those two are read: the file never
-    chooses the target, and twine is never handed it (with ``--repository-url`` twine ignores it). Raises
-    :class:`PublishRefused` when there is no credential at all, or two sections give the target different ones;
-    the keyring is not consulted. A password is never part of a message."""
-    if os.environ.get("TWINE_PASSWORD"):
+    """The PyPI credentials the upload to ``target`` gets beyond the environment's own. ``TWINE_USERNAME`` and
+    ``TWINE_PASSWORD`` both in the environment win: nothing is added. Otherwise the ``~/.pypirc`` section whose
+    ``repository`` is exactly ``target`` once canonical (``[pypi]`` / ``[testpypi]`` without one name twine's
+    defaults) fills whichever of the two the environment lacks. Only those two are read: the file never chooses the
+    target, and twine is never handed it (with ``--repository-url`` twine ignores it). Raises
+    :class:`PublishRefused`, so before anything is filed, when the pair is still incomplete, or two sections give
+    the target different ones; the keyring is not consulted. A password is never part of a message."""
+    env_user, env_pass = os.environ.get("TWINE_USERNAME", ""), os.environ.get("TWINE_PASSWORD", "")
+    if env_user and env_pass:
         return {}
     found: set[tuple[str, str]] = set()
     path = Path(os.path.expanduser("~")) / ".pypirc"
@@ -588,26 +602,31 @@ def pypi_credentials(target: str) -> dict[str, str]:
         parser = configparser.RawConfigParser()  # an unreadable file gives no credential
     for section in parser.sections():
         repository = parser.get(section, "repository", fallback=_PYPIRC_DEFAULTS.get(section))
-        password = parser.get(section, "password", fallback="")
-        if section == "distutils" or not repository or not password:
+        if section == "distutils" or not repository:
             continue
         try:
             canon = canonical_target(repository.strip())
         except PublishRefused:
             continue
-        if canon.rstrip("/") == target.rstrip("/"):
-            found.add((parser.get(section, "username", fallback="").strip(), password))
+        if canon == target:
+            found.add((parser.get(section, "username", fallback="").strip(),
+                       parser.get(section, "password", fallback="")))
     if len(found) > 1:
         raise PublishRefused(f"two sections of {path} give {target} different credentials; keep one, or set "
                              "TWINE_USERNAME / TWINE_PASSWORD in the environment")
-    if not found:
-        raise PublishRefused(f"no PyPI credential for {target}: set TWINE_USERNAME=__token__ and "
-                             f"TWINE_PASSWORD=<an API token> in the environment, or give {path} a section whose "
-                             f"repository is {target} with a username and password (the keyring is not consulted)")
-    username, password = found.pop()
-    creds = {"TWINE_PASSWORD": password}
-    if username and not os.environ.get("TWINE_USERNAME"):
+    username, password = found.pop() if found else ("", "")
+    creds = {}
+    if not env_user and username:
         creds["TWINE_USERNAME"] = username
+    if not env_pass and password:
+        creds["TWINE_PASSWORD"] = password
+    if not (env_user or username) or not (env_pass or password):
+        missing = " and ".join(n for n, have in (("TWINE_USERNAME", env_user or username),
+                                                 ("TWINE_PASSWORD", env_pass or password)) if not have)
+        raise PublishRefused(f"no complete PyPI credential for {target} ({missing} missing): set "
+                             f"TWINE_USERNAME=__token__ and TWINE_PASSWORD=<an API token> in the environment, or give "
+                             f"{path} a section whose repository is exactly {target} with a username and password "
+                             "(the keyring is not consulted)")
     return creds
 
 
@@ -676,17 +695,102 @@ def publish_argv(tool: list[str], call: dict[str, Any], snap: Path) -> list[str]
 Refusal = Callable[[dict[str, Any]], "str | None"]
 
 
-def _record(home: Path, key: str, result: PublishResult, receipt: Callable[[dict[str, Any]], Any]) -> list[str]:
+def _record(home: Path, key: str, result: PublishResult, receipt: Callable[[dict[str, Any]], Any],
+            done: set[str]) -> list[str]:
+    """Write the ``done`` journal line and the receipt, skipping either already in ``done`` and adding each to it
+    once tried. Anything raised, an interruption included (a ``KeyboardInterrupt``, a signal the caller's handler
+    raises), is a record error, so the other record is still written and the caller still learns what the upload
+    did."""
     errs = []
-    try:
-        append_line(home / "publish" / f"{key}.journal.jsonl", {"state": "done", "at": time.time(), **result.to_dict()})
-    except Exception as exc:  # noqa: BLE001 - any failure here must still reach the receipt
-        errs.append(f"done journal: {type(exc).__name__}: {exc}")
-    try:
-        receipt(result.to_dict())
-    except Exception as exc:  # noqa: BLE001 - reported to the caller as a record error, never swallowed
-        errs.append(f"receipt: {type(exc).__name__}: {exc}")
+    for what, write in (("done journal", lambda: append_line(home / "publish" / f"{key}.journal.jsonl",
+                                                             {"state": "done", "at": time.time(),
+                                                              **result.to_dict()})),
+                        ("receipt", lambda: receipt(result.to_dict()))):
+        if what in done:
+            continue
+        try:
+            write()
+            done.add(what)
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller as a record error, never swallowed
+            done.add(what)
+            errs.append(f"{what}{'' if isinstance(exc, Exception) else ' interrupted'}: {type(exc).__name__}: {exc}")
     return errs
+
+
+def _outcome(call: dict[str, Any], base: dict[str, Any], p: subprocess.CompletedProcess) -> PublishResult:
+    """What the tool's exit says: ``status`` ``"unknown"`` for a non-zero twine exit on more than one file (the first
+    may be on the index already)."""
+    tail = _clean((p.stderr or "").strip() or (p.stdout or "").strip()).strip()[-400:]
+    if p.returncode != 0 and call["index"] == "pypi" and len(call["files"]) > 1:
+        return PublishResult(ok=False, status="unknown", exit=p.returncode,
+                             detail=f"twine exited {p.returncode} part way through {len(call['files'])} files: "
+                                    f"{tail}"[-400:], **base)
+    ok = p.returncode == 0
+    return PublishResult(ok=ok, status="published" if ok else "failed", exit=p.returncode, detail="" if ok else tail,
+                         **base)
+
+
+def _touch(snap: Path) -> None:
+    """Mark the snapshot live, so a concurrent snapshot's sweep does not take it (best effort)."""
+    try:
+        os.utime(snap, follow_symlinks=False)
+    except OSError:
+        pass
+
+
+def _upload(call: dict[str, Any], base: dict[str, Any], argv: list[str], env: dict[str, str], snap: Path, home: Path,
+            key: str, receipt: Callable[[dict[str, Any]], Any], run: Callable[..., subprocess.CompletedProcess]
+            ) -> PublishResult:
+    """The intent line, the upload and its record, under one ``try``: whatever stops this, a signal included, between
+    the intent line and the return reaches the caller as :class:`PublishOutcomeUnknown` (the tool's exit not yet
+    known) or :class:`PublishRecordIncomplete` (known: its result is kept), never as itself. An ``OSError`` writing
+    the intent line propagates as itself: nothing was run."""
+    p: subprocess.CompletedProcess | None = None
+    result: PublishResult | None = None
+    done: set[str] = set()
+    intent = False
+    try:
+        append_line(home / "publish" / f"{key}.journal.jsonl", {"state": "intent", "at": time.time(), **base})
+        intent = True
+        # from here on the index may change: every path reaches the receipt
+        _touch(snap)
+        p = run(argv, env=env, cwd=str(snap), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=UPLOAD_TIMEOUT)
+        result = _outcome(call, base, p)
+        errs = _record(home, key, result, receipt, done)
+    except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is reported, never raw
+        if not intent and isinstance(exc, OSError):
+            raise                                       # the intent line could not be written; nothing ran
+        if p is not None and result is None:
+            result = _outcome(call, base, p)
+        if result is None:
+            detail = _clean(f"the upload did not report: {type(exc).__name__}: {exc}")[:400]
+            result = PublishResult(ok=False, status="unknown", exit=-1, detail=detail, **base)
+            errs = _record(home, key, result, receipt, done)
+        else:
+            errs = _record(home, key, result, receipt, done)
+            errs.append(f"interrupted after the upload reported: {type(exc).__name__}: {exc}")
+        if result.status == "unknown":
+            raise _unknown(call, result, errs) from exc
+        raise PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is incomplete: "
+                                      f"{'; '.join(errs)}", result, errs) from exc
+    if result.status == "unknown":
+        raise _unknown(call, result, errs)
+    if errs:
+        raise PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is incomplete: "
+                                      f"{'; '.join(errs)}", result, errs)
+    return result
+
+
+def _unknown(call: dict[str, Any], result: PublishResult, errs: list[str]) -> PublishOutcomeUnknown:
+    if result.exit == -1:
+        msg = (f"the publish of {call['package']} {call['version']} to {call['target']} may or may not have landed "
+               f"({result.detail})")
+    else:
+        msg = (f"the publish of {call['package']} {call['version']} to {call['target']} failed part way (twine exit "
+               f"{result.exit}): some files may have landed; check the index before publishing again "
+               f"({result.detail})")
+    return PublishOutcomeUnknown(msg + (f"; record errors: {'; '.join(errs)}" if errs else ""), result, errs)
 
 
 def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str | os.PathLike, refusal: Refusal,
@@ -699,11 +803,12 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
 
     Raises :class:`PublishRefused` for anything refused before the intent line (nothing was uploaded); an ``OSError``
     or an interruption before it propagates as itself, so whatever reaches the caller other than the classes below
-    means nothing was uploaded. After it: an upload that did not report, a ``KeyboardInterrupt`` / ``SystemExit``
-    included, raises :class:`PublishOutcomeUnknown`, and so does a non-zero twine exit for more than one file (the
-    first may have landed before the next failed); any other non-zero exit is a :class:`PublishResult` with ``ok``
-    False; a done line or receipt that could not be written raises :class:`PublishRecordIncomplete`. The tool's
-    output reaches ``detail`` without terminal escapes. ``resolve`` and ``run`` are injectable for tests."""
+    means nothing was uploaded. From the intent line on (see :func:`_upload`): an interruption anywhere before the
+    tool's exit is known, or an upload that did not report, raises :class:`PublishOutcomeUnknown`, and so does a
+    non-zero twine exit for more than one file (the first may have landed before the next failed); any other
+    non-zero exit is a :class:`PublishResult` with ``ok`` False; a done line or receipt that could not be written,
+    or an interruption once the exit is known, raises :class:`PublishRecordIncomplete` carrying that result. The
+    tool's output reaches ``detail`` without terminal escapes. ``resolve`` and ``run`` are injectable for tests."""
     _check_call(call)
     snap = Path(os.path.abspath(os.fspath(snap)))
     home = Path(os.path.abspath(os.fspath(levain_home)))
@@ -714,6 +819,7 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
     lock_fd = os.open(home / "publish" / f"{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _touch(snap)
         if (why := refusal(call)) is not None:
             raise PublishRefused(why)
         st = os.lstat(snap)
@@ -725,37 +831,6 @@ def execute(call: dict[str, Any], *, snap: str | os.PathLike, levain_home: str |
         argv = publish_argv(resolve(call["index"]), call, snap)
         env = publish_env(call)
         base = dict(call)
-        append_line(home / "publish" / f"{key}.journal.jsonl", {"state": "intent", "at": time.time(), **base})
-        # from here on the index may change: every path reaches the receipt
-        try:
-            p = run(argv, env=env, cwd=str(snap), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=UPLOAD_TIMEOUT)
-        except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
-            detail = _clean(f"the upload did not report: {type(exc).__name__}: {exc}")[:400]
-            result = PublishResult(ok=False, status="unknown", exit=-1, detail=detail, **base)
-            errs = _record(home, key, result, receipt)
-            raise PublishOutcomeUnknown(f"the publish of {call['package']} {call['version']} to {call['target']} may "
-                                        f"or may not have landed ({result.detail})"
-                                        + (f"; record errors: {'; '.join(errs)}" if errs else ""),
-                                        result, errs) from exc
-        tail = _clean((p.stderr or "").strip() or (p.stdout or "").strip()).strip()[-400:]
-        ok = p.returncode == 0
-        if not ok and call["index"] == "pypi" and len(call["files"]) > 1:
-            # twine uploads file by file: the first may be on the index already
-            n = len(call["files"])
-            result = PublishResult(ok=False, status="unknown", exit=p.returncode,
-                                   detail=f"twine exited {p.returncode} part way through {n} files: {tail}"[-400:],
-                                   **base)
-            errs = _record(home, key, result, receipt)
-            raise PublishOutcomeUnknown(f"the publish of {call['package']} {call['version']} to {call['target']} "
-                                        f"failed part way (twine exit {p.returncode}): some files may have landed; "
-                                        f"check the index before publishing again ({tail})"
-                                        + (f"; record errors: {'; '.join(errs)}" if errs else ""), result, errs)
-        result = PublishResult(ok=ok, status="published" if ok else "failed", exit=p.returncode,
-                               detail="" if ok else tail, **base)
-        if errs := _record(home, key, result, receipt):
-            raise PublishRecordIncomplete(f"the publish ran ({result.status}) but its record is incomplete: "
-                                          f"{'; '.join(errs)}", result, errs)
-        return result
+        return _upload(call, base, argv, env, snap, home, key, receipt, run)
     finally:
         os.close(lock_fd)

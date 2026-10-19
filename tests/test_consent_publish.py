@@ -821,3 +821,158 @@ def test_lowercase_npm_config_is_dropped(home, art, monkeypatch):
     call, snap = publish.snapshot("npm", [str(npm_tgz(art))], "http://127.0.0.1:4873", home)
     _exec(call, snap, home, runner)
     assert not [k for k in runner.calls[0]["env"] if k.lower().startswith("npm_config_")]
+
+
+# --- L3 round 1 (1019-q20/L3_r1_TRIAGE.md) -----------------------------------------------------------------------
+
+def _interrupt_after_intent(monkeypatch, exc):
+    """append_line writes the intent line, then the signal lands (the seam between the intent and the upload)."""
+    real = publish.append_line
+
+    def append(path, record):
+        real(path, record)
+        if record.get("state") == "intent":
+            raise exc
+    monkeypatch.setattr(publish, "append_line", append)
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), publish_gate._Interrupted("SIGTERM")])
+def test_h_an_interrupt_right_after_the_intent_line_is_unknown(home, art, monkeypatch, exc):
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    _interrupt_after_intent(monkeypatch, exc)
+    receipts = []
+    with pytest.raises(publish.PublishOutcomeUnknown, match="may or may not"):
+        _exec(call, snap, home, Runner(), receipts=receipts)
+    assert [j["state"] for j in journal(home, call)] == ["intent", "done"]
+    assert journal(home, call)[-1]["status"] == "unknown" == receipts[0]["status"]
+
+
+@pytest.mark.parametrize("seam", ["receipt", "journal"])
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), publish_gate._Interrupted("SIGTERM")])
+def test_h_an_interrupt_while_recording_keeps_the_result(home, art, monkeypatch, seam, exc):
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    receipts = []
+
+    def receipt(r):
+        if seam == "receipt":
+            raise exc
+        receipts.append(r)
+    if seam == "journal":
+        real = publish.append_line
+
+        def append(path, record):
+            if record.get("state") == "done":
+                raise exc
+            real(path, record)
+        monkeypatch.setattr(publish, "append_line", append)
+    with pytest.raises(publish.PublishRecordIncomplete) as got:
+        publish.execute(call, snap=snap, levain_home=home, refusal=ok, receipt=receipt,
+                        resolve=lambda index: ["/opt/fake/twine"], run=Runner())
+    assert got.value.result.ok and got.value.result.status == "published"
+    assert any("interrupted" in e.lower() for e in got.value.record_errors), got.value.record_errors
+    if seam == "receipt":     # the done line was written before the signal
+        assert journal(home, call)[-1]["status"] == "published"
+    else:                     # the receipt is still written after the signal hit the done line
+        assert receipts[0]["status"] == "published"
+
+
+def _gate_run(queue, keys, art):
+    out = io.StringIO()
+    t = _answer_when_filed(queue, keys["phone"], "allow")
+    rc = publish_gate.run(_args(queue, [wheel(art)], hold=20.0), out)
+    t.join(10)
+    return rc, out.getvalue()
+
+
+def test_h_gate_an_interrupt_after_the_intent_line_is_exit_4(gate, art, keys, monkeypatch):
+    queue, runner = gate
+    _interrupt_after_intent(monkeypatch, publish_gate._Interrupted("SIGTERM"))
+    rc, out = _gate_run(queue, keys, art)
+    assert rc == publish_gate.EXIT_UNKNOWN and "nothing was published" not in out, out
+
+
+def test_h_gate_an_interrupt_after_the_upload_reports_published(gate, art, keys, monkeypatch):
+    queue, runner = gate
+
+    def interrupted(home, extra):
+        def write(record):
+            raise KeyboardInterrupt
+        return write
+    monkeypatch.setattr(publish_gate, "_receipt", interrupted)
+    rc, out = _gate_run(queue, keys, art)
+    assert rc == publish_gate.EXIT_PUBLISHED and len(runner.calls) == 1, out
+    assert "record is incomplete" in out and "nothing was published" not in out, out
+
+
+def test_m_a_password_without_a_username_and_no_section_is_refused_before_filing(gate, art, monkeypatch):
+    queue, runner = gate
+    monkeypatch.delenv("TWINE_USERNAME")
+    out = io.StringIO()
+    rc = publish_gate.run(_args(queue, [wheel(art)]), out)
+    assert (rc, runner.calls, queue.pending()) == (publish_gate.EXIT_NOT_TAKEN, [], []), out.getvalue()
+    assert "TWINE_USERNAME" in out.getvalue() and "pypi-test" not in out.getvalue()
+
+
+def test_m_a_password_without_a_username_takes_the_sections_username(home, art, operator_env, monkeypatch):
+    monkeypatch.delenv("TWINE_USERNAME")
+    _pypirc(operator_env, "[local]\nrepository = http://127.0.0.1:8080/\nusername = u\npassword = file-pass\n")
+    assert publish.pypi_credentials(LOCAL) == {"TWINE_USERNAME": "u"}
+    runner = Runner()
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    _exec(call, snap, home, runner)
+    env = runner.calls[0]["env"]
+    assert (env["TWINE_USERNAME"], env["TWINE_PASSWORD"]) == ("u", "pypi-test")
+    _pypirc(operator_env, "[local]\nrepository = http://127.0.0.1:8080/\npassword = file-pass\n")   # no username
+    with pytest.raises(publish.PublishRefused, match="TWINE_USERNAME"):
+        publish.pypi_credentials(LOCAL)
+
+
+def test_m_a_username_without_a_password_takes_the_sections_password(operator_env, monkeypatch):
+    monkeypatch.delenv("TWINE_PASSWORD")
+    _pypirc(operator_env, "[local]\nrepository = http://127.0.0.1:8080/\nusername = u\npassword = p\n")
+    assert publish.pypi_credentials(LOCAL) == {"TWINE_PASSWORD": "p"}
+    monkeypatch.delenv("TWINE_USERNAME")
+    assert publish.pypi_credentials(LOCAL) == {"TWINE_USERNAME": "u", "TWINE_PASSWORD": "p"}
+
+
+@pytest.mark.parametrize("repo,target", [("http://127.0.0.1:8080/simple", "http://127.0.0.1:8080/simple/"),
+                                         ("http://127.0.0.1:8080/simple/", "http://127.0.0.1:8080/simple")])
+def test_m_a_section_matches_only_the_exact_target(operator_env, monkeypatch, repo, target):
+    monkeypatch.delenv("TWINE_USERNAME")
+    monkeypatch.delenv("TWINE_PASSWORD")
+    _pypirc(operator_env, f"[local]\nrepository = {repo}\nusername = u\npassword = p\n")
+    with pytest.raises(publish.PublishRefused, match="no complete PyPI credential"):
+        publish.pypi_credentials(publish.canonical_target(target))
+
+
+def test_l_stale_is_one_hour_and_a_live_run_touches_its_snapshot(home, art):
+    assert publish.SNAP_STALE == 3600
+    call, snap = publish.snapshot("pypi", [str(wheel(art))], LOCAL, home)
+    old = time.time() - 2 * publish.SNAP_STALE
+    os.utime(snap, (old, old))
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(os.lstat(snap).st_mtime)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    _exec(call, snap, home, run)
+    assert seen and seen[0] > time.time() - 60
+
+
+def test_l_the_total_of_all_inputs_is_capped_before_copying(home, art, tmp_path, monkeypatch):
+    s = tmp_path / "s"
+    s.mkdir()
+    w, sd = wheel(art), sdist(s)
+    monkeypatch.setattr(publish, "_copy_in", lambda *a: pytest.fail("copied before the total was checked"))
+    monkeypatch.setattr(publish, "MAX_TOTAL", w.stat().st_size + sd.stat().st_size - 1)
+    _refuse(home, "pypi", [w, sd], "together")
+
+
+def test_l_known_edges_a_bare_dot_entry_and_a_metadata_named_file_are_refused(home, art, tmp_path):
+    for i, entry in enumerate((".", "./")):
+        d = tmp_path / f"n{i}"
+        d.mkdir()
+        dot = tarfile.TarInfo(entry)
+        dot.type = tarfile.DIRTYPE
+        _refuse(home, "npm", [npm_tgz(d, extra=[dot])], "member path")
+    _refuse(home, "pypi", [wheel(art, extra=[("demo_pkg/METADATA_helpers.py", b"")])], "METADATA")
