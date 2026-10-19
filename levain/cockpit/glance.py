@@ -78,11 +78,12 @@ def _dot(label: str, results: list[Any]) -> dict[str, Any]:
     warned = [r for r in results if r.ok and r.warn]
     if failed:
         # names only: doctor's details carry absolute paths, which never go on the wire
-        return {"label": label, "value": f"{len(failed)} failing: {failed[0].name}", "unit": None, "status": "bad",
-                "read": "levain doctor"}
+        # the row says how many; the failing check's name rides in `detail` (the tile's tooltip), one line on the tile
+        return {"label": label, "value": f"{len(failed)} failing", "unit": None, "status": "bad",
+                "read": None, "detail": f"{failed[0].name} · levain doctor"}
     if warned:
-        return {"label": label, "value": f"{len(warned)} warning(s): {warned[0].name}", "unit": None,
-                "status": "warn", "read": "levain doctor"}
+        return {"label": label, "value": f"{len(warned)} warning" + ("" if len(warned) == 1 else "s"), "unit": None,
+                "status": "warn", "read": None, "detail": f"{warned[0].name} · levain doctor"}
     return {"label": label, "value": "ok", "unit": None, "status": "ok", "read": None}
 
 

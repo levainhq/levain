@@ -1174,7 +1174,6 @@ body.ke .skycard:not(:has(#ck-sky > *)) { display: none; }
 body.ke .ck-sky { min-width: 0; }
 body.ke .sky-hero { display: block; border: 0; }
 body.ke .sky-hero .plot { padding: 0; min-height: 200px; }
-body.ke[data-mode="build"] .sky-hero .plot { min-height: 300px; }
 body.ke .ck-sky .xbody { padding: 0; }
 body.ke .skycard .ck-legend { border-top: 1px solid var(--hair); }
 body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }

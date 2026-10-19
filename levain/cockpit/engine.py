@@ -2390,7 +2390,7 @@ def _v_status_dots(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"value.metrics[{i}].status", f"must be ok|warn|bad|unknown, got {m.get('status')!r}")
         if m.get("value") is not None and not (_is_num(m["value"]) or _is_str(m["value"])):
             raise _bad(spec, f"value.metrics[{i}].value", "must be a finite number or a string")
-        for k in ("unit", "read"):
+        for k in ("unit", "read", "detail"):
             if m.get(k) is not None and not _is_str(m[k]):
                 raise _bad(spec, f"value.metrics[{i}].{k}", "must be a string")
     if v.get("alerts") is not None:

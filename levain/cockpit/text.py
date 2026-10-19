@@ -154,7 +154,7 @@ def _t_status_dots(v: dict[str, Any], now: datetime, width: int, top_n: int) -> 
     out = []
     for m in v.get("metrics", []):
         unit = f" {visible(m['unit'])}" if m.get("unit") else ""
-        read = f" — {visible(m['read'])}" if m.get("read") else ""
+        read = f" — {visible(m.get('read') or m.get('detail'))}" if (m.get("read") or m.get("detail")) else ""
         out.append(_row(f"  [{m.get('status', 'unknown')}] {visible(m.get('label'))}: {visible(m.get('value'))}{unit}{read}", width))
     for a in v.get("alerts", []):
         out.append((ERROR if a.get("severity") == "bad" else STALE, _fit(f"  ! {visible(a.get('message'))}", width)))

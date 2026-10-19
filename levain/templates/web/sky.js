@@ -625,7 +625,10 @@
     };
   }
 
-  var api = { mount: mount, legendNode: legendNode, eventTip: eventTip, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
+  // true when a feed carries what only a Levain feed carries (the host picks the Levain key over flow's)
+  function isLevainFeed(value) { return normalise(value).some(isLev); }
+
+  var api = { mount: mount, legendNode: legendNode, isLevainFeed: isLevainFeed, eventTip: eventTip, hueKey: hueKey, noteRepo: noteRepo, repos: repos, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();
