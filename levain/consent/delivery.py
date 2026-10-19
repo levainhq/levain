@@ -88,7 +88,9 @@ _MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions", "auto
 # the permission mode itself. Any other option refuses the resume: an allowlist, so an option a later Claude Code
 # adds is refused until it is judged here. It was a denylist until 1019+1 measured Claude Code 2.1.303's options
 # against it and found resumes that dropped --restricted (the code-running tools came back), --agent,
-# --disable-slash-commands, --max-budget-usd, --safe-mode and --bare (each also as ``--flag=value``).
+# --disable-slash-commands, --max-budget-usd, --safe-mode and --bare (each also as ``--flag=value``). A run that is
+# not persisted (--no-session-persistence, Codex's --ephemeral) leaves no record of what it ran under, so a resume
+# would read an older one: those refuse too.
 _CLAUDE_NEUTRAL = frozenset({
     "-p", "--print", "--bg", "-r", "--resume", "-c", "--continue", "--session-id", "--fork-session",
     "--permission-mode", "--allow-dangerously-skip-permissions", "--model", "--fallback-model", "--effort",
@@ -96,8 +98,7 @@ _CLAUDE_NEUTRAL = frozenset({
     "--replay-user-messages", "--forward-subagent-text", "--verbose", "-d", "--debug", "--debug-file", "-n",
     "--name", "--prompt-suggestions", "--ax-screen-reader", "--ide", "--chrome", "--brief",
     "--exclude-dynamic-system-prompt-sections", "--autocompact", "--remote-control",
-    "--remote-control-session-name-prefix",
-    "--no-session-persistence", "-h", "--help", "-v", "--version",
+    "--remote-control-session-name-prefix", "-h", "--help", "-v", "--version",
 })
 # the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
 _BYPASS_FLAG = "--dangerously-skip-permissions"
@@ -112,7 +113,7 @@ _BYPASS_FLAG = "--dangerously-skip-permissions"
 CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 _CODEX_CARRIED = ("--skip-git-repo-check", "--strict-config")
 _CODEX_NEUTRAL = ("--json", "-o", "--output-last-message", "-m", "--model", "-i", "--image", "--color",
-                  "--output-schema", "--ephemeral", "--no-alt-screen", "-s", "--sandbox")
+                  "--output-schema", "--no-alt-screen", "-s", "--sandbox")
 # a session id: Claude Code's and Codex's are UUIDs; a subagent's key adds ``#agent:<id>``
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -399,7 +400,7 @@ def codex_sandbox_args(meta: Mapping[str, Any], thread: str) -> list[str] | None
             out += ["-c", f"sandbox_workspace_write.{key}={'true' if value else 'false'}"]
         elif (key in _WW_LISTS and isinstance(value, list)
               and all(isinstance(r, str) and os.path.isabs(r) and r.isprintable() for r in value)):
-            out += ["-c", f"sandbox_workspace_write.{key}={json.dumps(value)}"]
+            out += ["-c", f"sandbox_workspace_write.{key}={json.dumps(value, ensure_ascii=False)}"]
         else:
             return None
     return out

@@ -173,6 +173,8 @@ def test_the_newest_turn_context_decides_and_a_field_that_cannot_be_reproduced_r
     _rollout(chome, [{"type": "workspace-write", "network_access": False, "exclude_tmpdir_env_var": False,
                       "exclude_slash_tmp": False}])
     assert 'sandbox_workspace_write.writable_roots=[]' in dv.codex_sandbox_args(meta, _THREAD)
+    _rollout(chome, [{**full, "writable_roots": ["/w/\U0001f600"]}])              # TOML has no surrogate escapes
+    assert 'sandbox_workspace_write.writable_roots=["/w/\U0001f600"]' in dv.codex_sandbox_args(meta, _THREAD)
     _rollout(chome, ["danger-full-access"], tail='{"type": "turn_con')               # L3 r2: cut inside the type
     assert dv.codex_sandbox_args(meta, _THREAD) is None
 
@@ -190,7 +192,8 @@ def test_a_codex_resume_is_refused_when_its_sandbox_cannot_be_read_or_an_option_
     assert dv.resume_refusal("codex", _THREAD, base) is None
     for flags, named in (("codex -c", "-c"), ("codex --add-dir", "--add-dir"),
                          ("codex --dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass"),
-                         ("codex --profile", "--profile"), ("codex --some-later-flag", "--some-later-flag")):
+                         ("codex --profile", "--profile"), ("codex --some-later-flag", "--some-later-flag"),
+                         ("codex --ephemeral", "--ephemeral")):
         assert named in dv.resume_refusal("codex", _THREAD, {**base, "codex_flags": flags}), flags
     assert "not recorded" in dv.resume_refusal("codex", _THREAD, {k: v for k, v in base.items() if k != "codex_flags"})
 
@@ -211,7 +214,7 @@ def test_a_claude_resume_is_refused_for_any_option_it_cannot_carry_and_runs_for_
     back), --agent, --disable-slash-commands, --max-budget-usd, --safe-mode, --bare and any option added later."""
     for flag in ("--restricted", "--agent", "--disable-slash-commands", "--max-budget-usd", "--safe-mode", "--bare",
                  "--permission-prompts", "--settings", "--tools", "--an-option-added-later", "--plugin-url",
-                 "--no-chrome", "--system-prompt-snapshot", "--worktree", "-w", "--tmux",
+                 "--no-chrome", "--system-prompt-snapshot", "--worktree", "-w", "--tmux", "--no-session-persistence",
                  "--dangerously-bypass-something"):
         assert dv.unrestored_flags(f"claude -p {flag}", "default") == [flag], flag
     neutral = "/opt/bin/claude -p --model --output-format --verbose --permission-mode --resume=x --effort -n"
