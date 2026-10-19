@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -729,3 +730,21 @@ def test_codex_a_cached_commit_leaves_with_the_window(tmp_path):
     later = read(ReadContext(now + timedelta(seconds=5))).value
     assert len(scans) == 1                                  # still the cached scan
     assert not [e for e in later["events"] if e["kind"] == "commit"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_engine_validated_activity_value_draws_as_levain_lanes_in_the_sky(tmp_path, monkeypatch):
+    """K1 x K3 integration (L3 K3 r1, codex-HIGH-1): the value the ENGINE serves for `activity` (after _v_ambient),
+    handed to sky.js exactly as the page hands it, takes the Levain lanes and counts both waiting items."""
+    ck, _root, _src = _fixture(tmp_path, monkeypatch)
+    p = ck.panel("activity", credential_class="none")
+    assert p["status"] == "ok", p
+    sky = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "sky.js"
+    js = ("const s=require(process.argv[1]);const v=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+          "const ev=s.normalise(v);const m=s.buildModel(ev,{windowHours:14,topRows:5,pinnedRows:[],single:''},Date.now());"
+          "console.log(JSON.stringify({lev:m.lev,rows:m.rows.map(r=>r.id),counts:m.counts}));")
+    out = json.loads(subprocess.run([shutil.which("node"), "-e", js, str(sky)], input=json.dumps(p["value"]),
+                                    capture_output=True, text=True, check=True).stdout)
+    assert out["lev"] is True, out
+    assert {"sessions", "decisions", "memory", "questions"} <= set(out["rows"]), out
+    assert out["counts"]["waiting"] == 2, out        # the waiting consent and the open question
