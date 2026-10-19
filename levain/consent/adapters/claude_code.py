@@ -229,6 +229,9 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 # MCP server definitions: a ``.mcp.json`` anywhere (a workspace's). The user's ``~/.claude.json`` is matched by
 # its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
+# directly in a ``.git/`` directory (or a linked worktree's ``.git/worktrees/<name>/``): the config files git reads
+# executables from (``core.hooksPath``, ``core.fsmonitor``, aliases, filters)
+GIT_CONFIG_NAMES = frozenset({"config", "config.worktree"})
 USER_CONFIG_NAME = ".claude.json"
 
 
@@ -237,7 +240,7 @@ USER_CONFIG_NAME = ".claude.json"
 # A name that is config in ANY directory (``.mcp.json``) is not probed, or every directory would be: the file-name
 # field naming it is itself a candidate, tagged on its own.
 _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NAME, "x.pth", "sitecustomize.py",
-               "levain")
+               "levain", *sorted(GIT_CONFIG_NAMES))
 
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
@@ -249,7 +252,9 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
     derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
     server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
-    ``user_configs`` are the caller's, computed once. Over-matching only sends the request to the human."""
+    ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
+    human, or, when no enrolled key can sign T3 outside ``default`` and ``acceptEdits``, the call is refused (the
+    Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
@@ -269,10 +274,21 @@ def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_
             or _redirects_the_import(path, sites))
 
 
+def _is_git_exec_config(rest: list[str]) -> bool:
+    """What follows a ``.git`` directory component names a file git executes from or reads executables out of:
+    anything under its ``hooks/``, its ``config`` or ``config.worktree``, and the same in a linked worktree's git
+    directory (``worktrees/<name>/``). Never objects, refs or anything else under ``.git/``."""
+    if len(rest) >= 3 and rest[0] == "worktrees":
+        rest = rest[2:]
+    return (len(rest) > 1 and rest[0] == "hooks") or (len(rest) == 1 and rest[0] in GIT_CONFIG_NAMES)
+
+
 def _is_config_path(path: Path) -> bool:
     parts = [p.lower() for p in path.parts]
     if parts and parts[-1] in CONFIG_FILE_NAMES:
         return True
+    if parts and parts[-1] == ".git":
+        return True  # a gitfile (a linked worktree's ``.git``): it names the git directory whose config and hooks run
     for i, part in enumerate(parts[:-1]):
         rest = parts[i + 1:]
         if part == ".claude":
@@ -283,6 +299,8 @@ def _is_config_path(path: Path) -> bool:
             return True
         if part == "activation" and rest[0] == "hooks" and len(rest) > 1:
             return True  # a levain install's hook scripts (the consent hook among them) run in every agent session
+        if part == ".git" and _is_git_exec_config(rest):
+            return True  # git runs what these name, unsandboxed, at the operator's next git command
         if part == ".claude-plugin":
             return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
         if part == "hooks" and i > 0 and os.path.isdir(Path(*path.parts[:i]) / ".claude-plugin"):
@@ -295,8 +313,8 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
     files nothing (a queue row is kept for good). The PermissionRequest hook then leaves the call to the agent's own
-    dialog; the PreToolUse gate does so in ``default`` mode only, and in every other mode denies a T3 call (the
-    floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
+    dialog; the PreToolUse gate does so in ``default`` and ``acceptEdits`` only, and in every other mode denies a
+    T3 call (the floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
@@ -382,8 +400,11 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
     ``.claude/hooks/``, the one `levain init` wires under the install's ``activation/hooks/``, below); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
-    ``.codex/config.toml``; anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a
-    plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
+    ``.codex/config.toml``; git's executable config: anything under a ``.git/hooks/`` directory, a ``config`` or
+    ``config.worktree`` directly in a ``.git/`` directory, the same under a linked worktree's
+    ``.git/worktrees/<name>/``, and a file named ``.git`` (a gitfile, which names the git directory), never
+    ``.gitignore``, ``.gitattributes`` or objects and refs; anything under a ``.claude-plugin/`` directory, or
+    under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
@@ -618,6 +639,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if policy is None and nothing_can_decide(settings):
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
+    if agent_config and unconfined(cwd, home=home):
+        return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
     if agent_config:
         # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
         # dialog anyway on a path it protects: deliver that allow once, never a second question
@@ -673,11 +696,13 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # (:meth:`ConsentQueue.take_gate_allow`), so the operator is asked once:
 #
 # 0. a session started with ``LEVAIN_UNCONFINED=1`` (:data:`UNCONFINED_ENV`, Q10 D2) gets no decision: the mode
-#    decides, and no ruled allow is spent;
+#    decides, and no ruled allow is spent; unless a settings file the session can load sets the variable
+#    (:func:`unconfined_state`), which is then ignored;
 # 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
-# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default`` no decision (the
-#    dialog, or the operator's own allow rule, decides); in every other mode, an absent or unknown one included, the
-#    T3 FLOOR (Q10 D1): a deny with :data:`FLOOR_TEXT` and the hard stop, nothing filed;
+# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default`` and ``acceptEdits``
+#    (:data:`ATTENDED_POSTURES`) no decision (the dialog, or the operator's own allow rule, decides); in every other
+#    mode, an absent or unknown one included, the T3 FLOOR (Q10 D1): a plain deny with :data:`FLOOR_TEXT`, nothing
+#    filed (no hard stop: nothing is undecided, L2-2);
 # 2. else the request is filed with ``expires_at`` = now + D (the library owns the deadline, B1 fix 3), the operator
 #    is pinged through the notify seam (R-f; a failed ping never fails the gate), and the hook waits up to D for a
 #    verified decision, which it delivers;
@@ -721,19 +746,107 @@ U_REV = ("levain: UNDECIDED, not denied. The operator did not answer in time, so
 U_IRR = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
          "This class of action stops the task: do no further work. Do not retry it or achieve it another way. "
          "Write a short summary of what is done and what waits on gap #{n}, and end your turn.")
-# Q10 D1: the deny for a gated call when no enrolled key can sign it and no dialog asks
+# Q10 D1: the plain deny (no hard stop: nothing is undecided) for a gated call when no enrolled key can sign it and
+# no dialog asks. It names no way around the floor: the agent is told to ask, and the operator reads in
+# `levain doctor` how to allow it
 FLOOR_TEXT = ("levain: the action was NOT taken: {x}. Agent config and hooks are the operator's, and no enrolled key "
-              "can approve this, so it cannot be asked for. Do not retry it and do not achieve it another way. To "
-              "allow changes like this, the operator enrols a key that can sign them (they will then be asked), or "
-              "makes the change themselves or in a session they start with LEVAIN_UNCONFINED=1.")
+              "can approve this change, so it cannot be asked for. Do not retry it and do not achieve it another "
+              "way, including through the shell. Ask the operator: `levain doctor` shows them how to allow it.")
+# added to FLOOR_TEXT when the session's environment says unconfined but a settings file sets that (:func:`unconfined`)
+UNCONFINED_IGNORED_TEXT = (" The session's environment asks for an unconfined session, but that was ignored: a "
+                           "settings file this session can load sets it, and only the operator's own shell can "
+                           "start an unconfined session.")
 # Q10 D2: a session started with this set to "1" in its environment is unconfined: the gate passes its gated calls
 # and the session's mode decides. Read from the hook's own environment at every call (the agent's launch env)
 UNCONFINED_ENV = "LEVAIN_UNCONFINED"
+# the modes the gate treats as attended (head triage L2-3): Claude Code's dialog prompts in both for the paths it
+# protects itself (``.claude/``, ``.git/``, ``.mcp.json``, ``.claude.json``: its permission-modes docs; Codex sends
+# ``default`` with approvals on). With no key that can sign T3 the gate leaves the call to that dialog there, and
+# holds only while the operator is away. A T3 path Claude Code does not protect (``.codex/config.toml``) runs with no
+# question in acceptEdits (measured 10-19, Q10 run 4 case C5): open, routed to the head
+ATTENDED_POSTURES = ("default", "acceptEdits")
 
 
-def unconfined() -> bool:
-    """Whether the operator started this session unconfined (:data:`UNCONFINED_ENV` is exactly ``"1"``)."""
-    return os.environ.get(UNCONFINED_ENV) == "1"
+def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None) -> list[tuple[str, Path]]:
+    """Every settings file an agent session started in ``cwd`` can load an environment from, as (``json`` | ``toml``,
+    path): Claude Code's user settings (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``), Codex's ``config.toml`` (its home),
+    and in ``cwd``, ``$CLAUDE_PROJECT_DIR`` and each of their ancestors up to ``/`` (as written and resolved: Claude
+    Code reads a project's settings at its repository root) ``.claude/settings.json``, ``.claude/settings.local.json``
+    and ``.codex/config.toml``."""
+    home = home if home is not None else Path.home()
+    out: list[tuple[str, Path]] = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    for d in ([Path(config_dir)] if config_dir else []) + [home / ".claude"]:
+        out.append(("json", d / "settings.json"))
+    env_codex = os.environ.get("CODEX_HOME")
+    for d in ([codex_home] if codex_home is not None else []) + ([Path(env_codex)] if env_codex else []) \
+            + [home / ".codex"]:
+        out.append(("toml", d / "config.toml"))
+    for start in (cwd, os.environ.get("CLAUDE_PROJECT_DIR")):
+        if not isinstance(start, str) or not start:
+            continue
+        for p in {Path(os.path.abspath(start)), Path(os.path.realpath(start))}:
+            for d in (p, *p.parents):
+                out += [("json", d / ".claude" / "settings.json"), ("json", d / ".claude" / "settings.local.json"),
+                        ("toml", d / ".codex" / "config.toml")]
+    seen: set[Path] = set()
+    return [(k, p) for k, p in out if not (p in seen or seen.add(p))]
+
+
+def _key_anywhere(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return UNCONFINED_ENV in value or any(_key_anywhere(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_key_anywhere(v) for v in value)
+    return False
+
+
+def _sets_unconfined(kind: str, path: Path) -> bool:
+    """True when the settings file sets :data:`UNCONFINED_ENV` or that cannot be ruled out: an unreadable file, one
+    that does not parse, a Claude Code ``env`` that is not an object. A Claude Code file counts by its ``env`` block;
+    a Codex ``config.toml`` by the key anywhere in it (no Codex key is known to reach a hook's environment, but
+    ``shell_environment_policy.set`` reaches its subprocesses). A missing file sets nothing."""
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except Exception:  # noqa: BLE001 - unreadable: it cannot be ruled out
+        return True
+    try:
+        if kind == "toml":
+            import tomllib
+
+            return _key_anywhere(tomllib.loads(raw.decode("utf-8")))
+        data = json.loads(raw)
+        if not isinstance(data, Mapping):
+            return True
+        env = data.get("env")
+        return env is not None and (not isinstance(env, Mapping) or UNCONFINED_ENV in env)
+    except Exception:  # noqa: BLE001 - a file that does not parse cannot be ruled out
+        return True
+
+
+def unconfined_state(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> str | None:
+    """``"on"`` when the operator started this session unconfined: :data:`UNCONFINED_ENV` is exactly ``"1"`` in the
+    hook's environment and no settings file the session can load sets it (:func:`_settings_files`; the hook cannot
+    tell a variable a settings file's ``env`` put there from one the operator's shell did, so a cloned repository's
+    ``.claude/settings.json`` could otherwise turn the gate off, L2-1). ``"ignored"`` when it is ``"1"`` but such a
+    file sets it, or cannot be ruled out (:func:`_sets_unconfined`). ``None`` when it is not ``"1"``."""
+    if os.environ.get(UNCONFINED_ENV) != "1":
+        return None
+    files = _settings_files(cwd, home, codex_home)
+    return "ignored" if any(_sets_unconfined(kind, path) for kind, path in files) else "on"
+
+
+def unconfined(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
+    """Whether the operator started this session unconfined (:func:`unconfined_state` is ``"on"``)."""
+    return unconfined_state(cwd, home=home, codex_home=codex_home) == "on"
+
+
+def floor_text(what: str, state: str | None) -> str:
+    """The floor's deny reason for ``what``, with :data:`UNCONFINED_IGNORED_TEXT` when the session asked for
+    unconfined and a settings file sets it (``state`` from :func:`unconfined_state`)."""
+    return FLOOR_TEXT.format(x=what) + (UNCONFINED_IGNORED_TEXT if state == "ignored" else "")
 
 
 # DESIGN §3.6, verbatim: a late ruling delivered to its live session
@@ -945,12 +1058,13 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
     A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
-    or in a session started unconfined (:func:`unconfined`, nor is a ruled allow spent), else a ruled allow (taken
-    once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in ``default`` and the
-    floor's deny with the hard stop in every other mode (:data:`FLOOR_TEXT`, nothing filed), else, in every mode
-    (``default`` included), it is filed with its hold = D (``gate_hold_seconds``),
-    pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
-    (:func:`undecided_output`). In ``default`` the hold runs only while the operator is away, and ``still_away``
+    or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
+    allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
+    ``default`` and ``acceptEdits`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
+    (:func:`floor_text`, nothing filed), else, in every mode (``default`` included), it is filed with its hold = D
+    (``gate_hold_seconds``), pinged (:func:`notify`), held for a verified decision (delivered), and at D marked
+    undecided and denied (:func:`undecided_output`). In ``default`` and ``acceptEdits`` the hold runs only while
+    the operator is away, and ``still_away``
     (default :func:`still_away_from` the queue directory's settings file) is re-read every :data:`RECHECK_EVERY`
     (:func:`hold_for_answer`): when away ends the request is withdrawn and Claude Code's dialog asks. Anything
     that fails after the call is known gated is a deny (with the hard stop for
@@ -1049,22 +1163,23 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     posture = mode if isinstance(mode, str) and mode else None
     if posture == "plan":
         return None  # plan runs nothing: no decision, and a ruled allow is not spent on a call that will not run
-    if unconfined():
+    loose = unconfined_state(cwd, home=home)
+    if loose == "on":
         return None  # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow spent
     try:
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
-            if posture == "default":
+            if posture in ATTENDED_POSTURES:
                 return None  # Claude Code's own dialog (or the operator's own allow rule) decides while they are present
             # no dialog asks in this mode (an absent or unknown mode counts as none) and no key could answer a
-            # request: the floor denies, files nothing (Q10 D1)
+            # request: the floor denies, files nothing (Q10 D1). A plain deny: nothing is undecided, and the agent
+            # goes on with what does not need the change (L2-2)
             note(refused="floor")
-            return _pre("deny", FLOOR_TEXT.format(x=what),
-                        **_stop(tier, what, "no enrolled key can approve a change to agent config or hooks."))
-        if posture == "default" and not effective_away(settings)[0]:
-            # an attended default-mode session: Claude Code's own dialog (or the operator's own allow rule) decides,
+            return _pre("deny", floor_text(what, loose))
+        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
+            # an attended default or acceptEdits session: Claude Code's own dialog (or his own allow rule) decides,
             # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
             return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
@@ -1078,7 +1193,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
                cwd=queue.directory)
-        if posture == "default" and still_away is not None:
+        if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
             # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,

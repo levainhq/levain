@@ -86,8 +86,8 @@ def test_trusted_hash_is_codex_own_and_doctor_reads_trust(tmp_path):
 
 def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unconfined(tmp_path, monkeypatch):
     """Q10 D1 + D2 on Codex: with no enrolled key a gated call answered nothing and the mode ran it. Now any mode
-    but default gets the floor's PLAIN deny (Codex drops a deny that carries continue:false, runs2 BC_1), nothing
-    filed; default leaves it to Codex's approval; LEVAIN_UNCONFINED=1 passes it."""
+    but default (and acceptEdits) gets the floor's PLAIN deny (Codex drops a deny that carries continue:false,
+    runs2 BC_1), nothing filed; default leaves it to Codex's approval; LEVAIN_UNCONFINED=1 passes it."""
     monkeypatch.delenv(cx.UNCONFINED_ENV, raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     qdir = tmp_path / "consent"
@@ -102,6 +102,33 @@ def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unco
     rows = Ledger(qdir).window("codex", "S1", datetime.now(timezone.utc) - timedelta(days=1))
     assert [(r.phase, (r.stamp_detail or {}).get("decision")) for r in rows] == [("denied_by_gate", "floor")]
     assert _run(qdir, {**event, "permission_mode": "default"}) == ""
+    assert _run(qdir, {**event, "permission_mode": "acceptEdits"}) == ""  # L2-3: treated as default
+    for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
     assert _run(qdir, event) == ""
     assert ConsentQueue(qdir, authority=authority_source(qdir, anchor=None)).pending() == []
+
+
+def test_a_halted_session_stays_halted_when_started_unconfined(tmp_path, monkeypatch):
+    """L1-3: the halt is read before the unconfined check, so LEVAIN_UNCONFINED=1 never releases a halted Codex
+    session: a gated call and an ungated one both get HALT_TEXT."""
+    for var in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv(cx.UNCONFINED_ENV, "1")
+    qdir = tmp_path / "consent"
+    qdir.mkdir(mode=0o700)
+    t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    source = authority_source(qdir, anchor=None)
+    patch = {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"}
+    request = ConsentQueue(qdir, authority=source, clock=lambda: t0).file(
+        agent="codex", agent_session_id="S1", tool_name="apply_patch", tool_input=patch, cwd=str(tmp_path),
+        hold=timedelta(seconds=20), tier="T3")
+    assert ConsentQueue(qdir, authority=source, clock=lambda: t0 + timedelta(seconds=21)).mark_undecided(
+        request.id, halt=True).gap == 1
+    assert cx.unconfined(str(tmp_path), codex_home=tmp_path / "codex-home")
+    for tool, inp in (("apply_patch", patch), ("Bash", {"command": "ls"})):
+        out = json.loads(_run(qdir, _event("S1", tool, inp, str(tmp_path))))
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == cx.HALT_TEXT.format(n=1), tool
+    assert _run(qdir, _event("S2", "apply_patch", patch, str(tmp_path))) == ""  # another session is unconfined
