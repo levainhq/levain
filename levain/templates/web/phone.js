@@ -165,7 +165,11 @@
   // shell command looks like. Text only: the command is the agent's. A hint informs and never authorises
   function digestLine(label, value) {
     const full = typeof value === "string" ? value : "";
-    if (!full) return null;
+    if (!full) {                                   // a missing digest is shown as missing, never dropped
+      const gone = el("div", "dg");
+      gone.append(el("span", "dg-label", label + ": "), el("code", "dg-val", "(none)"));
+      return gone;
+    }
     const at = full.indexOf(":") + 1;
     const short = full.length > at + 12 ? full.slice(0, at + 12) + "\u2026" : full;
     const line = el("div", "dg");

@@ -150,7 +150,7 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
         hints = [visible(h) for h in hints_for(r, shown, shown is UNSHOWN)]
     except Exception:  # noqa: BLE001 - a hint is a reading aid: it never takes the decision surface down
         hints = []
-    return {"id": r.id, "agent": r.agent, "tool": r.tool_name, "tier": r.tier, "state": entry.state,
+    return {"id": r.id, "agent": visible(r.agent), "tool": visible(r.tool_name), "tier": r.tier, "state": entry.state,
             # agent-controlled text: invisible format characters show as markers (a bidi override must not reorder it)
             "display": visible(r.display), "cwd": visible(r.cwd), "targets": visible(consent_targets(r)),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
@@ -159,7 +159,7 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
             # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
             "tool_input_digest": r.tool_input_digest, "digest": r.digest,
             "hints": hints,
-            "audit": "" if pending else audit_line(entry)}
+            "audit": "" if pending else visible(audit_line(entry))}
 
 
 def _check_directory(directory: Path) -> None:
