@@ -1093,7 +1093,8 @@ class TestSession2Gaps:
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
             "now": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
-            "crystals": "C", "wraps": "C", "team-status": None, "sessions": None}      # the Team zone's one card: this install root has no team ledger
+            "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,      # the Team zone's one card: this install root has no team ledger
+            "notifications": None}
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
         assert sections and all(c in ("A", "B", "C") for c in sections.values())
 
