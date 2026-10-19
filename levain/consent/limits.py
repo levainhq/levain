@@ -871,3 +871,38 @@ def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir:
                 "where it stopped.")
     return (f"levain: the operator ENDED this session at its {label} limit (gap #{gap}). Stop here; do not continue "
             "the work another way.")
+
+
+def _iso(t: float | None) -> str | None:
+    from datetime import datetime, timezone
+
+    if t is None:
+        return None
+    try:
+        return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def panel(queue_dir: Path | str) -> dict[str, Any]:
+    """The cockpit's limits panel and ``levain limits show --json``: every counted session with its metrics against
+    its limits. ``status`` is ``over`` past the limit (``repeat``: at it), ``amber`` from 80 % of it, else ``ok``;
+    ``counting`` is False while the root's failure file reads nonzero (the store is failing to take its calls)."""
+    from datetime import datetime, timezone
+
+    qdir = Path(queue_dir)
+    sessions = []
+    for r in snapshot(qdir):
+        halt = r["halt"]
+        metrics = []
+        for k in KINDS:
+            value, limit = r["counts"][k], r["limits"][k]
+            over = value > limit or (k == "repeat" and value >= limit)
+            metrics.append({"key": k, "label": LABELS[k], "value": value, "limit": limit,
+                            "status": "over" if over else ("amber" if value >= 0.8 * limit else "ok")})
+        sessions.append({"agent": r["agent"], "session": r["root"], "last_at": _iso(r["last_at"]),
+                         "halted": ({"kind": halt["kind"], "gap": halt["gap"], "request_id": halt["request_id"]}
+                                    if halt else None),
+                         "counting": _fail_read(_fail_path(qdir, r["agent"], r["root"])) == 0,
+                         "metrics": metrics})
+    return {"as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "sessions": sessions}
