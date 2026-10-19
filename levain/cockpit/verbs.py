@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -335,7 +336,7 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
     except ConsentError as exc:
         raise EditError("stale" if "already answered" in str(exc) else "bad_request",
                         409 if "already answered" in str(exc) else 400, str(exc)) from None
-    except (QuestionStoreError, OSError) as exc:
+    except (QuestionStoreError, OSError, sqlite3.Error) as exc:
         raise EditError("source_unavailable", 503, f"the question store cannot answer now: {exc}") from None
 
     def deliver() -> None:

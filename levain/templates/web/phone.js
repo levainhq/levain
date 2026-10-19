@@ -59,7 +59,10 @@
     const waiting = rows.length + gaps.length + signs.length + asks.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
       + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "");
-    $("status").textContent = (waiting ? waiting + " waiting on you" : "nothing is waiting on you") + unread + (last ? " \u00b7 last: " + last : "");
+    const qnote = typeof data.questions_note === "string" && data.questions_note ? data.questions_note : "";
+    // a store fault is never "nothing waiting": the page says it cannot see the agents' questions
+    $("status").textContent = (waiting ? waiting + " waiting on you" : qnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
+      + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + unread + (last ? " \u00b7 last: " + last : "");
     list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
                          ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
@@ -354,6 +357,8 @@
 
   function load() {
     if (busy) return;
+    // a redraw would wipe words being typed into a question's box (and dismiss the keyboard)
+    if (Array.from(document.querySelectorAll("textarea.words")).some((t) => t.value.trim() !== "")) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
     call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
   }

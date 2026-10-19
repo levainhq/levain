@@ -301,3 +301,70 @@ def test_old_answers_leave_the_panel_after_a_day(tmp_path):
     ck = Cockpit(clock=lambda: T0)
     ck.attach_question_rows(store)
     assert ck.panel("decisions", credential_class="token")["rows"] == []
+
+
+# --- review fixes: one row id, a store fault, a read-only serve ------------------------------------------
+
+
+def test_a_question_answered_between_the_two_reads_is_one_row_in_its_answered_state(tmp_path):
+    store = QuestionStore(tmp_path / "consent")
+    q = _file(store)
+    stale_open = store.open_questions()           # the first read, taken before the answer lands
+    store.answer(q.n, option="ship", channel="phone")
+
+    class Split:
+        def open_questions(self):
+            return stale_open
+
+        def recent(self, n):
+            return store.recent(n)
+
+    ck = Cockpit(clock=lambda: datetime.now(timezone.utc))
+    ck.attach_question_rows(Split())
+    p = ck.panel("decisions", credential_class="token")
+    assert [r["id"] for r in p["rows"]] == [f"question:{q.n}"]
+    assert p["rows"][0]["facets"]["question_state"] == "answered" and "duplicate" not in (p.get("note") or "")
+
+
+def test_a_database_error_reading_one_question_is_a_fault_not_an_exception():
+    import sqlite3
+
+    from levain.cockpit.results import Fault
+
+    class Locked:
+        def open_questions(self):
+            return []
+
+        def get(self, ref):
+            raise sqlite3.OperationalError("database is locked")
+
+    ck = Cockpit(clock=lambda: T0)
+    ck.attach_question_rows(Locked())
+    assert isinstance(ck.read_one("decisions", "question:1"), Fault)
+
+
+def test_a_locked_store_answers_503_not_500(tmp_path, lh, monkeypatch):
+    import sqlite3
+
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+
+    def locked(self, *a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(QuestionStore, "answer", locked)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, body = _verb(base, _row(base, q.n), {"option": "ship"})
+    assert status == 503 and body["error"] == "source_unavailable"
+    assert store.get(q.n).answer is None
+
+
+def test_a_read_only_serve_refuses_an_answer_and_records_nothing(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    with _serve(src) as (base, _h):                          # no write_token: `levain serve` without --write
+        status, body = _verb(base, _row(base, q.n, None), {"option": "ship"}, token=TOKEN)
+        assert status == 403 and body["error"] == "credential_required"      # no token is configured to match
+    assert store.get(q.n).answer is None

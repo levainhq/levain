@@ -36,6 +36,7 @@ import itertools
 import json
 import math
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
@@ -493,7 +494,10 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     since = (now - timedelta(hours=QUESTION_DONE_HOURS)).astimezone(timezone.utc)
     done = [q for q in store.recent(50) if q.answer is not None
             and _parse_iso(q.answer.answered_at) >= since]
-    return [_question_row_in(q) for q in (*open_[:PENDING_CAP], *done)], max(len(open_) - PENDING_CAP, 0)
+    # two reads: a question answered between them is in both, and its row id is shown once (the answered state)
+    shown = {q.n: q for q in open_[:PENDING_CAP]}
+    shown.update((q.n, q) for q in done)
+    return [_question_row_in(q) for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
 class Cockpit:
@@ -1238,7 +1242,10 @@ class Cockpit:
         store = self._dec.questions
         if store is None:
             return Absent("no question store")
-        q = store.get(row_id[len(QUESTION_ROW_PREFIX):])     # also reads `#3` or `q-…`: only the canonical id is the row
+        try:
+            q = store.get(row_id[len(QUESTION_ROW_PREFIX):])     # also reads `#3` or `q-…`: only the canonical id is the row
+        except (OSError, sqlite3.Error) as exc:
+            return Fault(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
             return Absent(f"decision {row_id!r} is gone")
         return Read(rows=(_question_row_in(q),))

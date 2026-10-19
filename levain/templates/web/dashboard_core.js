@@ -4085,7 +4085,7 @@
     for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta, .text-editor textarea")) {
       if (ta.value !== ta.dataset.orig) return true;
     }
-    for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref")) {
+    for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref, .question-words")) {
       if (ta.closest(".text-editor")) continue;
       if (ta.value.trim() !== "") return true;
     }

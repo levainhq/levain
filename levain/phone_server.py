@@ -312,26 +312,28 @@ class _PhoneServer(ThreadingHTTPServer):
                 sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
-        questions, questions_overflow = self._questions()
+        questions, questions_overflow, questions_note = self._questions()
         return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
+                "questions_note": questions_note,
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow}
 
-    def _questions(self) -> "tuple[list[dict[str, Any]], int]":
-        """The open questions (oldest first, capped like the pending list) and how many were left out. A queue with
-        no ``questions.db`` lists none and creates none; a store that cannot be read lists none."""
+    def _questions(self) -> "tuple[list[dict[str, Any]], int, str]":
+        """The open questions (oldest first, capped like the pending list), how many were left out, and a note when
+        the store could not be read (the page says so rather than showing none). A queue with no ``questions.db``
+        lists none and creates none."""
         from levain.consent.listing import PENDING_CAP
         from levain.consent.questions import QuestionStore, QuestionStoreError
 
         try:
             open_ = QuestionStore(self.queue_dir).open_questions()
-        except (QuestionStoreError, OSError, sqlite3.Error):
-            return [], 0
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            return [], 0, f"{type(exc).__name__}: {exc}"
         rows = [{"n": q.n, "id": q.id, "agent": q.agent, "what": q.what,
                  "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
                  "filed_at": q.filed_at} for q in open_[:PENDING_CAP]]
-        return rows, max(len(open_) - PENDING_CAP, 0)
+        return rows, max(len(open_) - PENDING_CAP, 0), ""
 
     def question_answer(self, n: int, req: Any) -> dict[str, Any]:
         """``POST /question/<n>/answer`` ({option} or {text}): record the answer (unsigned, once), then deliver it

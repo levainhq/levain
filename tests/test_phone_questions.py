@@ -135,3 +135,22 @@ def test_unknown_question_and_bad_bodies_are_refused(qdir: Path) -> None:
         assert status == 400 and body["error"] == "bad_request"
     assert QuestionStore(qdir).get(n).answer is None
     assert not _CALLS
+
+
+def test_an_unreadable_store_is_a_note_never_an_empty_list(qdir: Path, monkeypatch) -> None:
+    import sqlite3
+
+    _file(qdir)
+
+    def locked(self):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(QuestionStore, "open_questions", locked)
+    with _serving(qdir) as base:
+        status, body = _call(base + "/consent.json")
+    assert status == 200 and body["questions"] == [] and "database is locked" in body["questions_note"]
+
+
+def test_a_readable_store_has_no_note(qdir: Path) -> None:
+    with _serving(qdir) as base:
+        assert _call(base + "/consent.json")[1]["questions_note"] == ""
