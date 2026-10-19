@@ -652,3 +652,19 @@ def test_a_session_with_no_record_files_without_a_preflight(capsys, ddir, contra
     os.chmod(ddir / "capabilities", 0o755)
     code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--json")
     assert code == 0 and json.loads(out)["capability_kept"].startswith("not kept"), out
+
+
+def test_a_fault_after_the_signature_committed_does_not_claim_nothing_was_signed(capsys, ddir, contract_file, keys,
+                                                                                 log, monkeypatch):
+    # head r2 ruling: a fault raised after the store's own write committed must not say "nothing was signed"
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    real_sign = JobStore.sign
+
+    def sign_then_fault(self, *a, **kw):
+        real_sign(self, *a, **kw)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(JobStore, "sign", sign_then_fault)
+    code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
+    assert code == 3 and "nothing was signed" not in out, out
+    assert f"job {job_id} is now signed (was filed)" in out and "is not known" in out, out
