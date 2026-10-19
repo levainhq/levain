@@ -235,7 +235,9 @@
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where it stands", "bad");
           if (!a.ok) { if (a.status !== 409) again(); return say("not answered, nothing allowed: " + why(a), "bad"); }
           words.value = "";
-          last = "answered question #" + q.n + " and allowed its push";
+          if (!a.body.answered) again();   // ruled, but the answer was not recorded: the card stays usable
+          last = a.body.answered ? "answered question #" + q.n + " and allowed its push"
+                                 : "allowed question #" + q.n + "'s push (its answer was not recorded)";
           const d = a.body.delivery || {};
           const head = a.body.answered ? "answered and ruled the push allowed" : "the push is ruled allowed; " + (a.body.answer_note || "");
           say(head + " \u00b7 signed by " + ((a.body.ruling || {}).signer_fp || "") + " \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""),

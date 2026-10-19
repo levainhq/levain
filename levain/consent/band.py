@@ -43,7 +43,8 @@ Known edges (one line each, not built against):
   next gap number though the agent was never refused, and its undecided receipt reads timed out (the receipt has
   no word for filed ahead; the request's note says why); asking the same push twice files two requests, and the one
   not ruled waits as an undecided gap; a question that fails to file after its push request did leaves that request
-  undecided, and the refusal names it; a push run before the operator taps holds and halts the session on its own
+  undecided, and the refusal names it; a ruling made in the moment between levain reading the request's state and
+  telling the agent leaves that text describing the earlier state (the push itself still takes only what was ruled); a push run before the operator taps holds and halts the session on its own
   request, and the later tap, a ruling on the question's request, does not release that halt; an answer of another
   option recorded while the tap is signing makes the tap's ruling apply with that other answer (the page says the
   answer was not recorded).
@@ -348,7 +349,8 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     try:
         ping_text = _ping_text(agent, q, qdir)
         if tappable:
-            ping_text += f"\nOption {link.option} also allows, with one passkey tap on the phone page: the {push_words}."
+            ping_text += (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
+                          "passkey also allows that push (or rule it with `levain consent rule`).")
         pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
     except Exception:  # noqa: BLE001 - a ping is a ping: it never fails the question
         pinged = False
@@ -372,8 +374,8 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
                      "session only if the operator's answer says to; it asks if nothing allows it.")
             return q, text
         text += (f" Option {link.option} leads to the {push_words}: levain filed it as consent request "
-                 f"{link.request_id}, undecided (gap {gap}). If the operator picks that option on the phone page "
-                 "with a passkey, that same tap signs a ruling that allows the push (with no passkey enrolled the "
+                 f"{link.request_id}, undecided (gap {gap}). While it is still undecided, if the operator picks that "
+                 "option on the phone page with a passkey, that same tap signs a ruling that allows the push (with no passkey enrolled the "
                  f"operator rules it with `levain consent rule`); then, from this same session, run {command} and "
                  f"it runs once without asking again. A new commit on {call['branch']} before then is a different "
                  "push, which asks.")
