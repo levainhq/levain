@@ -121,12 +121,14 @@ def test_a_resume_that_did_not_start_leaves_its_ruling_deliverable_once_and_an_u
 _THREAD = "01a152a3-b935-79e0-aa02-3c71635e0a03"
 
 
-def _rollout(chome, modes, thread=_THREAD):
+def _rollout(chome, modes, thread=_THREAD, tail=""):
     day = chome / "sessions" / "2026" / "10" / "19"
     day.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps({"type": "session_meta", "payload": {"id": thread, "cwd": "/w"}})]
-    lines += [json.dumps({"type": "turn_context", "payload": {"sandbox_policy": {"type": m}}}) for m in modes]
-    (day / f"rollout-2026-10-19T01-30-24-{thread}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lines += [json.dumps({"type": "turn_context", "payload": {"sandbox_policy": m if isinstance(m, dict) else
+                                                              {"type": m}}}) for m in modes]
+    (day / f"rollout-2026-10-19T01-30-24-{thread}.jsonl").write_text("\n".join(lines) + "\n" + tail,
+                                                                     encoding="utf-8")
 
 
 def test_a_codex_resume_restores_the_sandbox_its_rollout_last_ran_under(tmp_path, monkeypatch):
@@ -134,10 +136,35 @@ def test_a_codex_resume_restores_the_sandbox_its_rollout_last_ran_under(tmp_path
     _rollout(chome, ["workspace-write", "read-only"])
     monkeypatch.setattr(dv, "_exe", lambda name, env: f"/bin/{name}")
     meta = {"invocation": "-p", "cwd": str(tmp_path), "config_dir": str(chome),
-            "codex_flags": "codex -s --skip-git-repo-check --json"}
+            "codex_flags": "codex -s --skip-git-repo-check --strict-config --json"}
     assert dv.resume_refusal("codex", _THREAD, meta) is None
     assert dv._resume_argv("codex", _THREAD, meta, {}) == [
-        "/bin/codex", "exec", "resume", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"', _THREAD]
+        "/bin/codex", "-s", "read-only", "exec", "resume", "--skip-git-repo-check", "--strict-config", _THREAD]
+    # workspace-write: every recorded field is reproduced over whatever config.toml says now (L3 r1 codex HIGH)
+    _rollout(chome, [{"type": "workspace-write", "writable_roots": ["/x/extra"], "network_access": False,
+                      "exclude_tmpdir_env_var": True, "exclude_slash_tmp": False}])
+    assert dv._resume_argv("codex", _THREAD, {**meta, "codex_flags": "codex"}, {}) == [
+        "/bin/codex", "-s", "workspace-write", "exec", "resume",
+        "-c", 'sandbox_workspace_write.writable_roots=["/x/extra"]', "-c", "sandbox_workspace_write.network_access=false",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true", "-c", "sandbox_workspace_write.exclude_slash_tmp=false",
+        _THREAD]
+
+
+def test_the_newest_turn_context_decides_and_a_field_that_cannot_be_reproduced_refuses(tmp_path):
+    """L3 r1 codex HIGH: a damaged newest record never lets an older (looser) one decide."""
+    chome = tmp_path / "codex"
+    meta = {"config_dir": str(chome)}
+    _rollout(chome, ["danger-full-access"], tail='{"type": "turn_context", "payload": {"sandbox_pol')
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
+    _rollout(chome, ["danger-full-access", "read-only"],
+             tail=json.dumps({"type": "event_msg", "payload": {"kind": "turn_context"}}) + "\n")
+    assert dv.codex_sandbox_args(meta, _THREAD) == ["-s", "read-only"]      # a mention is not a record
+    _rollout(chome, [{"type": "workspace-write", "network_access": False, "a_field_codex_adds": 1}])
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
+    _rollout(chome, [{"type": "read-only", "network_access": True}])
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
+    _rollout(chome, [{"type": "workspace-write", "writable_roots": ["relative/root"]}])
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
 
 
 def test_a_codex_resume_is_refused_when_its_sandbox_cannot_be_read_or_an_option_cannot_be_restored(tmp_path,
@@ -156,3 +183,14 @@ def test_a_codex_resume_is_refused_when_its_sandbox_cannot_be_read_or_an_option_
                          ("codex --profile", "--profile"), ("codex --some-later-flag", "--some-later-flag")):
         assert named in dv.resume_refusal("codex", _THREAD, {**base, "codex_flags": flags}), flags
     assert "not recorded" in dv.resume_refusal("codex", _THREAD, {k: v for k, v in base.items() if k != "codex_flags"})
+
+
+def test_the_tail_read_spans_blocks_and_finds_the_newest_record(tmp_path):
+    chome = tmp_path / "codex"
+    filler = "".join(json.dumps({"type": "event_msg", "payload": {"text": "x" * 500}}) + "\n" for _ in range(400))
+    _rollout(chome, ["danger-full-access", "read-only"], tail=filler)
+    assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "read-only"]
+    big = json.dumps({"type": "turn_context", "payload": {"sandbox_policy": {"type": "workspace-write"},
+                                                         "note": "y" * 200_000}})
+    _rollout(chome, ["danger-full-access"], tail=big + "\n" + filler)
+    assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "workspace-write"]

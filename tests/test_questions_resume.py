@@ -286,7 +286,7 @@ def test_l3r2_a_long_first_rollout_line_still_gives_its_cwd(tmp_path):
 def test_l3r2_a_process_naming_the_session_blocks_a_resume(tmp_path, monkeypatch):
     meta = {"invocation": "-p", "cwd": str(tmp_path), "codex_pid": 999999, "codex_flags": "codex"}
     monkeypatch.setattr(dv, "_resume_argv", lambda *a: ["/bin/codex", "exec", "resume", SESSION])   # CI has no codex
-    monkeypatch.setattr(dv, "codex_rollout_sandbox", lambda meta, thread: "read-only")
+    monkeypatch.setattr(dv, "codex_sandbox_args", lambda meta, thread: ["-s", "read-only"])
     got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
                    named=lambda s: True)
     assert got[0] == "hook" and "a process naming this session may be running" in got[1]

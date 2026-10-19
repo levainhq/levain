@@ -94,15 +94,15 @@ _BYPASS_FLAG = "--dangerously-skip-permissions"
 # Codex: `codex exec resume` takes no -s and runs under config.toml's sandbox_mode, not the original's [measured:
 # 1019+1, codex-cli 0.162.1: an exec started -s read-only was resumed workspace-write]. So the resume restores the
 # sandbox the session last ran under, read from Codex's own rollout (its last turn_context's sandbox_policy, never
-# the command line as ps shows it, where a prompt's words cannot be told from options), with -c sandbox_mode;
-# --skip-git-repo-check is carried; and any other option on the original command line refuses the resume unless it
+# the command line as ps shows it, where a prompt's words cannot be told from options), with -s and, for
+# workspace-write, its recorded fields (codex_sandbox_args); --skip-git-repo-check and --strict-config are carried; and any other option on the original command line refuses the resume unless it
 # is on this list of ones that change no confinement, approval or rules (fail closed: an option a later Codex adds
 # is refused until it is judged here). A prompt word that looks like an option refuses the resume, except
 # --skip-git-repo-check, which then skips a check the original already passed by running in that directory.
 CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
-_CODEX_CARRIED = ("--skip-git-repo-check",)
+_CODEX_CARRIED = ("--skip-git-repo-check", "--strict-config")
 _CODEX_NEUTRAL = ("--json", "-o", "--output-last-message", "-m", "--model", "-i", "--image", "--color",
-                  "--output-schema", "--strict-config", "--ephemeral", "--no-alt-screen", "-s", "--sandbox")
+                  "--output-schema", "--ephemeral", "--no-alt-screen", "-s", "--sandbox")
 # a session id: Claude Code's and Codex's are UUIDs; a subagent's key adds ``#agent:<id>``
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -310,10 +310,48 @@ def unrestored_flags(flags: str, mode: str | None) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def codex_rollout_sandbox(meta: Mapping[str, Any], thread: str) -> str | None:
-    """The sandbox mode the Codex thread last ran under, from its one rollout under the recorded config directory
-    (``<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl``): the ``sandbox_policy`` type of its last
-    ``turn_context`` record, or ``None`` (no single rollout, none recorded, a mode not in :data:`CODEX_SANDBOXES`)."""
+def _last_turn_context(path: Path) -> dict[str, Any] | None:
+    """The newest ``turn_context`` record of a rollout, read from the file's end, or ``None``: none, or the newest
+    line that names one does not parse (a truncated or damaged newest record never lets an older one decide), or a
+    line longer than :data:`_ROLLOUT_LINE_MAX`."""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos, tail = fh.tell(), b""
+        while pos > 0:
+            step = min(_ROLLOUT_BLOCK, pos)
+            pos -= step
+            fh.seek(pos)
+            tail = fh.read(step) + tail
+            lines = tail.split(b"\n")
+            tail = lines[0] if pos > 0 else b""        # the first piece may be the end of an earlier line
+            for raw in reversed(lines[1:] if pos > 0 else lines):
+                if b'"turn_context"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    return None
+                if isinstance(rec, dict) and rec.get("type") == "turn_context":
+                    payload = rec.get("payload")
+                    return payload if isinstance(payload, dict) else None
+            if len(tail) > _ROLLOUT_LINE_MAX:
+                return None
+    return None
+
+
+_ROLLOUT_BLOCK = 1 << 16
+_ROLLOUT_LINE_MAX = 1 << 24
+# a workspace-write policy's fields as Codex records them [measured: 1019+1, codex-cli 0.162.1], each restored with
+# `-c sandbox_workspace_write.<key>=`; any other field, in any mode, refuses the resume (it cannot be reproduced)
+_WW_LISTS, _WW_BOOLS = ("writable_roots",), ("network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp")
+
+
+def codex_sandbox_args(meta: Mapping[str, Any], thread: str) -> list[str] | None:
+    """The options that make ``codex exec resume`` run under the sandbox the Codex thread last ran under (its one
+    rollout under the recorded config directory, ``<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl``, its
+    newest ``turn_context`` ``sandbox_policy``): ``-s <mode>`` first (a command-line flag outranks config.toml), then a
+    workspace-write policy's fields; or ``None`` (no single rollout, an unreadable newest record, a mode not in
+    :data:`CODEX_SANDBOXES`, a field that cannot be reproduced)."""
     if not session_ok(thread):
         return None
     config = meta.get("config_dir")
@@ -322,21 +360,26 @@ def codex_rollout_sandbox(meta: Mapping[str, Any], thread: str) -> str | None:
         found = list((chome / "sessions").glob(f"*/*/*/rollout-*-{thread}.jsonl"))
         if len(found) != 1:
             return None
-        mode: str | None = None
-        with found[0].open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if '"turn_context"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                payload = rec.get("payload") if isinstance(rec, dict) and rec.get("type") == "turn_context" else None
-                policy = payload.get("sandbox_policy") if isinstance(payload, dict) else None
-                mode = policy.get("type") if isinstance(policy, dict) else None
+        context = _last_turn_context(found[0])
     except OSError:
         return None
-    return mode if mode in CODEX_SANDBOXES else None
+    policy = context.get("sandbox_policy") if context else None
+    if not isinstance(policy, dict) or policy.get("type") not in CODEX_SANDBOXES:
+        return None
+    mode = policy["type"]
+    fields = {k: v for k, v in policy.items() if k != "type"}
+    if mode != "workspace-write":
+        return None if fields else ["-s", mode]
+    out = ["-s", mode]
+    for key, value in fields.items():
+        if key in _WW_BOOLS and isinstance(value, bool):
+            out += ["-c", f"sandbox_workspace_write.{key}={'true' if value else 'false'}"]
+        elif (key in _WW_LISTS and isinstance(value, list)
+              and all(isinstance(r, str) and os.path.isabs(r) and r.isprintable() for r in value)):
+            out += ["-c", f"sandbox_workspace_write.{key}={json.dumps(value)}"]
+        else:
+            return None
+    return out
 
 
 def codex_unrestored(flags: str) -> list[str]:
@@ -360,8 +403,9 @@ def resume_refusal(agent: str, session: str, meta: Mapping[str, Any]) -> str | N
         dropped = codex_unrestored(flags)
         if dropped:
             return f"it was started with {', '.join(dropped)}, which a resume does not carry over"
-        if codex_rollout_sandbox(meta, session) is None:
-            return "the sandbox it ran under could not be read from its rollout, so a resume could run under a looser one"
+        if codex_sandbox_args(meta, session) is None:
+            return ("the sandbox it ran under could not be read from its rollout, or cannot be reproduced, so a resume "
+                    "could run under a looser one")
         return None
     if not _transcript(meta, session).is_file():
         return "no transcript of it is where Claude Code keeps it for that config directory and start directory"
@@ -395,12 +439,11 @@ def _resume_argv(agent: str, session: str, meta: Mapping[str, Any], env: Mapping
     exe = _exe("codex", env)
     if exe is None:
         return None
-    sandbox = codex_rollout_sandbox(meta, session)
+    sandbox = codex_sandbox_args(meta, session)
     if sandbox is None:
         return None                       # never resumed under config.toml's sandbox (resume_refusal says why)
     names = {t.partition("=")[0] for t in str(meta.get("codex_flags") or "").split()}
-    return [exe, "exec", "resume", *(f for f in _CODEX_CARRIED if f in names), "-c", f'sandbox_mode="{sandbox}"',
-            session]
+    return [exe, *sandbox[:2], "exec", "resume", *(f for f in _CODEX_CARRIED if f in names), *sandbox[2:], session]
 
 
 def _verified_ruling(queue: ConsentQueue, request_id: str) -> Ruling | None:
