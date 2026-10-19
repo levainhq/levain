@@ -60,7 +60,8 @@ from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Question, QuestionStore, QuestionStoreError
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
-           "deliver_answer", "deliver_answers", "question_context", "run_ask", "run_question", "transcript_facts"]
+           "deliver_answer", "deliver_answers", "file_question", "question_context", "run_ask", "run_question",
+           "transcript_facts"]
 
 # the session a question names when the environment names none (no hook's session is ever this)
 NO_SESSION = "levain-ask"
@@ -213,32 +214,26 @@ def _ping_text(agent: str, q: Question, qdir: Path) -> str:
             f"Answer: levain question answer {q.n}{where} --option <key> (or --text \"...\").")
 
 
-def run_ask(args: argparse.Namespace, out: Any = None) -> int:
-    """``levain ask``: file the question, ping, return at once."""
-    out = out if out is not None else sys.stdout
-
-    def say(text: str) -> None:
-        print(text, file=out, flush=True)
-
+def file_question(agent: str, session: str, what: str, options: list[tuple[str, str]], rec: str, blocks: str,
+                  qdir: Path, *, no_session_hint: str = "(pass --session)") -> tuple[Question | None, str]:
+    """File one question, ping, and say so: the one path under ``levain ask`` and the ``ask`` MCP tool, so the
+    refusals, the ping, the resume meta and the wording are the same for both. Returns the question (``None`` when
+    it was refused or could not be written) and the text the caller shows the agent; ``no_session_hint`` is what
+    that text says to do when the question names no session."""
     try:
-        agent, session = _agent_and_session(args.agent, args.session)
         if _SUBAGENT in session:
             raise ValueError("--session must name the main session (no #agent: part): only its hooks receive "
                              "answers")
-        qdir = _queue_dir(args)
         try:
             resume = ask_resume_meta(agent, session)
         except Exception:  # noqa: BLE001 - no resume record: the answer then waits for the session's next hook
             resume = None
-        q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=args.what,
-                                     options=_options(args.option), rec=args.rec, blocks=args.blocks,
-                                     cwd=os.path.abspath(os.getcwd()), resume=resume)
+        q = QuestionStore(qdir).file(agent=agent, agent_session_id=session, what=what, options=options, rec=rec,
+                                     blocks=blocks, cwd=os.path.abspath(os.getcwd()), resume=resume)
     except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
-        say(f"levain ask: refused, nothing was filed: {exc}")
-        return EXIT_REFUSED
+        return None, f"levain ask: refused, nothing was filed: {exc}"
     except sqlite3.Error as exc:                     # a store locked past its wait, or damaged: the write rolled back
-        say(f"levain ask: the question store could not be written, so nothing was filed ({exc}); try again")
-        return EXIT_REFUSED
+        return None, f"levain ask: the question store could not be written, so nothing was filed ({exc}); try again"
     adapter = _agents()[agent]
     send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
     try:
@@ -247,12 +242,26 @@ def run_ask(args: argparse.Namespace, out: Any = None) -> int:
         pinged = False
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
-             "(pass --session)")
+             + no_session_hint)
     ping = ("pinged" if pinged else
             "NOT pinged (no notify command is configured; the question is listed in `levain question list`)")
-    say(f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does not "
-        f"block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
-    return EXIT_OK
+    return q, (f"levain ask: question #{q.n} filed ({q.id}); the operator was {ping}. Keep working on what it does "
+               f"not block; do not do what it blocks ({q.blocks}) until the answer comes: {where}.")
+
+
+def run_ask(args: argparse.Namespace, out: Any = None) -> int:
+    """``levain ask``: file the question, ping, return at once."""
+    out = out if out is not None else sys.stdout
+    try:
+        agent, session = _agent_and_session(args.agent, args.session)
+        qdir = _queue_dir(args)
+        options = _options(args.option)
+    except (ValueError, ConsentError, QuestionStoreError, OSError) as exc:
+        print(f"levain ask: refused, nothing was filed: {exc}", file=out, flush=True)
+        return EXIT_REFUSED
+    q, text = file_question(agent, session, args.what, options, args.rec, args.blocks, qdir)
+    print(text, file=out, flush=True)
+    return EXIT_OK if q is not None else EXIT_REFUSED
 
 
 def _row(q: Question) -> dict[str, Any]:
