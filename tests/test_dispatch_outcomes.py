@@ -458,3 +458,11 @@ def test_a_below_min_entry_reports_the_coarsest_nonzero_n_on_its_path():
     by = {r.key[1:]: {e.label: e for e in r.entries} for r in panel(cells, min_n=10).rows}
     e = by[("R0", "codex 0.5", "rename")]["verifier_pass:black-box"]
     assert e.rate == BELOW_MIN_N and e.n == 2 and e.cell == (M,)        # the model's own cell, not the 1-run leaf
+
+
+def test_a_run_with_verifier_labels_of_two_kinds_is_refused_by_the_rollup():
+    rows = [row(label="verifier_pass", verifier_kind="black-box"),
+            row(label="adopted"),
+            row(label="verifier_fail", verifier_kind="in-process")]
+    with pytest.raises(DispatchError, match="two kinds"):
+        rollup(rows, min_n=1)

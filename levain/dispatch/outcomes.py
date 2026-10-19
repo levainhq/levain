@@ -479,7 +479,10 @@ def rollup(rows: Iterable[OutcomeRow], *, min_n: int, now: datetime | None = Non
             path = (_model_key(row), row.route, row.harness, row.template_id)
             entry = runs[row.run] = (path, {}, [None])
         entry[1].setdefault(row.label, row.at)
-        if row.verifier_kind is not None and entry[2][0] is None:
+        if row.verifier_kind is not None:
+            # a run is bucketed by ONE verifier kind; two kinds on one run would put it under whichever came first
+            if entry[2][0] not in (None, row.verifier_kind):
+                raise DispatchError(f"run {row.run} carries verifier labels of two kinds")
             entry[2][0] = row.verifier_kind
     counts: dict[tuple, dict[str, int]] = {}
     denoms: dict[tuple, dict[str, int]] = {}

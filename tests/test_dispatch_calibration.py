@@ -548,3 +548,14 @@ def test_raised_is_counted_per_class(queue, keys):
 def test_judge_is_a_plain_protocol_not_a_runtime_check():
     with pytest.raises(TypeError):
         isinstance(Fixed("allow"), Judge)
+
+
+def test_the_report_carries_the_cut_count(queue, keys):
+    short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
+                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             hold=timedelta(minutes=5), tier="T2")
+    decide(queue, keys, short, "allow")
+    decide(queue, keys, cut, "deny")
+    got = report(read_labels(queue.directory, now=at(queue)), Fixed("allow"), min_n=1, min_agreement=0,
+                 min_coverage=0, max_dangerous=0)
+    assert got.excluded_cut == 1

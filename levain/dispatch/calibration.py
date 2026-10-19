@@ -429,11 +429,13 @@ class ClassEntry:
 class ReplayReport:
     """A judge's replay as plain data: per action class entries, how many requests the judge was shown and how many
     raised, the caveat, and ``incomplete`` (the queue listing overflowed, or ``limit`` cut the replay short: either
-    way the counts are a sample and no proposal rests on them)."""
+    way the counts are a sample and no proposal rests on them), and ``excluded_cut``, the requests left out because
+    their display was cut, carried here so a renderer handed only the report can say how many it never scored."""
     classes: Mapping[ActionClass, ClassEntry]
     replayed: int
     raised: int
     incomplete: bool
+    excluded_cut: int = 0
     caveat: str = CAVEAT
 
 
@@ -460,4 +462,4 @@ def report(labels: LabelSet, judge: Judge, *, min_n: int, min_agreement: Fractio
         ok, why = proposal_eligible(rep_, min_n=min_n, min_agreement=min_agreement, min_coverage=min_coverage,
                                     max_dangerous=max_dangerous)
         classes[cls] = ClassEntry(rep_, rates[cls], ok, why, raised_in.get(cls, 0))
-    return ReplayReport(classes, len(run.replayed), len(run.raised), incomplete)
+    return ReplayReport(classes, len(run.replayed), len(run.raised), incomplete, labels.excluded_cut)
