@@ -3207,6 +3207,32 @@
     facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
     facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
     parts.push(facts);
+    // Q12 / Q16: the two digests the terminal prints before signing (short, the whole value one click away) and what a shell
+    // command looks like; text only, and a hint informs, never authorises
+    for (const [label, value] of [["input digest", b.tool_input_digest], ["request digest", b.digest]]) {
+      const full = sv(value);
+      if (!full) continue;
+      const at = full.indexOf(":") + 1;
+      const short = full.length > at + 12 ? full.slice(0, at + 12) + "\u2026" : full;
+      const line = el("div", "consent-facts consent-dg");
+      const code = el("code", "consent-dgval", short);
+      code.tabIndex = 0;
+      code.setAttribute("role", "button");
+      code.title = full;
+      let open = false;
+      const flip = () => { open = !open; code.textContent = open ? full : short; };
+      code.addEventListener("click", flip);
+      code.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } });
+      line.append(el("span", "ext-meta", label), code);
+      parts.push(line);
+    }
+    const hints = Array.isArray(b.hints) ? b.hints.filter((h) => typeof h === "string" && h) : [];
+    if (hints.length) {
+      const box = el("div", "consent-facts consent-hint");
+      box.appendChild(el("span", "ext-meta", "hint (informs, never authorises)"));
+      for (const h of hints) box.appendChild(el("div", "consent-dgtext", "\u2022 " + h));
+      parts.push(box);
+    }
     if (sv(b.note)) parts.push(el("div", "consent-note ext-meta", sv(b.note)));
     if (!pending && sv(b.audit)) {
       const audit = row.querySelector(".consent-audit");

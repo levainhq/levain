@@ -160,6 +160,37 @@
     return card;
   }
 
+  // Q12 / Q16: the two digests the terminal prints before signing (short here, the whole value one tap away), and what a
+  // shell command looks like. Text only: the command is the agent's. A hint informs and never authorises
+  function digestLine(label, value) {
+    const full = typeof value === "string" ? value : "";
+    if (!full) return null;
+    const at = full.indexOf(":") + 1;
+    const short = full.length > at + 12 ? full.slice(0, at + 12) + "\u2026" : full;
+    const line = el("div", "dg");
+    const code = el("code", "dg-val", short);
+    code.tabIndex = 0;
+    code.setAttribute("role", "button");
+    code.title = full;
+    let open = false;
+    const flip = () => { open = !open; code.textContent = open ? full : short; };
+    code.addEventListener("click", flip);
+    code.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); flip(); } });
+    line.append(el("span", "dg-label", label + " "), code);
+    return line;
+  }
+  function checkLines(r) {
+    const out = [digestLine("input digest", r.tool_input_digest), digestLine("request digest", r.digest)];
+    const hints = Array.isArray(r.hints) ? r.hints.filter((h) => typeof h === "string" && h) : [];
+    if (hints.length) {
+      const box = el("div", "dg hint");
+      box.appendChild(el("span", "dg-label", "hint (informs, never authorises)"));
+      for (const h of hints) box.appendChild(el("div", "dg-hint", "\u2022 " + h));
+      out.push(box);
+    }
+    return out.filter(Boolean);
+  }
+
   function row(r, ruling) {
     const card = el("article", "req");
     const head = el("div", "req-head");
@@ -168,6 +199,7 @@
     card.append(head, el("pre", "display", typeof r.display === "string" ? r.display : ""));
     if (r.cwd) card.appendChild(el("div", "where", "in " + r.cwd));
     if (r.targets) card.appendChild(el("div", "where", "touches " + r.targets));
+    for (const n of checkLines(r)) card.appendChild(n);
     const note = el("div", "note");
     const say = (text, kind) => { notes.set(r.id, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
     if (notes.has(r.id)) say(notes.get(r.id)[0], notes.get(r.id)[1]);
