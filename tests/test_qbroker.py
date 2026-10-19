@@ -49,9 +49,9 @@ class Key:
         return subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(self.path), "-n", namespace],
                               input=message, capture_output=True, check=True, timeout=30).stdout.decode()
 
-    def signer(self, namespaces=(ANSWER_NAMESPACE,)) -> dict:
-        return {"principal": self.path.name, "key_type": self.type, "key_b64": self.b64,
-                "namespaces": list(namespaces)}
+    def signer(self, namespaces=(ANSWER_NAMESPACE,), key_class="display-phone", custody="unstated") -> dict:
+        return {"principal": self.path.name, "key_type": self.type, "key_b64": self.b64, "key_class": key_class,
+                "custody": custody, "namespaces": list(namespaces)}
 
 
 @pytest.fixture(scope="module")
@@ -356,13 +356,36 @@ def test_a_signer_without_the_answer_namespace_is_refused(L, broker, keys):
     assert ask(broker, rid)["refused"] == "answer-refused"
 
 
-def test_an_allow_at_t3_is_refused_and_a_deny_is_not(L, broker, keys):
-    """The class gap (seam.SIGNER_CLASS): an allowed signer is held to a phone key's class, which never allows T3."""
+def test_a_t3_allow_needs_a_t3_class_signer_and_a_deny_does_not(L, broker, keys):
+    """CONTRACT c7 §3.7: each signer's key_class is the consent queue's; class_covers decides an allow."""
     rid = filed(broker, fields=hook_fields("t3", tier="T3"))
-    write_answer(L, rid, keys["operator"])
+    write_answer(L, rid, keys["operator"])                                       # display-phone
     assert ask(broker, rid)["refused"] == "answer-refused"
     write_answer(L, rid, keys["operator"], decision="deny")
     assert ask(broker, rid)["decision"] == "deny"
+    write_signers(L, keys, 2, [keys["operator"].signer(key_class="laptop-presence", custody="passphrase")])
+    write_answer(L, rid, keys["operator"])
+    assert ask(broker, rid)["decision"] == "allow"
+
+
+@pytest.mark.parametrize("change", [
+    {"key_class": None}, {"custody": None},                              # missing (None = drop the field)
+    {"key_class": "root"}, {"key_class": "T3"},                          # not a consent key class
+    {"custody": "vault"},                                                # not a consent custody
+    {"key_class": "laptop-presence", "custody": "unstated"},             # a laptop key must state its custody
+    {"custody": "passkey"},                                              # passkey needs an sk-ecdsa key
+    {"key_class": "laptop-presence", "custody": "fido-attested"},        # refused until attestation is built
+])
+def test_a_signer_entry_without_a_valid_class_and_custody_is_refused(L, keys, change):
+    entry = keys["operator"].signer()
+    for k, v in change.items():
+        if v is None:
+            del entry[k]
+        else:
+            entry[k] = v
+    write_signers(L, keys, 2, [entry])
+    src = SignersSource(L / "policy", L / "routes" / "trust.pub")
+    assert src.current() is None and src.problem
 
 
 def test_answer_refusal_names_why(L, broker, keys):
@@ -762,15 +785,11 @@ def test_a_snapshot_signed_in_the_dispatch_config_namespace_is_refused(L, broker
 def test_an_allowed_signer_reads_as_an_authority_key(L, keys):
     """The attributes levain.consent.queue's key check reads (key.active, key_class, custody, public_key,
     fingerprint), so the seam can hand a snapshot to it as its ``authority``."""
-    from levain.authority import DISPLAY_PHONE, PASSKEY, UNSTATED
+    write_signers(L, keys, 2, [keys["operator"].signer(key_class="laptop-presence", custody="passphrase")])
     snap = SignersSource(L / "policy", L / "routes" / "trust.pub").current()
     key = snap.key(keys["operator"].fp)
-    assert (key.active, key.key_class, key.custody) == (True, DISPLAY_PHONE, UNSTATED)
+    assert (key.active, key.key_class, key.custody) == (True, "laptop-presence", "passphrase")   # as signed
     assert key.fingerprint == keys["operator"].fp and key.public_key.startswith("ssh-ed25519 ")
-    from levain.qbroker.signers import AllowedSigner
-    sk = AllowedSigner(principal="p", public_key="sk-ecdsa-sha2-nistp256@openssh.com AAAA", fingerprint="SHA256:x",
-                       namespaces=frozenset({"levain-consent-answer"}))
-    assert sk.custody == PASSKEY
 
 
 @pytest.mark.parametrize("digest", ["c" * 64, "sha256:" + "C" * 64, "sha256:" + "c" * 63, "sha1:" + "c" * 40, 7])

@@ -2,19 +2,16 @@
 
 :func:`answer_refusal` is the one check every ``ANSWER?`` passes. It must be the consent queue's own answer check
 (``ConsentQueue._refusal`` in ``levain/consent/queue.py``) applied to the broker's row. That check is not
-reachable as a pure function today: it is a private method of a queue bound to its cockpit authority log, and its
-signer step reads an :class:`levain.authority.AuthoritySnapshot` key (``active``, ``key_class``, ``custody``) that a
-``levain-allowed-signers/1`` entry does not carry. So this module composes the
-smallest pure pieces that check itself calls (the sealed request and its digest, ``answer_message``,
-``head_problem``, ``parse_stamp``, ``class_covers``, the passkey check, ``verify_link_sig``), and
-the field comparisons between them restate that check's one for one (they cannot be called apart from it).
-The differences:
+reachable as a pure function today: it is a private method of a queue bound to its cockpit authority log. So this
+module composes the smallest pure pieces that check itself calls (the sealed request and its digest,
+``answer_message``, ``head_problem``, ``parse_stamp``, ``class_covers``, the passkey check, ``verify_link_sig``),
+and the field comparisons between them restate that check's one for one (they cannot be called apart from it).
+The signer is a :class:`levain.qbroker.signers.AllowedSigner`, read through the same attributes as the queue's
+authority key (``active``, ``key_class``, ``custody``, ``public_key``, ``fingerprint``; CONTRACT c7 §3.7), so the
+tier rule (``class_covers``) and the passkey custody check are the queue's. The differences:
 
-- key class: an allowed signer has no class, so every signer is held to :data:`SIGNER_CLASS`, the lowest class
-  that may allow at all (a phone key's). An allow at a tier that class does not cover (T3) is refused.
-- custody: an allowed signer declares none, so an ``sk-ecdsa`` key is held to the passkey checks
-  (:func:`levain.consent.passkey.answer_signature_problem`), so an sk-ecdsa key that is not a passkey is refused;
-  an sk-ed25519 key gets only the presence check ``verify_link_sig`` makes.
+- namespaces: a snapshot signer lists the namespaces it may sign in, checked here; the queue's check has no such
+  step.
 - receipts head: a broker request has no receipt log, so the head is checked for its shape only (what the queue's
   own check does; the apply-time ``head_refusal`` has no log to read here).
 
@@ -32,9 +29,9 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import _ANSWER_KEYS, class_covers
 from levain.consent.receipt_log import head_problem
 from levain.consent.record import ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message
-from levain.qbroker.signers import SIGNER_CLASS, SignersSnapshot
+from levain.qbroker.signers import SignersSnapshot
 
-__all__ = ["SIGNER_CLASS", "answer_refusal", "request_of"]
+__all__ = ["answer_refusal", "request_of"]
 
 _REQUEST_KEYS = frozenset(ExternalGateRequest.__dataclass_fields__)
 
@@ -100,7 +97,7 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
     if not signer.active:
         return "the signer is not active"
     if decision == "allow" and not class_covers(signer.key_class, request.tier):
-        return f"an allowed signer (held to class {signer.key_class}) does not cover {request.tier}"
+        return f"key class {signer.key_class} does not cover {request.tier}"
     if not isinstance(signature, str) or not signature:
         return "the answer carries no signature"
     if signer.custody == PASSKEY:

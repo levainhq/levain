@@ -1,9 +1,10 @@
-"""levain.qbroker.signers — the answer-signer snapshot (CONTRACT c6 §3.7), verified before any answer is.
+"""levain.qbroker.signers — the answer-signer snapshot (CONTRACT c7 §3.7), verified before any answer is.
 
 ``L/policy/allowed_signers.json`` is the canonical ``levain-allowed-signers/1`` record ``{generation, issued_at,
-signers: [{principal, key_type, key_b64, namespaces}]}``; ``allowed_signers.json.sig`` is an SSHSIG over its bytes
-by the dispatch trust root (``L/routes/trust.pub``) in its own namespace, :data:`SIGNERS_NAMESPACE` (never a config
-item's). :class:`SignersSource` re-verifies the pair whenever any of the three files changes or the last try could
+signers: [{principal, key_type, key_b64, key_class, custody, namespaces}]}`` (``key_class`` and ``custody`` checked
+by the consent authority's own rules: a class it ranks, a custody ``custody_problem`` admits for that class and key
+type); ``allowed_signers.json.sig`` is an SSHSIG over its bytes by the dispatch trust root (``L/routes/trust.pub``)
+in its own namespace, :data:`SIGNERS_NAMESPACE` (never a config item's). :class:`SignersSource` re-verifies the pair whenever any of the three files changes or the last try could
 not run the verifier, and accepts a generation only when it is strictly greater than the last it accepted (the same
 bytes read again are not a change). While the pair is missing, unverifiable or a rollback, :meth:`SignersSource.current` returns ``None`` and
 every answer is refused (fail closed).
@@ -22,20 +23,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from levain.authority import DISPLAY_PHONE, PASSKEY, UNSTATED, VerifierUnavailable, verify_link_sig
+from levain.authority import VerifierUnavailable, custody_problem, verify_link_sig
+from levain.cockpit.firejournal import _CLASS_RANK
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.contracts.keys import fingerprint_line
 
-__all__ = ["SIGNER_CLASS", "SIGNERS_FORMAT", "SIGNERS_NAMESPACE", "AllowedSigner", "SignersSnapshot",
+__all__ = ["SIGNERS_FORMAT", "SIGNERS_NAMESPACE", "AllowedSigner", "SignersSnapshot",
            "SignersSource", "load"]
 
 SIGNERS_NAMESPACE = "levain-allowed-signers"
-# an allowed signer carries no class: every one is held to the lowest class that may allow at all (a phone key's)
-SIGNER_CLASS = DISPLAY_PHONE
 SIGNERS_FORMAT = "levain-allowed-signers/1"
 _KEYS = frozenset({"format", "generation", "issued_at", "signers"})
-_SIGNER_KEYS = frozenset({"principal", "key_type", "key_b64", "namespaces"})
+# CONTRACT c7 §3.7: key_class + custody as the consent queue's authority defines them, signed with the rest
+_SIGNER_KEYS = frozenset({"principal", "key_type", "key_b64", "key_class", "custody", "namespaces"})
 # a signers file is a handful of public keys; a signature is under a kilobyte (a passkey's, a few)
 _MAX_FILE = 256 * 1024
 
@@ -51,21 +52,13 @@ class AllowedSigner:
     principal: str
     public_key: str
     fingerprint: str
+    key_class: str
+    custody: str
     namespaces: frozenset[str]
 
     @property
     def active(self) -> bool:
         return True               # a removed signer is absent from the snapshot, never listed inactive
-
-    @property
-    def key_class(self) -> str:
-        return SIGNER_CLASS
-
-    @property
-    def custody(self) -> str:
-        # an allowed signer declares no custody; an sk-ecdsa key is held to the passkey checks, every other key
-        # gets only the presence check verify_link_sig makes
-        return PASSKEY if self.public_key.startswith("sk-ecdsa") else UNSTATED
 
 
 @dataclass(frozen=True)
@@ -94,8 +87,11 @@ def _read_regular(path: Path) -> bytes:
 
 def _signer(entry: Any) -> AllowedSigner:
     if not isinstance(entry, dict) or set(entry) != _SIGNER_KEYS:
-        raise SignersError("a signer is not a {principal, key_type, key_b64, namespaces} record")
+        raise SignersError("a signer is not a {principal, key_type, key_b64, key_class, custody, namespaces} record")
     principal, key_type, key_b64, spaces = (entry[k] for k in ("principal", "key_type", "key_b64", "namespaces"))
+    key_class, custody = entry["key_class"], entry["custody"]
+    if not isinstance(key_class, str) or key_class not in _CLASS_RANK:
+        raise SignersError(f"a signer's key_class {str(key_class)[:40]!r} is not one of {', '.join(_CLASS_RANK)}")
     if not all(isinstance(v, str) and v and v.isprintable() and " " not in v for v in (principal, key_type, key_b64)):
         raise SignersError("a signer's principal, key_type and key_b64 are non-empty words")
     if not isinstance(spaces, list) or not spaces or not all(isinstance(s, str) and s for s in spaces):
@@ -105,7 +101,12 @@ def _signer(entry: Any) -> AllowedSigner:
         fp = fingerprint_line(public_key)
     except ContractError as exc:
         raise SignersError(f"a signer's key does not parse: {exc}") from None
-    return AllowedSigner(principal=principal, public_key=public_key, fingerprint=fp, namespaces=frozenset(spaces))
+    # the authority's enrol rule for a declared custody (a snapshot entry is never a carried legacy key)
+    problem = custody_problem(key_class, custody, key_type)
+    if problem is not None:
+        raise SignersError(f"a signer's custody: {problem}")
+    return AllowedSigner(principal=principal, public_key=public_key, fingerprint=fp, key_class=key_class,
+                         custody=custody, namespaces=frozenset(spaces))
 
 
 def load(policy_dir: Path, trust_pub: Path, *, ssh_keygen: Path | str | None = None) -> SignersSnapshot:
