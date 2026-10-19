@@ -50,19 +50,7 @@ self.addEventListener('notificationclick', (e) => {
   // a cross-origin (or unparseable) url is never opened: the push body is the server's, the tap is the page's
   if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
   const url = u.href;
-  e.waitUntil((async () => {
-    try {
-      const token = await kv('readonly', (s) => s.get('token'));
-      if (data.ping !== undefined) {
-        const r = await fetch('/webpush/opened', {
-          method: 'POST',
-          headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { 'X-Levain-Phone-Token': token } : {}),
-          body: JSON.stringify({ ping: data.ping }),
-        });
-        // a refused credential (revoked device): stop sending it; the page hands a fresh one over after re-pairing
-        if (r.status === 403) await kv('readwrite', (s) => s.delete('token'));
-      }
-    } catch (_) { /* the open is a record, never a reason to skip opening the page */ }
+  const open = (async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of all) {
       if (new URL(c.url).origin === self.location.origin) {
@@ -72,5 +60,23 @@ self.addEventListener('notificationclick', (e) => {
       }
     }
     await self.clients.openWindow(url);
-  })());
+  })();
+  // the open is a record, never a reason to wait on the network or to skip opening the page
+  const record = (async () => {
+    if (data.ping === undefined) return;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    try {
+      const token = await kv('readonly', (s) => s.get('token'));
+      const r = await fetch('/webpush/opened', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { 'X-Levain-Phone-Token': token } : {}),
+        body: JSON.stringify({ ping: data.ping }),
+        signal: ctl.signal,
+      });
+      // a refused credential (revoked device): stop sending it; the page hands a fresh one over after re-pairing
+      if (r.status === 403) await kv('readwrite', (s) => s.delete('token'));
+    } catch (_) { /* best effort */ } finally { clearTimeout(timer); }
+  })();
+  e.waitUntil(Promise.allSettled([open, record]));
 });

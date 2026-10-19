@@ -76,17 +76,22 @@ def ensure_keys(queue_dir: Path | str, sub: str | None = None, *, rotate: bool =
 
 
 def authorization(queue_dir: Path | str, endpoint: str) -> dict[str, str]:
-    """The VAPID ``Authorization`` header for ``endpoint``, reusing the stored token for its origin."""
-    key, public, sub = ensure_keys(queue_dir)
+    """The VAPID ``Authorization`` header for ``endpoint``, reusing the stored token for its origin. The key, the
+    contact and the cached token are read in one transaction, and a cached token names the public key it was
+    signed for: one signed for another key is never reused."""
+    ensure_keys(queue_dir)
     store = PushStore(queue_dir)
     aud = ece.vapid_aud(endpoint)
     now = int(time.time())
     with store.write() as c:
+        kr = c.execute("SELECT private_der, public_b64, sub FROM vapid WHERE id = 1").fetchone()
+        key = serialization.load_der_private_key(bytes(kr["private_der"]), None)
+        public = kr["public_b64"]
         row = c.execute("SELECT jwt, exp FROM vapid_tokens WHERE aud = ?", (aud,)).fetchone()
-        if row is not None and row["exp"] - now >= _REUSE_FOR:
-            return {"Authorization": f"vapid t={row['jwt']}, k={public}"}
-        header = ece.vapid_headers(key, endpoint, sub, _now=now)["Authorization"]
+        if row is not None and row["exp"] - now >= _REUSE_FOR and row["jwt"].startswith(public + ":"):
+            return {"Authorization": f"vapid t={row['jwt'][len(public) + 1:]}, k={public}"}
+        header = ece.vapid_headers(key, endpoint, kr["sub"], _now=now)["Authorization"]
         jwt = header.split("t=", 1)[1].split(",", 1)[0]
         c.execute("INSERT OR REPLACE INTO vapid_tokens (aud, jwt, exp) VALUES (?,?,?)",
-                  (aud, jwt, now + ece.VAPID_LIFETIME))
+                  (aud, f"{public}:{jwt}", now + ece.VAPID_LIFETIME))
         return {"Authorization": header}

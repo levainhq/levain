@@ -30,10 +30,10 @@ _REQUEST_WORDS = {
 
 
 def outcome_of(queue_dir: Path, ref: Any, *, _queue: Any = None, _questions: Any = None) -> dict[str, Any]:
-    """``{"state", "words", "via"}`` for one ping's ref, read now. ``state`` is the queue's own word (or ``answered`` /
+    """``{"state", "words"}`` for one ping's ref, read now. ``state`` is the queue's own word (or ``answered`` /
     ``open`` for a question, ``none`` when the ping names nothing, ``unread`` when the store could not be read)."""
     if not isinstance(ref, str) or ":" not in ref:
-        return {"state": "none", "words": "nothing to follow up", "via": None}
+        return {"state": "none", "words": "nothing to follow up"}
     kind, _, key = ref.partition(":")
     try:
         if kind == "request":
@@ -43,13 +43,9 @@ def outcome_of(queue_dir: Path, ref: Any, *, _queue: Any = None, _questions: Any
                 _queue = ConsentQueue(queue_dir, authority=authority_source(queue_dir, anchor=None))
             got = _queue.get(key)
             if got is None:
-                return {"state": "gone", "words": "no longer in the queue", "via": None}
-            request, state = got
-            via = getattr(request, "via", None)
-            words = _REQUEST_WORDS.get(state, state)
-            if state in ("allowed", "denied") and via:
-                words = f"{words} ({'by passkey or terminal answer' if via == 'signature' else 'by a standing grant' if via == 'grant' else 'by a late ruling'})"
-            return {"state": state, "words": words, "via": via}
+                return {"state": "gone", "words": "no longer in the queue"}
+            _request, state = got
+            return {"state": state, "words": _REQUEST_WORDS.get(state, state)}
         if kind == "question":
             if _questions is None:
                 from levain.consent.questions import QuestionStore
@@ -57,13 +53,13 @@ def outcome_of(queue_dir: Path, ref: Any, *, _queue: Any = None, _questions: Any
                 _questions = QuestionStore(queue_dir)
             q = _questions.get(int(key)) if key.isdigit() else None
             if q is None:
-                return {"state": "gone", "words": "no such question", "via": None}
+                return {"state": "gone", "words": "no such question"}
             if q.answer is None:
-                return {"state": "open", "words": "not answered yet", "via": None}
-            return {"state": "answered", "words": f"answered from the {q.answer.channel}", "via": q.answer.channel}
+                return {"state": "open", "words": "not answered yet"}
+            return {"state": "answered", "words": f"answered from the {q.answer.channel}"}
     except Exception as exc:  # noqa: BLE001 - an unread store is said, never drawn as an outcome
-        return {"state": "unread", "words": f"outcome could not be read: {type(exc).__name__}", "via": None}
-    return {"state": "none", "words": "nothing to follow up", "via": None}
+        return {"state": "unread", "words": f"outcome could not be read: {type(exc).__name__}"}
+    return {"state": "none", "words": "nothing to follow up"}
 
 
 def record(queue_dir: Path, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

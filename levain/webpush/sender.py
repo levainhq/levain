@@ -8,19 +8,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import site
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 from levain.webpush import ece, vapid
 from levain.webpush.store import PushStore
 
-TIMEOUT = 10.0
+TIMEOUT = 6.0            # per socket operation: connect and read each, so one request ends well inside the budget
 WALL_BUDGET = 20.0       # one dead push service never holds the rest of a send longer than this
-MAX_WORKERS = 8
+UNKNOWN = -1             # a delivery not finished by the budget: unknown, never "corrected" by a late answer
 TTL = "3600"
 # serialized-byte budgets for the fields around the body, so even a title of control characters (six bytes each
 # once JSON escapes them) leaves the body room inside ece.MAX_PLAINTEXT
@@ -110,7 +113,7 @@ def _post(req: urllib.request.Request) -> int:
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> list[tuple[int, int]]:
     """Record the ping, push it to each live subscription concurrently; returns (subscription id, HTTP status)
-    pairs (status 0: no answer, or none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription. Every
+    pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription. Every
     store write happens in this thread; the workers only talk to the push services."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
@@ -120,25 +123,33 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
     statuses: dict[int, int] = {}
-    if any(r is not None for _, r in reqs):
-        pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-        try:
-            futures = {pool.submit(_post, r): sub["id"] for sub, r in reqs if r is not None}
-            done, _pending = wait(futures, timeout=WALL_BUDGET)
-            for fut in done:
-                statuses[futures[fut]] = fut.result()
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+
+    def work(sid: int, req: urllib.request.Request) -> None:
+        statuses[sid] = _post(req)
+
+    # one daemon thread per live subscription (the store caps them at MAX_SUBSCRIPTIONS), so every send starts
+    # at once and an unfinished one never holds the process past the budget
+    workers = [threading.Thread(target=work, args=(sub["id"], r), daemon=True) for sub, r in reqs if r is not None]
+    deadline = time.monotonic() + WALL_BUDGET
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join(max(0.0, deadline - time.monotonic()))
+    answered = dict(statuses)   # one snapshot: an answer after the budget is never written
     results: list[tuple[int, int]] = []
-    for sub, _r in reqs:
-        status = statuses.get(sub["id"], 0)
-        store.add_delivery(ping_id, sub["id"], status, retire=status in (404, 410))
+    for sub, r in reqs:
+        if r is None:   # bad stored keys or an endpoint off the allowlist: no later ping fares better
+            status, retire = 0, True
+        else:
+            status = answered.get(sub["id"], UNKNOWN)
+            retire = status in (404, 410)
+        store.add_delivery(ping_id, sub["id"], status, retire=retire)
         results.append((sub["id"], status))
     return results
 
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/") -> bool:
-    """Start :func:`send` detached, never waited on, in the queue directory. The text goes to the child on its
+    """Start :func:`send` detached, never waited on. The text goes to the child on its
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
     table. True when the child started."""
     from levain.launch import child_env
@@ -148,10 +159,14 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
     while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
         fields["body"] = fields["body"][: len(fields["body"]) // 2]
         data = json.dumps(fields).encode("utf-8", "replace")
-    argv = [sys.executable, "-m", "levain.webpush", "send", "--queue-dir", str(queue_dir), "--kind", kind]
+    argv = [sys.executable, "-P", "-m", "levain.webpush", "send", "--queue-dir", str(queue_dir), "--kind", kind]
+    env = child_env()
+    root = str(Path(__file__).resolve().parents[2])   # a source checkout: -P leaves the child no other way to import levain
+    if not any(root == str(Path(d).resolve()) for d in site.getsitepackages() + [site.getusersitepackages()]):
+        env["PYTHONPATH"] = root
     try:
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True, close_fds=True, env=child_env(), cwd=str(queue_dir))
+                                 start_new_session=True, close_fds=True, env=env, cwd=os.sep)
         try:
             child.stdin.write(data)
         finally:
