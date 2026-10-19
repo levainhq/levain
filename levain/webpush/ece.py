@@ -20,7 +20,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 RECORD_SIZE = 4096
 _TAG = 16
-_MAX_DATA = RECORD_SIZE - _TAG - 1   # one padding-delimiter byte
+_HEADER = 16 + 4 + 1 + 65            # salt, record size, key-id length, the sender's 65-byte public point = 86
+# RFC 8030 section 7.2: a push service accepts a request body of 4096 bytes. The body is the header plus one
+# ciphertext record (plaintext + one delimiter byte + the 16-byte tag), so the plaintext ceiling follows.
+MAX_REQUEST_BODY = 4096
+MAX_PLAINTEXT = MAX_REQUEST_BODY - _HEADER - _TAG - 1   # 3993
 VAPID_LIFETIME = 12 * 3600           # RFC 8292 caps a JWT at 24 h; half that leaves room for clock skew
 
 
@@ -48,8 +52,8 @@ def encrypt(plaintext: bytes, ua_public: bytes, auth_secret: bytes, *, _salt: by
     """The request body for one push message to the user agent holding ``ua_public`` (65-byte point) and
     ``auth_secret`` (16 bytes). ``_salt`` and ``_sender`` are a seam for the RFC's worked example only: a real
     send draws a fresh salt and a fresh ephemeral key every time."""
-    if len(plaintext) > _MAX_DATA:
-        raise ValueError(f"payload of {len(plaintext)} bytes does not fit one record ({_MAX_DATA})")
+    if len(plaintext) > MAX_PLAINTEXT:
+        raise ValueError(f"payload of {len(plaintext)} bytes does not fit one push request ({MAX_PLAINTEXT})")
     if len(auth_secret) != 16:
         raise ValueError("the auth secret must be 16 bytes")
     peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_public)   # refuses a point off the curve
@@ -66,13 +70,21 @@ def encrypt(plaintext: bytes, ua_public: bytes, auth_secret: bytes, *, _salt: by
     return salt + struct.pack(">IB", RECORD_SIZE, len(as_public)) + as_public + record
 
 
+def vapid_aud(endpoint: str) -> str:
+    """The VAPID ``aud`` of ``endpoint``: ``https://`` + the lowercase host, and the port only when it is not 443.
+    The one place it is built; the JWT claim and the token cache key both come from here."""
+    parts = urlsplit(endpoint)
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        raise ValueError("a push endpoint is an https URL")
+    port = parts.port
+    host = parts.hostname.lower()
+    return f"https://{host}" if port in (None, 443) else f"https://{host}:{port}"
+
+
 def vapid_headers(key: ec.EllipticCurvePrivateKey, endpoint: str, sub: str, *, _now: float | None = None) -> dict[str, str]:
     """The ``Authorization`` header for a push to ``endpoint`` (RFC 8292 scheme ``vapid``). ``aud`` is the
     endpoint's origin; ``sub`` is the contact claim."""
-    parts = urlsplit(endpoint)
-    if parts.scheme != "https" or not parts.hostname:
-        raise ValueError("a push endpoint is an https URL")
-    aud = f"https://{parts.netloc}"
+    aud = vapid_aud(endpoint)
     now = time.time() if _now is None else _now
     head = b64e(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
     claims = b64e(json.dumps({"aud": aud, "exp": int(now) + VAPID_LIFETIME, "sub": sub},

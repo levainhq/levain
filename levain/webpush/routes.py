@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -25,12 +25,13 @@ _STATIC_FILES = {
     "/app.webmanifest": ("app.webmanifest", "application/manifest+json"),
     "/icon-192.png": ("icon-192.png", "image/png"),
     "/icon-512.png": ("icon-512.png", "image/png"),
+    "/badge-96.png": ("badge-96.png", "image/png"),
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
 MAX_BODY = 8192
 MAX_ENDPOINT = 2048
 _PAIR_CODE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+_HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 JSON = "application/json"
 
 
@@ -42,34 +43,45 @@ def _err(status: int, code: str, message: str) -> tuple[int, bytes, str]:
     return _json(status, {"error": code, "message": message})
 
 
-def public_dns_host(host: str) -> bool:
-    """A DNS name with at least two labels: no IP literal (v4, v6 or numeric), no ``localhost`` or single-label
-    name. The stored endpoint is later POSTed to, so a loopback or private address is refused here."""
-    host = host.lower().rstrip(".")
-    if not host or len(host) > 253 or ":" in host:
-        return False
-    labels = host.split(".")
-    if len(labels) < 2 or not all(_LABEL.match(x) for x in labels):
-        return False
-    if labels[-1].isdigit() or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
-        return False
-    return True
+# The push services a browser subscribes through today: FCM (Chrome, Edge-on-Android, Brave, Samsung, Opera),
+# Mozilla autopush (Firefox), Apple (Safari, installed web apps) and WNS (Edge on Windows). A host is accepted by
+# NAME, never by shape: a lexical "looks public" test passes ``127.0.0.1.nip.io`` and ``0x7f.0x1``, which resolve to
+# loopback, and a stored endpoint is later POSTed to from the operator's machine.
+PUSH_HOST_SUFFIXES = ("fcm.googleapis.com", "push.apple.com", "push.services.mozilla.com", "notify.windows.com")
+MAX_INT = 2**63
+
+
+def push_service_host(host: str) -> bool:
+    """True when ``host`` is one of :data:`PUSH_HOST_SUFFIXES` or a subdomain of one (``web.push.apple.com``,
+    ``wns2-par02p.notify.windows.com``). The caller has lowercased it."""
+    return bool(_HOST.match(host)) and any(host == s or host.endswith("." + s) for s in PUSH_HOST_SUFFIXES)
 
 
 def valid_endpoint(endpoint: object) -> str | None:
-    """The endpoint when it is an https URL on a public DNS host with no credentials, else None."""
+    """The normalised endpoint (lowercase scheme and host) when it is an https URL on a known push service with no
+    credentials, port, whitespace or control character, else None. Checked again at send time."""
     if not isinstance(endpoint, str) or not endpoint or len(endpoint) > MAX_ENDPOINT or not endpoint.isascii():
+        return None
+    if any(c.isspace() or ord(c) < 33 or ord(c) == 127 or c == "\\" for c in endpoint):
         return None
     try:
         parts = urlsplit(endpoint)
         port = parts.port
+        host = parts.hostname
     except ValueError:
         return None
-    if parts.scheme != "https" or parts.username or parts.password or parts.fragment:
+    if parts.scheme != "https" or parts.username or parts.password or parts.fragment or "@" in parts.netloc:
         return None
-    if port not in (None, 443) or not parts.hostname or not public_dns_host(parts.hostname):
+    if port not in (None, 443) or not host or not push_service_host(host.lower()):
         return None
-    return endpoint
+    return urlunsplit(("https", host.lower(), parts.path, parts.query, ""))
+
+
+def _int(value: object) -> int | None:
+    """``value`` when it is an integer in 1 .. 2**63 - 1 (not a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < MAX_INT:
+        return None
+    return value
 
 
 def _body_json(body: bytes) -> dict | None:
@@ -77,7 +89,7 @@ def _body_json(body: bytes) -> dict | None:
         return None
     try:
         obj = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     return obj if isinstance(obj, dict) else None
 
@@ -115,7 +127,9 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         _, public, _sub = vapid.ensure_keys(queue_dir)
         return _json(200, {"key": public})
     if method == "GET" and path == "/webpush/record":
-        return _json(200, {"pings": store.record(100)})
+        from levain.webpush import record as rec
+
+        return _json(200, {"pings": rec.record(Path(queue_dir), store.record(limit=rec.SHOWN))})
     if method == "POST" and path == "/webpush/pair":
         obj = _body_json(body) or {}
         conn = store.connection()
@@ -129,7 +143,7 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         keys = obj.get("keys") if obj else None
         endpoint = valid_endpoint(obj.get("endpoint")) if obj else None
         if endpoint is None:
-            return _err(400, "bad_endpoint", "the endpoint must be an https URL on a public DNS host")
+            return _err(400, "bad_endpoint", "the endpoint must be an https URL on a known push service")
         try:
             p256dh, auth = keys["p256dh"], keys["auth"]
             ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ece.b64d(p256dh))
@@ -142,12 +156,12 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         obj = _body_json(body)
         endpoint = valid_endpoint(obj.get("endpoint")) if obj else None
         if endpoint is None:
-            return _err(400, "bad_endpoint", "the endpoint must be an https URL on a public DNS host")
+            return _err(400, "bad_endpoint", "the endpoint must be an https URL on a known push service")
         return _json(200, {"retired": store.retire_subscription(endpoint)})
     if method == "POST" and path == "/webpush/opened":
         obj = _body_json(body)
-        ping = obj.get("ping") if obj else None
-        if not isinstance(ping, int) or isinstance(ping, bool):
+        ping = _int(obj.get("ping")) if obj else None
+        if ping is None:
             return _err(400, "bad_ping", "ping must be an integer id")
         return _json(200, {"recorded": store.add_open(ping, device_id)})
     return _err(404, "not_found", "no such push path")

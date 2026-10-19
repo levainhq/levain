@@ -37,7 +37,7 @@ self.addEventListener('push', (e) => {
     tag: d.tag || 'levain',
     renotify: true,
     icon: '/icon-192.png',
-    badge: '/icon-192.png',
+    badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
     data: { url: d.url || '/', ping: d.ping },
   }));
 });
@@ -45,16 +45,22 @@ self.addEventListener('push', (e) => {
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   const data = e.notification.data || {};
-  const url = new URL(data.url || '/', self.location.origin).href;
+  let u;
+  try { u = new URL(data.url || '/', self.location.origin); } catch (_) { u = null; }
+  // a cross-origin (or unparseable) url is never opened: the push body is the server's, the tap is the page's
+  if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
+  const url = u.href;
   e.waitUntil((async () => {
     try {
       const token = await kv('readonly', (s) => s.get('token'));
       if (data.ping !== undefined) {
-        await fetch('/webpush/opened', {
+        const r = await fetch('/webpush/opened', {
           method: 'POST',
           headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { 'X-Levain-Phone-Token': token } : {}),
           body: JSON.stringify({ ping: data.ping }),
         });
+        // a refused credential (revoked device): stop sending it; the page hands a fresh one over after re-pairing
+        if (r.status === 403) await kv('readwrite', (s) => s.delete('token'));
       }
     } catch (_) { /* the open is a record, never a reason to skip opening the page */ }
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
