@@ -17,6 +17,10 @@ it serves only these:
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
     as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
+  - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
+    ``POST /question/<n>/answer`` answers one by an option key or free text, once. An answer is UNSIGNED (no
+    passkey) and authorises NOTHING: it is words the agent is told; it is then delivered to the agent's session
+    on its own thread (:func:`levain.consent.band.deliver_answer`), as a ruling is.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
 token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
@@ -59,6 +63,7 @@ _STATIC = {"/": ("phone.html", "text/html; charset=utf-8"),
 _CONSENT_PREFIX = "/consent/"
 _CONSENT_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")      # the cockpit's consent-body id shape
 _ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
+_QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/answer")
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
@@ -157,7 +162,8 @@ class _PhoneHandler(GuardedHandler):
         route = self.path.split("?", 1)[0]
         consent = _consent_route(route)
         sign = _sign_route(route)
-        if consent is None and sign is None and route != _KEY_LINE:
+        question = _QUESTION_ROUTE.fullmatch(route)
+        if consent is None and sign is None and question is None and route != _KEY_LINE:
             self._reject(404, "not_found", "no such route")
             return
         if not self._token_ok():
@@ -185,6 +191,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.answer_step(consent[0], consent[1], req)
             elif sign is not None:
                 result = self.server.sign_step(sign[0], sign[1], req)
+            elif question is not None:
+                result = self.server.question_answer(int(question.group(1)), req)
             else:
                 result = self.server.key_line(req)
         except PhoneError as exc:
@@ -304,9 +312,76 @@ class _PhoneServer(ThreadingHTTPServer):
                 sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
-        return {"rp_id": self.rp_id, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
+        questions, questions_overflow = self._questions()
+        return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow}
+
+    def _questions(self) -> "tuple[list[dict[str, Any]], int]":
+        """The open questions (oldest first, capped like the pending list) and how many were left out. A queue with
+        no ``questions.db`` lists none and creates none; a store that cannot be read lists none."""
+        from levain.consent.listing import PENDING_CAP
+        from levain.consent.questions import QuestionStore, QuestionStoreError
+
+        try:
+            open_ = QuestionStore(self.queue_dir).open_questions()
+        except (QuestionStoreError, OSError, sqlite3.Error):
+            return [], 0
+        rows = [{"n": q.n, "id": q.id, "agent": q.agent, "what": q.what,
+                 "options": [{"key": k, "label": label} for k, label in q.options], "rec": q.rec, "blocks": q.blocks,
+                 "filed_at": q.filed_at} for q in open_[:PENDING_CAP]]
+        return rows, max(len(open_) - PENDING_CAP, 0)
+
+    def question_answer(self, n: int, req: Any) -> dict[str, Any]:
+        """``POST /question/<n>/answer`` ({option} or {text}): record the answer (unsigned, once), then deliver it
+        to the agent's session on its own thread. Nothing here authorises anything."""
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.questions import QuestionStore, QuestionStoreError
+
+        if (not isinstance(req, dict) or len(req) != 1 or not set(req) <= {"option", "text"}
+                or not isinstance(next(iter(req.values())), str)):
+            raise PhoneError(400, "bad_request", 'send exactly one of {"option": key} or {"text": words}')
+        store = QuestionStore(self.queue_dir)
+        try:
+            q = store.get(n)
+            if q is None:
+                raise PhoneError(404, "not_found", f"no question #{n}")
+            if q.answer is not None:
+                raise PhoneError(409, "conflict", f"question #{n} was already answered")
+            try:
+                store.answer(q.id, channel="phone", **req)
+            except ConsentError as exc:
+                raise PhoneError(409 if "already answered" in str(exc) else 422, "answer_refused", str(exc)) from None
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            raise PhoneError(503, "unavailable", f"the question store cannot answer now: {exc}") from None
+        return {"answered": q.n, "delivery": {"route": "pending", "reason": "delivery is running"},
+                _AWAIT: self._deliver_answer_later(store, q.id)}
+
+    def _deliver_answer_later(self, store: Any, question_id: str) -> Any:
+        """As :meth:`_deliver_later`, for a question's answer (:func:`levain.consent.band.deliver_answer`)."""
+        from levain.consent import band
+
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                d = band.deliver_answer(store, question_id)
+                box["d"] = {"route": d.route, "reason": d.reason}
+            except Exception as exc:  # noqa: BLE001 - the answer stands; `levain question deliver` retries it
+                box["d"] = {"route": "failed", "reason": f"delivery raised {type(exc).__name__}; the answer stands: "
+                                                         "`levain question deliver` delivers it"}
+            finally:
+                done.set()
+
+        threading.Thread(target=run, name="levain-answer-delivery", daemon=True).start()
+
+        def wait(timeout: float) -> dict[str, Any]:
+            if done.wait(timeout):
+                return box["d"]
+            return {"route": "pending", "reason": "delivery is still running; the ping says where it lands"}
+
+        return wait
 
     def _sign_keys(self) -> "dict[str, Any]":
         """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook

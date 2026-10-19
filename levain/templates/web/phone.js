@@ -54,10 +54,13 @@
     const gaps = Array.isArray(data.undecided) ? data.undecided : [];
     // statements a caller filed for this phone's passkey to sign (`levain consent phone --sign-namespace`)
     const signs = Array.isArray(data.sign_pending) ? data.sign_pending : [];
-    const waiting = rows.length + gaps.length + signs.length;
-    const unread = Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "";
+    // questions an agent filed: answered by a tap or words, unsigned (an answer authorises nothing)
+    const asks = Array.isArray(data.questions) ? data.questions : [];
+    const waiting = rows.length + gaps.length + signs.length + asks.length;
+    const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
+      + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "");
     $("status").textContent = (waiting ? waiting + " waiting on you" : "nothing is waiting on you") + unread + (last ? " \u00b7 last: " + last : "");
-    list.replaceChildren(...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
+    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
                          ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
@@ -70,6 +73,54 @@
         ? "a passkey is enrolled for " + rpId + ", not one this browser made. Make one here if this phone has none."
         : "no passkey is enrolled for " + rpId + " yet. Make one here, then enrol it from the laptop.";
     if (!usable) $("status").textContent += " · this browser cannot use a passkey here (needs https)";
+  }
+
+  // a question: text only (never HTML) for everything the agent wrote. No passkey: the answer is unsigned and
+  // authorises nothing; the server records it once and delivers it to the agent's session
+  function questionCard(q) {
+    const card = el("article", "req ask");
+    const head = el("div", "req-head");
+    head.append(el("span", "tool", "question #" + q.n), el("span", "tier", "ask"), el("span", "meta", q.agent || ""));
+    card.append(head, el("pre", "display", typeof q.what === "string" ? q.what : ""));
+    card.appendChild(el("div", "where", "blocks: " + (q.blocks || "")));
+    const key = "ask\u0000" + q.id;   // never a consent id
+    const note = el("div", "note");
+    const say = (text, kind) => { notes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
+    const actions = el("div", "actions");
+    const buttons = [];
+    const send = (body) => {
+      if (busy) return;
+      busy++;
+      buttons.forEach((b) => { b.disabled = true; });
+      say("sending the answer\u2026");
+      call("POST", "/question/" + encodeURIComponent(q.n) + "/answer", body).then((a) => {
+        if (!a.ok) { buttons.forEach((b) => { b.disabled = false; }); return say("not answered: " + why(a), "bad"); }
+        last = "answered question #" + q.n;
+        const d = a.body.delivery || {};
+        say("answered \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""), d.route === "failed" || d.route === "none" ? "bad" : "ok");
+      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"); })
+        .finally(() => { busy--; setTimeout(load, 1500); });
+    };
+    for (const o of (Array.isArray(q.options) ? q.options : [])) {
+      const b = el("button", o.key === q.rec ? "allow" : "quiet", o.label + " (" + o.key + ")" + (o.key === q.rec ? " (rec)" : ""));
+      b.type = "button";
+      b.addEventListener("click", () => send({ option: o.key }));
+      buttons.push(b);
+      actions.appendChild(b);
+    }
+    const words = el("textarea", "words");
+    words.rows = 2;
+    words.maxLength = 4000;
+    words.placeholder = "or your own words";
+    const go = el("button", "quiet", "Send words");
+    go.type = "button";
+    go.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); else say("write something first", "bad"); });
+    buttons.push(go);
+    const sendRow = el("div", "actions");
+    sendRow.appendChild(go);
+    card.append(actions, words, sendRow, note);
+    return card;
   }
 
   function row(r, ruling) {

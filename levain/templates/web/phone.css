@@ -95,3 +95,5 @@ button.quiet { font-size: 13px; font-weight: 600; padding: 8px 14px; min-height:
 .cmd code { flex: 1 1 auto; min-width: 0; font: 12px/1.4 var(--mono); overflow-wrap: anywhere; user-select: all;
             background: var(--base); border: 1px solid var(--hair); padding: var(--sp-3); border-radius: var(--r-md); }
 .cmd button { flex: 0 0 auto; }
+textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); font: 15px/1.4 var(--round); color: inherit;
+                 background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); padding: 10px; }
