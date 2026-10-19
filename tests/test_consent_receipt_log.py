@@ -335,3 +335,38 @@ def test_a_payload_changed_after_answer_starts_cannot_change_what_is_applied(scr
     got = queue.answer(request.id, flipping, signature)
     assert got.decision == "deny" and queue.get(request.id)[1] == "denied"
     assert _stored(queue, request.id)["decision"] == "deny"
+
+
+def test_a_receipt_sqlite_cannot_decode_refuses_the_apply_and_the_payload_and_verify_reports_it(scratch, capsys):
+    # L3 r2 (complement + codex): text that is not UTF-8 fails in sqlite3's own decode, at fetchall, before leaf()
+    # sees the row. Seen red on 6892aed7: sqlite3.OperationalError out of queue.answer and queue.answer_payload
+    queue, laptop, fp, root = scratch
+    _signed_over_one_receipt(queue, laptop, root, capsys)
+    later = _file(queue, "/w/b.txt", "e-b")
+    payload = queue.answer_payload(later.id, "deny", fp)
+    signature = _sign(laptop, answer_message(payload))
+    _raw_sql(queue, "DROP TRIGGER receipts_frozen",
+             "UPDATE receipts SET face = CAST(x'80ff' AS TEXT) WHERE seq = (SELECT MIN(seq) FROM receipts)")
+    with pytest.raises(AnswerRefused, match="the receipts cannot be read as a log"):
+        queue.answer(later.id, payload, signature)
+    assert queue.get(later.id)[1] == "pending"
+    with pytest.raises(AnswerRefused, match="the receipts cannot be read as a log"):
+        queue.answer_payload(later.id, "allow", fp)
+    rc, out, err = _verify_cli(queue, root, capsys)
+    assert rc == 1, out
+    assert "UNREADABLE:" in out and "not UTF-8" in out
+
+
+def test_a_record_nested_past_any_record_is_refused_not_a_recursion_crash(scratch):
+    # L3 r2 (complement LOW): the phone page posts the payload; a deeply nested one must be a refusal (the phone
+    # handler answers AnswerRefused with a refusal), never a RecursionError. Seen red on 6892aed7: RecursionError
+    queue, laptop, fp, _ = scratch
+    request = _file(queue, "/w/a.txt", "e-a")
+    deny = queue.answer_payload(request.id, "deny", fp)
+    signature = _sign(laptop, answer_message(deny))
+    deep: object = {}
+    for _ in range(5000):
+        deep = {"x": deep}
+    with pytest.raises(AnswerRefused, match="nests deeper"):
+        queue.answer(request.id, {**deny, "x": deep}, signature)
+    assert queue.get(request.id)[1] == "pending"

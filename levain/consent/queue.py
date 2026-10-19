@@ -379,14 +379,22 @@ def _migrate_from_prior(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
 
 
-def _detached(value: Any) -> Any:
+# how deep a signed record may nest when it is copied: an answer or ruling nests one level (``receipts_head``), so
+# anything deeper is no record, refused before Python's recursion limit is near (L3 r2: a phone client posts it)
+_DETACH_DEPTH = 8
+
+
+def _detached(value: Any, depth: int = 0) -> Any:
     """A plain-data copy of a signed record as given, read once: every mapping a ``dict``, every list or tuple a
     ``list``, recursively; any other value kept as it is (the checks refuse what a record cannot hold). A caller's
-    mapping that changes after this read changes nothing the queue checks or applies."""
+    mapping that changes after this read changes nothing the queue checks or applies. Nesting past
+    :data:`_DETACH_DEPTH` raises :class:`AnswerRefused`."""
+    if depth > _DETACH_DEPTH:
+        raise AnswerRefused("the signed record nests deeper than any answer or ruling record")
     if isinstance(value, Mapping):
-        return {k: _detached(v) for k, v in value.items()}
+        return {k: _detached(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_detached(v) for v in value]
+        return [_detached(v, depth + 1) for v in value]
     return value
 
 

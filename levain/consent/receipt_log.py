@@ -86,9 +86,16 @@ def leaf(row: Sequence[Any]) -> bytes:
 
 
 def _rows(conn: sqlite3.Connection, size: int | None) -> list[tuple[Any, ...]]:
-    if size is None:
-        return conn.execute(_LEAF_SQL).fetchall()
-    return conn.execute(_LEAF_SQL + " LIMIT ?", (size,)).fetchall()
+    """The receipt rows in ``seq`` order, all or the first ``size``. A text column holding bytes that are not UTF-8
+    fails in sqlite3's own decode, before :func:`leaf` sees the row: that is :class:`LogUnreadable` too (L3 r2)."""
+    try:
+        if size is None:
+            return conn.execute(_LEAF_SQL).fetchall()
+        return conn.execute(_LEAF_SQL + " LIMIT ?", (size,)).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "decode" not in str(exc).lower():
+            raise
+        raise LogUnreadable("a receipt is not UTF-8 text") from None
 
 
 def leaves(conn: sqlite3.Connection, size: int | None = None) -> list[bytes]:
@@ -228,7 +235,11 @@ def verify(queue_dir: Path | str, *,
     cols = ", ".join(_FIELDS) + ", state, decided_at, answer, signature, signer_fp, via"
     try:
         with reading._read_as_is(frozenset({"requests", "receipts"}), whole=True) as conn:
-            rows = conn.execute(_LEAF_SQL).fetchall()
+            try:
+                rows: list[tuple[Any, ...]] | None = _rows(conn, None)
+                rows_unreadable = None
+            except LogUnreadable as exc:
+                rows, rows_unreadable = None, str(exc)
             got = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
             queue_id = None if got is None else got[0]
             cur = conn.execute(f"SELECT {cols} FROM requests WHERE via IN ('signature', 'ruling') "
@@ -242,6 +253,8 @@ def verify(queue_dir: Path | str, *,
     mismatches: list[tuple[str, str]] = []
     unreadable = None
     try:
+        if rows is None:
+            raise LogUnreadable(rows_unreadable)
         data: list[bytes] | None = [leaf(r) for r in rows]
     except LogUnreadable as exc:
         data = None
@@ -324,7 +337,7 @@ def verify(queue_dir: Path | str, *,
         good.append(SignedHead(request_id=rid, via=row["via"], size=size, root=signed_head["root"],
                                signer_fp=payload["signer_fp"], signed_at=payload["signed_at"]))
     last = max(good, key=lambda h: (h.size, h.signed_at), default=None)
-    count = len(rows)
-    return Report(receipts=count, last_signed=last, unsigned_tail=count - (last.size if last else 0),
+    count = None if rows is None else len(rows)   # rows the decode refused: no count, the report says unreadable
+    return Report(receipts=count, last_signed=last, unsigned_tail=0 if count is None else count - (last.size if last else 0),
                   unchained=tuple(unchained), mismatches=tuple(mismatches), signed=len(good),
                   revoked=tuple(revoked), unreadable=unreadable)
