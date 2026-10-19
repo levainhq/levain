@@ -162,3 +162,14 @@ def test_f8_naive_timestamp_is_utc(tmp_path):
     (tmp_path / 'b.jsonl').write_text(_line('s2', 'n2', '2026-10-16T12:00:00Z', 'Bash', {'command': 'echo é'}) + '\n',
                                       encoding='utf-8')
     assert friction.compute(str(tmp_path), '2026-10-16')['tool_calls'] == 2
+
+
+def test_flagged_members_of_the_native_set():
+    # Claude Code's permissions page names sed, sort, file and ps in its read-only set, with flag conditions
+    cases = {"sed -n 1,20p a.py": "bash-native-ro", "sed -i s/a/b/ a.py": "bash-other",
+             "sort a.txt": "bash-native-ro", "sort -o out a": "bash-other",
+             "file a.bin": "bash-native-ro", "file -m magic a": "bash-other",
+             "ps aux": "bash-native-ro", "ps -ef": "bash-native-ro", "ps -Ao pid,etime,ucomm": "bash-native-ro",
+             "ps auxe": "bash-other", "ps aux -e": "bash-other"}
+    for cmd, want in cases.items():
+        assert friction.classify_bash(cmd, "/w") == want, cmd

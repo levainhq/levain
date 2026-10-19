@@ -26,9 +26,12 @@ import zoneinfo
 
 TZ = zoneinfo.ZoneInfo('America/New_York')
 IDLE = 600  # a gap over 10 min between tool calls is not active time
-NATIVE_RO = {'ls', 'cat', 'echo', 'pwd', 'head', 'tail', 'grep', 'find', 'wc', 'which', 'diff', 'stat', 'du'}
-UNLISTED_RO = {'rg', 'sort', 'uniq', 'cut', 'tr', 'jq', 'df', 'uptime', 'ps', 'sed', 'awk', 'basename', 'dirname',
-               'realpath', 'tree', 'date', 'file'}
+# Claude Code's built-in read-only set: the names its permissions page lists ("The set includes ...") plus the ones the
+# same section names with flag conditions (sed, sort, file, ps); the flag conditions are applied below
+NATIVE_RO = {'ls', 'cat', 'echo', 'pwd', 'head', 'tail', 'grep', 'find', 'wc', 'which', 'diff', 'stat', 'du', 'sed',
+             'sort', 'file', 'ps'}
+UNLISTED_RO = {'rg', 'uniq', 'cut', 'tr', 'jq', 'df', 'uptime', 'awk', 'basename', 'dirname', 'realpath', 'tree',
+               'date'}
 GIT_RO = {'status', 'log', 'diff', 'show', 'rev-parse', 'ls-files', 'grep', 'merge-base', 'ls-remote', 'cherry', 'blame',
           'describe', 'cat-file', 'check-ignore', 'rev-list', 'ls-tree', 'show-ref', 'shortlog', 'name-rev', 'for-each-ref'}
 GIT_OPT_WITH_VALUE = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'}
@@ -272,6 +275,12 @@ def classify_bash(cmd, cwd=None):
                                   (a.startswith('-') and not a.startswith('--') and 'o' in a) for a in args):
             return 'bash-other'
         if name == 'rg' and any(a == '--pre' or a.startswith('--pre=') for a in args):
+            return 'bash-other'
+        if name == 'file' and any(a in ('-m', '-f') or a.startswith(('--magic-file', '--files-from')) or
+                                  (a.startswith('-') and not a.startswith('--') and ('m' in a or 'f' in a))
+                                  for a in args):
+            return 'bash-other'
+        if name == 'ps' and any((a.isalpha() and 'e' in a) or a == '-e' for a in args):   # BSD 'e' prints env
             return 'bash-other'
         if name in UNLISTED_RO:
             unlisted = True
