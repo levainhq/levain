@@ -520,26 +520,44 @@ def deliver_answer(store: QuestionStore, ref: Any, *, listing: Any = None, runni
     if state == "unconfirmed":
         return replace(out, route="unconfirmed", reason=f"a resume was started for it at {when} and never confirmed: "
                                                         "it may have run, so it is not started again")
-    with _session_lock(store, q.agent, q.agent_session_id):
+    with _session_lock(store, q.agent, q.agent_session_id) as held:
+        if not held:
+            return replace(out, reason=f"another delivery for its session held the lock for {SESSION_LOCK_WAIT:g} s, "
+                                       "so this one started nothing; the answer lands at its next step")
         return _deliver_locked(store, q, out, listing=listing, running=running, launch=launch)
 
 
+SESSION_LOCK_WAIT = 15.0       # seconds a delivery waits on another delivery of the same session before routing hook
+
+
 @contextmanager
-def _session_lock(store: QuestionStore, agent: str, session: str) -> Iterator[None]:
+def _session_lock(store: QuestionStore, agent: str, session: str) -> Iterator[bool]:
     """One delivery per session at a time, from the route through the resume's settle (an exclusive ``flock`` on
     ``<store>/resumes/<digest of agent and session>.lock``): two answers delivered at once (the phone page delivers
     each on its own thread) would otherwise both pass the route's checks and start two resumes; the second now
-    routes after the first resume has started, whose process names the session."""
+    routes after the first resume has started, whose process names the session. Yields False, never proceeding
+    unlocked, when the lock stays held past :data:`SESSION_LOCK_WAIT` (a hung or suspended holder): the caller then
+    starts nothing and the answer stays deliverable."""
     import fcntl
     import hashlib
+    import time
 
     folder = Path(store.directory) / "resumes"
     folder.mkdir(mode=0o700, exist_ok=True)
     name = hashlib.sha256(f"{agent}\0{session}".encode()).hexdigest()[:32]
     fd = os.open(folder / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        deadline = time.monotonic() + SESSION_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.1)
+        yield True
     finally:
         os.close(fd)
 

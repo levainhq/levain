@@ -369,3 +369,35 @@ def test_l3r3_two_deliveries_of_one_session_start_one_resume(tmp_path, monkeypat
     second.join(10)
     assert len(launches) == 1
     assert sorted(r.route for r in results) == ["hook", "resumed"]
+
+
+def test_l3r4_a_hung_lock_holder_never_blocks_a_delivery(tmp_path, monkeypatch):
+    """codex r4: flock(LOCK_EX) waited without a bound, so a hung holder blocked every later delivery of its session.
+    Past SESSION_LOCK_WAIT the delivery starts nothing and routes hook; the answer stays deliverable."""
+    import fcntl
+    import hashlib
+    import time
+
+    store = QuestionStore(tmp_path / "consent")
+    store.file(agent="codex", agent_session_id=SESSION, what="q?", options=[("a", "x"), ("b", "y")], rec="a",
+               blocks="z", cwd="/w")
+    store.answer(1, option="a", channel="phone")
+    monkeypatch.setattr(dv, "route", lambda *a, **k: ("resumed", "ended", ("/bin/codex", "exec", "resume", SESSION),
+                                                      str(tmp_path)))
+    monkeypatch.setattr(band, "SESSION_LOCK_WAIT", 0.3)
+    folder = tmp_path / "consent" / "resumes"
+    folder.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(f"codex\0{SESSION}".encode()).hexdigest()[:32]
+    holder = os.open(folder / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)                              # the hung holder
+    launches = []
+    try:
+        t0 = time.monotonic()
+        got = band.deliver_answer(store, 1, launch=lambda *a: launches.append(a))
+        assert time.monotonic() - t0 < 5
+        assert got.route == "hook" and "held the lock" in got.reason
+        assert launches == [] and store.delivery_state(store.get(1).id)[0] not in ("delivered", "unconfirmed")
+    finally:
+        os.close(holder)
+    got = band.deliver_answer(store, 1, launch=lambda *a: launches.append(a))   # freed: it delivers
+    assert got.route == "resumed" and len(launches) == 1
