@@ -79,6 +79,9 @@ R0_PATHS = [
     ("pom.xml", NOT_SOURCE), ("tsconfig.json", NOT_SOURCE), ("scripts/run.sh", NOT_SOURCE),
     ("src/data.json", NOT_SOURCE), ("config.yaml", NOT_SOURCE),
     # code under test and its docs: what R0 exists to write
+    # head round 1b: a test file in any language, pip's lockfile class, and rc only as a dotfile (not arc.py)
+    ("src/test_x.js", DENY), ("test_x.ts", DENY), ("requirements.txt", DENY), ("requirements-dev.txt", DENY),
+    ("constraints.txt", DENY), ("src/arc.py", OK), ("src/orc.ts", OK), ("src.py", OK),
     ("src/a.py", OK), ("src/__init__.py", OK), ("src/testing_utils.py", OK), ("src/contest.py", OK),
     ("lib/latest.py", OK), ("src/x.pyi", OK), ("web/app.tsx", OK), ("lib/mod.rs", OK), ("cmd/main.go", OK),
     ("styles/a.scss", OK), ("docs/x.md", OK), ("README.rst", OK), ("notes.txt", OK), ("LIB/B.PY", OK),

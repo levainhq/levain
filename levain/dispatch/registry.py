@@ -93,13 +93,13 @@ R0_SOURCE_EXTENSIONS: tuple[str, ...] = (
 #   agent and editor configuration: the next agent session or the editor loads it as instructions or tasks
 #   lockfiles: they choose the code every later install runs
 EXECUTION_BEARING_FILES: tuple[str, ...] = (
-    "test_*.py", "test.py", "tests.py", "*.test.*", "*.spec.*", "*_test.*", "*_spec.*", "conftest.py",
+    "test_*.*", "test.py", "tests.py", "*.test.*", "*.spec.*", "*_test.*", "*_spec.*", "conftest.py",
     "makefile", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "noxfile.py", "build.rs", "*.config.*",
     ".gitlab-ci.yml",
     ".pre-commit-config.yaml", ".pre-commit-config.yml", ".gitattributes", ".gitmodules",
-    "sitecustomize.py", "usercustomize.py", "*.pth", ".envrc", "*rc", "*rc.*",
+    "sitecustomize.py", "usercustomize.py", "*.pth", ".envrc", ".*rc", ".*rc.*",
     "agents.md", "claude.md", "claude.local.md", "gemini.md", ".mcp.json",
-    "*.lock", "package-lock.json", "poetry.lock", "uv.lock",
+    "*.lock", "package-lock.json", "poetry.lock", "uv.lock", "requirements*.txt", "constraints*.txt",
 )
 EXECUTION_BEARING_DIRS: tuple[str, ...] = (
     "tests", "test", "testing", "__tests__", "spec", "e2e",
