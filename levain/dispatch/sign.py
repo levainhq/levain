@@ -5,7 +5,8 @@ shown, the contract's expiry, the signer and when it was signed, and its canonic
 own SSHSIG namespace, so a dispatch signature verifies as nothing else and nothing else verifies as one. The store's
 random ``store_id`` is bound so a signature made for a job in one dispatch store is refused by any other.
 
-:func:`refusal` is the one check: exact keys and format, the store, the job's id, digest and expiry, a ``signed_at``
+:func:`refusal` is the one check: exact keys and format, every field and the signature bounded in length
+(:data:`FIELD_MAX`, :data:`SIGNATURE_MAX`) before anything is verified, the store, the job's id, digest and expiry, a ``signed_at``
 inside the job's unsigned lease, then the signer checks (an enrolled key, not revoked, of a class that covers T2, a
 non-empty signature, a passkey's extra checks, the signature over the payload's bytes), in an order meant to mirror
 the consent queue's signer check for an allow; this module's tests pin the order here. A verifier that cannot run is
@@ -32,14 +33,19 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import class_covers
 from levain.contracts.canon import canonical_bytes
 
-__all__ = ["DISPATCH_SIGN_NAMESPACE", "FORMAT", "PAYLOAD_KEYS", "SIGN_TIER", "refusal", "sign_message",
-           "sign_payload"]
+__all__ = ["DISPATCH_SIGN_NAMESPACE", "FIELD_MAX", "FORMAT", "PAYLOAD_KEYS", "SIGNATURE_MAX", "SIGN_TIER", "refusal",
+           "sign_message", "sign_payload"]
 
 DISPATCH_SIGN_NAMESPACE = "levain-dispatch-contract"
 FORMAT = "levain-dispatch-sign/1"
 PAYLOAD_KEYS = frozenset({"format", "store_id", "job_id", "digest", "signer_fp", "signed_at", "expires_at"})
 # the tier a contract signature allows at: the class a key needs to sign one
 SIGN_TIER = "T2"
+# bounds checked before anything is verified or stored: every real payload field is under 100 characters and a real
+# signature, SSH or a passkey's armored SSHSIG, under a kilobyte; the signature bound leaves room for the browser
+# fields a passkey signature carries, each of which the passkey check holds to 16 KiB
+FIELD_MAX = 256
+SIGNATURE_MAX = 64 * 1024
 
 
 class SignableJob(Protocol):
@@ -82,6 +88,8 @@ def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Sig
         return "the signature payload is not a dispatch signature record"
     if not all(isinstance(payload[k], str) for k in PAYLOAD_KEYS):
         return "every field of a dispatch signature record is text"
+    if any(len(payload[k]) > FIELD_MAX for k in PAYLOAD_KEYS):
+        return f"a field of the dispatch signature record is over {FIELD_MAX} characters"
     if payload["format"] != FORMAT:
         return f"signature format {payload['format']!r} is not {FORMAT!r}"
     if payload["store_id"] != job.store_id:
@@ -113,6 +121,8 @@ def refusal(payload: Any, signature: Any, authority: AuthoritySnapshot, job: Sig
         return f"key class {key.key_class} does not cover {SIGN_TIER}"
     if not isinstance(signature, str) or not signature:
         return "the contract signature is empty"
+    if len(signature) > SIGNATURE_MAX:
+        return f"the contract signature is over {SIGNATURE_MAX} characters"
     if key.custody == PASSKEY:
         # a passkey's WebAuthn checks that ssh-keygen does not make (user verification, the page's origin): the
         # consent path's passkey check is called here so the two paths hold a passkey to one rule

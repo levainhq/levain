@@ -17,12 +17,17 @@ adoption are later slices); the table names them all.
 
 Every filed job holds a LEASE: an unsigned contract lapses :data:`UNSIGNED_LEASE` after filing (or at its expiry, if
 sooner), a signed one at the expiry its digest binds. Every read and every write first sweeps (:meth:`JobStore.sweep`)
-at the store's own clock: a job past its lease that is not yet authorised moves to ``failed`` with cause
+at the store's own clock, read only once the transaction's write lock is held (a lock wait never dates a check in
+the past): a job past its lease that is not yet authorised moves to ``failed`` with cause
 ``lease_lapsed``. The sweep commits in its own write transaction before the operation's, so an operation that is then
 refused does not roll the lapse back; the operation's transaction sweeps again, so what it checks is current. One
 live contract per write file: filing is refused while a live job (not terminal, lease not lapsed) in the same repo
 writes a file in common, compared without case (a case-insensitive disk holds ``A.py`` and ``a.py`` as one file), so
 an abandoned or runaway planner cannot hold a file past its lease.
+
+By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human
+signed for that result, and only a human releases it (adoption, or the human cancel, whose public method is slice
+b's). The lease protects against a planner that abandons a job, and an authorised job is no longer the planner's.
 
 The store is ``<directory>/dispatch.db``, ``<levain home>/dispatch`` by default, in a directory that is the
 operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse UPDATE, DELETE and an
@@ -236,8 +241,15 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
     return now
 
 
-def _capability_sha(capability: str) -> str:
-    return hashlib.sha256(capability.encode("utf-8")).hexdigest()
+def _capability_sha(capability: Any) -> str:
+    """The SHA-256 of a capability, or ``""`` (which matches no stored hash) for anything that is not text UTF-8
+    can encode: a lone surrogate is a mismatch, never a crash."""
+    if not isinstance(capability, str):
+        return ""
+    try:
+        return hashlib.sha256(capability.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return ""
 
 
 def _label(name: str, value: Any, high: int) -> str:
@@ -320,14 +332,19 @@ class JobStore:
         with write_transaction(self._connect) as conn:
             yield conn
 
+    def _stamp(self) -> str:
+        return utc_stamp(_now_utc(self._clock))
+
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
-        """The sweep committed in its own write transaction, then the operation's write transaction (swept again, at
-        the same stamp, so what it reads is current) and the stamp both use."""
-        stamp = utc_stamp(_now_utc(self._clock))
+        """The sweep committed in its own write transaction, then the operation's write transaction, swept again so
+        what it reads is current. Each transaction reads the clock only AFTER its ``BEGIN IMMEDIATE`` holds the
+        lock, so a lock wait can never date a check or a transition at a time already past; the operation's stamp is
+        the one its sweep used, and is yielded for its transition."""
         with self._write() as conn:
-            self._sweep(conn, stamp)
+            self._sweep(conn, self._stamp())
         with self._write() as conn:
+            stamp = self._stamp()
             self._sweep(conn, stamp)
             yield conn, stamp
 
@@ -393,10 +410,10 @@ class JobStore:
     # --- the public operations -----------------------------------------------------------------------------------
     def sweep(self) -> list[str]:
         """Fail every lapsed job not yet authorised (cause ``lease_lapsed``) at the store's own clock; returns their
-        ids. It takes no caller time: a time ahead of the clock would fail live jobs, and a failure is final."""
-        stamp = utc_stamp(_now_utc(self._clock))
+        ids. It takes no caller time: a time ahead of the clock would fail live jobs, and a failure is final. The
+        clock is read once the write lock is held."""
         with self._write() as conn:
-            return self._sweep(conn, stamp)
+            return self._sweep(conn, self._stamp())
 
     def _idem_row(self, filer_session: str, idem_key: str) -> tuple[str, str, str] | None:
         with self._write() as conn:
@@ -443,14 +460,22 @@ class JobStore:
                     raise JobStoreError(f"job {prior[0]} vanished from an append-only store")
             if parsed.expires_at <= stamp:
                 raise ContractRefused("the contract has expired; resolve it again")
-            unsigned_until = min(utc_stamp(now + UNSIGNED_LEASE), parsed.expires_at)
+            # the lease runs from the filing stamp (read under the lock), never from the clock read before resolving
+            unsigned_until = min(utc_stamp(parse_stamp(stamp) + UNSIGNED_LEASE), parsed.expires_at)
             mine = {p.casefold(): p for p in parsed.write_paths}
             live = conn.execute(
                 f"SELECT j.id, j.contract FROM jobs j JOIN ({_CURRENT}) c ON c.job_id = j.id "
                 f"WHERE j.repo = ? AND c.to_state NOT IN ({','.join('?' * len(TERMINAL))}) ORDER BY j.id",
                 (parsed.repo, *sorted(TERMINAL))).fetchall()
             for other_id, other_text in live:
-                theirs = {p.casefold(): p for p in parse_contract(other_text).write_paths}
+                try:
+                    other = parse_contract(other_text)
+                except DispatchError:
+                    # a stored contract is written canonical and never changed: one that no longer parses is a
+                    # damaged store, not a refusal of the submission in hand
+                    raise JobStoreError(f"live job {other_id} holds a stored contract that no longer parses; the "
+                                        "dispatch store is damaged") from None
+                theirs = {p.casefold(): p for p in other.write_paths}
                 common = sorted(theirs[k] for k in mine.keys() & theirs.keys())
                 if common:
                     raise ContractRefused(f"live job {other_id} already writes {common[0]}; one live contract per "
@@ -471,20 +496,24 @@ class JobStore:
     def sign(self, job_id: str, payload: Any, signature: Any, authority: AuthoritySource) -> Job:
         """Store the operator's signature over a filed job's digest and move it to ``signed``, in one write
         transaction; raises :class:`SignatureRefused` saying why when it does not verify. ``authority`` is the
-        trusted source (:func:`levain.consent.queue.authority_source`), replayed afresh here, never a snapshot a
-        caller captured earlier."""
+        trusted source (:func:`levain.consent.queue.authority_source`), replayed afresh INSIDE the write
+        transaction, just before the check, so a key revoked while the call waited for the lock is seen as revoked;
+        never a snapshot a caller captured earlier. An authority log that cannot be read (its refusal, a database
+        error, an unreadable file, a malformed value) is a :class:`SignatureRefused`, as the consent queue turns the
+        same failures into no decision."""
         if type(authority) is not AuthoritySource:
             raise SignatureRefused("authority must be the AuthoritySource authority_source() returns")
-        try:
-            snapshot = authority()
-        except AuthorityError as exc:
-            raise SignatureRefused(f"the authority log could not be read: {exc}") from None
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state != _FILED:
                 raise SignatureRefused(f"job {job.id} is {job.state}, not filed; a contract is signed once")
+            try:
+                snapshot = authority()
+            except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
+                raise SignatureRefused(f"the authority log could not be read: {type(exc).__name__}: "
+                                       f"{str(exc)[:200]}") from None
             problem = dsign.refusal(payload, signature, snapshot, job, ssh_keygen=self._ssh_keygen)
-            if problem is None and payload["signed_at"] > utc_stamp(_now_utc(self._clock) + _SIGN_SKEW):
+            if problem is None and payload["signed_at"] > utc_stamp(parse_stamp(stamp) + _SIGN_SKEW):
                 problem = "the signature is dated in the future"
             if problem is not None:
                 raise SignatureRefused(problem)
@@ -501,8 +530,7 @@ class JobStore:
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             stored = conn.execute("SELECT capability_sha256 FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
-            given = _capability_sha(capability) if isinstance(capability, str) else ""
-            if not hmac.compare_digest(given, stored):
+            if not hmac.compare_digest(_capability_sha(capability), stored):
                 raise CapabilityRefused(f"that capability is not job {job.id}'s")
             self._apply(conn, job.id, to_state, cause, stamp)
             out = self._load(conn, job.id)

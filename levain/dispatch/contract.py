@@ -9,7 +9,9 @@ digest, once.
 Every path resolves FROM GIT AT ``base``, never from the working tree, so what the human is shown is what the executor
 and the verifier will see: a read path must be a regular file at base (a symlink, a submodule or a missing path refuses
 the contract) and its blob is bound; a write path is either a regular file at base (its blob bound) or a NEW file whose
-every ancestor is a plain directory or absent at base. Git runs with an argv list and :func:`git_env`, never a
+every ancestor is a plain directory or absent at base, and neither it nor any ancestor has a twin at base that differs
+only in case (the target disk is case-insensitive). A regular mode must name a blob. No write path is an ancestor of
+another, compared without case: one path cannot be both a file and a directory. Git runs with an argv list and :func:`git_env`, never a
 shell: every inherited ``GIT_*`` variable scrubbed, replace objects and graft files off, so ``base`` names its own
 tree and no ref or graft can swap another in. The contract binds that tree's sha (``base_tree``) beside ``base``, so
 the stages that later build and check a worktree compare one sha, with the same :func:`git_env`. The listing is read
@@ -34,9 +36,10 @@ import posixpath
 import re
 import subprocess
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 
 from levain.cockpit.consent import ConsentError, parse_stamp
@@ -209,6 +212,19 @@ def _paths(raw: Any, what: str) -> list[str]:
     return sorted(raw)
 
 
+def _nested_problem(paths: Iterable[str]) -> str | None:
+    """Why a write set cannot be materialised because one path is an ancestor of another (``tmp`` and
+    ``tmp/x.py``: one file cannot also be a directory), compared without case; ``None`` when no path nests."""
+    folded = {p.casefold(): p for p in paths}
+    for p in sorted(folded.values()):
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            ancestor = folded.get("/".join(parts[:i]).casefold())
+            if ancestor is not None:
+                return f"write lists {ancestor} and {p}, which is under it; a file cannot also be a directory"
+    return None
+
+
 @dataclass(frozen=True)
 class PathEntry:
     """A resolved path: its git mode and blob sha at base, or :data:`NEW` for both when it is a file to create."""
@@ -296,7 +312,7 @@ def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
         entry = tree.get(p)
         if entry is None:
             return None
-        mode, _kind, sha = entry
+        mode, kind, sha = entry
         if mode == _SYMLINK:
             raise _refuse(f"{what} path {p} is a symlink at base; symlinks are never contract files")
         if mode == _GITLINK:
@@ -305,7 +321,23 @@ def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
             raise _refuse(f"{what} path {p} is a directory at base; name exact files")
         if mode not in _REGULAR:
             raise _refuse(f"{what} path {p} has mode {mode} at base, not a regular file")
+        # git's own word on the object, not the mode alone: a regular mode over anything but a blob is a damaged tree
+        if kind != "blob" or _SHA1.fullmatch(sha) is None:
+            raise _refuse(f"{what} path {p} has a regular mode at base but is a {kind[:16]!r} object "
+                          f"{sha[:40]!r}, not a blob")
         return PathEntry(p, mode, sha)
+
+    # every spelling at base of each case-folded path (git is case-sensitive; the target disk is not)
+    folded: dict[str, set[str]] | None = None
+
+    def twin(p: str) -> str | None:
+        nonlocal folded
+        if folded is None:
+            folded = {}
+            for q in tree:
+                folded.setdefault(q.casefold(), set()).add(q)
+        others = sorted(folded.get(p.casefold(), set()) - {p})
+        return others[0] if others else None
 
     reads = []
     for p in read:
@@ -313,7 +345,6 @@ def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
         if entry is None:
             raise _refuse(f"read path {p} does not exist at base")
         reads.append(entry)
-    folded = None
     writes = []
     for p in write:
         entry = existing(p, "write")
@@ -321,6 +352,12 @@ def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
             parts = p.split("/")
             for i in range(1, len(parts)):
                 ancestor = "/".join(parts[:i])
+                # a differently-cased twin of an ancestor is the same directory (or file, or symlink) on a
+                # case-insensitive disk, so the new file would land somewhere the contract never named
+                other = twin(ancestor)
+                if other is not None:
+                    raise _refuse(f"new write path {p}: its parent {ancestor} differs only in case from {other} "
+                                  "at base")
                 got = tree.get(ancestor)
                 if got is None:
                     continue
@@ -330,11 +367,12 @@ def _resolve_paths(tree: Mapping[str, tuple[str, str, str]], read: list[str],
                     raise _refuse(f"new write path {p}: its parent {ancestor} is a submodule (gitlink) at base")
                 if got[0] != _TREE:
                     raise _refuse(f"new write path {p}: its parent {ancestor} is a file at base")
-            if folded is None:
-                folded = {q.casefold(): q for q in tree}
-            twin = folded.get(p.casefold())
-            if twin is not None:
-                raise _refuse(f"new write path {p} differs only in case from {twin} at base")
+                if got[1] != "tree":
+                    raise _refuse(f"new write path {p}: its parent {ancestor} has a directory mode at base but is "
+                                  f"a {got[1][:16]!r} object")
+            other = twin(p)
+            if other is not None:
+                raise _refuse(f"new write path {p} differs only in case from {other} at base")
             entry = PathEntry(p, NEW, NEW)
         writes.append(entry)
     return tuple(reads), tuple(writes)
@@ -358,6 +396,10 @@ class ResolvedContract:
     template: ResolvedTemplate
     policy_hash: str
     format: str = FORMAT
+
+    def __post_init__(self) -> None:
+        # the budget is a read-only view over the contract's own copy: no holder can change what the digest binds
+        object.__setattr__(self, "budget", MappingProxyType(dict(self.budget)))
 
     def to_mapping(self) -> dict[str, Any]:
         return {"format": self.format, "goal": self.goal, "repo": self.repo, "base": self.base,
@@ -448,6 +490,9 @@ def resolve_contract(submission: Any, *, resolve_template: Callable[[str], Resol
     write = _paths(submission["write"], "write")
     if not write:
         raise _refuse("write names no file; a dispatch contract changes at least one file")
+    problem = _nested_problem(write)
+    if problem is not None:
+        raise _refuse(problem)
     template_id = submission["template"]
     if not isinstance(template_id, str) or _ID.fullmatch(template_id) is None:
         raise _refuse(f"template {str(template_id)[:64]!r} is not a template id; the contract is R2, and R2 is "
@@ -569,6 +614,9 @@ def _parse_contract(text: str | bytes) -> ResolvedContract:
         paths = [e.path for e in entries]
         if paths != sorted(paths) or len({p.casefold() for p in paths}) != len(paths):
             raise _refuse(f"{what} entries must be sorted, each path once")
+    problem = _nested_problem(e.path for e in writes)
+    if problem is not None:
+        raise _refuse(problem)
     if not {e.path for e in writes} <= template.write_paths:
         raise _refuse("a write path is outside the template's write set")
     contract = ResolvedContract(goal=goal, repo=obj["repo"], base=obj["base"], base_tree=obj["base_tree"], read=reads, write=writes,

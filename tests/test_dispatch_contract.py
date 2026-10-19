@@ -528,3 +528,62 @@ def test_parse_refuses_anything_malformed_as_contract_refused(repo):
     m["write"][0]["mode"] = {"a": 1}
     with pytest.raises(ContractRefused):
         parse_contract(canonical(m))
+
+
+# --- fix round 2 (L3 r1) -----------------------------------------------------------------------------------------
+
+def _wide(*extra: str):
+    # a template whose write set also holds ``extra``, for a provider that may read everything but NEVER
+    return registry(template(write_paths=WRITE_SET | frozenset(extra), provider="anthropic"))
+
+
+@pytest.mark.parametrize("new, match", [
+    ("SRC/new.py", "parent SRC differs only in case from src"),      # complement: a case twin of a directory
+    ("readme/x.py", "parent readme differs only in case from README"),  # codex: a case twin of a file
+    ("Srclink/n.py", "parent Srclink differs only in case from srclink"),  # ... and of a symlink
+])
+def test_a_new_path_under_a_case_twin_of_any_ancestor_refuses(repo, new, match):
+    path, base = repo
+    with pytest.raises(ContractRefused, match=match):
+        resolve(submission(path, base, write=[new]), resolver=_wide(new))
+
+
+@pytest.mark.parametrize("write", [["tmp", "tmp/result.py"], ["tmp", "TMP/r.py"], ["a/b", "a/b/c/d.py"]])
+def test_a_write_set_holding_a_path_and_its_own_ancestor_refuses(repo, write):
+    # codex: both new, both "files"; one cannot also be the other's directory
+    path, base = repo
+    with pytest.raises(ContractRefused, match="a file cannot also be a directory"):
+        resolve(submission(path, base, write=write), resolver=_wide(*write))
+
+
+def test_parse_refuses_a_stored_write_set_that_nests(repo):
+    path, base = repo
+    m = json.loads(resolve(submission(path, base)).canonical())
+    m["write"] = [{"path": "src/new.py", "mode": NEW, "blob": NEW}, {"path": "src/new.py/x", "mode": NEW, "blob": NEW}]
+    with pytest.raises(ContractRefused, match="a file cannot also be a directory"):
+        parse_contract(canonical(m))
+
+
+@pytest.mark.parametrize("tree, read, write, match", [
+    ({"src/a.py": ("100644", "tree", "a" * 40)}, ["src/a.py"], [], "not a blob"),       # codex: mode lies about kind
+    ({"src/a.py": ("100644", "commit", "a" * 40)}, [], ["src/a.py"], "not a blob"),
+    ({"src/a.py": ("100644", "blob", "zz")}, ["src/a.py"], [], "not a blob"),           # not a 40-hex object id
+    ({"d": ("040000", "blob", "a" * 40)}, [], ["d/x.py"], "directory mode at base but is a 'blob'"),
+])
+def test_a_malformed_tree_entry_refuses(tree, read, write, match):
+    from levain.dispatch.contract import _resolve_paths
+    with pytest.raises(ContractRefused, match=match):
+        _resolve_paths(tree, read, write)
+
+
+def test_the_budget_is_read_only_and_never_shared(repo):
+    # codex: a mutable budget dict inside the frozen contract let a holder change what the digest binds
+    path, base = repo
+    c = resolve(submission(path, base))
+    digest = c.digest
+    with pytest.raises(TypeError):
+        c.budget["tokens"] = 0                                           # type: ignore[index]
+    mine = dict(c.budget)
+    again = dataclasses.replace(c, budget=mine)
+    mine["tokens"] = 1
+    assert again.digest == digest and again.budget["tokens"] != 1

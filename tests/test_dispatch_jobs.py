@@ -504,3 +504,105 @@ def test_each_store_has_its_own_store_id_and_a_signature_binds_it(tmp_path, cloc
     # the same job id, digest and expiry in another store (a restored or copied store's twin): refused by store
     twin = dataclasses.replace(job_a, store_id=job_b.store_id)
     assert dsign.refusal(payload, sig, snapshot, twin) == "the signature is for another dispatch store"
+
+
+# --- fix round 2 (L3 r1) -----------------------------------------------------------------------------------------
+
+class Sequence:
+    """A clock that answers each call from a list, then repeats the last: the time before a lock wait, then after."""
+    def __init__(self, *times):
+        self.times = list(times)
+
+    def __call__(self):
+        return self.times.pop(0) if len(self.times) > 1 else self.times[0]
+
+
+def test_a_lock_wait_never_dates_a_signature_inside_a_lapsed_lease(store, repo, keys, log):
+    # codex: the stamp was sampled before the lock and reused; a signing call that waited past the unsigned lease
+    # was still judged at the earlier time and accepted
+    job, _ = file_job(store, repo)
+    payload, sig = signed(job, keys["phone"], at=NOW + UNSIGNED_LEASE - timedelta(seconds=2))
+    store._clock = Sequence(NOW + UNSIGNED_LEASE - timedelta(seconds=1), NOW + UNSIGNED_LEASE + timedelta(seconds=10))
+    with pytest.raises(SignatureRefused, match="is failed, not filed"):
+        store.sign(job.id, payload, sig, log.source)
+    got = store.get(job.id)
+    assert got.state == "failed" and got.history[-1].at == utc_stamp(NOW + UNSIGNED_LEASE + timedelta(seconds=10))
+
+
+def test_filing_dates_the_job_and_its_lease_from_the_clock_read_under_the_lock(store, repo):
+    store._clock = Sequence(NOW, NOW + timedelta(minutes=5))
+    job, _ = file_job(store, repo)
+    assert job.filed_at == utc_stamp(NOW + timedelta(minutes=5))
+    assert job.unsigned_until == utc_stamp(NOW + timedelta(minutes=5) + UNSIGNED_LEASE)
+
+
+def test_a_key_revoked_while_signing_waits_for_the_lock_is_refused(store, repo, keys, clock, tmp_path):
+    # complement: the authority was replayed before the write lock; a revocation in that window was missed
+    from contextlib import contextmanager
+
+    from tests.test_consent_queue import Log
+    (tmp_path / "auth").mkdir()
+    lg = Log(tmp_path / "auth", keys)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("phone", "display-phone")
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    payload, sig = signed(job, keys["phone"])
+    original, entered = store._write, []
+
+    @contextmanager
+    def waiting():
+        entered.append(1)
+        if len(entered) == 2:                 # the operation's own lock: the operator revokes while we wait
+            lg.revoke("phone")
+        with original() as conn:
+            yield conn
+
+    store._write = waiting
+    with pytest.raises(SignatureRefused, match="revoked"):
+        store.sign(job.id, payload, sig, lg.source)
+    store._write = original
+    assert store.get(job.id).state == "filed"
+
+
+def test_an_authority_log_that_cannot_be_read_is_a_signature_refusal(store, repo, keys, clock, tmp_path):
+    # codex: a sqlite3.Error from the authority source escaped sign() as a crash
+    from levain.consent.queue import authority_source
+    bad = tmp_path / "cockpit.db"
+    bad.write_bytes(b"this is not a database" * 100)
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    payload, sig = signed(job, keys["phone"])
+    with pytest.raises(SignatureRefused, match="the authority log could not be read"):
+        store.sign(job.id, payload, sig, authority_source(bad, anchor=None))
+    with pytest.raises(SignatureRefused, match="the authority log could not be read"):
+        store.sign(job.id, payload, sig, authority_source(tmp_path / "missing" / "cockpit.db", anchor=None))
+    assert store.get(job.id).state == "filed"
+
+
+def test_a_live_job_whose_stored_contract_no_longer_parses_is_a_damaged_store(store, repo):
+    # glm: a damaged live row surfaced as ContractRefused, blaming the new submission
+    path, _base = repo
+    store.list()                                            # the store exists
+    damaged = "dj-" + "f" * 32
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute("INSERT INTO jobs (id, digest, contract, filed_at, filer_session, capability_sha256, idem_key, "
+                     "repo, expires_at, unsigned_until) VALUES (?, ?, 'not a contract', ?, 's', ?, NULL, ?, ?, ?)",
+                     (damaged, "sha256:" + "0" * 64, utc_stamp(NOW), "0" * 64, str(path),
+                      utc_stamp(NOW + timedelta(hours=1)), utc_stamp(NOW + timedelta(minutes=20))))
+        conn.execute("INSERT INTO transitions (job_id, seq, to_state, cause, at, evidence) "
+                     "VALUES (?, 1, 'filed', 'filed', ?, '')", (damaged, utc_stamp(NOW)))
+    finally:
+        conn.close()
+    with pytest.raises(JobStoreError, match=f"live job {damaged} holds a stored contract that no longer parses"):
+        file_job(store, repo)
+
+
+@pytest.mark.parametrize("capability", ["\ud800", "ok\udfffok", 7, None])
+def test_a_capability_that_is_not_encodable_text_is_a_mismatch_never_a_crash(store, repo, capability):
+    # complement: a lone surrogate raised UnicodeEncodeError out of the planner channel
+    job, _ = file_job(store, repo)
+    with pytest.raises(CapabilityRefused):
+        store.cancel_by_planner(job.id, capability)
+    assert store.get(job.id).state == "filed"

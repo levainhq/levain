@@ -44,6 +44,7 @@ FORMAT = "levain-dispatch-outcomes/1"
 UNKNOWN = "unknown"
 _ACCESS_BY_OTHERS = 0o077
 _FIELD_MAX = 200
+_RUN_INDEX_MAX = 2 ** 63 - 1            # SQLite's INTEGER: past it a bind raises OverflowError, never a refusal
 
 # label -> the one source it may carry (design §6's table). A verifier or a contrast compare is a machine on a
 # human-owned criterion; the planner is a model, so a machine; a signature is a human; a revert is a human act
@@ -109,8 +110,8 @@ class OutcomeRow:
     def __post_init__(self) -> None:
         for name in ("job_id", "model_requested", "model_answered", "route", "harness", "template_id"):
             _one_line(name, getattr(self, name))
-        if type(self.run_index) is not int or self.run_index < 0:
-            raise DispatchError("run_index must be a non-negative integer")
+        if type(self.run_index) is not int or not 0 <= self.run_index <= _RUN_INDEX_MAX:
+            raise DispatchError(f"run_index must be an integer from 0 to {_RUN_INDEX_MAX} (SQLite's INTEGER)")
         if self.label not in SOURCES:
             raise DispatchError(f"label must be one of {', '.join(LABELS)}: {self.label!r}")
         if self.source != SOURCES[self.label]:

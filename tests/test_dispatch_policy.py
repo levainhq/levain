@@ -171,3 +171,57 @@ def test_a_control_character_or_odd_space_refuses_a_path_and_a_pattern(policy, b
 
 def test_a_plain_space_is_a_path_character(policy):
     assert policy.refusal("anthropic", ["docs/a b.md"], []) is None
+
+
+# --- fix round 2 (L3 r1) -----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("where", ["never", "read"])
+def test_a_pattern_not_in_nfc_is_refused_at_load(where):
+    # codex: a decomposed NEVER rule (e + U+0301) never matches the composed NFC path a contract must use
+    decomposed = "**/café.pem"
+    raw = {"never": [decomposed] if where == "never" else [],
+           "providers": {"x": {"read": [decomposed] if where == "read" else ["**"]}}}
+    with pytest.raises(PolicyError, match="NFC"):
+        ProviderPolicy.from_mapping(raw)
+
+
+def test_the_loaded_policy_is_immutable_and_its_hash_is_what_it_judges():
+    # codex: a mutable providers dict inside the frozen policy let the approved policy and the hashed one differ
+    providers = {"anthropic": ("**",)}
+    p = ProviderPolicy(never=("**/*.pem",), providers=providers)
+    before = p.content_hash()
+    providers["evil"] = ("**",)                       # the caller's own mapping changes after construction
+    assert "evil" not in p.providers and p.content_hash() == before
+    with pytest.raises(TypeError):
+        p.providers["evil"] = ("**",)                 # type: ignore[index]
+    loaded = ProviderPolicy.from_mapping(POLICY)
+    with pytest.raises(TypeError):
+        loaded.providers["anthropic"] = ()            # type: ignore[index]
+    assert isinstance(loaded.never, tuple) and loaded.refusal("evil", ["a.py"], []) is not None
+
+
+@pytest.mark.parametrize("pattern, component", [
+    ("*a*a*a*a*a*a*b", "a" * 1000),                   # complement: a many-star pattern, failing at the end
+    ("*_*_*_*.py", "_" * 1000),
+    ("*" * 200 + "b", "a" * 1000),
+])
+def test_a_many_star_pattern_against_a_long_failing_component_is_fast(pattern, component):
+    import time
+    started = time.monotonic()
+    assert match(pattern, component) is False
+    assert match("src/" + pattern, "src/" + component) is False
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_component_matcher_agrees_with_a_reference_translation():
+    import random
+    rng = random.Random(1019)
+
+    def reference(pattern, text):
+        rx = "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c) for c in pattern)
+        return re.fullmatch(rx, text, re.DOTALL) is not None
+
+    for _ in range(4000):
+        pattern = "".join(rng.choice("ab*?.") for _ in range(rng.randint(1, 6)))
+        text = "".join(rng.choice("ab.") for _ in range(rng.randint(1, 8)))
+        assert match(pattern, text) is reference(pattern, text), (pattern, text)

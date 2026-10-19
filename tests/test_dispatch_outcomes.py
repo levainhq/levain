@@ -218,3 +218,11 @@ def test_a_rollup_over_a_real_store(store):
         store.append(r)
     cells = rollup(store.rows(), min_n=4)
     assert cells[(("glm-5.2", "answered"),)].rate("adopted") == Fraction(3, 4)
+
+
+def test_a_run_index_past_sqlites_integer_is_refused_at_construction(store):
+    # codex: 2**63 escaped as a raw OverflowError from the bind, not a refusal
+    with pytest.raises(DispatchError, match="run_index"):
+        row(run=2 ** 63)
+    top = row(run=2 ** 63 - 1)
+    assert store.append(top) and store.rows() == [top]

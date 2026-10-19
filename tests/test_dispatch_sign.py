@@ -182,3 +182,22 @@ def test_a_passkey_key_gets_the_passkey_checks(job, keys, snapshot):
     recorded = to_sshsig(pk, bytes.fromhex(_FIX["authData_hex"]), _FIX["clientDataJSON"].encode(),
                          bytes.fromhex(_FIX["sig_der_hex"]), namespace=_FIX["namespace"])
     assert dsign.refusal(payload, recorded, snapshot, job) == "the contract signature does not verify"
+
+
+# --- fix round 2 (L3 r1) -----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field", sorted(dsign.PAYLOAD_KEYS))
+def test_an_oversized_payload_field_is_refused_before_anything_is_compared(job, keys, snapshot, field):
+    # glm: no bound on a payload string or the signature before verifying and storing
+    payload, sig = signed(job, keys["phone"], **{field: "x" * (dsign.FIELD_MAX + 1)})
+    assert dsign.refusal(payload, sig, snapshot, job) == (
+        f"a field of the dispatch signature record is over {dsign.FIELD_MAX} characters")
+
+
+def test_an_oversized_signature_is_refused_before_it_is_verified(job, keys, snapshot, monkeypatch):
+    payload, _sig = signed(job, keys["phone"])
+    called = []
+    monkeypatch.setattr(dsign, "verify_link_sig", lambda *a, **k: called.append(1) or True)
+    assert dsign.refusal(payload, "A" * (dsign.SIGNATURE_MAX + 1), snapshot, job) == (
+        f"the contract signature is over {dsign.SIGNATURE_MAX} characters")
+    assert called == []

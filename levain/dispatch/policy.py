@@ -20,7 +20,17 @@ is refused at load, the message naming its ``**/<pattern>`` form: gitignore's ha
 and a NEVER list written that way would leak ``app/.env``. NEVER matching casefolds both the pattern and the path,
 since a case-insensitive disk holds ``server.PEM`` as the same kind of file as ``server.pem``; casefolding NEVER only
 adds refusals. The read allowlists match exactly. A pattern or a path holding any control character (newline and tab
-included) or any space other than U+0020 is refused.
+included) or any space other than U+0020 is refused. A pattern not in Unicode NFC is refused at load: contract paths
+are NFC-only, so a decomposed pattern (``cafe\u0301``) could never match the composed path it looks like, and a NEVER
+rule written that way would let the file through.
+
+Matching one component is a linear glob loop (a ``*`` backtracks only to the last ``*`` seen), never a regular
+expression, so a many-star pattern against a long component that fails at its end costs at most the product of their
+lengths; the components are joined by a dynamic program over (pattern component, path component).
+
+A loaded policy is immutable all the way down: ``never`` is a tuple and ``providers`` a read-only view over the
+policy's own copy, so what :meth:`ProviderPolicy.refusal` judges and what :meth:`ProviderPolicy.content_hash` binds
+are one value.
 
 The policy is dispatch CONTROL STATE (design §3.2): the intent is that it lives in a signed, generation-checked store
 the control principal owns, which agent sessions can read and never write. That store is a later slice (F3); here the
@@ -34,6 +44,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from levain.contracts.canon import canonical_bytes
@@ -75,6 +86,9 @@ def _pattern_problem(pattern: Any) -> str | None:
     problem = path_text_problem(pattern, "pattern")
     if problem is not None:
         return f"{problem} ({pattern[:80]!r})"
+    if unicodedata.normalize("NFC", pattern) != pattern:
+        return (f"pattern {pattern[:80]!r} is not in Unicode NFC; contract paths are NFC-only, so it could never "
+                "match the path it looks like")
     if pattern.startswith("~"):
         return (f"pattern {pattern!r} is a home path; the policy judges repo-relative paths, so it could never "
                 "match (data outside the repo never enters the executor's worktree)")
@@ -90,19 +104,36 @@ def _pattern_problem(pattern: Any) -> str | None:
     return None
 
 
-def _component_regex(component: str) -> re.Pattern[str]:
-    out = []
-    for c in component:
-        out.append("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c))
-    return re.compile("".join(out), re.DOTALL)
+def _component_match(pattern: str, text: str) -> bool:
+    """One path component against one pattern component (``*`` any run, ``?`` one character, all else literal):
+    the iterative star-backtrack loop, which returns to the LAST ``*`` only, so it is O(len(pattern) * len(text)) at
+    worst and never exponential."""
+    p = t = 0
+    star = -1          # the pattern index of the last * seen
+    resume = 0         # the text index that * is now taken to end at
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == "*":
+            star, resume = p, t
+            p += 1
+        elif p < len(pattern) and (pattern[p] == "?" or pattern[p] == text[t]):
+            p += 1
+            t += 1
+        elif star >= 0:
+            resume += 1
+            p, t = star + 1, resume
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "*":
+        p += 1
+    return p == len(pattern)
 
 
 def match(pattern: str, path: str) -> bool:
     """True when the repo-relative POSIX ``path`` matches ``pattern`` (see the module docstring for the syntax).
-    Iterative over (pattern component, path component) positions, so no pattern costs more than their product."""
-    pats = pattern.split("/")
+    Iterative over (pattern component, path component) positions, each pair matched by a linear glob loop, so no
+    pattern costs more than the product of their lengths."""
     parts = path.split("/")
-    regexes = [None if p == "**" else _component_regex(p) for p in pats]
+    regexes: list[str | None] = [None if p == "**" else p for p in pattern.split("/")]
     # reach[j] is True when pattern components [0, i) can consume path components [0, j)
     reach = [True] + [False] * len(parts)
     last = len(regexes) - 1
@@ -120,7 +151,7 @@ def match(pattern: str, path: str) -> bool:
                 nxt[j] = seen
         else:
             for j in range(len(parts)):
-                if reach[j] and rx.fullmatch(parts[j]) is not None:
+                if reach[j] and _component_match(rx, parts[j]):
                     nxt[j + 1] = True
         reach = nxt
         if not any(reach):
@@ -157,6 +188,13 @@ class ProviderPolicy:
     :meth:`from_mapping`, which refuses every malformed input; both pattern lists are held sorted."""
     never: tuple[str, ...]
     providers: Mapping[str, tuple[str, ...]]
+
+    def __post_init__(self) -> None:
+        # immutable all the way down: a private copy behind a read-only view, every pattern list a tuple, so the
+        # value refusal() judges is the value content_hash() binds, whoever held the mapping it was built from
+        object.__setattr__(self, "never", tuple(self.never))
+        object.__setattr__(self, "providers", MappingProxyType(
+            {n: tuple(p) for n, p in sorted(dict(self.providers).items())}))
 
     @classmethod
     def from_mapping(cls, d: Any) -> ProviderPolicy:

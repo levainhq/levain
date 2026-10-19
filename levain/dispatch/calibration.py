@@ -60,10 +60,14 @@ class Label:
 @dataclass(frozen=True)
 class LabelSet:
     """What :func:`read_labels` found: the labels, how many grant-answered requests were left out and why they were
-    (see the module docstring), and how many rows the reader skipped because they did not check out."""
+    (see the module docstring), how many rows the reader skipped because they did not check out, and whether the set
+    is ``incomplete``: the queue listing overflowed its cap (more undecided requests than it reads, or more pending,
+    which it does not tell apart), so some requests were not read at all. Every report built from an incomplete set
+    says so, and :func:`proposal_eligible` refuses it."""
     labels: tuple[Label, ...] = ()
     excluded_grants: int = 0
     skipped: int = 0
+    incomplete: bool = False
 
 
 def _class_of(entry: ConsentEntry) -> ActionClass:
@@ -73,8 +77,8 @@ def _class_of(entry: ConsentEntry) -> ActionClass:
 
 def read_labels(directory: Path | str | None = None, *, now: datetime, span: timedelta = DEFAULT_SPAN) -> LabelSet:
     """The labels in the consent queue at ``directory`` (default: the queue's own directory) decided within ``span``
-    of ``now``, plus every undecided request however old. Read-only through :func:`read_listing`; a missing queue is
-    an empty set."""
+    of ``now``, plus every undecided request however old, up to the listing's cap: past it the set is marked
+    ``incomplete``. Read-only through :func:`read_listing`; a missing queue is an empty set."""
     listing = read_listing(directory, now=now, span=span, cap=_NO_CAP)
     labels: list[Label] = []
     grants = 0
@@ -89,7 +93,24 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
                                     entry.via, entry.decided_at))
             # an allowed or denied row with any other via carries no signed judgment this layer can name: left out
     labels.sort(key=lambda lab: (lab.decided_at or "", lab.request_id))
-    return LabelSet(tuple(labels), grants, listing.skipped)
+    return LabelSet(tuple(labels), grants, listing.skipped, listing.overflow)
+
+
+def _unique(labels: Iterable[Label] | LabelSet, incomplete: bool) -> tuple[list[Label], bool]:
+    """The labels once per request id, and whether the set they came from is incomplete. The same label twice (two
+    overlapping reads concatenated) counts once; two DIFFERENT labels for one request are refused, since one of them
+    is not his record."""
+    if isinstance(labels, LabelSet):
+        incomplete = incomplete or labels.incomplete
+        labels = labels.labels
+    seen: dict[str, Label] = {}
+    for lab in labels:
+        prior = seen.get(lab.request_id)
+        if prior is None:
+            seen[lab.request_id] = lab
+        elif prior != lab:
+            raise DispatchError(f"request {lab.request_id!r} carries two different labels; one request is one label")
+    return list(seen.values()), incomplete
 
 
 # --- deny rate -------------------------------------------------------------------------------------------------
@@ -97,21 +118,27 @@ def read_labels(directory: Path | str | None = None, *, now: datetime, span: tim
 @dataclass(frozen=True)
 class DenyRate:
     """``n`` allow and deny labels (undecided are NOT in it), ``denies`` of them denies, ``undecided`` kept apart.
-    ``rate`` is exact, ``None`` with no label to divide by."""
+    ``rate`` is exact, ``None`` with no label to divide by. ``incomplete``: the labels came from a set that did not
+    read every request (see :class:`LabelSet`)."""
     n: int
     denies: int
     undecided: int
+    incomplete: bool = False
 
     @property
     def rate(self) -> Fraction | None:
         return Fraction(self.denies, self.n) if self.n else None
 
 
-def deny_rate(labels: Iterable[Label], *, by_class: bool = True) -> dict[object, DenyRate]:
+def deny_rate(labels: Iterable[Label] | LabelSet, *, by_class: bool = True,
+              incomplete: bool = False) -> dict[object, DenyRate]:
     """How often he denied, with N: per action class (``by_class``) or under the single key ``"all"``. The
-    always-allow judge's score is ``1 - rate``; :func:`agreement` states that baseline per class."""
+    always-allow judge's score is ``1 - rate``; :func:`agreement` states that baseline per class. Each request counts
+    once (see :func:`agreement`); a :class:`LabelSet` passes its ``incomplete`` flag on to every rate, and a plain
+    iterable takes it from ``incomplete``."""
+    unique, incomplete = _unique(labels, incomplete)
     tally: dict[object, list[int]] = {}
-    for lab in labels:
+    for lab in unique:
         key: object = lab.action_class if by_class else "all"
         n, denies, undecided = tally.setdefault(key, [0, 0, 0])
         if lab.decision == "undecided":
@@ -119,7 +146,7 @@ def deny_rate(labels: Iterable[Label], *, by_class: bool = True) -> dict[object,
         else:
             tally[key][0] = n + 1
             tally[key][1] = denies + (lab.decision == "deny")
-    return {key: DenyRate(*vals) for key, vals in tally.items()}
+    return {key: DenyRate(n, denies, undecided, incomplete) for key, (n, denies, undecided) in tally.items()}
 
 
 # --- agreement -------------------------------------------------------------------------------------------------
@@ -133,7 +160,8 @@ class ClassReport:
     denied), ``judge_deny_human_allow`` the costly-but-safe one. ``abstained`` labelled requests the judge passed on;
     ``deny_rate`` his rate over every labelled request of the class. ``baseline_agreement`` is what an always-allow judge
     would have scored over the SAME predicted requests (his allows among them over ``n_predicted``), which is the
-    number the judge has to beat; over all labels that is ``1 - deny_rate``."""
+    number the judge has to beat; over all labels that is ``1 - deny_rate``. ``incomplete``: the labels came from a
+    set that did not read every request, so the counts may be short; :func:`proposal_eligible` refuses it."""
     action_class: ActionClass
     n_labelled: int
     n_predicted: int
@@ -144,6 +172,7 @@ class ClassReport:
     deny_rate: Fraction | None
     baseline_agreement: Fraction | None
     undecided: int = 0
+    incomplete: bool = False
     caveat: str = field(default=CAVEAT, compare=False)
 
     @property
@@ -151,15 +180,22 @@ class ClassReport:
         return Fraction(self.agree, self.n_predicted) if self.n_predicted else None
 
 
-def agreement(labels: Iterable[Label], predictions: Mapping[str, str]) -> dict[ActionClass, ClassReport]:
+def agreement(labels: Iterable[Label] | LabelSet, predictions: Mapping[str, str], *,
+              incomplete: bool = False) -> dict[ActionClass, ClassReport]:
     """Score a judge's ``predictions`` (request id -> allow, deny or abstain) against ``labels``, per action class.
     The judge is not called here. A prediction for a request with no allow/deny label (an undecided one, an unknown
-    id) is not scored. A labelled request the judge made no prediction for counts as abstained."""
+    id) is not scored. A labelled request the judge made no prediction for counts as abstained.
+
+    Each request counts ONCE: the same label repeated (overlapping reads concatenated) is counted once, and two
+    different labels for one request id are refused (:class:`DispatchError`), so N is the number of his decisions,
+    never of rows. A :class:`LabelSet` passes its ``incomplete`` flag to every report; for a plain iterable the
+    caller states it with ``incomplete``."""
     for rid, said in predictions.items():
         if said not in PREDICTIONS:
             raise DispatchError(f"prediction for {rid!r} must be one of {', '.join(PREDICTIONS)}: {said!r}")
+    unique, incomplete = _unique(labels, incomplete)
     seen: dict[ActionClass, dict[str, int]] = {}
-    for lab in labels:
+    for lab in unique:
         t = seen.setdefault(lab.action_class, dict.fromkeys(
             ("labelled", "denied", "predicted", "agree", "dangerous", "costly", "abstained", "undecided",
              "predicted_allowed"), 0))
@@ -185,7 +221,8 @@ def agreement(labels: Iterable[Label], predictions: Mapping[str, str]) -> dict[A
         out[cls] = ClassReport(
             cls, t["labelled"], t["predicted"], t["agree"], t["dangerous"], t["costly"], t["abstained"],
             Fraction(t["denied"], t["labelled"]) if t["labelled"] else None,
-            Fraction(t["predicted_allowed"], t["predicted"]) if t["predicted"] else None, t["undecided"])
+            Fraction(t["predicted_allowed"], t["predicted"]) if t["predicted"] else None, t["undecided"],
+            incomplete)
     return out
 
 
@@ -203,7 +240,8 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
     """Whether a class's measured agreement is enough for the M17 card to PROPOSE a grant for that class:
     ``(True, "")``, or ``(False, reason)`` naming every test that failed. All must hold: at least ``min_n`` predicted
     requests, agreement over those at least ``min_agreement``, coverage (predicted over labelled: how much of his
-    record the judge was willing to answer) at least ``min_coverage``, at most ``max_dangerous``
+    record the judge was willing to answer) at least ``min_coverage``, a COMPLETE label set (not ``incomplete``), at
+    most ``max_dangerous``
     judge-allow-human-deny disagreements, and agreement strictly above the always-allow baseline (a judge that merely
     says allow scores the same without reading anything). The coverage floor is required: without it a judge that
     abstains on every hard call can pass on the easy ones.
@@ -219,6 +257,8 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
     if not 0 <= coverage_floor <= 1:
         raise DispatchError("min_coverage must be between 0 and 1")
     why: list[str] = []
+    if report.incomplete:
+        why.append("the label set is incomplete (the queue listing overflowed its cap), so its counts may be short")
     if report.n_predicted < min_n:
         why.append(f"only {report.n_predicted} predicted requests, below min_n={min_n}")
     coverage = Fraction(report.n_predicted, report.n_labelled) if report.n_labelled else None

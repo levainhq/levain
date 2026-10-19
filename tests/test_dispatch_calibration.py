@@ -247,3 +247,49 @@ def test_min_coverage_is_required_and_validated():
     for bad in ("1.5", -1, "x", True):
         with pytest.raises(DispatchError):
             proposal_eligible(r, min_n=1, min_agreement="0.9", min_coverage=bad, max_dangerous=0)
+
+
+# --- fix round 2 (L3 r1) -----------------------------------------------------------------------------------------
+
+def test_a_request_counts_once_however_many_times_its_label_is_repeated():
+    # codex: one allow and one deny repeated twenty times scored as 40 decisions and passed min_n=30
+    labels = [L("1", A, "allow"), L("2", A, "deny")] * 20
+    preds = {"1": "allow", "2": "deny"}
+    r = agreement(labels, preds)[A]
+    assert (r.n_labelled, r.n_predicted, r.agree) == (2, 2, 2)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=0)
+    assert ok is False and "below min_n=30" in why
+    assert deny_rate(labels)[A].n == 2
+
+
+def test_two_different_labels_for_one_request_are_refused():
+    for other in (L("1", A, "deny"), L("1", B, "allow")):
+        with pytest.raises(DispatchError, match="two different labels"):
+            agreement([L("1", A, "allow"), other], {"1": "allow"})
+        with pytest.raises(DispatchError, match="two different labels"):
+            deny_rate([L("1", A, "allow"), other])
+
+
+def test_an_overflowing_listing_marks_the_set_incomplete_and_no_proposal_rests_on_it(monkeypatch):
+    # codex + complement: the undecided cap dropped requests with no signal
+    from levain.consent import listing as listing_mod
+    from levain.dispatch import calibration as cal
+    full = listing_mod.ConsentListing(overflow=True)
+    monkeypatch.setattr(cal, "read_listing", lambda *a, **k: full)
+    got = read_labels("/nonexistent", now=datetime(2026, 10, 19, tzinfo=timezone.utc))
+    assert got.incomplete is True
+    monkeypatch.setattr(cal, "read_listing", lambda *a, **k: listing_mod.ConsentListing())
+    assert read_labels("/nonexistent", now=datetime(2026, 10, 19, tzinfo=timezone.utc)).incomplete is False
+
+    labels = [L(f"a{i}", A, "allow") for i in range(30)] + [L(f"d{i}", A, "deny") for i in range(10)]
+    preds = {lab.request_id: lab.decision for lab in labels}
+    from levain.dispatch.calibration import LabelSet
+    r = agreement(LabelSet(tuple(labels), incomplete=True), preds)[A]
+    assert r.incomplete is True
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=0)
+    assert ok is False and "incomplete" in why
+    assert all(rate.incomplete for rate in deny_rate(LabelSet(tuple(labels), incomplete=True)).values())
+    complete = agreement(LabelSet(tuple(labels)), preds)[A]
+    assert complete.incomplete is False
+    assert proposal_eligible(complete, min_n=30, min_agreement="0.9", min_coverage=0, max_dangerous=0) == (True, "")
+    assert agreement(labels, preds, incomplete=True)[A].incomplete is True
