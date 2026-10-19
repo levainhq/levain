@@ -137,8 +137,8 @@ from levain.consent.record import (
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
-           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent", "authority_source",
-           "default_queue_dir", "gap_label", "session_handle"]
+           "ANSWER_KEYS", "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent",
+           "answer_refusal", "authority_source", "default_queue_dir", "gap_label", "session_handle", "signer_refusal"]
 
 DB_NAME = "queue.db"
 STORE_FORMAT = "levain-consent-queue/4"
@@ -146,8 +146,10 @@ STORE_FORMAT = "levain-consent-queue/4"
 PRIOR_FORMAT = "levain-consent-queue/3"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn", "undecided")
 TERMINAL: frozenset[str] = frozenset({"allowed", "denied", "expired", "withdrawn"})
-_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
-                          "signer_fp", "signed_at", "receipts_head"})
+# the keys of a signed answer record (``ANSWER_FORMAT``); public so another store's answers are checked by the same set
+ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
+                         "signer_fp", "signed_at", "receipts_head"})
+_ANSWER_KEYS = ANSWER_KEYS
 _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
@@ -526,6 +528,94 @@ def default_queue_dir() -> Path:
     (as ``levain.autonomic.db.default_store_dir`` does for the autonomic store)."""
     home = os.environ.get("LEVAIN_HOME")
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "consent").resolve()
+
+
+def answer_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any, authority: Any, *,
+                   ssh_keygen: Path | str | None = None, unchained_ok: bool = False) -> str | None:
+    """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
+    verifies. The one check an answer passes to be stored AND again every time it is delivered, in any store that
+    holds levain consent answers; applying one also checks its ``receipts_head`` against that store's receipts
+    (:func:`~levain.consent.receipt_log.head_refusal`, inside the applying write transaction, as
+    :meth:`ConsentQueue.answer` does), which this does not. ``unchained_ok`` (delivery and the verifier,
+    never the apply): an answer in the format from before the chaining is checked as that format, every
+    check but the head's, since it has none. ``authority`` is an :class:`AuthoritySnapshot` or any object whose
+    ``key(fingerprint)`` returns ``None`` or a key with ``public_key``, ``fingerprint``, ``active``, ``key_class`` and
+    ``custody``; ``ssh_keygen`` is the verifier binary (default: levain's own resolution)."""
+    unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
+    if unchained and not unchained_ok:
+        return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
+                "chained: it covers no receipts head; answer the request again")
+    if not isinstance(payload, Mapping) \
+            or set(payload) != (_ANSWER_KEYS_UNCHAINED if unchained else _ANSWER_KEYS):
+        return "the answer is not an answer record"
+    if not unchained:
+        if payload["format"] != ANSWER_FORMAT:
+            return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
+        problem = head_problem(payload["receipts_head"])
+        if problem is not None:
+            return f"the answer's {problem}"
+    if payload["queue_id"] != queue_id:
+        return "the answer names another queue"
+    if payload["request_id"] != request.id:
+        return "the answer is for another request"
+    if payload["request_digest"] != request.digest:
+        return "the answer signs another version of this request"
+    if payload["expires_at"] != request.expires_at:
+        return "the answer names another expiry"
+    signed_at = payload["signed_at"]
+    try:
+        parse_stamp(signed_at)
+    except ConsentError:
+        return "the answer's signed_at is not a timestamp"
+    if signed_at < request.received_at:
+        return "the answer was signed before the request was filed"
+    if signed_at >= request.expires_at:
+        return "the answer was signed after the request expired"
+    decision = payload["decision"]
+    if decision not in DECISIONS:
+        return f"decision {decision!r} is not one of {DECISIONS}"
+    return signer_refusal(request, payload, signature, authority, noun="answer", encode_record=answer_message,
+                          namespace=ANSWER_NAMESPACE, ssh_keygen=ssh_keygen)
+
+
+def signer_refusal(request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any, authority: Any, *,
+                   noun: str, encode_record: Callable[[dict[str, Any]], bytes], namespace: str,
+                   ssh_keygen: Path | str | None = None) -> str | None:
+    """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
+    ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
+    ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
+    decision = payload["decision"]
+    signer_fp = payload["signer_fp"]
+    key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
+    if key is None:
+        return "the signer is not an enrolled key"
+    if not key.active:
+        return "the signer's key is revoked"
+    if decision == "allow" and request is None:
+        return f"an allow {noun} names no request"
+    if decision == "allow" and not class_covers(key.key_class, request.tier):
+        return f"key class {key.key_class} does not cover {request.tier}"
+    if not isinstance(signature, str) or not signature:
+        return f"the {noun} carries no signature"
+    if key.custody == PASSKEY:
+        # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
+        # verification, not only where the phone port converted the assertion
+        from levain.consent.passkey import answer_signature_problem
+
+        problem = answer_signature_problem(signature, key.public_key)
+        if problem is not None:
+            return problem
+    try:
+        message = encode_record(dict(payload))
+    except ConsentError as exc:
+        return f"the {noun} cannot be encoded: {exc}"
+    kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
+    try:
+        ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+                             namespace=namespace, **kwargs)
+    except VerifierUnavailable as exc:
+        return f"the {noun} could not be verified: {exc}"
+    return None if ok else f"the {noun}'s signature does not verify"
 
 
 class AuthoritySource:
@@ -1221,86 +1311,16 @@ class ConsentQueue:
     # --- answers -------------------------------------------------------------------------------------
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
                  authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
-        """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
-        verifies. The one check an answer passes to be stored AND again every time it is delivered; applying it
-        also checks its ``receipts_head`` against the log (:func:`~levain.consent.receipt_log.head_refusal`, in
-        :meth:`answer`'s write transaction), which this does not. ``unchained_ok`` (delivery and the verifier,
-        never the apply): an answer in the format from before the chaining is checked as that format, every
-        check but the head's, since it has none."""
-        unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
-        if unchained and not unchained_ok:
-            return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
-                    "chained: it covers no receipts head; answer the request again")
-        if not isinstance(payload, Mapping) \
-                or set(payload) != (_ANSWER_KEYS_UNCHAINED if unchained else _ANSWER_KEYS):
-            return "the answer is not an answer record"
-        if not unchained:
-            if payload["format"] != ANSWER_FORMAT:
-                return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
-            problem = head_problem(payload["receipts_head"])
-            if problem is not None:
-                return f"the answer's {problem}"
-        if payload["queue_id"] != queue_id:
-            return "the answer names another queue"
-        if payload["request_id"] != request.id:
-            return "the answer is for another request"
-        if payload["request_digest"] != request.digest:
-            return "the answer signs another version of this request"
-        if payload["expires_at"] != request.expires_at:
-            return "the answer names another expiry"
-        signed_at = payload["signed_at"]
-        try:
-            parse_stamp(signed_at)
-        except ConsentError:
-            return "the answer's signed_at is not a timestamp"
-        if signed_at < request.received_at:
-            return "the answer was signed before the request was filed"
-        if signed_at >= request.expires_at:
-            return "the answer was signed after the request expired"
-        decision = payload["decision"]
-        if decision not in DECISIONS:
-            return f"decision {decision!r} is not one of {DECISIONS}"
-        return self._signer_refusal(request, payload, signature, authority, noun="answer",
-                                    encode_record=answer_message, namespace=ANSWER_NAMESPACE)
+        """:func:`answer_refusal` with this queue's verifier."""
+        return answer_refusal(request, queue_id, payload, signature, authority, ssh_keygen=self._ssh_keygen,
+                              unchained_ok=unchained_ok)
 
     def _signer_refusal(self, request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any,
                         authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
                         namespace: str) -> str | None:
-        """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
-        ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
-        ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
-        decision = payload["decision"]
-        signer_fp = payload["signer_fp"]
-        key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
-        if key is None:
-            return "the signer is not an enrolled key"
-        if not key.active:
-            return "the signer's key is revoked"
-        if decision == "allow" and request is None:
-            return f"an allow {noun} names no request"
-        if decision == "allow" and not class_covers(key.key_class, request.tier):
-            return f"key class {key.key_class} does not cover {request.tier}"
-        if not isinstance(signature, str) or not signature:
-            return f"the {noun} carries no signature"
-        if key.custody == PASSKEY:
-            # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
-            # verification, not only where the phone port converted the assertion
-            from levain.consent.passkey import answer_signature_problem
-
-            problem = answer_signature_problem(signature, key.public_key)
-            if problem is not None:
-                return problem
-        try:
-            message = encode_record(dict(payload))
-        except ConsentError as exc:
-            return f"the {noun} cannot be encoded: {exc}"
-        kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
-        try:
-            ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
-                                 namespace=namespace, **kwargs)
-        except VerifierUnavailable as exc:
-            return f"the {noun} could not be verified: {exc}"
-        return None if ok else f"the {noun}'s signature does not verify"
+        """:func:`signer_refusal` with this queue's verifier."""
+        return signer_refusal(request, payload, signature, authority, noun=noun, encode_record=encode_record,
+                              namespace=namespace, ssh_keygen=self._ssh_keygen)
 
     def _ruling_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any,
                         signature: Any, authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
