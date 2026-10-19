@@ -239,7 +239,11 @@ USER_CONFIG_NAME = ".claude.json"
 # linked worktree's or a submodule's git directory) is agent config (L3 r2 G1'): tagged by path, never parsed.
 GIT_STATE_DIRS = frozenset({"objects", "refs", "logs"})
 GIT_STATE_FILES = frozenset({"head", "index", "packed-refs", "orig_head", "fetch_head", "commit_editmsg"})
-GIT_ASK_TIMEOUT = 2.0        # seconds one ``git rev-parse --git-path hooks`` may take
+# Asking git where hooks run (L3 r3 G1): from a fixed binary, never one the session's PATH finds; within one gate
+# call's budget, at most GIT_QUERIES repositories asked and GIT_BUDGET_SECONDS spent, past which a target is tagged.
+GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+GIT_QUERIES = 4
+GIT_BUDGET_SECONDS = 3.0
 
 
 # The names a file inside a directory is probed under, so that a directory is agent config exactly when a file the
@@ -320,47 +324,106 @@ def global_git_configs(home: Path) -> tuple[Path, ...]:
     return tuple(out)
 
 
-def _git_env() -> dict[str, str]:
-    """The environment git is asked in: the absolute entries of ``PATH`` (``os.defpath`` when none), ``HOME`` from
-    :func:`operator_home`, ``LANG=C``, nothing else (no ``GIT_*``, no ``XDG_*``): the answer is what the operator's
-    own shell would get, not what an agent-set variable says."""
-    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(p)]
-    return {"PATH": os.pathsep.join(entries) or os.defpath, "HOME": str(operator_home()), "LANG": "C"}
+_GIT_BINARY: list[str | None] = []   # resolved once per process: [path] or [None]
+GIT_TAGGED = "tagged"                # a repository answer that tags every target asked of it (fail closed)
 
 
-def _ask_git_hooks(directory: Path) -> Path | None:
-    """``git -C <directory> rev-parse --git-path hooks``: git's own answer to where the repository holding
-    ``directory`` runs hooks from (``core.hooksPath`` from every config file git reads, includes, linked worktrees
-    and submodules applied), absolute (a relative answer is relative to ``directory``). ``None`` when git is not
-    found, fails, or takes longer than :data:`GIT_ASK_TIMEOUT` (not a repository, a config git cannot read): git
-    could not run hooks from that repository either. ``rev-parse`` runs no hooks and nothing is overridden."""
-    env = _git_env()
-    git = shutil.which("git", path=env["PATH"])
-    if not git or not os.path.isabs(git):
-        return None
-    try:
-        got = subprocess.run([git, "-C", str(directory), "rev-parse", "--git-path", "hooks"], env=env,
-                             stdin=subprocess.DEVNULL, capture_output=True, timeout=GIT_ASK_TIMEOUT, check=False)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    answer = got.stdout.decode("utf-8", "surrogateescape").rstrip("\r\n") if got.returncode == 0 else ""
-    if not answer or "\n" in answer:
-        return None
-    return Path(answer) if os.path.isabs(answer) else directory / answer
+def git_binary() -> str | None:
+    """The git the gate asks: the first existing executable of :data:`GIT_CANDIDATES`, resolved once. Never found
+    through ``PATH`` (L3 r3 G1: a session's PATH can name a workspace ``bin/`` holding a planted ``git``)."""
+    if not _GIT_BINARY:
+        _GIT_BINARY.append(next((g for g in GIT_CANDIDATES if os.path.isfile(g) and os.access(g, os.X_OK)), None))
+    return _GIT_BINARY[0]
 
 
-def git_hooks_dirs(dirs: Iterable[Path], cache: dict[Any, Any] | None = None) -> set[Path]:
-    """The hooks directories git answers (:func:`_ask_git_hooks`) for each of ``dirs``, git asked once per
-    directory per ``cache`` (one gate call's)."""
-    asked = (cache if cache is not None else {}).setdefault("git_hooks", {})
-    out: set[Path] = set()
-    for d in dirs:
-        key = str(d)
-        if key not in asked:
-            asked[key] = _ask_git_hooks(d)
-        if asked[key] is not None:
-            out.add(asked[key])
-    return out
+def _git_envs() -> list[dict[str, str]]:
+    """The environments git is asked in: ``PATH`` = ``os.defpath``, ``HOME`` from :func:`operator_home`,
+    ``LANG``/``LC_ALL`` = ``C``, nothing else (no ``GIT_*``, no ``XDG_*``); and, when this process's
+    ``XDG_CONFIG_HOME`` is absolute, the same with it set (L3 r3 G1: the operator's own git reads its global config
+    there). Both answers count."""
+    base = {"PATH": os.defpath, "HOME": str(operator_home()), "LANG": "C", "LC_ALL": "C"}
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return [base, {**base, "XDG_CONFIG_HOME": xdg}] if xdg and os.path.isabs(xdg) else [base]
+
+
+def _git_budget(cache: dict[Any, Any]) -> dict[str, Any]:
+    """One gate call's git state, in its ``cache``: answers by repository top-level (``scopes``), by directory
+    asked (``asked``), queries spent and the deadline (set at the first query)."""
+    return cache.setdefault("git", {"scopes": {}, "asked": {}, "queries": 0, "deadline": None})
+
+
+def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
+    """``git -C <directory> rev-parse --path-format=absolute --show-toplevel --git-path hooks``, one spawn per
+    environment (:func:`_git_envs`): git's own answer to where the repository holding ``directory`` runs hooks from
+    (``core.hooksPath`` from every config file git reads, includes, linked worktrees and submodules applied), the
+    hooks directories as a set, recorded under the repository's top-level. Exit 128 saying "not a git repository"
+    is no repository (an empty set, recorded for ``directory``'s ancestors up to its mount point, which git's own
+    search covered). Any other failure, a timeout, more than two lines, the budget spent (:data:`GIT_QUERIES`,
+    :data:`GIT_BUDGET_SECONDS`): :data:`GIT_TAGGED`. No git at :data:`GIT_CANDIDATES`: an empty set, no query
+    spent (no git, no hooks run). An older git (< 2.31) echoes the unknown ``--path-format`` and prints a relative
+    answer relative to ``directory`` (measured on 2.50 without the option), which is how it is joined.
+    ``rev-parse`` runs no hooks."""
+    git = git_binary()
+    if git is None:
+        return frozenset()
+    if state["queries"] >= GIT_QUERIES:
+        return GIT_TAGGED
+    state["queries"] += 1
+    if state["deadline"] is None:
+        state["deadline"] = time.monotonic() + GIT_BUDGET_SECONDS
+    hooks: set[Path] = set()
+    top: str | None = None
+    for env in _git_envs():
+        left = state["deadline"] - time.monotonic()
+        if left <= 0:
+            return GIT_TAGGED
+        try:
+            got = subprocess.run([git, "-C", directory, "rev-parse", "--path-format=absolute", "--show-toplevel",
+                                  "--git-path", "hooks"], env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                                 timeout=left, check=False)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return GIT_TAGGED
+        if got.returncode == 128 and b"not a git repository" in got.stderr:
+            continue
+        lines = got.stdout.decode("utf-8", "surrogateescape").splitlines()
+        if lines and lines[0] == "--path-format=absolute":
+            lines = lines[1:]
+        if got.returncode != 0 or len(lines) != 2 or not os.path.isabs(lines[0]) or not lines[1]:
+            return GIT_TAGGED
+        top = lines[0]
+        hooks.add(Path(lines[1]) if os.path.isabs(lines[1]) else Path(directory) / lines[1])
+    answer = frozenset(hooks)
+    if top is not None:
+        state["scopes"][top] = answer
+    else:
+        d = Path(directory)
+        while True:
+            state["scopes"].setdefault(str(d), answer)
+            if d.parent == d or os.path.ismount(d):
+                break
+            d = d.parent
+    return answer
+
+
+def _git_answer(directory: Path, cache: dict[Any, Any]) -> frozenset[Path] | str:
+    """The hooks directories of the repository holding ``directory`` (real, existing): an answer already in
+    ``cache`` for a repository top-level (or a no-repository ancestor) reached from ``directory`` without passing a
+    directory that could start another repository (one holding a ``.git`` or a ``HEAD``, or a mount point), else
+    :func:`_ask_git`. So every target inside the cwd's repository reuses its answer, and a nested repository
+    (a submodule) is asked its own."""
+    state = _git_budget(cache)
+    key = str(directory)
+    if key in state["asked"]:
+        return state["asked"][key]
+    d = directory
+    while True:
+        if str(d) in state["scopes"]:
+            return state["scopes"][str(d)]
+        if os.path.lexists(d / ".git") or os.path.lexists(d / "HEAD") or os.path.ismount(d) or d.parent == d:
+            break
+        d = d.parent
+    state["asked"][key] = got = _ask_git(key, state)
+    return got
 
 
 def _nearest_dir(start: Path) -> Path:
@@ -373,16 +436,22 @@ def _nearest_dir(start: Path) -> Path:
 
 def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None) -> bool:
     """``path`` lies under a directory git runs hooks from (husky's ``.husky/``, a ``.githooks/``, an absolute
-    ``core.hooksPath`` outside the worktree) for the repository of the event's ``cwd`` or of the target's nearest
-    existing ancestor directory, as git answers (:func:`git_hooks_dirs`). ``cache`` is one call's, shared by its
-    candidates."""
+    ``core.hooksPath`` outside the worktree) for the repository of the event's ``cwd`` (its nearest existing
+    directory) or of the target's nearest existing ancestor directory, as git answers (:func:`_git_answer`), the
+    cwd's answer checked first. An answer git could not give in the call's budget (:data:`GIT_TAGGED`) tags the
+    target. ``cache`` is one gate call's, shared by its candidates."""
     cache = cache if cache is not None else {}
     try:
-        dirs = [Path(cwd)] if cwd and os.path.isabs(cwd) else []
+        dirs = [_nearest_dir(Path(cwd))] if cwd and os.path.isabs(cwd) else []
         dirs.append(_nearest_dir(path.parent))
-        hooks = tuple({s for h in git_hooks_dirs(dirs, cache)
-                       for s in (os.path.normpath(h).lower(), os.path.realpath(h).lower())})
-        return _under(path, hooks)
+        for d in dirs:
+            got = _git_answer(Path(os.path.realpath(d)), cache)
+            if isinstance(got, str):   # GIT_TAGGED
+                return True
+            hooks = tuple({s for h in got for s in (os.path.normpath(h).lower(), os.path.realpath(h).lower())})
+            if _under(path, hooks):
+                return True
+        return False
     except (OSError, ValueError):
         return True   # a path that cannot be examined is tagged, as the other checks do
 
@@ -519,7 +588,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     (:func:`names_config_dir`), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
     missing one). Other tools are never tagged: Bash is not parsed (ruling 1). ``git_cache`` is one gate call's,
-    shared across the calls a caller makes for it (Codex's patch headers), so git is asked once per directory."""
+    shared across the calls a caller makes for it (Codex's patch headers), so git is asked once per repository within
+    one budget (:func:`_git_answer`)."""
     targets = _targets(tool_name, tool_input)
     if targets is None and not tool_name.startswith("mcp__"):
         return False
@@ -536,7 +606,7 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
-        git_cache = git_cache if git_cache is not None else {}   # git asked once per directory, per call
+        git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
         home = Path(home)
         # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
         # ``~/.config/git/config``, the XDG one), which every repository reads executables from (L3 r1 G1c, r2 G1')
@@ -1182,7 +1252,7 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    An event with no valid ``tool_name``, ``cwd`` or session id is denied when its tool is unnamed, a file tool or
+    An event with no valid ``tool_name``, absolute ``cwd`` or session id is denied when its tool is unnamed, a file tool or
     an MCP tool (:func:`_malformed`). A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
     or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
     allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
@@ -1203,7 +1273,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return None
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = _session_of(event)
-    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd or session is None:
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not os.path.isabs(cwd) \
+            or session is None:
         return _malformed(event, queue, settings, home=home)
     if tool_input is None:
         tool_input = {}
@@ -1238,8 +1309,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
 
 def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, *,
                home: Path | None) -> dict[str, Any] | None:
-    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, ``cwd`` or session id (L3 r1 G4,
-    r2 G4'): fail closed, as Codex's gate does, for every call whose targets can be gated: a deny with the
+    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, absolute ``cwd`` or session id (L3 r1 G4,
+    r2 G4', r3: a relative cwd anchors nothing): fail closed, as Codex's gate does, for every call whose targets can be gated: a deny with the
     irreversible tier's hard stop when the tool is unnamed, a file tool (:data:`FILE_TOOLS`, the ones
     :func:`levain.consent.policy.targets` reads a path from) or an MCP tool, never classified (a relative target
     cannot be anchored without ``cwd``, and the event is not trusted to say what it is). Any other named tool (Bash,
@@ -1249,7 +1320,7 @@ def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     cwd = event.get("cwd")
     missing = [k for k, ok in (("session_id", _session_of(event) is not None),
                                ("tool_name", isinstance(tool_name, str) and bool(tool_name)),
-                               ("cwd", isinstance(cwd, str) and bool(cwd))) if not ok]
+                               ("cwd", isinstance(cwd, str) and os.path.isabs(cwd))) if not ok]
     named = isinstance(tool_name, str) and bool(tool_name)
     if named and tool_name not in FILE_TOOLS and not tool_name.startswith("mcp__"):
         return None
