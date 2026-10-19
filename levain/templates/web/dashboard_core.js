@@ -580,8 +580,14 @@
         first.appendChild(el("b", null, name || "This install"));
         second.textContent = today;
       } else {
-        first.appendChild(el("b", null, "No wraps yet"));
-        second.textContent = [name, today].filter(Boolean).join(" · ") || "a fresh install";
+        const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : 0;
+        if (total > 0) {   // the history list was not sent but the health panel counts wraps: a count, never "none yet"
+          first.appendChild(el("b", null, total + (total === 1 ? " wrap" : " wraps")));
+          second.textContent = [name, today].filter(Boolean).join(" · ");
+        } else {
+          first.appendChild(el("b", null, "No wraps yet"));
+          second.textContent = [name, today].filter(Boolean).join(" · ") || "a fresh install";
+        }
       }
     }
     box.append(first, second);
@@ -727,6 +733,10 @@
     pruneLineTiles();     // the last render's tiles went with their cards: nothing may keep watching them
     for (const f of fitLines) f();
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.fitWidgets) window.LevainCockpitKinds.fitWidgets(region);   // after attach: the room a tile has is only known on the page
+    if (!region.dataset.ckWatched && typeof MutationObserver === "function") {   // the glance tiles alone can change: the strip's count and shape follow them
+      region.dataset.ckWatched = "1";
+      new MutationObserver(scheduleLayout).observe(region, { childList: true });
+    }
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
     region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
   }

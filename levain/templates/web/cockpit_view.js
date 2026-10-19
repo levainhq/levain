@@ -1699,7 +1699,7 @@
   // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
   // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
   // part it keeps as `key=value`. The name is read with that suffix removed and, when the address is rewritten, written bare.
-  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => p.replace(/=$/, ""));
+  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => (MODES.indexOf(p.replace(/=$/, "")) >= 0 ? p.replace(/=$/, "") : p));
   function hashMode() { return hashParts().find((p) => MODES.indexOf(p) >= 0) || ""; }
   // the address follows the tab the reader chose; any other fragment part stays
   function writeHash(m) {
@@ -1721,9 +1721,8 @@
     const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean);
     if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
   }
-  // The grids keep their designed widths whatever a mode hides (10-14: a lone widget or a lone Work card stretched
-  // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
-  // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
+  // The grids are laid out from what a mode shows: the glance is a strip sharing its row (tiles from four), and a zone grid is six
+  // tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }
   // A card with nothing to list is its header and the one empty-state line, not a populated card's height with a gap in it.
   // Decided at render (this runs after each one): a card the person is filtering keeps its height, since the filter is the

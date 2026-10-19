@@ -45,6 +45,7 @@ def test_morning_draws_the_tray_the_full_width_of_the_page(tmp_path: Path) -> No
     ])
     assert vals[1] == "morning", vals
     assert vals[2] is not None, "no visible Tray on Morning"
+    assert vals[2]["inCol"] is True, vals                                       # the Tray sits inside .ck-col, not as a direct grid child
     assert vals[2]["share"] > 0.95, vals                                        # found inside .ck-col (display: contents), not as a direct child
 
 

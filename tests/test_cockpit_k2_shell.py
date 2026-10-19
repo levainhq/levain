@@ -253,6 +253,7 @@ const bad = head("wraps", "visual", "Wraps", { status: "error", error: "boom" })
 out.withTotal = build(true, good(50), 312);
 out.cappedNoTotal = build(false, good(50), 0);
 out.underCapNoTotal = build(false, good(3), 0);
+out.emptyWithTotal = build(true, good(0), 7);
 out.faultedWithHealth = build(true, bad, 41);
 out.faultedNoHealth = build(false, bad, 0);
 """ % json.dumps(_FIGS), tmp_path)
@@ -267,6 +268,7 @@ for (const k of Object.keys(V)) out.l[k] = wrapLineOf(V[k]).kids.map((x) => x.te
     assert out["withTotal"][1] == "312 wraps"                  # the health panel's total beats the held list
     assert out["cappedNoTotal"][1] == "50+ wraps"              # a full history list is a floor, not a count
     assert out["underCapNoTotal"][1] == "3 wraps held"
+    assert out["emptyWithTotal"][0] == "7 wraps", out["emptyWithTotal"]   # a count with no list is a count, never "No wraps yet"
     for k in ("faultedWithHealth", "faultedNoHealth"):         # an unreadable wraps panel is no evidence of "never"
         assert "No wraps yet" not in out[k][0], (k, out[k])
         assert not any("wrap" in x.lower() for x in out[k]), (k, out[k])
@@ -275,7 +277,7 @@ for (const k of Object.keys(V)) out.l[k] = wrapLineOf(V[k]).kids.map((x) => x.te
 
 def test_a_deep_link_survives_the_write_token_strip(tmp_path: Path) -> None:
     """The cockpit is opened as `#write_token=T&memory`; dashboard_boot.js strips the token (URLSearchParams spells the rest
-    `memory=`), and cockpit_view.js, loaded after it as the page orders its scripts, must still open that tab."""
+    `memory=`), and cockpit_view.js, which the page loads in the head (before boot, while the document is still loading), must still open that tab."""
     drv = tmp_path / "deep.js"
     drv.write_text(r"""
 const fs = require("fs");
@@ -287,10 +289,14 @@ globalThis.history = { replaceState: (a, b, url) => { globalThis.location.hash =
 globalThis.localStorage = { getItem: (k) => store[k] || null, setItem: (k, v) => { store[k] = v; }, removeItem: (k) => { delete store[k]; } };
 globalThis.fetch = () => Promise.reject(new Error("offline"));
 const node = () => ({ dataset: {}, classList: { add() {}, contains: () => false, toggle() {}, remove() {} }, addEventListener() {}, setAttribute() {}, appendChild() {}, append() {} });
-globalThis.document = { readyState: "complete", visibilityState: "visible", activeElement: null, body: node(), documentElement: node(), addEventListener() {},
+const ready = [];
+globalThis.document = { readyState: "loading", visibilityState: "visible", activeElement: null, body: node(), documentElement: node(),
+  addEventListener: (t, f) => { if (t === "DOMContentLoaded") ready.push(f); },
   querySelectorAll: () => [], querySelector: () => null, getElementById: () => null, createElement: node, createElementNS: node, createTextNode: () => node() };
-new Function(boot)();                 // page order: dashboard_boot.js first
-new Function(view)();                 // then cockpit_view.js
+new Function(view)();                 // dashboard.html's order: cockpit_view.js in the head, the document still loading
+new Function(boot)();                 // then dashboard_boot.js at the foot
+globalThis.document.readyState = "interactive";
+for (const f of ready.slice()) f();   // the document is ready: the handlers run in registration order
 const K = globalThis.LevainCockpitKinds;
 console.log(JSON.stringify({ hash: globalThis.location.hash, mode: K.hashMode(), token: store.levain_write_token || null }));
 process.exit(0);                      // the page's repaint interval would keep node alive
@@ -316,6 +322,17 @@ K.applyMode("build", true);
 out.written = calls;
 """, tmp_path)
     assert out["read"] == "memory" and out["written"] == ["/#build"], out
+
+
+def test_a_fragment_part_that_is_not_a_tab_keeps_its_equals(tmp_path: Path) -> None:
+    out = run_node(r"""
+globalThis.location = { hash: "#key=&memory=", search: "", pathname: "/" };
+const calls = [];
+globalThis.history = { replaceState: (a, b, url) => calls.push(url) };
+K.applyMode("build", true);
+out.written = calls;
+""", tmp_path)
+    assert out["written"] == ["/#key=&build"], out
 
 
 def test_the_legacy_page_keeps_only_the_two_mode_rules_it_had() -> None:
@@ -378,3 +395,8 @@ def test_the_band_wrap_cap_is_the_kernels_wrap_history_limit():
     src = Path(dashboard.__file__).read_text()
     kernel_cap = int(re.search(r"max_wraps: int = (\d+)", src).group(1))
     assert page_cap == kernel_cap
+
+
+def test_the_glance_tiles_alone_ask_for_the_layout_again() -> None:
+    src = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
+    assert re.search(r'new MutationObserver\(scheduleLayout\)\.observe\(region, \{ childList: true \}\)', src)
