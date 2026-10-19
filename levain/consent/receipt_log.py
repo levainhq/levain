@@ -15,7 +15,10 @@ no schema change and no stored hash: the log is COMPUTED from the rows every tim
     its receipts, checked inside the write transaction that applies it (:func:`head_refusal`). So the operator's
     signature attests every receipt before it: no mediator's signature, no key but his;
   - :func:`verify` recomputes the log and checks every stored signed answer's head against it
-    (``levain consent receipts verify``).
+    (``levain consent receipts verify``). An answer applied before the chaining (``.../1``) has its signature
+    re-verified and is listed as signed before chaining; one signed by a key revoked SINCE (its signature good under
+    that key) is listed as such. Neither is a failure: only a head that does not match, a signature that does not
+    verify, a key never enrolled or marked compromised, or an unreadable log is.
 
 Known edges (each stated, none built against):
   - a rewrite of receipts after the last signed head (the unsigned tail: grant answers, expiries, undecided marks,
@@ -23,8 +26,10 @@ Known edges (each stated, none built against):
     signs again;
   - the heads :func:`verify` checks are read from request rows, which a raw writer can also delete or rewrite:
     deleting the rows of the latest signed answers moves the last signed head back (the tail it reports grows);
+  - delivery checks a stored head's shape, never the log: an answer applied before a rewrite still delivers; the
+    next apply and :func:`verify` are what see the rewrite;
   - recomputing a head reads and hashes every receipt up to its size: linear in the log, per signed answer
-    applied and per distinct head verified;
+    applied and per distinct head verified (71-136 ms for a head over 10,000 receipts, measured 10-19);
   - the authority ledger (:mod:`levain.consent.ledger`) is not part of this log;
   - a writer who also holds an enrolled key can sign a head over anything: the key is the root of trust.
 
@@ -35,13 +40,15 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from pathlib import Path
 from typing import Any
 
 from levain.contracts import merkle
 
-__all__ = ["HEAD_KEYS", "Report", "SignedHead", "head", "head_problem", "head_refusal", "leaf", "leaves", "verify"]
+__all__ = ["HEAD_KEYS", "Report", "Revoked", "SignedHead", "head", "head_problem", "head_refusal", "leaf", "leaves",
+           "verify"]
 
 HEAD_KEYS = frozenset({"size", "root"})
 _LEAF_SQL = "SELECT seq, request_id, state, created_at, face FROM receipts ORDER BY seq"
@@ -125,22 +132,47 @@ class SignedHead:
 
 
 @dataclass(frozen=True)
+class Revoked:
+    """A stored signed answer or ruling whose signature verifies under a key the authority log has revoked SINCE
+    (revoked, never marked compromised): information, never a chain failure. Delivery still delivers nothing for
+    it. ``head_checked``: it carries a head and that head matches (an unchained one has none to check)."""
+    request_id: str
+    signer_fp: str
+    head_checked: bool
+
+
+@dataclass(frozen=True)
 class Report:
     """What :func:`verify` found. ``receipts``: the log's size. ``last_signed``: the matching signed head of the
-    greatest size (the latest signed among equals), or ``None``. ``unsigned_tail``: receipts after it.
-    ``unchained``: requests answered in a format signed before the receipts were chained (no head; listed, never
-    failures). ``mismatches``: ``(request_id, reason)`` for every signed answer or ruling that does not verify now
-    or whose head does not match. ``ok`` only with no mismatch."""
+    greatest size (the latest signed among equals) by a key still active, or ``None``. ``unsigned_tail``: receipts
+    after it. ``unchained``: requests answered in a format signed before the receipts were chained whose signature
+    still verifies (no head to check; listed, never failures). ``revoked``: signed answers whose signer was revoked
+    since (:class:`Revoked`; listed, never failures, and never the last signed head). ``mismatches``:
+    ``(request_id, reason)`` for every signed answer or ruling that does not verify now (a bad signature, a key never
+    enrolled, a key marked compromised) or whose head does not match. ``unreadable``: why the receipts cannot be
+    read as a log, or ``None``. ``ok`` only with no mismatch and a readable log."""
     receipts: int
     last_signed: SignedHead | None
     unsigned_tail: int
     unchained: tuple[str, ...]
     mismatches: tuple[tuple[str, str], ...]
     signed: int
+    revoked: tuple[Revoked, ...] = ()
+    unreadable: str | None = None
 
     @property
     def ok(self) -> bool:
-        return not self.mismatches
+        return not self.mismatches and self.unreadable is None
+
+
+def _revoked_since(snap: Any, payload: Mapping[str, Any]) -> Any:
+    """``snap`` with the payload's signer read as active, when the signer is a key ``snap`` holds REVOKED (and never
+    marked compromised); else ``None``. Used only to ask whether the signature itself verifies."""
+    fp = payload.get("signer_fp")
+    key = snap.key(fp) if isinstance(fp, str) else None
+    if key is None or key.active or key.compromised_since is not None:
+        return None
+    return replace(snap, keys=MappingProxyType({**snap.keys, fp: replace(key, revoked_seq=None)}))
 
 
 def verify(queue_dir: Path | str, *,
@@ -183,13 +215,16 @@ def verify(queue_dir: Path | str, *,
                 if r["via"] == "ruling":
                     gaps[r["id"]] = ConsentQueue._gap_of(conn, r["id"])
     mismatches: list[tuple[str, str]] = []
+    unreadable = None
     try:
         data: list[bytes] | None = [leaf(r) for r in rows]
     except UnicodeEncodeError:
         data = None
+        unreadable = "the receipts cannot be read as a log (a receipt is not UTF-8 text)"
     roots: dict[int, str] = {}
     snapshots: dict[str, Any] = {}
     unchained: list[str] = []
+    revoked: list[Revoked] = []
     good: list[SignedHead] = []
     for row in signed_rows:
         rid = str(row["id"])
@@ -202,9 +237,7 @@ def verify(queue_dir: Path | str, *,
             mismatches.append((rid, "the stored answer is not its own canonical record"))
             continue
         noun = "ruling" if row["via"] == "ruling" else "answer"
-        if payload.get("format") in UNCHAINED_FORMATS:
-            unchained.append(rid)
-            continue
+        is_unchained = payload.get("format") in UNCHAINED_FORMATS
         named = payload.get("decision")
         if not isinstance(named, str) or {"allow": "allowed", "deny": "denied"}.get(named) != row["state"] \
                 or payload.get("signer_fp") != row["signer_fp"]:
@@ -220,14 +253,31 @@ def verify(queue_dir: Path | str, *,
         if isinstance(snap, str):
             mismatches.append((rid, snap))
             continue
-        if noun == "answer":
-            why = reading._refusal(request, queue_id, payload, row["signature"], snap)
-        elif gaps.get(rid) is None:
-            why = "the ruled request has no gap number"
-        else:
-            why = reading._ruling_refusal(request, queue_id, gaps[rid], payload, row["signature"], snap)
+        if noun == "ruling" and gaps.get(rid) is None:
+            mismatches.append((rid, "the ruled request has no gap number"))
+            continue
+
+        def refusal(authority: Any) -> str | None:
+            # the queue's own delivery check (an unchained record as its own format), never a copy of it
+            if noun == "answer":
+                return reading._refusal(request, queue_id, payload, row["signature"], authority, unchained_ok=True)
+            return reading._ruling_refusal(request, queue_id, gaps[rid], payload, row["signature"], authority,
+                                           unchained_ok=True)
+
+        why = refusal(snap)
+        was_revoked = False
         if why is not None:
-            mismatches.append((rid, why))
+            # a signer revoked SINCE: is the signature itself good under that key? then it is information
+            as_active = _revoked_since(snap, payload)
+            why_active = None if as_active is None else refusal(as_active)
+            if as_active is None or why_active is not None:
+                mismatches.append((rid, why if why_active is None else f"{why_active} (its signer revoked since)"))
+                continue
+            was_revoked = True
+        if is_unchained:
+            if was_revoked:
+                revoked.append(Revoked(request_id=rid, signer_fp=payload["signer_fp"], head_checked=False))
+            unchained.append(rid)
             continue
         signed_head = payload["receipts_head"]
         size = signed_head["size"]
@@ -242,9 +292,13 @@ def verify(queue_dir: Path | str, *,
         if roots[size] != signed_head["root"]:
             mismatches.append((rid, f"the receipts changed under this {noun}"))
             continue
+        if was_revoked:
+            revoked.append(Revoked(request_id=rid, signer_fp=payload["signer_fp"], head_checked=True))
+            continue
         good.append(SignedHead(request_id=rid, via=row["via"], size=size, root=signed_head["root"],
                                signer_fp=payload["signer_fp"], signed_at=payload["signed_at"]))
     last = max(good, key=lambda h: (h.size, h.signed_at), default=None)
     count = len(rows)
     return Report(receipts=count, last_signed=last, unsigned_tail=count - (last.size if last else 0),
-                  unchained=tuple(unchained), mismatches=tuple(mismatches), signed=len(good))
+                  unchained=tuple(unchained), mismatches=tuple(mismatches), signed=len(good),
+                  revoked=tuple(revoked), unreadable=unreadable)
