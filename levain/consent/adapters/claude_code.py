@@ -40,9 +40,12 @@ import argparse
 import json
 import math
 import os
+import pwd
 import re
 import shlex
+import shutil
 import site
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -231,17 +234,28 @@ CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugin
 CONFIG_FILE_NAMES = frozenset({".mcp.json"})
 USER_CONFIG_NAME = ".claude.json"
 
+# Under a ``.git`` directory component, what git itself writes and never executes from: its object store, refs and
+# reflogs (directories), and its state files. Everything else there (config, config.worktree, hooks, info/, a
+# linked worktree's or a submodule's git directory) is agent config (L3 r2 G1'): tagged by path, never parsed.
+GIT_STATE_DIRS = frozenset({"objects", "refs", "logs"})
+GIT_STATE_FILES = frozenset({"head", "index", "packed-refs", "orig_head", "fetch_head", "commit_editmsg"})
+# Asking git where hooks run (L3 r3 G1): from a fixed binary, never one the session's PATH finds; within one gate
+# call's budget, at most GIT_QUERIES repositories asked and GIT_BUDGET_SECONDS spent, past which a target is tagged.
+GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+GIT_QUERIES = 4
+GIT_BUDGET_SECONDS = 3.0
+
 
 # The names a file inside a directory is probed under, so that a directory is agent config exactly when a file the
 # checks below tag could sit directly in it (:func:`names_config_dir`): one name each directory-keyed check keys on.
 # A name that is config in ANY directory (``.mcp.json``) is not probed, or every directory would be: the file-name
 # field naming it is itself a candidate, tagged on its own.
 _DIR_PROBES = ("x", "settings.json", "hooks.json", "config.toml", USER_CONFIG_NAME, "x.pth", "sitecustomize.py",
-               "levain")
+               "levain", "config")
 
 
 def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], sites: tuple[str, ...],
-                     user_configs: frozenset[str]) -> bool:
+                     user_configs: frozenset[str], git_cache: dict[Any, Any] | None = None) -> bool:
     """For an MCP tool's every-string candidates only (:func:`levain.consent.policy.mcp_config_candidates`): True
     when a server given ``target`` as a directory and a file name in another field could write agent config:
     ``target`` (``~`` expanded, joined to ``cwd``; as written and resolved) holds a file the path checks of
@@ -249,30 +263,205 @@ def names_config_dir(target: str, cwd: str, home: Path, roots: tuple[str, ...], 
     derived from those checks, never spelled twice) or directly one of ``roots`` (a protected file such as the
     authority database, :func:`protected_paths`), or its file name is ``.claude.json`` wherever it sits (a
     server that joins a relative name to a root of its own, home among them). ``roots``, ``sites`` and
-    ``user_configs`` are the caller's, computed once. Over-matching only sends the request to the human."""
+    ``user_configs`` are the caller's, computed once. An over-match costs a gated call: the request goes to the
+    human, or, when no enrolled key can sign T3 outside ``default``, the call is refused (the
+    Q10 floor) and the agent reads why."""
     raw = Path(str(home) + target[1:]) if target == "~" or target.startswith("~/") else Path(target)
     if not raw.is_absolute():
         raw = Path(cwd) / raw
+    git_cache = git_cache if git_cache is not None else {}
     parents = {os.path.dirname(r) for r in roots}   # a directory holding a protected file (cockpit.db) as well
     for p in (Path(os.path.normpath(raw)), Path(os.path.realpath(raw))):
         if p.name.lower() == USER_CONFIG_NAME or str(p).lower() in parents:
             return True
         for probe in _DIR_PROBES:
-            if _tags_path(p / probe, roots, sites, user_configs):
+            if _tags_path(p / probe, cwd, roots, sites, user_configs, git_cache):
                 return True
     return False
 
 
-def _tags_path(path: Path, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str]) -> bool:
+def _tags_path(path: Path, cwd: str, roots: tuple[str, ...], sites: tuple[str, ...], user_configs: frozenset[str],
+               git_cache: dict[Any, Any] | None = None) -> bool:
     """One spelling of a target path (already normalised or resolved) is agent config or the hook's own code."""
     return (_is_config_path(path) or _under(path, roots) or str(path).lower() in user_configs
-            or _redirects_the_import(path, sites))
+            or _redirects_the_import(path, sites) or _under_hooks_path(path, cwd, git_cache))
+
+
+def _is_git_config(rest: list[str]) -> bool:
+    """What follows a ``.git`` directory component (lower-cased) is something git reads or executes from: anything
+    but its object store, refs and reflogs (:data:`GIT_STATE_DIRS`) and its state files (:data:`GIT_STATE_FILES`)
+    directly in it. A linked worktree's or a submodule's git directory (``worktrees/<name>/``, ``modules/<name>/``)
+    is tagged whole, its objects and refs included: an over-match costs a gated call, and git writes those itself."""
+    if not rest:
+        return False
+    if len(rest) > 1 and rest[0] in GIT_STATE_DIRS:
+        return False
+    return not (len(rest) == 1 and rest[0] in GIT_STATE_FILES)
+
+
+# --- where git runs hooks from (L3 r2 G1'): asked of git, never read out of its config ------------------------------
+
+def operator_home() -> Path:
+    """The operator's home directory from the password database, not ``$HOME`` (which the agent's environment
+    sets): the home the operator's own shell and git read the user's git config from."""
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError):
+        return Path(os.path.expanduser("~"))
+
+
+def global_git_configs(home: Path) -> tuple[Path, ...]:
+    """The user-level git config files, tagged by full path: ``~/.gitconfig`` and ``~/.config/git/config`` for
+    ``home`` (where a ``~`` in a target expands) and for :func:`operator_home`, ALWAYS, whatever
+    ``$XDG_CONFIG_HOME`` says (an agent-set value must not move the protected file), plus
+    ``$XDG_CONFIG_HOME/git/config`` when that variable is set to an absolute path."""
+    out: list[Path] = []
+    for h in dict.fromkeys((Path(home), operator_home())):
+        out += [h / ".gitconfig", h / ".config" / "git" / "config"]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isabs(xdg):
+        out.append(Path(xdg) / "git" / "config")
+    return tuple(out)
+
+
+_GIT_BINARY: list[str | None] = []   # resolved once per process: [path] or [None]
+GIT_TAGGED = "tagged"                # a repository answer that tags every target asked of it (fail closed)
+
+
+def git_binary() -> str | None:
+    """The git the gate asks: the first existing executable of :data:`GIT_CANDIDATES`, resolved once. Never found
+    through ``PATH`` (L3 r3 G1: a session's PATH can name a workspace ``bin/`` holding a planted ``git``)."""
+    if not _GIT_BINARY:
+        _GIT_BINARY.append(next((g for g in GIT_CANDIDATES if os.path.isfile(g) and os.access(g, os.X_OK)), None))
+    return _GIT_BINARY[0]
+
+
+def _git_envs() -> list[dict[str, str]]:
+    """The environments git is asked in: ``PATH`` = ``os.defpath``, ``HOME`` from :func:`operator_home`,
+    ``LANG``/``LC_ALL`` = ``C``, nothing else (no ``GIT_*``, no ``XDG_*``); and, when this process's
+    ``XDG_CONFIG_HOME`` is absolute, the same with it set (L3 r3 G1: the operator's own git reads its global config
+    there). Both answers count."""
+    base = {"PATH": os.defpath, "HOME": str(operator_home()), "LANG": "C", "LC_ALL": "C"}
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return [base, {**base, "XDG_CONFIG_HOME": xdg}] if xdg and os.path.isabs(xdg) else [base]
+
+
+def _git_budget(cache: dict[Any, Any]) -> dict[str, Any]:
+    """One gate call's git state, in its ``cache``: answers by repository top-level (``scopes``), by directory
+    asked (``asked``), queries spent and the deadline (set at the first query)."""
+    return cache.setdefault("git", {"scopes": {}, "asked": {}, "queries": 0, "deadline": None})
+
+
+def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
+    """``git -C <directory> rev-parse --path-format=absolute --show-toplevel --git-path hooks``, one spawn per
+    environment (:func:`_git_envs`): git's own answer to where the repository holding ``directory`` runs hooks from
+    (``core.hooksPath`` from every config file git reads, includes, linked worktrees and submodules applied), the
+    hooks directories as a set, recorded under the repository's top-level. Exit 128 saying "not a git repository"
+    is no repository (an empty set, recorded for ``directory``'s ancestors up to its mount point, which git's own
+    search covered). Any other failure, a timeout, more than two lines, the budget spent (:data:`GIT_QUERIES`,
+    :data:`GIT_BUDGET_SECONDS`): :data:`GIT_TAGGED`. No git at :data:`GIT_CANDIDATES`: an empty set, no query
+    spent (no git, no hooks run). An older git (< 2.31) echoes the unknown ``--path-format`` and prints a relative
+    answer relative to ``directory`` (measured on 2.50 without the option), which is how it is joined.
+    ``rev-parse`` runs no hooks."""
+    git = git_binary()
+    if git is None:
+        return frozenset()
+    if state["queries"] >= GIT_QUERIES:
+        return GIT_TAGGED
+    state["queries"] += 1
+    if state["deadline"] is None:
+        state["deadline"] = time.monotonic() + GIT_BUDGET_SECONDS
+    hooks: set[Path] = set()
+    top: str | None = None
+    for env in _git_envs():
+        left = state["deadline"] - time.monotonic()
+        if left <= 0:
+            return GIT_TAGGED
+        try:
+            got = subprocess.run([git, "-C", directory, "rev-parse", "--path-format=absolute", "--show-toplevel",
+                                  "--git-path", "hooks"], env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                                 timeout=left, check=False)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return GIT_TAGGED
+        if got.returncode == 128 and b"not a git repository" in got.stderr:
+            continue
+        lines = got.stdout.decode("utf-8", "surrogateescape").splitlines()
+        if lines and lines[0] == "--path-format=absolute":
+            lines = lines[1:]
+        if got.returncode != 0 or len(lines) != 2 or not os.path.isabs(lines[0]) or not lines[1]:
+            return GIT_TAGGED
+        top = lines[0]
+        hooks.add(Path(lines[1]) if os.path.isabs(lines[1]) else Path(directory) / lines[1])
+    answer = frozenset(hooks)
+    if top is not None:
+        state["scopes"][top] = answer
+    else:
+        d = Path(directory)
+        while True:
+            state["scopes"].setdefault(str(d), answer)
+            if d.parent == d or os.path.ismount(d):
+                break
+            d = d.parent
+    return answer
+
+
+def _git_answer(directory: Path, cache: dict[Any, Any]) -> frozenset[Path] | str:
+    """The hooks directories of the repository holding ``directory`` (real, existing): an answer already in
+    ``cache`` for a repository top-level (or a no-repository ancestor) reached from ``directory`` without passing a
+    directory that could start another repository (one holding a ``.git`` or a ``HEAD``, or a mount point), else
+    :func:`_ask_git`. So every target inside the cwd's repository reuses its answer, and a nested repository
+    (a submodule) is asked its own."""
+    state = _git_budget(cache)
+    key = str(directory)
+    if key in state["asked"]:
+        return state["asked"][key]
+    d = directory
+    while True:
+        if str(d) in state["scopes"]:
+            return state["scopes"][str(d)]
+        if os.path.lexists(d / ".git") or os.path.lexists(d / "HEAD") or os.path.ismount(d) or d.parent == d:
+            break
+        d = d.parent
+    state["asked"][key] = got = _ask_git(key, state)
+    return got
+
+
+def _nearest_dir(start: Path) -> Path:
+    """``start`` or its nearest ancestor that is an existing directory (``/`` at the latest)."""
+    d = start
+    while not d.is_dir() and d.parent != d:
+        d = d.parent
+    return d
+
+
+def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None) -> bool:
+    """``path`` lies under a directory git runs hooks from (husky's ``.husky/``, a ``.githooks/``, an absolute
+    ``core.hooksPath`` outside the worktree) for the repository of the event's ``cwd`` (its nearest existing
+    directory) or of the target's nearest existing ancestor directory, as git answers (:func:`_git_answer`), the
+    cwd's answer checked first. An answer git could not give in the call's budget (:data:`GIT_TAGGED`) tags the
+    target. ``cache`` is one gate call's, shared by its candidates."""
+    cache = cache if cache is not None else {}
+    try:
+        dirs = [_nearest_dir(Path(cwd))] if cwd and os.path.isabs(cwd) else []
+        dirs.append(_nearest_dir(path.parent))
+        for d in dirs:
+            got = _git_answer(Path(os.path.realpath(d)), cache)
+            if isinstance(got, str):   # GIT_TAGGED
+                return True
+            hooks = tuple({s for h in got for s in (os.path.normpath(h).lower(), os.path.realpath(h).lower())})
+            if _under(path, hooks):
+                return True
+        return False
+    except (OSError, ValueError):
+        return True   # a path that cannot be examined is tagged, as the other checks do
 
 
 def _is_config_path(path: Path) -> bool:
     parts = [p.lower() for p in path.parts]
     if parts and parts[-1] in CONFIG_FILE_NAMES:
         return True
+    if parts and parts[-1] == ".git":
+        return True  # a gitfile (a linked worktree's or a submodule's ``.git``): it names the git directory
     for i, part in enumerate(parts[:-1]):
         rest = parts[i + 1:]
         if part == ".claude":
@@ -283,6 +472,8 @@ def _is_config_path(path: Path) -> bool:
             return True
         if part == "activation" and rest[0] == "hooks" and len(rest) > 1:
             return True  # a levain install's hook scripts (the consent hook among them) run in every agent session
+        if part == ".git" and _is_git_config(rest):
+            return True  # git runs what these name, unsandboxed, at the operator's next git command
         if part == ".claude-plugin":
             return True  # a plugin's manifest directory (plugin.json can declare hooks and MCP servers inline)
         if part == "hooks" and i > 0 and os.path.isdir(Path(*path.parts[:i]) / ".claude-plugin"):
@@ -294,7 +485,9 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
     has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
     holds only for an enrolled key, :func:`away_hold`), so the hook
-    files nothing (a queue row is kept for good) and the agent's own dialog answers. A cockpit.db the cockpit made
+    files nothing (a queue row is kept for good). The PermissionRequest hook then leaves the call to the agent's own
+    dialog; the PreToolUse gate does so in ``default`` only, and in every other mode denies a
+    T3 call (the floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
     before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
     (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
     a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
@@ -307,7 +500,7 @@ def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bo
     try:
         snap = authority_source(Path(root) / "cockpit.db", anchor=anchor_path(root))()
     except Exception:
-        return True  # an authority that does not replay verifies nothing; the dialog answers
+        return True  # an authority that does not replay verifies nothing
     if tier == AGENT_CONFIG_TIER:
         from levain.consent.queue import class_covers
 
@@ -375,13 +568,18 @@ def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
 
 
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
-                         protected: Iterable[Path] = ()) -> bool:
+                         protected: Iterable[Path] = (), git_cache: dict[Any, Any] | None = None) -> bool:
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
     ``.claude/hooks/``, the one `levain init` wires under the install's ``activation/hooks/``, below); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
-    ``.codex/config.toml``; anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a
-    plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
+    ``.codex/config.toml``; git's config and hooks, by path and never by parsing git's config: anything under a
+    ``.git`` directory but its objects, refs, reflogs and state files (:func:`_is_git_config`; its ``config``,
+    ``hooks/``, ``info/``, a linked worktree's or a submodule's git directory), a file named ``.git`` (a gitfile,
+    which names the git directory), anything under the directory git itself answers it runs hooks from for the
+    repository of ``cwd`` or of the target (:func:`_under_hooks_path`: ``core.hooksPath`` wherever it points), and
+    the user's git config files (:func:`global_git_configs`), never ``.gitignore`` or ``.gitattributes``; anything under a ``.claude-plugin/`` directory, or
+    under ``hooks/`` beside one (a plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
     it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and every
@@ -389,7 +587,9 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     field of any name), each also tagged when it names a config directory or ``.claude.json``
     (:func:`names_config_dir`), and an input past that function's bound is tagged. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
     symlinks; either match tags it. A target that is not a non-empty string is tagged (for a file tool, so is a
-    missing one). Other tools are never tagged: Bash is not parsed (ruling 1)."""
+    missing one). Other tools are never tagged: Bash is not parsed (ruling 1). ``git_cache`` is one gate call's,
+    shared across the calls a caller makes for it (Codex's patch headers), so git is asked once per repository within
+    one budget (:func:`_git_answer`)."""
     targets = _targets(tool_name, tool_input)
     if targets is None and not tool_name.startswith("mcp__"):
         return False
@@ -406,8 +606,12 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
-        user_config = Path(home) / USER_CONFIG_NAME
-        user_configs = frozenset({os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()})
+        git_cache = git_cache if git_cache is not None else {}   # git asked once per repository, in one budget, per call
+        home = Path(home)
+        # by full path: the home's ``.claude.json`` and the user's git config files (``~/.gitconfig``,
+        # ``~/.config/git/config``, the XDG one), which every repository reads executables from (L3 r1 G1c, r2 G1')
+        user_configs = frozenset({s for f in (home / USER_CONFIG_NAME, *global_git_configs(home))
+                                  for s in (os.path.normpath(f).lower(), os.path.realpath(f).lower())})
     except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
@@ -421,10 +625,11 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             resolved = Path(os.path.realpath(raw))
         except (OSError, ValueError):
             return True
-        if _tags_path(written, roots, sites, user_configs) or _tags_path(resolved, roots, sites, user_configs):
+        if (_tags_path(written, cwd, roots, sites, user_configs, git_cache)
+                or _tags_path(resolved, cwd, roots, sites, user_configs, git_cache)):
             return True
     try:
-        return any(names_config_dir(target, cwd, Path(home), roots, sites, user_configs) for target in extra)
+        return any(names_config_dir(target, cwd, home, roots, sites, user_configs, git_cache) for target in extra)
     except (OSError, ValueError):
         return True
 
@@ -616,6 +821,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if policy is None and nothing_can_decide(settings):
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
+    if agent_config and unconfined(cwd, home=home):
+        return None  # an unconfined session (Q10 D2): its dialog answers, as the gate left the call to its mode (L1-7)
     if agent_config:
         # the gate already asked the operator about this call and delivered an allow, and Claude Code shows its
         # dialog anyway on a path it protects: deliver that allow once, never a second question
@@ -670,7 +877,14 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # protects, ``.claude/settings.json``), the PermissionRequest hook delivers that same allow once
 # (:meth:`ConsentQueue.take_gate_allow`), so the operator is asked once:
 #
+# 0. a session started with ``LEVAIN_UNCONFINED=1`` (:data:`UNCONFINED_ENV`, Q10 D2) gets no decision: the mode
+#    decides, and no ruled allow is spent; unless a settings file the session can load sets the variable
+#    (:func:`unconfined_state`), which is then ignored;
 # 1. a ruled allow for this exact call (R-d) runs it, once (:meth:`ConsentQueue.take_ruled_allow`);
+# 1a. else, when no enrolled key can sign it (:func:`nothing_can_decide` at T3): in ``default``
+#    (:data:`ATTENDED_POSTURES`) no decision (the dialog, or the operator's own allow rule, decides); in every other
+#    mode, an absent or unknown one included, the T3 FLOOR (Q10 D1): a plain deny with :data:`FLOOR_TEXT`, nothing
+#    filed (no hard stop: nothing is undecided, L2-2);
 # 2. else the request is filed with ``expires_at`` = now + D (the library owns the deadline, B1 fix 3), the operator
 #    is pinged through the notify seam (R-f; a failed ping never fails the gate), and the hook waits up to D for a
 #    verified decision, which it delivers;
@@ -714,6 +928,122 @@ U_REV = ("levain: UNDECIDED, not denied. The operator did not answer in time, so
 U_IRR = ("levain: UNDECIDED, not denied. The operator did not answer in time, so the action was NOT taken: {x}. "
          "This class of action stops the task: do no further work. Do not retry it or achieve it another way. "
          "Write a short summary of what is done and what waits on gap #{n}, and end your turn.")
+# Q10 D1: the plain deny (no hard stop: nothing is undecided) for a gated call when no enrolled key can sign it and
+# no dialog asks. It names no way around the floor: the agent is told to ask, and the operator reads in
+# `levain doctor` how to allow it
+FLOOR_TEXT = ("levain: the action was NOT taken: {x}. Agent config and hooks are the operator's, and no enrolled key "
+              "can approve this change, so it cannot be asked for. Do not retry it and do not achieve it another "
+              "way, including through the shell. Ask the operator: `levain doctor` shows them how to allow it.")
+# added to FLOOR_TEXT when the session's environment says unconfined but a settings file sets that (:func:`unconfined`)
+UNCONFINED_IGNORED_TEXT = (" The session's environment asks for an unconfined session, but that was ignored: a "
+                           "settings file this session can load sets it, and only the operator's own shell can "
+                           "start an unconfined session.")
+# Q10 D2: a session started with this set to "1" in its environment is unconfined: the gate passes its gated calls
+# and the session's mode decides. Read from the hook's own environment at every call (the agent's launch env)
+UNCONFINED_ENV = "LEVAIN_UNCONFINED"
+# the modes the gate treats as attended: only ``default`` (Codex sends ``default`` with approvals on). With no key
+# that can sign T3 the gate leaves the call to Claude Code's dialog there, and holds only while the operator is
+# away. acceptEdits is NOT attended: it auto-accepts workspace edits Claude Code does not itself protect (measured
+# 10-19, Q10 run 4 case C5: a Write of ``.codex/config.toml`` ran with no question), so it is floored/held like any
+# no-dialog mode
+ATTENDED_POSTURES = ("default",)
+# the machine-wide settings every session loads too (L3 r1 G3): Codex's system config, Claude Code's managed
+# settings (macOS, Linux). A missing one sets nothing
+SYSTEM_SETTINGS_FILES: tuple[tuple[str, Path], ...] = (
+    ("toml", Path("/etc/codex/config.toml")),
+    ("json", Path("/Library/Application Support/ClaudeCode/managed-settings.json")),
+    ("json", Path("/etc/claude-code/managed-settings.json")),
+)
+
+
+def _settings_files(cwd: str | None, home: Path | None, codex_home: Path | None) -> list[tuple[str, Path]]:
+    """Every settings file an agent session started in ``cwd`` can load an environment from, as (``json`` | ``toml``,
+    path): Claude Code's user settings (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``), Codex's ``config.toml`` (its home),
+    the machine-wide :data:`SYSTEM_SETTINGS_FILES`, and in ``cwd``, ``$CLAUDE_PROJECT_DIR`` and each of their ancestors up to ``/`` (as written and resolved: Claude
+    Code reads a project's settings at its repository root) ``.claude/settings.json``, ``.claude/settings.local.json``
+    and ``.codex/config.toml``."""
+    home = home if home is not None else Path.home()
+    out: list[tuple[str, Path]] = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    for d in ([Path(config_dir)] if config_dir else []) + [home / ".claude"]:
+        out.append(("json", d / "settings.json"))
+    env_codex = os.environ.get("CODEX_HOME")
+    for d in ([codex_home] if codex_home is not None else []) + ([Path(env_codex)] if env_codex else []) \
+            + [home / ".codex"]:
+        out.append(("toml", d / "config.toml"))
+    out += list(SYSTEM_SETTINGS_FILES)
+    for start in (cwd, os.environ.get("CLAUDE_PROJECT_DIR")):
+        if not isinstance(start, str) or not start:
+            continue
+        for p in {Path(os.path.abspath(start)), Path(os.path.realpath(start))}:
+            for d in (p, *p.parents):
+                out += [("json", d / ".claude" / "settings.json"), ("json", d / ".claude" / "settings.local.json"),
+                        ("toml", d / ".codex" / "config.toml")]
+    seen: set[Path] = set()
+    return [(k, p) for k, p in out if not (p in seen or seen.add(p))]
+
+
+def _key_anywhere(value: Any) -> bool:
+    """:data:`UNCONFINED_ENV` inside any key or string value, at any depth."""
+    if isinstance(value, str):
+        return UNCONFINED_ENV in value
+    if isinstance(value, Mapping):
+        return any(_key_anywhere(k) or _key_anywhere(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_key_anywhere(v) for v in value)
+    return False
+
+
+def _sets_unconfined(kind: str, path: Path) -> bool:
+    """True when the settings file mentions :data:`UNCONFINED_ENV` anywhere (L3 r1 G3: in its raw text, or, once
+    parsed, in any key or string value at any depth, which also catches an escaped spelling; JSON or TOML alike,
+    an ``env`` block or not) or that cannot be ruled out: an unreadable file, one that does not parse, a JSON file
+    that is not an object, a Claude Code ``env`` that is not an object. A missing file sets nothing."""
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except Exception:  # noqa: BLE001 - unreadable: it cannot be ruled out
+        return True
+    if UNCONFINED_ENV.encode() in raw:
+        return True
+    try:
+        if kind == "toml":
+            import tomllib
+
+            return _key_anywhere(tomllib.loads(raw.decode("utf-8")))
+        data = json.loads(raw)
+        if not isinstance(data, Mapping):
+            return True
+        env = data.get("env")
+        return (env is not None and not isinstance(env, Mapping)) or _key_anywhere(data)
+    except Exception:  # noqa: BLE001 - a file that does not parse cannot be ruled out
+        return True
+
+
+def unconfined_state(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> str | None:
+    """``"on"`` when the operator started this session unconfined: :data:`UNCONFINED_ENV` is exactly ``"1"`` in the
+    hook's environment and no settings file the session can load sets it (:func:`_settings_files`; the hook cannot
+    tell a variable a settings file's ``env`` put there from one the operator's shell did, so a cloned repository's
+    ``.claude/settings.json`` could otherwise turn the gate off, L2-1). ``"ignored"`` when it is ``"1"`` but such a
+    file sets it, or cannot be ruled out (:func:`_sets_unconfined`). ``None`` when it is not ``"1"``."""
+    if os.environ.get(UNCONFINED_ENV) != "1":
+        return None
+    files = _settings_files(cwd, home, codex_home)
+    return "ignored" if any(_sets_unconfined(kind, path) for kind, path in files) else "on"
+
+
+def unconfined(cwd: str | None, *, home: Path | None = None, codex_home: Path | None = None) -> bool:
+    """Whether the operator started this session unconfined (:func:`unconfined_state` is ``"on"``)."""
+    return unconfined_state(cwd, home=home, codex_home=codex_home) == "on"
+
+
+def floor_text(what: str, state: str | None) -> str:
+    """The floor's deny reason for ``what``, with :data:`UNCONFINED_IGNORED_TEXT` when the session asked for
+    unconfined and a settings file sets it (``state`` from :func:`unconfined_state`)."""
+    return FLOOR_TEXT.format(x=what) + (UNCONFINED_IGNORED_TEXT if state == "ignored" else "")
+
+
 # DESIGN §3.6, verbatim: a late ruling delivered to its live session
 RULING_TEXT = {
     "allow": ("levain: ruling on gap #{n}: ALLOW. Do {x} now, it will be allowed. Then list what you skipped or "
@@ -922,11 +1252,15 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
          sleep: Callable[[float], None] = time.sleep,
          still_away: Callable[[], tuple[bool, str, str]] | None = None) -> dict[str, Any] | None:
     """The gate's output for one ``PreToolUse`` event, or ``None`` (the call goes on as the session's mode says).
-    A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent),
-    else a ruled allow (taken once), else, in every other mode (``default`` included) and when
-    something could decide (:func:`nothing_can_decide`), it is filed with its hold = D (``gate_hold_seconds``),
-    pinged (:func:`notify`), held for a verified decision (delivered), and at D marked undecided and denied
-    (:func:`undecided_output`). In ``default`` the hold runs only while the operator is away, and ``still_away``
+    An event with no valid ``tool_name``, absolute ``cwd`` or session id is denied when its tool is unnamed, a file tool or
+    an MCP tool (:func:`_malformed`). A gated call (:func:`gate_class`) gets no decision in ``plan`` (nothing runs there, and no ruled allow is spent)
+    or in a session started unconfined (:func:`unconfined_state` ``"on"``, nor is a ruled allow spent), else a ruled
+    allow (taken once), else, when nothing can decide it (:func:`nothing_can_decide` at T3), no decision in
+    ``default`` (:data:`ATTENDED_POSTURES`) and the floor's plain deny in every other mode
+    (:func:`floor_text`, nothing filed), else, in every mode (``default`` included), it is filed with its hold = D
+    (``gate_hold_seconds``), pinged (:func:`notify`), held for a verified decision (delivered), and at D marked
+    undecided and denied (:func:`undecided_output`). In ``default`` the hold runs only while
+    the operator is away, and ``still_away``
     (default :func:`still_away_from` the queue directory's settings file) is re-read every :data:`RECHECK_EVERY`
     (:func:`hold_for_answer`): when away ends the request is withdrawn and Claude Code's dialog asks. Anything
     that fails after the call is known gated is a deny (with the hard stop for
@@ -939,8 +1273,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return None
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
     session = _session_of(event)
-    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not cwd or session is None:
-        return None
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(cwd, str) or not os.path.isabs(cwd) \
+            or session is None:
+        return _malformed(event, queue, settings, home=home)
     if tool_input is None:
         tool_input = {}
     try:
@@ -970,6 +1305,34 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         spec["additionalContext"] = f"{spec['additionalContext']}\n{context}" if spec.get("additionalContext") \
             else context
     return out
+
+
+def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, *,
+               home: Path | None) -> dict[str, Any] | None:
+    """The gate's answer to a ``PreToolUse`` event with no valid ``tool_name``, absolute ``cwd`` or session id (L3 r1 G4,
+    r2 G4', r3: a relative cwd anchors nothing): fail closed, as Codex's gate does, for every call whose targets can be gated: a deny with the
+    irreversible tier's hard stop when the tool is unnamed, a file tool (:data:`FILE_TOOLS`, the ones
+    :func:`levain.consent.policy.targets` reads a path from) or an MCP tool, never classified (a relative target
+    cannot be anchored without ``cwd``, and the event is not trusted to say what it is). Any other named tool (Bash,
+    which is never parsed) is not the gate's to answer and goes on (``None``). Nothing is filed or ledgered: there is
+    no session to file under."""
+    tool_name, tool_input = event.get("tool_name"), event.get("tool_input", {})
+    cwd = event.get("cwd")
+    missing = [k for k, ok in (("session_id", _session_of(event) is not None),
+                               ("tool_name", isinstance(tool_name, str) and bool(tool_name)),
+                               ("cwd", isinstance(cwd, str) and os.path.isabs(cwd))) if not ok]
+    named = isinstance(tool_name, str) and bool(tool_name)
+    if named and tool_name not in FILE_TOOLS and not tool_name.startswith("mcp__"):
+        return None
+    what = "this call"
+    if named:
+        try:
+            what = _what(tool_name, tool_input)
+        except Exception:  # noqa: BLE001 - the deny stands whatever the description does
+            what = tool_name
+    return _pre("deny", f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken: "
+                f"{what}. Do not retry it and do not achieve it another way.",
+                **_stop("irreversible", what, "the hook event was malformed."))
 
 
 def _ledger_note(queue_dir: Path, event: Mapping[str, Any], session: str, tool_name: str, tool_input: Any, cwd: str,
@@ -1025,14 +1388,23 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     posture = mode if isinstance(mode, str) and mode else None
     if posture == "plan":
         return None  # plan runs nothing: no decision, and a ruled allow is not spent on a call that will not run
+    loose = unconfined_state(cwd, home=home)
+    if loose == "on":
+        return None  # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow spent
     try:
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
-            return None
-        if posture == "default" and not effective_away(settings)[0]:
-            # an attended default-mode session: Claude Code's own dialog (or the operator's own allow rule) decides,
+            if posture in ATTENDED_POSTURES:
+                return None  # Claude Code's own dialog (or the operator's own allow rule) decides while they are present
+            # no dialog asks in this mode (an absent or unknown mode counts as none) and no key could answer a
+            # request: the floor denies, files nothing (Q10 D1). A plain deny: nothing is undecided, and the agent
+            # goes on with what does not need the change (L2-2)
+            note(refused="floor")
+            return _pre("deny", floor_text(what, loose))
+        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
+            # an attended default session: Claude Code's own dialog (or his own allow rule) decides,
             # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
             return None
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
@@ -1046,7 +1418,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
                cwd=queue.directory)
-        if posture == "default" and still_away is not None:
+        if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
             # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,

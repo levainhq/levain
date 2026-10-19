@@ -88,8 +88,9 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
     protected_paths,
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
-    GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN, RULING_TEXT, U_IRR, U_REV, _pre,
-    _what, notify, send_repings,
+    ATTENDED_POSTURES, FLOOR_TEXT, GATE_HOLD_CEILING, GATE_POLL, GATE_SLEEP_CAP, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN,
+    RULING_TEXT, UNCONFINED_ENV, U_IRR, U_REV, _pre, _what, floor_text, notify, send_repings, unconfined,
+    unconfined_state,
 )
 from levain.consent.adapters.claude_code import targets_agent_config as _claude_targets_agent_config
 from levain.consent.policy import AGENT_CONFIG_TIER
@@ -173,14 +174,17 @@ def _in_codex_config(path: str, cwd: str, home: Path, codex_dir: Path) -> bool:
 
 
 def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
-                         codex_dir: Path | None = None, protected: tuple[Path, ...] = ()) -> bool:
+                         codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
+                         git_cache: dict[Any, Any] | None = None) -> bool:
     """True when a Codex ``apply_patch`` or an MCP tool targets an agent's config or hooks: every path the Claude
     Code adapter tags (:func:`levain.consent.adapters.claude_code.targets_agent_config`: Claude Code's config,
     ``.codex/hooks.json`` and ``config.toml``, the levain package, the adapter's own queue and authority), plus
     anything under a ``.codex/`` directory or under CODEX_HOME (``codex_dir``). An MCP tool's targets are its
     :data:`MCP_PATH_FIELDS` and every other string in its input (:func:`levain.consent.policy.mcp_config_candidates`). A patch whose headers name no file
     is tagged, as is a non-string MCP path. Shell requests (:data:`levain.authority.CONSENT_SHELL_TOOLS`) and every
-    other tool are never tagged: a command is not parsed (ruling 1)."""
+    other tool are never tagged: a command is not parsed (ruling 1). ``git_cache`` is one gate call's: one git
+    budget (:func:`levain.consent.adapters.claude_code._git_answer`) for all its headers, past which a header is
+    tagged."""
     home = home if home is not None else Path.home()
     codex_dir = codex_dir if codex_dir is not None else codex_home()
     if tool_name == PATCH_TOOL:
@@ -191,7 +195,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     elif tool_name.startswith("mcp__"):
         # the Claude Code check reads the whole MCP input once (named fields, every-string candidates, config
         # directories); what is left per path is CODEX_HOME and any .codex/
-        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected):
+        if _claude_targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected,
+                                        git_cache=git_cache):
             return True
         targets = consent_policy.mcp_config_candidates(tool_input) or []
         try:
@@ -200,15 +205,19 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
             return True
     else:
         return False
-    return any(_header_is_config(target, cwd, home, codex_dir, protected) for target in targets)
+    git_cache = git_cache if git_cache is not None else {}   # one budget for the whole patch (and the gate call)
+    return any(_header_is_config(target, cwd, home, codex_dir, protected, git_cache) for target in targets)
 
 
-def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...]) -> bool:
-    """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to)."""
+def _header_is_config(target: Any, cwd: str, home: Path, codex_dir: Path, protected: tuple[Path, ...],
+                      git_cache: dict[Any, Any] | None = None) -> bool:
+    """Whether one patch header names agent config or hooks (an empty or unreadable one is taken to). Where git runs
+    hooks from is asked of git (the Claude Code check), shared across one call's headers through ``git_cache``."""
     if not isinstance(target, str) or not target:
         return True
     try:
-        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected)
+        return (_claude_targets_agent_config("Write", {"file_path": target}, cwd, home=home, protected=protected,
+                                             git_cache=git_cache)
                 or _in_codex_config(target, cwd, home, codex_dir))
     except (OSError, ValueError):
         return True
@@ -253,6 +262,8 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         return None
     agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
                                         protected=protected)
+    if agent_config and unconfined(cwd, home=home, codex_home=codex_dir):
+        return None  # an unconfined session (Q10 D2): Codex's approval answers, as the gate left it to the mode
     hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
@@ -305,6 +316,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
 # A hook Codex kills at its timeout, or one that exits non-zero, FAILS OPEN on Codex (no ``onFailure`` setting
 # exists): the entry's timeout is the ceiling's (:data:`GATE_TIMEOUT`), and :func:`main` never raises.
 #
+# The T3 floor (Q10 D1) and the unconfined session (D2) are Claude Code's (its gate section): with no enrolled key
+# that can sign a T3 allow, a gated call in any mode but ``default`` and ``plan`` is denied (a plain
+# deny, per the first bullet), and a session started with ``LEVAIN_UNCONFINED=1`` passes gated calls, its halt still
+# read first, unless a settings file the session can load (Codex's or Claude Code's) sets the variable.
+#
 # Codex keeps no per-call approval in its rollout, so the authority ledger cannot read after the fact who allowed
 # a gated call: the gate files the call's row itself when levain answered it (:func:`_ledger_note`).
 
@@ -315,7 +331,8 @@ HALT_TEXT = ("levain: this session is halted on gap #{n}. No further tool calls 
 
 
 def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home: Path | None = None,
-               codex_dir: Path | None = None, protected: tuple[Path, ...] = ()) -> str:
+               codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
+               git_cache: dict[Any, Any] | None = None) -> str:
     """The action in a few words: for a readable patch, ``apply_patch of <paths>`` naming the agent-config paths
     FIRST and counting the rest (``apply_patch of .codex/hooks.json (+14 other files)``), so a cut never hides the
     path that made the call gated (the agent orders the headers); else the Claude Code adapter's description."""
@@ -326,7 +343,8 @@ def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home:
             if cwd:
                 home = home if home is not None else Path.home()
                 codex_dir = codex_dir if codex_dir is not None else codex_home()
-                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected)]
+                git_cache = git_cache if git_cache is not None else {}
+                tagged = [p for p in paths if _header_is_config(p, cwd, home, codex_dir, protected, git_cache)]
             if tagged and len(tagged) < len(paths):
                 rest = len(paths) - len(tagged)
                 text = f"{PATCH_TOOL} of {', '.join(tagged)} (+{rest} other file{'s' if rest != 1 else ''})"
@@ -337,11 +355,13 @@ def _call_what(tool_name: str, tool_input: Any, cwd: str | None = None, *, home:
 
 
 def gate_class(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
-               codex_dir: Path | None = None, protected: tuple[Path, ...] = ()) -> str | None:
+               codex_dir: Path | None = None, protected: tuple[Path, ...] = (),
+               git_cache: dict[Any, Any] | None = None) -> str | None:
     """The gate's tier for a Codex call: ``irreversible`` for agent config and hooks (:func:`targets_agent_config`,
     Q10's floor and Q14's irreversible tier at once), else ``None`` (not gated). A shell command is never parsed.
     THE SEAM for B6: the push executor's tool joins here as ``irreversible``."""
-    if targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected):
+    if targets_agent_config(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
+                            git_cache=git_cache):
         return "irreversible"
     return None
 
@@ -440,12 +460,17 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     """The gate's output for one Codex ``PreToolUse`` event, or ``None`` (the call goes on). The halt is read
     first, as soon as the event names a session: a session halted on a gap gets :data:`HALT_TEXT` for EVERY call,
     gated or not, until the ruling on that gap releases it. An event missing a required field (``session_id``,
-    ``tool_name``, ``cwd``) is denied. Else a gated call (:func:`gate_class`) is: run once on a ruled allow; else,
-    when something could decide it (:func:`nothing_can_decide` at the gated tier) and, in ``default`` mode (approvals
+    ``tool_name``, an absolute ``cwd``) is denied. Else a gated call (:func:`gate_class`) gets no decision in a session started
+    unconfined (:func:`levain.consent.adapters.claude_code.unconfined_state` ``"on"``; no ruled allow is spent, and a
+    halt read above still wins); else is run once on a ruled allow; else, when nothing can decide it
+    (:func:`nothing_can_decide` at the gated tier), gets no decision in ``default`` (Codex's approval asks) or ``plan``, and in every other mode, an absent or unknown one
+    included, the floor's plain deny (:func:`floor_text`, nothing filed); else,
+    when something could decide it and, in ``default`` mode (approvals
     on), only while the operator is away, filed with its hold = D (``gate_hold_seconds``), pinged, held for a
     verified decision (delivered), and at D marked undecided (the irreversible tier halting its session) and denied
-    (:func:`undecided_output`). Every allow is re-checked against the halt just before it is returned: a halt set
-    meanwhile wins. Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
+    (:func:`undecided_output`). Every allow, and every no-decision return of a gated call (unconfined, the floor's
+    ``default``/``plan`` pass, the attended pass), is re-checked against the halt just before it is returned: a
+    halt set meanwhile wins (a sibling call that halts the session after that check still races it). Anything that fails once the call is known gated, or while the halt is read, is a deny. Late
     rulings for the session, and the answers to its questions not yet delivered
     (:func:`levain.consent.band.question_context`), ride whatever is returned, as ``additionalContext``."""
     if getattr(queue, "directory", None) is None:
@@ -465,7 +490,8 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
             _ledger_note(Path(queue.directory), event, session, str(tool_name), tool_input,
                          cwd if isinstance(cwd, str) else "", refused="halted")
             return _with_rulings(_deny(HALT_TEXT.format(n=halted)), queue, session)
-    missing = [k for k, v in (("session_id", session), ("tool_name", tool_name), ("cwd", cwd))
+    missing = [k for k, v in (("session_id", session), ("tool_name", tool_name),
+                              ("cwd", cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
                if not isinstance(v, str) or not v]
     if missing:
         return _deny(f"levain: the hook event has no valid {', '.join(missing)}, so the action was NOT taken. Do not "
@@ -538,23 +564,37 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     what = "this call"
     try:
         protected = protected_paths(qdir, settings)
-        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected)
-        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected)
+        git_cache: dict[Any, Any] = {}   # one git budget for the gate call (L3 r3 G1), its description included
+        what = _call_what(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
+                          git_cache=git_cache)
+        tier = gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir, protected=protected,
+                          git_cache=git_cache)
         if tier is None:
             return None
         tool_use_id = event.get("tool_use_id")
         event_id = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
         mode = event.get("permission_mode")
         posture = mode if isinstance(mode, str) and mode else None
+        loose = unconfined_state(cwd, home=home, codex_home=codex_dir)
+        if loose == "on":
+            # the operator started this session unconfined (Q10 D2): the mode decides, no ruled allow is spent. A
+            # halt was read before this call reached here (:func:`gate`): the env var never releases one. A
+            # settings file that sets the variable makes it ignored (L2-1, :func:`unconfined_state`)
+            return halt_wins(None)  # and a halt set since the gate read it still wins (L3 r1 G2)
         ruled = queue.take_ruled_allow(AGENT, session, tool_name, tool_input, cwd=cwd, event=event_id)
         if ruled is not None:
             return deliver(ruled)
         if nothing_can_decide(settings, tier=AGENT_CONFIG_TIER):
-            return None
-        if posture == "default" and not effective_away(settings)[0]:
+            if posture in (*ATTENDED_POSTURES, "plan"):
+                return halt_wins(None)  # Codex's own approval asks (default), or the mode runs nothing (plan)
+            # no approval asks in this mode (an absent or unknown mode counts as none) and no key could answer a
+            # request: the floor denies, files nothing (Q10 D1); a plain deny, never ``continue: false`` (above)
+            note(refused="floor")
+            return _deny(floor_text(what, loose))
+        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
             # approvals on and the operator present: Codex's own approval asks for an agent-config write (measured
             # B5-fix1, MEASURE_away), so the gate holds only while he is away, as Claude Code's does (head ruling 10-18)
-            return None
+            return halt_wins(None)
         hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)  # the installed timeout - the margin
         request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input,
                              cwd=cwd, hold=timedelta(seconds=hold), tier=AGENT_CONFIG_TIER, event_id=event_id,
@@ -566,7 +606,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
     try:
         notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
                cwd=queue.directory)
-        if posture == "default" and still_away is not None:
+        if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): when away ends, the call goes back to Codex's approval
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
                                         still_away=still_away)
@@ -605,19 +645,20 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
 
 def gate_failed(event: Any, queue_dir: Path, settings: AdapterSettings) -> dict[str, Any] | None:
     """:func:`main`'s answer when the gate raised before it could answer (the queue would not open): a deny when
-    the event lacks a valid ``session_id``, ``tool_name`` or ``cwd`` (as :func:`gate` denies it), when the call is
+    the event lacks a valid ``session_id``, ``tool_name`` or absolute ``cwd`` (as :func:`gate` denies it), when the call is
     gated or cannot be classified, AND for every call while the queue store exists, since a halt on this session
     cannot then be ruled out; ``None`` only for a well-formed ungated call with no store (nothing was ever filed,
     so no session can be halted)."""
     try:
         tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input") or {}, event.get("cwd")
         session = event.get("session_id")
-        if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)):
+        if any(not isinstance(v, str) or not v for v in (tool_name, cwd, session)) or not os.path.isabs(cwd):
             tier, what = "irreversible", "this call"
         else:
             protected = protected_paths(queue_dir, settings)
-            tier = gate_class(tool_name, tool_input, cwd, protected=protected)
-            what = _call_what(tool_name, tool_input, cwd, protected=protected)
+            git_cache: dict[Any, Any] = {}   # one git budget for the call
+            tier = gate_class(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
+            what = _call_what(tool_name, tool_input, cwd, protected=protected, git_cache=git_cache)
     except Exception:
         tier, what = "irreversible", "this call"
     if tier is None and not os.path.lexists(queue_dir / QUEUE_DB_NAME):

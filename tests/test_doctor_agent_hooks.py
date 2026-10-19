@@ -69,3 +69,31 @@ def test_sandbox_off_warns_and_on_passes(install):
     (install / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": True, "failIfUnavailable": True}}))
     (r,) = doctor._check_cc_sandbox(install)
     assert r.ok and not r.warn
+
+
+def test_doctor_fails_when_a_workspace_or_user_config_turns_the_hooks_off(install, tmp_path, monkeypatch):
+    """L3 r1 G5 (codex H1): a cloned repository's ``.claude/settings.json`` ``disableAllHooks: true`` or
+    ``.codex/config.toml`` ``[features] hooks = false`` turns off every hook, the consent gate's floor included.
+    Doctor cannot enforce it; it FAILs naming the file. Hooks on, or a file that does not parse, is no row."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    home, codex_home = tmp_path / "home", tmp_path / "codex"
+    assert doctor._check_hooks_off(install, "claude-code", home=home) == []
+    assert doctor._check_hooks_off(install, "codex", home=home, codex_home=codex_home) == []
+    for path, body, adapter in (
+            (install / ".claude" / "settings.json", json.dumps({"hooks": {}, "disableAllHooks": True}), "claude-code"),
+            (install / ".claude" / "settings.local.json", json.dumps({"disableAllHooks": True}), "claude-code"),
+            (home / ".claude" / "settings.json", json.dumps({"disableAllHooks": True}), "claude-code"),
+            (install / ".codex" / "config.toml", "[features]\nhooks = false\n", "codex"),
+            (codex_home / "config.toml", "features.codex_hooks = false\n", "codex")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before = path.read_text() if path.exists() else None
+        path.write_text(body)
+        (r,) = doctor._check_hooks_off(install, adapter, home=home, codex_home=codex_home)
+        assert not r.ok and str(path) in r.detail and "cannot refuse" in r.detail, path
+        path.write_text(before) if before is not None else path.unlink()
+    (install / ".claude" / "settings.json").write_text(json.dumps({"disableAllHooks": False}))
+    (install / ".codex").mkdir(exist_ok=True)
+    (install / ".codex" / "config.toml").write_text("[features]\nhooks = true\n")
+    (install / ".claude" / "settings.local.json").write_text("{not json")
+    assert doctor._check_hooks_off(install, "claude-code", home=home) == []
+    assert doctor._check_hooks_off(install, "codex", home=home, codex_home=codex_home) == []
