@@ -568,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_away_parser(cs_sub)
     _add_consent_rule_parser(cs_sub)
     _add_push_parser(subparsers)
+    _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
 
     run_p = subparsers.add_parser(
@@ -2298,6 +2299,13 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
 def _add_push_parser(subparsers: argparse._SubParsersAction) -> None:
     """``levain push``: the gated push (``levain.consent.push_gate``)."""
     from levain.consent.push_gate import add_parser
+
+    add_parser(subparsers)
+
+
+def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
+    """``levain limits``: the per-session budgets (``levain.consent.limits_cli``)."""
+    from levain.consent.limits_cli import add_parser
 
     add_parser(subparsers)
 

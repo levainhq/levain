@@ -134,6 +134,7 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
+    core.extend(_check_consent_limits())
     for r in core:
         _emit(r)
 
@@ -276,6 +277,37 @@ def _check_consent_hooks(install: Path) -> list[CheckResult]:
     from levain.consent.canary import doctor_findings
 
     return [CheckResult(f.name, True, f.detail, f.hint, warn=f.warn) for f in doctor_findings(install)]
+
+
+def _check_consent_limits() -> list[CheckResult]:
+    """The session budgets (Q13): the limits in force per agent and where they came from, the sessions counted, how
+    many a limit halted, and a WARN when any root's counter is failing to count (its calls proceed uncounted)."""
+    from levain.consent import limits
+    from levain.install import _consent_queue_dir
+
+    name = "consent limits"
+    try:
+        qdir = _consent_queue_dir()
+        forces, not_counting, halted, counted = [], [], 0, 0
+        for agent in limits.AGENTS:
+            lim, src = limits.load_limits(qdir, agent)
+            shown = ", ".join(f"{k} {int(v) if k != 'active_hours' else v:g}" for k, v in lim.items())
+            forces.append(f"{agent}: {shown} [{src}]")
+        for row in limits.snapshot(qdir):
+            counted += 1
+            halted += 1 if row["halt"] else 0
+            if limits._fail_read(limits._fail_path(qdir, row["agent"], row["root"])):
+                not_counting.append(row["root"][:12])
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
+                            "Check the consent directory's permissions.", warn=True)]
+    detail = f"{'; '.join(forces)}; {counted} session(s) counted, {halted} halted"
+    if not_counting:
+        return [CheckResult(name, True, f"NOT COUNTING: {', '.join(not_counting)} (the limits store is failing "
+                                        f"to take their calls, which go on uncounted); {detail}",
+                            f"Look at {qdir / limits.DB_NAME}: a full disk, a store of another levain version or a "
+                            "corrupt file. The next call is counted once it can be written.", warn=True)]
+    return [CheckResult(name, True, detail)]
 
 
 def _check_seed_content(install: Path) -> list[CheckResult]:
