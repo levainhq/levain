@@ -313,7 +313,8 @@ class _PhoneServer(ThreadingHTTPServer):
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
         questions, questions_overflow = self._questions()
-        return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow, "pending": rows, "undecided": undecided, "overflow": listing.overflow,
+        return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
+                "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
                 "sign_overflow": sign_overflow}
 
@@ -379,7 +380,8 @@ class _PhoneServer(ThreadingHTTPServer):
         def wait(timeout: float) -> dict[str, Any]:
             if done.wait(timeout):
                 return box["d"]
-            return {"route": "pending", "reason": "delivery is still running; the ping says where it lands"}
+            return {"route": "pending", "reason": "delivery is still running; the answer is recorded either way "
+                                                  "(`levain question list --all` shows it)"}
 
         return wait
 
