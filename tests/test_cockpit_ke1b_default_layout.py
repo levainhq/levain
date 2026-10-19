@@ -29,7 +29,7 @@ def _zone(r, zid):
 class TestDefaultLayout:
     def test_hero_holds_the_activity_ambient_and_no_reading(self, regions) -> None:
         r, _ = regions
-        assert r["hero"] == ["activity"]       # K1: the Levain-native feed; a downstream with its own sky excludes it
+        assert r["hero"] == ["activity"]       # K1: the Levain-native feed; a downstream hero ambient (flow's sky) replaces it
 
     def test_brief_holds_the_state_line(self, regions) -> None:
         r, _ = regions

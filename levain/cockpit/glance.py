@@ -2,8 +2,8 @@
 
 ``memory_glance`` (Memory): episodes today, episodes in all, open spores, and the top open item named. ``doctor``
 (Levain health): doctor's own checks, read-only, grouped into status dots. The tile runs only checks ``levain
-doctor`` runs and that write nothing (the hook-pin check is left out: its first run records a pin), and it names
-what doctor does not check rather than drawing it as healthy.
+doctor`` runs and that write nothing (the hook-pin check is left out: its first run records a pin), and shows only
+those: what doctor has no check for gets no dot at all, never a permanent unknown.
 """
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ from typing import Any, Callable
 
 from levain.cockpit.results import Fault, Read, Result
 
-__all__ = ["DOCTOR_CACHE_S", "DOCTOR_UNCHECKED", "doctor_reader", "memory_glance_reader"]
+__all__ = ["DOCTOR_CACHE_S", "DOCTOR_FAULT_CACHE_S", "HOOK_LAYOUT_CHECKS", "doctor_reader", "memory_glance_reader"]
 
 DOCTOR_CACHE_S = 60.0
+DOCTOR_FAULT_CACHE_S = 30.0         # a check run that raised is not retried on every poll
+# the install-layout results the hooks dot holds, by doctor's result names: the install root (a missing install
+# fails every hook) and the activation tree the hooks live in
+HOOK_LAYOUT_CHECKS = frozenset({"install root", "activation/", "activation/hooks/", "hook scripts"})
 TOP_MAX = 80
-# what the Levain health tile names (SHAPE F5) that doctor has no check for: shown as unknown, never as a dot
-DOCTOR_UNCHECKED = ("serve", "phone", "push", "limits")
 
 
 def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
@@ -59,10 +61,10 @@ def _checks(install: Path) -> list[tuple[str, list[Any]]]:
     from levain.install import effective_adapter
 
     hookless = effective_adapter(install) == "openhands"
-    hooks: list[Any] = []
+    # a hookless install has no hooks to draw as healthy: only a failing layout check reaches its dot
+    hooks = [r for r in doctor._check_install_layout(install, expect_hooks=not hookless)
+             if r.name in HOOK_LAYOUT_CHECKS and not (hookless and r.ok)]
     if not hookless:
-        hooks += [r for r in doctor._check_install_layout(install, expect_hooks=True)
-                  if "hook" in r.name or "activation" in r.name]
         hooks += doctor._check_hook_freshness(install)
         hooks += doctor._check_consent_hooks(install)
     return [("hooks", hooks), ("memory store", doctor._check_store(install)),
@@ -88,20 +90,23 @@ def doctor_reader(install_root: Path | None) -> Callable[[Any], Result]:
     """``read(ctx)``: doctor's checks over the install as status dots, rebuilt at most once per
     ``DOCTOR_CACHE_S`` (a write's ``fresh`` read rebuilds)."""
     lock = threading.Lock()
-    cache: dict[str, Any] = {"at": 0.0, "value": None}
+    cache: dict[str, Any] = {"at": 0.0, "value": None, "fault": None, "fault_at": 0.0}
 
     def read(ctx: Any) -> Result:
         if install_root is None:
             return Fault("not configured: no install root, doctor checks an install")
         with lock:
-            if cache["value"] is None or getattr(ctx, "fresh", False) or time.monotonic() - cache["at"] > DOCTOR_CACHE_S:
+            fresh = getattr(ctx, "fresh", False)
+            if cache["fault"] is not None and not fresh and time.monotonic() - cache["fault_at"] <= DOCTOR_FAULT_CACHE_S:
+                return Fault(cache["fault"])
+            if cache["value"] is None or fresh or time.monotonic() - cache["at"] > DOCTOR_CACHE_S:
                 try:
                     groups = _checks(Path(install_root))
                 except Exception as exc:  # noqa: BLE001 - a check that raises is the tile's fault, named
-                    return Fault(f"doctor's checks did not run: {type(exc).__name__}")
+                    cache["fault"], cache["fault_at"] = f"doctor's checks did not run: {type(exc).__name__}", time.monotonic()
+                    return Fault(cache["fault"])
+                cache["fault"] = None
                 metrics = [_dot(label, rs) for label, rs in groups]
-                metrics += [{"label": name, "value": "doctor does not check this", "unit": None,
-                             "status": "unknown", "read": None} for name in DOCTOR_UNCHECKED]
                 cache["value"], cache["at"] = {"metrics": metrics, "alerts": []}, time.monotonic()
             return Read(value={"metrics": list(cache["value"]["metrics"]), "alerts": []})
     return read

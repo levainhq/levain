@@ -69,9 +69,11 @@ NEUTRALISE = (
 LEGEND = ("commits per repo; agent sessions as spans (live while a hook fired in the last 15 minutes); "
           "decisions allowed, denied, waiting or failed; memory writes; questions open or answered")
 
-# the consent queue's display states, as the sky's outcomes; a state not listed here is skipped and counted
+# the consent queue's display states, as the sky's outcomes; a state not listed here (nor in _DECISION_SILENT) is
+# skipped and counted. A withdrawn request is the agent's own retraction, not a failure: it draws nothing.
 _DECISION_OUTCOMES = {"allowed": "allowed", "denied": "denied", "pending": "waiting", "undecided": "waiting",
-                      "expired": "failed", "withdrawn": "failed"}
+                      "expired": "failed"}
+_DECISION_SILENT = frozenset({"withdrawn"})
 
 
 def _iso(t: datetime) -> str:
@@ -476,6 +478,8 @@ def _decision_events(listing: Any, start: datetime) -> tuple[list[tuple[dict[str
     bad = 0
     for e in (*listing.pending, *listing.undecided, *listing.recent):
         try:
+            if e.state in _DECISION_SILENT:
+                continue
             r = e.request
             at = _parse(r.received_at)
             outcome = _DECISION_OUTCOMES.get(e.state)
@@ -630,7 +634,8 @@ def activity_reader(*, install_root: Path | None, episodic_db: Path,
             errors.append(f"{len(events) - ACTIVITY_EVENTS_MAX} older events past the cap of {ACTIVITY_EVENTS_MAX} "
                           "not shown (the newest are)")
             events = events[-ACTIVITY_EVENTS_MAX:]
-        return Read(value={"events": events, "legend": LEGEND,
-                           "window": {"hours": ACTIVITY_WINDOW_H, "start": _iso(start), "end": _iso(now)},
+        # the window is its length only: a clock-stamped start/end would change the value on every read, so an
+        # idle install would stream panel-changed for ever
+        return Read(value={"events": events, "legend": LEGEND, "window": {"hours": ACTIVITY_WINDOW_H},
                            "errors": errors, "unreadable": unreadable})
     return read
