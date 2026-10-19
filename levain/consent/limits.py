@@ -383,8 +383,9 @@ def root_halted(queue_dir: Path | str, agent: str, root: str) -> bool | None:
 
 def extended_by(queue_dir: Path | str, request_id: str) -> bool:
     """True when ``request_id``'s own Extend was applied AND it is what released the root's halt (``released_by``):
-    the one allow whose holder may resume the session."""
-    conn = _connect(Path(queue_dir))
+    the one allow whose holder may resume the session. Read-only (``mode=ro``): a read never creates or migrates the
+    store; a failure to read raises."""
+    conn = sqlite3.connect((Path(queue_dir) / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
     try:
         return (conn.execute("SELECT 1 FROM extensions WHERE request_id = ?", (request_id,)).fetchone() is not None
                 and conn.execute("SELECT 1 FROM halts WHERE released_by = ?", (request_id,)).fetchone() is not None)
