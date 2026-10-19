@@ -1788,10 +1788,14 @@ def make_server(
     httpd.consent_reader = _consent_reader()
     from levain.consent.questions import QuestionStore
 
-    httpd.question_store = QuestionStore(getattr(httpd.consent_reader, "directory", None))
+    # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
+    # question store, never the default queue's (as the proposals route, _ConsentReader)
+    httpd.question_store = (QuestionStore(httpd.consent_reader.directory)
+                            if hasattr(httpd.consent_reader, "directory") else None)
     if cockpit is not None:
         cockpit.attach_consent_rows(httpd.consent_reader)      # agents waiting on the operator (Q6a)
-        cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
+        if httpd.question_store is not None:
+            cockpit.attach_question_rows(httpd.question_store)     # and the questions they ask him (Q-2b)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
