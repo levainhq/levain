@@ -42,6 +42,10 @@ Known edges (one line each):
 - the loop guard catches one call recurring, not a loop that varies an argument every time; tokens and calls catch that.
 - only the first crossed kind is reported; a second kind already past its limit is held at the next call.
 - the recent-id memory is bounded (:data:`RECENT_IDS`): a call id seen again after that many other calls counts again.
+- a root followed through more than :data:`SPEND_PATHS` transcript paths re-reads a returning one from its start
+  (an over-count, never an under-count).
+- past 256 subagent transcripts in one session, the later ones' tokens are not read; their calls and repeats still count.
+- an event with no absolute ``cwd`` is not counted (Claude Code and Codex always send one).
 
 Stdlib only.
 """
@@ -739,7 +743,7 @@ def _resolve(agent: str, queue: Any, qdir: Path, root: str, kind: str, request_i
     from datetime import datetime, timezone
 
     from levain.cockpit.consent import parse_stamp
-    from levain.consent.queue import Decision
+    from levain.consent.queue import Decision, Ruling
 
     held = queue.get(request_id)
     if held is not None and held[1] == "pending":
@@ -748,6 +752,15 @@ def _resolve(agent: str, queue: Any, qdir: Path, root: str, kind: str, request_i
             sleep(min(left + 0.05, 6.0))
     marked = queue.mark_undecided(request_id)       # idempotent: a retry keeps the gap; a decided one says what decided it
     got = marked.decision
+    if isinstance(got, Ruling):        # ruled late after the hold ended (a filer that died between the mark and the halt)
+        if got.ruling == "allow" and verified_allow(queue, request_id, root=root, kind=kind):
+            with write_transaction(lambda: _connect(qdir)) as conn:
+                _ensure(conn)
+                _apply_extension(conn, request_id, agent, root, kind, now())
+            return Outcome(True, extended=kind)
+        _halt_on(qdir, agent, root, kind, request_id, marked.gap if marked.gap is not None else queue.gap(request_id),
+                 now())
+        return Outcome(False, stop_text(kind, marked.gap), stop=True)
     if isinstance(got, Decision) and got.decision == "allow" and _filed_for(queue, request_id, got, root=root,
                                                                              kind=kind):
         with write_transaction(lambda: _connect(qdir)) as conn:
@@ -771,7 +784,8 @@ def _resolve(agent: str, queue: Any, qdir: Path, root: str, kind: str, request_i
         conn.execute("DELETE FROM holds WHERE agent = ? AND root = ? AND kind = ? AND request_id = ?",
                      (agent, root, kind, request_id))
     return Outcome(False, f"levain: this session's {LABELS.get(kind, kind)} limit request ended without a decision "
-                          f"({marked.reason or held and held[1]}); the action was NOT taken. Run it again to ask again.")
+                          f"({marked.reason or (held[1] if held else 'gone')}); the action was NOT taken. Run it "
+                          "again to ask again.")
 
 
 def _hold_id(qdir: Path, agent: str, root: str, kind: str) -> str | None:
@@ -817,17 +831,27 @@ def file_extend(queue: Any, agent: str, session: str, *, hold: float, cwd: str) 
     return request.id, call
 
 
-def ruling_text(ruling: str, gap: int | None, display: str | None) -> str:
+def ruling_text(ruling: str, gap: int | None, display: str | None, *, queue_dir: Path | str | None = None,
+                agent: str | None = None) -> str | None:
     """What a session is told of a late ruling on its LIMIT request (never the gated-action text: there is no action
-    to do): an allow is an Extend, so it goes on; a deny is an End, so it stays stopped."""
+    to do): an allow is an Extend, so it goes on; a deny is an End, so it stays stopped. ``None`` for an unknown
+    ruling, and for an End the session no longer stands under (given ``queue_dir`` and ``agent``: its root has no open
+    limit halt, so an Extend lifted it since): a stale End is never told to a session that was extended."""
     from types import SimpleNamespace
 
     from levain.consent.listing import filed_input
 
     call = filed_input(SimpleNamespace(tool_name=LIMIT_TOOL, display=display or ""))
-    label = LABELS.get(call.get("limit") if isinstance(call, dict) else None, "budget")
+    call = call if isinstance(call, dict) else {}
+    label = LABELS.get(call.get("limit"), "budget")
+    if ruling not in ("allow", "deny"):
+        return None
+    if ruling == "deny" and queue_dir is not None and agent is not None and isinstance(call.get("session"), str):
+        if _halt_read_only(Path(queue_dir), agent, call["session"]) is None:
+            return None
     if ruling == "allow":
-        to = f" to {call['extend_to']}" if isinstance(call, dict) and "extend_to" in call else ""
+        n = call.get("extend_to")
+        to = f" to {n}" if isinstance(n, str) and n and len(n) <= 24 and set(n) <= set("0123456789,.") else ""
         return (f"levain: the operator EXTENDED this session's {label} limit{to} (gap #{gap}). Go on with the work "
                 "where it stopped.")
     return (f"levain: the operator ENDED this session at its {label} limit (gap #{gap}). Stop here; do not continue "

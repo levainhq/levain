@@ -212,3 +212,45 @@ def test_a_late_ruling_on_a_limit_reads_as_extend_or_end(tmp_path, keys, authori
     from levain.consent import delivery
 
     assert "stays stopped" in delivery.plan(q2, rid).reason
+
+
+# --- L3 r1 findings ------------------------------------------------------------------------------------------------
+
+def test_a_late_ruling_after_a_dead_filers_mark_is_applied(tmp_path, keys, authority, monkeypatch):
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    r = _dead_filer(q)
+    time.sleep(0.5)
+    q.mark_undecided(r.id)                       # the filer marked the gap, then died before halting
+    payload = q.ruling_payload(r.id, "allow", keys["phone"].fp)
+    q.answer_late(r.id, payload, keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE))
+    out = _check(q, 3)
+    assert out.go and out.extended == "calls"
+
+
+def test_a_stale_end_is_not_told_after_an_extend_and_codex_hears_a_live_end(tmp_path, keys, authority, monkeypatch):
+    from levain.consent.adapters import claude_code, codex
+
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    _check(q, 3, hold=0.4)                       # silence: halted on gap #1
+    rid = q.undecided_for("claude_code")[0].request.id
+    payload = q.ruling_payload(rid, "deny", keys["phone"].fp)
+    q.answer_late(rid, payload, keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE))
+    eid, _call = L.file_extend(q, "claude_code", "s1", hold=30, cwd="/work")
+    p2, s2 = signed(q, q.get(eid)[0], keys["phone"], "allow")
+    q.answer(eid, p2, s2)
+    assert _check(q, 4).go
+    assert not (claude_code.ruling_context(q, "s1") or "")   # the End on gap #1 was superseded: not told
+    q2 = ConsentQueue(tmp_path / "h2" / "consent", authority=authority)
+    run = lambda i: codex.gate({"hook_event_name": "PreToolUse", "session_id": "s9", "tool_use_id": f"c{i}",  # noqa: E731
+                                "tool_name": "Read", "tool_input": {"file_path": f"/w/{i}"}, "cwd": "/w"}, q2,
+                               codex.AdapterSettings(gate_hold_seconds=0.4))
+    run(1), run(2), run(3)
+    rid2 = q2.undecided_for("codex")[0].request.id
+    payload = q2.ruling_payload(rid2, "deny", keys["phone"].fp)
+    q2.answer_late(rid2, payload, keys["phone"].sign(ruling_message(payload), RULING_NAMESPACE))
+    out = run(4)
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny" and "ENDED this session" in spec.get("additionalContext", "")
+    assert "continue" not in out

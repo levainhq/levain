@@ -343,7 +343,7 @@ def iter_usage(path: Path | str, include_subagents: bool = False,
 
 
 _STEP_BYTES = 32 << 20      # bytes read per spend_step call, all files together; the rest is read by later calls
-_RECENT_IDS = 512           # message ids whose counted usage is remembered, so a message written as several records adds once
+_RECENT_IDS = 128           # message ids whose counted usage is remembered, so a message written as several records adds once
 _SPEND_FILES = 256          # subagent transcripts followed for spend; more are counted in state["skipped"]
 
 
