@@ -1,7 +1,7 @@
 """QMCP-2: the question band's MCP server wired into `init` / `update` / `doctor` (DESIGN_QMCP R-q20 .. R-q23).
 
 Claude Code: the WORKSPACE .mcp.json gains a ``levain_band`` server from its own fragment and the settings allow
-``mcp__levain_band``; the hosted template (host_guard.cc_mcp_config: exactly anneal_memory) is unchanged. Codex: a
+``mcp__levain_band__ask``; the hosted template (host_guard.cc_mcp_config: exactly anneal_memory) is unchanged. Codex: a
 ``[mcp_servers.levain_band]`` block beside anneal's, kept when the operator edited it. Every install here lives
 under tmp_path (HOME, CODEX_HOME, LEVAIN_HOME)."""
 from __future__ import annotations
@@ -67,7 +67,7 @@ def test_the_workspace_mcp_json_registers_the_band_with_its_argv(make_install):
     assert inst._PYTHON_NAME.fullmatch(Path(b["command"]).name)
     assert servers["anneal_memory"]["command"] == b["command"]   # one interpreter for both
     settings = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    assert {"mcp__anneal_memory", "mcp__levain_band"} <= set(settings["permissions"]["allow"])
+    assert {"mcp__anneal_memory", "mcp__levain_band__ask"} <= set(settings["permissions"]["allow"])
 
 
 def test_the_hosted_template_still_names_exactly_anneal_memory(tmp_path):
@@ -299,6 +299,47 @@ def test_doctor_warns_when_the_band_files_under_another_levain_home(make_install
     (row,) = _band_rows(doctor._check_codex(install))
     assert row.warn and "LEVAIN_HOME" in row.detail and "cockpit here" in row.detail, row
     assert row.hint == "levain update", row
+
+
+def test_a_reinit_after_the_levain_home_moved_rewrites_levains_own_band_block(make_install, tmp_path, monkeypatch,
+                                                                              capsys):
+    """L3 r1 (complement MED): levain's own block written under another home was judged the operator's and kept, and
+    the doctor hint `levain update` looped."""
+    install = make_install("codex")
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "moved-home"))
+    assert run_init(install, "codex", force=True, answers_file=tmp_path / "entity-answers.json") == 0
+    capsys.readouterr()
+    server = tomllib.loads(_config(tmp_path).read_text(encoding="utf-8"))["mcp_servers"]["levain_band"]
+    assert server["env"]["LEVAIN_HOME"] == str((tmp_path / "moved-home").resolve())
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.ok and not row.warn, row
+
+
+def test_doctor_reports_an_unresolvable_home_instead_of_crashing(make_install, tmp_path):
+    """L3 r1 (codex MED): a NUL in a TOML string reached Path.resolve and aborted doctor."""
+    install = make_install("codex")
+    config = _config(tmp_path)
+    block = inst._codex_band_block(config.read_text(encoding="utf-8"))
+    home_line = next(line for line in block.splitlines() if line.startswith("env = "))
+    _edit_band(config, block.replace(home_line, 'env = { LEVAIN_HOME = "/x\\u0000y", CODEX_HOME = "/c" }'))
+    (row,) = _band_rows(doctor._check_codex(install))
+    assert row.warn and "LEVAIN_HOME" in row.detail, row
+
+
+def test_doctor_warns_when_the_ask_tool_is_not_allowed(make_install):
+    """L3 r1 (codex MED): with the server registered but no allow rule, a headless session is refused `ask` while
+    doctor read green. The rule names the one tool, never the whole server."""
+    install = make_install()
+    settings_path = install / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert "mcp__levain_band__ask" in settings["permissions"]["allow"]
+    assert "mcp__levain_band" not in settings["permissions"]["allow"]
+    (row,) = [r for r in doctor._check_claude_code(install) if r.name == doctor.BAND_ALLOW_ROW]
+    assert row.ok and not row.warn, row
+    settings["permissions"]["allow"].remove("mcp__levain_band__ask")
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    (row,) = [r for r in doctor._check_claude_code(install) if r.name == doctor.BAND_ALLOW_ROW]
+    assert row.warn and "headless" in row.detail, row
 
 
 # ---- the agent line ---------------------------------------------------------------------------------------------

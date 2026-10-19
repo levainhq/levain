@@ -2,7 +2,7 @@
   "permissions": {
     "allow": [
       "mcp__anneal_memory",
-      "mcp__levain_band"
+      "mcp__levain_band__ask"
     ]
   },
   "hooks": {

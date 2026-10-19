@@ -2926,6 +2926,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
                         "Add 'mcp__anneal_memory' to permissions.allow, or re-run `levain init`.",
                     )
                 )
+            results.append(_check_band_allow(allow))
 
     mcp_path = install / ".mcp.json"
     if not mcp_path.is_file():
@@ -3016,6 +3017,21 @@ def _check_band_server(where: str, server: object, agent: str, codex_home: Path 
                                        f"--agent {agent}")
 
 
+BAND_ALLOW_ROW = "settings levain_band ask allowed"
+
+
+def _check_band_allow(allow: object) -> CheckResult:
+    """Advisory: Claude Code may call the band's ``ask`` tool without a prompt. Without the rule a headless session
+    (``-p``, dontAsk) is refused the call and files nothing, though the server is registered. A settings.json kept as
+    the operator's on update can lack it."""
+    rules = allow if isinstance(allow, list) else []
+    if any(a in ("mcp__levain_band", "mcp__levain_band__ask") for a in rules):
+        return CheckResult(BAND_ALLOW_ROW, True, "mcp__levain_band__ask allowed")
+    return CheckResult(BAND_ALLOW_ROW, True, "mcp__levain_band__ask is not in permissions.allow: a headless session "
+                                             "is refused the `ask` tool (an interactive one asks first)",
+                       "Add 'mcp__levain_band__ask' to .claude/settings.json permissions.allow", warn=True)
+
+
 _BAND_KEYS = frozenset({"type", "command", "args"})
 # Codex's block also carries the levain home and the approval mode levain writes (QMCP R-q20 amended)
 _CODEX_BAND_KEYS = _BAND_KEYS | {"env", "default_tools_approval_mode"}
@@ -3036,11 +3052,19 @@ def _codex_band_settings(server: dict, codex_home: Path) -> tuple[str, bool] | N
     if not isinstance(env, dict) or set(env) != {"LEVAIN_HOME", "CODEX_HOME"}:
         return (f"carries env {env!r} where levain writes only LEVAIN_HOME and CODEX_HOME: it may not run the band "
                 f"levain ships"), False
-    for key, want, why in (("LEVAIN_HOME", str(default_queue_dir().parent), "the cockpit here will not see them"),
-                           ("CODEX_HOME", str(codex_home.expanduser().resolve()),
-                            "an ended Codex thread is not resumed with its answer")):
+    try:
+        homes = (("LEVAIN_HOME", str(default_queue_dir().parent), "the cockpit here will not see them"),
+                 ("CODEX_HOME", str(codex_home.expanduser().resolve()),
+                  "an ended Codex thread is not resumed with its answer"))
+    except (OSError, RuntimeError, ValueError) as exc:
+        return f"cannot be compared with this shell's homes ({exc})", False
+    for key, want, why in homes:
         named = env[key]
-        if not isinstance(named, str) or str(Path(named).expanduser().resolve()) != want:
+        try:
+            seen = str(Path(named).expanduser().resolve()) if isinstance(named, str) else None
+        except (OSError, RuntimeError, ValueError):     # a NUL, a symlink loop: not a home levain wrote
+            seen = None
+        if seen != want:
             return f"starts the band with {key} {named!r}, not {want}: {why}", True
     if mode != "approve":
         return (f"has default_tools_approval_mode {mode!r}: `codex exec` refuses an MCP call that is not approved, "

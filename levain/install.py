@@ -3527,16 +3527,26 @@ def _codex_band_unmatched(text: str) -> bool:
 # Keys the band block gained after its first render (QMCP R-q20 amended): a block that lacks them all, and is levain's
 # launcher with nothing else, is an older levain render, never the operator's.
 _BAND_AMENDED_KEYS = ("env", "default_tools_approval_mode")
+_BAND_ENV_KEYS = frozenset({"LEVAIN_HOME", "CODEX_HOME"})
 
 
 def _codex_band_is_levains(block: str, new_block: str) -> bool:
     """Whether ``block`` is a band registration levain itself writes: its launcher (R-q21) and nothing the
-    operator added beside it, in this render's form or the older one without :data:`_BAND_AMENDED_KEYS`. A changed
-    ``env`` or approval mode is the operator's."""
+    operator added beside it, in this render's form or the older one without :data:`_BAND_AMENDED_KEYS`. An ``env``
+    of exactly levain's two homes is levain's whatever their values (written under other homes); any other ``env``
+    or a changed approval mode is the operator's."""
     old_dict, new_dict = _codex_block_dict(block), _codex_block_dict(new_block)
     if not _is_levain_launcher(old_dict, None, server=BAND_SERVER, agent="codex"):
         return False
     old_rest, new_rest = _without_band_keys(old_dict), _without_band_keys(new_dict)
+    if old_rest == new_rest:
+        return True
+    old_server = dict(((old_rest or {}).get("mcp_servers") or {}).get(BAND_SERVER) or {})
+    env = old_server.get("env")
+    if isinstance(env, dict) and set(env) == _BAND_ENV_KEYS and all(isinstance(v, str) for v in env.values()):
+        # levain's own env, written under other homes (a re-init after LEVAIN_HOME or CODEX_HOME moved): levain's
+        old_server["env"] = (((new_rest or {}).get("mcp_servers") or {}).get(BAND_SERVER) or {}).get("env")
+    old_rest = {**(old_rest or {}), "mcp_servers": {**((old_rest or {}).get("mcp_servers") or {}), BAND_SERVER: old_server}}
     if old_rest == new_rest:
         return True
     older = dict((new_rest or {}).get("mcp_servers") or {})
