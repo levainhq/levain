@@ -23,10 +23,11 @@ def live(queue_dir: Path | str | None) -> bool:
         st = os.lstat(path)
         if not stat.S_ISREG(st.st_mode):
             return False
-        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+        # a short wait: a gate hook reads this, and a sender holding the write lock must not stall the gate
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
         try:
-            return conn.execute("SELECT 1 FROM subscriptions WHERE retired_at IS NULL AND device_id IS NOT NULL "
-                                "LIMIT 1").fetchone() is not None
+            return conn.execute("SELECT 1 FROM subscriptions s JOIN devices d ON d.id = s.device_id "
+                                "WHERE s.retired_at IS NULL AND d.revoked_at IS NULL LIMIT 1").fetchone() is not None
         finally:
             conn.close()
     except (OSError, sqlite3.Error, ValueError):

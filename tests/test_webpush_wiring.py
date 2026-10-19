@@ -51,3 +51,10 @@ def test_a_ruling_ping_reaches_the_phone_without_a_notify_command(tmp_path, monk
     assert send is not None
     send("levain: ruling on gap 1 (ALLOW) waits: x.")
     assert calls and calls[0]["kind"] == "ruling" and calls[0]["ref"] == "request:r9"
+
+
+def test_a_revoked_phone_is_not_live(tmp_path):
+    store = _phone(tmp_path)
+    with store.write() as c:
+        c.execute("UPDATE devices SET revoked_at = '2026-10-19T00:00:00Z'")
+    assert webpush.live(tmp_path) is False
