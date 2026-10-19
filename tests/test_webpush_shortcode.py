@@ -382,3 +382,12 @@ def test_the_page_copy_never_sends_the_operator_back_to_a_browser_link():
 
     assert re.match(r"this page's (token|credential) is needed", f"this page's token is needed, sent as {PHONE_TOKEN_HEADER}")
     assert re.match(r"this page's (token|credential) is needed", "this page's credential is needed")
+
+
+def test_the_box_takes_a_pasted_code_with_invisible_characters_in_front_of_it():
+    """The server strips format characters up to its own raw-input cap, so the box must not cut the paste first."""
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "phone_app.js").read_text()
+    box = js[js.index('id: "pair-code"'):][:200]
+    assert 'maxlength: "64"' in box and 'maxlength: "12"' not in box

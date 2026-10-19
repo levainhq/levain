@@ -420,6 +420,7 @@
     if (installBusy) return;
     installBusy = true;
     const seq = ++installSeq;
+    installShort = "";   // the code on screen dies the moment a new one is asked for: never show a dead code beside a countdown
     renderPings();
     api("POST", "/webpush/pair", { label: "iPhone" }).then((r) => {
       if (seq !== installSeq) return;
@@ -588,7 +589,7 @@
     }
     const kept = box.querySelector("#pair-code");
     const typed = kept ? kept.value : "";
-    const input = h("input", { id: "pair-code", type: "text", maxlength: "12", autocapitalize: "characters", autocorrect: "off",
+    const input = h("input", { id: "pair-code", type: "text", maxlength: "64", autocapitalize: "characters", autocorrect: "off",
                                autocomplete: "off", spellcheck: "false", inputmode: "text", enterkeyhint: "go",
                                placeholder: "ABCD-EFGH", "aria-label": "pairing code", disabled: pairBusy });
     input.value = typed;
