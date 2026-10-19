@@ -426,6 +426,10 @@ def _not_done(store: JobStore, job_id: str, last: Job | None, verb: str) -> str:
     if verb == "sign":
         return f"nothing was signed; job {shown} is unchanged ({state})"
     if now is not None and now.state in TERMINAL:
+        if last is None:
+            # never read before the fault, so whether this call's own write made it terminal is not known
+            return f"job {shown} is {now.state}; the store faulted, so whether this call made that change is not " \
+                   "known: read it with `levain dispatch show`"
         return f"this call cancelled nothing; job {shown} is {now.state}"
     return f"job {shown} is NOT cancelled; it is still {state} and holds its files"
 

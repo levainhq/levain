@@ -605,7 +605,7 @@ def _record_dir(ddir):
     return d
 
 
-@pytest.mark.parametrize("damage", ["reachable", "unwritable", "corrupt", "symlink"])
+@pytest.mark.parametrize("damage", ["reachable", "unwritable", "corrupt", "symlink", "lockdir"])
 def test_a_record_that_cannot_be_kept_refuses_the_filing_before_it_is_made(capsys, ddir, contract_file, damage,
                                                                          tmp_path):
     # complement MED: a record that could not be written after the filing still exited 0
@@ -618,6 +618,9 @@ def test_a_record_that_cannot_be_kept_refuses_the_filing_before_it_is_made(capsy
     elif damage == "corrupt":
         record.write_bytes(b"not a record")
         os.chmod(record, 0o600)
+    elif damage == "lockdir":
+        # codex r2: a lock path keep() cannot open passed preflight, so the filing was made and the record lost
+        record.with_suffix(".lock").mkdir(mode=0o700)
     else:
         os.rmdir(d)
         (tmp_path / "elsewhere").mkdir(mode=0o700)
@@ -668,3 +671,20 @@ def test_a_fault_after_the_signature_committed_does_not_claim_nothing_was_signed
     code, out, _ = run(capsys, *_sign_argv(ddir, job_id, keys, log, "--yes"))
     assert code == 3 and "nothing was signed" not in out, out
     assert f"job {job_id} is now signed (was filed)" in out and "is not known" in out, out
+
+
+def test_a_fault_after_a_planner_cancel_committed_does_not_claim_it_cancelled_nothing(capsys, ddir, contract_file,
+                                                                                      monkeypatch):
+    # codex r2 MED / glm N1: the planner branch never read the job, so a terminal re-read said "cancelled nothing"
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    real_cancel = JobStore.cancel_by_planner
+
+    def cancel_then_fault(self, *a, **kw):
+        real_cancel(self, *a, **kw)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(JobStore, "cancel_by_planner", cancel_then_fault)
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    assert code == 3 and "cancelled nothing" not in out, out
+    assert f"job {job_id} is cancelled" in out and "is not known" in out, out

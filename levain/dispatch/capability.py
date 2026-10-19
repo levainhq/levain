@@ -210,7 +210,12 @@ def preflight(directory: Path | str, agent: str, session: Any) -> None:
             return
         if not os.access(d, os.W_OK | os.X_OK):
             raise CapabilityRecordError(f"{d} cannot be written by uid {os.getuid()}")
-    _read(path, agent, session)
+    # the lock keep() takes, taken here too: a lock path keep() could not open stops the filing, not the keeping
+    try:
+        with _locked(path):
+            _read(path, agent, session)
+    except OSError as exc:
+        raise CapabilityRecordError(f"capability record {path} cannot be locked: {exc}") from None
 
 
 def recall(directory: Path | str, agent: str, session: Any, job_id: str) -> str | None:
