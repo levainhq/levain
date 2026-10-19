@@ -87,8 +87,7 @@ def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_n
 def test_a_text_editor_keeps_its_own_size_when_typed_in(tmp_path: Path) -> None:
     vals = _page(tmp_path, [{"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"}, {"until": "[...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''))"}, {"eval": """(() => {
       const card = [...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''));
-      // K6: the Identity cards sit behind one list's rows; the row's Edit opens the card and presses the card's own edit button
-      card.closest('.ck-mem-item').querySelector('.ck-mem-edit').click(); const ta = card.querySelector('.text-editor textarea');
+      card.querySelector('.edit-btn').click(); const ta = card.querySelector('.text-editor textarea');
       const before = ta.offsetHeight; ta.value = Array.from({length: 60}, (_, i) => 'line ' + i).join('\\n'); ta.dispatchEvent(new Event('input', {bubbles: true}));
       return { before, after: ta.offsetHeight, inline: ta.style.height }; })()"""}])
     got = vals[3]

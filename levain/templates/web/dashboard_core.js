@@ -953,20 +953,40 @@
 
   // ---- the Memory tab (K6) --------------------------------------------------------------------------------------------------
   // The mind zone is ONE neocortex card with every section readable at once (State, threads, context and understanding left;
-  // patterns and decisions right), then Crystallized patterns and Cognition side by side; the identity zone is ONE list of
-  // eight rows. The panels the kernel drew keep doing their own work: each section is still its own panel inside the card (so its
-  // editor is the one it always had), and each identity panel is still the editor, kept closed behind its row until Edit opens it.
+  // patterns and decisions right), then Crystallized patterns and Cognition side by side. The identity zone is ONE card of eight rows:
+  // the identity cards themselves, restyled into rows (title | one-line summary | the card's own Edit), the editor opening in place.
+  // Nothing is hidden and nothing is pressed for the reader: each panel the kernel drew keeps doing its own work.
+  const MEM_WRAP_CAP = 50;   // the longest history list the page is sent
   function memWrapsLine(view) {
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
-    const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : ws.length;
-    const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? new Date(ws[0].wrapped_at) : null;
-    if (!total) return "";
-    let out = total + (total === 1 ? " wrap" : " wraps");
-    if (last && !Number.isNaN(last.getTime())) {
+    const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
+    // the newest stamp, wherever it sits in the list
+    let last = null;
+    for (const w of ws) {
+      const d = w && typeof w.wrapped_at === "string" ? new Date(w.wrapped_at) : null;
+      if (d && !Number.isNaN(d.getTime()) && (!last || d > last)) last = d;
+    }
+    if (total === null && !ws.length) return "";
+    let out = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+      : ws.length >= MEM_WRAP_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap" : " wraps");
+    if (total === 0) return "";
+    if (last) {
       out += " · last wrap " + last.toLocaleDateString(undefined, { weekday: "short" }) + " " +
         last.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
     }
     return out;
+  }
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  function memCogBits(view) {
+    const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
+    const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
+    const bits = [];
+    if (ws) bits.push((ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
+    if (gn) bits.push(gn + " nodes");
+    if (ge) bits.push(ge + " edges");
+    const live = view.health && "write_path_live" in view.health ? view.health.write_path_live : view.write_path_live;
+    if (live === false) bits.push("write path dark");
+    return bits;
   }
   function memCard(cls, title, meta, modes) {
     const card = el("div", "panel ck-mem-card " + cls);
@@ -993,7 +1013,7 @@
     const modes = nodes[0].dataset.modes || "memory";
     if (zoneId === "identity") {
       // the identity cards are config panels (the page's own) or typed text panels (the kernel's `config:*` panels): either is a card with
-      // its own editor, which stays the editor
+      // its own editor, and the card IS the row
       const rows = nodes.filter((n) => /^config(:|$)/.test(pid(n)) || (entryOf.get(n) || {}).kind === "config");
       if (!rows.length) return;
       const card = memCard("ck-mem-ident", "Identity", "", modes);
@@ -1001,39 +1021,9 @@
       card.querySelector(".phead").appendChild(el("span", "ck-mem-meta", "read at every session start"));
       const list = el("div", "ck-mem-ilist");
       for (const n of rows) {
-        const e = entryOf.get(n);
-        const doc = e.kind === "config" ? (view.config_docs || [])[e.ref] || {} : null;
-        const text = doc
-          ? String(doc.body || "").split(/\n\s*\n/).map((b) => b.split("\n").filter((l) => !/^\s*#/.test(l)).join(" ")).map((b) => b.replace(/[*_`]/g, "").trim()).find(Boolean) || ""
-          : ((n.querySelector(".md-p") || {}).textContent || "").trim();
-        const item = el("div", "ck-mem-item");
-        const row = el("div", "ck-mem-irow");
-        row.appendChild(el("span", "ck-mem-il", e.title));
-        row.appendChild(el("span", "ck-mem-it", text));
-        if (n.dataset.editable === "1" || n.querySelector(".edit-btn")) {
-          const b = el("button", "ck-mem-edit", "Edit");
-          b.type = "button";
-          b.addEventListener("click", () => {
-            // the same editor the card always had: show the card behind this row and press its own edit button; when the editor goes
-            // (save re-draws the page; cancel just removes it) the card folds back behind its row
-            const open = n.querySelector(".edit-btn");
-            if (!open) return;
-            n.classList.add("ck-mem-open");
-            open.click();
-            if (typeof MutationObserver === "function") {
-              const mo = new MutationObserver(() => {
-                const ed = n.querySelector(".editor, .text-editor");
-                if (!ed || ed.hidden) { n.classList.remove("ck-mem-open"); mo.disconnect(); }
-              });
-              mo.observe(n, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden"] });
-            }
-          });
-          row.appendChild(b);
-        }
-        item.appendChild(row);
-        item.appendChild(memNest(n));
-        n.classList.add("ck-mem-fold");
-        list.appendChild(item);
+        memNest(n);
+        n.classList.add("ck-mem-rowcard");
+        list.appendChild(n);
       }
       card.appendChild(list);
       grid.insertBefore(card, grid.firstChild);
@@ -1045,8 +1035,9 @@
     const cog = nodes.filter((n) => pid(n) === "graph" || pid(n) === "wraps");
     const RIGHT = /^(patterns|decisions)$/i;
     const card = memCard("ck-mem-neo", "Neocortex", memWrapsLine(view), modes);
-    const full = secs.filter((n) => !n.dataset.ckNoText);
-    for (const n of secs) if (n.dataset.ckNoText) n.remove();
+    // a section with no text is left out unless it can be edited: an editable one stays as a slim row that keeps its Edit
+    const full = secs.filter((n) => !n.dataset.ckNoText || n.dataset.ckSlim);
+    for (const n of secs) if (!full.includes(n)) n.remove();
     if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
     else {
       const left = el("div", "ck-mem-col"), right = el("div", "ck-mem-col");
@@ -1062,31 +1053,27 @@
     const row = el("div", "ck-mem-row");
     row.dataset.modes = modes;
     if (crystals) {
-      const lv = (view.crystal_index || []).map((c) => num(c.level)).filter((x) => x > 0);
-      if (lv.length) {
+      const lv = (Array.isArray(view.crystal_index) ? view.crystal_index : []).map((c) => num(c && c.level)).filter((x) => x > 0);
+      const chead = crystals.querySelector(".phead");
+      if (lv.length && chead) {
         const lo = Math.min(...lv), hi = Math.max(...lv);
-        crystals.querySelector(".phead").appendChild(el("span", "ck-mem-meta", lo === hi ? "level " + lo : "levels " + lo + " to " + hi));
+        chead.appendChild(el("span", "ck-mem-meta", lo === hi ? "level " + lo : "levels " + lo + " to " + hi));
       }
       crystals.classList.add("ck-mem-crys");
       crystals.classList.remove("ck-fold");   // the kernel's dashed one-liner spans its grid; here it keeps its side of the row
       row.appendChild(crystals);
     }
     if (cog.length) {
-      const g = view.graph, gn = g && g.nodes ? g.nodes.length : 0, ge = g && g.edges ? g.edges.length : 0;
       const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
-      const bits = [];
-      if (ws) bits.push(ws + (ws === 1 ? " consolidation" : " consolidations"));
-      if (gn) bits.push(gn + " nodes");
-      if (ge) bits.push(ge + " edges");
-      // the write path is the one figure of the retired Health strip that is a warning: it speaks only when it is dark
-      if (view.health && view.health.write_path_live === false) bits.push("write path dark");
+      const bits = memCogBits(view);
       const graph = cog.find((n) => pid(n) === "graph") || cog[0];
       if (!ws) {
         // no wrap yet: no history to tab to, so no tab row and no second panel; the card is the title and its one line
         for (const n of cog) { const t = n.querySelector(".ck-tabs"); if (t) t.remove(); if (n !== graph) n.remove(); }
         cog.splice(0, cog.length, graph);
       }
-      if (bits.length) { const gh = graph.querySelector(".phead"); (gh.querySelector(".ck-card-title") || gh.querySelector("h2")).after(el("span", "ck-mem-meta", bits.join(" · "))); }
+      // the figures ride the header of every Cognition tab, so whichever is showing carries them
+      if (bits.length) for (const n of cog) { const gh = n.querySelector(".phead"); const t = gh && (gh.querySelector(".ck-card-title") || gh.querySelector("h2")); if (t) t.after(el("span", "ck-mem-meta", bits.join(" · "))); }
       graph.classList.add("ck-mem-cog");
       for (const n of cog) row.appendChild(n);
     }
@@ -2287,41 +2274,49 @@
   }
   // [MD-EXTRACT-END]
 
-  // The Patterns and Decisions sections are lists on the Memory tab (a count chip and a name; a date and a line), read off the section's
-  // own markdown. A body the readers do not recognise line for line stays the markdown it is: the list never drops a line to look tidy.
-  // Patterns: `- !!! name | 4x (date) [evidence: ...]` under optional `{group}` headers. Decisions: `[decided, 2026-10-18, who] **TITLE** ...`.
-  const memPlain = (t) => t.replace(/\[episode:[^\]]*\]/g, "").replace(/\[evidence:[^\]]*\]/g, "").replace(/[*`]/g, "").replace(/\s+/g, " ").trim();
+  // The Patterns and Decisions sections are lists on the Memory tab, read off the section's own markdown. A list drops nothing: every
+  // line of the body is a row, a group label or part of a row (its second line, its continuation), or the whole section stays the
+  // markdown it is. Patterns: `- !!! name | 4x (date) [evidence: ...] prose` under optional `{group}` headers. Decisions:
+  // `[decided, 2026-10-18, who] **TITLE** ...` (also `[forwarded ...]`, `[carried ...]`), a line without a bracket continuing the row above.
   function memPatternRows(body) {
     const rows = [];
+    let seen = 0;
     for (const line of String(body || "").split("\n")) {
-      if (!line.trim() || /^\s*\{[^}]*\}\s*$/.test(line)) continue;
-      const m = /^\s*[-*]\s*(?:[!~]+\s*)?([^\s|]+)\s*\|\s*(\d+)x\b/.exec(line);
+      if (!line.trim()) continue;
+      const g = /^\s*\{([^}]*)\}\s*$/.exec(line);
+      if (g) { rows.push({ group: g[1].trim() }); continue; }
+      const m = /^\s*[-*]\s*(?:[!~]+\s+)?([^|]+?)\s*\|\s*(\d+)x\b(.*)$/.exec(line);
       if (!m) return null;
-      rows.push({ n: m[2], name: m[1] });
+      rows.push({ n: m[2], name: m[1], rest: m[3].trim() });
+      seen++;
     }
-    return rows.length ? rows : null;
+    return seen ? rows : null;
   }
   function memDecisionRows(body) {
     const rows = [];
-    let dated = 0;
     for (const line of String(body || "").split("\n")) {
       if (!line.trim()) continue;
       const m = /^\s*\[(decided|forwarded|carried)\b([^\]]*)\]\s*(.*)$/.exec(line);
-      let when = "", text = line;
       if (m) {
-        const d = /(\d{4}-)?(\d\d-\d\d)/.exec(m[2]);
-        when = m[1] === "decided" && d ? d[2] : m[1];
-        if (m[1] === "decided" && d) dated++;
-        text = m[3];
-      }
-      text = memPlain(text);
-      if (text) rows.push({ when: when, text: text });
+        const d = /,\s*(?:\d{4}-)?(\d\d-\d\d)/.exec(m[2]);
+        rows.push({ when: m[1] === "decided" && d ? d[1] : m[1], text: m[3].trim() });
+      } else if (rows.length) rows[rows.length - 1].text += " " + line.trim();
+      else return null;
     }
-    return dated ? rows : null;
+    return rows.length ? rows : null;
+  }
+  // text through the same inline markdown a section uses (code spans and links keep their rendering); a citation stays, muted
+  function memInline(parent, text) {
+    for (const part of String(text).split(/(\[(?:episode|evidence):[^\]]*\])/)) {
+      if (!part) continue;
+      if (/^\[(?:episode|evidence):/.test(part)) parent.appendChild(el("span", "ck-mem-cite", part));
+      else mdInline(part, parent, 0);
+    }
   }
   function memList(cls, rows, cell) {
     const d = el("div", "section section-display ck-mem-list " + cls);
     for (const r of rows) {
+      if (r.group) { d.appendChild(el("div", "ck-mem-group", r.group)); continue; }
       const row = el("div", "ck-mem-li");
       cell(row, r);
       d.appendChild(row);
@@ -2335,11 +2330,25 @@
     const head = String(sec.heading || entry.heading || entry.title || "").trim().toLowerCase();
     const pats = head === "patterns" ? memPatternRows(sec.body) : null;
     const decs = head === "decisions" ? memDecisionRows(sec.body) : null;
-    if (pats) p.appendChild(memList("ck-mem-pats", pats, (row, r) => { row.appendChild(el("span", "ck-mem-n", r.n + "x")); row.appendChild(el("span", "ck-mem-name", r.name)); }));
-    else if (decs) p.appendChild(memList("ck-mem-decs", decs, (row, r) => { row.appendChild(el("span", "ck-mem-when", r.when)); row.appendChild(el("span", "ck-mem-text", r.text)); }));
+    if (pats) p.appendChild(memList("ck-mem-pats", pats, (row, r) => {
+      row.appendChild(el("span", "ck-mem-n", r.n + "x"));
+      const t = el("span", "ck-mem-t");
+      t.appendChild(el("span", "ck-mem-name", r.name));
+      if (r.rest) { const rest = el("span", "ck-mem-rest"); memInline(rest, r.rest); t.appendChild(rest); }
+      row.appendChild(t);
+    }));
+    else if (decs) p.appendChild(memList("ck-mem-decs", decs, (row, r) => {
+      row.appendChild(el("span", "ck-mem-when", r.when));
+      const t = el("span", "ck-mem-text");
+      memInline(t, r.text);
+      row.appendChild(t);
+    }));
     else p.appendChild(sectionDisplay(sec.body));  // markdown-rendered (edit shows raw)
-    // a section with no text is left out of the Memory tab's neocortex card (a bare heading says nothing)
-    if (!String(sec.body || "").trim()) p.dataset.ckNoText = "1";
+    // a section with no text is left out of the Memory tab's neocortex card (a bare heading says nothing), unless it can be edited:
+    // then it is a slim row that keeps its Edit
+    const bare = !String(sec.body || "").trim();
+    if (bare) p.dataset.ckNoText = "1";
+    if (bare && isEditablePanel(entry)) { p.dataset.ckSlim = "1"; p.appendChild(el("p", "empty", "empty")); }
     if (isEditablePanel(entry)) {
       // State (Class-A neocortex section) is editable in Slice 2b via the SAME
       // affordance config panels use — mark + stash; finalizePanels appends the bar.

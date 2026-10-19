@@ -1541,9 +1541,9 @@ body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap:
 body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
 body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
 /* a status row in a narrow tile wraps: the value drops under its label (right-aligned) rather than running past the body that clips it; the status word is never cut */
-.w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
-.w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
-.w .op .v { max-width: 100%; overflow-wrap: anywhere; }
+body.ke .ck-widgets .w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
+body.ke .ck-widgets .w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
+body.ke .ck-widgets .w .op .v { max-width: 100%; overflow-wrap: anywhere; }
 body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
 body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 3px 0 0 var(--accent); }
 body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
@@ -1677,7 +1677,15 @@ body.ke .ck-mem-nest .edit-trigger-row { margin-top: var(--sp-2); }
 body.ke .ck-mem-list { display: flex; flex-direction: column; gap: var(--sp-2); }
 body.ke .ck-mem-li { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
 body.ke .ck-mem-n { font: var(--fw-bold) var(--fs-meta)/1.5 var(--mono); color: var(--accent); }
+body.ke .ck-mem-t { display: flex; flex-direction: column; min-width: 0; }
 body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.4; overflow-wrap: anywhere; }
+body.ke .ck-mem-group { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); padding-top: var(--sp-3); }
+body.ke .ck-mem-group:first-child { padding-top: 0; }
+body.ke .ck-mem-slim { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-3); }
+body.ke .ck-mem-slim > .pbody { flex: 1 1 auto; min-width: 0; }
+body.ke .ck-mem-slim > .pbody:has(.editor) { flex-basis: 100%; }
+body.ke .ck-mem-slim .empty { margin: 0; color: var(--label); }
 body.ke .ck-mem-when { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
 body.ke .ck-mem-text { overflow-wrap: anywhere; }
 /* crystals beside cognition */
@@ -1686,10 +1694,11 @@ body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height
 body.ke .ck-mem-row > .panel > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
 body.ke .ck-zgrid .ck-mem-row .pbody { max-height: none; overflow: visible; }
 body.ke .ck-crys { align-content: start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--sp-8, 40px); }
-body.ke .ck-crys .row { display: flex; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
+body.ke .ck-crys .row { display: flex; flex-wrap: nowrap; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
 body.ke .ck-crys .lvl { color: var(--accent); font: var(--fw-bold) var(--fs-lead)/1 var(--round); min-width: 2rem; }
-body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-crys .lvl { flex: none; }
+body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; flex: 1 1 0; min-width: 0; }
+body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: break-word; word-break: normal; min-width: 0; }
 body.ke .ck-crys .clause { flex: none; color: var(--label); font-size: var(--fs-meta); }
 body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); }
 body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: center; }
@@ -1701,26 +1710,36 @@ body.ke .ck-mem-cog .scope-ch::before { content: ""; display: block; width: 10px
 body.ke .ck-mem-cog .scope-ch-l { font-weight: var(--fw-bold); color: var(--text); }
 body.ke .ck-mem-cog .scope-ch-v { color: var(--label); font-size: var(--fs-meta); }
 body.ke .ck-mem-cog .scope-wrap > .note { display: none; }
-/* identity: one list of rows, each card kept behind its row until Edit opens it */
+/* identity: one card of rows. Each identity card IS its row: title | one-line summary | the card's own Edit. The body of the card is
+   flattened into the row's grid (display: contents), the summary is the card's own first paragraph cut to one line, and the editor, when
+   opened, takes the next row of the same card. Nothing is hidden and no node is added. */
 body.ke .ck-mem-ident .ck-mem-meta { margin-left: 0; }
 body.ke .ck-mem-ilist { display: flex; flex-direction: column; }
-body.ke .ck-mem-item { border-top: 1px solid var(--hair); }
-body.ke .ck-mem-item:first-child { border-top: 0; }
-body.ke .ck-mem-irow { display: grid; grid-template-columns: minmax(8rem, 15rem) minmax(0, 1fr) auto; gap: var(--sp-6); align-items: center; padding: var(--sp-3) 0; }
-body.ke .ck-mem-il { font-weight: var(--fw-semibold); }
-body.ke .ck-mem-it { color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-body.ke .ck-mem-edit { font: var(--fw-medium) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; min-height: 32px; }
-body.ke .ck-mem-edit:hover { border-color: var(--label); }
-body.ke .ck-zgrid .panel.ck-mem-fold { display: none; }
-body.ke .ck-zgrid .panel.ck-mem-fold.ck-mem-open { display: block; padding-bottom: var(--sp-4); }
+body.ke .ck-zgrid .panel.ck-mem-rowcard { display: grid; grid-template-columns: minmax(8rem, 15rem) minmax(0, 1fr) auto; column-gap: var(--sp-6); align-items: center; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .panel.ck-mem-rowcard:first-child { border-top: 0; }
+body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; padding: 0; }
+body.ke .ck-mem-rowcard > .phead h2 { font: var(--fw-semibold) var(--fs-body, 14px)/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); }
+body.ke .ck-mem-rowcard > .pbody { display: contents; }
+body.ke .ck-mem-rowcard .pbody > * { display: none; }
+body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { display: block; grid-column: 2; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; }
+body.ke .ck-mem-rowcard .section-display > * { display: none; }
+body.ke .ck-mem-rowcard .section-display > .md-p:first-of-type { display: block; }
+body.ke .ck-mem-rowcard .md-p { margin: 0; color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .ck-mem-rowcard .pbody > .err { color: var(--bad); white-space: normal; }
+body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { display: block; grid-column: 3; grid-row: 1; margin: 0; padding: 0; }
+body.ke .ck-mem-rowcard .edit-btn { text-transform: capitalize; min-height: 32px; }
+body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { display: block; grid-column: 1 / -1; grid-row: 2; margin-top: var(--sp-3); }
+body.ke .ck-mem-rowcard:has(.text-editor:not([hidden])) .md-p, body.ke .ck-mem-rowcard:has(.editor) .md-p { display: none; }
 @media (max-width: 720px) {
   body.ke .ck-mem-cols, body.ke .ck-mem-row, body.ke .ck-crys { grid-template-columns: minmax(0, 1fr); }
   body.ke .ck-mem-cog .scope-plot { flex-direction: column; align-items: stretch; }
   body.ke .ck-mem-cog .scope-box { flex: none; }
   body.ke .ck-mem-cog .scope-legend { flex-direction: row; flex-wrap: wrap; }
-  body.ke .ck-mem-irow { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-1); }
-  body.ke .ck-mem-it { grid-column: 1 / -1; grid-row: 2; white-space: normal; }
-  body.ke .ck-mem-edit { grid-column: 2; grid-row: 1; }
+  body.ke .ck-zgrid .panel.ck-mem-rowcard { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-1); }
+  body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { grid-column: 1 / -1; grid-row: 2; }
+  body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { grid-column: 2; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { grid-row: 3; }
 }
 /* the retired Health strip: its figures are the Cognition card's header and chart (the Morning glance keeps its own Health tile) */
 body.ke[data-mode="memory"] .ck-widgets { display: none; }
