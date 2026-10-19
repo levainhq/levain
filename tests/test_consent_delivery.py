@@ -163,7 +163,17 @@ def test_the_newest_turn_context_decides_and_a_field_that_cannot_be_reproduced_r
     assert dv.codex_sandbox_args(meta, _THREAD) is None
     _rollout(chome, [{"type": "read-only", "network_access": True}])
     assert dv.codex_sandbox_args(meta, _THREAD) is None
-    _rollout(chome, [{"type": "workspace-write", "writable_roots": ["relative/root"]}])
+    full = {"type": "workspace-write", "writable_roots": [], "network_access": False, "exclude_tmpdir_env_var": False,
+            "exclude_slash_tmp": False}
+    _rollout(chome, [{**full, "writable_roots": ["relative/root"]}])
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
+    _rollout(chome, [{k: v for k, v in full.items() if k != "network_access"}])     # L3 r2: a field left out
+    assert dv.codex_sandbox_args(meta, _THREAD) is None
+    # what real Codex records for a workspace-write exec with no extra roots (RUN v8): writable_roots left out
+    _rollout(chome, [{"type": "workspace-write", "network_access": False, "exclude_tmpdir_env_var": False,
+                      "exclude_slash_tmp": False}])
+    assert 'sandbox_workspace_write.writable_roots=[]' in dv.codex_sandbox_args(meta, _THREAD)
+    _rollout(chome, ["danger-full-access"], tail='{"type": "turn_con')               # L3 r2: cut inside the type
     assert dv.codex_sandbox_args(meta, _THREAD) is None
 
 
@@ -190,17 +200,18 @@ def test_the_tail_read_spans_blocks_and_finds_the_newest_record(tmp_path):
     filler = "".join(json.dumps({"type": "event_msg", "payload": {"text": "x" * 500}}) + "\n" for _ in range(400))
     _rollout(chome, ["danger-full-access", "read-only"], tail=filler)
     assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "read-only"]
-    big = json.dumps({"type": "turn_context", "payload": {"sandbox_policy": {"type": "workspace-write"},
+    big = json.dumps({"type": "turn_context", "payload": {"sandbox_policy": {"type": "read-only"},
                                                          "note": "y" * 200_000}})
     _rollout(chome, ["danger-full-access"], tail=big + "\n" + filler)
-    assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "workspace-write"]
+    assert dv.codex_sandbox_args({"config_dir": str(chome)}, _THREAD) == ["-s", "read-only"]
 
 
 def test_a_claude_resume_is_refused_for_any_option_it_cannot_carry_and_runs_for_neutral_ones():
     """The class sibling of the Codex sandbox (1019+1): the old denylist let a resume drop --restricted (Bash came
     back), --agent, --disable-slash-commands, --max-budget-usd, --safe-mode, --bare and any option added later."""
     for flag in ("--restricted", "--agent", "--disable-slash-commands", "--max-budget-usd", "--safe-mode", "--bare",
-                 "--permission-prompts", "--settings", "--tools", "--an-option-added-later",
+                 "--permission-prompts", "--settings", "--tools", "--an-option-added-later", "--plugin-url",
+                 "--no-chrome", "--system-prompt-snapshot", "--worktree", "-w", "--tmux",
                  "--dangerously-bypass-something"):
         assert dv.unrestored_flags(f"claude -p {flag}", "default") == [flag], flag
     neutral = "/opt/bin/claude -p --model --output-format --verbose --permission-mode --resume=x --effort -n"

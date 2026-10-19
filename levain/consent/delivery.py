@@ -94,9 +94,9 @@ _CLAUDE_NEUTRAL = frozenset({
     "--permission-mode", "--allow-dangerously-skip-permissions", "--model", "--fallback-model", "--effort",
     "--output-format", "--input-format", "--json-schema", "--include-partial-messages", "--include-hook-events",
     "--replay-user-messages", "--forward-subagent-text", "--verbose", "-d", "--debug", "--debug-file", "-n",
-    "--name", "--prompt-suggestions", "--ax-screen-reader", "--ide", "--chrome", "--no-chrome", "--brief",
-    "--plugin-url", "--exclude-dynamic-system-prompt-sections", "--autocompact", "--system-prompt-snapshot",
-    "-w", "--worktree", "--tmux", "--remote-control", "--remote-control-session-name-prefix",
+    "--name", "--prompt-suggestions", "--ax-screen-reader", "--ide", "--chrome", "--brief",
+    "--exclude-dynamic-system-prompt-sections", "--autocompact", "--remote-control",
+    "--remote-control-session-name-prefix",
     "--no-session-persistence", "-h", "--help", "-v", "--version",
 })
 # the one --dangerously-* flag a resume restores: bypassPermissions IS that flag's mode
@@ -322,12 +322,12 @@ def unrestored_flags(flags: str, mode: str | None) -> list[str]:
 
 
 def _last_turn_context(path: Path) -> dict[str, Any] | None:
-    """The newest ``turn_context`` record of a rollout, read from the file's end, or ``None``: none, or the newest
-    line that names one does not parse (a truncated or damaged newest record never lets an older one decide), or a
-    line longer than :data:`_ROLLOUT_LINE_MAX`."""
+    """The newest ``turn_context`` record of a rollout, read from the file's end, or ``None``: none, or the file's
+    last line or the newest line that names one does not parse (a truncated or damaged newest record never lets an
+    older one decide), or a line longer than :data:`_ROLLOUT_LINE_MAX`."""
     with path.open("rb") as fh:
         fh.seek(0, os.SEEK_END)
-        pos, tail = fh.tell(), b""
+        pos, tail, seen_last = fh.tell(), b"", False
         while pos > 0:
             step = min(_ROLLOUT_BLOCK, pos)
             pos -= step
@@ -336,6 +336,12 @@ def _last_turn_context(path: Path) -> dict[str, Any] | None:
             lines = tail.split(b"\n")
             tail = lines[0] if pos > 0 else b""        # the first piece may be the end of an earlier line
             for raw in reversed(lines[1:] if pos > 0 else lines):
+                if not seen_last and raw.strip():
+                    seen_last = True
+                    try:                  # the newest line, damaged where its type would be, decides nothing
+                        json.loads(raw)
+                    except ValueError:
+                        return None
                 if b'"turn_context"' not in raw:
                     continue
                 try:
@@ -353,7 +359,8 @@ def _last_turn_context(path: Path) -> dict[str, Any] | None:
 _ROLLOUT_BLOCK = 1 << 16
 _ROLLOUT_LINE_MAX = 1 << 24
 # a workspace-write policy's fields as Codex records them [measured: 1019+1, codex-cli 0.162.1], each restored with
-# `-c sandbox_workspace_write.<key>=`; any other field, in any mode, refuses the resume (it cannot be reproduced)
+# `-c sandbox_workspace_write.<key>=`; a missing bool or any other field, in any mode, refuses the resume (it would
+# come from config.toml, or cannot be reproduced)
 _WW_LISTS, _WW_BOOLS = ("writable_roots",), ("network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp")
 
 
@@ -381,6 +388,11 @@ def codex_sandbox_args(meta: Mapping[str, Any], thread: str) -> list[str] | None
     fields = {k: v for k, v in policy.items() if k != "type"}
     if mode != "workspace-write":
         return None if fields else ["-s", mode]
+    # Codex leaves writable_roots out when it is empty [measured: 1019+1, 0.162.1], so absent means [] and is written
+    # as []; a bool left out would come from config.toml as it is now, so it refuses
+    fields.setdefault("writable_roots", [])
+    if set(fields) != {*_WW_LISTS, *_WW_BOOLS}:
+        return None
     out = ["-s", mode]
     for key, value in fields.items():
         if key in _WW_BOOLS and isinstance(value, bool):
