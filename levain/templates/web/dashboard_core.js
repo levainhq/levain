@@ -3322,10 +3322,10 @@
   function drawQuestionBody(q, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
-    const cli = "levain question answer " + q.n + " --option <key>";
+    const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
     if (b.error) {
       const parts = [el("div", "consent-note ext-meta", b.error)];
-      if (open) parts.push(copyLine(cli, "answer command"));   // no token: the terminal route still answers
+      if (open) parts.push(copyLine(cli, "show command"));   // no token: the terminal route still answers
       slot.replaceChildren(...parts);
       return;
     }
@@ -3345,7 +3345,7 @@
     }
     if (!(open && q.offered && answerQuestion)) {
       for (const o of options) parts.push(el("div", "ext-meta", sv(o && o.key) + " — " + sv(o && o.label)));
-      if (open) parts.push(copyLine(cli, "answer command"));
+      if (open) parts.push(copyLine(cli, "show command"));
       slot.replaceChildren(...parts);
       return;
     }
@@ -3356,7 +3356,7 @@
       for (const c of controls) c.disabled = true;
       let res;
       try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
-      if (res && res.ok) return;   // the board re-reads and redraws this row as answered
+      if (res && res.ok) { words.value = ""; return; }   // the board re-reads and redraws this row as answered
       for (const c of controls) c.disabled = false;
       msg.textContent = (res && (res.message || res.error)) || "failed";
     };
@@ -3958,6 +3958,7 @@
     const overlay = document.getElementById("levain-modal");
     if (overlay) overlay.remove();
     sessionBodies.clear();
+    questionBodies.clear();
     consentBodies.clear();   // request bodies (commands, working directories) are not kept past the view
     consentGen++;
     pruneModalKinds();
@@ -4086,7 +4087,7 @@
       if (ta.value !== ta.dataset.orig) return true;
     }
     for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref, .question-words")) {
-      if (ta.closest(".text-editor")) continue;
+      if (ta.closest(".text-editor") || ta.disabled) continue;
       if (ta.value.trim() !== "") return true;
     }
     return false;

@@ -308,6 +308,15 @@ _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   #
                                 and _facet(r, "question_state") == "open")
 
 
+def _applies_to_row(verb: "VerbSpec", row: dict[str, Any]) -> bool:
+    """Whether ``verb`` is offered on / fires against ``row``. A ``question:`` row on the composed decisions panel is
+    the kernel's: only ``question_answer`` is ever offered or dispatched on it, never a verb the attached decision
+    source declared without an ``applies_to`` (that source's verbs bind to its own rows)."""
+    if str(row.get("id", "")).startswith("question:") and verb.name != "question_answer":
+        return False
+    return verb.applies_to is None or bool(verb.applies_to(row))
+
+
 def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer one question (Q-2b): the operator's words or option key, recorded once and unsigned, channel
     ``cockpit``, then delivered to the agent's session on a daemon thread (a resume settles in seconds, and a verb
@@ -595,7 +604,7 @@ def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: 
     out = []
     label = row_label(row)
     for v in offered(registry, cockpit, panel_id):
-        if v.binding != "row" or (v.applies_to is not None and not v.applies_to(row)):
+        if v.binding != "row" or not _applies_to_row(v, row):
             continue
         t = v.rendered_tier(row, label, today, policy=policy)
         # an escalation names the tier the fire will take, so the policy raises it as it raises the fire
@@ -786,7 +795,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
     label = row_label(row)
     if row is not None:
-        if verb.applies_to is not None and not verb.applies_to(row):
+        if not _applies_to_row(verb, row):
             raise _refuse("stale", 409, f"panel {panel_id!r} no longer offers {verb.name!r} on this row")
         if req.get("row_version") != row["version"]:
             raise _refuse("stale", 409, f"row {row['id']!r} changed since it was rendered")

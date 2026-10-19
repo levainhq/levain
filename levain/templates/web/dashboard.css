@@ -601,12 +601,13 @@
   .verb-btn:hover { color: var(--text); background: var(--card-2); }
   .verb-btn:disabled { opacity: .4; cursor: default; }
   .verb-form { display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-left: auto; }
-  .verb-kind, .verb-ref, .verb-domain {
+  .verb-kind, .verb-ref, .verb-domain, .question-words {
     font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--ink); background: var(--base);
     border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
   }
   .verb-ref, .verb-domain { min-width: 140px; }
-  .verb-kind:focus, .verb-ref:focus, .verb-domain:focus {
+  .question-words { display: block; box-sizing: border-box; width: 100%; max-width: 36rem; min-width: 140px; margin: var(--sp-2) 0; resize: vertical; }
+  .verb-kind:focus, .verb-ref:focus, .verb-domain:focus, .question-words:focus {
     border-color: var(--label);
   }
   .verb-confirm, .verb-cancel {
@@ -760,12 +761,13 @@
     .verb-ref,
     .verb-domain,
     .verb-kind,
+    .question-words,
     .state-input,
     .ep-search-input { font-size: var(--fs-title); }
     /* tap-target floor on the focusable fields. .name-input (the masthead rename)
        is 18px so it needs no zoom-fix, but its base height is ~30px — under the
        floor — so it gets min-height here for a consistent thumb target (L3: complement). */
-    .name-input, .state-input, .verb-kind, .verb-ref, .verb-domain, .ep-search-input { min-height: 38px; }
+    .name-input, .state-input, .verb-kind, .verb-ref, .verb-domain, .question-words, .ep-search-input { min-height: 38px; }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
 
@@ -1301,6 +1303,8 @@ body.ke .row .verb-menu .verb-dup { display: none; }
 body.ke .row .verb-actions { grid-column: 6 / 8; grid-row: 3; justify-self: end; margin: 0; flex-wrap: nowrap; gap: var(--sp-1); position: relative; opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
 body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions, body.ke .row .verb-actions:has([aria-expanded="true"]) { opacity: 1; }
 @media (hover: none) { body.ke .row .verb-actions { opacity: 1; } }
+/* an opened question's answer buttons are the body the operator opened: always shown, not hover-revealed */
+body.ke .row .verb-actions.question-answer { opacity: 1; }
 /* an open form takes the whole line under the meta, and shows (the opacity rule above would hide it with the row unhovered) */
 body.ke .row .verb-actions:has(.verb-form), body.ke .row .verb-actions:has(.edit-msg) { grid-column: 1 / -1; grid-row: 4; justify-self: stretch; opacity: 1; flex-wrap: wrap; }
 body.ke .row .verb-menu { position: absolute; top: 100%; right: 0; z-index: 20; display: flex; flex-direction: column; min-width: 120px; padding: var(--sp-2);

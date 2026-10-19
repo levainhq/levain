@@ -96,13 +96,19 @@
       if (busy) return;
       busy++;
       buttons.forEach((b) => { b.disabled = true; });
+      words.disabled = true;
       say("sending the answer\u2026");
       call("POST", "/question/" + encodeURIComponent(q.n) + "/answer", body).then((a) => {
-        if (!a.ok) { buttons.forEach((b) => { b.disabled = false; }); return say("not answered: " + why(a), "bad"); }
+        if (a.status === 409) words.value = "";   // answered elsewhere: nothing left to keep a draft for
+        if (!a.ok) {
+          if (a.status !== 409) { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; }   // retryable: the draft stays
+          return say("not answered: " + why(a), "bad");
+        }
+        words.value = "";
         last = "answered question #" + q.n;
         const d = a.body.delivery || {};
         say("answered \u00b7 delivery " + (d.route || "") + ": " + (d.reason || ""), d.route === "failed" || d.route === "none" ? "bad" : "ok");
-      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"); })
+      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); words.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"); })
         .finally(() => { busy--; setTimeout(load, 1500); });
     };
     for (const o of (Array.isArray(q.options) ? q.options : [])) {
@@ -358,7 +364,7 @@
   function load() {
     if (busy) return;
     // a redraw would wipe words being typed into a question's box (and dismiss the keyboard)
-    if (Array.from(document.querySelectorAll("textarea.words")).some((t) => t.value.trim() !== "")) return;
+    if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
     call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
   }

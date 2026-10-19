@@ -368,3 +368,25 @@ def test_a_read_only_serve_refuses_an_answer_and_records_nothing(tmp_path, lh):
         status, body = _verb(base, _row(base, q.n, None), {"option": "ship"}, token=TOKEN)
         assert status == 403 and body["error"] == "credential_required"      # no token is configured to match
     assert store.get(q.n).answer is None
+
+
+def test_a_verb_without_applies_to_is_never_offered_or_fired_on_a_question_row(monkeypatch):
+    """A decision source's row verb that declared no ``applies_to`` binds to ITS rows: the composed decisions panel
+    offers a ``question:`` row only ``question_answer`` (offer path and dispatch path share one predicate)."""
+    from datetime import date
+
+    from levain.cockpit import verbs as V
+    from levain.authority import genesis_policy
+
+    probe = V.VerbSpec("probe", "probe", "e", "row", floor="T2", tier_fn=lambda *a: "T2")
+    assert probe.applies_to is None
+    answer = V.VerbSpec("question_answer", "answer", "e", "row", fields=("option", "text"), floor="C1",
+                        tier_fn=lambda *a: "C1", applies_to=lambda r: True)
+    monkeypatch.setattr(V, "offered", lambda *a, **k: [probe, answer])
+    qrow = {"id": "question:3", "version": "v", "facets": {"question_state": "open"}, "title": "t"}
+    other = {"id": "np:1", "version": "v", "facets": {}, "title": "t"}
+    got = V.row_actions(None, None, "decisions", qrow, "token", "local", date(2026, 10, 18), policy=genesis_policy())
+    assert [a["verb"] for a in got] == ["question_answer"]
+    got = V.row_actions(None, None, "decisions", other, "token", "local", date(2026, 10, 18), policy=genesis_policy())
+    assert "probe" in [a["verb"] for a in got]
+    assert not V._applies_to_row(probe, qrow) and V._applies_to_row(probe, other)
