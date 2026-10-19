@@ -234,8 +234,9 @@
           // a sent signature: only the server's own refusal (a 4xx) says nothing was ruled
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where it stands", "bad");
           if (!a.ok) { if (a.status !== 409) again(); return say("not answered, nothing allowed: " + why(a), "bad"); }
-          words.value = "";
-          if (!a.body.answered) again();   // ruled, but the answer was not recorded: the card stays usable
+          // ruled, but the answer was not recorded: the draft stays, and the reload below redraws the card with its
+          // push no longer undecided, so the option is then a plain answer (never a second ruling)
+          if (a.body.answered) words.value = "";
           last = a.body.answered ? "answered question #" + q.n + " and allowed its push"
                                  : "allowed question #" + q.n + "'s push (its answer was not recorded)";
           const d = a.body.delivery || {};

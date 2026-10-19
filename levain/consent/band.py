@@ -348,7 +348,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     send = getattr(adapter, "notify", _agents()["claude_code"].notify)   # Codex shares Claude Code's notify seam
     try:
         ping_text = _ping_text(agent, q, qdir)
-        if tappable:
+        if state == "undecided":                 # the ping claims the tap only on a state actually read
             ping_text += (f"\nOption {link.option} is tied to the {push_words}: picking it on the phone page with a "
                           "passkey also allows that push (or rule it with `levain consent rule`).")
         pinged = send(adapter.load_settings(qdir), ping_text, cwd=qdir)
