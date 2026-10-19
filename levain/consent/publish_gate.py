@@ -270,7 +270,8 @@ def _execute(queue: ConsentQueue, decided: Decision, call: dict[str, Any], snap:
             f"{type(exc).__name__}: {exc}")
         return EXIT_NOT_TAKEN
     except (_Interrupted, KeyboardInterrupt):
-        # the executor turns an interruption after its intent line into PublishOutcomeUnknown: this one came before
+        # the executor turns an interruption after its intent line into PublishOutcomeUnknown or, once the tool's
+        # exit is known, PublishRecordIncomplete: this one came before
         say(f"levain publish: interrupted before the upload started; nothing was published: {what}.")
         return EXIT_NOT_TAKEN
     how = (f"your ruling on gap #{decided.gap}" if decided.via == "ruling"
