@@ -23,6 +23,7 @@
   'use strict';
 
   var FLY = 600, LIFE = 750;        // ms to land / ms until gone
+  var PACK_GAP_MS = 6 * 60000;      // two sessions closer than this never share a track
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
@@ -195,11 +196,11 @@
       else if (e.kind === 'decision') { counts.decisions++; if (e.out === 'waiting') counts.waiting++; }
       else counts.memory++;
     });
-    // sessions are packed into tracks (a bar starting within 6 minutes of the last one's end takes the next track)
+    // sessions are packed into tracks: a bar starting within PACK_GAP_MS of a track's last end takes the next track
     var ends = [];
     inWin.filter(function (e) { return e.kind === 'session'; }).sort(function (a, b) { return a.t - b.t; }).forEach(function (e) {
       var i = 0;
-      while (i < ends.length && e.t < ends[i] + 360000) i++;
+      while (i < ends.length && e.t < ends[i] + PACK_GAP_MS) i++;
       ends[i] = sessEnd(e, nowMs); e.track = i;
     });
     return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.length, tracks: ends.length,
