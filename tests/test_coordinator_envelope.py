@@ -608,3 +608,35 @@ def test_an_inherited_git_dir_does_not_answer_for_the_where_repo(ctx, monkeypatc
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
     d, _fresh, _b, _s = ctx.structured("from inside a hook")
     assert d.envelope_id is not None, ctx.store.envelope_refused(d.drop_id)
+
+
+# --- L3 round 2: the unhashable-value class (all three seats) -------------------------------------------------
+
+def test_an_unhashable_push_field_is_a_shape_refusal_and_keeps_the_words(ctx):
+    bad = {"repo": [1], "remote": "o", "url": "u", "branch": "b"}
+    d = ctx.plain("x")
+    with pytest.raises(env.EnvelopeError):
+        env.parse_body(canonical(ctx.body(d.drop_id, d.words, pushes=[bad])))
+    dropped, fresh, _b, _s = ctx.structured("keep me", pushes=[bad])
+    assert fresh and dropped.envelope_id is None and dropped.words == "keep me"
+    assert ctx.store.envelope_refused(dropped.drop_id)
+
+
+@pytest.mark.parametrize("effect", [("lands", {"repo": [], "onto": "main"}), ("pushes", {"repo": {}, "remote": "o",
+                                                                                         "url": "u", "branch": "b"})])
+def test_an_unhashable_effect_asked_for_is_a_refusal_line(ctx, structured_thread, effect):
+    _d, b, t = structured_thread
+    assert "not a land, push or publish" in ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, effect=effect)
+
+
+@pytest.mark.parametrize("scope", [("/r", "README"), ([], ["README"]), ("/r",), ("/r", [["README"]])])
+def test_a_malformed_scope_is_a_refusal_line(ctx, structured_thread, scope):
+    _d, b, t = structured_thread
+    assert "not (repo, [paths])" in ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, scope=scope)
+
+
+def test_a_generator_of_paths_is_checked_not_spent(ctx, structured_thread):
+    # L3 r3 complement LOW: the shape guard must not consume the paths the loop then checks
+    _d, b, t = structured_thread
+    refused = ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, scope=(ctx.path, (p for p in ["setup.py"])))
+    assert refused is not None and "setup.py" in refused
