@@ -1626,6 +1626,20 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
     verify_p.add_argument("--path", type=Path, default=None,
                           help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     verify_p.set_defaults(func=_cmd_consent_receipts_verify)
+    export_p = sub.add_parser(
+        "export", help="Write the queue's receipts in another format (AgentBoundary Action Receipts).",
+        description=(
+            "Writes the queue's receipts as a JSON array in the named format: one AgentBoundary Action Receipt "
+            "per settled receipt row, chained by prior_receipt, to stdout or to --out. A one-line count summary "
+            "goes to stderr, never into the JSON. Exits non-zero, with nothing on stdout, for a store that cannot "
+            "be read or an export clock ahead of the real one. Reads the store read-only."))
+    export_p.add_argument("--format", required=True, choices=("agentboundary",), dest="export_format",
+                          help="The receipt format. Only `agentboundary` today.")
+    export_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                          help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+    export_p.add_argument("--out", type=Path, default=None, metavar="FILE",
+                          help="Write the JSON here (atomically) instead of stdout; refuses to overwrite a file.")
+    export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
 def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
@@ -1674,6 +1688,47 @@ def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
                 else "the receipts cannot be read as a log")
         print(f"levain consent receipts verify: {what}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
+    import json
+    import sqlite3
+    import tempfile
+
+    from levain.consent.agentboundary import ExportError, export
+
+    try:
+        qdir = _consent_queue_dir(args)
+        result = export(qdir)
+        text = json.dumps(result.receipts, ensure_ascii=False) + "\n"
+        if args.out is not None:
+            out = Path(os.path.abspath(args.out.expanduser()))
+            if os.path.lexists(out):
+                raise FileExistsError(f"{out} exists; remove it or pick another --out")
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=out.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.link(tmp_name, out)                  # no-clobber publish: fails if the file appeared meanwhile
+            finally:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+    except (ExportError, OSError, sqlite3.Error, UnicodeError) as exc:
+        print(f"levain consent receipts export: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    if args.out is None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    rep = result.report
+    states = ", ".join(f"{k} {v}" for k, v in rep.by_state.items()) or "none"
+    print(_term_safe(f"levain consent receipts export: {rep.receipts} receipt(s) ({states}); "
+                     f"{rep.pending_skipped} pending skipped, {rep.held_unsettled} held back unsettled"
+                     + ("" if rep.ledger_found else "; no authority ledger found")), file=sys.stderr)
     return 0
 
 
