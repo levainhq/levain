@@ -2666,7 +2666,8 @@ def _v_log(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
 TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
 TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
-TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "done", "failed")
+TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
+TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
 TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
 TOPOLOGY_LABEL_MAX = 48
 
@@ -2781,6 +2782,11 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_TASK_STATES)}, got {t.get('state')!r}")
         strings(f"{w}.waits_on", t.get("waits_on"))
         text(f"{w}.card", t.get("card"), null=True)
+        # an open loop's age and heat, both optional (a provider with no such thing omits them): present means ISO / a tier name, or null
+        if t.get("opened") is not None and not _is_iso(t["opened"]):
+            raise _bad(spec, f"{w}.opened", "must be an ISO-8601 timestamp or null (when the task was opened)")
+        if t.get("heat") is not None and t["heat"] not in TOPOLOGY_TASK_HEATS:
+            raise _bad(spec, f"{w}.heat", f"must be one of {list(TOPOLOGY_TASK_HEATS)} or null, got {t.get('heat')!r}")
         outs = t.get("outcomes")
         if not isinstance(outs, list):
             raise _bad(spec, f"{w}.outcomes", "must be a list")

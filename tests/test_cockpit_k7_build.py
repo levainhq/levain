@@ -451,6 +451,7 @@ def test_build_places_results_left_and_edits_over_loops_right_with_loops_carryin
 def test_a_bare_install_says_one_line_per_section_and_draws_no_empty_card(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _root, src, _ids = _install(tmp_path)
+    src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work the Sessions card draws, so "bare" means no loop either
     probe = ("JSON.stringify({sess: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' '), rows: document.querySelectorAll('#k7-sessions .k7-srow').length, "
              "tabs: document.querySelectorAll('#k7-sessions .k7-srows').length, "
              "results: (document.querySelector('.k7-results-none') || {innerText: ''}).innerText.replace(/\\s+/g, ' '), "

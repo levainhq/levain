@@ -10,7 +10,8 @@ worker of the one ``unattached`` task, never of a guessed one.
 The two quiet states never merge. WAITING ON YOU is a record: a pending consent request, an open question, a
 dispatch contract waiting on a signature or an authorisation. STALLED (a node) and STUCK (a task) are silence with
 no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing for
-``STALL_S``, an open loop, which no session is linked to.
+``STALL_S``. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
+panel's own words), not silence.
 
 "Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
 dir the cockpit owns, which takes only allow-listed, shape-checked settings from the repository's config and
@@ -43,7 +44,7 @@ from typing import Any, Callable
 
 from levain.cockpit import activity as act
 from levain.cockpit.display_safe import visible
-from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX
+from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
 from levain.cockpit.results import Fault, Read, Result
 
 __all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "SPORES_MAX", "STALL_S", "topology_reader"]
@@ -329,16 +330,37 @@ def _dispatch_tasks(directory: Path, now: datetime) -> tuple[list[dict[str, Any]
     return tasks, errors
 
 
-def _spore_tasks(spores: list[Any]) -> list[dict[str, Any]]:
+#: the heat an open loop carries, as the spore store's own tier names it (the Open loops panel's word for it)
+HEATS = ("hot", "warm", "cold", "parked")
+
+
+def _opened(created: Any, now: datetime) -> str | None:
+    """When a spore was opened, as an instant: its own ISO stamp, or its date taken as local midnight (the Open loops
+    panel counts calendar days in the install's own clock, so the age the renderer draws agrees with it). None when
+    the store has no usable date: unknown, never a guess."""
+    t = act._parse(created) if isinstance(created, str) else None
+    if t is not None:
+        return _iso(t)
+    d = parse_date(created)
+    if d is None:
+        return None
+    return _iso(datetime(d.year, d.month, d.day, tzinfo=now.astimezone().tzinfo))
+
+
+def _spore_tasks(spores: list[Any], now: datetime | None = None) -> list[dict[str, Any]]:
     """The first ``SPORES_MAX`` open loops as tasks. The spore store links no loop to a session or a record, so a
-    loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today, so STUCK: silence, no
-    record). A recent touch is not a worker. No timestamp is on the task wire, so the loop's age is not carried."""
+    loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today). A loop nobody is on is
+    OPEN, not STUCK: STUCK is a live worker gone silent. It carries ``opened`` (its created time) and ``heat`` (its
+    tier, the Open loops panel's own value), each null when the store does not say. A recent touch is not a worker."""
+    now = now or datetime.now(timezone.utc)
     tasks = []
     for s in spores[:SPORES_MAX]:
         workers: list[str] = []
+        tier = getattr(s, "tier", None)
         tasks.append({"id": f"spore:{_wire(s.id)}", "kind": "spore", "label": _wire(s.text),
-                      "state": "running" if workers else "stuck", "waits_on": [], "card": None, "outcomes": [],
-                      "cost": dict(NO_COST), "workers": workers})
+                      "state": "running" if workers else "open", "waits_on": [], "card": None, "outcomes": [],
+                      "cost": dict(NO_COST), "workers": workers, "opened": _opened(getattr(s, "created", None), now),
+                      "heat": tier if tier in HEATS else None})
     return tasks
 
 
@@ -497,7 +519,7 @@ def topology_reader(*, install_root: Path | None,
             blind("spores", "no spore store is attached")
         else:
             try:
-                tasks += _spore_tasks(list(spores(ctx)))
+                tasks += _spore_tasks(list(spores(ctx)), now)
             except Exception as exc:  # noqa: BLE001
                 blind("spores", f"unreadable ({type(exc).__name__})")
         on_task = {w for t in tasks for w in t["workers"]}

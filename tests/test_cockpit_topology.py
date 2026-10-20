@@ -672,8 +672,8 @@ def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():
     old = SimpleNamespace(id="spore-2", text="touched long ago", seen="2020-01-01", created="2020-01-01")
     undated = SimpleNamespace(id="spore-3", text="never dated", seen=None, created=None)
     tasks = topo._spore_tasks([fresh, old, undated])
-    # a spore links no session, so no worker is ever on it: silence with no record is STUCK, however recent
-    assert [t["state"] for t in tasks] == ["stuck", "stuck", "stuck"]
+    # a spore links no session, so no worker is ever on it: a loop nobody is on is OPEN (an age and a heat), never STUCK (a live worker gone silent)
+    assert [t["state"] for t in tasks] == ["open", "open", "open"]
     assert all(t["workers"] == [] for t in tasks)
     # the recent-touch heuristic is gone, not renamed
     assert not hasattr(topo, "SPORE_QUIET_DAYS")

@@ -88,11 +88,11 @@ def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_
     assert got["recs"] >= 1, got                                                        # the pending consents are records in the left column
     assert not any(t[1] in ("consent", "question") for t in got["tasks"]), got          # ... and not centre cards
     by = {t[1]: t for t in got["tasks"]}
-    assert by["spore"][0] == "stuck" and by["spore"][2] == "cost not tracked" and by["spore"][3] == [], got  # a spore carries no session
+    assert by["spore"][0] == "open" and by["spore"][2] == "cost not tracked" and by["spore"][3] == [], got   # a spore carries no session: open, never stuck
     assert any(t[0] != "waiting" and t[1] == "unattached" for t in got["tasks"]), got                              # the codex session: no task, none guessed
     strip = dict(s.split("=", 1) for s in got["strip"])
     assert strip["conflicts"] == "conflicts not tracked" and strip["tokens"] == "tokens today not tracked", got
-    assert list(strip) == ["tasks", "waiting", "stuck", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["stuck"] == "2 stuck", got
+    assert list(strip) == ["tasks", "waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
 @needs_browser
@@ -133,6 +133,7 @@ def test_the_view_and_the_lens_persist_across_a_reload_in_the_same_browser(tmp_p
 def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _root, src, _ids = _install(tmp_path)
+    src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
     probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#k7-sessions [data-tv]').length, "
              "quiet: !!document.querySelector('#k7-sessions .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
     out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-none')"}, {"eval": probe}])
@@ -170,7 +171,7 @@ def test_three_columns_records_left_tasks_centre_outcomes_right_on_the_tasks_own
              "waiting_open: !!%s.querySelector('.tv-task.waiting.tv-open'), stuck_open: !!%s.querySelector('.tv-task.stuck.tv-open')})") % ((TV,) * 9)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])
-    assert got["order"] == ["t-sign", "t-fail", "t-stuck", "t-run", "t-done", "unattached"], got      # loudest state first, unattached last; the consent is no centre card
+    assert got["order"] == ["t-sign", "t-run", "t-stuck", "t-fail", "t-done", "unattached"], got      # waiting, running, stuck, (open), then what ended; unattached last; the consent is no centre card
     assert [r[0] for r in got["recs"]] == ["t-wait", "t-sign"], got                                    # the consent and the contract waiting on a signature
     assert all(r[2] <= got["task_left"] for r in got["recs"]), got                                     # records sit left of the tasks
     assert got["outs"] and all(o[1] > got["task_left"] and o[2] for o in got["outs"]), got              # outcomes sit right of them, on the task's own row

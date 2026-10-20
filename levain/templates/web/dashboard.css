@@ -1906,6 +1906,14 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-tag.stuck, .tv-tag.stalled { color: var(--warn); border: 1px dashed var(--warn); }
 .tv-tag.failed, .tv-tag.errored { color: var(--bad); border-color: var(--bad); }
 .tv-tag.running { color: var(--ok); border-color: var(--ok); }
+/* an open loop's heat: the quiet ramp only (state colours are taken), hot filled and bright to parked hollow and dashed */
+.tv-dot.open { background: none; border: 1px solid var(--meta); }
+.tv-heat { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+.tv-heat.hot { background: var(--text); }
+.tv-heat.warm { background: var(--label); }
+.tv-heat.cold { background: var(--meta); }
+.tv-heat.parked { background: none; border: 1px dashed var(--meta); }
+.tv-age { color: var(--meta); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* the Work lens: records | tasks | outcomes. Wide, one grid: the records are a cell spanning every task row, a task and its
    outcomes share a row (--tv-r, --tv-c set by the renderer). Narrow, the same children stack in DOM order. */
 .tv-work { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); align-items: start; }
@@ -1926,6 +1934,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-task.stuck { border-style: dashed; border-color: var(--warn); }
 .tv-task.failed { border-color: var(--bad); }
 .tv-task.done { background: none; }
+.tv-task.open { background: none; border-color: var(--hair); }
 .tv-task.tv-loose { background: none; border-style: dashed; }
 .tv-open { cursor: pointer; }
 .tv-open:hover, .tv-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

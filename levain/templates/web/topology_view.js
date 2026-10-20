@@ -24,12 +24,14 @@
   const MODE_KEY = "levain_cockpit_topology_mode";
   const LENS_KEY = "levain_cockpit_topology_lens";
   const WIDE_PX = 1440;                    // the width from which the topology is the default view on Build
-  // loudest first: the order the Work lens lists its groups in
-  const TASK_ORDER = ["waiting", "failed", "stuck", "running", "done"];
+  // the order the Work lens lists its groups in (K10: what needs you, what is moving, what went quiet, the open loops, then what ended)
+  const TASK_ORDER = ["waiting", "running", "stuck", "open", "failed", "done"];
+  const HEAT_ORDER = ["hot", "warm", "cold", "parked"];      // an open loop's heat, hottest first; none last
   const TASK_WORDS = {
     waiting: ["Waiting on you", "a pending record you can answer"],
     failed: ["Failed", "the work ended without its outcome"],
-    stuck: ["Stuck", "silence, and no record behind it"],
+    stuck: ["Stuck", "a live worker gone silent, and no record behind it"],
+    open: ["Open", "a loop nobody is working yet"],
     running: ["Running", "a worker or a live job is on it"],
     done: ["Done", "finished"],
   };
@@ -81,10 +83,16 @@
     return seg("Sessions view", [["list", "list"], ["topology", "topology"]], current, (id) => { keep(MODE_KEY, id); onChange(id); });
   }
 
-  // does the value hold anything to draw? Sessions, or a task that is more than an open loop: loops alone are the Open loops
-  // card's, and a wall of "stuck" with no agent anywhere is not a work view. An install with neither keeps the card's empty line
-  // (with the quiet line beside it when a source could not be read).
-  function hasWork(v) { return isObj(v) && (arr(v.nodes).length > 0 || arr(v.tasks).some((t) => t.kind !== "spore")); }
+  // does the value hold anything to draw? Sessions or any task, an open loop included (it is a task with an age, as the flow cockpit
+  // shows it). An install with neither keeps the card's empty line (with the quiet line beside it when a source could not be read).
+  function hasWork(v) { return isObj(v) && (arr(v.nodes).length > 0 || arr(v.tasks).length > 0); }
+  // "open N d": calendar days from the day it was opened to the provider's own clock, in this browser's day (the Open loops panel's count)
+  function openDays(t, asOf) {
+    const a = Date.parse(t.opened), b = Date.parse(asOf);
+    if (isNaN(a) || isNaN(b)) return null;
+    const day = (ms) => { const d = new Date(ms); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); };
+    return Math.max(0, Math.round((day(b) - day(a)) / 86400000));
+  }
 
   // what the quiet line says: what the provider could not read, never hidden
   function quietLine(v) {
@@ -212,7 +220,9 @@
     };
     row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", n("waiting"), "waiting on you", n("waiting") ? "hot" : ""));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
-    row.append(stat("stuck", n("stuck"), "stuck"), stat("done", n("done"), "done"));
+    row.append(stat("stuck", n("stuck"), "stuck"));
+    if (n("open")) row.appendChild(stat("open", n("open"), "open"));
+    row.appendChild(stat("done", n("done"), "done"));
     const rest = strip(v, "work");
     for (const k of ["conflicts", "tokens"]) row.appendChild(rest.querySelector('[data-k="' + k + '"]'));
     return row;
@@ -238,7 +248,7 @@
     if (risk) c.appendChild(risk);
     return c;
   }
-  function taskCard(t, byId, lost, opts) {
+  function taskCard(t, byId, lost, opts, asOf) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));
     c.dataset.task = t.id;
     c.dataset.kind = t.kind;
@@ -247,7 +257,12 @@
     // unattached work is not a task: its heading says so, and its card is the chips (and a stuck tag, when silence is the news)
     if (t.kind === "unattached") head.appendChild(el("span", "tv-loose-h", "unattached work"));
     else { const ti = el("b", "tv-task-t", t.label); ti.title = t.label; head.appendChild(ti); }
-    if (t.kind !== "unattached" || t.state !== "running") head.appendChild(tag(t.state, t.state === "waiting" ? "waiting on you" : t.state));
+    if (t.state === "open") {
+      // an open loop is quiet: its age and its heat, never a tag that looks like a state change
+      const days = openDays(t, asOf);
+      if (t.heat) { const h = el("i", "tv-heat " + t.heat); h.title = t.heat; h.setAttribute("role", "img"); h.setAttribute("aria-label", "heat: " + t.heat); head.appendChild(h); }
+      head.appendChild(el("span", "tv-age", days === null ? "open" : "open " + days + " d"));
+    } else if (t.kind !== "unattached" || t.state !== "running") head.appendChild(tag(t.state, t.state === "waiting" ? "waiting on you" : t.state));
     c.appendChild(head);
     const foot = el("div", "tv-task-f");
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-kind", KIND_WORDS[t.kind] || t.kind));
@@ -330,7 +345,12 @@
     wrap.appendChild(left);
     // the centre: every other task, loudest state first; the right: its outcomes, on the same row
     const centre = [];
-    for (const st of TASK_ORDER) for (const t of tasks) if (t.state === st && t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question") centre.push(t);
+    const heatRank = (t) => { const i = HEAT_ORDER.indexOf(t.heat); return i < 0 ? HEAT_ORDER.length : i; };
+    for (const st of TASK_ORDER) {
+      const group = tasks.filter((t) => t.state === st && t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question");
+      if (st === "open") group.sort((a, b) => heatRank(a) - heatRank(b));       // hot first; the store's order within a heat (the sort is stable)
+      centre.push(...group);
+    }
     for (const t of tasks) if (t.kind === "unattached") centre.push(t);
     const links = [];
     let row = 2;
@@ -341,7 +361,7 @@
       const folds = t.kind !== "unattached" && t.state !== "waiting" && t.state !== "failed";
       const idx = folds ? (seen.set(t.state, (seen.get(t.state) || 0) + 1), seen.get(t.state)) : 0;
       const hide = folds && idx > GROUP_CAP && !shownAll.has(t.state);
-      const c = taskCard(t, byId, lost, opts);
+      const c = taskCard(t, byId, lost, opts, v.as_of);
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;
@@ -442,7 +462,7 @@
   // ---- the legend under the Work columns: the five states and the two definitions that keep waiting and stuck apart ----
   function legend() {
     const l = el("div", "tv-legend");
-    for (const st of ["waiting", "stuck", "failed", "running", "done"]) {
+    for (const st of ["waiting", "stuck", "failed", "running", "open", "done"]) {
       const i = el("span", "tv-leg");
       i.append(dot(st), st === "waiting" ? "waiting on you" : st);
       l.appendChild(i);
