@@ -475,7 +475,7 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace, 
            f"the CLI's `--names`): each rule keyed by a value Levain wrote (read off Levain's own receipt: its policy "
            f"name and version, actor id, capability, cwd, the signer's `ssh-key:<fp>`) sets the scenario's alias for "
            f"it, and the exporter renames before provenance, score and hash; with a names file every `receipt_id` is "
-           f"derived with the file's sha256, so it never reuses an unrenamed receipt's id. Every authority name "
+           f"derived with the digest of the file's validated rules, so it never reuses an unrenamed receipt's id. Every authority name "
            f"(policy name and version, capability, resource id, approver id) is set only by a rule whose `when` pins "
            f"exactly that field to Levain's value (the version: name and version), and the approver map names only "
            f"the key that signed. NO name is rewritten after the export (only O1-O3 below, as in STRICT). A names "

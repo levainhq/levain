@@ -144,15 +144,15 @@ def test_the_receipt_id_comes_from_the_rules_never_from_a_handed_sha256(world):
     assert ab._rules_digest(((( ("policy.name", "levain.consent.T2"),), (("policy.name", "acme.x"),)),)) == PINNED
 
 
-def test_a_forged_names_with_a_lone_surrogate_raises_export_error_or_digests(world):
-    """A hand-built Names carrying a lone surrogate in `when` never escapes export as a UnicodeEncodeError."""
-    queue, now, _ = world
+def test_a_forged_names_with_a_lone_surrogate_in_when_digests_and_renames_nothing(world):
+    """A hand-built Names carrying a lone surrogate in `when` (L3 r3 complement LOW: it used to escape export as a
+    UnicodeEncodeError) digests as ASCII JSON and, matching no Levain value, renames nothing."""
+    queue, now, plain = world
     forged = ab.Names(rules=(((("policy.name", "levain.consent.\ud800"),), (("policy.name", "acme.x"),)),),
                       sha256="0" * 64)
-    try:
-        ab.export(queue.directory, now=now, names=forged)
-    except ab.ExportError:
-        pass
+    got = ab.export(queue.directory, now=now, names=forged)
+    assert got.report.names_renamed == 0
+    assert len(got.receipts) == len(plain.receipts)
 
 
 @pytest.mark.parametrize("field", ["policy.decision", "execution.status", "actor.type", "approval.approved_at",
