@@ -195,7 +195,9 @@ class WriteScope:
       schema). Called ``state_episode(text, source, run)`` after the line is set, once per set; the
       sink dedupes per ``run`` (a re-set of the live text passes the same run). When set it is used
       INSTEAD of recording into ``anneal.episodic_db``; a raise leaves the line set and reports
-      ``episode: failed``. ``None`` records into ``anneal.episodic_db``.
+      ``episode: failed``. ``None`` records into ``anneal.episodic_db``. It is synchronous, runs
+      outside ``apply_edit``'s write lock, must be bounded, and must key on ``run`` rather than
+      infer recency from call order.
 
     ``from_install_root`` reproduces the pre-WriteScope BEHAVIOR (store paths by the
     ``.levain/memory.db`` convention, ledger physical location at ``.levain/``, undo
@@ -675,13 +677,20 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
         raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
     # Serialize the entire mutation (read→check→backup→audit→write) across the
     # server's request threads — this is what makes single-writer true (L1 HIGH).
+    if kind == "operator_state":
+        # the line is set under the lock; its episode is delivered AFTER it is released (a busy store
+        # or a sink must not hold every other edit, and a sink may re-enter apply_edit)
+        with _WRITE_LOCK:
+            result = _apply_operator_state_edit(scope, req, now, defer_episode=True)
+        deliver = result.pop("_deliver", None)
+        if deliver is not None:
+            result.update(deliver())
+        return result
     with _WRITE_LOCK:
         if kind == "config":
             return _apply_config_edit(scope, req, now)
         if kind == "state":
             return _apply_state_edit(scope, req, now)
-        if kind == "operator_state":
-            return _apply_operator_state_edit(scope, req, now)
         if kind == "entity_name":
             return _apply_entity_name(scope, req, now)
         if kind == "spore_touch":
@@ -1101,7 +1110,8 @@ def _apply_config_edit(scope: WriteScope, req: dict[str, Any], now: str | None) 
 
 
 def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None,
-                               check: "Callable[[], None] | None" = None) -> dict[str, Any]:
+                               check: "Callable[[], None] | None" = None,
+                               defer_episode: bool = False) -> dict[str, Any]:
     """Set (or clear) the operator's freeform state line, the ``operator_state`` kind:
     live-state in ``scope.context_json`` (``write_state``'s lock, no continuity lock or backup;
     ``check`` is the cockpit's version compare, run under that lock),
@@ -1113,7 +1123,10 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     a re-set adds none): an INPUT the consolidate reads, like any episode, never a write into the
     felt layer. The result's ``episode`` says what happened; a failed episode leaves the line set
     and reports ``episode_error`` (no warning is raised: one raised by a ``-W error`` filter
-    would fail a set that has already landed)."""
+    would fail a set that has already landed). With ``defer_episode`` (``apply_edit``'s path, which holds
+    the process-wide write lock) the result carries ``episode: pending`` and a private ``_deliver``
+    that ``apply_edit`` calls after the lock is released, so a slow store or a blocking sink never
+    freezes the other edits and a sink may call back into ``apply_edit"""
     ctx = scope.context_json
     if ctx is None:
         raise EditError(
@@ -1137,7 +1150,8 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
 
     try:
         done = write_state(ctx, collapsed, source=source, check=check,
-                           episodic_db=scope.anneal.episodic_db, record_episode=scope.state_episode)
+                           episodic_db=scope.anneal.episodic_db, record_episode=scope.state_episode,
+                           defer_episode=defer_episode)
     except StateLockUnavailable as exc:
         raise EditError("lock_unavailable", 501, str(exc)) from exc
     except OSError as exc:      # the lock file or the write itself: retryable, never a bare 500
@@ -1146,6 +1160,16 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
                               "episode": done.episode}
     if done.episode == "failed":    # the line is set; its felt episode is not: say so, never fail the set
         result["episode_error"] = done.episode_error
+    if done.deliver is not None:
+        finish = done.deliver
+
+        def _deliver() -> dict[str, Any]:
+            late = finish()
+            out: dict[str, Any] = {"episode": late.episode}
+            if late.episode == "failed":
+                out["episode_error"] = late.episode_error
+            return out
+        result["_deliver"] = _deliver
     return result
 
 

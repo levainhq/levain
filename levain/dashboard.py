@@ -841,7 +841,7 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
 @dataclass(frozen=True)
 class StateWrite:
     """What one ``write_state`` did beyond the line itself: the felt episode it owed.
-    ``episode`` is ``written`` (the store holds this run's episode: this call wrote it, or an
+    ``episode`` is ``pending`` (only with ``defer_episode``: ``deliver`` finishes it), ``written`` (the store holds this run's episode: this call wrote it, or an
     earlier call of the same run had; anneal does not say which), ``cleared`` (a clear sets
     nothing), ``no_store`` (no episodic store to write to) or ``failed`` (the line is set, the
     episode is not; ``episode_error`` says why)."""
@@ -849,6 +849,16 @@ class StateWrite:
     text: str
     episode: str
     episode_error: str | None = None
+    deliver: "Callable[[], StateWrite] | None" = None   # set only with ``defer_episode``: episode ``pending``, this finishes it
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``Type: message`` for a result, without trusting the message: an exception whose ``__str__``
+    raises must still become a ``failed`` result, never a second exception after the line is set."""
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception:   # noqa: BLE001
+        return type(exc).__name__
 
 
 STATE_EPISODE_SOURCE = "levain-state"
@@ -893,14 +903,15 @@ def _record_state_episode(episodic_db: Path, text: str, source: str, *, run: str
                 origin_key=_state_origin_key(run, text),
             )
     except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
-        return StateWrite(text, "failed", f"{type(exc).__name__}: {exc}")
+        return StateWrite(text, "failed", _exc_text(exc))
     return StateWrite(text, "written")
 
 
 def write_state(context_json: Path, text: str, *, source: str = "cli",
                 check: "Callable[[], None] | None" = None,
                 episodic_db: Path | None = None,
-                record_episode: "Callable[[str, str, str], None] | None" = None) -> StateWrite:
+                record_episode: "Callable[[str, str, str], None] | None" = None,
+                defer_episode: bool = False) -> StateWrite:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
     write-peer of ``_read_state``, kept adjacent so the contract (the state keys, a
     tz-aware ISO stamp) cannot drift between read and write.
@@ -928,7 +939,12 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     records no episode. ``record_episode(text, source, run)``, when given, is called INSTEAD of
     recording into ``episodic_db`` (an embedder whose episode store is not an anneal store levain can
     open): once per set, with the run, so its sink dedupes per run; a raise is ``failed``, never a
-    failed set."""
+    failed set. The sink is synchronous and must be bounded: it runs on the caller's thread. It
+    must key on ``run`` and not infer recency from call order (two concurrent sets can reach it
+    in the opposite order from the one in which they landed). ``levain state`` (the CLI) has no
+    scope, so it always records into the install's own store. With ``defer_episode`` the line is
+    set and the result is ``pending`` with ``deliver``: the caller finishes it AFTER dropping any
+    lock of its own, so a slow store or sink never holds that lock."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
@@ -941,15 +957,20 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
                                   run=prior.run if continues else None)
     if run is None:
         return StateWrite("", "cleared")
-    if record_episode is not None:
-        try:
-            record_episode(collapsed, source, run)
-        except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
-            return StateWrite(collapsed, "failed", f"{type(exc).__name__}: {exc}")
-        return StateWrite(collapsed, "written")
-    if episodic_db is None:
-        return StateWrite(collapsed, "no_store")
-    return _record_state_episode(episodic_db, collapsed, source, run=run)
+    def deliver() -> StateWrite:
+        if record_episode is not None:
+            try:
+                record_episode(collapsed, source, run)
+            except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
+                return StateWrite(collapsed, "failed", _exc_text(exc))
+            return StateWrite(collapsed, "written")
+        if episodic_db is None:
+            return StateWrite(collapsed, "no_store")
+        return _record_state_episode(episodic_db, collapsed, source, run=run)
+
+    if defer_episode:
+        return StateWrite(collapsed, "pending", deliver=deliver)
+    return deliver()
 
 
 @dataclass

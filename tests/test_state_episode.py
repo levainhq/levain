@@ -485,3 +485,50 @@ def test_a_sink_that_raises_leaves_the_line_set_and_says_failed(root: Path) -> N
 
 def test_a_scope_without_a_sink_records_into_its_store_as_before(root: Path) -> None:
     assert _set(root, "no sink")["episode"] == "written" and [e.content for e in _episodes(root)] == ["no sink"]
+
+
+# ── the episode is delivered AFTER apply_edit's process-wide write lock is released (L3 r3, codex HIGH) ──
+
+def test_the_sink_runs_outside_the_write_lock(root: Path) -> None:
+    from levain import writes
+    seen: list = []
+
+    def sink(*_a):
+        got = writes._WRITE_LOCK.acquire(blocking=False)
+        seen.append(got)
+        if got:
+            writes._WRITE_LOCK.release()
+    assert apply_edit(_sink_scope(root, sink), {"kind": "operator_state", "text": "x"})["episode"] == "written"
+    assert seen == [True]
+
+
+def test_a_sink_may_call_back_into_apply_edit_without_deadlocking(root: Path) -> None:
+    out: dict = {}
+
+    def sink(*_a):
+        out["inner"] = apply_edit(WriteScope.from_install_root(root), {"kind": "operator_state", "text": "inner"})
+
+    scope = _sink_scope(root, sink)
+    worker = threading.Thread(daemon=True, target=lambda: out.setdefault("outer", apply_edit(scope, {"kind": "operator_state", "text": "outer"})))
+    worker.start()
+    worker.join(20)
+    assert not worker.is_alive(), "apply_edit deadlocked on its own write lock"
+    assert out["outer"]["episode"] == "written" and out["inner"]["ok"]
+
+
+def test_the_result_never_carries_the_private_delivery_or_a_pending_episode(root: Path) -> None:
+    for text in ("a", "a", ""):
+        res = _set(root, text)
+        assert "_deliver" not in res and res["episode"] != "pending"
+
+
+def test_a_sink_exception_whose_message_raises_is_still_a_failed_result(root: Path) -> None:
+    class Hostile(Exception):
+        def __str__(self) -> str:
+            raise ValueError("no text for you")
+
+    def boom(*_a):
+        raise Hostile()
+    res = apply_edit(_sink_scope(root, boom), {"kind": "operator_state", "text": "line survives"})
+    assert res["ok"] and res["episode"] == "failed" and res["episode_error"] == "Hostile"
+    assert _line(root)["state"] == "line survives"
