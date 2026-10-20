@@ -112,7 +112,7 @@
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
-      id: bare(row.id), age: ageOf(row), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
+      id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
       disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
@@ -237,7 +237,8 @@
           const st = jf.job_status;
           line.dot = st === "done" ? "ok" : st === "failed" ? "bad" : "off";
           line.text = (typeof jf.verb === "string" && jf.verb ? jf.verb : r.title) + " " + (st === "done" ? "finished" : st === "failed" ? "failed" : st || "");
-          line.meta = [typeof jf.at === "string" ? ago(jf.at) : "", st === "pending" || st === "running" ? st : ""].filter(Boolean).join(" \u00b7 ");
+          // `at` is the job's finish for a finished job; a job still pending or running is not a result yet and says so
+          line.meta = st === "pending" || st === "running" ? st : (typeof jf.at === "string" ? ago(jf.at) : "");
         }
         const rf = (r.facets || {}).repo;   // the structured repo: when a row carries one, its tag comes from this, not its words
         if (typeof rf === "string" && visible(rf).trim()) line.repo = visible(rf).trim();
@@ -1872,7 +1873,9 @@
   }
   const k7K = (n) => (n >= 1000 ? Math.round(n / 1000) + "K" : String(n));
   // the context meter: how much of the model's window (Codex states it) or of the operator's warn line (Claude Code does not)
-  // the session holds. Orange only while the session waits on a decision; never a number the transcript did not give.
+  // the session holds. A session at or past the warn line (either agent, not compacted) says OVER in words and in red: that
+  // reads on a screenshot and on touch, and is not the orange of a session waiting on a decision. Never a number the
+  // transcript did not give.
   function k7Meter(v, waiting) {
     const m = el("div", "k7-meter");
     const head = el("div", "k7-meter-h");
@@ -1880,33 +1883,40 @@
     const bar = el("div", "k7-bar");
     const fill = el("i");
     bar.appendChild(fill);
-    let label = "not read", frac = 0;
+    let label = "not read", frac = 0, over = false;
     if (isNum(v.tokens) && v.compacted) { label = "compacted"; }
     else if (isNum(v.tokens) && v.tokens > 0) {
-      const wall = isNum(v.window) && v.window > 0 ? v.window : (isNum(v.warn) && v.warn > 0 ? v.warn : 0);
+      const hasWin = isNum(v.window) && v.window > 0;
+      const wall = hasWin ? v.window : (isNum(v.warn) && v.warn > 0 ? v.warn : 0);
       frac = wall ? Math.min(1, v.tokens / wall) : 0;
-      label = isNum(v.window) && v.window > 0 ? Math.round((v.tokens / v.window) * 100) + "%" : k7K(v.tokens);
+      // Codex states its window: a percentage of it. Claude Code does not: the bar is measured against the warn line, and says so
+      label = hasWin ? Math.round((v.tokens / v.window) * 100) + "%" : (wall ? k7K(v.tokens) + " of " + k7K(wall) + " warn" : k7K(v.tokens));
+      over = isNum(v.warn) && v.warn > 0 && v.tokens >= v.warn;
     }
     fill.style.width = Math.round(frac * 100) + "%";
+    if (over) head.appendChild(el("span", "k7-over", "OVER"));
     head.appendChild(el("span", "k7-meter-v", label));
     m.append(head, bar);
     if (typeof v.context === "string" && v.context) m.title = v.context;
     if (waiting) m.classList.add("waiting");
+    if (over) m.classList.add("over");
     if (label === "not read") m.classList.add("unread");
     return m;
   }
   function k7Limits(v) {
     const l = v.limits;
     if (!isObj(l)) return null;
-    let text = "", tone = "ok";
-    if (l.counting === false) { text = "limits: not counting"; tone = "over"; }
-    else if (typeof l.halted === "string" && l.halted) { text = "halted: " + l.halted; tone = "over"; }
-    else if (typeof l.metric === "string" && l.metric) { text = l.metric; tone = l.status === "over" || l.status === "amber" ? l.status : "ok"; }
-    return text ? el("div", "k7-limits " + tone, text) : null;
+    // the blocking fact first (a halted session), then that nobody is counting; a session nobody counts is never drawn as healthy
+    const parts = [];
+    let tone = "ok";
+    if (typeof l.halted === "string" && l.halted) { parts.push("halted: " + l.halted); tone = "over"; }
+    if (l.counting !== true) { parts.push("limits: not counting"); tone = "over"; }
+    if (!parts.length && typeof l.metric === "string" && l.metric) { parts.push(l.metric); tone = l.status === "over" || l.status === "amber" ? l.status : "ok"; }
+    return parts.length ? el("div", "k7-limits " + tone, parts.join(" \u00b7 ")) : null;
   }
   function k7Row(ln, now) {
     const v = ln.sess, live = v.active === true;
-    const waiting = live && typeof v.waiting === "string" && v.waiting !== "";
+    const waiting = typeof v.waiting === "string" && v.waiting !== "";
     const row = el("div", "k7-srow" + (live ? " live" : " quiet") + (waiting ? " waiting" : ""));
     const dot = el("i", "k7-sdot " + (live ? "live" : "quiet"));
     dot.setAttribute("aria-hidden", "true");
@@ -1917,10 +1927,13 @@
     who.append(top, el("div", "k7-cwd", v.cwd || ""));
     const nowc = el("div", "k7-now");
     let said;
-    if (waiting) said = "waiting on a decision (" + v.waiting + ")";
-    else if (live) said = v.tool ? v.tool + " · " + k7Ago(v.tool_at, now) : "last hook " + k7Ago(v.last_seen, now);
+    let tick = null;      // [prefix, iso]: an "N s ago" the page keeps current in place, without drawing the card again
+    if (waiting) said = "waiting on a decision (" + v.waiting + (isNum(v.waiting_n) && v.waiting_n > 1 ? " +" + (v.waiting_n - 1) : "") + ")";
+    else if (live) { tick = v.tool ? [v.tool + " \u00b7 ", v.tool_at] : ["last hook ", v.last_seen]; said = tick[0] + k7Ago(tick[1], now); }
     else said = v.tool ? "last tool " + k7Time(v.tool_at) : "last hook " + k7Time(v.last_seen);
-    nowc.appendChild(el("div", "k7-tool", said));
+    const toolEl = el("div", "k7-tool", said);
+    if (tick) { toolEl.dataset.k7Pre = tick[0]; toolEl.dataset.k7At = tick[1]; }
+    nowc.appendChild(toolEl);
     const lim = k7Limits(v);
     if (lim) nowc.appendChild(lim);
     // "ended" would claim what no hook announces: a quiet session says when it last fired one
@@ -1950,8 +1963,15 @@
     if (!s || document.body.dataset.mode !== "build") { if (!s) { sec.hidden = true; k7Sig = ""; } return; }
     const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
     const now = Date.now();
-    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), Math.floor(now / 5000), s.data.empty || ""]);
-    if (sig === k7Sig && !sec.hidden) return;
+    // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
+    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || ""]);
+    if (sig === k7Sig && !sec.hidden) {
+      for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
+        const w = t.dataset.k7Pre + k7Ago(t.dataset.k7At, now);
+        if (t.textContent !== w) t.textContent = w;
+      }
+      return;
+    }
     k7Sig = sig;
     sec.hidden = false;
     const card = el("div", "panel k7-card");
@@ -1997,6 +2017,7 @@
       head.append(t, g);
     }
     const grid = zone.querySelector(".ck-zgrid");
+    if (grid && grid.querySelector('[data-ck-panel="jobs"]')) for (const old of grid.querySelectorAll(".k7-results-none")) old.remove();   // a real Results card replaces the placeholder
     if (grid && !grid.querySelector('[data-ck-panel="jobs"]') && !grid.querySelector(".k7-results-none")) {
       const p = el("div", "panel ck-dash k7-results-none");
       p.dataset.ckPanel = "jobs-none";

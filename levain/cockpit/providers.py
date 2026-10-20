@@ -8,6 +8,7 @@ edit ledger is read directly because ``recent_edits`` swallows every fault."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -772,7 +773,10 @@ def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
             RowIn(
                 id=f"job:{r['job_id']}", title=f"{r['verb']} {r['status']}",
                 body=json.dumps(r.get("result")) if r.get("result") is not None else (r.get("error") or None),
-                facets={"job_status": r["status"], "verb": r["verb"], "at": r["created_at"]},
+                # `at` is when the result EXISTS: the job's finish for a terminal job (so Results orders and words by it),
+                # its creation while it is still pending or running
+                facets={"job_status": r["status"], "verb": r["verb"],
+                        "at": (r.get("finished_at") if r["status"] in ("done", "failed") else None) or r["created_at"]},
                 stored={"job_id": r["job_id"], "verb": r["verb"], "status": r["status"],
                         "created_at": r["created_at"], "started_at": r.get("started_at"),
                         "finished_at": r.get("finished_at"), "result": r.get("result"), "error": r.get("error")},
@@ -890,6 +894,7 @@ SESSIONS_NOTE = ("Sandbox is what the settings files say for each session's work
                  "relocated config directory is only found for sessions whose hook has recorded the path.")
 SESSION_FACETS = frozenset({"agent", "last_seen", "source", "session_activity", "legacy_meta", "repo", "session_view"})
 SESSION_TOOL_LISTED = 12            # the newest listed sessions whose transcript log is read for the tool they last ran
+LIMIT_LABEL_MAX = 40               # characters of a limits metric label the Build tab shows
 SESSION_TOOL_MAX = 60               # characters of a tool event's text the Build tab shows
 LIMIT_STATUS_RANK = {"ok": 0, "amber": 1, "over": 2}
 
@@ -992,8 +997,33 @@ def _cwd_hint(cwd: str) -> str:
     return f"~/…/{name}" if home and cwd.startswith(home + os.sep) else f"/…/{name}"
 
 
+# the tools whose one argument is a file path: the panel shows the BASENAME and nothing else of it
+_FILE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Read", "apply_patch"})
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_.\-]{1,48}")
+
+
+def _tool_name(name: Any) -> str:
+    """A tool's name as the token-free panel may show it: a plain identifier (MCP names included), else ``a tool``. Never
+    argument text: a name with a space, a slash or a control character is not a name."""
+    return name if isinstance(name, str) and _TOOL_NAME.fullmatch(name) else "a tool"
+
+
+def _tool_label(text: str) -> str:
+    """The token-free panel's words for a tool event (the hook logs ``Name: argument``): the tool name alone, plus the
+    BASENAME of the path for a file tool. The argument of any other tool (a shell command, an MCP call's payload) is never
+    shown, and a path is never shown whole: this panel is served without a token."""
+    name, sep, arg = " ".join(text.split()).partition(": ")
+    name = _tool_name(name.strip())
+    if sep and name in _FILE_TOOLS:
+        base = re.split(r"[/\\]", arg.strip().rstrip("/\\"))[-1]
+        base = "".join(c for c in base if c.isprintable())[:SESSION_TOOL_MAX]
+        if base:
+            return f"{name} {base}"
+    return name
+
+
 def _last_tool(install_root: Path, stem: str) -> tuple[str, str] | None:
-    """The newest ``tool`` event of a session's transcript log as (iso time, one line of text), or None. A display read
+    """The newest ``tool`` event of a session's transcript log as (iso time, :func:`_tool_label`), or None. A display read
     through the log reader's own bounded tail; any failure is no reading, never a dark panel."""
     try:
         from levain.cockpit import session_log as sl
@@ -1004,10 +1034,8 @@ def _last_tool(install_root: Path, stem: str) -> tuple[str, str] | None:
         for line in reversed(raw.splitlines()):
             ev = sl._event(line)
             if ev is not None and ev["kind"] == "tool":
-                text = " ".join(ev["text"].split())
-                text = text.replace(": ", " ", 1) if ": " in text[:40] else text
-                text = "".join(c for c in text if c.isprintable())
-                return ev["at"], (text[:SESSION_TOOL_MAX - 1] + "\u2026" if len(text) > SESSION_TOOL_MAX else text)
+                label = _tool_label(ev["text"])
+                return ev["at"], (label[:SESSION_TOOL_MAX - 1] + "\u2026" if len(label) > SESSION_TOOL_MAX else label)
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -1015,27 +1043,33 @@ def _last_tool(install_root: Path, stem: str) -> tuple[str, str] | None:
 
 def _limit_figure(v: Any) -> str:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return str(v)
+        return "unknown"
     return str(int(v)) if float(v).is_integer() else f"{v:.1f}"
 
 
-def _limit_lines() -> dict[tuple[str, str], dict[str, Any]]:
+def _limit_lines() -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
     """Per (agent, session id), the budget line the Q13 limits panel reports: its worst metric, whether the session is
-    counted at all, whether it is halted. ``levain.consent.limits.panel`` is another lane's; where it does not exist (or
-    reads nothing) this is empty and the session row draws no limits line, and nothing is raised."""
+    counted at all, whether it is halted. ``levain.consent.limits.panel`` is another lane's. Returns ``(state, lines)``:
+    ``absent`` (no such module or no ``panel``: no row draws a limits line), ``unreadable`` (it exists and raised or
+    answered junk: a budget nobody is watching, said on every row, never drawn as health) or ``ok``."""
     import importlib
 
     try:
         mod = importlib.import_module("levain.consent.limits")
         fn = getattr(mod, "panel", None)
-        if not callable(fn):
-            return {}
+    except ImportError:
+        return "absent", {}
+    except Exception:  # noqa: BLE001 - a module that exists and cannot be loaded is not a budget being watched
+        return "unreadable", {}
+    if not callable(fn):
+        return "absent", {}
+    try:
         from levain.consent.queue import default_queue_dir
 
         data = fn(default_queue_dir())
         sessions = data.get("sessions") if isinstance(data, dict) else None
         if not isinstance(sessions, list):
-            return {}
+            return "unreadable", {}
         out: dict[tuple[str, str], dict[str, Any]] = {}
         for ent in sessions:
             if not isinstance(ent, dict) or not isinstance(ent.get("agent"), str) or not isinstance(ent.get("session"), str):
@@ -1050,19 +1084,21 @@ def _limit_lines() -> dict[tuple[str, str], dict[str, Any]]:
                     and not isinstance(v, bool) and not isinstance(lim, bool) and lim else 0.0
                 if (LIMIT_STATUS_RANK[st], ratio) > wr:
                     worst, wr = (m, st), (LIMIT_STATUS_RANK[st], ratio)
-            line: dict[str, Any] = {"counting": ent.get("counting") is not False}
+            # only an explicit `counting: true` is counting: a missing key is a session nobody is counting
+            line: dict[str, Any] = {"counting": ent.get("counting") is True}
             if worst is not None:
                 m, st = worst
+                label = "".join(c for c in m["label"] if c.isprintable())[:LIMIT_LABEL_MAX]
                 figure = _limit_figure(m.get("value")) + (f"/{_limit_figure(m['limit'])}" if m.get("limit") is not None else "")
-                line["metric"] = f"{m['label']} {figure}"
+                line["metric"] = f"{label} {figure}"
                 line["status"] = st
             halted = ent.get("halted")
             if isinstance(halted, dict):
-                line["halted"] = str(halted.get("kind") or "limit")[:40]
+                line["halted"] = "".join(c for c in str(halted.get("kind") or "limit") if c.isprintable())[:40]
             out[(ent["agent"], ent["session"])] = line
-        return out
-    except Exception:  # noqa: BLE001 - a limits panel that cannot be read is no line, never a dark sessions panel
-        return {}
+        return "ok", out
+    except Exception:  # noqa: BLE001 - a limits panel that cannot be read is said on the rows, never a dark sessions panel
+        return "unreadable", {}
 
 
 def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime], Any] | None]
@@ -1090,7 +1126,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             return Fault(f"the sessions directory cannot be read: {type(exc).__name__}")
         found.sort(key=lambda p: p[0], reverse=True)
         waiting: dict[tuple[str, str], int] = {}
-        waiting_on: dict[tuple[str, str], str] = {}
+        waiting_on: dict[tuple[str, str], tuple[str, str]] = {}      # session -> (received_at, tool_name) of the NEWEST
         consent_read = True
         reader = consent()
         if reader is not None:
@@ -1101,11 +1137,13 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
                     if e.state in ("pending", "undecided"):
                         k = (e.request.agent, e.request.agent_session_id)
                         waiting[k] = waiting.get(k, 0) + 1
-                        waiting_on.setdefault(k, e.request.tool_name)
+                        at = str(e.request.received_at)
+                        if k not in waiting_on or at > waiting_on[k][0]:
+                            waiting_on[k] = (at, e.request.tool_name)
             except Exception:  # noqa: BLE001 - an unread queue is said, not shown as zero waiting
                 consent_read = False
         listed: list[tuple[dict[str, Any], list[str], str, bool, dict[str, Any]]] = []
-        limits = _limit_lines()
+        limits_state, limits = _limit_lines()
         bad = 0
         sandbox: dict[str, str] = {}
         for _mt, path in found[:SESSIONS_SHOWN]:
@@ -1143,8 +1181,12 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             if len(listed) < SESSION_TOOL_LISTED and (tool := _last_tool(source.install_root, rec["_stem"])) is not None:
                 view["tool_at"], view["tool"] = tool
             if key in waiting_on:
-                view["waiting"] = waiting_on[key] or "a tool"
-            if key in limits:
+                view["waiting"] = _tool_name(waiting_on[key][1])
+                if waiting[key] > 1:
+                    view["waiting_n"] = waiting[key]
+            if limits_state == "unreadable":
+                view["limits"] = {"counting": False}
+            elif key in limits:
                 view["limits"] = limits[key]
             listed.append((rec, chips, work, age < SESSION_ACTIVE_S, view))
         # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
@@ -1156,7 +1198,9 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
         rows: list[RowIn] = []
         for rec, chips, work, active, view in listed:
             stored = {"agent": rec["agent"], "workspace": work, "last_seen": rec["last_seen"],
-                      "active": active, "chips": chips[1:], "view": view}
+                      "active": active, "chips": chips[1:],
+                      # the view ships once (facets); the row's version still moves with it, through its digest
+                      "view_sig": hashlib.sha1(json.dumps(view, sort_keys=True).encode("utf-8")).hexdigest()[:12]}
             started = _session_stamp(rec["first_seen"]) if titles[(rec["agent"], work)] > 1 else None
             meta = chips
             if started is not None and started <= rec["_seen"]:

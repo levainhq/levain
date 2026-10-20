@@ -1634,6 +1634,9 @@ body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: 
 .k7-bar > i { display: block; height: 100%; background: var(--label); }
 .k7-meter.waiting .k7-bar > i { background: var(--accent); }
 .k7-meter.unread .k7-meter-v { color: var(--meta); }
+.k7-meter.over .k7-bar > i { background: var(--bad); }
+.k7-meter.over .k7-meter-v { color: var(--bad); }
+.k7-over { margin-left: auto; margin-right: var(--sp-2); padding: 0 var(--sp-2); border-radius: 3px; background: var(--bad); color: var(--bg, #fff); letter-spacing: .08em; }
 .k7-when { text-align: right; color: var(--label); font-size: var(--fs-meta); white-space: nowrap; }
 .k7-srow.waiting .k7-now .k7-tool { color: var(--text); }
 @media (max-width: 720px) {

@@ -1460,8 +1460,8 @@
     }
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
-    const aged = /^(\d+)d old$/.exec(String(s.age || ""));
-    if (aged) row.appendChild(el("span", "k7-opend", "open " + aged[1] + " d"));
+    // the integer the kernel sends (the spore's own created date), never the badge words parsed back
+    if (Number.isInteger(s.age_days) && s.age_days >= 0) row.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); row.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["edit", "schedule", "dismiss"] : null);
     return row;
