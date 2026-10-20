@@ -69,7 +69,7 @@ def test_end_halts_the_root_and_its_subagents(tmp_path, keys, authority, monkeyp
     t.join()
     assert not out.go and out.stop and "operator chose End" in out.text
     sub = _check(q, 4, session="s1#agent:a1")
-    assert not sub.go and sub.stop and "STOPPED by a budget" in sub.text
+    assert not sub.go and sub.stop and "STOPPED by a budget" in sub.text and "operator chose End" in sub.text
     assert L.snapshot(q.directory)[0]["counts"]["calls"] == 3   # a halted root counts nothing
 
 
@@ -348,4 +348,4 @@ def test_an_extend_does_not_carry_a_late_crossing_past_a_newer_end(tmp_path, key
     assert not _check(q, 12, session="s1#agent:a0").go  # call 5: End, the root halts
     t.join()
     out = _hold(q, v, "s1#agent:a1")                   # a1's settled Extend is older than the End
-    assert not out.go and out.stop and "STOPPED by a budget" in out.text
+    assert not out.go and out.stop and "STOPPED by a budget" in out.text and "operator chose End" in out.text

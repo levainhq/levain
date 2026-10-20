@@ -765,7 +765,8 @@ def check(agent: str, event: Mapping[str, Any], queue: Any, session: str, tool_n
         return Outcome(False, f"levain: the action was NOT taken: {v.reason}. The operator's budget cannot be counted, "
                               "so nothing runs until it can.")
     if v.state == "halted":
-        return Outcome(False, stop_text(v.kind, (v.halt or {}).get("gap")), stop=True)
+        gap = (v.halt or {}).get("gap")
+        return Outcome(False, stop_text(v.kind, gap, ended=v.halt is not None and gap is None), stop=True)
     root, kind = session_root(session), v.kind or "calls"
     try:
         return _hold(agent, queue, qdir, root, kind, v, hold=hold, notify=notify, resume=resume, cwd=cwd,
@@ -824,7 +825,7 @@ def _hold(agent: str, queue: Any, qdir: Path, root: str, kind: str, v: Verdict, 
             _ensure(conn)
             halt = _open_halt(conn, agent, root)
         if halt is not None:
-            return Outcome(False, stop_text(halt["kind"], halt["gap"]), stop=True)
+            return Outcome(False, stop_text(halt["kind"], halt["gap"], ended=halt["gap"] is None), stop=True)
     return out
 
 
