@@ -484,7 +484,9 @@ class CoordStore:
         is not work closes itself (by the service) once done; a thread that holds no drops cannot be reopened."""
         if state not in STATES:
             raise CoordError(f"a thread's state is one of {', '.join(STATES)}")
-        by = self._actor(by, ACTORS)
+        # the service is never a caller: its steps (a merge's carried claim, closing what a regroup emptied, an ask
+        # closing itself) are taken only inside the store's own operations
+        by = self._actor(by, ("operator", "coordinator"))
         cause = self._cause(cause)
         with self._write() as (conn, now):
             t = self._must_thread(conn, thread_id)
@@ -493,8 +495,6 @@ class CoordStore:
                 raise CoordError(f"a thread cannot go from {t.state} to {state}")
             if by not in allowed:
                 raise CoordError(f"{by} cannot take a thread from {t.state} to {state} (only {', '.join(sorted(allowed))})")
-            if by == "service" and state == "closed" and t.kind == "work":
-                raise CoordError("the service never closes a work thread; you do (a regroup that empties one closes it)")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")
             if state == "open" and t.about is not None and self._thread(conn, t.about).state == "closed":

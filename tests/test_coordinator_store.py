@@ -412,3 +412,11 @@ def test_final_round_bounds(store, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"x" * (WORDS_MAX * 4 + 3))))
     assert main(["drop", "--queue-dir", str(q), "-"]) == 1
     assert "at most" in capsys.readouterr().err
+
+
+def test_the_service_is_never_a_caller(store):
+    d, _ = store.accept_drop(TWO, surface="cli")
+    (x,) = store.split(d.drop_id, [work("x")])
+    for state in ("working", "closed"):
+        with pytest.raises(CoordError, match="by is one of"):
+            store.set_state(x.thread_id, state, by="service")
