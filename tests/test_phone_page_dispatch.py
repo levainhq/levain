@@ -312,3 +312,75 @@ def test_a_press_dragged_off_a_button_leaves_polling_working(world, tmp_path: Pa
             {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
         ])
     assert out["values"][4] >= 3, out
+
+
+# --- fix round 5 -----------------------------------------------------------------------------------------------------
+
+# two activations of one picker button queued before the first one's redraw: `close()` runs twice
+TWICE = ("(label) => { const b = [...document.querySelectorAll('article.dispatch .pick')]"
+         ".find(x => x.textContent.startsWith(label)); b.click(); b.click(); return 1; }")
+
+
+@needs_browser
+def test_a_double_dismiss_leaves_busy_at_zero_and_polling_working(world, tmp_path: Path) -> None:
+    _two_passkeys(world, tmp_path)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": SIGN_TAP},                                             # opens the picker (it holds busy)
+            {"eval": "(" + TWICE + ")('dismiss')"},
+            {"eval": FETCH_HOOK},
+            {"eval": POLLS},
+            {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
+            {"eval": PICKS},
+        ])
+    assert out["values"][5] >= 3, out                                       # busy went back to 0, not below it
+    assert out["values"][6] == 0, out
+
+
+@needs_browser
+def test_a_double_pick_runs_one_ceremony_and_polling_resumes(world, tmp_path: Path) -> None:
+    job = _two_passkeys(world, tmp_path)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            _authenticator(world["phone"]),
+            {"until": CARD + " && 1"},
+            {"eval": SIGN_TAP},
+            {"eval": "(" + TWICE + ")('" + world["phone"].fp[:18] + "')"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 8000},
+            {"eval": WAIT},
+            {"eval": WAIT},
+            {"eval": FETCH_HOOK},
+            {"eval": POLLS},
+            {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
+        ])
+    routes = [p.split(" ", 1)[0] for p in out["posts"]]
+    assert routes == [f"/dispatch/{job.id}/challenge", f"/dispatch/{job.id}/answer"], routes   # one ceremony, not two
+    assert out["values"][8] >= 3, out
+
+
+@needs_browser
+def test_words_typed_while_a_get_is_in_flight_are_not_redrawn_away(world, tmp_path: Path) -> None:
+    file_job(world)
+    hold = """(() => { const f = window.fetch; window.__release = null; window.fetch = (u, o) => {
+      if (!String(u).includes('consent.json')) return f(u, o);
+      return new Promise((res) => { window.__release = () => res(f(u, o)); }); };
+      document.getElementById('refresh').click(); return 1; })()"""
+    # a question's words box gets text while the GET is parked; the card is marked so a redraw would show
+    type_words = """(() => { const t = document.createElement('textarea'); t.className = 'words';
+      document.getElementById('requests').prepend(t); t.value = 'half a sentence';
+      document.querySelector('article.dispatch').dataset.mark = '1'; return 1; })()"""
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": hold},
+            {"eval": type_words},
+            {"eval": "(() => { window.__release(); return 1; })()"},
+            {"eval": WAIT},
+            {"eval": "[document.querySelector('textarea.words') && document.querySelector('textarea.words').value,"
+                     " document.querySelector('article.dispatch').dataset.mark || null]"},
+        ])
+    assert out["values"][5] == ["half a sentence", "1"], out

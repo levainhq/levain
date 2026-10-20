@@ -259,17 +259,27 @@
     // it again) or by dismissing it
     busy++;
     const picks = [];
-    const close = () => { picks.forEach((x) => x.remove()); busy--; closePick = null; };
+    // close() releases busy once: a second activation queued before the first one's redraw (or a later picker's
+    // replace) finds it closed and does nothing, so busy never goes below 0 and a pick never runs twice
+    let closed = false;
+    const close = () => {
+      if (closed) return false;
+      closed = true;
+      picks.forEach((x) => x.remove());
+      busy--;
+      if (closePick === close) closePick = null;
+      return true;
+    };
     closePick = close;
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => { close(); run(fp, known.length ? local[fp] : null); });
+      p.addEventListener("click", () => { if (close()) run(fp, known.length ? local[fp] : null); });
       picks.push(p);
     }
     const x = el("button", "quiet pick", "dismiss");
     x.type = "button";
-    x.addEventListener("click", () => { close(); say(""); });
+    x.addEventListener("click", () => { if (close()) say(""); });
     picks.push(x);
     picks.forEach((b) => actions.appendChild(b));
   }
@@ -639,15 +649,20 @@
       .finally(() => { busy--; });
   }
 
+  // what holds the list still: a ceremony or an open picker (busy), words being typed into a question's box, or a
+  // focused cancel reason (a redraw would wipe the words and dismiss the keyboard)
+  function held() {
+    if (busy) return true;
+    if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return true;
+    return !!(document.activeElement && document.activeElement.matches("input.reason"));
+  }
+
   function load() {
-    if (busy) return;
-    // a redraw would wipe words being typed into a question's box or a cancel's reason (and dismiss the keyboard)
-    if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return;
-    if (document.activeElement && document.activeElement.matches("input.reason")) return;
+    if (held()) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
     call("GET", "/consent.json").then((r) => {
-      // re-checked here, not only before the GET: a ceremony or a focused reason box that began meanwhile holds the list still
-      if (busy || (document.activeElement && document.activeElement.matches("input.reason"))) return;
+      // re-checked here, not only before the GET: any hold that began while it was in flight keeps the list still
+      if (held()) return;
       if (r.ok) draw(r.body); else $("status").textContent = why(r);
     });
   }

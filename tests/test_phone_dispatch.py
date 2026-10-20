@@ -157,3 +157,31 @@ def test_a_dispatch_dir_that_is_a_file_leaves_the_consent_listing_intact(world, 
     assert status == 200
     assert [r["id"] for r in body["pending"]] == [rid]
     assert body["dispatch_pending"] == [] and body["dispatch_overflow"] == 0 and "cannot be read" in body["dispatch_note"]
+
+
+# --- fix round 5 -----------------------------------------------------------------------------------------------------
+
+def test_a_faulting_keys_source_keeps_the_consent_cards_and_lists_the_jobs_unsignable(world, monkeypatch) -> None:
+    """The server's one keys source faults (the cockpit's keys db): the listing still answers 200, the consent cards
+    are all there, and the dispatch jobs are shown with no signer and the fault as their note, so no Sign can start."""
+    import sqlite3
+
+    import levain.consent.answering as answering
+
+    job = file_job(world)
+    queue = ConsentQueue(world["qdir"], authority=world["source"])
+    rid = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                     tool_input={"file_path": "/tmp/x.txt", "content": "hi"}, cwd="/w", hold=timedelta(minutes=5),
+                     tier="T2", event_id="dispatch-keys-fault-1").id
+
+    def broken(*_a, **_k):
+        raise sqlite3.OperationalError("keys db")
+
+    monkeypatch.setattr(answering, "passkey_keys", broken)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        status, body = _call(base + "/consent.json")
+    assert status == 200
+    assert [r["id"] for r in body["pending"]] == [rid]                       # the consent card survives the fault
+    (row,) = body["dispatch_pending"]
+    assert row["id"] == job.id and row["signers"] == [] and "keys db" in row["signer_note"]
+    assert body["dispatch_overflow"] == 0
