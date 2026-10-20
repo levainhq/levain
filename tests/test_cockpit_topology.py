@@ -268,7 +268,7 @@ def test_waiting_and_stalled_are_two_states_and_unattached_work_is_never_a_guess
     assert not ({w for t in v["tasks"] if t["kind"] != "unattached" for w in t["workers"]} & set(un["workers"]))
     # every cost is "not tracked" on this branch, never a guess
     assert all(t["cost"] == {"usd": None, "tokens": None, "source": None} for t in v["tasks"])
-    assert v["conflicts"] is None and v["counts"] == {"tokens_today": None}
+    assert v["conflicts"] == [] and v["counts"] == {"tokens_today": None}
     # the open loop from the install is a task
     assert any(t["kind"] == "spore" and t["label"] == "a loop" for t in v["tasks"])
     assert {g["label"] for g in v["groups"] if g["id"].startswith("dir:")} >= {"wait", "stall"}

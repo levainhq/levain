@@ -18,9 +18,12 @@ dir the cockpit owns, which takes only allow-listed, shape-checked settings from
 ``config.worktree``; see that function), bounded by the same whole-scan deadline,
 each working tree past it named, and cached for ``LOST_CACHE_S``.
 
+File conflicts come from the session log: the PostToolUse hook logs ``Name: file_path`` for an Edit/Write, and two
+live nodes with the same whole path inside the live window are a conflict (basename only on the wire; ``null`` when
+live nodes exist and none has a log).
+
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
-log holds it only inside text this token-free panel must not carry), file conflicts (no hook records an Edit or
-Write path), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
+log holds it only inside text this token-free panel must not carry), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
 episodes (episodes carry no session) and running children (no hook records a subagent). What does reach the wire is
 display-safe: a consent task is its agent and tool, a question its number, a dispatch contract its template, never
 its goal or a request's body; but a file name, a branch name, a repository or directory basename and an open loop's
@@ -180,6 +183,42 @@ def _log_signal(install_root: Path, stem: str, now: datetime) -> tuple[datetime 
     return last_at, last_kind, round(recent / (RATE_WINDOW_S / 60), 2)
 
 
+#: the tools whose logged argument is the file they write (the PostToolUse hook logs ``Name: file_path``)
+_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"})
+CONFLICTS_MAX = 20
+
+
+def _edit_paths(install_root: Path, stem: str, cwd: str, now: datetime, window_s: float) -> set[str] | None:
+    """The files a session's hook logged an Edit/Write on within ``window_s``, as normalised absolute paths (kept
+    inside this module: only a basename leaves it). A tool event is ``Name: argument``; an event whose text was cut
+    at the log's cap names no whole path and is skipped, never completed. No log is None (unknown, not "none")."""
+    from levain.cockpit.session_log import _event, _tail
+
+    raw = _tail(install_root / ".levain" / "sessions" / f"{stem}.log.jsonl")
+    if raw is None:
+        return None
+    out: set[str] = set()
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        ev = _event(line)
+        if ev is None or ev["kind"] != "tool" or ev["cut"]:
+            continue
+        at = act._parse(ev["at"])
+        if at is None or not 0 <= (now - at).total_seconds() <= window_s:
+            continue
+        name, sep, arg = ev["text"].partition(": ")
+        arg = arg.strip()
+        if not sep or name not in _WRITE_TOOLS or not arg or "\n" in arg:
+            continue
+        if not os.path.isabs(arg):
+            if not os.path.isabs(cwd):
+                continue
+            arg = os.path.join(cwd, arg)
+        out.add(os.path.normpath(arg))
+    return out
+
+
 def _node_state(waiting: bool, age_s: float, last_kind: str | None) -> str:
     """WAITING (a record) > STALLED (mid-turn and silent) > RUNNING > IDLE (quiet past the Sessions panel's Active
     line, or its turn ended in a reply). Silence with no log is never STALLED: nothing says the turn is open."""
@@ -192,6 +231,31 @@ def _node_state(waiting: bool, age_s: float, last_kind: str | None) -> str:
     if age_s >= STALL_S:
         return "stalled" if last_kind in ("prompt", "tool") else "idle"
     return "running"
+
+
+def _conflicts(install_root: Path, live: list[tuple[str, str]], stems: dict[str, str], now: datetime,
+               window_s: float) -> list[dict[str, Any]] | None:
+    """Two live nodes whose hooks logged an Edit/Write on the same path within ``window_s`` (the live window): a
+    pair per path, basename only on the wire. None when live nodes exist and none has a readable log (nothing was
+    observed, so "no conflicts" would be absence rendered as health); a list (maybe empty) once any log was read."""
+    seen: dict[str, list[str]] = {}
+    read_any = False
+    for nid, cwd in live:
+        paths = _edit_paths(install_root, stems[nid], cwd, now, window_s)
+        if paths is None:
+            continue
+        read_any = True
+        for path in paths:
+            seen.setdefault(path, []).append(nid)
+    if live and not read_any:
+        return None
+    out: list[dict[str, Any]] = []
+    for path in sorted(seen):
+        ids = sorted(seen[path])
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                out.append({"path": _wire(os.path.basename(path), base=True), "nodes": [a, b]})
+    return out[:CONFLICTS_MAX]
 
 
 # --- lost if closed: the git read ------------------------------------------------------------------------------
@@ -434,6 +498,7 @@ def topology_reader(*, install_root: Path | None,
         nodes: list[dict[str, Any]] = []
         by_session: dict[tuple[str, str], str] = {}
         live: list[tuple[str, str]] = []           # (node id, cwd) of the sessions Lost-if-closed reads
+        live_stems: dict[str, str] = {}            # node id -> record stem, for the conflict read
         walked: dict[str, tuple[tuple[Path, Path, Path] | None, str | None]] = {}
 
         def tree_of(cwd: str) -> tuple[tuple[Path, Path, Path] | None, str | None]:
@@ -480,6 +545,7 @@ def topology_reader(*, install_root: Path | None,
             by_session[(agent, sid)] = nid
             if (now - last).total_seconds() < SESSION_ACTIVE_S:
                 live.append((nid, cwd))
+                live_stems[nid] = stem
 
         # a repository label two groups share names the parent directory, then a fragment of the id if still shared
         repos = [g for g in groups.values() if g["id"] in parent_of]
@@ -559,10 +625,12 @@ def topology_reader(*, install_root: Path | None,
                          "branches": [_wire(st["branch"])] if st and st["unpushed"] and st["branch"] else [],
                          "uncaptured_episodes": None, "running_children": None})
 
+        conflicts = _conflicts(install_root, live, live_stems, now, SESSION_ACTIVE_S)
+
         errors = list(dict.fromkeys(errors))
         return Read(value={
             "hub": {"id": HUB_ID, "label": _wire(hub_label(ctx) or "Levain")},
-            "groups": list(groups.values()), "nodes": nodes, "conflicts": None,
+            "groups": list(groups.values()), "nodes": nodes, "conflicts": conflicts,
             "counts": {"tokens_today": None},
             # the minute, not the instant: a value stamped per read would change on every poll of an idle install
             "as_of": _iso(now.replace(second=0, microsecond=0)),

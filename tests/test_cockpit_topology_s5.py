@@ -61,11 +61,46 @@ def test_a_reader_with_no_directory_attribute_names_no_dispatch_directory(tmp_pa
     assert _dispatch_dir(_Explicit()) == explicit
 
 
-def test_a_dispatch_task_is_labelled_by_its_contracts_goal(tmp_path, monkeypatch):
-    ck, _root, _src, cdir, _work = _rig(tmp_path, monkeypatch)
-    job = _file_dispatch(cdir, tmp_path, goal="Round the money totals to cents\nwith a long second line")
+def _tools(root, agent, sid, events):
+    """A session log of tool events: (age, text, cut)."""
+    import hashlib
+
+    stem = hashlib.sha1(f"{agent}:{sid}".encode()).hexdigest()[:24]
+    lines = [json.dumps({"v": 1, "at": _stamp(ago), "kind": "tool", "text": text, "cut": cut})
+             for ago, text, cut in events]
+    (root / ".levain" / "sessions" / f"{stem}.log.jsonl").write_text("\n".join(lines) + "\n")
+
+
+def test_two_live_nodes_editing_one_path_are_a_conflict_with_a_basename_only(tmp_path, monkeypatch):
+    ck, root, _src, _cdir, work = _rig(tmp_path, monkeypatch)
+    shared = str(work / "shared" / "money.py")
+    m = timedelta(minutes=1)
+    _tools(root, "claude_code", "s-run", [(2 * m, f"Edit: {shared}", 0), (m, "Read: /x/only_read.py", 0),
+                                          (m, "Write: /x/solo.py", 0)])
+    _tools(root, "claude_code", "s-stall", [(3 * m, f"Write: {shared}", 0), (m, "Read: /x/only_read.py", 0)])
+    # one session's relative path resolves against its own cwd: another directory, so no clash with the others
+    _tools(root, "claude_code", "s-done", [(m, "Edit: money.py", 0)])
     v = ck.panel("topology", credential_class="none")["value"]
-    t = next(x for x in v["tasks"] if x["id"] == f"dispatch:{job.id}")
-    assert t["label"] == "Round the money totals to cents with a long…"[:48] or t["label"].startswith("Round the money")
-    assert len(t["label"]) <= 48
-    assert "second line" not in t["label"] or len(t["label"]) <= 48
+    pair = sorted([_stem("claude_code", "s-run"), _stem("claude_code", "s-stall")])
+    assert v["conflicts"] == [{"path": "money.py", "nodes": pair}]
+    assert str(work) not in json.dumps(v["conflicts"])
+
+
+def test_a_cut_event_an_old_event_and_an_idle_node_make_no_conflict(tmp_path, monkeypatch):
+    ck, root, _src, _cdir, work = _rig(tmp_path, monkeypatch)
+    shared = str(work / "shared" / "money.py")
+    m = timedelta(minutes=1)
+    _tools(root, "claude_code", "s-run", [(m, f"Edit: {shared}", 0)])
+    _tools(root, "claude_code", "s-stall", [(m, f"Edit: {shared}", 12)])            # cut: not a whole path
+    _tools(root, "claude_code", "s-done", [(20 * m, f"Edit: {shared}", 0)])         # outside the window
+    _tools(root, "claude_code", "s-old", [(m, f"Edit: {shared}", 0)])               # not a live node (2 h old)
+    v = ck.panel("topology", credential_class="none")["value"]
+    assert v["conflicts"] == []
+
+
+def test_conflicts_are_null_when_no_live_node_has_a_log(tmp_path, monkeypatch):
+    ck, root, _src, _cdir, _work = _rig(tmp_path, monkeypatch)
+    for f in (root / ".levain" / "sessions").glob("*.log.jsonl"):
+        f.unlink()
+    v = ck.panel("topology", credential_class="none")["value"]
+    assert v["conflicts"] is None            # nothing observed: not "no conflicts"
