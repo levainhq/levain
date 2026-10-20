@@ -68,9 +68,31 @@ def consent_targets(request: object) -> str:
         return "(too long to answer here: the input as filed is cut at its display limit)"
     got = _request_targets(request.agent, request.tool_name, tool_input)
     if not got:
-        return "(none named: the working directory)"
+        named = _named_by_tool(request.tool_name, tool_input)
+        return named if named is not None else "(none named: the working directory)"
     # a path named by two readers (a file tool's file_path is also a path field) is shown once
     return ", ".join(dict.fromkeys("(unreadable)" if t is None else str(t) for t in got))
+
+
+def _field(call: dict, key: str) -> str:
+    """One filed field as text; a missing, empty or non-scalar one reads ``(absent)``."""
+    v = call.get(key)
+    return str(v) if isinstance(v, (str, int, float)) and not isinstance(v, bool) and str(v) else "(absent)"
+
+
+def _named_by_tool(tool_name: str, tool_input: object) -> str | None:
+    """What a levain-filed publish or limit request names, read from its filed input (they name no path, so the
+    targets reader finds none). ``None`` for any other tool or a non-mapping input. A display only."""
+    if not isinstance(tool_input, dict):
+        return None
+    if tool_name == "levain_publish":       # publish_gate.PUBLISH_TOOL
+        return (f"publish {_field(tool_input, 'package')} {_field(tool_input, 'version')} to "
+                f"{_field(tool_input, 'index')} ({_field(tool_input, 'target')})")
+    if tool_name == "levain_limit":         # limits.LIMIT_TOOL
+        return (f"{_field(tool_input, 'agent')} session {_field(tool_input, 'session')} limit "
+                f"{_field(tool_input, 'limit')} count {_field(tool_input, 'count')} "
+                f"extend_to {_field(tool_input, 'extend_to')}")
+    return None
 
 
 @dataclass(frozen=True)
