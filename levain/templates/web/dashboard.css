@@ -1981,7 +1981,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-node-m, .tv-node-f { font-size: var(--fs-meta); color: var(--label); overflow-wrap: anywhere; }
 .tv-node-f { color: var(--meta); }
 .tv-lit { outline: 2px solid var(--accent); outline-offset: 2px; }
-@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec, .tv-node.waiting { animation: tv-breathe 3.2s ease-in-out infinite; } }
+@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec, .tv-node.waiting { animation: tv-breathe 3.2s ease-in-out 3; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
