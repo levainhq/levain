@@ -36,6 +36,8 @@ from levain.contracts import canon
 from levain.slot import Refused, write_all
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES
+# The §7.3 states END sends; records owns the names (the full set and its legal edges).
+from levain.slot.records import CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED
 from levain.slot.root_intent import (INTENT_PHASES, Cas, Fault, Phase, PhaseFailed, Plan, RootIntent,
                                      atomic_write, begin, fsync_dir, intent_path, read_root_intent,
                                      reconcile)
@@ -58,9 +60,6 @@ MANIFEST_FORMAT = "levain-end-manifest/1"
 META_FORMAT = "levain-retention-meta/1"
 OBJECT_FORMAT = "levain-retained-object/1"
 
-# The §7.3 states END sends (the full set and its legal edges are CONTROL's).
-REVOKED, FROZEN, DEAD = "REVOKED", "FROZEN", "DEAD"
-CREDENTIAL_PARKED, RETAINED, HELD = "CREDENTIAL_PARKED", "RETAINED", "HELD"
 
 #: The vendor credential files (plan §2e 11): (dir under the session tree, file name), parked in
 #: ``L/slots/e<n>/keep/`` under the same name.

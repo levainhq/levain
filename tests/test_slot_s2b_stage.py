@@ -3,6 +3,7 @@ thread (``thread_run_as``: the suite is not root, so the drop is a VM row) and t
 recorded no-op."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -316,11 +317,45 @@ def test_reader_runs_as_staging_uid(dirs):
         assert e.name == "staging-uid-root"
 
 
-def test_drop_refuses_root_target():
-    with pytest.raises(PermissionError):
-        st.drop_and_assert(0, 20)
-    with pytest.raises(PermissionError):
-        st.drop_and_assert(501, 0)
+def _root_calls(log):
+    """A wall.OsCalls that starts as root and records every act (the suite is not root)."""
+    from levain.slot import wall
+
+    ids = {"u": 0, "g": 0, "groups": [0]}
+
+    def rec(name, key=None):
+        def f(v):
+            log.append((name, v))
+            if ids["u"] != 0:
+                raise PermissionError(errno.EPERM, name)
+            if key:
+                ids[key] = v
+        return f
+
+    def regain(name):
+        def f(v):
+            log.append((name, v))
+            raise PermissionError(errno.EPERM, name)
+        return f
+
+    return wall.OsCalls(setgroups=rec("setgroups", "groups"), setgid=rec("setgid", "g"), setuid=rec("setuid", "u"),
+                        getuid=lambda: ids["u"], geteuid=lambda: ids["u"], getgid=lambda: ids["g"],
+                        getegid=lambda: ids["g"], getgroups=lambda: list(ids["groups"]),
+                        seteuid=regain("seteuid"), setegid=regain("setegid"),
+                        getrlimit=lambda w: log.append(("getrlimit", w)), setrlimit=lambda *a: log.append(a))
+
+
+def test_reader_drop_is_walls_with_exactly_the_peer_gid():
+    """S1 2e: the reader's drop is wall's one drop (no second copy), to the lease peer with groups {gid}, no
+    RLIMIT_NPROC; root ids are refused before any call."""
+    assert not hasattr(st, "drop_and_assert")
+    log = []
+    st.drop_to_lease_peer(501, 20, os_calls=_root_calls(log))
+    assert log == [("setgroups", [20]), ("setgid", 20), ("setuid", 501), ("seteuid", 0), ("setegid", 0)]
+    for uid, gid in ((0, 20), (501, 0)):
+        log = []
+        e = refused(st.drop_to_lease_peer, uid, gid, os_calls=_root_calls(log))
+        assert e.name == "drop-to-root" and log == []
 
 
 def test_reader_opens_nofollow_nonblock_noctty():

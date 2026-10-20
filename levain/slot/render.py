@@ -15,10 +15,10 @@ What it renders, per (host, vendor, class):
   output if the word appears anywhere in it.
 - the vendors' onboarding pre-seed under ``<S>/config/`` so the TUI starts with no dialog.
 
-Plus the three checks ``start`` runs before exec: the effective-config read-back (:func:`readback_refusals`,
-refused ``config-readback:<key>``), the repo-layer loosening check (:func:`repo_loosening_refusals`, host_guard's
-lists, refused ``loosening:<key>``) and the §5.5 discovery check (:func:`discovery_refusals`, refused
-``planted-discovery:<root>-<name>``).
+Plus the checks: the effective-config read-back (:func:`readback_refusals`, refused ``config-readback:<key>``) and
+the §5.5 discovery check (:func:`discovery_refusals`, refused ``planted-discovery:<root>-<name>``), which ``start``
+runs before exec, and the repo-layer loosening check (:func:`repo_loosening_refusals`, host_guard's lists, refused
+``loosening:<key>``), which the supervisor runs on the clone before it bundles it.
 
 Refusal names travel on the helper's stdout through ``runtime_grammar.refusal_line``, whose name alphabet is
 lowercase words joined by ``-`` with one ``:`` qualifier; a key or file name is folded into that alphabet by
@@ -36,7 +36,6 @@ from typing import Any, Iterable, Mapping
 from levain.contracts import ContractError
 from levain.contracts import canon
 from levain.firing.hands import HostOS
-from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE, _MISSING, _get
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -74,6 +73,18 @@ _HOOK_MATCHER_RE = re.compile(r"[\x20-\x7e]{0,256}", re.ASCII)
 _SBPL_SAFE_RE = re.compile(r"[A-Za-z0-9/._+-]+", re.ASCII)
 
 DRIVER_INPUT_DEPTH = 64   # §5.4: driver_input nests no deeper than 64
+
+#: The read-back's "no such key". This module runs as root under the host's own ``/usr/bin/python3`` (macOS: CLT
+#: 3.9), so it never imports ``levain.host_guard`` at module level (tomllib, 3.11+); :func:`_get` mirrors host_guard's.
+_MISSING = object()
+
+
+def _get(d: Any, keys: Iterable[str]) -> Any:
+    for k in keys:
+        if not isinstance(d, Mapping) or k not in d:
+            return _MISSING
+        d = d[k]
+    return d
 
 
 # --- wire names --------------------------------------------------------------------------------------------
@@ -638,7 +649,13 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
     in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin). A
     document that is not an object is refused ``repo-settings-malformed``. Hooks, permissions and every other key
-    launch (plan §2c 3: the repo's settings are its own)."""
+    launch (plan §2c 3: the repo's settings are its own).
+
+    Operator-side: the supervisor runs this on the clone it bundles, before the bundle is made (the slot clones
+    exactly that bundle), never the root helper. host_guard is imported here, not at module level, so the root path
+    that imports this module stays on the host's 3.9."""
+    from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE
+
     out: list[Refused] = []
     for path in sorted(docs):
         doc = docs[path]

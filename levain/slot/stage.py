@@ -1,7 +1,7 @@
 """Staging -> ``<S>/in/``: ONE byte-copy primitive, run as the lease peer (CONTRACT §5.4, V19, V24, V25).
 
 ``render`` (3) never chowns, opens or follows anything in staging. :func:`stage_copy` forks a READER that drops to
-alloc ``staging_uid`` (drop + assert as §8.2) before it opens anything, opens the one name under the staging dir with
+alloc ``staging_uid`` (wall's drop, §8.2) before it opens anything, opens the one name under the staging dir with
 ``O_NOFOLLOW|O_NONBLOCK|O_NOCTTY``, refuses a non-regular file (a FIFO cannot hang it), takes ``accepted_size`` from
 ``fstat`` and streams exactly that many bytes to root over a pipe, then reports whether one more byte was there.
 Root writes them into a FRESH file it creates (``O_CREAT|O_EXCL``), checks the fixed 16-byte git header and the
@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
-from levain.slot import Refused, write_all
+from levain.slot import Refused, wall, write_all
 from levain.slot.render import parse_driver_input
 
 BUNDLE_CAP = 8 * 1024 ** 3          # §11 V19
@@ -80,25 +80,12 @@ class StageResult:
 
 # --- the drop (§8.2) -------------------------------------------------------------------------------------------
 
-def drop_and_assert(uid: int, gid: int) -> None:
-    """§8.2's drop + assert, for a process that is root: groups, gid, uid (each call checked by its raising), then
-    real + effective uid/gid == the target, groups == exactly ``{gid}``, uid != 0, and ``seteuid(0)`` /
-    ``setegid(0)`` both FAIL. Any miss raises; the caller exits without reading."""
-    if uid == 0 or gid == 0:
-        raise PermissionError("refusing to drop to root")
-    os.setgroups([gid])
-    os.setgid(gid)
-    os.setuid(uid)
-    if (os.getuid(), os.geteuid(), os.getgid(), os.getegid()) != (uid, uid, gid, gid):
-        raise PermissionError("ids after drop")
-    if set(os.getgroups()) - {gid}:
-        raise PermissionError("groups after drop")
-    for regain in (os.seteuid, os.setegid):
-        try:
-            regain(0)
-        except PermissionError:
-            continue
-        raise PermissionError(f"{regain.__name__}(0) succeeded after the drop")
+def drop_to_lease_peer(uid: int, gid: int, *, os_calls: wall.OsCalls | None = None) -> None:
+    """§8.2's drop + assert to the lease peer (the operator or ``_levain_dispatch``, never a slot): wall's
+    :func:`levain.slot.wall.drop_and_assert`, the one drop, with the supplementary groups EXACTLY ``{gid}``.
+    Raises :class:`Refused` at the first step not proven; the caller exits without reading."""
+    # DECISION: no RLIMIT_NPROC (nproc=None): the reader never forks, so the limit would bound nothing.
+    wall.drop_and_assert(uid, gid, (gid,), nproc=None, os_calls=os_calls)
 
 
 def _close_fds_except(keep: Sequence[int]) -> None:
@@ -136,7 +123,7 @@ def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int) -> Read
         code = 0
         try:
             _close_fds_except([wfd])
-            drop_and_assert(uid, gid)
+            drop_to_lease_peer(uid, gid)
             fn(wfd)
         except BaseException:   # noqa: BLE001 - the child never returns into the parent's stack
             code = 70
@@ -454,6 +441,6 @@ def make_bundle(repo: str | os.PathLike[str], branch: str, out: str | os.PathLik
 
 __all__ = [
     "BUNDLE_CAP", "STAGE_DEADLINE_S", "DRIVER_INPUT_CAP", "BUNDLE_HEADERS", "StageResult", "Reader", "RunAs",
-    "drop_and_assert", "fork_run_as", "thread_run_as", "reader", "stage_copy", "stage_bundle",
+    "drop_to_lease_peer", "fork_run_as", "thread_run_as", "reader", "stage_copy", "stage_bundle",
     "stage_driver_input", "make_bundle",
 ]
