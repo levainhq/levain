@@ -68,7 +68,7 @@ def handle_get(
     server's write capability, published in the manifest."""
     parts = urlsplit(raw_path)
     path = parts.path
-    qs = parse_qs(parts.query)
+    qs = parse_qs(parts.query, keep_blank_values=True)    # a blank value is still SENT (a blank ``at`` is a refusal, not a live read)
     cred = credential if credential is not None else credential_for(token, expected_token)
     base_headers = [("Vary", VARY)]
 
@@ -89,7 +89,7 @@ def handle_get(
     if path == MANIFEST_PATH:
         return ok(cockpit.manifest(cred, transport=transport), ["manifest", cred["class"]])
     panel_id = unquote(path[len(PANEL_PREFIX): -len(PANEL_SUFFIX)])
-    profile = (qs.get("profile") or ["full"])[0]
+    profile = (qs.get("profile") or [""])[0] or "full"
     if profile not in PROFILES:
         return jerr(400, "bad_request", f"profile must be one of {list(PROFILES)}")
     q = (qs.get("q") or [""])[0] or None      # the decoded value as sent: the kernel validates it, nothing trims it first
@@ -103,7 +103,11 @@ def handle_get(
         return jerr(400, "bad_request", "limit must be an integer")
     # ``at``: the panel at a past instant (F12 Replay), on this same route and so under the same read gate; a panel
     # without a past read, or an instant outside the window, is a 400 (never clamped)
-    at = (qs.get("at") or [""])[0] or None
+    at = (qs.get("at") or [None])[0]
+    if "at" in qs and (len(qs["at"]) != 1 or not at):
+        return jerr(400, "bad_request", "at is one ISO-8601 instant, e.g. 2026-10-20T11:30:00Z")
+    if at is not None and any(k in qs for k in ("q", "row", "limit")):
+        return jerr(400, "bad_request", "at is a read of the whole panel: it takes no q, row or limit")
     try:
         panel = cockpit.panel(panel_id, profile=profile, q=q, row=row, credential_class=cred["class"], limit=limit,
                               **({"at": at} if at is not None else {}))
