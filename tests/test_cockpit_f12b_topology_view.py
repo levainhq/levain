@@ -171,7 +171,7 @@ def test_three_columns_records_left_tasks_centre_outcomes_right_on_the_tasks_own
              "waiting_open: !!%s.querySelector('.tv-task.waiting.tv-open'), stuck_open: !!%s.querySelector('.tv-task.stuck.tv-open')})") % ((TV,) * 9)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])
-    assert got["order"] == ["t-sign", "t-run", "t-stuck", "t-fail", "t-done", "unattached"], got      # waiting, running, stuck, (open), then what ended; unattached last; the consent is no centre card
+    assert got["order"] == ["t-sign", "t-fail", "t-stuck", "t-run", "t-done", "unattached"], got      # loudest first: waiting, failed, stuck, running, (open), done; unattached last; the consent is no centre card
     assert [r[0] for r in got["recs"]] == ["t-wait", "t-sign"], got                                    # the consent and the contract waiting on a signature
     assert all(r[2] <= got["task_left"] for r in got["recs"]), got                                     # records sit left of the tasks
     assert got["outs"] and all(o[1] > got["task_left"] and o[2] for o in got["outs"]), got              # outcomes sit right of them, on the task's own row

@@ -85,4 +85,4 @@ def test_stuck_stays_a_live_worker_gone_silent_and_open_loops_sit_after_it(tmp_p
     probe = "JSON.stringify([...%s.querySelectorAll('.tv-task')].map(t => t.dataset.task))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     ids = json.loads(out[-1])
-    assert ids.index("t-stuck") < ids.index("spore:a") < ids.index("t-fail"), ids
+    assert ids.index("t-fail") < ids.index("t-stuck") < ids.index("spore:a") < ids.index("t-done"), ids   # loudest first: failed and stuck before an open loop

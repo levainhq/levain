@@ -25,7 +25,7 @@
   const LENS_KEY = "levain_cockpit_topology_lens";
   const WIDE_PX = 1440;                    // the width from which the topology is the default view on Build
   // the order the Work lens lists its groups in (K10: what needs you, what is moving, what went quiet, the open loops, then what ended)
-  const TASK_ORDER = ["waiting", "running", "stuck", "open", "failed", "done"];
+  const TASK_ORDER = ["waiting", "failed", "stuck", "running", "open", "done"];
   const HEAT_ORDER = ["hot", "warm", "cold", "parked"];      // an open loop's heat, hottest first; none last
   const TASK_WORDS = {
     waiting: ["Waiting on you", "a pending record you can answer"],
