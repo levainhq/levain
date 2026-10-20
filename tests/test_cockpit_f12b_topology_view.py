@@ -91,7 +91,9 @@ def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_
     assert by["spore"][0] == "open" and by["spore"][2] == "cost not tracked" and by["spore"][3] == [], got   # a spore carries no session: open, never stuck
     assert any(t[0] != "waiting" and t[1] == "unattached" for t in got["tasks"]), got                              # the codex session: no task, none guessed
     strip = dict(s.split("=", 1) for s in got["strip"])
-    assert strip["conflicts"] == "conflicts not tracked" and strip["tokens"] == "tokens today not tracked", got
+    # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
+    # says 0; "not tracked" is the null it sends only when live nodes exist and none has a log (test_conflicts_are_null_when_no_live_node_has_a_log)
+    assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "tokens today not tracked", got
     assert list(strip) == ["tasks", "waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
@@ -140,7 +142,10 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
     got = json.loads(out[-1])
     assert got["tv"] is False and got["switch"] == 0, got
     assert "No agent session yet: start Claude Code or Codex in a workspace." in got["text"], got
-    assert got["quiet"] is True, got            # a source the provider could not read is said beside the empty line, not instead of it
+    # K10 S5 item 1 (0c45fe2d): a default install now reads the default dispatch store, so nothing is unreadable here and no quiet line is
+    # drawn (absence of a note is honest only because every source read); a source that could not be read is said beside the empty
+    # line, not instead of it (held by test_what_the_provider_could_not_read_is_one_quiet_line_never_hidden)
+    assert got["quiet"] is False, got
 
 
 @needs_browser
