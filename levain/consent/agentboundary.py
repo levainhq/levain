@@ -91,10 +91,27 @@ a timestamp that does not parse, an empty required string, a score that is not a
 The names bridge (``names=``, :func:`load_names`). Levain names its own things (``levain.consent.<tier>``,
 ``ssh-key:<fp>``, ``claude-code.<tool>``, the working directory); an operator's verifier knows its organisation's
 names. A names file (``{"format": "levain-agentboundary-names/1", "rules": [{"when": {...}, "set": {...}}]}``) maps
-one onto the other inside the export: ``when`` tests Levain's own values (every key equal), ``set`` writes names, the
-first matching rule wins per field. It may write NAMES only, never FACTS (the allowlist at :data:`_NAME_FIELDS`); a
-file that tries is refused whole when loaded. The rename lands before provenance, score and hash, each renamed path is
-``inferred``, and ``execution.result_ref`` still names Levain's own leaf.
+one onto the other inside the export: ``when`` tests Levain's own names (every key equal), ``set`` writes names, the
+first matching rule wins per field. What it can and cannot do, in plain words:
+
+  - facts are never written. What happened, when, by what kind of actor, under which decision, with what evidence
+    (the allowlist at :data:`_NAME_FIELDS` is everything else) is refused at load, and ``when`` may test only names
+    (never a receipt id, a time, ``approval.context`` or a provenance entry), so no rule can single one record out;
+  - an AUTHORITY name (the approver, the policy name and version, the tool's capability, the resource) is what a
+    verifier authorises by, so it can only be mapped ONE TO ONE from Levain's own value: a rule that sets one must pin
+    that same field to Levain's exact value in ``when`` (the policy version: the policy name and version both), and
+    across the export each of Levain's values maps to exactly one name and no two to the same one. No rule may be
+    keyed by Levain's words for a call it never decided (the agent's own dialog, ``native-dialog:operator``; its
+    standing permissions, ``<framework>.native-permissions``), so neither ever becomes an operator's approver or
+    policy. A call the agent's dialog answered still carries its tier's policy name, which a policy map renames like
+    any other, while its approver stays ``native-dialog:operator`` and its context ``signed: false``;
+  - every renamed path is ``synthesized`` (the spec: produced at translation time), so a rename never raises
+    ``completeness_score``; a name that hides a character (:mod:`levain.unshowable`) is refused at load;
+  - the operator's export vouches for the mapping. Levain proves only that its own value was there. A renamed path is
+    ``synthesized``, as is anything Levain had no source for, so the receipt alone does not say a names file was
+    applied; the export's report carries the file's sha256 and how many receipts it renamed.
+
+The rename lands before provenance, score and hash, and ``execution.result_ref`` still names Levain's own leaf.
 
 Known edges (each stated, none built against):
   - a kept refused answer is covered by no signed head (``refused_answers`` is outside the Q11 log): a raw writer of
@@ -142,8 +159,8 @@ from typing import Any, NamedTuple
 from levain.cockpit.consent import ConsentError, parse_stamp, record_sha256
 from levain.cockpit.consent import encode as jcs_encode
 
-__all__ = ["AB_VERSION", "Export", "ExportError", "NAMES_FORMAT", "Names", "Report", "SETTLE", "export", "load_names",
-           "policy_identity", "receipt_hash"]
+__all__ = ["AB_VERSION", "Export", "ExportError", "NAMES_FORMAT", "NAMES_MAX_BYTES", "Names", "Report", "SETTLE",
+           "export", "load_names", "policy_identity", "receipt_hash"]
 
 AB_VERSION = "agentboundary/v0.2-alpha"
 # fixed, so a re-export reproduces every receipt_id; it is uuid5(NAMESPACE_URL, _NS_NAME), written out so an edit to
@@ -374,10 +391,30 @@ _NAME_FIELDS: dict[str, frozenset[str] | None] = {
     "tool.capability": None, "target.system": None, "target.environment": frozenset({"prod", "staging", "dev"}),
     "target.resource_id": None, "policy.name": None, "policy.version": None, "approval.approver.id": None,
     "approval.approver.display_name": None}
-# what a rule's `when` may test: a field of the receipt as Levain maps it, before the rename; provenance, the score,
-# the hash and prior_receipt are computed after the rename, so a test of them could never match and is refused
-_WHEN_FIELDS = frozenset(("version",) + _REQUIRED_PATHS + tuple(
-    p for p in _CONDITIONAL_PATHS if not p.startswith("prior_receipt.")))
+# what a rule's `when` may test: Levain's own NAMES only (agent.framework and tool.name among them, the usual
+# selectors). Never a fact: a test of receipt_id, issued_at or approval.context would single one record out and
+# rename it alone
+_WHEN_FIELDS = frozenset(_NAME_FIELDS)
+# ⛔ AUTHORITY names: what a verifier authorises by (the approver list, the policy store, the capability its policy
+# rules match, the resource). Each maps one to one from Levain's own value: a rule that sets one must pin, in `when`,
+# the fields listed here to Levain's exact values, and the export refuses a mapping that joins or splits values
+_AUTHORITY_PINS: dict[str, tuple[str, ...]] = {
+    "approval.approver.id": ("approval.approver.id",), "policy.name": ("policy.name",),
+    "policy.version": ("policy.name", "policy.version"), "tool.capability": ("tool.capability",),
+    "target.resource_id": ("target.resource_id",)}
+# the identity each authority field is judged one to one by, across the export (a version means nothing without its
+# policy's name)
+_AUTHORITY_KEYS: dict[str, tuple[str, ...]] = {
+    "approval.approver.id": ("approval.approver.id",), "policy": ("policy.name", "policy.version"),
+    "policy.name": ("policy.name",), "tool.capability": ("tool.capability",),
+    "target.resource_id": ("target.resource_id",)}
+# the names Levain writes for a call it never decided: the agent's own dialog answered it (`ran`), or its own standing
+# permission ran it (`ran_unasked`). A rule keyed by either would write a decision where there was none, so none may be
+_NATIVE_APPROVER = "native-dialog:operator"
+_NATIVE_POLICY_SUFFIX = ".native-permissions"
+# display names are prose (a presentation selector that changes its base may show); every other name is an identifier
+_DISPLAY_FIELDS = frozenset({"actor.display_name", "approval.approver.display_name"})
+NAMES_MAX_BYTES = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -408,14 +445,25 @@ def _name_string(value: Any, where: str) -> str:
 
 
 def load_names(data: bytes) -> Names:
-    """Parse and validate a names file's bytes. Raises :class:`ExportError`, naming the field, for a file that is not
-    well-formed UTF-8 JSON (a key repeated in one object included), has another ``format``, holds a key the format
-    does not define, tests a field in ``when`` that is not one of the receipt's, or SETS a field that is not a name
-    (the allowlist above: ``policy.decision``, ``execution.status``, ``actor.type`` or any time is refused)."""
+    """Parse and validate a names file's bytes. Raises :class:`ExportError`, naming the field and the rule, for a file
+    that is larger than :data:`NAMES_MAX_BYTES` or is not well-formed UTF-8 JSON (a key repeated in one object, or
+    nesting too deep to parse, included), has another ``format``, holds a key the format does not define, tests in
+    ``when`` a field that is not a name, SETS a field that is not a name (the allowlist above: ``policy.decision``,
+    ``execution.status``, ``actor.type`` or any time is refused), sets an authority name without pinning it one to one
+    (:data:`_AUTHORITY_PINS`), maps one of Levain's authority values to two names or two to one, keys a rule by a
+    call Levain never decided, or sets a name that hides a character (:mod:`levain.unshowable`)."""
     import hashlib
+
+    from levain.unshowable import describe
+    if not isinstance(data, (bytes, bytearray)):
+        raise ExportError("names file: expected the file's bytes")
+    if len(data) > NAMES_MAX_BYTES:
+        raise ExportError(f"names file: {len(data)} bytes, larger than the {NAMES_MAX_BYTES}-byte limit")
     try:
-        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicates)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        doc = json.loads(bytes(data).decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except RecursionError:
+        raise ExportError("names file: not well-formed UTF-8 JSON: nested too deep to parse") from None
+    except ValueError as exc:                     # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise ExportError(f"names file: not well-formed UTF-8 JSON: {exc}") from None
     if not isinstance(doc, dict):
         raise ExportError("names file: the top level must be an object")
@@ -426,6 +474,9 @@ def load_names(data: bytes) -> Names:
     if not isinstance(doc["rules"], list):
         raise ExportError("names file: rules must be a list")
     rules = []
+    # per authority field: Levain's pinned value(s) -> the name, and the name -> the rule that first claimed it
+    forward: dict[str, dict[tuple[str, ...], tuple[str, int]]] = {f: {} for f in _AUTHORITY_PINS}
+    backward: dict[str, dict[str, tuple[tuple[str, ...], int]]] = {f: {} for f in _AUTHORITY_PINS}
     for i, rule in enumerate(doc["rules"]):
         if not isinstance(rule, dict) or set(rule) != {"when", "set"}:
             raise ExportError(f"names file: rule {i} must be an object with exactly `when` and `set`")
@@ -434,17 +485,51 @@ def load_names(data: bytes) -> Names:
             raise ExportError(f"names file: rule {i}: `when` must be an object and `set` a non-empty object")
         for field in when:
             if field not in _WHEN_FIELDS:
-                raise ExportError(f"names file: rule {i}: `when` tests {field!r}, not a field of Levain's receipt")
+                raise ExportError(f"names file: rule {i}: `when` tests {field!r}, which is not a name; `when` may "
+                                  f"test only Levain's names ({', '.join(_NAME_FIELDS)}), never a fact")
         for field in sets:
             if field not in _NAME_FIELDS:
                 raise ExportError(f"names file: rule {i}: `set` writes {field!r}, which is not a name a names file "
                                   f"may set (only {', '.join(_NAME_FIELDS)})")
         w = tuple((f, _name_string(v, f"rule {i} when {f}")) for f, v in when.items())
         s = tuple((f, _name_string(v, f"rule {i} set {f}")) for f, v in sets.items())
+        pinned = dict(w)
+        if pinned.get("approval.approver.id") == _NATIVE_APPROVER:
+            raise ExportError(f"names file: rule {i}: `when` pins approval.approver.id {_NATIVE_APPROVER!r}, Levain's "
+                              "word for a call the agent's own dialog answered; Levain decided nothing there, so no "
+                              "rule may be keyed by it")
+        if pinned.get("policy.name", "").endswith(_NATIVE_POLICY_SUFFIX):
+            raise ExportError(f"names file: rule {i}: `when` pins policy.name {pinned['policy.name']!r}, Levain's "
+                              "word for a call the agent's own standing permission ran; Levain decided nothing there, "
+                              "so no rule may be keyed by it")
         for f, v in s:
             allowed = _NAME_FIELDS[f]
             if allowed is not None and v not in allowed:
                 raise ExportError(f"names file: rule {i}: set {f} must be one of {sorted(allowed)}, not {v!r}")
+            hides = (describe(v, allow="") if f in _DISPLAY_FIELDS
+                     else describe(v, allow="", selectors=False))
+            if hides is not None:
+                raise ExportError(f"names file: rule {i}: set {f} holds a character a reader cannot see: {hides}")
+            pins = _AUTHORITY_PINS.get(f)
+            if pins is None:
+                continue
+            missing = [p for p in pins if p not in pinned]
+            if missing:
+                raise ExportError(
+                    f"names file: rule {i}: sets the authority name {f} but its `when` does not pin "
+                    f"{' and '.join(missing)} to Levain's value; an authority name maps only one to one, from the "
+                    f"exact value Levain wrote")
+            key = tuple(pinned[p] for p in pins)
+            seen = forward[f].get(key)
+            if seen is not None and seen[0] != v:
+                raise ExportError(f"names file: rule {i}: maps Levain's {f} {key[-1]!r} to {v!r}, but rule {seen[1]} "
+                                  f"maps it to {seen[0]!r}; an authority name maps one to one")
+            forward[f].setdefault(key, (v, i))
+            other = backward[f].get(v)
+            if other is not None and other[0] != key and f != "policy.version":   # a version is judged with its name
+                raise ExportError(f"names file: rule {i}: maps Levain's {f} {key[-1]!r} to {v!r}, which rule "
+                                  f"{other[1]} already maps {other[0][-1]!r} to; an authority name maps one to one")
+            backward[f].setdefault(v, (key, i))
         rules.append((w, s))
     return Names(rules=tuple(rules), sha256=hashlib.sha256(data).hexdigest())
 
@@ -476,6 +561,26 @@ def _rename(receipt: dict[str, Any], names: Names) -> list[str]:
         block[leaf] = v
         changed.append(f)
     return changed
+
+
+def _one_to_one(key: str, levains: tuple[Any, ...], final: tuple[Any, ...],
+                seen: dict[str, tuple[dict[tuple[Any, ...], tuple[Any, ...]], dict[tuple[Any, ...], tuple[Any, ...]]]]
+                ) -> None:
+    """Across one export, each of Levain's values of the authority identity ``key`` (:data:`_AUTHORITY_KEYS`) becomes
+    exactly one value, and no two become the same one; an unrenamed value counts as mapping to itself. A names file
+    whose rules split one of Levain's values (a rule's other `when` keys renaming it for some calls only) or join two
+    (a name that is also another of Levain's own) raises :class:`ExportError`. Absent (no approval block): skipped."""
+    if any(v is None for v in levains):
+        return
+    forward, backward = seen.setdefault(key, ({}, {}))
+    was = forward.setdefault(levains, final)
+    if was != final:
+        raise ExportError(f"names file: Levain's {key} {levains[-1]!r} becomes both {was[-1]!r} and {final[-1]!r} in "
+                          f"one export; an authority name maps one to one")
+    came = backward.setdefault(final, levains)
+    if came != levains:
+        raise ExportError(f"names file: Levain's {key} {came[-1]!r} and {levains[-1]!r} both become {final[-1]!r} in "
+                          f"one export; an authority name maps one to one")
 
 
 def _open_ro(path: Path, what: str) -> sqlite3.Connection:
@@ -785,7 +890,7 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
             prov["execution.error_code"] = "inferred"
         if kind == "ran":
             _stamp(row.received, "received time", seq)
-            approval = {"approver": {"id": "native-dialog:operator", "role": "operator"}, "approved_at": row.received,
+            approval = {"approver": {"id": _NATIVE_APPROVER, "role": "operator"}, "approved_at": row.received,
                         "context": json.dumps({"queue": queue_id, "request_id": row.request_id, "via": "native-dialog",
                                                "signed": False}, sort_keys=True, separators=(",", ":"))}
             prov.update({"approval.approver.id": "inferred", "approval.approver.role": "synthesized",
@@ -793,7 +898,7 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
             decision = "require-approval"
             counters["dialog_ran"] += 1
         else:
-            name, version = f"{framework}.native-permissions", _UNKNOWN
+            name, version = f"{framework}{_NATIVE_POLICY_SUFFIX}", _UNKNOWN
             decision = "allow"
             prov["policy.name"] = "inferred"
             counters["dialog_ran_unasked"] += 1
@@ -836,8 +941,8 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
     clock by more than a few seconds, or the export is refused; the same queue and ``now`` yield the same receipts,
     and any later ``now`` yields them as a prefix. ``names`` (:func:`load_names`) renames each receipt's names to the
     operator's before its provenance, score and hash are computed, so the hash and the chain cover the renamed
-    receipt; a renamed path's provenance is ``inferred`` (the operator declared it, Levain did not observe it).
-    Raises :class:`ExportError` when the store is not a readable current-format queue or a row cannot be made into a
+    receipt; a renamed path's provenance is ``synthesized`` (produced at translation time from the operator's file),
+    and an authority name that does not map one to one across the export raises :class:`ExportError`. Raises :class:`ExportError` when the store is not a readable current-format queue or a row cannot be made into a
     receipt."""
     if names is not None and not isinstance(names, Names):
         raise ExportError("names must be a Names from load_names")
@@ -857,6 +962,7 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
     by_state: dict[str, int] = {}
     receipts: list[dict[str, Any]] = []
     pending = normalised = held = renamed = 0
+    authority: dict[str, Any] = {}                 # the one-to-one check across this export (_one_to_one)
     prior: dict[str, str] | None = None
     stopped = False
     for row in rows:
@@ -894,10 +1000,16 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
             normalised += 1
             receipt = clean
         if names is not None:
+            levains = {k: tuple(_get(receipt, p) for p in paths) for k, paths in _AUTHORITY_KEYS.items()}
             changed = _rename(receipt, names)
+            for k, paths in _AUTHORITY_KEYS.items():
+                _one_to_one(k, levains[k], tuple(_get(receipt, p) for p in paths), authority)
             if changed:
                 renamed += 1
-                prov.update({p: "inferred" for p in changed})
+                # produced at translation time from the operator's file: the spec's `synthesized`, which weighs 0, so
+                # a rename never raises the score (a changed path weighs no more than before, a new one adds a 0 to
+                # the mean)
+                prov.update({p: "synthesized" for p in changed})
         if prior is not None:
             receipt["prior_receipt"] = dict(prior)
             prov.update({"prior_receipt.receipt_id": "inferred", "prior_receipt.receipt_hash": "inferred"})

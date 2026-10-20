@@ -1668,10 +1668,14 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
                           help="Write the JSON here instead of stdout (whole or not at all where the filesystem has hard "
                                "links); refuses to overwrite a file.")
     export_p.add_argument("--names", type=Path, default=None, metavar="FILE",
-                          help="A names file (JSON, format levain-agentboundary-names/1) that maps Levain's names "
-                               "(policy, approver key, agent, tool, target) to your organisation's. Names only: a "
-                               "file that sets a decision, a status, an actor type or a time is refused and nothing "
-                               "is exported. The hash covers the renamed receipt.")
+                          help="A names file (JSON, format levain-agentboundary-names/1, at most 1 MiB) that maps "
+                               "Levain's names (policy, approver key, agent, tool, target) to your organisation's. "
+                               "Facts are never written: a file that sets a decision, a status, an actor type or a "
+                               "time, or tests anything but a name, is refused and nothing is exported. An authority "
+                               "name (approver, policy, capability, resource) can only be mapped one to one from "
+                               "Levain's own exact value, never from a call Levain did not decide, and each renamed "
+                               "field is marked synthesized: your export vouches for that mapping. The hash covers "
+                               "the renamed receipt.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
@@ -1729,14 +1733,15 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
     import sqlite3
     import tempfile
 
-    from levain.consent.agentboundary import ExportError, export, load_names
+    from levain.consent.agentboundary import NAMES_MAX_BYTES, ExportError, export, load_names
 
     try:
         names = None
         if args.names is not None:
             if args.export_format != "agentboundary":
                 raise ExportError(f"--names applies to --format agentboundary only, not {args.export_format}")
-            names = load_names(args.names.expanduser().read_bytes())
+            with open(args.names.expanduser(), "rb") as fh:     # read one byte past the cap so load_names refuses it
+                names = load_names(fh.read(NAMES_MAX_BYTES + 1))
         qdir = _consent_queue_dir(args)
         result = export(qdir, names=names)
         # UTF-8 bytes whatever the locale or PYTHONIOENCODING says: the file and stdout carry the same JSON

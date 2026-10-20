@@ -304,12 +304,15 @@ class LevainImplementation(Implementation):
             self.trace[f"{self._n:03d}"] = note
         names = None
         if self.names_file:
-            # NAMES: the operator's names file, built from the scenario's names and keyed by LEVAIN's own values (the
-            # receipt's names before any rename), handed to the exporter; no name is rewritten after the export
-            stranger = keys["stranger"] if note.startswith("approval refused (approver-not-authorized") else None
+            # NAMES: the operator's names file, built from the scenario's names and keyed by LEVAIN's own values (read
+            # off Levain's own export, as an operator would), handed to the exporter; no name is rewritten after the
+            # export. Each authority name is pinned one to one; the approver map names the one key that signed
+            stranger = note.startswith("approval refused (approver-not-authorized")
+            levains = ab.export(queue.directory).receipts
+            assert len(levains) == 1, f"expected one terminal receipt, got {len(levains)}"
             names = ab.load_names(json.dumps(_names_file(
-                action, policy, agent, tool, cwd, approver_id, [k for k in (akey, stranger) if k is not None]),
-                ensure_ascii=False).encode("utf-8"))
+                action, policy, tool, levains[0], approver_id,
+                keys["stranger"] if stranger else akey), ensure_ascii=False).encode("utf-8"))
         exported = ab.export(queue.directory, names=names)
         assert len(exported.receipts) == 1, f"expected one terminal receipt, got {len(exported.receipts)}"
         receipt = copy.deepcopy(exported.receipts[0])
@@ -348,32 +351,35 @@ class LevainImplementation(Implementation):
         return RuntimeOutcome(decision=decision, receipt=receipt, arguments=arguments)
 
 
-def _names_file(action: dict[str, Any], policy: dict[str, Any], agent: str, tool: str, cwd: str,
-                approver_id: str | None, approver_keys: list[_Key]) -> dict[str, Any]:
+def _names_file(action: dict[str, Any], policy: dict[str, Any], tool: str, levain: dict[str, Any],
+                approver_id: str | None, approver_key: _Key | None) -> dict[str, Any]:
     """The names file an operator running the scenario's world would write: each rule's ``when`` is a value LEVAIN
-    writes (``levain.consent.agentboundary._map``: framework ``claude-code`` / ``codex``, capability
-    ``<framework>.<tool lowercased>``, actor ``agent:<agent>:session/suite``, resource id the cwd, approver
-    ``ssh-key:<fp>``), each ``set`` the scenario's name for it. Names only: ``actor.type`` is a fact and is never set."""
-    framework = ab._FRAMEWORKS.get(agent, agent.replace("_", "-"))
-
+    wrote (read off ``levain``, Levain's own receipt of the request: its policy name and version, actor id,
+    framework, tool name, capability and working directory, and the signer ``ssh-key:<fp>``), each ``set`` the
+    scenario's name for it. Names only: ``actor.type`` is a fact and is never set. Every authority name (policy name
+    and version, capability, resource id, approver id) is set only by a rule whose ``when`` pins that same field to
+    Levain's value, so each maps one to one; the approver map names the one key that signed (the enrolled approver's,
+    or for an unauthorised approver the stranger's whose refused answer the queue kept), never a second key."""
     def strs(block: dict[str, Any], fields: tuple[str, ...], prefix: str) -> dict[str, str]:
         return {f"{prefix}.{f}": block[f] for f in fields if isinstance(block.get(f), str) and block[f]}
 
     pname, pver = ((policy["name"], str(policy["version"])) if policy is not IMPLICIT_DENY_POLICY
                    else ("implicit.deny", "0"))
+    scen_tool, scen_target = action.get("tool", {}), action.get("target", {})
     rules: list[dict[str, Any]] = [
-        {"when": {"tool.capability": f"{framework}.{tool.lower()}"},
+        {"when": {"policy.name": levain["policy"]["name"], "policy.version": levain["policy"]["version"]},
          "set": {"policy.name": pname, "policy.version": pver}},
-        {"when": {"actor.id": f"agent:{agent}:session/suite"},
+        {"when": {"actor.id": levain["actor"]["id"]},
          "set": strs(action.get("actor", {}), ("id", "display_name"), "actor")},
-        {"when": {"agent.framework": framework},
+        {"when": {"agent.framework": levain["agent"]["framework"]},
          "set": strs(action.get("agent", {}), ("framework", "framework_version", "model", "model_version"), "agent")},
-        {"when": {"tool.name": tool}, "set": strs(action.get("tool", {}), ("name", "version", "capability"), "tool")},
-        {"when": {"target.resource_id": cwd},
-         "set": strs(action.get("target", {}), ("system", "environment", "resource_id"), "target")}]
-    if approver_id:
-        rules += [{"when": {"approval.approver.id": f"ssh-key:{k.fp}"}, "set": {"approval.approver.id": approver_id}}
-                  for k in approver_keys]
+        {"when": {"tool.name": tool}, "set": strs(scen_tool, ("name", "version"), "tool")},
+        {"when": {"tool.capability": levain["tool"]["capability"]}, "set": strs(scen_tool, ("capability",), "tool")},
+        {"when": {"target.resource_id": levain["target"]["resource_id"]},
+         "set": strs(scen_target, ("system", "environment", "resource_id"), "target")}]
+    if approver_id and approver_key is not None:
+        rules.append({"when": {"approval.approver.id": f"ssh-key:{approver_key.fp}"},
+                      "set": {"approval.approver.id": approver_id}})
     return {"format": ab.NAMES_FORMAT, "rules": [r for r in rules if r["set"]]}
 
 
@@ -460,12 +466,16 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace, 
            f"- **BOUND (informational): {cnt(bound)} / {n}** (42 / 54 before S-R2). FALLBACK plus a rewrite of actor, agent, tool, target, "
            f"policy name/version and approver id to the scenario's names. Not a conformance claim: it shows how much "
            f"of the result is naming rather than structure.",
-           f"- **NAMES (the product path): {cnt(names)} / {n}**. STRICT (an `allow` is a standing grant) with an "
-           f"operator's names file handed to the exporter (`export(names=...)`, the CLI's `--names`): each rule keyed "
-           f"by a value Levain writes (its capability, actor id, framework, tool name, cwd, approver `ssh-key:<fp>`) "
-           f"sets the scenario's name for it, and the exporter renames before provenance, score and hash. NO name is "
-           f"rewritten after the export (only O1-O3 below, as in STRICT). A names file may set names only, never "
-           f"facts, so `actor.type` stays `agent`.", "",
+           f"- **NAMES (the product path): {cnt(names)} / {n}** (42 / 54 before names fix r1, which pinned every "
+           f"authority name one to one and made renamed paths `synthesized`; the same scenarios pass). STRICT (an "
+           f"`allow` is a standing grant) with an operator's names file handed to the exporter (`export(names=...)`, "
+           f"the CLI's `--names`): each rule keyed by a value Levain wrote (read off Levain's own receipt: its policy "
+           f"name and version, actor id, framework, tool name, capability, cwd, the signer's `ssh-key:<fp>`) sets the "
+           f"scenario's name for it, and the exporter renames before provenance, score and hash. Every authority name "
+           f"(policy name and version, capability, resource id, approver id) is set only by a rule that pins that same "
+           f"field to Levain's value, and the approver map names only the key that signed. NO name is rewritten after "
+           f"the export (only O1-O3 below, as in STRICT). A names file may set names only, never facts, so "
+           f"`actor.type` stays `agent`.", "",
            "## NAMES: what still fails, by reason", "",
            "Every NAMES failure, with the reviewed reason. None is naming: the names file closed every naming "
            "failure STRICT had.", ""]
