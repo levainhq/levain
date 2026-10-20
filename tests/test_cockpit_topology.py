@@ -1,15 +1,15 @@
 """F12a: the ``topology`` kind's contract and the Levain provider behind it (F12_SPEC, with the 14a amendment).
 
-The hostile-repository test is the one the trust boundary needs: "Lost if closed" runs ``git status`` in a working tree
-an agent writes, and a status read hashes files, which runs a filter driver's ``clean`` from that repository's config.
-It first proves the planted programs really run under a plain git (the control), so the second half cannot pass by
-planting something git would never have run."""
+The hostile-repository tests are the ones the trust boundary needs: "Lost if closed" runs ``git status`` in a working
+tree an agent writes, and a status read hashes files, which runs a filter driver's ``clean`` from whatever config git
+reads. The read runs on a private git directory, so the repository's own config is never one of them. Each test first
+proves the planted programs really run under a plain git (the control), so the second half cannot pass by planting
+something git would never have run; the race test runs the agent's config swap against the read."""
 from __future__ import annotations
 
 import copy
 import json
 import os
-import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -429,7 +429,7 @@ def _plant(repo: Path, bin_dir: Path, sentinels: Path) -> None:
     _commit(repo, "tracked", {"a.txt": "same\n", ".gitattributes": "* filter=evil\n"})
     with open(repo / ".git" / "config", "a") as fh:
         fh.write(f"[filter \"evil\"]\n\tclean = {bin_dir / 'filter'}\n\tsmudge = {bin_dir / 'filter'}\n"
-                 f"[core]\n\tfsmonitor = {bin_dir / 'fsmonitor'}\n\thooksPath = {hooks}\n")
+                 f"\trequired = true\n[core]\n\tfsmonitor = {bin_dir / 'fsmonitor'}\n\thooksPath = {hooks}\n")
 
 
 def _touch_tracked(repo: Path) -> None:
@@ -453,41 +453,36 @@ def test_a_hostile_repo_runs_nothing_through_lost_if_closed(tmp_path, capsys):
         print(f"\n[topology-hostile] control (plain git status) fired: {fired}")
     if "filter" not in fired:
         pytest.fail(f"CONTROL FAILED: the filter driver did not fire under a plain git status ({fired}), so the "
-                    "refusal proves nothing")
+                    "read below proves nothing")
     for p in sentinels.iterdir():
         p.unlink()
-    # (b) the topology read: the filter driver refuses the tree, named, nothing runs, the counts are unknown
+    # (b) the topology read, the driver (required) still in the repository's config: the tree reads on a private git
+    # directory, nothing runs, and the counts are true (the touched file's content is unchanged: not dirty)
     _touch_tracked(repo)
     (repo / "new.txt").write_text("x\n")
     root = tmp_path / "inst"
     _session(root, "hs", str(repo), timedelta(minutes=2))
     read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
                                 hub_label=lambda c: "x", home=str(tmp_path))
+    idx = repo / ".git" / "index"
+    before = (idx.read_bytes(), idx.stat().st_mtime_ns)
     v = read(ReadContext(datetime.now(timezone.utc))).value
-    row = _lost(v, _stem("claude_code", "hs"))
-    with capsys.disabled():
-        print(f"[topology-hostile] with its filter driver: errors {[e for e in v['errors'] if e.startswith('hostile')]}; "
-              f"lost {row}; sentinels: {sorted(p.name for p in sentinels.iterdir())}")
-    assert "hostile: its config defines a filter driver (a program a status read would run), not read" in v["errors"]
-    assert row["dirty"] is None and row["unpushed"] is None
-    assert not list(sentinels.iterdir())
-    # (c) the driver taken out of the config (the attributes still name it), fsmonitor and hooks still planted:
-    # the status reads, and no sentinel
-    cfg = repo / ".git" / "config"
-    text = cfg.read_text()
-    start = text.index('[filter "evil"]')
-    end = text.index("[core]", start)
-    cfg.write_text(text[:start] + text[end:])
-    assert "filter" not in cfg.read_text() and "fsmonitor" in cfg.read_text()
-    _touch_tracked(repo)
-    v = read(ReadContext(datetime.now(timezone.utc), fresh=True)).value
     row = _lost(v, _stem("claude_code", "hs"))
     after = sorted(p.name for p in sentinels.iterdir())
     with capsys.disabled():
-        print(f"[topology-hostile] driver removed: lost {row}; errors {[e for e in v['errors'] if e.startswith('hostile')]}; "
-              f"sentinels after the read: {after}")
+        print(f"[topology-hostile] driver (required) in its config: lost {row}; errors "
+              f"{[e for e in v['errors'] if e.startswith('hostile')]}; sentinels after the read: {after}")
     assert after == [], f"the topology read ran a planted program: {after}"
+    assert [e for e in v["errors"] if e.startswith("hostile")] == []
     assert row["dirty"] == 1 and row["dirty_names"] == ["new.txt"] and row["unpushed"] == 1, row
+    assert (idx.read_bytes(), idx.stat().st_mtime_ns) == before                # the real index is never written
+    # (c) the tracked file really changed: counted, and still nothing runs (git hashed it with no driver)
+    (repo / "a.txt").write_text("changed\n")
+    v = read(ReadContext(datetime.now(timezone.utc), fresh=True)).value
+    row = _lost(v, _stem("claude_code", "hs"))
+    assert row["dirty"] == 2 and sorted(row["dirty_names"]) == ["a.txt", "new.txt"], row
+    assert not list(sentinels.iterdir())
+    cfg = repo / ".git" / "config"
     # (d) an include is refused unread, as on the commit read
     inc = tmp_path / "bin" / "inc.cfg"
     inc.write_text("[core]\n\tpager = cat\n")
@@ -498,17 +493,163 @@ def test_a_hostile_repo_runs_nothing_through_lost_if_closed(tmp_path, capsys):
     assert not list(sentinels.iterdir())
 
 
-def test_a_linked_worktrees_own_config_worktree_is_checked(tmp_path):
+def test_a_linked_worktrees_own_config_worktree_runs_nothing(tmp_path):
     repo = _repo(tmp_path / "work" / "main")
+    _commit(repo, "attrs", {"a.txt": "same\n", ".gitattributes": "* filter=x\n"})
     wt = tmp_path / "work" / "main-seat"
     _git(repo, "worktree", "add", "-q", "-b", "seat", str(wt), check=True)
+    _git(repo, "config", "extensions.worktreeConfig", "true", check=True)
     found, why = act.find_worktree(str(wt), str(tmp_path))
     assert why is None and found is not None
     common, gitdir, top = found
     assert common == (repo / ".git").resolve() and gitdir.parent.name == "worktrees" and top == wt.resolve()
-    (gitdir / "config.worktree").write_text("[filter \"x\"]\n\tclean = /bin/false\n")
-    assert act.worktree_refusal(common, gitdir) == \
-        "its worktree's config.worktree defines a filter driver (a program a status read would run), not read"
+    sent = tmp_path / "sent"
+    sent.mkdir()
+    prog = tmp_path / "prog"
+    prog.write_text(f"#!/bin/sh\ntouch {sent / 'x'}\ncat\n")
+    prog.chmod(0o755)
+    (gitdir / "config.worktree").write_text(f"[filter \"x\"]\n\tclean = {prog}\n\trequired = true\n")
+    _touch_tracked(wt)
+    _git(wt, "status")                                                     # control: git reads it for this worktree
+    assert (sent / "x").exists(), "CONTROL FAILED: the worktree's config.worktree driver did not run under git status"
+    (sent / "x").unlink()
+    _touch_tracked(wt)
+    got = act.git_worktree_state(common, gitdir, top, 3.0)
+    assert not (sent / "x").exists()
+    assert got == {"dirty": 0, "dirty_names": [], "branch": "seat", "unpushed": 2}, got
+
+
+def test_the_agents_config_swapped_under_the_read_runs_nothing(tmp_path, capsys):
+    """L2 H1: the agent swaps a filter driver in and out of its config while the cockpit reads, and keeps the index
+    racily clean (its mtime no later than the entry's), so git compares content through whatever driver it knows."""
+    import threading
+
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "attrs", {"a.txt": "same\n", ".gitattributes": "* filter=evil\n"})
+    sent = tmp_path / "sent"
+    sent.mkdir()
+    prog = tmp_path / "prog"
+    prog.write_text(f"#!/bin/sh\ntouch {sent / 'filter'}\ncat\n")
+    prog.chmod(0o755)
+    cfg = repo / ".git" / "config"
+    clean = cfg.read_text()
+    evil = clean + f"[filter \"evil\"]\n\tclean = {prog}\n\trequired = true\n"
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+
+    def racy() -> None:
+        st = os.stat(repo / "a.txt")
+        os.utime(repo / ".git" / "index", (st.st_mtime - 10, st.st_mtime - 10))
+
+    cfg.write_text(evil)                                                   # control: the racy entry runs the driver
+    racy()
+    _git(repo, "diff-files", "--name-only", env={"GIT_OPTIONAL_LOCKS": "0"})
+    assert (sent / "filter").exists(), "CONTROL FAILED: a racily clean entry did not run the driver"
+    (sent / "filter").unlink()
+    cfg.write_text(clean)
+    stop = threading.Event()
+
+    def flipper() -> None:
+        i = 0
+        while not stop.is_set():
+            tmp = repo / ".git" / "c.tmp"
+            tmp.write_text(evil if i % 2 else clean)
+            os.replace(tmp, cfg)
+            i += 1
+            time.sleep(0.002)
+
+    t = threading.Thread(target=flipper, daemon=True)
+    t.start()
+    got: list[Any] = []
+    try:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            racy()
+            try:
+                got.append(act.git_worktree_state(common, gitdir, top, 3.0)["dirty"])
+            except Exception as exc:  # noqa: BLE001 - counted, and failed below
+                got.append(type(exc).__name__)
+    finally:
+        stop.set()
+        t.join()
+    with capsys.disabled():
+        print(f"\n[topology-race] {len(got)} reads under the swap; results {sorted(set(map(str, got)))}; "
+              f"fired: {(sent / 'filter').exists()}")
+    assert not (sent / "filter").exists(), "the read ran the agent's driver"
+    assert len(got) >= 5 and set(got) == {0}, got
+
+
+def test_a_status_git_cannot_read_is_unknown_never_clean(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "one", {"a.txt": "a\n"})
+    (repo / "b.txt").write_text("untracked\n")
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+    made: list[str] = []
+    real = act.tempfile.mkdtemp
+
+    def spy(*a: Any, **k: Any) -> str:
+        d = real(*a, **k)
+        made.append(d)
+        assert (os.stat(d).st_mode & 0o777) == 0o700
+        return d
+
+    monkeypatch.setattr(act.tempfile, "mkdtemp", spy)
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 1
+    (repo / ".git" / "index").write_bytes(b"DIRC not an index")
+    with pytest.raises(RuntimeError):
+        act.git_worktree_state(common, gitdir, top, 3.0)
+    assert len(made) == 2 and not any(os.path.exists(d) for d in made)    # the private git dir never outlives a read
+    root = tmp_path / "inst"
+    _session(root, "s", str(repo), timedelta(minutes=2))
+    v = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
+                             hub_label=lambda c: "x", home=str(tmp_path))(ReadContext(datetime.now(timezone.utc))).value
+    row = _lost(v, _stem("claude_code", "s"))
+    assert row["dirty"] is None and row["dirty_names"] == [], row
+    assert "r: worktree unreadable (RuntimeError)" in v["errors"]
+
+
+def test_the_repositorys_exclude_and_core_settings_still_shape_the_count(tmp_path):
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "one", {"a.txt": "a\n"})
+    (repo / "ignored.log").write_text("x\n")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("*.log\n")
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 0
+    (repo / "a.txt").chmod(0o755)                                          # a mode change, seen with core.filemode
+    _git(repo, "config", "core.filemode", "false", check=True)
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 0
+    _git(repo, "config", "core.filemode", "true", check=True)
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 1
+
+
+def test_a_split_index_reads_through_its_shared_index_copy(tmp_path):
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "one", {"a.txt": "a\n", "b.txt": "b\n"})
+    _git(repo, "update-index", "--split-index", check=True)
+    assert any(p.name.startswith("sharedindex.") for p in (repo / ".git").iterdir())
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "u.txt").write_text("u\n")
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+    got = act.git_worktree_state(common, gitdir, top, 3.0)
+    assert got["dirty"] == 2 and sorted(got["dirty_names"]) == ["a.txt", "u.txt"], got
+
+
+def test_detached_and_unborn_heads_read_as_the_real_repository_has_them(tmp_path):
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "one", {"a.txt": "a\n"})
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["branch"] == "main"
+    _git(repo, "checkout", "-q", "--detach", check=True)
+    got = act.git_worktree_state(common, gitdir, top, 3.0)
+    assert got["branch"] is None and got["unpushed"] == 2 and got["dirty"] == 0, got
+    fresh = tmp_path / "u"
+    fresh.mkdir()
+    _git(fresh, "init", "-q", "-b", "main", check=True)
+    (fresh / "n.txt").write_text("n\n")
+    _git(fresh, "add", "n.txt", check=True)
+    common, gitdir, top = act.find_worktree(str(fresh), str(tmp_path))[0]
+    assert act.git_worktree_state(common, gitdir, top, 3.0) == \
+        {"dirty": 1, "dirty_names": ["n.txt"], "branch": None, "unpushed": 0}
 
 
 def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():

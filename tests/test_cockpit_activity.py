@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -415,6 +416,31 @@ def test_the_refusals_name_partial_clones_and_borrowed_objects(tmp_path):
     assert act.repo_refusal(g) == "it borrows objects (objects/info/alternates), not read"
     for msg in [act.repo_refusal(g)]:
         assert str(tmp_path) not in msg
+
+
+def test_each_git_call_gets_only_the_time_left_in_its_budget(tmp_path, monkeypatch):
+    """L2 L1: the refusal's two config reads, then the worktree read's own calls, share one budget: no call is given
+    more time than is left of it, so a tree cannot overrun the scan deadline by a call's timeout."""
+    g = _repo(tmp_path / "r") / ".git"
+    (g / "config.worktree").write_text("[core]\n\tbare = false\n")
+    real_run = act._run
+    given: list[tuple[float, float]] = []
+
+    def slow(argv: list[str], timeout: float) -> tuple[int, str]:
+        given.append((timeout, time.monotonic()))
+        time.sleep(0.3)
+        return real_run(argv, timeout)
+
+    monkeypatch.setattr(act, "_run", slow)
+    t0 = time.monotonic()
+    assert act.repo_refusal(g, 0.5) is None
+    assert len(given) == 2 and given[0][0] <= 0.5
+    assert given[1][0] <= 0.5 - (given[1][1] - t0) + 0.01, given          # the second call: what is left, not 0.5
+    given.clear()
+    with pytest.raises(subprocess.TimeoutExpired):
+        act.git_worktree_state(g, g, g.parent, 0.5)
+    assert given and all(t <= 0.5 for t, _ in given)
+    assert time.monotonic() - t0 < 0.5 + 0.5 + 1.0                            # both budgets, plus a call's kill grace
 
 
 # --- linked worktrees (K1 L1-2, L1-3) ---------------------------------------------------------------------------
