@@ -518,7 +518,10 @@ class EnvelopeStore(CoordStore):
         if scope is not None:
             try:
                 repo, paths = scope
-                if not isinstance(repo, str) or isinstance(paths, str) or not all(isinstance(p, str) for p in paths):
+                if isinstance(paths, str):
+                    raise TypeError
+                paths = tuple(paths)  # an iterator would be spent by the check below and pass the loop vacuously
+                if not isinstance(repo, str) or not all(isinstance(p, str) for p in paths):
                     raise TypeError
             except (TypeError, ValueError):
                 return "the scope asked for is not (repo, [paths])"

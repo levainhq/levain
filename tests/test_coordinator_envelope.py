@@ -633,3 +633,10 @@ def test_an_unhashable_effect_asked_for_is_a_refusal_line(ctx, structured_thread
 def test_a_malformed_scope_is_a_refusal_line(ctx, structured_thread, scope):
     _d, b, t = structured_thread
     assert "not (repo, [paths])" in ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, scope=scope)
+
+
+def test_a_generator_of_paths_is_checked_not_spent(ctx, structured_thread):
+    # L3 r3 complement LOW: the shape guard must not consume the paths the loop then checks
+    _d, b, t = structured_thread
+    refused = ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, scope=(ctx.path, (p for p in ["setup.py"])))
+    assert refused is not None and "setup.py" in refused
