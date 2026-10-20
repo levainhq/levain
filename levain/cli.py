@@ -1669,13 +1669,16 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
                                "links); refuses to overwrite a file.")
     export_p.add_argument("--names", type=Path, default=None, metavar="FILE",
                           help="A names file (JSON, format levain-agentboundary-names/1, at most 1 MiB) that maps "
-                               "Levain's names (policy, approver key, agent, tool, target) to your organisation's. "
-                               "Facts are never written: a file that sets a decision, a status, an actor type or a "
-                               "time, or tests anything but a name, is refused and nothing is exported. An authority "
-                               "name (approver, policy, capability, resource) can only be mapped one to one from "
-                               "Levain's own exact value, never from a call Levain did not decide, and each renamed "
-                               "field is marked synthesized: your export vouches for that mapping. The hash covers "
-                               "the renamed receipt.")
+                               "Levain's names (actor, approver key, policy, capability, resource) to your "
+                               "organisation's aliases. Facts are never written: a file that sets a decision, a "
+                               "status, an actor type, a time, or what the run was (the agent's framework or model, "
+                               "the tool's name, the environment, any version but the policy's) is refused and "
+                               "nothing is exported. An authority name (approver, policy, capability, resource) maps "
+                               "only one to one from Levain's own exact value, by a rule that selects on that field "
+                               "alone, never from or to a call Levain did not decide; each renamed field is marked "
+                               "synthesized: your export vouches for that mapping. The hash covers the renamed "
+                               "receipt, and each receipt_id includes the file's sha256, so one queue exported with "
+                               "two names files is two distinct sets of receipts.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
@@ -1740,7 +1743,12 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
         if args.names is not None:
             if args.export_format != "agentboundary":
                 raise ExportError(f"--names applies to --format agentboundary only, not {args.export_format}")
-            with open(args.names.expanduser(), "rb") as fh:     # read one byte past the cap so load_names refuses it
+            # O_NONBLOCK so opening a FIFO does not wait for a writer; a regular file only (a FIFO, a device or a
+            # directory is refused before any read), then one byte past the cap so load_names refuses an oversize one
+            fd = os.open(args.names.expanduser(), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    raise ExportError(f"--names {args.names}: not a regular file")
                 names = load_names(fh.read(NAMES_MAX_BYTES + 1))
         qdir = _consent_queue_dir(args)
         result = export(qdir, names=names)
