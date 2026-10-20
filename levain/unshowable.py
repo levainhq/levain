@@ -243,4 +243,5 @@ def describe(text: str, allow: str = "", selectors: bool = True) -> str | None:
     if found is None:
         return None
     i, ch = found
-    return f"U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}) at character {i + 1}"
+    name = unicodedata.name(ch, "") or f"a {unicodedata.category(ch)} character"
+    return f"U+{ord(ch):04X} ({name}) at character {i + 1}"
