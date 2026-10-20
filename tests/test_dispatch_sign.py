@@ -279,7 +279,7 @@ def test_a_passkey_cancel_gets_the_passkey_checks(job, keys, snapshot):
     fp = fingerprint_of(passkey_line())
     payload = dsign.cancel_payload(job, signer_fp=fp, signed_at=NOW + timedelta(minutes=1))
     plain = keys["phone"].sign(dsign.sign_message(payload), CNS)
-    assert dsign.cancel_refusal(payload, plain, snapshot, job) == "a passkey answer must be a WebAuthn signature"
+    assert dsign.cancel_refusal(payload, plain, snapshot, job) == "a passkey signature must be a WebAuthn signature"
 
 
 def test_a_cancel_verifier_that_cannot_run_is_raised_never_a_refusal(job, keys, snapshot, tmp_path):
