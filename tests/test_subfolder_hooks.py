@@ -36,6 +36,17 @@ def cc_local_layout(monkeypatch):
                         lambda ws: Path(os.path.abspath(ws)) / ".claude" / "settings.local.json")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_version_read(monkeypatch, request):
+    """No test spawns the real ``claude --version`` (doctor._check_claude_code reads it); the two tests of the
+    real reader (a fake binary on PATH, and the memo itself) keep it."""
+    from levain.consent import canary
+
+    if "_u5_" in request.node.name or "_v3_v4_" in request.node.name:
+        return
+    monkeypatch.setattr(canary, "agent_version", lambda agent, **_: None)
+
+
 pytestmark = pytest.mark.usefixtures("cc_local_layout")
 
 
@@ -685,7 +696,10 @@ def test_r3_u2_update_writes_nothing_when_the_local_file_stops_it(make_install):
     doc["hooks"]["Stop"] = 7
     lfile.write_text(json.dumps(doc), encoding="utf-8")
     before = {p: p.read_bytes() for p in (lfile, shared, cc / "CLAUDE.md", inst.activation_receipt_path(cc))}
+    tree = {p: p.read_bytes() for p in cc.rglob("*") if p.is_file()}  # the hook pin files and consent settings too
     r, text = _refresh(cc)
+    assert r.stopped_local
+    assert {p: p.read_bytes() for p in cc.rglob("*") if p.is_file()} == tree
     assert "/".join(LOCAL) in r.review and not r.refreshed and "not lists" in text, text
     assert "NOT refreshed, none of them" in text, text
     assert hook.read_bytes() == old
@@ -757,3 +771,23 @@ def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tm
     doctor.run_doctor(cc)
     capsys.readouterr()
     assert count.read_text(encoding="utf-8").count("x") == 1
+
+
+def test_r4_v3_v4_version_memo_is_per_context_and_a_failure_rereads(monkeypatch):
+    from levain.consent import canary
+
+    reads = iter([None, "2.1.300", "9.9.9"])
+    monkeypatch.setattr(canary, "_read_agent_version", lambda a, b, t: next(reads))
+    with canary.versions_read_once():
+        assert canary.agent_version("claude_code", binary="/x") is None  # a failure is not memoized
+        assert canary.agent_version("claude_code", binary="/x") == "2.1.300"
+        assert canary.agent_version("claude_code", binary="/x") == "2.1.300"  # a success is
+    assert canary._VERSIONS_READ.get() is None
+    assert canary.agent_version("claude_code", binary="/x") == "9.9.9"  # outside it nothing is reused
+    # overlapping contexts (V3): the inner reset restores the outer's memo, never a stale one
+    with canary.versions_read_once():
+        outer = canary._VERSIONS_READ.get()
+        with canary.versions_read_once():
+            assert canary._VERSIONS_READ.get() is outer
+        assert canary._VERSIONS_READ.get() is outer
+    assert canary._VERSIONS_READ.get() is None

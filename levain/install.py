@@ -3316,6 +3316,8 @@ class AdapterRefresh:
 
     refreshed: list[str] = field(default_factory=list)
     review: list[str] = field(default_factory=list)
+    # True only on the return that the local-settings check stopped: refresh_adapter then writes nothing after it.
+    stopped_local: bool = False
 
 
 def _expected_activation(
@@ -3355,6 +3357,8 @@ def refresh_adapter(
         if effective_adapter(root) in ("claude-code", "codex"):
             pin_before = host_guard.agent_pin_status(root)
     out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier, messaging=messaging)
+    if out.stopped_local:
+        return out  # the local-file check stopped the refresh: no re-pin, no consent settings
     if pin_before is not None:
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
     if apply:
@@ -3493,6 +3497,7 @@ def _refresh_adapter(
                 out.review.append("/".join(CC_LOCAL_SETTINGS_REL))
                 emit("\n• adapter files NOT refreshed, none of them (activation, carrier and settings alike):")
                 emit(stop)
+                out.stopped_local = True
                 return out
         _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"

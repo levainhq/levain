@@ -25,6 +25,7 @@ request AND the agent reported the denial AND the sentinel file does not exist; 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import os
 import re
@@ -63,34 +64,37 @@ class UntestedAgentVersion(RuntimeError):
     """The agent's version is not one the consent hook was tested with, and no override was given."""
 
 
-# Inside versions_read_once(): each (agent, binary) read's answer, reused; None outside it.
-_VERSIONS_READ: dict[tuple[str, str | None], str | None] | None = None
+# Inside versions_read_once(): each (agent, binary) read's answer, reused; None outside it. A ContextVar, so
+# overlapping runs in two threads (or tasks) each keep their own memo and reset by token.
+_VERSIONS_READ: contextvars.ContextVar[dict[tuple[str, str | None], str] | None] = contextvars.ContextVar(
+    "levain_versions_read", default=None)
 
 
 @contextlib.contextmanager
 def versions_read_once() -> Iterator[None]:
-    """Within it each agent's version is read at most once (the first answer, a failed read included, is reused):
-    for a caller with several rows about one agent version, so one run spawns ``<bin> --version`` once."""
-    global _VERSIONS_READ
-    outer = _VERSIONS_READ
-    if outer is None:
-        _VERSIONS_READ = {}
+    """Within it each agent's version is read at most once (a successful answer is reused; a failed read is
+    not memoized and re-reads): for a caller with several rows about one agent version, so one run spawns
+    ``<bin> --version`` once."""
+    token = _VERSIONS_READ.set({} if _VERSIONS_READ.get() is None else _VERSIONS_READ.get())
     try:
         yield
     finally:
-        _VERSIONS_READ = outer
+        _VERSIONS_READ.reset(token)
 
 
 def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.0) -> str | None:
     """The installed agent's version: ``<bin> --version`` exited 0 and its whole output is the agent's version line
     (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way. Inside
-    :func:`versions_read_once`, read once per agent and binary."""
-    memo = _VERSIONS_READ
+    :func:`versions_read_once`, a successful read is reused per agent and binary."""
+    memo = _VERSIONS_READ.get()
     if memo is None:
         return _read_agent_version(agent, binary, timeout)
-    if (agent, binary) not in memo:
-        memo[(agent, binary)] = _read_agent_version(agent, binary, timeout)
-    return memo[(agent, binary)]
+    if (agent, binary) in memo:
+        return memo[(agent, binary)]
+    got = _read_agent_version(agent, binary, timeout)
+    if got is not None:  # a failure re-reads: the key omits timeout, so a short-timeout failure must not stick
+        memo[(agent, binary)] = got
+    return got
 
 
 def _read_agent_version(agent: str, binary: str | None, timeout: float) -> str | None:
