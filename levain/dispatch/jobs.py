@@ -740,11 +740,15 @@ class JobStore:
                 "SELECT id FROM jobs WHERE (? IS NULL OR repo = ?) ORDER BY filed_at, id", (repo, repo))]
             return [job for job in (self._load(conn, i) for i in ids) if job is not None]
 
-    def _transition(self, job_id: str, to_state: str, cause: str, *, evidence: str = "") -> Job:
+    def _transition(self, job_id: str, to_state: str, cause: str, *, evidence: str = "",
+                    expect: str | None = None) -> Job:
         """Any edge of :data:`EDGES`, for the slices that own its cause (runs, the verifier, adoption) and for the
-        tests that walk the table; no public caller exists in this slice."""
+        tests that walk the table; no public caller exists in this slice. ``expect``: the state the caller read the job
+        in; another state now (another writer moved it) refuses, even where the edge itself is allowed from both."""
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
+            if expect is not None and job.state != expect:
+                raise TransitionRefused(f"job {job.id} is {job.state}, not the {expect} it was read as")
             self._apply(conn, job.id, to_state, cause, stamp, evidence)
             out = self._load(conn, job.id)
         assert out is not None

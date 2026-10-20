@@ -469,7 +469,7 @@ def test_a_rule_needs_distinct_backends_and_black_box_passes(jstore, cstore, rep
     for i in (0, 1):
         git(repo[0], "update-ref", "-d", staged_ref(job.id, i))
     inproc = [record(repo, job, 0, tree), record(repo, job, 1, tree, kind="in-process")]
-    assert "not black-box" in by_rule(jstore, cstore, job, inproc).message
+    assert "another verifier than the signed template" in by_rule(jstore, cstore, job, inproc).message
 
 
 # --- revalidation and the artifact ---------------------------------------------------------------------------------
@@ -501,7 +501,7 @@ def test_a_write_outside_the_contract_is_refused(jstore, cstore, repo, log, keys
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, {"src/sub/deep.py": b"x = 1\n"})
     out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))
-    assert out.outcome == "refused" and "outside the contract's signed write list" in out.message
+    assert out.outcome == "refused" and "not a path the contract's write list names exactly" in out.message
 
 
 def test_a_graft_file_in_the_repository_is_not_read(jstore, cstore, repo, log, keys, tmp_path):
@@ -676,3 +676,69 @@ def test_a_rule_land_records_the_generation_of_the_rules_it_was_judged_by(jstore
     assert out.outcome == "adopted"
     intent = json.loads(next(h for h in out.job.history if h.to_state == "authorised").evidence)
     assert intent["rule"] == {"generation": 4, "index": 0}
+
+
+# --- L3 r1 1020+17 -------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("variant", ["SRC/a.py", "src/A.py", "src/á.py"])
+def test_a_case_or_form_variant_of_a_signed_path_is_refused(variant, jstore, cstore, repo, log, keys, tmp_path):
+    # folding approved SRC/A.PY as src/a.py: another file on a case-sensitive disk (codex + complement)
+    with_rule(cstore, log, keys, repo, criteria=[{"onto": ["main"]}, {"max_files": 5}])
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, {variant: b"x = 1\n"})
+    for out in (by_rule(jstore, cstore, job, recs), by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))):
+        assert out.outcome == "refused" and "names exactly" in out.message, out.message
+    assert git(repo[0], "rev-parse", "main") == repo[1]
+
+
+def test_a_record_naming_another_verifier_is_refused(jstore, cstore, repo, log, keys, tmp_path):
+    from dataclasses import replace
+
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = [replace(r, verifier={**r.verifier, "id": "my-own-verifier"}) for r in runs(repo, job, tmp_path, A_FIX)]
+    out = by_rule(jstore, cstore, job, recs)
+    assert out.outcome == "refused" and "another verifier than the signed template" in out.message
+
+
+def test_a_rule_refuses_more_runs_than_the_templates_k(jstore, cstore, repo, log, keys, tmp_path):
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    out = by_rule(jstore, cstore, job, runs(repo, job, tmp_path, A_FIX, k=3))
+    assert out.outcome == "refused" and "each once" in out.message
+
+
+def test_a_stale_moved_base_never_fails_another_lands_authorisation(jstore, cstore, repo, log, keys, tmp_path):
+    # codex: a request that read the job as verified must not fail it once another land authorised it
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    jstore.authorise(job.id, cause="human_adoption_rule", evidence="{}")
+    out = adopt._fail_moved(jstore, job, "MOVED BASE: stale")          # ``job`` is the stale verified read
+    assert out.outcome == "refused" and jstore.get(job.id).state == "authorised"
+    assert git(repo[0], "for-each-ref", f"refs/heads/levain/dispatch/{job.id}/")    # nothing deleted
+
+
+def test_a_finisher_that_loses_to_another_reports_the_adoption(jstore, cstore, repo, log, keys, tmp_path):
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    assert adopt._finish(jstore, stale, recs).outcome == "adopted"           # the first finisher lands
+    again = adopt._finish(jstore, stale, recs)                               # the second read it as authorised
+    assert again.outcome == "adopted" and again.job.state == "adopted"
+
+
+def test_a_git_that_fails_is_never_read_as_absent(repo, monkeypatch):
+    path, base = repo
+
+    class Failed:
+        returncode, stdout, stderr = 128, b"", b"fatal: broken"
+
+    monkeypatch.setattr(adopt, "_git", lambda *a, **k: Failed())
+    with pytest.raises(adopt.GitFault):
+        adopt._read_branch(str(path), "main")
+    with pytest.raises(adopt.GitFault):
+        adopt._object_type(str(path), base)

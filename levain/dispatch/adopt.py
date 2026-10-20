@@ -41,7 +41,6 @@ import os
 import re
 import shlex
 import subprocess
-import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -209,8 +208,14 @@ def _git_ok(repo: str, *args: str, **kw: Any) -> bytes:
 
 
 def _object_type(repo: str, sha: str) -> str | None:
-    cp = _git(repo, "cat-file", "-t", sha)
-    return cp.stdout.decode("ascii", "replace").strip() if cp.returncode == 0 else None
+    """The object's type, or ``None`` when the object is absent; a git that fails otherwise raises, so an unreadable
+    fact is never read as an absent one (L3 r1 codex)."""
+    present = _git(repo, "cat-file", "-e", sha)
+    if present.returncode == 1:
+        return None
+    if present.returncode != 0:
+        raise GitFault(f"git cat-file -e failed in {repo} (exit {present.returncode})")
+    return _git_ok(repo, "cat-file", "-t", sha).decode("ascii", "replace").strip()
 
 
 def _commit_shape(repo: str, sha: str) -> tuple[list[str], str] | None:
@@ -223,8 +228,13 @@ def _commit_shape(repo: str, sha: str) -> tuple[list[str], str] | None:
 
 
 def _read_branch(repo: str, onto: str) -> str | None:
+    """The branch's commit, or ``None`` when it does not exist (rev-parse --quiet exit 1); any other failure raises."""
     cp = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/heads/{onto}^{{commit}}")
-    return cp.stdout.decode("ascii").strip() if cp.returncode == 0 else None
+    if cp.returncode == 1:
+        return None
+    if cp.returncode != 0:
+        raise GitFault(f"git rev-parse failed in {repo} (exit {cp.returncode})")
+    return cp.stdout.decode("ascii").strip()
 
 
 def _is_ancestor(repo: str, sha: str, tip: str) -> bool:
@@ -385,9 +395,12 @@ def change_set(repo: str, base: str, staged: str) -> ChangeSet | str:
         out_b = _git_ok(repo, "cat-file", "--batch", feed=("\n".join(blobs) + "\n").encode("ascii"))
         pos = 0
         for sha in blobs:
-            nl = out_b.index(b"\n", pos)
-            header = out_b[pos:nl].decode("ascii", "replace").split(" ")
-            size = int(header[2])
+            try:
+                nl = out_b.index(b"\n", pos)
+                header = out_b[pos:nl].decode("ascii", "replace").split(" ")
+                size = int(header[2])
+            except (ValueError, IndexError):
+                raise GitFault(f"git cat-file --batch answered no readable header for {sha}") from None
             if header[0] != sha or size != sizes[sha]:
                 raise GitFault(f"git cat-file --batch answered {header[0][:64]!r} for {sha}")
             contents[sha] = out_b[nl + 1:nl + 1 + size]
@@ -407,10 +420,6 @@ def change_set(repo: str, base: str, staged: str) -> ChangeSet | str:
                               old_size=sizes.get(osha, 0), new_size=sizes.get(nsha, 0), added=added,
                               deleted=deleted, binary=binary, non_blob=non_blob))
     return ChangeSet(tuple(entries))
-
-
-def _fold(p: str) -> str:
-    return unicodedata.normalize("NFC", p).casefold()
 
 
 # --- (A) the human authorise item (F11 §3) -------------------------------------------------------------------------
@@ -539,10 +548,11 @@ def criteria_failure(criteria: Iterable[tuple[str, Any]], changes: ChangeSet, *,
             if len(changes.entries) > value:
                 return f"criterion max_files: {len(changes.entries)} changed files is over {value}"
         elif key == "paths":
-            exact = {_fold(p) for p in value if not p.endswith("/")}
-            dirs = tuple(_fold(p) for p in value if p.endswith("/"))
+            # exact, never folded: a case or Unicode-form variant is another file on a case-sensitive disk
+            exact = {p for p in value if not p.endswith("/")}
+            dirs = tuple(p for p in value if p.endswith("/"))
             for c in changes.entries:
-                f = _fold(c.path)
+                f = c.path
                 if f not in exact and not f.startswith(dirs):
                     return f"criterion paths: {c.path} is not under {list(value)}"
         elif key == "no_new_files":
@@ -594,6 +604,10 @@ def _artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None
     contract = job.contract
     if record.job_id != job.id or record.contract_digest != job.digest or record.base != contract.base:
         return f"run {record.run}'s record is for another job, contract or base"
+    t = contract.template
+    if (record.verifier.get("id"), record.verifier.get("hash"), record.verifier.get("kind")) != \
+            (t.verifier_id, t.verifier_hash, t.verifier_kind):
+        return f"run {record.run}'s record names another verifier than the signed template's"
     shape = _commit_shape(repo, record.staged_commit)
     if shape is None:
         return f"run {record.run}'s staged commit {record.staged_commit} is not a commit in {repo}"
@@ -606,10 +620,12 @@ def _artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None
 
 
 def _changes_problem(job: Job, changes: ChangeSet) -> str | None:
-    allowed = {_fold(p) for p in job.contract.write_paths}
+    # a path approves only as signed, byte for byte: folding (case, NFC) is for refusing clashes, never for approving,
+    # since SRC/A.PY is a file src/a.py's signature never named on a case-sensitive disk (L3 r1, codex + complement)
+    allowed = set(job.contract.write_paths)
     for c in changes.entries:
-        if _fold(c.path) not in allowed:
-            return f"the change set writes {c.path}, outside the contract's signed write list"
+        if c.path not in allowed:
+            return f"the change set writes {c.path}, which is not a path the contract's write list names exactly"
     if not changes.entries:
         return "the change set is empty"
     return None
@@ -620,10 +636,10 @@ def _contrast_problem(records: Sequence[ArtifactRecord], template: ResolvedTempl
     identities, every run verified."""
     if template.tier != "R0":
         return f"the template is {template.tier}; only an R0 result may land without a human signature"
-    if len(records) < 2 or len(records) < template.k:
-        return f"{len(records)} verified runs, fewer than the template's k={template.k} (and at least 2)"
-    if sorted(r.run for r in records) != list(range(len(records))):
-        return "the runs are not 0..k-1, each once"
+    if template.k < 2:
+        return f"the template's k={template.k}; a contrast needs at least 2 runs"
+    if sorted(r.run for r in records) != list(range(template.k)):
+        return f"the runs are not 0..{template.k - 1}, each once (the template's k={template.k})"
     for r in records:
         if r.verifier.get("kind") != "black-box":
             return f"run {r.run}'s recorded verifier kind is {r.verifier.get('kind')!r}, not black-box"
@@ -809,18 +825,54 @@ def _worktree_of(repo: str, onto: str) -> str | None:
     return None
 
 
-def _delete_staged(repo: str, job_id: str) -> None:
+def _delete_staged(repo: str, job_id: str) -> list[str]:
+    """Delete the job's staged refs; returns the ones git would not delete (reported, never silent)."""
     out = _git_ok(repo, "for-each-ref", "--format=%(refname) %(objectname)",
                   f"refs/heads/levain/dispatch/{job_id}/")
+    kept = []
     for line in out.decode("utf-8", "surrogateescape").splitlines():
         ref, _, sha = line.rpartition(" ")
-        _git(repo, "update-ref", "--no-deref", "-d", ref, sha)
+        if _git(repo, "update-ref", "--no-deref", "-d", ref, sha).returncode != 0:
+            kept.append(ref)
+    return kept
+
+
+def _settled(store: JobStore, job: Job, *, landed: str | None = None) -> Landing:
+    """The job as another writer left it, after this land's transition lost to it (L3 r1): its outcome, never a
+    raise. ``landed``: the commit THIS land already moved the branch to, said when the winner was not an adoption."""
+    again = store.get(job.id)
+    if again is None:
+        raise TransitionRefused(f"no dispatch job {job.id}")
+    if again.state == "adopted":
+        return Landing(outcome="adopted", job=again, message="another land adopted this job")
+    note = (f"; this land had already moved the branch to {landed}: revert it with `git revert` if it is unwanted"
+            if landed else "")
+    if again.state == "failed" and again.history[-1].cause == "base_moved":
+        return Landing(outcome="failed", job=again, message="another land found the base moved" + note)
+    if again.state == "authorised":
+        return Landing(outcome="refused", job=again, message="the job was authorised by another land; run land "
+                                                             "again to finish it" + note)
+    return Landing(outcome="refused", job=again, message=f"the job is {again.state}" + note)
+
+
+def _move(store: JobStore, job: Job, to: str, cause: str, evidence: str) -> Job | None:
+    """``job`` -> ``to`` only from the state it was read in; ``None`` when another writer moved it first."""
+    try:
+        return store._transition(job.id, to, cause, evidence=evidence, expect=job.state)
+    except TransitionRefused:
+        if store.get(job.id) is not None and store.get(job.id).state != job.state:      # lost a race
+            return None
+        raise
 
 
 def _fail_moved(store: JobStore, job: Job, line: str) -> Landing:
-    out = store._transition(job.id, "failed", "base_moved", evidence=json.dumps({"why": line[:500]}))
-    _delete_staged(job.repo, job.id)
-    return Landing(outcome="failed", job=out, message=line)
+    # only from the state this land read: a stale request never fails another land's winning authorisation
+    out = _move(store, job, "failed", "base_moved", json.dumps({"why": line[:500]}))
+    if out is None:
+        return _settled(store, job)
+    kept = _delete_staged(job.repo, job.id)
+    note = f"; staged refs git would not delete: {', '.join(kept)}" if kept else ""
+    return Landing(outcome="failed", job=out, message=line + note)
 
 
 def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Landing:
@@ -829,8 +881,10 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     repo, onto, staged, base = job.repo, intent["onto"], intent["staged"], intent["base"]
     tip = _read_branch(repo, onto)
     if tip is not None and _object_type(repo, staged) == "commit" and _is_ancestor(repo, staged, tip):
-        out = store._transition(job.id, "adopted", "adopted",
-                                evidence=json.dumps({"landed": staged, "onto": onto, "moved": False}, sort_keys=True))
+        out = _move(store, job, "adopted", "adopted",
+                    json.dumps({"landed": staged, "onto": onto, "moved": False}, sort_keys=True))
+        if out is None:
+            return _settled(store, job)
         return Landing(outcome="adopted", job=out, message=f"{onto} already contains {staged}")
     if tip != base:
         return _fail_moved(store, job, f"MOVED BASE: {onto} is at {tip}, not the authorised base {base}")
@@ -856,8 +910,11 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     if cp.returncode != 0:
         return Landing(outcome="refused", job=job, message=f"{onto} moved during the land; run land again")
     _after_cas()
-    out = store._transition(job.id, "adopted", "adopted",
-                            evidence=json.dumps({"landed": staged, "onto": onto, "moved": True}, sort_keys=True))
+    out = _move(store, job, "adopted", "adopted",
+                json.dumps({"landed": staged, "onto": onto, "moved": True}, sort_keys=True))
+    if out is None:
+        # a human cancel (or another finisher) between this land's read and its write: say what moved
+        return _settled(store, job, landed=staged)
     return Landing(outcome="adopted", job=out, moved=True, message=f"{onto} -> {staged}")
 
 
