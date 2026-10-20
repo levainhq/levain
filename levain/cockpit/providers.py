@@ -207,7 +207,7 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if loops:
             lines.append({"label": "loop", "text": clip(loops[0].text)})
         if not lines:
-            return Read(value={"headline": "Nothing set for today yet",
+            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the Tray and Open loops",
                                "lines": [{"label": "set", "text": "Drop a thought in the Tray, or say what you are on with `levain state \"...\"`."}]})
         value: dict[str, Any] = {"headline": "", "lines": lines, "title": "Where to begin",
                                  "source": "from the Tray and Open loops"}

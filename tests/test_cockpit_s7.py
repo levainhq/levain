@@ -55,6 +55,7 @@ def test_where_to_begin_draws_the_overnight_line_only_when_the_install_knows_it(
 def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     got = _begin()
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got and "overnight" not in got
+    assert got["title"] == "Where to begin" and got["source"]
 
 
 _PROBE = r"""(() => {
@@ -78,7 +79,7 @@ def test_the_card_groups_threads_by_repo_loudest_first(tmp_path: Path) -> None:
                                                           {"eval": _PROBE}])["values"]
     got = json.loads(out[-1])
     assert got["card"] and got["title"] == "Where to begin" and got["source"] == "from the Tray and Open loops", got
-    assert got["lead"]
+    assert got["lead"] and got["rows"], got
     counts = [int(r["n"].split()[0]) for r in got["rows"]]
     assert counts == sorted(counts, reverse=True), got                  # loudest first
     assert all((r["tag"] is None) == (r["hue"] is None) for r in got["rows"]), got   # a tag always wears its repo hue

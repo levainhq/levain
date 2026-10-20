@@ -1221,7 +1221,7 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .thread .t { flex: 1; min-width: 0; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brief-card .thread .pill { flex: none; color: var(--meta); font: var(--fw-regular) var(--fs-micro) var(--mono); }
 .brief-card .thread .rp-tag { flex: none; margin-right: 0; }
-@media (max-width: 720px) { .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr); row-gap: var(--sp-5); } }
+@media (max-width: 720px) { .brief-card .brief-head .stamp { display: none; } .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr); row-gap: var(--sp-5); } }
 
 /* WIDGETS: one answer each, equal widths in one row */
 body.ke .ck-widgets[hidden] { display: none; }
