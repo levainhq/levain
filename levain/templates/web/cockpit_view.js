@@ -334,6 +334,12 @@
       const fields = fieldsOf(out.search, ["verb", "target", "actor"]);
       out.hays = v.rows.map((r) => hayOfValue(r, fields));
       out.typed = true;
+    } else if (kind === "topology") {
+      // F12a placeholder until the F12b renderer: the graph's counts as lines (full value, or the compact profile's numbers)
+      const n = (x, c) => (Array.isArray(x) ? x.length : isNum(c) ? c : 0);
+      const tasks = Array.isArray(v.tasks) ? v.tasks : [];
+      const waiting = isNum(v.waiting) ? v.waiting : tasks.filter((t) => isObj(t) && t.state === "waiting").length;
+      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions · " + n(v.tasks, v.tasks) + " tasks · " + waiting + " waiting on you" }];
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -375,7 +381,7 @@
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
     tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
-    edits: "build", jobs: "build", sessions: "morning board build", health: "memory",
+    edits: "build", jobs: "build", sessions: "morning board build", topology: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
   const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });

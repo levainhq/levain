@@ -66,11 +66,11 @@ from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 SCHEMA = "levain.cockpit/2"
 ENTITY_TIMEOUT_S = 10.0
-# The eleven kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
+# The twelve kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
 # levain.cockpit/1 declares an ALIAS; it is normalised to the new kind when the spec is built, so the
 # manifest only ever carries the new names.
 KINDS = ("reading", "line", "brief", "count-queue", "ambient", "status-dots", "metric-grid", "roster", "list",
-         "form", "log")
+         "form", "log", "topology")
 ALIASES = {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
 # row-shaped kinds (the searchable property); list and count-queue ride the RowIn engine, roster and log
 # carry their rows inside the value
@@ -1375,6 +1375,8 @@ class Cockpit:
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
+        if kind == "topology":
+            return not value.get("nodes") and not value.get("tasks")
         key = {"line": "lines", "status-dots": "metrics", "metric-grid": "numbers", "roster": "rows",
                "log": "rows", "ambient": "events"}.get(kind)
         if key == "events" and "visual" in value:
@@ -2003,7 +2005,7 @@ class Cockpit:
                     value = _with_health(value, ctx.now)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
-                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief"):
+                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief", "topology"):
                     out["next"] = f"/cockpit/panel/{panel_id}.json?profile=full"
                 if head["priority"] == "feed" and head["kind"] in ("line", "status-dots"):
                     out["value"] = None
@@ -2659,10 +2661,159 @@ def _v_log(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     return v
 
 
+TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
+TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
+TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "done", "failed")
+TOPOLOGY_COST_SOURCES = ("dispatch", "ledger")
+TOPOLOGY_LABEL_MAX = 48
+
+
+def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    """F12's live topology (F12_SPEC, with the 14a amendment): a hub, groups, nodes, tasks and what closing a live
+    node would lose. Every string is display-safe (``visible`` leaves it unchanged) and every label at most
+    ``TOPOLOGY_LABEL_MAX`` characters; ids are unique and every reference names one; null is "unknown" wherever the
+    contract allows it, and is never read as zero. ``conflicts`` may be null (the source is not tracked) and the
+    counts in ``lost_if_closed`` may be null (not read). Extra keys are accepted and ignored."""
+    v = _need_obj(spec, v)
+
+    def text(where: str, x: Any, *, null: bool = False, label: bool = False, blank: bool = True) -> None:
+        if x is None and null:
+            return
+        if not _is_str(x):
+            raise _bad(spec, where, "must be a string" + (" or null" if null else ""))
+        if not blank and not x:
+            raise _bad(spec, where, "must be a non-empty string")
+        if visible(x) != x:
+            raise _bad(spec, where, "carries an invisible or format character (send it through display_safe.visible)")
+        if label and len(x) > TOPOLOGY_LABEL_MAX:
+            raise _bad(spec, where, f"is longer than {TOPOLOGY_LABEL_MAX} characters")
+
+    def count(where: str, x: Any, *, null: bool = True) -> None:
+        if x is None and null:
+            return
+        if not (isinstance(x, int) and not isinstance(x, bool) and x >= 0):
+            raise _bad(spec, where, "must be a non-negative integer" + (" or null (unknown)" if null else ""))
+
+    def strings(where: str, x: Any, *, names: bool = False, label: bool = False) -> list[str]:
+        if not isinstance(x, list):
+            raise _bad(spec, where, "must be a list of strings")
+        for i, s_ in enumerate(x):
+            text(f"{where}[{i}]", s_, label=names or label, blank=False)
+            if names and ("/" in s_ or "\\" in s_):
+                raise _bad(spec, f"{where}[{i}]", "must be a basename (no path on the wire)")
+        return x
+
+    def unique(where: str, items: list[Any]) -> set[str]:
+        seen: set[str] = set()
+        for i, it in enumerate(items):
+            text(f"{where}[{i}].id", it.get("id"), blank=False)
+            if it["id"] in seen:
+                raise _bad(spec, f"{where}[{i}].id", f"{it['id']!r} is repeated")
+            seen.add(it["id"])
+            text(f"{where}[{i}].label", it.get("label"), label=True)
+        return seen
+
+    hub = v.get("hub")
+    if not isinstance(hub, dict):
+        raise _bad(spec, "value.hub", "must be an object {id, label}")
+    text("value.hub.id", hub.get("id"), blank=False)
+    text("value.hub.label", hub.get("label"), label=True)
+    groups = _need_list(spec, v, "groups")
+    group_ids = unique("value.groups", groups)
+    for i, g in enumerate(groups):
+        text(f"value.groups[{i}].repo", g.get("repo"), null=True)
+    nodes = _need_list(spec, v, "nodes")
+    node_ids = unique("value.nodes", nodes)
+    for i, n in enumerate(nodes):
+        w = f"value.nodes[{i}]"
+        if n.get("group") not in group_ids:
+            raise _bad(spec, f"{w}.group", f"must name a group id, got {n.get('group')!r}")
+        par = n.get("parent")
+        if par is not None and (par not in node_ids or par == n["id"]):
+            raise _bad(spec, f"{w}.parent", f"must be null or another node's id, got {par!r}")
+        for k in ("agent", "model", "tool", "card"):
+            text(f"{w}.{k}", n.get(k), null=True, label=k in ("agent", "model", "tool"))
+        if n.get("state") not in TOPOLOGY_NODE_STATES:
+            raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_NODE_STATES)}, got {n.get('state')!r}")
+        count(f"{w}.tokens", n.get("tokens"))
+        for k in ("started", "last_event"):
+            if not _is_iso(n.get(k)):
+                raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
+        if not _is_num(n.get("rate")) or n["rate"] < 0:
+            raise _bad(spec, f"{w}.rate", "must be a non-negative finite number (events per minute)")
+    if "conflicts" not in v:
+        raise _bad(spec, "value.conflicts", "is required (null when the source is not tracked)")
+    if v["conflicts"] is not None:
+        for i, c in enumerate(_need_list(spec, v, "conflicts")):
+            text(f"value.conflicts[{i}].path", c.get("path"), label=True, blank=False)
+            if "/" in c["path"] or "\\" in c["path"]:
+                raise _bad(spec, f"value.conflicts[{i}].path", "must be a basename (no path on the wire)")
+            pair = c.get("nodes")
+            if not (isinstance(pair, list) and len(pair) == 2 and all(x in node_ids for x in pair) and pair[0] != pair[1]):
+                raise _bad(spec, f"value.conflicts[{i}].nodes", "must be two distinct node ids")
+    counts = v.get("counts")
+    if not isinstance(counts, dict):
+        raise _bad(spec, "value.counts", "must be an object {tokens_today}")
+    if "tokens_today" not in counts:
+        raise _bad(spec, "value.counts.tokens_today", "is required (null when not tracked)")
+    count("value.counts.tokens_today", counts["tokens_today"])
+    if not _is_iso(v.get("as_of")):
+        raise _bad(spec, "value.as_of", "must be an ISO-8601 timestamp")
+    tasks = _need_list(spec, v, "tasks")
+    unique("value.tasks", tasks)
+    for i, t in enumerate(tasks):
+        w = f"value.tasks[{i}]"
+        if t.get("kind") not in TOPOLOGY_TASK_KINDS:
+            raise _bad(spec, f"{w}.kind", f"must be one of {list(TOPOLOGY_TASK_KINDS)}, got {t.get('kind')!r}")
+        if t.get("state") not in TOPOLOGY_TASK_STATES:
+            raise _bad(spec, f"{w}.state", f"must be one of {list(TOPOLOGY_TASK_STATES)}, got {t.get('state')!r}")
+        strings(f"{w}.waits_on", t.get("waits_on"))
+        text(f"{w}.card", t.get("card"), null=True)
+        outs = t.get("outcomes")
+        if not isinstance(outs, list):
+            raise _bad(spec, f"{w}.outcomes", "must be a list")
+        for j, o in enumerate(outs):
+            if not isinstance(o, dict):
+                raise _bad(spec, f"{w}.outcomes[{j}]", "must be an object {label, at, ok}")
+            text(f"{w}.outcomes[{j}].label", o.get("label"), label=True)
+            if not _is_iso(o.get("at")):
+                raise _bad(spec, f"{w}.outcomes[{j}].at", "must be an ISO-8601 timestamp")
+            if not isinstance(o.get("ok"), bool):
+                raise _bad(spec, f"{w}.outcomes[{j}].ok", "must be a boolean")
+        cost = t.get("cost")
+        if not isinstance(cost, dict) or not {"usd", "tokens", "source"} <= set(cost):
+            raise _bad(spec, f"{w}.cost", "must be an object {usd, tokens, source} (null fields = not tracked)")
+        if cost["usd"] is not None and not (_is_num(cost["usd"]) and cost["usd"] >= 0):
+            raise _bad(spec, f"{w}.cost.usd", "must be a non-negative finite number or null")
+        count(f"{w}.cost.tokens", cost["tokens"])
+        if cost["source"] is not None and cost["source"] not in TOPOLOGY_COST_SOURCES:
+            raise _bad(spec, f"{w}.cost.source", f"must be one of {list(TOPOLOGY_COST_SOURCES)} or null")
+        if cost["source"] is None and (cost["usd"] is not None or cost["tokens"] is not None):
+            raise _bad(spec, f"{w}.cost.source", "must name where a cost came from (a cost is never an estimate)")
+        workers = strings(f"{w}.workers", t.get("workers"))
+        for j, x in enumerate(workers):
+            if x not in node_ids:
+                raise _bad(spec, f"{w}.workers[{j}]", f"must name a node id, got {x!r}")
+    for i, lost in enumerate(_need_list(spec, v, "lost_if_closed")):
+        w = f"value.lost_if_closed[{i}]"
+        if lost.get("node") not in node_ids:
+            raise _bad(spec, f"{w}.node", f"must name a node id, got {lost.get('node')!r}")
+        for k in ("dirty", "unpushed", "uncaptured_episodes", "running_children"):
+            if k not in lost:
+                raise _bad(spec, f"{w}.{k}", "is required (null when not read)")
+            count(f"{w}.{k}", lost[k])
+        strings(f"{w}.dirty_names", lost.get("dirty_names"), names=True)
+        strings(f"{w}.branches", lost.get("branches"), label=True)
+    for k in ("errors", "unreadable"):
+        if v.get(k) is not None:
+            strings(f"value.{k}", v[k])
+    return v
+
+
 VALUE_VALIDATORS: dict[str, Callable[["ProviderSpec", Any], dict[str, Any]]] = {
     "reading": _v_reading, "line": _v_line, "brief": _v_brief, "ambient": _v_ambient,
     "status-dots": _v_status_dots, "metric-grid": _v_metric_grid, "roster": _v_roster, "form": _v_form,
-    "log": _v_log,
+    "log": _v_log, "topology": _v_topology,
 }
 
 # What a row of each row-shaped kind carries, i.e. what ``search.fields`` may name, and the default.
@@ -2796,4 +2947,9 @@ def _compact_value(kind: str, value: Any) -> Any:
         return {"legend": value.get("legend", ""), "events": len(value.get("events") or [])}
     if kind == "brief":
         return {"headline": value.get("headline", "")}
+    if kind == "topology":
+        # the phone draws no topology (F12_SPEC): the counts, and the full value one link away
+        return {"as_of": value.get("as_of"), "nodes": len(value.get("nodes") or []),
+                "tasks": len(value.get("tasks") or []),
+                "waiting": sum(1 for t in value.get("tasks") or [] if t.get("state") == "waiting")}
     return value
