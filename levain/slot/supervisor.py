@@ -700,8 +700,16 @@ HELPER_DEADLINE_DEFAULT_S = 120.0
 _HELPER_OUT_MAX = 1 << 20  # DECISION: a helper answer past this is no single line: refused malformed
 _HELPER_ERR_KEEP = 1 << 16
 KILL_GRACE_S = 2.0         # DECISION: between TERM and KILL for a helper being ended
-FINAL_DRAIN_S = 2.0        # DECISION: at the session's end, how long a terminal that is not reading gets for the rest
+_AFTER_EXIT_MAX = 1 << 20  # DECISION: once the helper has exited the master is read past the cap (what the pty still
+#                            holds is the stream's end, and `start`'s line); past this much more the bytes are counted, not
+#                            kept: something left in the slot is writing, and memory stays bounded
+FINAL_DRAIN_S = 2.0        # DECISION: at the session's end, how long a terminal may take NOTHING before the rest is
+#                            abandoned (counted); a terminal that keeps taking bytes keeps the drain, up to the cap below
+FINAL_DRAIN_MAX_S = 30.0   # DECISION: the final drain's hard bound, however slowly the terminal trickles
+FINAL_RESET_S = 1.0        # DECISION: the reporting-mode reset's own attempt, after the drain has given up on the rest
 SAY_WAIT_S = 1.0           # DECISION: how long a status line waits on stderr before it is held for the end of the run
+HELD_DRAIN_S = 2.0         # DECISION: the held status lines' bounded, non-blocking write at the end of the run
+_CAN = b"\x18"             # cancels a sequence the abandoned rest may have cut, so the reset that follows is read whole
 
 
 def _host() -> str:
@@ -776,6 +784,9 @@ class Supervisor:
         self._proc: Optional["subprocess.Popen[bytes]"] = None
         self._master = self._slave = -1
         self._held: List[str] = []           # status lines a terminal that was not reading has yet to take
+        self._output_failed = False           # the operator's stdout refused a write (not EAGAIN): the relay ended
+        self._reset_untaken = False           # the reporting-mode reset did not reach his terminal whole
+        self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
 
     # -- small ------------------------------------------------------------------------------------------------------
 
@@ -801,13 +812,83 @@ class Supervisor:
             return True
 
     def _release_held(self) -> None:
+        """The held status lines, after teardown and the lease close, written non-blocking within
+        :data:`HELD_DRAIN_S`: a stderr that still is not reading never holds the launcher's return. What it did not
+        take is counted (:attr:`unshown_lines`) and the count tried once, without waiting, as the last line."""
         held, self._held = self._held, []
+        if not held:
+            return
+        try:
+            fd = self.err.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = -1
+        if fd < 0:                            # not an fd (a test's StringIO): it cannot stall
+            for line in held:
+                try:
+                    self.err.write(line)
+                    self.err.flush()
+                except (OSError, ValueError):
+                    return
+            return
+        enc = getattr(self.err, "encoding", None) or "utf-8"
+        ends, data = [], bytearray()
         for line in held:
+            data += line.encode(enc, "backslashreplace")
+            ends.append(len(data))
+        total = len(data)
+        try:
+            was = os.get_blocking(fd)
+            os.set_blocking(fd, False)
+        except OSError:
+            self.unshown_lines = len(held)
+            return
+        try:
+            gone = self._drain(fd, data, time.monotonic() + HELD_DRAIN_S, watch_stops=False)
+            done = total - len(data)
+            self.unshown_lines = sum(1 for e in ends if e > done)
+            if self.unshown_lines and gone is None:
+                cut = b"" if done in ends or done == 0 else b"\n"
+                note = f"levain: {self.unshown_lines} status lines were not shown: stderr did not take them\n"
+                try:
+                    os.write(fd, cut + note.encode("ascii"))
+                except OSError:
+                    pass
+        finally:
             try:
-                self.err.write(line)
-                self.err.flush()
-            except (OSError, ValueError):
-                return
+                os.set_blocking(fd, was)
+            except OSError:
+                pass
+
+    def _drain(self, fd: int, buf: bytearray, deadline: float, *, idle_s: Optional[float] = None,
+               watch_stops: bool = True) -> Optional[OSError]:
+        """Write ``buf`` (consumed in place) to the non-blocking ``fd`` until it is empty, ``deadline`` passes, ``fd``
+        takes nothing for ``idle_s``, or a stop signal arrives during it. Returns the error that ended it when the
+        fd refused a write (its reader is gone), else ``None``; what is left in ``buf`` is what it did not take."""
+        stops = self._stops
+        idle_end = None if idle_s is None else time.monotonic() + idle_s
+        while buf:
+            now = time.monotonic()
+            end = deadline if idle_end is None else min(deadline, idle_end)
+            if end <= now or (watch_stops and self._stops > stops):
+                return None
+            rl = [self._wake_r] if watch_stops and self._wake_r >= 0 else []
+            try:
+                ready, writable, _ = select.select(rl, [fd], [], end - now)
+                if ready:
+                    try:
+                        os.read(self._wake_r, 64)
+                    except OSError:
+                        pass
+                if writable:
+                    n = os.write(fd, buf)
+                    del buf[:n]
+                    if n and idle_s is not None:
+                        idle_end = time.monotonic() + idle_s
+            except (BlockingIOError, InterruptedError):
+                continue
+            except (OSError, ValueError) as e:
+                return e if isinstance(e, OSError) else OSError(errno.EBADF, str(e))
+        return None
 
     def _lease_fds(self) -> Tuple[int, ...]:
         return (self.lease.fileno(),) if self.lease is not None else ()
@@ -996,6 +1077,10 @@ class Supervisor:
                     self.lease = None
                 self._restore()
             finally:
+                if self._reset_untaken:
+                    # The run's last line: whatever else he missed, this is the one that leaves his shell wrong.
+                    self.say("your terminal did not take the reset of the reporting modes the session turned on "
+                             "(mouse, focus or paste reports may still be on): run `reset`")
                 self._release_held()
 
     def _leased(self, clone: Path, branch: str, blob: bytes) -> int:
@@ -1093,6 +1178,8 @@ class Supervisor:
         if self.stop_signal is not None:
             self.say(f"{signal.Signals(self.stop_signal).name}: ending session {session}")
             return False
+        if self._output_failed:
+            return False                      # the relay said why; the vendor may still run: teardown ends it
         try:
             code = proc.wait(timeout=self.s.start_grace_s)
         except subprocess.TimeoutExpired:
@@ -1118,15 +1205,19 @@ class Supervisor:
     def _relay(self, master: int, proc: "subprocess.Popen[bytes]") -> bytes:
         """operator stdin -> pty master; pty master -> :class:`TermFilter` -> operator stdout. Nothing in the loop
         blocks: the master and the operator's stdout are non-blocking and both directions are buffered, so a
-        terminal that is not reading stops the master being read (past :data:`_OUTPUT_MAX`), never the loop, and the
-        wake pipe is always watched. Ends on a stop signal, or once the master is done (EOF / EIO, or the helper
-        exited and a read pass found it empty) and the output buffer is written. Returns the stream's raw tail
-        (where ``start``'s line is)."""
+        terminal that is not reading stops the master being read (past :data:`_OUTPUT_MAX`, while the helper runs),
+        never the loop, and the wake pipe is always watched. Ends on a stop signal, on a stdout that refused a write
+        (its bytes counted, :attr:`_output_failed` set), or as soon as the master is done (EOF / EIO, or the helper
+        exited and a read pass found it empty): what the terminal has yet to take then gets :meth:`_last_output`,
+        bounded, so a terminal that is not reading never holds teardown. Returns the stream's raw tail (where
+        ``start``'s line is)."""
         filt = TermFilter()
         tail = bytearray()
-        stdin_open, out_open, master_done = True, True, False
+        stdin_open, master_done = True, False
+        out_err: Optional[OSError] = None
         pending = bytearray()      # operator input the pty has not taken yet
         outbuf = bytearray()       # filtered output the operator's terminal has not taken yet
+        over = 0                   # filtered bytes read after the helper's exit past _AFTER_EXIT_MAX: counted, not kept
         stdout = self.s.stdout
         # O_NONBLOCK is a property of the open file, which stdout may share with stdin (one tty): stdin's read
         # then answers EAGAIN too, and both are put back as they were on every way out.
@@ -1134,15 +1225,14 @@ class Supervisor:
         os.set_blocking(master, False)
         os.set_blocking(stdout, False)
         try:
-            while self.stop_signal is None:
-                if master_done and not (outbuf and out_open):
-                    break
+            while self.stop_signal is None and not master_done and out_err is None:
                 exited = proc.poll() is not None      # read BEFORE the select: all its output is in the pty
-                read_master = not master_done and len(outbuf) < _OUTPUT_MAX
+                # Once the helper is gone holding the master back holds nothing up but the end of the stream.
+                read_master = exited or len(outbuf) < _OUTPUT_MAX
                 rl = [self._wake_r] + ([master] if read_master else [])
-                if stdin_open and not master_done and len(pending) < _INPUT_MAX:
+                if stdin_open and len(pending) < _INPUT_MAX:
                     rl.append(self.s.stdin)
-                wl = ([master] if pending and not master_done else []) + ([stdout] if outbuf and out_open else [])
+                wl = ([master] if pending else []) + ([stdout] if outbuf else [])
                 try:
                     ready, writable, _ = select.select(rl, wl, [], 0.5)
                 except InterruptedError:
@@ -1159,9 +1249,8 @@ class Supervisor:
                         del outbuf[:os.write(stdout, outbuf)]
                     except (BlockingIOError, InterruptedError):
                         pass
-                    except OSError:
-                        out_open = False          # his terminal is gone: nothing more can be shown
-                        outbuf.clear()
+                    except OSError as e:
+                        out_err = e               # his terminal is gone: the relay ends, the loss is counted below
                 if master in writable and pending:
                     try:
                         del pending[:os.write(master, pending)]
@@ -1183,8 +1272,11 @@ class Supervisor:
                         master_done = True
                     elif data:
                         tail = (tail + data)[-8192:]
-                        if out_open:
-                            outbuf += filt.feed(data)
+                        shown = filt.feed(data)
+                        if len(outbuf) < _OUTPUT_MAX + _AFTER_EXIT_MAX:
+                            outbuf += shown
+                        else:
+                            over += len(shown)
                 elif read_master and exited:
                     master_done = True            # the helper is gone and nothing was left to read
                 if self.s.stdin in ready:
@@ -1201,31 +1293,40 @@ class Supervisor:
         finally:
             left = 0
             try:
-                if out_open:
-                    left = self._last_output(outbuf + filt.flush() + filt.reset())
+                rest, reset = outbuf + filt.flush(), filt.reset()
+                if out_err is None:
+                    left, untaken, out_err = self._last_output(rest, reset)
+                else:
+                    left, untaken = len(rest), len(reset)
+                self._reset_untaken = self._reset_untaken or untaken > 0
             finally:
                 os.set_blocking(stdout, was_blocking)
+            if out_err is not None:
+                self._output_failed = True
+                self.say(f"your terminal refused the session's output ({out_err.strerror or out_err}): "
+                         f"ending the session")
             if left:
                 self.say(f"your terminal did not take the session's last {left} bytes")
+            if over:
+                self.say(f"{over} bytes written to the terminal after the vendor's helper exited were not shown")
         return bytes(tail)
 
-    def _last_output(self, rest: bytearray) -> int:
-        """The session's last bytes (what the terminal had yet to take, then the reporting-mode reset), given
-        :data:`FINAL_DRAIN_S` and no more: a terminal that is not reading does not hold teardown. Returns how many
-        it did not take."""
-        deadline = time.monotonic() + FINAL_DRAIN_S
-        while rest:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                break
-            try:
-                if select.select([], [self.s.stdout], [], left)[1]:
-                    del rest[:os.write(self.s.stdout, rest)]
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                return 0                      # his terminal is gone
-        return len(rest)
+    def _last_output(self, rest: bytearray, reset: bytes) -> Tuple[int, int, Optional[OSError]]:
+        """The session's last bytes, then the reporting-mode reset, on the non-blocking stdout. The rest gets the
+        drain bounded by :data:`FINAL_DRAIN_S` of the terminal taking nothing (and :data:`FINAL_DRAIN_MAX_S` in all);
+        the reset then gets :data:`FINAL_RESET_S` of its own, so abandoning the rest never abandons it (led by CAN
+        when the rest was cut, which may have been inside a sequence). A terminal that is not reading does not hold
+        teardown. Returns (rest bytes not taken, reset bytes not taken, the error if stdout refused a write)."""
+        now = time.monotonic()
+        err = self._drain(self.s.stdout, rest, now + FINAL_DRAIN_MAX_S, idle_s=FINAL_DRAIN_S)
+        left = len(rest)
+        if not reset:
+            return left, 0, err
+        if err is not None:
+            return left, len(reset), err
+        tail = bytearray((_CAN if left else b"") + reset)
+        err = self._drain(self.s.stdout, tail, time.monotonic() + FINAL_RESET_S)
+        return left, len(tail), err
 
     def _end_start(self) -> None:
         """After teardown: teardown ended the vendor (END freezes and kills the slot's processes), so ``start``
