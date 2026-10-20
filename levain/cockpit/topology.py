@@ -12,8 +12,8 @@ dispatch contract waiting on a signature or an authorisation. STALLED (a node) a
 no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing for
 ``STALL_S``, an open loop, which no session is linked to.
 
-"Lost if closed" is per live session, read on the activity feed's git path (``activity.git_worktree_state``: the
-same walk, refusals, environment and overrides, no new git call path), bounded by the same whole-scan deadline,
+"Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
+dir the cockpit owns, so no repository config reaches it; see that function), bounded by the same whole-scan deadline,
 each working tree past it named, and cached for ``LOST_CACHE_S``.
 
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
