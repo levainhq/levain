@@ -1,0 +1,1297 @@
+"""The runtime helper's ``__main__``: one root NOPASSWD entry, argv + stdin in, one canonical JSON line out
+(CONTRACT §5 preamble, §5.1).
+
+:func:`main` derives the caller from ``SUDO_UID`` (the operator recorded in ``L/policy/operator``, or
+``_levain_dispatch``), reads the configured slots from the store (never from argv), passes argv and stdin through
+:mod:`levain.slot.runtime_grammar` and runs the verb. Every refusal is :func:`runtime_grammar.refusal_line` and a
+non-zero exit, raised before the next act: nothing after the refusing check acts.
+
+Verbs built here: ``prepare``, ``render``, ``resume``, ``status``. ``start``, ``teardown`` and ``confirm-identity``
+register in :data:`VERB_HANDLERS` from their own lane; until then (and for ``adopt-open`` / ``discard`` /
+``restore``, session 5's) a verb answers ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers
+``verb-unbuilt:ticket`` (session 2f's).
+
+Every root filesystem act goes through a dirfd: the store root is opened once with ``O_DIRECTORY|O_NOFOLLOW`` and
+every path below it is reached one component at a time with ``O_NOFOLLOW`` (§5 preamble), so no argv token, stdin
+field or planted link names a path. Every OS act a unit test cannot do as a non-root user is a field of
+:class:`Seams` with a real default (owners are recorded, not applied, in the tests).
+
+The slot state file ``L/slots/{e,v}<n>/state`` (``levain-slot-state/1``, §3.5 Pool) is read and written here
+because ``prepare`` is its first writer built (§2.1 also names install, END, SCRUBBED and ``replenish``).
+"""
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+
+from levain.contracts import ContractError, canon
+from levain.slot import Refused, wall, write_all
+from levain.slot import records as R
+from levain.slot import render as RD
+from levain.slot import stage as ST
+from levain.slot.end import V5_FLOOR_BYTES
+from levain.slot.grammar import SESSION_RE
+from levain.slot.ids import SlotId, in_own_range
+from levain.slot.layout import BASE_ROUTES_FORMAT, RUN, STORE
+from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
+                                         bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
+
+PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
+SLOT_STATE_FORMAT = "levain-slot-state/1"
+SLOT_STATES = ("leased", "scrubbed", "reusable", "retired")
+
+EXIT_OK = 0
+EXIT_REFUSED = 1       # DECISION: every refusal by name
+EXIT_INTERNAL = 70     # DECISION: an unexpected error (stdout still carries one line, ``internal``)
+
+LOCK_WAIT_S = 10.0     # §11 V23: render's ``locked`` retry window; DECISION: also the pool / slot flock wait
+LOCK_SLICE_S = 0.02    # DECISION: the flock retry's first backoff (doubling to 0.5 s)
+
+#: The front's GO pipe read end sits on this fd in the front (§5.1 render (4)): above 0-2 and wall's SPEC_FD.
+GO_FD = 4
+#: DECISION: the front learns its GO fd from this env var (the front's env is ``extra_env`` alone, wall §8.2).
+GO_FD_ENV = "LEVAIN_GO_FD"
+GO_BYTE = b"G"         # DECISION: §5.1 (5b) "writes the go byte" names no value
+#: §5.1 render (4): the front program is a parameter; session 2's is the stub, session 3a's the gateway front.
+FRONT_MODULE = "levain.broker.stub"
+
+#: §2.1 ``keep/``: the vendor credential file a slot parks (END's ``CREDENTIAL_FILES``, by vendor).
+CREDENTIAL_NAME: Mapping[str, str] = {"claude": ".credentials.json", "codex": "auth.json"}
+
+_O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_O_READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_O_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_RECORD_CAP = 1 << 20
+_SUDO_UID_RE = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
+
+
+# --- seams ----------------------------------------------------------------------------------------------------------
+
+def _host() -> str:
+    return "darwin" if sys.platform == "darwin" else "linux"
+
+
+def _root_trusted(st: os.stat_result) -> bool:
+    """A store directory root may act below: root-owned, not group- or other-writable."""
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def _fchown(fd: int, uid: int, gid: int, rel: str) -> None:
+    os.fchown(fd, uid, gid)
+
+
+def _free_bytes(store_fd: int) -> int:
+    st = os.fstatvfs(store_fd)
+    return st.f_bavail * st.f_frsize
+
+
+def _account_uid(name: str) -> int:
+    import pwd
+
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        raise Refused("account-missing", name) from None
+
+
+def _group_gid(name: str) -> int:
+    import grp
+
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        raise Refused("group-missing", name) from None
+
+
+def _user_gid(uid: int) -> int:
+    import pwd
+
+    try:
+        return pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        raise Refused("account-missing", str(uid)) from None
+
+
+def read_boot_id() -> str:
+    """The boot's id (§7.1 ``boot_id``): Linux ``/proc/sys/kernel/random/boot_id``, macOS ``kern.bootsessionuuid``."""
+    if sys.platform == "darwin":
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True,
+                           timeout=10, env={})
+        text = r.stdout if r.returncode == 0 else ""
+    else:
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+    if not text.strip():
+        raise Refused("boot-id-unknown", sys.platform)
+    return text.strip()
+
+
+def _new_session() -> str:
+    return "s-" + os.urandom(8).hex()
+
+
+def _default_client(path: Path):
+    try:
+        from levain.slot.control_client import ControlClient
+    except ImportError:
+        raise Refused("control-down", "the CONTROL client is not built") from None
+    return ControlClient(path)
+
+
+def proc_identity(pid: int) -> Optional[Tuple[int, int]]:
+    """``(uid, start)`` of a live process, or None. Linux: real uid from ``/proc/<pid>/status``, start = field 22
+    of ``/proc/<pid>/stat`` (clock ticks since boot). macOS: ``ps -o uid=,lstart=``, start as epoch seconds.
+    DECISION: these are the start-time units the front registration carries (§3.3 ``front:{uid, pid, start}``);
+    keys' peer check (session 3b) must read the same units."""
+    if sys.platform == "darwin":
+        r = subprocess.run(["/bin/ps", "-o", "uid=,lstart=", "-p", str(int(pid))], capture_output=True, text=True,
+                           timeout=10, env={"LC_ALL": "C"})
+        parts = r.stdout.split(None, 1) if r.returncode == 0 else []
+        if len(parts) != 2:
+            return None
+        try:
+            started = int(time.mktime(time.strptime(parts[1].strip(), "%a %b %d %H:%M:%S %Y")))
+            return int(parts[0]), started
+        except ValueError:
+            return None
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii", errors="replace") as fh:
+            start = int(fh.read().rsplit(")", 1)[-1].split()[19])
+        with open(f"/proc/{int(pid)}/status", encoding="ascii", errors="replace") as fh:
+            uid = next(int(line.split()[1]) for line in fh if line.startswith("Uid:"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    return uid, start
+
+
+def _sigkill_and_reap(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        os.waitpid(pid, 0)          # the helper is the front's parent until it exits: reap it
+    except ChildProcessError:
+        pass
+
+
+def darwin_user_dir(uid: int, gid: int) -> str:
+    """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (render's ``var_folders``), from ``getconf
+    DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``). [not run: a 2g row]"""
+    r = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_DIR"], capture_output=True, text=True, timeout=10,
+                       env={}, user=uid, group=gid, extra_groups=[])
+    parts = [p for p in r.stdout.strip().split("/") if p] if r.returncode == 0 else []
+    if len(parts) < 4 or parts[:2] != ["var", "folders"]:
+        raise Refused("var-folders-unknown", str(uid))
+    return "/private/var/folders/" + parts[2] + "/" + parts[3]
+
+
+def _close_fds_except(keep: Sequence[int]) -> None:
+    hi = min(os.sysconf("SC_OPEN_MAX"), 65536)
+    lo = 3
+    for fd in sorted(k for k in set(keep) if k >= 3):
+        os.closerange(lo, fd)
+        lo = fd + 1
+    os.closerange(lo, hi)
+
+
+def spawn_front(argv: Sequence[str], spec_json: bytes, go_rfd: int) -> int:
+    """§5.1 render (4): start the front DETACHED and return its pid. The child: ``setsid``; fds 0/1/2 on
+    ``/dev/null``; the GO pipe's read end on :data:`GO_FD`; every other fd closed but the spec pipe, which
+    :func:`wall.exec_launch` moves to ``SPEC_FD`` before it execs the stage (drop + assert to ``_levain_gw<n>``,
+    §8.2). The parent writes the spec and keeps no fd of the child's. Only root can run it (a VM row)."""
+    spec_r, spec_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the root child; exercised only in the VM (2g)
+        try:
+            os.setsid()
+            null = os.open("/dev/null", os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            if null > 2:
+                os.close(null)
+            hi_go = fcntl.fcntl(go_rfd, fcntl.F_DUPFD, 32)
+            hi_spec = fcntl.fcntl(spec_r, fcntl.F_DUPFD, 32)
+            os.dup2(hi_go, GO_FD)
+            _close_fds_except([GO_FD, hi_spec])
+            wall.exec_launch(argv, hi_spec)
+        except BaseException:   # noqa: BLE001 - the child never returns into the helper's stack
+            pass
+        os._exit(70)
+    os.close(spec_r)
+    try:
+        write_all(spec_w, spec_json)
+    finally:
+        os.close(spec_w)
+    return pid
+
+
+def wake_reaper(run: Path) -> None:
+    """A wake on ``R/reaper/wake.sock`` (§2.2, §3.5 Pool: ``prepare`` wakes the sync). Best effort: content is
+    ignored and a lost wake costs one V11 interval."""
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.sendto(b"w", str(run / "reaper" / "wake.sock"))
+        finally:
+            s.close()
+    except OSError:
+        pass
+
+
+@dataclass
+class Seams:
+    """Every OS act the helper takes that a unit test cannot take as a non-root user, with its real default.
+
+    ``chown(fd, uid, gid, rel)``: ``rel`` is the path below the store the fd names (tests record it). ``at(step)``
+    is called before each named step of a verb (tests observe the order and inject faults there)."""
+
+    host: str = field(default_factory=_host)
+    store: Optional[Path] = None
+    run: Optional[Path] = None
+    euid: Callable[[], int] = os.geteuid
+    trusted: Callable[[os.stat_result], bool] = _root_trusted
+    chown: Callable[[int, int, int, str], None] = _fchown
+    fsync: Callable[[int], None] = os.fsync
+    free_bytes: Callable[[int], int] = _free_bytes
+    clock: Callable[[], float] = time.time
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    boot_id: Callable[[], str] = read_boot_id
+    new_session: Callable[[], str] = _new_session
+    account_uid: Callable[[str], int] = _account_uid
+    group_gid: Callable[[str], int] = _group_gid
+    user_gid: Callable[[int], int] = _user_gid
+    client_factory: Callable[[Path], object] = _default_client
+    stage_run_as: ST.RunAs = ST.fork_run_as
+    spawn_front: Callable[[Sequence[str], bytes, int], int] = spawn_front
+    proc_identity: Callable[[int], Optional[Tuple[int, int]]] = proc_identity
+    kill: Callable[[int], None] = _sigkill_and_reap
+    var_folders: Callable[[int, int], str] = darwin_user_dir
+    wake_reaper: Optional[Callable[[], None]] = None
+    hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
+    front_module: str = FRONT_MODULE
+    lock_wait_s: float = LOCK_WAIT_S
+    at: Callable[[str], None] = lambda step: None
+
+    @property
+    def L(self) -> Path:
+        return Path(self.store) if self.store is not None else STORE[self.host]
+
+    @property
+    def R(self) -> Path:
+        return Path(self.run) if self.run is not None else RUN[self.host]
+
+
+# --- dirfd primitives (§5 preamble) ---------------------------------------------------------------------------------
+
+def _openat_dir(parent: int, name: str, where: str) -> int:
+    try:
+        return os.open(name, _O_DIR, dir_fd=parent)
+    except FileNotFoundError:
+        raise Refused("store-missing", where) from None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise Refused("bad-root", f"{where} is not a directory") from None
+        raise
+
+
+def read_at(dirfd: int, name: str, where: str, *, cap: int = _RECORD_CAP) -> Optional[bytes]:
+    """A regular file's bytes below ``dirfd``, ``None`` when absent; a link or a non-regular file is ``bad-root``."""
+    try:
+        fd = os.open(name, _O_READ, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO):
+            raise Refused("bad-root", f"{where} is a link or not a file") from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("bad-root", f"{where} is not a regular file")
+        if st.st_size > cap:
+            raise Refused("record-too-large", where)
+        out = bytearray()
+        while len(out) <= cap:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            out += chunk
+        if len(out) > cap:
+            raise Refused("record-too-large", where)
+        return bytes(out)
+    finally:
+        os.close(fd)
+
+
+def exists_regular_at(dirfd: int, name: str) -> bool:
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
+def replace_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable[[int], None]) -> None:
+    """``records.write_durably`` below a dirfd: a fresh temp (``O_EXCL``, no link followed), written whole, fsynced,
+    renamed over ``name``, the directory fsynced. A failure leaves ``name`` as it was."""
+    tmp = name + ".tmp"
+    try:
+        os.unlink(tmp, dir_fd=dirfd)        # a temp a dead writer left
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, _O_NEW, mode, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, mode)
+        write_all(fd, data)
+        fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp, dir_fd=dirfd)
+        raise
+    os.close(fd)
+    try:
+        os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except BaseException:
+        os.unlink(tmp, dir_fd=dirfd)
+        raise
+    fsync(dirfd)
+
+
+@dataclass(frozen=True)
+class DirRow:
+    """One §2.1 row a verb makes: ``rel`` below ``<S>`` (``""`` = ``<S>`` itself), owner, group, mode."""
+
+    rel: str
+    uid: int
+    gid: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class FileRow:
+    rel: str
+    data: bytes
+    uid: int
+    gid: int
+    mode: int
+
+
+class Store:
+    """Root's handle on ``L``: one dirfd opened at the store root, every path below reached by :meth:`dir`
+    one ``O_NOFOLLOW`` component at a time. Each directory root acts in must pass ``seams.trusted``."""
+
+    def __init__(self, seams: Seams) -> None:
+        self.seams = seams
+        self.path = seams.L
+        try:
+            self.fd = os.open(str(self.path), _O_DIR)
+        except OSError:
+            raise Refused("store-missing", str(self.path)) from None
+        if not seams.trusted(os.fstat(self.fd)):
+            os.close(self.fd)
+            raise Refused("bad-root", str(self.path))
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def open_dir(self, *parts: str, trusted: bool = True) -> int:
+        """An fd on ``L/<parts…>``. ``trusted``: the LAST component must pass ``seams.trusted`` (every
+        intermediate always must)."""
+        cur = os.dup(self.fd)
+        where = str(self.path)
+        try:
+            for i, p in enumerate(parts):
+                if not p or p in (".", "..") or "/" in p:
+                    raise Refused("bad-token", p[:64])
+                where += "/" + p
+                nxt = _openat_dir(cur, p, where)
+                os.close(cur)
+                cur = nxt
+                if (trusted or i < len(parts) - 1) and not self.seams.trusted(os.fstat(cur)):
+                    raise Refused("bad-root", where)
+            return cur
+        except BaseException:
+            os.close(cur)
+            raise
+
+    @contextmanager
+    def dir(self, *parts: str, trusted: bool = True) -> Iterator[int]:
+        fd = self.open_dir(*parts, trusted=trusted)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+    def read(self, parts: Sequence[str], name: str, *, trusted: bool = True) -> Optional[bytes]:
+        with self.dir(*parts, trusted=trusted) as fd:
+            return read_at(fd, name, "/".join((str(self.path), *parts, name)))
+
+    def replace(self, parts: Sequence[str], name: str, data: bytes, *, mode: int) -> None:
+        with self.dir(*parts) as fd:
+            replace_at(fd, name, data, mode=mode, fsync=self.seams.fsync)
+
+    def mkdir(self, parent: int, name: str, row_uid: int, row_gid: int, mode: int, rel: str) -> None:
+        """A fresh directory ``name`` under ``parent`` with its §2.1 owner and mode (chown first, mode last)."""
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            raise Refused("session-exists", rel) from None
+        fd = _openat_dir(parent, name, rel)
+        try:
+            self.seams.chown(fd, row_uid, row_gid, rel)
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
+    def create_file(self, parent: int, name: str, row: FileRow) -> None:
+        """A FRESH file (``O_CREAT|O_EXCL``, never over an existing name) with its row's owner and mode, fsynced."""
+        try:
+            fd = os.open(name, _O_NEW, 0o600, dir_fd=parent)
+        except FileExistsError:
+            raise Refused("render-dest-exists", row.rel) from None
+        try:
+            self.seams.chown(fd, row.uid, row.gid, row.rel)
+            os.fchmod(fd, row.mode)
+            write_all(fd, row.data)
+            self.seams.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+# --- small record readers ---------------------------------------------------------------------------------------------
+
+def _canon_obj(data: bytes, what: str) -> dict:
+    try:
+        obj = canon.parse(data)
+    except ContractError as e:
+        raise Refused(f"{what}-malformed", str(e)[:128]) from None
+    if type(obj) is not dict or canon.canonical_bytes(obj) != data:
+        raise Refused(f"{what}-malformed", "not a canonical object")
+    return obj
+
+
+def read_operator_uid(store: Store) -> int:
+    from levain.slot.install_helper import parse_operator_record
+
+    data = store.read(("policy",), "operator")
+    if data is None:
+        raise Refused("no-operator", "L/policy/operator")
+    return int(parse_operator_record(data)["uid"])
+
+
+def configured_slots(store: Store) -> Dict[str, frozenset]:
+    """The configured slots, from the store: every ``L/slots/e<n>/`` and ``L/slots/v<n>/`` directory."""
+    out: Dict[str, set] = {"egress": set(), "none": set()}
+    with store.dir("slots") as fd:
+        names = os.listdir(fd)
+        for name in names:
+            if len(name) < 2 or name[0] not in "ev" or not name[1:].isdigit() or str(int(name[1:])) != name[1:]:
+                continue
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                idx = int(name[1:])
+                if idx < 64:
+                    out["egress" if name[0] == "e" else "none"].add(idx)
+    return {k: frozenset(v) for k, v in out.items()}
+
+
+def base_route_types(store: Store) -> Dict[str, str]:
+    """``L/routes/base.json`` (§4.3 S1 base map): route id -> its §4.1 type. Interactive and login sessions name
+    base-map ids only (§5.3), so this map is the whole set a render may name."""
+    data = store.read(("routes",), "base.json")
+    if data is None:
+        raise Refused("base-map-missing", "L/routes/base.json")
+    obj = _canon_obj(data, "base-map")
+    routes = obj.get("routes")
+    if obj.get("format") != BASE_ROUTES_FORMAT or type(routes) is not list:
+        raise Refused("base-map-malformed", "format or routes")
+    out: Dict[str, str] = {}
+    for r in routes:
+        if type(r) is not dict or type(r.get("route")) is not str or r.get("type") not in RD.ROUTE_TYPES \
+                or r["route"] in out:
+            raise Refused("base-map-malformed", "a route")
+        out[r["route"]] = r["type"]
+    return out
+
+
+# --- the slot state file (§3.5 Pool) ---------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SlotState:
+    """``levain-slot-state/1``. ``rev`` +1 on EVERY write, never reset; ``lease_seq`` +1 on every lease."""
+
+    slot: SlotId
+    rev: int
+    lease_seq: int
+    state: str
+    dispatch_eligible: bool
+    changed_at: str
+    session: Optional[str] = None
+
+
+_SLOT_STATE_KEYS = frozenset({"format", "class", "index", "rev", "lease_seq", "state", "session",
+                              "dispatch_eligible", "changed_at"})
+
+
+def slot_state_bytes(s: SlotState) -> bytes:
+    rec: Dict[str, object] = {"format": SLOT_STATE_FORMAT, "class": s.slot.slot_class, "index": s.slot.index,
+                              "rev": s.rev, "lease_seq": s.lease_seq, "state": s.state,
+                              "dispatch_eligible": s.dispatch_eligible, "changed_at": s.changed_at}
+    if s.session is not None:
+        rec["session"] = s.session
+    return canon.canonical_bytes(rec)
+
+
+def parse_slot_state(data: bytes, slot: SlotId) -> SlotState:
+    """Strict: exact keys, canonical bytes, the file's own (class, index). DECISION: ``session`` is required when
+    ``leased`` and allowed in any state (END may leave it naming the session it served)."""
+    obj = _canon_obj(data, "slot-state")
+    missing = (_SLOT_STATE_KEYS - {"session"}) - set(obj)
+    if set(obj) - _SLOT_STATE_KEYS or missing or obj["format"] != SLOT_STATE_FORMAT:
+        raise Refused("slot-state-malformed", slot.tag)
+    if obj["class"] != slot.slot_class or obj["index"] != slot.index or obj["state"] not in SLOT_STATES \
+            or type(obj["dispatch_eligible"]) is not bool:
+        raise Refused("slot-state-malformed", slot.tag)
+    for k in ("rev", "lease_seq"):
+        R._uint(obj[k], f"slot-state.{k}")
+    R.check_timestamp(obj["changed_at"], "slot-state.changed_at")
+    session = obj.get("session")
+    if session is not None:
+        R.check_session(session, "slot-state.session")
+    if obj["state"] == "leased" and session is None:
+        raise Refused("slot-state-malformed", f"{slot.tag}: leased with no session")
+    return SlotState(slot, obj["rev"], obj["lease_seq"], obj["state"], obj["dispatch_eligible"],
+                     obj["changed_at"], session)
+
+
+@dataclass(frozen=True)
+class SlotView:
+    """What the pick reads of one slot under the pool lock: its state file, which vendors' credential ``keep/``
+    holds (by name: §2.1 keep files are moved, never opened), and its baseline's vendor (``"?"`` when the file
+    exists but does not parse; ``None`` when absent)."""
+
+    state: Optional[SlotState]
+    slot: SlotId
+    credentials: frozenset = frozenset()
+    baseline: Optional[str] = None
+
+    @property
+    def reusable(self) -> bool:
+        return self.state is not None and self.state.state == "reusable"
+
+    def holds(self, vendor: str) -> bool:
+        return vendor in self.credentials and self.baseline == vendor
+
+    @property
+    def operator_held(self) -> bool:
+        return bool(self.credentials) or self.baseline is not None
+
+
+def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
+    if data is None:
+        return None
+    try:
+        obj = canon.parse(data)
+    except ContractError:
+        return "?"
+    v = obj.get("vendor") if type(obj) is dict else None
+    return v if v in VENDORS else "?"
+
+
+def read_view(store: Store, slot: SlotId) -> SlotView:
+    with store.dir("slots", slot.tag) as sfd:
+        raw = read_at(sfd, "state", f"slots/{slot.tag}/state")
+        state = parse_slot_state(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
+        creds: frozenset = frozenset()
+        baseline = None
+        if slot.slot_class == "egress":
+            try:
+                kfd = _openat_dir(sfd, "keep", f"slots/{slot.tag}/keep")
+            except Refused:
+                kfd = -1
+            if kfd >= 0:
+                try:
+                    creds = frozenset(v for v, n in CREDENTIAL_NAME.items() if exists_regular_at(kfd, n))
+                finally:
+                    os.close(kfd)
+            baseline = _baseline_vendor(read_at(sfd, "baseline", f"slots/{slot.tag}/baseline"))
+    return SlotView(state, slot, creds, baseline)
+
+
+def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: str, auth: str,
+              named: Optional[int], ticketed: bool) -> SlotId:
+    """§5.1 prepare + §3.5 Pool's point-of-use rules, PURE over the views read under the pool lock.
+
+    Operator: ``no-baseline:<slot>`` for ``passthrough`` + kind != ``login`` when no REUSABLE slot holds this
+    vendor's credential AND a baseline; then the named slot if REUSABLE, else (passthrough) the lowest credential +
+    baseline slot, else the lowest REUSABLE (verifier: the lowest free pair). Ticketed: no ``<slot>`` argument,
+    never a slot whose ``keep/`` holds a credential or that has a baseline, and ``operator-slot-reserved`` if
+    taking the slot would leave no reusable credential-free egress slot."""
+    mine = sorted((v for v in views if v.slot.slot_class == slot_class), key=lambda v: v.slot.index)
+    reusable = [v for v in mine if v.reusable]
+    if ticketed:
+        if named is not None:
+            raise Refused("ticket-slot-argument", f"{slot_class} {named}")
+        free = [v for v in reusable if not v.operator_held]
+        if not free:
+            raise Refused(f"no-free-slot:{slot_class}", "no reusable credential-free slot")
+        if slot_class == "egress" and len(free) < 2:
+            raise Refused("operator-slot-reserved", "the last credential-free egress slot is the operator's")
+        return free[0].slot
+    if auth == "passthrough" and kind != "login" and not any(v.holds(vendor) for v in reusable):
+        # DECISION: <slot> is the named slot's tag (e<n>), or the class when none was named.
+        raise Refused(f"no-baseline:{SlotId(slot_class, named).tag if named is not None else slot_class}",
+                      f"no reusable slot holds a {vendor} credential and baseline")
+    if named is not None:
+        for v in reusable:
+            if v.slot.index == named:
+                return v.slot
+    if auth == "passthrough":
+        held = [v for v in reusable if v.holds(vendor)]
+        if held:
+            return held[0].slot
+    if not reusable:
+        raise Refused(f"no-free-slot:{slot_class}", "no reusable slot")
+    return reusable[0].slot
+
+
+# --- flock (pool lock before slot lock, §3.5 LOCK ORDER) -------------------------------------------------------------
+
+def _open_lock(dirfd: int, name: str, where: str) -> int:
+    try:
+        return os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+    except FileNotFoundError:
+        raise Refused("store-missing", where) from None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise Refused("bad-root", where) from None
+        raise
+
+
+def try_flock(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as e:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return False
+        raise
+
+
+def wait_flock(fd: int, seams: Seams, name: str) -> None:
+    """LOCK_EX within ``seams.lock_wait_s`` (backoff doubling to 0.5 s), else ``Refused(name)``."""
+    deadline = seams.monotonic() + seams.lock_wait_s
+    delay = LOCK_SLICE_S
+    while not try_flock(fd):
+        if seams.monotonic() >= deadline:
+            raise Refused(name, "held past the wait")
+        seams.sleep(delay)
+        delay = min(delay * 2, 0.5)
+
+
+@dataclass
+class Leased:
+    """A slot ``prepare`` took: its new state (written) and its HELD slot lock fd (released after ATTACH)."""
+
+    slot: SlotId
+    state: SlotState
+    lock_fd: int
+
+    def release(self) -> None:
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)       # closing the fd drops the flock
+            self.lock_fd = -1
+
+
+def lease_slot(store: Store, *, slot_class: str, kind: str, vendor: str, auth: str, named: Optional[int],
+               ticketed: bool, session: str) -> Leased:
+    """§3.5 Pool ORDER: the pool lock, then the slot lock; ``leased`` with ``lease_seq + 1`` and the session, durable;
+    the pool lock released; the slot lock returned HELD. DECISION: under the pool lock the slot lock is only TRIED
+    (a holder is mid-END or mid-revert): a held slot is passed over as not reusable and the pick runs again, so
+    the pool lock never waits on a slot lock."""
+    seams = store.seams
+    with store.dir("slots") as slots_fd:
+        pool = _open_lock(slots_fd, "pool.lock", "slots/pool.lock")
+        try:
+            wait_flock(pool, seams, "pool-locked")
+            seams.at("pool-locked")
+            indices = configured_slots(store)[slot_class]
+            views = [read_view(store, SlotId(slot_class, i)) for i in sorted(indices)]
+            busy: set = set()
+            while True:
+                live = [v if v.slot not in busy else replace(v, state=None) for v in views]
+                slot = pick_slot(live, slot_class=slot_class, kind=kind, vendor=vendor, auth=auth, named=named,
+                                 ticketed=ticketed)
+                with store.dir("slots", slot.tag) as sfd:
+                    lock = _open_lock(sfd, "lock", f"slots/{slot.tag}/lock")
+                if try_flock(lock):
+                    break
+                os.close(lock)
+                busy.add(slot)
+            try:
+                old = next(v.state for v in views if v.slot == slot)
+                assert old is not None
+                new = replace(old, rev=old.rev + 1, lease_seq=old.lease_seq + 1, state="leased", session=session,
+                              changed_at=R.timestamp(seams.clock()))
+                seams.at("slot-leased")
+                store.replace(("slots", slot.tag), "state", slot_state_bytes(new), mode=0o644)
+            except BaseException:
+                os.close(lock)
+                raise
+        finally:
+            os.close(pool)                 # the pool lock is released here; the slot lock stays held
+    return Leased(slot, new, lock)
+
+
+# --- the caller context -------------------------------------------------------------------------------------------------
+
+@dataclass
+class Ctx:
+    seams: Seams
+    store: Store
+    sudo_uid: int
+    caller: str
+    operator_uid: int
+    env: Mapping[str, str]
+    _client: object = None
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = self.seams.client_factory(self.seams.R / "control" / "control.sock")
+        return self._client
+
+    def call(self, op: str, **fields: object) -> dict:
+        return self.client.call(op, **fields)
+
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:   # noqa: BLE001 - closing never changes the verb's answer
+                pass
+
+
+def slot_ids(ctx: Ctx, slot: SlotId) -> Dict[str, int]:
+    """The two accounts of ``slot`` (egress: slot + front; none: driver + child), each in its §1.1 range."""
+    out = {}
+    for name in slot.accounts:
+        uid = ctx.seams.account_uid(name)
+        if not in_own_range(ctx.seams.host, name, uid):
+            raise Refused("account-out-of-range", f"{name} {uid!r}")
+        out[name] = uid
+    return out
+
+
+def read_alloc(ctx: Ctx, session: str) -> R.Alloc:
+    """The alloc of ``session``, bound to its caller (DECISION: a lease verb on a session is the lease peer's that
+    prepared it: ``supervisor_uid == SUDO_UID``; ``_levain_dispatch`` only on an alloc carrying a ticket, §5.1).
+    Anything else answers ``no-session``, so a caller learns nothing of another's sessions."""
+    data = ctx.store.read(("alloc",), f"{session}.json")
+    if data is None:
+        raise Refused("no-session", session)
+    a = R.parse_alloc(data)
+    if a.session != session or a.supervisor_uid != ctx.sudo_uid or (ctx.caller == DISPATCH and a.ticket is None):
+        raise Refused("no-session", session)
+    return a
+
+
+def write_alloc(ctx: Ctx, a: R.Alloc) -> None:
+    ctx.store.replace(("alloc",), f"{a.session}.json", R.alloc_bytes(a), mode=0o600)
+
+
+# --- prepare (§5.1) -----------------------------------------------------------------------------------------------------
+
+def session_dir_rows(slot: SlotId, ids: Mapping[str, int]) -> List[DirRow]:
+    """§2.1's rows ``prepare`` makes under ``<S>``, in creation order. Egress: ``<S>`` root : ``_levain_s<n>`` 0750,
+    the slot-owned 0700 dirs. Verifier: ``<S>`` root : root 0711, ``driver/`` ``_levain_v<n>`` 0700, the rest the
+    CHILD's. DECISION: the parents ``config/`` and ``xdg/`` (no §2.1 row) are root : the owner's group 0750, so the
+    owner reaches its dirs and cannot rename or replace them."""
+    first, second = slot.accounts
+    if slot.slot_class == "egress":
+        owner = ids[first]
+        rows = [DirRow("", 0, owner, 0o750)]
+    else:
+        owner = ids[second]
+        rows = [DirRow("", 0, 0, 0o711), DirRow("driver", ids[first], ids[first], 0o700)]
+    rows += [DirRow("config", 0, owner, 0o750), DirRow("config/claude", owner, owner, 0o700),
+             DirRow("config/codex", owner, owner, 0o700), DirRow("xdg", 0, owner, 0o750)]
+    rows += [DirRow(f"xdg/{d}", owner, owner, 0o700) for d in ("data", "cache", "config", "state")]
+    rows += [DirRow("tmp", owner, owner, 0o700), DirRow("sock", owner, owner, 0o700)]
+    return rows
+
+
+def make_session_dirs(ctx: Ctx, session: str, rows: Sequence[DirRow]) -> None:
+    with ctx.store.dir("live") as live:
+        for row in rows:
+            parts = [p for p in row.rel.split("/") if p]
+            if not parts:
+                ctx.store.mkdir(live, session, row.uid, row.gid, row.mode, f"live/{session}")
+                continue
+            with ctx.store.dir("live", session, *parts[:-1]) as parent:
+                ctx.store.mkdir(parent, parts[-1], row.uid, row.gid, row.mode, f"live/{session}/{row.rel}")
+        ctx.seams.fsync(live)
+
+
+def make_staging(ctx: Ctx, session: str) -> Path:
+    """``L/staging/<session>/`` owned by the LEASE PEER (alloc ``staging_uid``) 0700 (§2.1, §5.4)."""
+    with ctx.store.dir("staging") as fd:
+        ctx.store.mkdir(fd, session, ctx.sudo_uid, ctx.seams.user_gid(ctx.sudo_uid), 0o700, f"staging/{session}")
+        ctx.seams.fsync(fd)
+    return ctx.store.path / "staging" / session
+
+
+def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, object]:
+    seams = ctx.seams
+    if ctx.caller == DISPATCH or blob.ticket is not None:
+        raise Refused("verb-unbuilt:ticket", "ticketed prepare is session 2f's")
+    seams.at("floor")
+    if seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:        # §5.1: refuses below V5
+        raise Refused("below-floor", "free space under V5")
+    session = seams.new_session()
+    if not SESSION_RE.fullmatch(session):
+        raise Refused("internal", "session id")
+    leased = lease_slot(ctx.store, slot_class=req.slot_class, kind=req.kind, vendor=req.vendor, auth=req.auth,
+                        named=req.slot, ticketed=False, session=session)
+    try:
+        slot = leased.slot
+        ids = slot_ids(ctx, slot)
+        first, second = slot.accounts
+        linux = seams.host == "linux"
+        alloc = R.Alloc(
+            session=session, slot=slot, lease_seq=leased.state.lease_seq, slot_rev=leased.state.rev,
+            slot_uid=ids[first], slot_gid=ids[first], kind=req.kind, vendor=req.vendor, auth=req.auth,
+            operator_uid=ctx.operator_uid, supervisor_uid=ctx.sudo_uid, staging_uid=ctx.sudo_uid,
+            created_at=R.timestamp(seams.clock()), boot_id=seams.boot_id(),
+            child_uid=ids[second] if slot.slot_class == "none" else None,
+            netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None)
+        seams.at("alloc")
+        write_alloc(ctx, alloc)
+        claims = {"operator_uid": alloc.operator_uid, "supervisor_uid": alloc.supervisor_uid,
+                  "slot": R.slot_obj(slot), "class": slot.slot_class, "kind": alloc.kind, "vendor": alloc.vendor,
+                  "auth": alloc.auth, "lease_seq": alloc.lease_seq, "slot_rev": alloc.slot_rev}
+        seams.at("attach")
+        ans = ctx.call("ATTACH", lease_nonce=blob.lease_nonce, sudo_uid=ctx.sudo_uid, session=session,
+                       claims=claims)
+        if ans.get("generation") != 0:
+            raise Refused("attach-answer-malformed", repr(ans.get("generation"))[:32])
+    finally:
+        leased.release()           # §3.5: only after ATTACH answers or prepare gives up
+    if seams.wake_reaper is not None:
+        seams.wake_reaper()
+    else:
+        wake_reaper(seams.R)
+    seams.at("session-dirs")
+    make_session_dirs(ctx, session, session_dir_rows(slot, ids))
+    staging = make_staging(ctx, session)
+    out: Dict[str, object] = {"format": PREPARE_RESULT_FORMAT, "session": session, "slot": R.slot_obj(slot),
+                              "staging": str(staging)}
+    if slot.slot_class == "egress":
+        out["gwport"] = RD.gwport_for(seams.host, slot)
+    return out
+
+
+# --- render (§5.1, in its ORDER (1)-(6)) ----------------------------------------------------------------------------
+
+@dataclass
+class RenderRun:
+    """One render's moving parts: the generation it holds, the front it started (killed on any later refusal)."""
+
+    ctx: Ctx
+    alloc: R.Alloc
+    blob: RenderBlob
+    generation: int = 0
+    facts: Optional[RD.RenderFacts] = None
+    front_uid: Optional[int] = None
+    front_pid: Optional[int] = None
+    front_start: Optional[int] = None
+    go_w: int = -1
+
+    @property
+    def egress(self) -> bool:
+        return self.alloc.slot.slot_class == "egress"
+
+
+def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
+    """The alloc facts ``render.render`` needs (§7.1: root acts on alloc only), plus the base map's route types,
+    the slot's /var/folders (macOS), ``TERM`` from the supervisor's env when it is a plain terminal name, and the
+    hook templates the blob names (a missing one is refused by name in ``render.check_facts``)."""
+    seams = ctx.seams
+    slot = alloc.slot
+    egress = slot.slot_class == "egress"
+    owner = alloc.slot_uid if egress else alloc.child_uid
+    assert owner is not None
+    folders: Tuple[str, ...] = ()
+    if seams.host == "darwin":
+        folders = (seams.var_folders(owner, owner),) if egress else \
+            (seams.var_folders(owner, owner), seams.var_folders(alloc.slot_uid, alloc.slot_gid))
+    term = ctx.env.get("TERM")
+    if term is not None and not RD._TERM_RE.fullmatch(term):
+        term = None
+    return RD.RenderFacts(
+        host=seams.host, session=alloc.session, slot=slot, kind=alloc.kind, vendor=alloc.vendor, auth=alloc.auth,
+        slot_uid=owner, slot_gid=owner, gwport=RD.gwport_for(seams.host, slot) if egress else None,
+        route_types=base_route_types(ctx.store), term=term, var_folders=folders,
+        driver_uid=None if egress else alloc.slot_uid, driver_gid=None if egress else alloc.slot_gid,
+        hook_templates={k: v for k, v in seams.hook_templates.items() if k in blob.hooks})
+
+
+def render_step1_cas_rendering(run: RenderRun) -> None:
+    """(1) CAS ALLOCATED -> RENDERING. An ALLOCATED record is always generation 0 (ATTACH creates it there and
+    any later write moves it out of ALLOCATED or ends its lease). Refused = stop: nothing started."""
+    ans = run.ctx.call("CAS", session=run.alloc.session, generation=0, **{"from": R.ALLOCATED, "to": R.RENDERING},
+                       fields={})
+    run.generation = int(ans["generation"])
+
+
+def render_step2_policy(run: RenderRun) -> None:
+    """(2) Validate the (class, kind, vendor, auth, routes, hooks) matrix and write the policy into alloc with
+    ``front:{uid, pending:true}`` (egress), fsync. DECISION: ``incarnation`` = the slot's ``lease_seq``, unique per
+    lease of the slot (the contract types it nowhere; records.py reads it as a uint)."""
+    ctx, a, blob = run.ctx, run.alloc, run.blob
+    facts = render_facts(ctx, a, blob)
+    RD.check_facts(blob, facts)
+    run.facts = facts
+    if run.egress:
+        run.front_uid = slot_ids(ctx, a.slot)[a.slot.accounts[1]]
+    egress_routes = tuple(r for r in blob.routes if facts.route_types[r] == "egress")
+    policy = R.AllocPolicy(routes=tuple(blob.routes), egress_routes=egress_routes,
+                           queue_grant="levain_queue" in blob.hooks, hooks=frozenset(blob.hooks),
+                           incarnation=a.lease_seq, model=blob.model, verifier_steps=blob.verifier_steps,
+                           front=R.Front(run.front_uid, True) if run.egress else None)
+    run.alloc = replace(a, policy=policy)
+    write_alloc(ctx, run.alloc)
+
+
+def render_layer_rows(slot: SlotId, owner_gid: int) -> List[DirRow]:
+    """§2.1 rows ``render`` makes: ``<S>/in/`` root : the slot (verifier: the child) 0750; ``<S>/root/`` root : the
+    slot 0750 (verifier root : root 0755, as a none-class layer is world-readable, §2.1). DECISION: ``root/hooks/``
+    takes ``root/``'s row."""
+    if slot.slot_class == "egress":
+        layer = (0, owner_gid, 0o750)
+    else:
+        layer = (0, 0, 0o755)
+    return [DirRow("in", 0, owner_gid, 0o750), DirRow("root", *layer), DirRow("root/hooks", *layer)]
+
+
+def render_step3_files(run: RenderRun) -> None:
+    """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``);
+    then ``<S>/root/*`` and the onboarding pre-seed from ``render.render``, each a fresh file with its §2.1 row;
+    then staging is emptied, only now that every staged file's destination is durable."""
+    ctx, a = run.ctx, run.alloc
+    seams = ctx.seams
+    facts = run.facts
+    assert facts is not None
+    rendered = RD.render(run.blob, facts)
+    S = ("live", a.session)
+    for row in render_layer_rows(a.slot, facts.slot_gid):
+        *parent, name = row.rel.split("/")
+        with ctx.store.dir(*S, *parent) as pfd:
+            ctx.store.mkdir(pfd, name, row.uid, row.gid, row.mode, f"live/{a.session}/{row.rel}")
+            seams.fsync(pfd)
+    with ctx.store.dir("staging", a.session, trusted=False) as staging, ctx.store.dir(*S, "in") as dest:
+        ST.stage_bundle(staging, dest, staging_uid=a.staging_uid, staging_gid=seams.user_gid(a.staging_uid),
+                        dest_gid=facts.slot_gid, run_as=seams.stage_run_as, fsync=seams.fsync,
+                        chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+    for f in rendered.files:
+        *parent, name = f.path.split("/")
+        with ctx.store.dir(*S, *parent) as pfd:
+            ctx.store.create_file(pfd, name, FileRow(f"live/{a.session}/{f.path}", f.data, f.uid, f.gid, f.mode))
+            seams.fsync(pfd)
+    # DECISION: only the names this render staged are removed (the verifier's driver_input.json is session 2f's to
+    # stage, so it is never removed here unstaged); the dir itself is END's ("staging deleted").
+    with ctx.store.dir("staging", a.session, trusted=False) as staging:
+        os.unlink(ST.BUNDLE_NAME, dir_fd=staging)
+        seams.fsync(staging)
+
+
+def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
+    """wall's FRONT path (§8.2 last sentence): drop + assert to ``_levain_gw<n>``, no profile, no ``asuser``; the
+    program is ``seams.front_module`` and its one extra fd is the GO pipe on :data:`GO_FD`."""
+    ctx, a = run.ctx, run.alloc
+    seams = ctx.seams
+    gw = a.slot.accounts[1]
+    spec = wall.launch_spec(seams.host, "front", slot=a.slot, session=a.session, ids={gw: run.front_uid},
+                            shared={"levain-gwfronts": seams.group_gid("levain-gwfronts")},
+                            extra_env={GO_FD_ENV: str(GO_FD)}, keep_fds=(GO_FD,), front_module=seams.front_module)
+    if seams.host == "darwin":
+        argv = wall.macos_launch_argv(spec)
+    else:
+        argv = wall.linux_launch_argv(spec, slot=a.slot, session=a.session, kind=a.kind).argv
+    return argv, spec.to_json()
+
+
+def render_step4_front(run: RenderRun) -> None:
+    """(4) egress only: the front DETACHED, blocked reading the GO pipe; its ``pid`` + ``start`` into alloc, fsync."""
+    if not run.egress:
+        return
+    seams = run.ctx.seams
+    argv, spec_json = front_launch(run)
+    go_r, go_w = os.pipe()
+    try:
+        run.front_pid = seams.spawn_front(argv, spec_json, go_r)
+        run.go_w = go_w
+    except BaseException:
+        os.close(go_w)
+        raise
+    finally:
+        os.close(go_r)
+    ident = seams.proc_identity(run.front_pid)
+    if ident is None:
+        raise Refused("front-start-unknown", str(run.front_pid))
+    run.front_start = ident[1]
+    pol = run.alloc.policy
+    assert pol is not None and pol.front is not None
+    run.alloc = replace(run.alloc, policy=replace(pol, front=replace(pol.front, pid=run.front_pid,
+                                                                     start=run.front_start)))
+    write_alloc(run.ctx, run.alloc)
+
+
+def mint_claims(run: RenderRun) -> Dict[str, object]:
+    """§3.3 MINT claims, from alloc."""
+    pol = run.alloc.policy
+    assert pol is not None
+    claims: Dict[str, object] = {"routes": list(pol.routes), "queue_grant": pol.queue_grant,
+                                 "incarnation": pol.incarnation, "egress_routes": list(pol.egress_routes)}
+    if pol.model is not None:
+        claims["model"] = pol.model
+    if run.egress:
+        claims["front"] = {"uid": run.front_uid, "pid": run.front_pid, "start": run.front_start}
+    return claims
+
+
+def render_step5_mint(run: RenderRun) -> None:
+    """(5) MINT with the claims (CONTROL registers the front with keys before it answers)."""
+    ans = run.ctx.call("MINT", session=run.alloc.session, generation=run.generation, claims=mint_claims(run))
+    run.generation = int(ans["generation"])
+
+
+def render_step5b_arm(run: RenderRun) -> None:
+    """(5b) egress only: FRONT-ARM, wait for its answer, then the go byte and the pipe closed: only now may the
+    front open ``H``. DECISION: a go byte the pipe refuses (the front is gone) is ``front-lost``."""
+    if not run.egress:
+        return
+    run.ctx.call("FRONT-ARM", session=run.alloc.session, generation=run.generation)
+    try:
+        write_all(run.go_w, GO_BYTE)
+    except OSError:
+        raise Refused("front-lost", str(run.front_pid)) from None
+    finally:
+        os.close(run.go_w)
+        run.go_w = -1
+
+
+def render_step6_cas_rendered(run: RenderRun) -> None:
+    """(6) CAS RENDERING -> RENDERED."""
+    ans = run.ctx.call("CAS", session=run.alloc.session, generation=run.generation,
+                       **{"from": R.RENDERING, "to": R.RENDERED}, fields={})
+    run.generation = int(ans["generation"])
+
+
+RENDER_STEPS: Tuple[Tuple[str, Callable[[RenderRun], None]], ...] = (
+    ("cas-rendering", render_step1_cas_rendering),
+    ("policy", render_step2_policy),
+    ("files", render_step3_files),
+    ("front", render_step4_front),
+    ("mint", render_step5_mint),
+    ("arm", render_step5b_arm),
+    ("cas-rendered", render_step6_cas_rendered),
+)
+
+
+def kill_front(run: RenderRun) -> None:
+    """The helper SIGKILLs the front IT started, uid + start checked first (§5.1). DECISION: the uid may still be
+    root, the stage not yet dropped: the helper is the front's unreaped parent, so the pid cannot be another
+    process's, and the start time matches."""
+    if run.go_w >= 0:
+        os.close(run.go_w)              # the front reads EOF: it exits without opening H
+        run.go_w = -1
+    if run.front_pid is None:
+        return
+    seams = run.ctx.seams
+    ident = seams.proc_identity(run.front_pid)
+    if ident is not None and (run.front_start is None or ident[1] == run.front_start) \
+            and ident[0] in (run.front_uid, 0):
+        seams.kill(run.front_pid)
+
+
+def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]:
+    assert req.session is not None
+    a = read_alloc(ctx, req.session)
+    if a.policy is not None:
+        raise Refused("not-allocated", req.session)
+    run = RenderRun(ctx, a, blob)
+    try:
+        for name, step in RENDER_STEPS:
+            ctx.seams.at(name)
+            step(run)
+    except BaseException:
+        kill_front(run)
+        raise
+    return {}
+
+
+# --- resume, status ---------------------------------------------------------------------------------------------------
+
+def state_generation(ctx: Ctx, session: str) -> int:
+    """The state record's generation, read as a HINT for root's CAS (root never acts on a state field, §7.1): a
+    forged one only makes CONTROL refuse the CAS ``stale-generation``."""
+    data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
+    if data is None:
+        raise Refused("no-session", session)
+    return R.parse_state(data).generation
+
+
+def resume(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """BRAKED -> ACTIVE, only above V5. DECISION: the CAS clears ``brake_reason``."""
+    assert req.session is not None
+    read_alloc(ctx, req.session)
+    if ctx.seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:
+        raise Refused("below-floor", "free space under V5")
+    gen = state_generation(ctx, req.session)
+    ctx.call("CAS", session=req.session, generation=gen, **{"from": R.BRAKED, "to": R.ACTIVE},
+             fields={"brake_reason": None})
+    return {}
+
+
+def status(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """Read-only (§5.1): the caller's alloc records (``supervisor_uid == SUDO_UID``; dispatch: ticketed only).
+    DECISION: the answer is ``{records:[levain-alloc/1…]}`` sorted by session; a named session the caller does not
+    hold is ``no-session``."""
+    if req.session is not None:
+        return {"records": [R.alloc_record(read_alloc(ctx, req.session))]}
+    out = []
+    with ctx.store.dir("alloc") as fd:
+        names = sorted(os.listdir(fd))
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".intent.json") or not SESSION_RE.fullmatch(name[:-5]):
+            continue
+        try:
+            out.append(R.alloc_record(read_alloc(ctx, name[:-5])))
+        except Refused as e:
+            if e.name != "no-session":
+                raise
+    return {"records": out}
+
+
+#: verb -> handler(ctx, request, stdin blob) -> the ok line's fields. Lanes register their verbs here.
+VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
+    "prepare": prepare, "render": render, "resume": resume, "status": status,
+}
+
+
+# --- main ----------------------------------------------------------------------------------------------------------------
+
+def _sudo_uid(env: Mapping[str, str]) -> int:
+    raw = env.get("SUDO_UID")
+    if type(raw) is not str or not _SUDO_UID_RE.fullmatch(raw):      # never root, one spelling, ASCII only
+        raise Refused("no-sudo-uid", "SUDO_UID")
+    return int(raw)
+
+
+def _caller(seams: Seams, sudo_uid: int, operator_uid: int) -> str:
+    if sudo_uid == operator_uid:
+        return OPERATOR
+    try:
+        if sudo_uid == seams.account_uid("_levain_dispatch"):
+            return DISPATCH
+    except Refused:
+        pass
+    raise Refused("unknown-caller", str(sudo_uid))
+
+
+def run(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Seams) -> Dict[str, object]:
+    """The verb's ok fields, or :class:`Refused`. Reads only until the verb's first act."""
+    if seams.euid() != 0:
+        raise Refused("not-root", "the runtime helper runs as root")
+    sudo_uid = _sudo_uid(env)
+    store = Store(seams)
+    ctx = None
+    try:
+        operator_uid = read_operator_uid(store)
+        caller = _caller(seams, sudo_uid, operator_uid)
+        req = parse_runtime_argv(argv, configured_slots=configured_slots(store), caller=caller)
+        blob = parse_stdin(req.verb, stdin)
+        bind_stdin(req, blob)
+        handler = VERB_HANDLERS.get(req.verb)
+        if handler is None:
+            raise Refused(f"verb-unbuilt:{req.verb}", req.verb)
+        ctx = Ctx(seams, store, sudo_uid, caller, operator_uid, env)
+        return handler(ctx, req, blob)
+    finally:
+        if ctx is not None:
+            ctx.close()
+        store.close()
+
+
+def main(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Optional[Seams] = None,
+         out=None, err=None) -> int:
+    """Exactly one canonical JSON line on ``out``; the refusal's detail (never on stdout) on ``err``."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    try:
+        fields = run(argv, stdin=stdin, env=env, seams=seams or Seams())
+        line = ok_line(fields)
+    except Refused as e:
+        err.write(f"levain runtime-helper: refused {e.name}: {e.detail!r}\n")
+        out.write(refusal_line(e))
+        out.flush()
+        return EXIT_REFUSED
+    except Exception as e:   # noqa: BLE001 - one line on stdout, whatever went wrong
+        err.write(f"levain runtime-helper: internal error: {type(e).__name__}: {e}\n")
+        out.write(refusal_line(Refused("internal")))
+        out.flush()
+        return EXIT_INTERNAL
+    out.write(line)
+    out.flush()
+    return EXIT_OK
+
+
+def _read_stdin() -> bytes:
+    """At most the grammar's cap + 1 bytes (parse_stdin refuses the extra one by size). DECISION: a verb with no
+    stdin reads none, so a terminal on stdin never blocks it."""
+    data = bytearray()
+    fd = sys.stdin.fileno()
+    while len(data) <= 64 * 1024:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
+__all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
+           "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
+           "RenderRun", "SLOT_STATE_FORMAT", "SLOT_STATES", "Seams", "SlotState", "SlotView", "Store",
+           "VERB_HANDLERS", "configured_slots", "kill_front", "lease_slot", "main", "parse_slot_state", "pick_slot",
+           "prepare", "proc_identity", "read_view", "render", "render_layer_rows", "resume", "run",
+           "session_dir_rows", "slot_state_bytes", "spawn_front", "status"]
+
+
+if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
+    _args = sys.argv[1:]
+    _stdin = _read_stdin() if _args[:1] in (["prepare"], ["render"]) else b""
+    raise SystemExit(main(_args, stdin=_stdin, env=dict(os.environ)))
