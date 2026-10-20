@@ -881,6 +881,14 @@ class JobStore:
                                     json.dumps({"runs": template.k}, sort_keys=True))
             out = self._load(conn, job.id)
         assert out is not None
+        if out.state == "failed":
+            # a failed job can never land, so its staged refs (this run's and every run that passed before it) are
+            # clutter in the operator's repo: deleted once the failure is durable; a record keeps its sha, and only
+            # ever is read. A ref git keeps, or git not answering, leaves clutter and nothing worse, so it never raises
+            try:
+                adopt._delete_staged(repo, job.id)
+            except adopt.GitFault:
+                pass
         return out
 
     def run_records(self, job_id: str) -> list[ArtifactRecord]:

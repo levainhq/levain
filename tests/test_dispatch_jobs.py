@@ -965,6 +965,15 @@ def test_a_fail_writes_its_record_and_fails_the_job_naming_the_step(store, repo)
     assert [(r.run, r.verifier["result"]) for r in store.run_records(job.id)] == [(0, "fail")]
 
 
+def test_a_failed_job_leaves_no_staged_ref_even_for_a_run_that_passed_first(store, repo):
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    assert len(staged_refs(repo, job)) == 1
+    out = verify(store, repo, job, 1, verdicts=("fail", "pass"))
+    assert out.state == "failed" and staged_refs(repo, job) == []
+    assert [r.run for r in store.run_records(job.id)] == [0, 1]
+
+
 def test_a_refused_event_fails_the_job_with_its_name_and_no_record(store, repo):
     from tests import test_dispatch_verifier_report as tvr
 
