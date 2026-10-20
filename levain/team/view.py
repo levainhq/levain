@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from typing import Any
 
+from levain.cockpit import display_safe
 from levain.http_guards import GuardedHandler
 from levain.web_server import load_web_asset
 
@@ -154,7 +155,9 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
 # .row / .etype / .sid / .tier / .clause. team_view.css only adds what the cockpit has no class for.
 
 def _e(s: Any) -> str:
-    return html.escape(str(s), quote=True)
+    # every field here is peer-written (a signed entry's owner, summary, reason, paths): hidden characters are shown as
+    # markers before escaping, so `client:acme\u200b` cannot pass for `client:acme` (entry_v1's schema is frozen)
+    return html.escape(display_safe.visible(str(s)), quote=True)
 
 
 def _row(c: dict, why: str = "", paths: bool = True) -> str:
