@@ -661,12 +661,22 @@ def slot_state_bytes(s: SlotState) -> bytes:
     if s.session is not None:
         rec["session"] = s.session
     data = canon.canonical_bytes(rec)
-    parse_slot_state(data)
+    _parse_slot_state(data)                 # the writer refuses with the specific name
     return data
 
 
 def parse_slot_state(data: bytes) -> SlotState:
-    """Strict parse of a ``levain-slot-state/1`` file."""
+    """Strict parse of a ``levain-slot-state/1`` file. Every refusal is ``slot-state-malformed`` (the head's ruling:
+    one name for "this slot's state file cannot be trusted"), with the specific reason in the detail."""
+    try:
+        return _parse_slot_state(data)
+    except Refused as e:
+        if e.name == "slot-state-malformed":
+            raise
+        raise Refused("slot-state-malformed", f"{e.name}: {e.detail}" if e.detail else e.name) from None
+
+
+def _parse_slot_state(data: bytes) -> SlotState:
     obj = _parse_canonical(data, "slot state")
     _keys(obj, SLOT_STATE_KEYS, SLOT_STATE_KEYS - {"session"}, "slot state")
     if obj["format"] != SLOT_STATE_FORMAT:

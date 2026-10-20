@@ -254,12 +254,12 @@ def write_initial_slot_state(store: Path, slot: SlotId, *, clock: Callable[[], f
     with pool_lock(store, waits=waits):
         raw = R.read_record(path)
         if raw is not None:
-            have = RH.parse_slot_state(raw, slot)
+            have = RH.parse_slot_state_of(raw, slot)
             return True, f"{slot.tag} already has its state ({have.state}, rev {have.rev})"
-        state = RH.SlotState(slot, rev=0, lease_seq=0, state="reusable",
+        state = R.SlotState(slot, rev=0, lease_seq=0, state="reusable",
                              dispatch_eligible=not _operator_held(slot.slot_dir(Path(store))),
                              changed_at=R.timestamp(clock()))
-        R.write_durably(path, RH.slot_state_bytes(state), mode=0o644)
+        R.write_durably(path, R.slot_state_bytes(state), mode=0o644)
     return True, ""
 
 

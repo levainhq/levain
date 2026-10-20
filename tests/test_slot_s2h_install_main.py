@@ -253,12 +253,12 @@ def test_state_file_eligibility_and_rerun_never_resets(tmp_path):
     (e0.slot_dir(L) / "keep").mkdir()
     (e0.slot_dir(L) / "keep" / ".credentials.json").write_text("{}")
     assert IH.write_initial_slot_state(L, e0)[0]
-    assert RH.parse_slot_state((e0.slot_dir(L) / "state").read_bytes(), e0).dispatch_eligible is False
-    newer = RH.SlotState(e1, rev=7, lease_seq=3, state="leased", dispatch_eligible=True, changed_at=TS, session=S1)
-    (e1.slot_dir(L) / "state").write_bytes(RH.slot_state_bytes(newer))
+    assert RH.parse_slot_state_of((e0.slot_dir(L) / "state").read_bytes(), e0).dispatch_eligible is False
+    newer = R.SlotState(e1, rev=7, lease_seq=3, state="leased", dispatch_eligible=True, changed_at=TS, session=S1)
+    (e1.slot_dir(L) / "state").write_bytes(R.slot_state_bytes(newer))
     ok, why = IH.write_initial_slot_state(L, e1)
     assert ok and "already has its state (leased, rev 7)" in why
-    assert RH.parse_slot_state((e1.slot_dir(L) / "state").read_bytes(), e1) == newer
+    assert RH.parse_slot_state_of((e1.slot_dir(L) / "state").read_bytes(), e1) == newer
     (e1.slot_dir(L) / "state").write_bytes(b"{}")
     with pytest.raises(Refused) as ei:
         IH.write_initial_slot_state(L, e1)
@@ -472,8 +472,8 @@ def test_gather_replenish_reads_the_slots_in_service(tmp_path):
     for s in (e0, e1, v0):
         s.slot_dir(L).mkdir()
     IH.write_initial_slot_state(L, e0)
-    retired = RH.SlotState(e1, rev=4, lease_seq=2, state="retired", dispatch_eligible=True, changed_at=TS)
-    (e1.slot_dir(L) / "state").write_bytes(RH.slot_state_bytes(retired))
+    retired = R.SlotState(e1, rev=4, lease_seq=2, state="retired", dispatch_eligible=True, changed_at=TS)
+    (e1.slot_dir(L) / "state").write_bytes(R.slot_state_bytes(retired))
     (state / "install-intent").unlink()
     g = gather_facts(parse_install_argv(["replenish"]), "darwin", OP_UID, run=run, store_seams=_store_seams(L),
                      state_dir=state, user_name=lambda uid: OP)

@@ -66,10 +66,10 @@ def test_slot_state_round_trip_and_refusals():
     assert e.value.name == "bad-value"                       # leased names its session
     with pytest.raises(Refused) as e:
         R.parse_slot_state(data.replace(b'"leased"', b'"borrowed"'))
-    assert e.value.name == "bad-value"
+    assert e.value.name == "slot-state-malformed" and "bad-value" in e.value.detail
     with pytest.raises(Refused) as e:
         R.parse_slot_state(data.replace(b"{", b"{ ", 1))
-    assert e.value.name in ("record-malformed", "record-not-canonical")
+    assert e.value.name == "slot-state-malformed"
 
 
 # --- render ------------------------------------------------------------------------------------------------
