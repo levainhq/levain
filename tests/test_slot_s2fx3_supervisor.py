@@ -55,6 +55,16 @@ START_HOOKS = r'''
             os.write(1, b"Q" * 65536)
         line({"exit": 0, "ok": True})
         sys.exit(0)
+    if mode == "stall":
+        import tty
+        tty.setraw(0)
+        os.write(1, b"Q" * 200000)
+        open(os.path.join(store, "raw"), "w").close()
+        while b"q" not in os.read(0, 64):
+            pass
+        open(os.path.join(store, "quit"), "w").close()
+        line({"exit": 0, "ok": True})
+        sys.exit(0)
     if mode in ("forever", "immortal"):
         import signal
         if mode == "immortal":
@@ -285,6 +295,39 @@ def test_a_slow_terminal_gets_every_byte(tmp_path: Path, monkeypatch: pytest.Mon
     assert got.count(b"Q") == n
 
 
+@pytest.mark.timeout(60)
+def test_input_still_reaches_the_vendor_while_his_terminal_is_stalled(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    # The terminal takes nothing until the vendor has seen the operator's key: a relay blocked in a write to it
+    # would never forward the key.
+    r = rig(tmp_path, monkeypatch, FAKE_START="stall")
+    out_r, out_w = os.pipe()
+    r.seams.stdout = out_w
+    seen, got = [], bytearray()
+
+    def reader() -> None:
+        deadline = time.monotonic() + 10
+        while not (r.store / "quit").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        seen.append((r.store / "quit").exists())
+        while True:
+            chunk = os.read(out_r, 65536)
+            if not chunk:
+                return
+            got.extend(chunk)
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    r.feed(b"q")
+    try:
+        assert r.run() == 0
+    finally:
+        os.close(out_w)
+    t.join(20)
+    os.close(out_r)
+    assert seen == [True]
+    assert got.count(b"Q") == 200000
+
+
 # --- g4-4 / g4-6: the filter --------------------------------------------------------------------------------------------
 
 def _run(chunks: list) -> bytes:
@@ -451,6 +494,32 @@ def test_relay_ends_when_the_helper_exits_though_the_operator_keeps_typing(tmp_p
         stop.set()
     assert time.monotonic() - t0 < 30
     assert "claude exited 3" in r.stderr()
+
+
+@pytest.mark.timeout(60)
+def test_relay_ends_on_the_drained_master_when_no_hangup_comes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                                               ) -> None:
+    # With the helper as the pty's session leader, its exit hangs the pty up and the master reads EIO. Without a
+    # hangup (no controlling terminal), only "exited, and a read pass found the master empty" ends the relay.
+    r = rig(tmp_path, monkeypatch)
+    real = r.seams.spawn
+    r.seams.spawn = lambda argv, **kw: real(argv, **{**kw, "ctty": False})
+    stop = threading.Event()
+
+    def typist() -> None:
+        while not stop.is_set():
+            try:
+                os.write(r.in_w, b"k")
+            except OSError:
+                return
+            time.sleep(0.05)
+    threading.Thread(target=typist, daemon=True).start()
+    t0 = time.monotonic()
+    try:
+        assert r.run() == 0
+    finally:
+        stop.set()
+    assert time.monotonic() - t0 < 30
 
 
 @pytest.mark.timeout(60)
