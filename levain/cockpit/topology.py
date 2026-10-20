@@ -48,7 +48,7 @@ from typing import Any, Callable
 
 from levain.cockpit import activity as act
 from levain.cockpit.display_safe import visible
-from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
+from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, opened_day, parse_date
 from levain.cockpit.results import Fault, Read, Result
 
 __all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "SPORES_MAX", "STALL_S", "topology_reader"]
@@ -434,8 +434,7 @@ def _age_days(created: Any, now: datetime) -> int | None:
     """Whole calendar days from the day a spore was opened to the provider's own day (the install's local day, the one the
     Open loops panel counts in): the number the page draws, so no browser clock or zone decides it. None when the store has no
     usable date."""
-    t = act._parse(created) if isinstance(created, str) else None
-    opened = t.astimezone().date() if t is not None else parse_date(created)
+    opened = opened_day(created)
     if opened is None:
         return None
     return max(0, (now.astimezone().date() - opened).days)

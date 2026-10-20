@@ -346,3 +346,30 @@ def test_the_decisions_tile_draws_the_glance_lines_and_not_a_generic_first_line_
             {"eval": f"JSON.stringify([...{TILE}.querySelectorAll('.sub')].map(e => [e.className, e.textContent]))"}])["values"]
     subs = json.loads(out[-1])
     assert [c for c, _t in subs] == ["sub glance-top", "sub glance-sum"], subs
+
+
+def test_the_two_server_views_count_a_spores_age_from_the_same_local_day(monkeypatch) -> None:
+    """L3 r2 (codex): `2026-10-20T00:30:00Z` is 10-19 in New York; topology and the Open loops row must both say 1 day old."""
+    import os
+    from datetime import date, datetime, timezone
+    from types import SimpleNamespace
+
+    from levain.cockpit import providers as prov
+    from levain.cockpit import topology as topo
+
+    old = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        s = SimpleNamespace(id="spore-9", text="t", tier="hot", created="2026-10-20T00:30:00Z", disposition="loop", domain="d",
+                            salience=1, type="x", seen="", next=None, pointer=None, origin_key="")
+        now = datetime(2026, 10, 20, 16, 0, tzinfo=timezone.utc)      # 12:00 in New York
+        row = prov._spore_row(s, date(2026, 10, 20))
+        task = topo._spore_tasks([s], now)[0]
+        assert row.facets["age_days"] == task["age_days"] == 1, (row.facets["age_days"], task["age_days"])
+    finally:
+        if old is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", old)
+        time.tzset()

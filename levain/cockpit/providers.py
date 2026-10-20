@@ -22,7 +22,7 @@ from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
-from levain.cockpit.registry import parse_date
+from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
     CLASS_A,
@@ -126,7 +126,7 @@ def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
         facets["held"] = True
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
-    created = parse_date(s.created)
+    created = opened_day(s.created)
     if created and created <= today:
         facets["age_days"] = (today - created).days
     return RowIn(id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets, stored=spore_stored(s))

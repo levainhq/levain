@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable
 
 from levain.cockpit.results import RowIn
@@ -170,6 +170,22 @@ def parse_date(v: Any) -> date | None:
         return date.fromisoformat(m.group(0))
     except ValueError:
         return None
+
+
+def opened_day(v: Any) -> date | None:
+    """The one rule for "the day a spore was opened": the install's LOCAL calendar day of the stored instant (an ISO
+    timestamp with a zone, parsed and converted), a date-only or zone-less string as written, None when unusable. Every
+    server view that counts a spore's age calls this, so none can count from a different day."""
+    if not isinstance(v, str):
+        return None
+    if v and len(v) <= 40:
+        try:
+            t = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+        except ValueError:
+            t = None
+        if t is not None and t.tzinfo is not None:
+            return t.astimezone().date()
+    return parse_date(v)
 
 
 def _salience(row: RowIn) -> int:
