@@ -194,7 +194,7 @@ def _parse_budget(text: str | None) -> dict[str, int]:
     for item in text.split(","):
         key, sep, val = item.partition("=")
         key = key.strip()
-        if not sep or key not in out or not val.strip().isdigit():
+        if not sep or key not in out or not (val.strip().isascii() and val.strip().isdigit()):
             raise CoordError(f"--budget is {','.join(k + '=N' for k in env.BUDGET_KEYS)}, any of them (got "
                              f"{item[:40]!r})")
         out[key] = int(val)
@@ -425,7 +425,7 @@ def _confirm(args: argparse.Namespace, label: str, prompt: str) -> None:
     _need_terminal(args, label)
     try:
         answer = dcli._ask(args, f"{prompt}? [y/N] ")
-    except EOFError:
+    except (EOFError, KeyboardInterrupt):
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
         raise CoordError("not confirmed; nothing was signed or stored")
@@ -539,11 +539,12 @@ def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
     print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
     _need_terminal(args, "signing")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "envelope sign")
-    authority = _snapshot(args, store)
-    _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(authority, signer_fp)))
+    _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(_snapshot(args, store), signer_fp)))
     # the clock is read only now: the store refuses a signed_at far from its own, and a slow reader is not a stale one
     payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())
     signature = dcli._sign_bytes(sign, env.sign_message(payload))
+    # and the authority log too: the prompt's snapshot only names the key; a key revoked while it waited signs nothing
+    authority = _snapshot(args, store)
     stored, created = store.accept_envelope(text, payload, signature, authority=authority)
     sigfile = args.file.expanduser().with_name(args.file.name + ".sig.json")
     record: dict[str, Any] = {"payload": payload, "signature": signature}
@@ -567,14 +568,14 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
         raise CoordError("the signature file is not JSON") from None
     if not isinstance(sig, dict) or not {"payload", "signature"} <= set(sig) <= {"payload", "signature", "note"}:
         raise CoordError('the signature file is {"payload": ..., "signature": ...}')
-    authority = _snapshot(args, store)
     payload = sig["payload"]
     fp = payload.get("signer_fp") if isinstance(payload, dict) else None
     print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
     if isinstance(fp, str):
-        print(f"signed by {fp[:80]} ({_signer_class(authority, fp)})"
+        print(f"signed by {fp[:80]} ({_signer_class(_snapshot(args, store), fp)})"
               + (f", {str(sig['note'])[:80]}" if "note" in sig else ""), file=sys.stderr if args.json else out,
               flush=True)
+    authority = _snapshot(args, store)          # read after the output, which can block, right before the write
     stored, created = store.accept_envelope(text, sig["payload"], sig["signature"], authority=authority)
     _accepted(args, out, store, stored, created, authority)
     return 0
@@ -645,18 +646,27 @@ def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore
         spec = json.loads(_read_file(args.envelope, 64 * 1024, "the envelope spec"))
     except ValueError:
         raise CoordError("the envelope spec is not JSON") from None
+    if args.outbox_id is not None and (sent := store.drop_by_outbox(args.outbox_id)) is not None:
+        # a resend returns the stored drop as it was, so an envelope signed now would never be read
+        raise CoordError(f"outbox id {args.outbox_id[:60]} is already delivered as {sent.drop_id}; nothing new is "
+                         f"signed for it (levain drops show {sent.drop_id})")
     body = _spec_body(spec, words, source, store)
     text = canonical(body)
-    env.parse_body(text)
+    body = store.check_body(text)          # a body the store can only refuse is never shown for signing
     print(_view(body, store, words=words), file=sys.stderr if args.json else out, flush=True)
     _need_terminal(args, "a drop with an envelope")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "a drop with an envelope")
-    authority = _snapshot(args, store)
-    _confirm(args, "a drop with an envelope", _prompt(body, signer_fp, _signer_class(authority, signer_fp)))
+    _confirm(args, "a drop with an envelope",
+             _prompt(body, signer_fp, _signer_class(_snapshot(args, store), signer_fp)))
     payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())          # after the answer, not before
     signature = dcli._sign_bytes(sign, env.sign_message(payload))
+    authority = _snapshot(args, store)          # after the answer too: a key revoked while it waited signs nothing
     drop, created = store.accept_drop(words, surface="cli", outbox_id=args.outbox_id, source=source,
                                       envelope=(text, payload, signature), authority=authority)
+    if not created and drop.envelope_id != body["envelope_id"]:
+        # the same outbox id delivered between the check above and this write
+        raise CoordError(f"outbox id {drop.outbox_id[:60]} was delivered as {drop.drop_id} while you signed; the "
+                         f"envelope you signed was not read and nothing was written (levain drops show {drop.drop_id})")
     refused = None if drop.envelope_id else (store.envelope_refused(drop.drop_id) or "the envelope was not taken")
     how = " (signed with --yes, no prompt)" if args.yes else ""
     line = f"envelope: taken ({drop.envelope_id}){how}" if drop.envelope_id \

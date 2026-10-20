@@ -74,12 +74,15 @@ ENVELOPE_SCHEMA: tuple[str, ...] = (
     *_append_only("envelopes", "an envelope"),
     *_append_only("envelope_binds", "an envelope bind"),
     *_append_only("envelope_attenuations", "an attenuation"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
+    "CREATE TRIGGER IF NOT EXISTS gseq_no_replace BEFORE INSERT ON gseq WHEN EXISTS (SELECT 1 FROM gseq WHERE "
+    "gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'the sequence is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS envelopes_no_replace BEFORE INSERT ON envelopes WHEN EXISTS (SELECT 1 FROM "
-    "envelopes WHERE envelope_id = NEW.envelope_id OR rowid = NEW.rowid) "
+    "envelopes WHERE envelope_id = NEW.envelope_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an envelope is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS envelope_binds_no_replace BEFORE INSERT ON envelope_binds WHEN EXISTS (SELECT 1 "
-    "FROM envelope_binds WHERE (envelope_id = NEW.envelope_id AND thread_id = NEW.thread_id) OR rowid = NEW.rowid) "
-    "BEGIN SELECT RAISE(ABORT, 'a bind is never replaced'); END",
+    "FROM envelope_binds WHERE (envelope_id = NEW.envelope_id AND thread_id = NEW.thread_id) OR gseq = NEW.gseq "
+    "OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a bind is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS envelope_attenuations_no_replace BEFORE INSERT ON envelope_attenuations WHEN "
     "EXISTS (SELECT 1 FROM envelope_attenuations WHERE gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an attenuation is never replaced'); END",
@@ -260,7 +263,16 @@ class EnvelopeStore(CoordStore):
     def accept_envelope(self, body_text: str, payload: Mapping[str, Any], signature: str, *,
                         authority: AuthoritySnapshot) -> tuple[Envelope, bool]:
         """Accept a WORDED envelope (the coordinator's echo, signed by you) bound to the thread revisions it names;
-        ``(envelope, True)``. The identical record again writes nothing: ``(stored, False)``."""
+        ``(envelope, True)``. The identical record again writes nothing: ``(stored, False)``, looked up before the
+        signature and disk checks, so a retry after a lost answer returns what was accepted even when its signer or a
+        branch has since gone (in force is decided at use, never by this record)."""
+        try:
+            with read_transaction(self._connect) as conn:
+                again = self._same_or_conflict(conn, self._parsed(body_text), payload, signature)
+        except (CoordError, TypeError, ValueError):
+            again = None          # not this exact record: the full checks below give the refusal
+        if again is not None:
+            return again, False
         body, signer_class = self._checked(body_text, payload, signature, authority)
         if body["origin"] != "worded":
             raise CoordError("a structured envelope arrives with its drop (accept_drop), never later")

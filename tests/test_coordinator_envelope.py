@@ -640,3 +640,37 @@ def test_a_generator_of_paths_is_checked_not_spent(ctx, structured_thread):
     _d, b, t = structured_thread
     refused = ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, scope=(ctx.path, (p for p in ["setup.py"])))
     assert refused is not None and "setup.py" in refused
+
+
+# C2 --final L3 (g1) -------------------------------------------------------------------------------------------------
+def test_final_exact_retry_of_an_accepted_envelope_returns_it_after_its_signer_is_revoked(ctx, keys, tmp_path):
+    root = tmp_path / "auth-later"
+    root.mkdir()
+    lg = Log(root, keys)
+    for name, cls in (("laptop", "laptop-presence"), ("phone", "display-phone")):
+        lg.enrol(name, cls)
+    d, t = ctx.plain_thread("retry after a lost answer")
+    _b, signed = ctx.worded(d, t)
+    first, created = ctx.store.accept_envelope(*signed, authority=lg.source())
+    assert created
+    lg.revoke("phone")
+    again, created = ctx.store.accept_envelope(*signed, authority=lg.source())
+    assert (again.envelope_id, created) == (first.envelope_id, False)
+    assert ctx.rows("SELECT COUNT(*) FROM envelopes") == [(1,)]
+
+
+def test_final_insert_or_replace_cannot_rewrite_the_sequence_an_envelope_or_a_bind(ctx, structured_thread):
+    _d, b, _t = structured_thread
+    conn = sqlite3.connect(ctx.store.path)
+    stmts = [
+        "INSERT OR REPLACE INTO gseq (gseq, at) VALUES (1, 'x')",
+        "INSERT OR REPLACE INTO envelopes SELECT 'ev-other', gseq, origin, drop_id, body, digest, payload, signature, "
+        "signer_fp, signer_class, supersedes, stop_at, accepted_at FROM envelopes",
+        "INSERT OR REPLACE INTO envelope_binds SELECT envelope_id, thread_id || 'x', rev, gseq, at FROM envelope_binds",
+    ]
+    for sql in stmts:
+        with pytest.raises(sqlite3.DatabaseError, match="never replaced"):
+            conn.execute(sql)
+    conn.rollback()
+    assert ctx.rows("SELECT envelope_id FROM envelopes") == [(b["envelope_id"],)]
+    assert len(ctx.rows("SELECT * FROM envelope_binds")) == 1

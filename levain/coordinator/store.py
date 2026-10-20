@@ -579,6 +579,12 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             return self._must_drop(conn, drop_id)
 
+    def drop_by_outbox(self, outbox_id: str) -> Drop | None:
+        """The drop stored under ``outbox_id``, or None."""
+        with read_transaction(self._connect) as conn:
+            row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            return None if row is None else self._drop(conn, row[0])
+
     def drops(self, limit: int = 50) -> list[Drop]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
             raise CoordError("limit is 1 to 1000")

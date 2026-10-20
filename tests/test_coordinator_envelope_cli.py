@@ -480,3 +480,83 @@ def test_l6_accept_prints_the_view_and_the_signer(run, repo, tmp_path, monkeypat
                                                                                   env.SIGN_NAMESPACE)}))
     out = run("envelope", "accept", str(f), str(s), "--data-root", run.root).out
     assert "NOT IN FORCE YET" in out and f"signed by {keys['phone'].fp} (display-phone)" in out
+
+
+# C2 --final L3 (g2) -------------------------------------------------------------------------------------------------
+@pytest.fixture
+def own_log(keys, tmp_path, capsys, qdir):
+    """A cockpit of this test's own (the module's is shared), so a key can be revoked mid-prompt."""
+    root = tmp_path / "own-cockpit"
+    root.mkdir()
+    log = Log(root, keys)
+    for name, cls in (("laptop", "laptop-presence"), ("phone", "display-phone"), ("stranger", "display-phone")):
+        log.enrol(name, cls)
+    return log, Run(capsys, qdir, root, keys)
+
+
+def test_final_a_key_revoked_while_the_prompt_waits_signs_nothing_into_force(repo, tmp_path, monkeypatch, own_log):
+    from levain.dispatch import cli as dcli
+
+    log, run = own_log
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, _got = echo(run, repo, thread, tmp_path)
+
+    revoke = {"key": "phone"}
+
+    def revoke_then_yes(args, prompt):
+        log.revoke(revoke["key"])
+        return "y"
+
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr(dcli, "_ask", revoke_then_yes)
+    err = run(*run.signed("envelope", "sign", str(f)), rc=1).err
+    assert "revoked" in err
+    assert "no envelopes" in run("envelope", "list", "--thread", thread).out
+    revoke["key"] = "stranger"          # a key of its own, enrolled when the prompt opened
+    got = run.json("drop", "--envelope", str(spec(tmp_path, repo)), "--signing-key", str(run.keys["stranger"].path),
+                   "--data-root", run.root, "revoked mid-prompt", rc=1)
+    assert got["envelope"]["taken"] is False and "revoked" in got["envelope"]["refused"]
+    assert got["words"] == "revoked mid-prompt"
+
+
+def test_final_drop_envelope_runs_the_disk_checks_before_the_prompt(run, repo, tmp_path, monkeypatch, tty):
+    monkeypatch.chdir(repo)
+    notrepo = tmp_path / "not-a-repo"
+    notrepo.mkdir()
+    p = tmp_path / "spec-bad.json"
+    p.write_text(json.dumps({"where": [{"repo": str(notrepo), "paths": ["."]}],
+                             "lands": [{"repo": str(notrepo), "onto": "main"}]}))          # parses; only disk refuses
+    err = run(*run.signed("drop", "--envelope", str(p), "never asked"), rc=1).err
+    assert "is not a git work tree's top" in err and tty["prompts"] == []
+    assert "no drops" in run("drops", "list").out
+
+
+def test_final_a_resend_with_a_new_envelope_is_refused_before_signing(run, repo, tmp_path, monkeypatch, tty):
+    monkeypatch.chdir(repo)
+    first = run.json(*run.signed("drop", "--envelope", str(spec(tmp_path, repo)), "--outbox-id", "ob-retry-0001",
+                                 "same words"))
+    assert first["envelope"]["taken"] is True
+    tty["prompts"].clear()
+    err = run(*run.signed("drop", "--envelope", str(spec(tmp_path, repo)), "--outbox-id", "ob-retry-0001",
+                          "same words"), rc=1).err
+    assert first["drop_id"] in err and "already delivered" in err and tty["prompts"] == []
+
+
+def test_final_ctrl_c_at_the_prompt_is_a_refusal(run, repo, tmp_path, monkeypatch):
+    from levain.dispatch import cli as dcli
+
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, _got = echo(run, repo, thread, tmp_path)
+
+    def interrupt(args, prompt):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr(dcli, "_ask", interrupt)
+    assert "not confirmed" in run(*run.signed("envelope", "sign", str(f)), rc=1).err
+
+
+def test_final_budget_takes_ascii_digits_only(run, repo, tmp_path, monkeypatch):
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    err = run("envelope", "echo", thread, "--where", f"{repo}=.", "--budget", "hours=²", rc=1).err
+    assert "--budget is" in err
