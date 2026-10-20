@@ -388,8 +388,9 @@ def main(argv: list[str] | None = None) -> int:
             "cockpit shows, verbatim with its age. "
             "It is never parsed, scored or used to limit what the partner does; you are "
             "the authority on your own state. With TEXT, sets it; with no argument, shows "
-            "it; --clear removes it. It expires after 12 hours: a stale state is dropped, "
-            "not shown. Stored in .levain/context.json."
+            "it; --clear removes it. The line expires after 12 hours, but each one you set "
+            "is also saved once, word for word, as a `felt,state` memory episode that stays "
+            "until you tombstone it in the cockpit. Stored in .levain/context.json."
         ),
     )
     state_p.add_argument(
