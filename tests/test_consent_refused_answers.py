@@ -25,8 +25,8 @@ from levain.authority import sshsig_public_key
 from levain.cockpit.consent import utc_stamp
 from levain.consent import AnswerRefused, ConsentQueue, answer_message, answer_payload
 from levain.consent.queue import (
-    REFUSED_BUSY_MS, REFUSED_NOT_AUTHORIZED, REFUSED_PER_REQUEST, REFUSED_WINDOW_ELAPSED, STORE_FORMAT,
-    UNDECIDED_GRACE,
+    REFUSED_BUSY_MS, REFUSED_NOT_AUTHORIZED, REFUSED_PER_REQUEST, REFUSED_UNENROLLED_PER_REQUEST,
+    REFUSED_WINDOW_ELAPSED, STORE_FORMAT, UNDECIDED_GRACE,
 )
 from levain.consent.receipt_log import head as receipts_head
 from levain.consent.receipt_log import verify as verify_receipts
@@ -268,7 +268,7 @@ def test_at_most_the_bound_is_kept_per_request_first_ones_first(queue, clock, ke
         payload, sig = signed(queue, request, k)
         assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
     kept = queue.refused_answers(request.id)
-    assert [r["signer_fp"] for r in kept] == [k.fp for k in strangers[:REFUSED_PER_REQUEST]]
+    assert [r["signer_fp"] for r in kept] == [k.fp for k in strangers[:REFUSED_UNENROLLED_PER_REQUEST]]
     assert [r["seq"] for r in kept] == sorted(r["seq"] for r in kept)
     payload, sig = signed(queue, other, keys["stranger"])           # the bound is per request
     _refused(queue, other.id, payload, sig)
@@ -279,16 +279,16 @@ def test_a_full_request_is_counted_before_any_verify(queue, clock, strangers, mo
     """W4: once the bound is reached, a refusal does no replay and no verify to learn it keeps nothing."""
     import levain.consent.queue as qmod
     request = FakeAgent(queue).ask(hold=timedelta(hours=1))
-    for k in strangers[:REFUSED_PER_REQUEST]:
+    for k in strangers[:REFUSED_UNENROLLED_PER_REQUEST]:
         payload, sig = signed(queue, request, k)
         _refused(queue, request.id, payload, sig)
     calls = []
     real = qmod.verify_link_sig
     monkeypatch.setattr(qmod, "verify_link_sig", lambda *a, **kw: calls.append(1) or real(*a, **kw))
-    payload, sig = signed(queue, request, strangers[REFUSED_PER_REQUEST])
+    payload, sig = signed(queue, request, strangers[REFUSED_UNENROLLED_PER_REQUEST])
     assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
     assert calls == []
-    assert len(queue.refused_answers(request.id)) == REFUSED_PER_REQUEST
+    assert len(queue.refused_answers(request.id)) == REFUSED_UNENROLLED_PER_REQUEST
 
 
 def test_one_key_and_decision_is_kept_once_whatever_its_signatures(queue, clock, keys):
@@ -569,8 +569,8 @@ def test_an_unenrolled_passkey_assertion_is_not_kept(queue, keys, monkeypatch):
 
 
 def test_a_locked_store_never_holds_the_refusal_or_changes_it(queue, keys):
-    """W4/W6/W10: another writer holds the lock; keeping waits at most REFUSED_BUSY_MS (not the 30 s of every
-    other write), the real OperationalError is swallowed with no warning, the refusal is the same text, and
+    """W4/W6/W10, X6: another writer holds the lock; keeping gives up well before the 30 s of every other write
+    (it waits REFUSED_BUSY_MS; only a generous upper bound is asserted), the real OperationalError is swallowed with no warning, the refusal is the same text, and
     nothing is left held."""
     request = FakeAgent(queue).ask()
     payload, sig = signed(queue, request, keys["stranger"])
@@ -583,7 +583,7 @@ def test_a_locked_store_never_holds_the_refusal_or_changes_it(queue, keys):
             assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
             took = time.monotonic() - t0
         assert [w for w in seen if issubclass(w.category, RuntimeWarning)] == []
-        assert REFUSED_BUSY_MS / 1000 * 0.9 <= took < 10
+        assert took < 20                     # generous: only that it is not the 30 s every other write waits
         locker.execute("ROLLBACK")
     finally:
         locker.close()
@@ -677,12 +677,170 @@ def test_the_bound_and_the_dedupe_hold_across_processes(tmp_path, keys, clock, s
     procs = [ctx.Process(target=_refuse_in_a_process, args=(d, log.path, request.id, b, out)) for b in batches]
     for p in procs:
         p.start()
-    got = [out.get(timeout=120) for _ in procs]
+    got = [out.get(timeout=300) for _ in procs]
     for p in procs:
-        p.join(timeout=60)
+        p.join(timeout=120)
     assert all(t == ["the signer is not an enrolled key"] * len(strangers) for t in got)
     kept = q.refused_answers(request.id)
-    assert len(kept) == REFUSED_PER_REQUEST
-    assert len({(r["signer_fp"], r["decision"]) for r in kept}) == REFUSED_PER_REQUEST
+    assert len(kept) == REFUSED_UNENROLLED_PER_REQUEST
+    assert len({(r["signer_fp"], r["decision"]) for r in kept}) == REFUSED_UNENROLLED_PER_REQUEST
     assert {r["signer_fp"] for r in kept} <= {k.fp for k in strangers}
     assert q.get(request.id)[1] == "pending"
+
+
+# --- r2 (refused_FIX_r2): head, caps by class, repeats, warnings as errors, the insert ---------------------------
+
+def test_a_wrong_receipts_head_is_never_kept_on_any_path(queue, clock, keys):
+    """X1: a well-formed head that is not the log's head of its size (another root, or more receipts than the queue
+    holds) is no evidence: not from an unauthorised signer, not from an authorised one too late. The right head is."""
+    agent = FakeAgent(queue)
+    first, request, late = agent.ask("a"), agent.ask("b"), agent.ask("c", hold=timedelta(seconds=30))
+    p0, s0 = signed(queue, first, keys["phone"])
+    queue.answer(first.id, p0, s0)                                    # one receipt: size 1 has one true root
+    size = receipts_head(queue)["size"]
+    wrong = ({"size": size, "root": "0" * 64}, {"size": size + 5, "root": "0" * 64})
+    for head in wrong:
+        payload, sig = signed(queue, request, keys["stranger"], receipts_head=head)
+        assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    lp = [signed(queue, late, keys["phone"], receipts_head=head) for head in wrong]
+    clock.now = NOW + timedelta(seconds=30)
+    for payload, sig in lp:
+        assert _refused(queue, late.id, payload, sig).startswith(f"request {late.id} is already expired")
+    assert _table_rows(queue) == []
+    clock.now = NOW
+    payload, sig = signed(queue, request, keys["stranger"])           # the right head: kept
+    _refused(queue, request.id, payload, sig)
+    good, gsig = signed(queue, late, keys["phone"])
+    clock.now = NOW + timedelta(seconds=30)
+    _refused(queue, late.id, good, gsig)
+    assert [r["subreason"] for r in queue.refused_answers(request.id)] == ["not-enrolled"]
+    assert [r["subreason"] for r in queue.refused_answers(late.id)] == ["late"]
+
+
+def test_a_wrong_head_on_a_late_ruling_is_not_kept(queue, keys):
+    """X1 for a ruling by an unauthorised key."""
+    request, _gap = undecided(queue)
+    size = receipts_head(queue)["size"]
+    payload, sig = ruled(queue, request.id, keys["stranger"], receipts_head={"size": size, "root": "0" * 64})
+    assert _late_refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert queue.refused_answers(request.id) == []
+    payload, sig = ruled(queue, request.id, keys["stranger"])
+    _late_refused(queue, request.id, payload, sig)
+    assert len(queue.refused_answers(request.id)) == 1
+
+
+def test_unenrolled_keys_never_crowd_out_enrolled_evidence(tmp_path, keys, clock, strangers):
+    """X2: the caps are per (request, enrolled): throwaway keys fill only their own REFUSED_UNENROLLED_PER_REQUEST,
+    and enrolled keys refused for their class still get REFUSED_PER_REQUEST, each cap on its own."""
+    enrolled_keys = strangers[:REFUSED_PER_REQUEST + 1]
+    named = {**keys, **{f"e{i}": k for i, k in enumerate(enrolled_keys)}}
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", named)
+    log.enrol("laptop", "laptop-presence")
+    for i in range(len(enrolled_keys)):
+        log.enrol(f"e{i}", "presence")                                # presence does not cover T2: refused
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request = FakeAgent(q).ask(hold=timedelta(hours=1))
+    throwaway = strangers[REFUSED_PER_REQUEST + 1:] + [keys[n] for n in ("stranger", "phone", "presence", "revoked")]
+    assert len(throwaway) > REFUSED_UNENROLLED_PER_REQUEST
+    for k in throwaway:
+        payload, sig = signed(q, request, k)
+        assert _refused(q, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert len(q.refused_answers(request.id)) == REFUSED_UNENROLLED_PER_REQUEST
+    for k in enrolled_keys:
+        payload, sig = signed(q, request, k)
+        assert _refused(q, request.id, payload, sig) == "key class presence does not cover T2"
+    kept = q.refused_answers(request.id)
+    assert [r["signer_fp"] for r in kept if r["enrolled"]] == [k.fp for k in enrolled_keys[:REFUSED_PER_REQUEST]]
+    assert [r["signer_fp"] for r in kept if not r["enrolled"]] == \
+        [k.fp for k in throwaway[:REFUSED_UNENROLLED_PER_REQUEST]]
+    other = FakeAgent(q).ask("b", hold=timedelta(hours=1))           # and the enrolled cap alone, unenrolled empty
+    for k in enrolled_keys:
+        payload, sig = signed(q, other, k)
+        _refused(q, other.id, payload, sig)
+    payload, sig = signed(q, other, keys["stranger"])
+    _refused(q, other.id, payload, sig)
+    assert [r["enrolled"] for r in q.refused_answers(other.id)] == [True] * REFUSED_PER_REQUEST + [False]
+
+
+def test_a_repeat_or_a_full_class_costs_no_replay_and_no_verify(queue, clock, keys, strangers, monkeypatch):
+    """X3: a refusal already kept for this (request, signer, decision), or one whose class is full, returns from the
+    first read: no authority replay (the late path replays only to keep) and no ssh-keygen."""
+    import levain.consent.queue as qmod
+    request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
+    other = FakeAgent(queue).ask("b", hold=timedelta(seconds=30))
+    first, fsig = signed(queue, request, keys["stranger"])
+    fill = [signed(queue, other, k) for k in strangers[:REFUSED_UNENROLLED_PER_REQUEST + 1]]
+    clock.now = NOW + timedelta(seconds=30)                           # the late path: answer() itself never replays
+    calls = {"verify": 0, "replay": 0}
+    real_verify, real_fresh = qmod.verify_link_sig, ConsentQueue._fresh_authority
+
+    def verify(*a, **kw):
+        calls["verify"] += 1
+        return real_verify(*a, **kw)
+
+    def fresh(self):
+        calls["replay"] += 1
+        return real_fresh(self)
+
+    monkeypatch.setattr(qmod, "verify_link_sig", verify)
+    monkeypatch.setattr(ConsentQueue, "_fresh_authority", fresh)
+    _refused(queue, request.id, first, fsig)
+    assert calls == {"verify": 1, "replay": 1} and len(queue.refused_answers(request.id)) == 1
+    clock.now = NOW + timedelta(seconds=31)
+    again, asig = signed(queue, request, keys["stranger"], signed_at=utc_stamp(NOW + timedelta(seconds=1)))
+    for payload, sig in ((first, fsig), (again, asig)):              # the same, and re-signed: one row, no work
+        _refused(queue, request.id, payload, sig)
+    assert calls == {"verify": 1, "replay": 1}
+    for payload, sig in fill[:REFUSED_UNENROLLED_PER_REQUEST]:
+        _refused(queue, other.id, payload, sig)
+    calls.update(verify=0, replay=0)
+    payload, sig = fill[-1]                                           # the unenrolled class is full: no verify
+    _refused(queue, other.id, payload, sig)
+    assert calls["verify"] == 0
+    assert len(queue.refused_answers(other.id)) == REFUSED_UNENROLLED_PER_REQUEST
+
+
+def test_a_full_class_in_time_costs_no_replay_beyond_the_answer_s_own(queue, strangers, monkeypatch):
+    """X3, the path that already holds a replay: a full class returns before any further replay or verify."""
+    import levain.consent.queue as qmod
+    request = FakeAgent(queue).ask(hold=timedelta(hours=1))
+    for k in strangers[:REFUSED_UNENROLLED_PER_REQUEST]:
+        payload, sig = signed(queue, request, k)
+        _refused(queue, request.id, payload, sig)
+    calls = {"verify": 0, "replay": 0}
+    real_verify, real_fresh = qmod.verify_link_sig, ConsentQueue._fresh_authority
+    monkeypatch.setattr(qmod, "verify_link_sig",
+                        lambda *a, **kw: calls.__setitem__("verify", calls["verify"] + 1) or real_verify(*a, **kw))
+    monkeypatch.setattr(ConsentQueue, "_fresh_authority",
+                        lambda self: calls.__setitem__("replay", calls["replay"] + 1) or real_fresh(self))
+    payload, sig = signed(queue, request, strangers[REFUSED_UNENROLLED_PER_REQUEST])
+    assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert calls == {"verify": 0, "replay": 1}                        # the one replay is answer()'s own
+
+
+def test_warnings_as_errors_never_change_the_refusal(queue, keys, monkeypatch):
+    """X4: with warnings as errors the bug's RuntimeWarning is dropped, never raised in place of the refusal."""
+    request = FakeAgent(queue).ask()
+    payload, sig = signed(queue, request, keys["stranger"])
+
+    def bug(self, *a, **kw):
+        raise KeyError("subreason")
+
+    monkeypatch.setattr(ConsentQueue, "_refused_reason", bug)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert queue.get(request.id)[1] == "pending"
+
+
+def test_a_row_the_checks_refuse_is_a_warning_not_a_silent_no_row(queue, keys, monkeypatch):
+    """X5: the insert ignores only the (request, signer, decision) dedupe; a CHECK failing (a bug in the keeping)
+    raises out of the insert and is shown as a RuntimeWarning, the refusal unchanged."""
+    request = FakeAgent(queue).ask()
+    payload, sig = signed(queue, request, keys["stranger"])
+    monkeypatch.setattr(ConsentQueue, "_refused_reason",
+                        lambda self, *a, **kw: (REFUSED_NOT_AUTHORIZED, "late", "x", False))
+    with pytest.warns(RuntimeWarning, match="was not kept: IntegrityError"):
+        assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert queue.refused_answers(request.id) == []

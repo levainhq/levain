@@ -64,8 +64,9 @@ never lateness). Nothing else is kept: not a duplicate answer to a decided or wi
 head, an answer refused while the authority log cannot be replayed, a bad signature, a malformed record, or an
 unenrolled passkey's assertion. A kept refusal never moves the request, never changes the refusal the signer is
 given, is no receipt and no leaf of the receipts log, and is never authority; at most :data:`REFUSED_PER_REQUEST`
-are kept per request (counted before any verify), each (request, signer, decision) once, and keeping one waits at
-most :data:`REFUSED_BUSY_MS` for the lock.
+by enrolled keys and :data:`REFUSED_UNENROLLED_PER_REQUEST` by others are kept per request (counted before any
+verify), each (request, signer, decision) once (a repeat costs no verify either), and keeping one waits at most
+:data:`REFUSED_BUSY_MS` for the lock.
 
 The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
 delivery or reading of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`,
@@ -151,7 +152,7 @@ from levain.consent.record import (
 )
 
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
-           "REFUSED_REASONS", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
+           "REFUSED_REASONS", "REFUSED_UNENROLLED_PER_REQUEST", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
            "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent", "authority_source",
            "default_queue_dir", "gap_label", "session_handle"]
@@ -214,9 +215,12 @@ REFUSED_REASONS: tuple[str, ...] = (REFUSED_NOT_AUTHORIZED, REFUSED_WINDOW_ELAPS
 REFUSED_SUBREASONS: tuple[str, ...] = ("not-enrolled", "revoked", "compromised", "class", "late")
 #: What was refused: an answer (:meth:`ConsentQueue.answer`) or a late ruling (:meth:`ConsentQueue.answer_late`).
 REFUSED_KINDS: tuple[str, ...] = ("answer", "ruling")
-#: The most refused answers kept per request: the first ones are kept, later ones are refused as before and kept
-#: nowhere.
+#: The most refused answers kept per request by keys the authority log holds (``enrolled``): the first ones are
+#: kept, later ones are refused as before and kept nowhere.
 REFUSED_PER_REQUEST = 8
+#: The most kept per request by keys the log does not hold, counted apart from :data:`REFUSED_PER_REQUEST`: anyone
+#: can make a key, so throwaway keys never use up the room an enrolled key's evidence has.
+REFUSED_UNENROLLED_PER_REQUEST = 4
 #: How long keeping a refused answer waits for the queue's write lock, in ms: a refusal is never held up for the
 #: 30 s every other write waits (:func:`levain.autonomic.durable_sqlite.open_durable`); past it, nothing is kept.
 REFUSED_BUSY_MS = 2000
@@ -1433,16 +1437,25 @@ class ConsentQueue:
         late ruling (``gap`` the request's) in ``refused_answers`` when it is evidence (:meth:`_refused_reason`).
         ``late``: the queue's clock or state says the request's hold had ended when it came. Keeping it is its own
         transaction; a store, disk, verifier or record failure there is swallowed, and any other exception (a bug
-        in the keeping) is given as a :class:`RuntimeWarning`, never raised: the caller raises the same refusal
-        either way."""
+        in the keeping, a row the table's CHECKs refuse among them) is given as a :class:`RuntimeWarning`, never
+        raised, even with warnings as errors: the caller raises the same refusal either way."""
         try:
             self._record_refused(detail, request, payload, signature, late=late, gap=gap, queue_id=queue_id,
                                  authority=authority)
+        except sqlite3.IntegrityError as exc:   # the insert ignores only the dedupe: a CHECK failing is a bug
+            bug: BaseException | None = exc
         except (sqlite3.Error, OSError, VerifierUnavailable, ConsentError):
-            pass                            # the record is evidence, never a gate: the refusal stands as it is
+            bug = None                      # the record is evidence, never a gate: the refusal stands as it is
         except Exception as exc:            # a bug: seen by the tests, never by the signer
-            warnings.warn(f"levain: a refused answer to {request.id} was not kept: {type(exc).__name__}: {exc}",
-                          RuntimeWarning, stacklevel=3)
+            bug = exc
+        else:
+            bug = None
+        if bug is not None:
+            try:                            # warnings as errors (-W error) must not turn into the caller's error
+                warnings.warn(f"levain: a refused answer to {request.id} was not kept: {type(bug).__name__}: {bug}",
+                              RuntimeWarning, stacklevel=3)
+            except Warning:
+                pass
         return AnswerRefused(detail)
 
     def _refused_reason(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any, detail: str,
@@ -1487,19 +1500,37 @@ class ConsentQueue:
     def _record_refused(self, detail: str, request: ExternalGateRequest, payload: Any, signature: Any, *,
                         late: bool, gap: tuple[int, str] | None, queue_id: str | None,
                         authority: AuthoritySnapshot | None) -> None:
-        def full(conn: sqlite3.Connection) -> bool:
-            kept = conn.execute("SELECT count(*) FROM refused_answers WHERE request_id = ?", (request.id,)).fetchone()
-            return kept[0] >= REFUSED_PER_REQUEST
+        def full(conn: sqlite3.Connection, enrolled: bool) -> bool:
+            kept = conn.execute("SELECT count(*) FROM refused_answers WHERE request_id = ? AND enrolled = ?",
+                                (request.id, int(enrolled))).fetchone()
+            return kept[0] >= (REFUSED_PER_REQUEST if enrolled else REFUSED_UNENROLLED_PER_REQUEST)
 
-        with read_transaction(self._connect_briefly) as conn:   # a full request costs no replay and no verify
-            if full(conn):
+        named = isinstance(payload, Mapping) and isinstance(payload.get("signer_fp"), str) \
+            and isinstance(payload.get("decision"), str)
+        head = payload.get("receipts_head") if isinstance(payload, Mapping) else None
+        # the first read: a repeat, a stale head, or both classes full costs no replay and no verify; one class full
+        # costs no verify, and no replay when the caller already holds one (only a replay says which class a key is
+        # in). The receipts are append-only, so a head that is the log's head of its size here stays so.
+        with read_transaction(self._connect_briefly) as conn:
+            if named and conn.execute("SELECT 1 FROM refused_answers WHERE request_id = ? AND signer_fp = ? "
+                                      "AND decision = ?", (request.id, payload["signer_fp"],
+                                                           payload["decision"])).fetchone() is not None:
+                return                      # this (request, signer, decision) is kept already
+            if head_problem(head) is None and head_refusal(conn, head, noun="ruling" if gap else "answer") is not None:
+                return                      # not the log's head of its size: a stale head is never kept
+            fulls = {enrolled: full(conn, enrolled) for enrolled in (False, True)}
+            if all(fulls.values()):
                 return
             if queue_id is None:
                 queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        if authority is not None and named and fulls[authority.key(payload["signer_fp"]) is not None]:
+            return                          # its class is full, known without a replay
         if authority is None:
             authority = self._fresh_authority()
         if authority is None:
             return                          # no verdict on the key is possible
+        if named and fulls[authority.key(payload["signer_fp"]) is not None]:
+            return                          # its class is full: no verify
         kept = self._refused_reason(request, queue_id, payload, signature, detail, late=late, gap=gap,
                                     authority=authority)
         if kept is None:
@@ -1507,11 +1538,13 @@ class ConsentQueue:
         reason, subreason, why, enrolled = kept
         record = (answer_message if gap is None else ruling_message)(dict(payload)).decode("utf-8")
         with write_transaction(self._connect_briefly) as conn:
-            if full(conn):                  # the count again under the lock: the cap holds across processes
+            if full(conn, enrolled):        # the count again under the lock: the cap holds across processes
                 return
-            conn.execute("INSERT OR IGNORE INTO refused_answers (request_id, kind, refused_at, reason_code, subreason, "
+            # only the dedupe is ignored: a CHECK or NOT NULL failure is a bug in the keeping and is raised
+            conn.execute("INSERT INTO refused_answers (request_id, kind, refused_at, reason_code, subreason, "
                          "enrolled, detail, decision, signer_fp, signed_at, record, signature) "
-                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                         "ON CONFLICT (request_id, signer_fp, decision) DO NOTHING",
                          (request.id, "answer" if gap is None else "ruling", utc_stamp(_now_utc(self._clock)), reason,
                           subreason, int(enrolled), why, payload["decision"], payload["signer_fp"],
                           payload["signed_at"], record, signature))
