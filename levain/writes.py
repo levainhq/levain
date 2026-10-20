@@ -190,6 +190,12 @@ class WriteScope:
       read, but a concurrent whole-object writer can revert a just-set line, which —
       unlike a resampled sensor key — does NOT self-heal). Accepted low-stakes; the full
       rationale lives in ``dashboard.write_state``'s docstring.
+    - ``state_episode`` — OPTIONAL. Where the felt episode of a state line goes when the embedder's
+      episode store is not an anneal store levain can open (flow keeps its episodes in a different
+      schema). Called ``state_episode(text, source, run)`` after the line is set, once per set; the
+      sink dedupes per ``run`` (a re-set of the live text passes the same run). When set it is used
+      INSTEAD of recording into ``anneal.episodic_db``; a raise leaves the line set and reports
+      ``episode: failed``. ``None`` records into ``anneal.episodic_db``.
 
     ``from_install_root`` reproduces the pre-WriteScope BEHAVIOR (store paths by the
     ``.levain/memory.db`` convention, ledger physical location at ``.levain/``, undo
@@ -203,6 +209,7 @@ class WriteScope:
     ledger_root: Path
     install_root: Path | None = None
     context_json: Path | None = None
+    state_episode: "Callable[[str, str, str], None] | None" = None
 
     @classmethod
     def from_install_root(cls, install_root: str | Path) -> "WriteScope":
@@ -1130,7 +1137,7 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
 
     try:
         done = write_state(ctx, collapsed, source=source, check=check,
-                           episodic_db=scope.anneal.episodic_db)
+                           episodic_db=scope.anneal.episodic_db, record_episode=scope.state_episode)
     except StateLockUnavailable as exc:
         raise EditError("lock_unavailable", 501, str(exc)) from exc
     except OSError as exc:      # the lock file or the write itself: retryable, never a bare 500

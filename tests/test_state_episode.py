@@ -437,3 +437,51 @@ def test_a_store_that_cannot_be_derived_sets_the_line_without_an_episode(
     assert run_state(root, "line stands", source="cli") == 0
     assert _line(root)["state"] == "line stands" and _episodes(root) == []
     capsys.readouterr()
+
+
+# ── the episode sink: an embedder whose episode store is not an anneal store levain can open ──
+# (flow keeps its episodes in a different schema; flow's 1020+23 flow-seat asked for this seam,
+# and the shape is its proposal: WriteScope.state_episode(text, source, run))
+
+def _sink_scope(root: Path, sink) -> WriteScope:
+    base = WriteScope.from_install_root(root)
+    return WriteScope(anneal=base.anneal, ledger_root=base.ledger_root, install_root=base.install_root,
+                      context_json=base.context_json, state_episode=sink)
+
+
+def test_a_sink_gets_text_source_and_run_once_per_set_and_the_store_gets_nothing(root: Path) -> None:
+    calls: list = []
+    scope = _sink_scope(root, lambda *a: calls.append(a))
+    assert apply_edit(scope, {"kind": "operator_state", "text": "Picking Som up", "source": "tui"})["episode"] == "written"
+    (text, source, run), = calls
+    assert (text, source) == ("Picking Som up", "tui") and run == _line(root)["state_run"]
+    assert _episodes(root) == []        # the sink is used INSTEAD of the scope's episodic store
+
+
+def test_a_reset_of_the_live_text_passes_the_same_run_a_changed_text_a_new_one(root: Path) -> None:
+    calls: list = []
+    scope = _sink_scope(root, lambda *a: calls.append(a))
+    for text in ("a", "a", "b"):
+        apply_edit(scope, {"kind": "operator_state", "text": text})
+    assert [c[0] for c in calls] == ["a", "a", "b"]
+    assert calls[0][2] == calls[1][2] != calls[2][2]
+
+
+def test_a_clear_does_not_call_the_sink(root: Path) -> None:
+    calls: list = []
+    scope = _sink_scope(root, lambda *a: calls.append(a))
+    apply_edit(scope, {"kind": "operator_state", "text": "x"})
+    res = apply_edit(scope, {"kind": "operator_state", "text": ""})
+    assert res["cleared"] is True and res["episode"] == "cleared" and len(calls) == 1
+
+
+def test_a_sink_that_raises_leaves_the_line_set_and_says_failed(root: Path) -> None:
+    def boom(*_a):
+        raise RuntimeError("flow store is busy")
+    res = apply_edit(_sink_scope(root, boom), {"kind": "operator_state", "text": "line survives"})
+    assert res["ok"] and res["episode"] == "failed" and "flow store is busy" in res["episode_error"]
+    assert _line(root)["state"] == "line survives"
+
+
+def test_a_scope_without_a_sink_records_into_its_store_as_before(root: Path) -> None:
+    assert _set(root, "no sink")["episode"] == "written" and [e.content for e in _episodes(root)] == ["no sink"]

@@ -899,7 +899,8 @@ def _record_state_episode(episodic_db: Path, text: str, source: str, *, run: str
 
 def write_state(context_json: Path, text: str, *, source: str = "cli",
                 check: "Callable[[], None] | None" = None,
-                episodic_db: Path | None = None) -> StateWrite:
+                episodic_db: Path | None = None,
+                record_episode: "Callable[[str, str, str], None] | None" = None) -> StateWrite:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
     write-peer of ``_read_state``, kept adjacent so the contract (the state keys, a
     tz-aware ISO stamp) cannot drift between read and write.
@@ -924,7 +925,10 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     appends ONE ``observation`` episode tagged ``felt,state`` carrying the line verbatim, keyed on
     its run, AFTER the line is written and outside the lock (never an episode without the line);
     none for a clear, and a run never gets a second one. A writer that passes no ``episodic_db``
-    records no episode."""
+    records no episode. ``record_episode(text, source, run)``, when given, is called INSTEAD of
+    recording into ``episodic_db`` (an embedder whose episode store is not an anneal store levain can
+    open): once per set, with the run, so its sink dedupes per run; a raise is ``failed``, never a
+    failed set."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
@@ -937,6 +941,12 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
                                   run=prior.run if continues else None)
     if run is None:
         return StateWrite("", "cleared")
+    if record_episode is not None:
+        try:
+            record_episode(collapsed, source, run)
+        except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
+            return StateWrite(collapsed, "failed", f"{type(exc).__name__}: {exc}")
+        return StateWrite(collapsed, "written")
     if episodic_db is None:
         return StateWrite(collapsed, "no_store")
     return _record_state_episode(episodic_db, collapsed, source, run=run)
