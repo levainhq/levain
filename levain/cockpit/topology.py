@@ -10,7 +10,7 @@ worker of the one ``unattached`` task, never of a guessed one.
 The two quiet states never merge. WAITING ON YOU is a record: a pending consent request, an open question, a
 dispatch contract waiting on a signature or an authorisation. STALLED (a node) and STUCK (a task) are silence with
 no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing for
-``STALL_S``, an open loop nobody has touched for ``SPORE_QUIET_DAYS``.
+``STALL_S``, an open loop, which no session is linked to.
 
 "Lost if closed" is per live session, read on the activity feed's git path (``activity.git_worktree_state``: the
 same walk, refusals, environment and overrides, no new git call path), bounded by the same whole-scan deadline,
@@ -41,11 +41,10 @@ from levain.cockpit.display_safe import visible
 from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX
 from levain.cockpit.results import Fault, Read, Result
 
-__all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "SPORE_QUIET_DAYS", "SPORES_MAX", "STALL_S", "topology_reader"]
+__all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "SPORES_MAX", "STALL_S", "topology_reader"]
 
 STALL_S = 5 * 60                   # a session mid-turn (last event a prompt or a tool) silent this long is STALLED
 RATE_WINDOW_S = 5 * 60             # a node's rate: logged events per minute over this window
-SPORE_QUIET_DAYS = 7               # an open loop untouched this long, with no record behind it, is STUCK
 SPORES_MAX = 20                    # open loops shown as tasks, in the store's order
 DISPATCH_DONE_H = 14               # a finished contract stays on the board this long (the sky's window)
 LOST_WORKTREES_MAX = act.ACTIVITY_REPOS_MAX
@@ -287,18 +286,16 @@ def _dispatch_tasks(directory: Path, now: datetime, worker_of_session: Callable[
     return tasks, errors
 
 
-def _spore_tasks(spores: list[Any], today: date) -> list[dict[str, Any]]:
+def _spore_tasks(spores: list[Any]) -> list[dict[str, Any]]:
     """The first ``SPORES_MAX`` open loops as tasks. The spore store links no loop to a session or a record, so a
-    loop is never WAITING: RUNNING while touched in the last ``SPORE_QUIET_DAYS``, else STUCK (silence, no record)."""
-    from levain.cockpit.registry import parse_date
-
+    loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today, so STUCK: silence, no
+    record). A recent touch is not a worker. No timestamp is on the task wire, so the loop's age is not carried."""
     tasks = []
     for s in spores[:SPORES_MAX]:
-        seen = parse_date(getattr(s, "seen", None)) or parse_date(getattr(s, "created", None))
-        quiet = seen is None or (today - seen).days > SPORE_QUIET_DAYS
+        workers: list[str] = []
         tasks.append({"id": f"spore:{_label(s.id)}", "kind": "spore", "label": _label(s.text),
-                      "state": "stuck" if quiet else "running", "waits_on": [], "card": None, "outcomes": [],
-                      "cost": dict(NO_COST), "workers": []})
+                      "state": "running" if workers else "stuck", "waits_on": [], "card": None, "outcomes": [],
+                      "cost": dict(NO_COST), "workers": workers})
     return tasks
 
 
@@ -439,7 +436,7 @@ def topology_reader(*, install_root: Path | None,
             blind("spores", "no spore store is attached")
         else:
             try:
-                tasks += _spore_tasks(list(spores(ctx)), ctx.today)
+                tasks += _spore_tasks(list(spores(ctx)))
             except Exception as exc:  # noqa: BLE001
                 blind("spores", f"unreadable ({type(exc).__name__})")
         on_task = {w for t in tasks for w in t["workers"]}

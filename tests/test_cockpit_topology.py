@@ -509,3 +509,18 @@ def test_a_linked_worktrees_own_config_worktree_is_checked(tmp_path):
     (gitdir / "config.worktree").write_text("[filter \"x\"]\n\tclean = /bin/false\n")
     assert act.worktree_refusal(common, gitdir) == \
         "its worktree's config.worktree defines a filter driver (a program a status read would run), not read"
+
+
+def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():
+    from types import SimpleNamespace
+
+    today = datetime.now(timezone.utc).date()
+    fresh = SimpleNamespace(id="spore-1", text="touched today", seen=today.isoformat(), created=today.isoformat())
+    old = SimpleNamespace(id="spore-2", text="touched long ago", seen="2020-01-01", created="2020-01-01")
+    undated = SimpleNamespace(id="spore-3", text="never dated", seen=None, created=None)
+    tasks = topo._spore_tasks([fresh, old, undated])
+    # a spore links no session, so no worker is ever on it: silence with no record is STUCK, however recent
+    assert [t["state"] for t in tasks] == ["stuck", "stuck", "stuck"]
+    assert all(t["workers"] == [] for t in tasks)
+    # the recent-touch heuristic is gone, not renamed
+    assert not hasattr(topo, "SPORE_QUIET_DAYS")
