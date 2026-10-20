@@ -652,6 +652,7 @@ def test_oversized_line_holding_the_id_is_result_oversized_never_allow(tmp_path,
     t.write_bytes(big)
     scan = stamps.claude_scan(t, ["toolu_BIG", "toolu_OTHER"], max_line_bytes=1 << 20)
     assert scan.states["toolu_BIG"] == ("result_oversized", None)
+    assert {st for st, _ in scan.states.values()} <= set(stamps.CLAUDE_STATES)   # the published vocabulary holds it
     assert scan.states["toolu_OTHER"] == ("no_result", None)
     ledger = _ledger(tmp_path)
     row = _cc_row(ledger, "toolu_BIG", t, at=NOW - timedelta(hours=2))

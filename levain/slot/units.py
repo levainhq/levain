@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Literal
 
 from levain.firing.hands import HostOS, Step, _abs
+from levain.launch import child_env
 from levain.slot import Refused
 from levain.slot.layout import ROOT_GROUP, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
@@ -168,7 +169,7 @@ def start_order(host: HostOS, services: Iterable[Service] | None = None) -> tupl
 def _launchd_job_absent(label: str, run: Callable[..., object] | None = None) -> tuple[bool, str]:
     import subprocess
 
-    r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True)
+    r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True, env=child_env())
     loaded = getattr(r, "returncode", 1) == 0
     return (not loaded, f"{label} is still loaded" if loaded else "")
 
@@ -197,7 +198,7 @@ def _unload_launchd_if_changed(label: str, path: Path, text: str, run: Callable[
     absent, _ = _launchd_job_absent(label, run)
     if absent or not _differs(read, path, text):
         return True, ""
-    (run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True)
+    (run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True, env=child_env())
     return _launchd_job_absent(label, run)
 
 
@@ -219,8 +220,8 @@ def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run:
     if not _differs(read, path, text):
         return True, ""
     run = run or subprocess.run
-    run([systemctl, "stop", name], capture_output=True)   # a unit systemd never loaded: non-zero, harmless
-    r = run([systemctl, "show", "-p", "ActiveState", "--value", name], capture_output=True, text=True)
+    run([systemctl, "stop", name], capture_output=True, env=child_env())   # a unit systemd never loaded: non-zero, harmless
+    r = run([systemctl, "show", "-p", "ActiveState", "--value", name], capture_output=True, text=True, env=child_env())
     state = (getattr(r, "stdout", "") or "").strip()
     if state not in ("inactive", "failed"):
         return False, f"{name} is {state or 'in an unknown state'} after systemctl stop"

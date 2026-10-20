@@ -183,13 +183,108 @@ def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
         if key in _NO_ENV:
             out.append(f"{where} {key[0]}.{key[1]} cannot take an environment")
         elif key in _SPAWN or key[0] == "asyncio" and key[1].startswith("create_subprocess"):
-            env = next((k.value for k in node.keywords if k.arg == "env"), None)
-            if env is None:
-                out.append(f"{where} {key[0]}.{key[1]} without env=")
-            elif ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
-                out.append(f"{where} {key[0]}.{key[1]} with env={ast.unparse(env)}")
+            problem = _env_problem(node, f"{where} {key[0]}.{key[1]}")
+            if problem:
+                out.append(problem)
         elif key[0] == "os" and key[1] in _ENV_EXEC and path.name != "launch.py":
             out.append(f"{where} os.{key[1]}: only levain/launch.py re-executes")
+    return out + _alias_problems(tree, path.relative_to(root))
+
+
+def _env_problem(call: ast.Call, what: str) -> str | None:
+    env = next((k.value for k in call.keywords if k.arg == "env"), None)
+    if env is None:
+        return f"{what} without env="
+    if ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
+        return f"{what} with env={ast.unparse(env)}"
+    return None
+
+
+def _alias_problems(tree: ast.Module, rel: Path) -> list[str]:
+    """Spawners held as a VALUE (`run: Run = subprocess.run`, `run = run or subprocess.run`,
+    `(run or subprocess.run)(...)`): the scan above sees only `subprocess.run(...)`, so it follows the
+    alias instead. Every call through it must pass env=; the alias may be handed on to a function defined
+    in the same module (followed into that parameter); any other use of it, and any other value reference
+    to a spawner, is refused because the scan cannot follow it. Type annotations are not references."""
+    parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    annotations: set[int] = set()
+    for n in ast.walk(tree):
+        held = [getattr(n, "annotation", None), getattr(n, "returns", None)]
+        for a in held:
+            if isinstance(a, ast.AST):
+                annotations.update(id(x) for x in ast.walk(a))
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    def scope_of(n: ast.AST) -> ast.AST:
+        while n in parent:
+            n = parent[n]
+            if isinstance(n, scopes):
+                return n
+        return tree
+
+    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    out: list[str] = []
+    todo: list[tuple[ast.AST, str, str]] = []   # (scope, alias name, what it holds)
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)) or id(n) in annotations:
+            continue
+        key = (n.value.id, n.attr)
+        if key not in _SPAWN and key not in _NO_ENV:
+            continue
+        p = parent.get(n)
+        if isinstance(p, ast.Call) and p.func is n:
+            continue   # a direct call: checked above
+        what = f"{rel}:{n.lineno} {key[0]}.{key[1]}"
+        if key in _NO_ENV:
+            out.append(f"{what} held as a value: it cannot take an environment")
+            continue
+        holder = parent.get(p) if isinstance(p, ast.BoolOp) else p
+        if isinstance(p, ast.BoolOp) and isinstance(holder, ast.Call) and holder.func is p:
+            problem = _env_problem(holder, f"{what} (through `{ast.unparse(p)}`)")
+            if problem:
+                out.append(problem)
+        elif isinstance(holder, ast.arguments):
+            node = p if isinstance(p, ast.BoolOp) else n
+            positional = holder.posonlyargs + holder.args
+            if node in holder.defaults:
+                arg = positional[len(positional) - len(holder.defaults) + holder.defaults.index(node)]
+            else:
+                arg = holder.kwonlyargs[holder.kw_defaults.index(node)]
+            todo.append((parent[holder], arg.arg, what))
+        elif isinstance(holder, ast.Assign) and len(holder.targets) == 1 and isinstance(holder.targets[0], ast.Name):
+            todo.append((scope_of(holder), holder.targets[0].id, what))
+        else:
+            out.append(f"{what} held as a value the scan cannot follow: call it directly with env=")
+    seen: set[tuple[int, str]] = set()
+    while todo:
+        scope, name, what = todo.pop()
+        if (id(scope), name) in seen:
+            continue
+        seen.add((id(scope), name))
+        for u in ast.walk(scope):
+            if not (isinstance(u, ast.Name) and u.id == name and isinstance(u.ctx, ast.Load)):
+                continue
+            p = parent[u]
+            if isinstance(p, ast.Call) and p.func is u:
+                problem = _env_problem(p, f"{rel}:{u.lineno} {name}(...) (holds {what})")
+                if problem:
+                    out.append(problem)
+                continue
+            q = parent.get(p) if isinstance(p, ast.BoolOp) else p
+            if isinstance(q, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in q.targets):
+                continue   # `run = run or subprocess.run`: the rebind is the alias itself
+            if isinstance(p, ast.keyword):
+                p, u = parent[p], p
+            callee = funcs.get(p.func.id) if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) else None
+            if callee is not None:
+                params = callee.args.posonlyargs + callee.args.args
+                if isinstance(u, ast.keyword):
+                    todo.append((callee, u.arg, what))
+                    continue
+                if u in p.args and p.args.index(u) < len(params):
+                    todo.append((callee, params[p.args.index(u)].arg, what))
+                    continue
+            out.append(f"{rel}:{u.lineno} `{name}` (holds {what}) used where the scan cannot follow it")
     return out
 
 
@@ -214,6 +309,23 @@ def test_the_scan_catches_a_call_without_env(tmp_path: Path) -> None:
                    "subprocess.run(['x'], env=os.environ | {'A': 'b'})\nimport webbrowser\n"
                    "webbrowser.open('u')\nfrom subprocess import run\nimport subprocess as sp\n")
     assert len(_spawn_problems(bad, tmp_path)) == 9
+
+
+def test_the_scan_follows_a_spawner_held_as_a_value(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.py"
+    bad.write_text("import subprocess\n"
+                   "def g(run=subprocess.run):\n    return run(['x'])\n"            # default, no env
+                   "def h(run=subprocess.run):\n    return _inner(run)\n"           # handed on ...
+                   "def _inner(run):\n    return run(['x'])\n"                      # ... and called bare
+                   "def k(run=None):\n    return (run or subprocess.run)(['x'])\n"  # call target, no env
+                   "def m(run=None):\n    run = run or subprocess.run\n    run(['x'])\n"
+                   "R = subprocess.Popen\nR(['y'])\n"                               # module alias
+                   "print(subprocess.run)\n"                                         # cannot follow
+                   "def ok(run=subprocess.run):\n    return run(['x'], env={})\n"
+                   "def ann(p: subprocess.Popen) -> subprocess.Popen:\n    return p\n")
+    problems = _spawn_problems(bad, tmp_path)
+    assert len(problems) == 6, "\n".join(problems)
+    assert not any(f"bad.py:{n} " in p for n in (16, 17, 18) for p in problems), "\n".join(problems)
 
 
 # --- the console entry --------------------------------------------------------------------------
