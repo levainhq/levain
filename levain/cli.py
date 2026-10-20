@@ -1057,8 +1057,8 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Make `levain serve --write` always-on — start on login and survive a crash — so "
             "the cockpit just works without an ad-hoc `nohup`. Per-user, no admin/root: a "
-            "launchd user agent on macOS (systemd --user / Task Scheduler are planned "
-            "pure-additions). An always-on serve is a 24/7 loopback-LOCAL write window; "
+            "launchd user agent on macOS, a systemd --user unit on Linux (Windows Task Scheduler "
+            "is a planned pure-addition). An always-on serve is a 24/7 loopback-LOCAL write window; "
             "off-box serve is never daemonized (install-bearing serve is loopback-only)."
         ),
     )
