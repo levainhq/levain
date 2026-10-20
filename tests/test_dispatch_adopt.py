@@ -945,3 +945,37 @@ def test_a_job_that_ends_during_a_land_is_refused_never_raised(when, jstore, cst
                onto="main", rules=lambda: adoption_rules_at(cstore))
     assert out.outcome == "refused", out.message
     assert git(repo[0], "rev-parse", "main") == repo[1]
+
+
+@pytest.mark.parametrize("winner", ["authorised", "adopted", "base_moved"])
+def test_a_job_another_land_took_during_the_records_read_is_reported_as_that_land_left_it(winner, jstore, cstore,
+                                                                                         repo, log, keys, tmp_path,
+                                                                                         monkeypatch):
+    # L3 r2 codex MED + complement LOW: the job read again after the records could already be another land's
+    path, base = repo
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    real_records = JobStore.run_records
+    intent = __import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": base,
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2",
+         "rule": {"generation": 4, "index": 0}})
+
+    def records(self, job_id):
+        out = real_records(self, job_id)
+        if self.get(job_id).state == "verified":
+            JobStore.authorise(self, job_id, cause="human_adoption_rule", evidence=intent)
+            if winner == "adopted":
+                git(path, "update-ref", "refs/heads/main", recs[0].staged_commit)
+                self._transition(job_id, "adopted", "adopted", evidence="{}")
+            elif winner == "base_moved":
+                self._transition(job_id, "failed", "base_moved", evidence="{}")
+        return out
+
+    monkeypatch.setattr(JobStore, "run_records", records)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=resolver(cstore), policy=active_policy(cstore),
+               onto="main", rules=lambda: adoption_rules_at(cstore))
+    expect = {"authorised": "adopted", "adopted": "adopted", "base_moved": "failed"}[winner]
+    assert out.outcome == expect and out.job.state == expect, out.message

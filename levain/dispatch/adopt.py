@@ -935,6 +935,19 @@ def _finish(store: JobStore, job: Job) -> Landing:
     return Landing(outcome="adopted", job=out, moved=True, message=f"{onto} -> {staged}")
 
 
+def _taken(store: JobStore, job: Job) -> Landing | None:
+    """Where another land already took ``job``, as this land reports it: an ``authorised`` job is finished from ITS
+    intent (the authorisation written first is the authority), ``adopted`` and a ``base_moved`` failure are said as
+    they are; anything else is ``None``. The one classification for every point a land can find its job moved."""
+    if job.state == "authorised":
+        return _finish(store, job)
+    if job.state == "adopted":
+        return Landing(outcome="adopted", job=job, message="another land adopted this job")
+    if job.state == "failed" and job.history[-1].cause == "base_moved":
+        return Landing(outcome="failed", job=job, message="another land found the base moved")
+    return None
+
+
 def land(store: JobStore, job_id: str, *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
@@ -957,6 +970,9 @@ def land(store: JobStore, job_id: str, *,
     # the records first, then the job read again: a lease the records' sweep lapsed is the state the floor judges
     records = store.run_records(job.id)
     job = store.get(job.id) or job
+    taken = _taken(store, job)
+    if taken is not None:
+        return taken
     stamp = store.stamp()
     payload = human[0] if human is not None else None
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
@@ -998,14 +1014,9 @@ def land(store: JobStore, job_id: str, *,
         again = store.get(job.id)
         if again is None:
             raise
-        if again.state == "adopted":
-            return Landing(outcome="adopted", job=again, message="another land adopted this job")
-        if again.state == "failed" and again.history[-1].cause == "base_moved":
-            return Landing(outcome="failed", job=again, message="another land found the base moved")
-        if again.state != "authorised":
-            return Landing(outcome="refused", job=again, message=f"job {again.id} became {again.state} during this "
-                                                                 "land; nothing moved")
-        job = again
+        return _taken(store, again) or Landing(outcome="refused", job=again, message=f"job {again.id} became "
+                                                                                     f"{again.state} during this "
+                                                                                     "land; nothing moved")
     return _finish(store, job)
 
 
