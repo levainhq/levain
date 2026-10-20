@@ -1114,6 +1114,17 @@ class TestSession2CompactNow:
         assert now["count"] == full["count"]
 
 
+class TestK6CrystalMode:
+    def test_a_crystal_row_carries_its_activation_mode_to_the_page(self, env) -> None:
+        """The Memory tab draws a crystal's mode (K6 r3, codex): the row must carry it as a facet, not only in stored."""
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(
+            '{"crystal": [{"name": "good", "status": "crystallized", "level": 2, "explanation": "x",'
+            ' "activation_mode": "always", "permanence": "permanent"}]}')
+        rows = ck.panel("crystals")["rows"]
+        assert [r["facets"].get("activation_mode") for r in rows] == ["always"]
+
+
 class TestL3R4Fixes:
     def test_an_infinite_crystal_level_drops_that_row_not_the_panel(self, env) -> None:
         root, _s, ck = env

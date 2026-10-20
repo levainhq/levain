@@ -675,7 +675,7 @@
           const f = r.facets || {};
           const tags = tagsOf(f.tags);
           return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
-                   last_activated_on: f.last_activated_on, tags: tags };
+                   activation_mode: f.activation_mode, last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
       } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {

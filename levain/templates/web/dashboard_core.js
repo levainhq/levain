@@ -816,6 +816,7 @@
     if (Object.hasOwn(ZONE_GLOSS, zone.id)) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
     sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
+    const entryOf = new Map();   // node -> its manifest entry (the Memory tab's composition reads it)
     grid.dataset.ckRegion = "zone";
     grid.dataset.ckZone = zone.id;
     // rows: sequential fill, the way a 3-column grid auto-places spans
@@ -839,12 +840,16 @@
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
           if (e.kind === "external") node.dataset.ckExternal = "1";
           ckCountPill(node, e.count);
+          entryOf.set(node, e);
           nodes.push(node);
           grid.appendChild(node);
         }
-        if (c.tabs && nodes.length > 1) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
+        // the Memory tab shows every neocortex section at once (composeMemory), so its section card has no tabs
+        const sectionsOnly = zone.id === "mind" && c.entries.every((e) => e.kind === "section");
+        if (c.tabs && nodes.length > 1 && !sectionsOnly) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
       }
     }
+    if (zone.id === "mind" || zone.id === "identity") composeMemory(zone.id, grid, view, entryOf);
     stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
@@ -944,6 +949,138 @@
       const K = window.LevainCockpitKinds;
       if (K && typeof K.fillGrids === "function") K.fillGrids();
     }, 60);
+  }
+
+  // ---- the Memory tab (K6) --------------------------------------------------------------------------------------------------
+  // The mind zone is ONE neocortex card with every section readable at once (State, threads, context and understanding left;
+  // patterns and decisions right), then Crystallized patterns and Cognition side by side. The identity zone is ONE card of eight rows:
+  // the identity cards themselves, restyled into rows (title | one-line summary | the card's own Edit), the editor opening in place.
+  // Nothing is hidden and nothing is pressed for the reader: each panel the kernel drew keeps doing its own work.
+  const MEM_WRAP_CAP = 50;   // the longest history list the page is sent
+  // the authoritative wrap count when the view has one; the list is capped, so its length is only ever a floor
+  const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
+  function memWrapsLine(view) {
+    const ws = Array.isArray(view.wraps) ? view.wraps : [];
+    const total = memWrapTotal(view);
+    // the newest stamp, wherever it sits in the list
+    let last = null;
+    for (const w of ws) {
+      const d = w && typeof w.wrapped_at === "string" ? new Date(w.wrapped_at) : null;
+      if (d && !Number.isNaN(d.getTime()) && (!last || d > last)) last = d;
+    }
+    if (total === null && !ws.length) return "";
+    let out = total !== null ? total + (total === 1 ? " wrap" : " wraps")
+      : ws.length >= MEM_WRAP_CAP ? ws.length + "+ wraps" : ws.length + (ws.length === 1 ? " wrap" : " wraps");
+    if (total === 0) return "";
+    if (last) {
+      out += " · last wrap " + last.toLocaleDateString(undefined, { weekday: "short" }) + " " +
+        last.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    }
+    return out;
+  }
+  // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
+  function memCogBits(view) {
+    const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
+    const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
+    const ws = total !== null ? total : listed;
+    const bits = [];
+    if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
+    if (gn) bits.push(gn + " nodes");
+    if (ge) bits.push(ge + " edges");
+    // dark if either place the view can say so says so
+    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
+    return bits;
+  }
+  function memCard(cls, title, meta, modes) {
+    const card = el("div", "panel ck-mem-card " + cls);
+    card.dataset.zone = cls.indexOf("ident") >= 0 ? "identity" : "mind";
+    if (modes) card.dataset.modes = modes;
+    const head = el("div", "phead");
+    head.appendChild(el("h2", null, title));
+    if (meta) head.appendChild(el("span", "ck-mem-meta", meta));
+    card.appendChild(head);
+    return card;
+  }
+  // a kernel card moved inside another: its own chrome (the expand control, the edit-class chip, the source path) stays out of the
+  // way, and it is never clamped, so the section reads in full
+  function memNest(node) {
+    node.classList.add("ck-mem-nest");
+    node.removeAttribute("data-clamp");
+    node.classList.remove("ck-tab-off");
+    return node;
+  }
+  function composeMemory(zoneId, grid, view, entryOf) {
+    const nodes = Array.from(grid.children).filter((n) => n.classList && n.classList.contains("panel"));
+    if (!nodes.length) return;
+    const pid = (n) => n.dataset.ckPanel || "";
+    const modes = nodes[0].dataset.modes || "memory";
+    if (zoneId === "identity") {
+      // the identity cards are config panels (the page's own) or typed text panels (the kernel's `config:*` panels): either is a card with
+      // its own editor, and the card IS the row
+      const rows = nodes.filter((n) => /^config(:|$)/.test(pid(n)) || (entryOf.get(n) || {}).kind === "config");
+      if (!rows.length) return;
+      const card = memCard("ck-mem-ident", "Identity", "", modes);
+      card.querySelector(".phead h2").after(el("span", "ck-count", String(rows.length)));
+      card.querySelector(".phead").appendChild(el("span", "ck-mem-meta", "read at every session start"));
+      const list = el("div", "ck-mem-ilist");
+      for (const n of rows) {
+        memNest(n);
+        n.classList.add("ck-mem-rowcard");
+        list.appendChild(n);
+      }
+      card.appendChild(list);
+      grid.insertBefore(card, grid.firstChild);
+      return;
+    }
+    // the mind zone
+    const secs = nodes.filter((n) => (entryOf.get(n) || {}).kind === "section");
+    const crystals = nodes.find((n) => pid(n) === "crystals");
+    const cog = nodes.filter((n) => pid(n) === "graph" || pid(n) === "wraps");
+    const RIGHT = /^(patterns|decisions)$/i;
+    const card = memCard("ck-mem-neo", "Neocortex", memWrapsLine(view), modes);
+    // a section with no text is left out unless it can be edited: an editable one stays as a slim row that keeps its Edit
+    const full = secs.filter((n) => !n.dataset.ckNoText || n.dataset.ckSlim);
+    for (const n of secs) if (!full.includes(n)) n.remove();
+    if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
+    else {
+      const left = el("div", "ck-mem-col"), right = el("div", "ck-mem-col");
+      for (const n of full) (RIGHT.test(String((entryOf.get(n) || {}).heading || "").trim()) ? right : left).appendChild(memNest(n));
+      const cols = el("div", "ck-mem-cols");
+      cols.appendChild(left);
+      if (right.children.length) cols.appendChild(right); else cols.classList.add("ck-mem-one");
+      if (!left.children.length) { cols.classList.add("ck-mem-one"); cols.replaceChildren(right); }
+      card.appendChild(cols);
+    }
+    grid.insertBefore(card, grid.firstChild);
+    // Crystallized patterns beside Cognition (about 60 / 40)
+    const row = el("div", "ck-mem-row");
+    row.dataset.modes = modes;
+    if (crystals) {
+      const lv = (Array.isArray(view.crystal_index) ? view.crystal_index : []).map((c) => num(c && c.level)).filter((x) => x > 0);
+      const chead = crystals.querySelector(".phead");
+      if (lv.length && chead) {
+        const lo = Math.min(...lv), hi = Math.max(...lv);
+        chead.appendChild(el("span", "ck-mem-meta", lo === hi ? "level " + lo : "levels " + lo + " to " + hi));
+      }
+      crystals.classList.add("ck-mem-crys");
+      crystals.classList.remove("ck-fold");   // the kernel's dashed one-liner spans its grid; here it keeps its side of the row
+      row.appendChild(crystals);
+    }
+    if (cog.length) {
+      const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
+      const bits = memCogBits(view);
+      const graph = cog.find((n) => pid(n) === "graph") || cog[0];
+      if (!ws) {
+        // no wrap yet: no history to tab to, so no tab row and no second panel; the card is the title and its one line
+        for (const n of cog) { const t = n.querySelector(".ck-tabs"); if (t) t.remove(); if (n !== graph) n.remove(); }
+        cog.splice(0, cog.length, graph);
+      }
+      // the figures ride the header of every Cognition tab, so whichever is showing carries them
+      if (bits.length) for (const n of cog) { const gh = n.querySelector(".phead"); const t = gh && (gh.querySelector(".ck-card-title") || gh.querySelector("h2")); if (t) t.after(el("span", "ck-mem-meta", bits.join(" · "))); }
+      graph.classList.add("ck-mem-cog");
+      for (const n of cog) row.appendChild(n);
+    }
+    if (row.children.length) grid.insertBefore(row, card.nextSibling);
   }
 
   // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries
@@ -1097,11 +1234,11 @@
       return p;
     }
     const NS = "http://www.w3.org/2000/svg";
-    const W = 640, H = 210, PAD = 12;
+    const W = 480, H = 170, PAD = 10;
     const CHANNELS = [
-      { label: "CH1 EPISODES", cls: "ch1", val: (w) => num(w.episodes_compressed) },
-      { label: "CH2 GRADUATIONS", cls: "ch2", val: (w) => num(w.graduations_validated) },
-      { label: "CH3 LINKS", cls: "ch3",
+      { label: "Episodes", cls: "ch1", val: (w) => num(w.episodes_compressed) },
+      { label: "Graduations", cls: "ch2", val: (w) => num(w.graduations_validated) },
+      { label: "Links", cls: "ch3",
         val: (w) => num(w.associations_formed) + num(w.associations_strengthened) },
     ];
 
@@ -1114,11 +1251,12 @@
     const wrap = el("div", "scope-wrap");
     wrap.dataset.solo = "";
     const bar = el("div", "scope-bar");
-    bar.appendChild(el("span", "lbl", "timebase"));
+    if (series.length > 12) bar.appendChild(el("span", "lbl", "timebase"));
     const scopeBox = el("div", "scope-box");
     const legend = el("div", "scope-legend");
     const note = el("p", "note", "");
-    for (const n of [12, 24, 48]) {
+    // the timebase is drawn only when the history is longer than its shortest span: below that every button would draw the same trace
+    for (const n of (series.length > 12 ? [12, 24, 48] : [])) {
       const b = el("button", "scope-tb" + (n === span ? " active" : ""), String(n));
       b.type = "button";
       b.addEventListener("click", () => {
@@ -1160,8 +1298,9 @@
           pl.setAttribute("pathLength", "1"); // normalizes the draw-in dash math
           svg.appendChild(pl);
         }
-        const chip = el("button", `scope-ch ${ch.cls}`,
-          `${ch.label} ${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`);
+        const chip = el("button", `scope-ch ${ch.cls}`);
+        chip.appendChild(el("span", "scope-ch-l", ch.label));
+        chip.appendChild(el("span", "scope-ch-v", `${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`));
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
@@ -1174,17 +1313,14 @@
         legend.appendChild(chip);
       }
       scopeBox.replaceChildren(svg);
-      const g = view.graph;
-      const assoc = g && g.nodes && g.nodes.length
-        ? ` · association graph ${g.nodes.length} nodes / ${(g.edges || []).length} edges`
-        : "";
-      note.textContent = `${wraps.length} consolidations, oldest → newest${assoc}`;
+      note.textContent = `oldest → newest`;   // the consolidation / node / edge counts are the card's header line (composeMemory)
     }
 
     p.appendChild(wrap);
-    wrap.appendChild(bar);
-    wrap.appendChild(scopeBox);
-    wrap.appendChild(legend);
+    if (bar.children.length) wrap.appendChild(bar);
+    const plot = el("div", "scope-plot");
+    plot.append(scopeBox, legend);
+    wrap.appendChild(plot);
     wrap.appendChild(note);
     draw();
     return p;
@@ -1202,24 +1338,30 @@
   const tierErr = (view, key) => view.errors && view.errors[key];
 
   function renderCrystals(entry, view) {
-    const list = view.crystal_index || [];
+    const list = Array.isArray(view.crystal_index) ? view.crystal_index : [];
     const p = panel(entry);
     const err = tierErr(view, "crystal_index");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "none crystallized yet")); return p; }
+    const grid = el("div", "ck-crys");
     for (const c of list) {
       const row = el("div", "row");
       row.appendChild(el("span", "lvl", `${c.level}x`));
-      row.appendChild(el("span", "name", c.name));
-      if (c.one_clause) row.appendChild(el("span", "clause", "— " + c.one_clause));
-      // fuller crystal detail — permanence / activation mode / tags
+      const txt = el("span", "ck-crys-t");
+      // a name breaks after each underscore, so a long snake_case name wraps at a word and never mid-word
+      const nm = el("span", "name");
+      String(c.name == null ? "" : c.name).split("_").forEach((part, i) => { if (i) nm.appendChild(document.createTextNode("_")), nm.appendChild(document.createElement("wbr")); nm.appendChild(document.createTextNode(part)); });
+      txt.appendChild(nm);
+      if (c.one_clause) txt.appendChild(el("span", "clause", c.one_clause));
+      // permanence / activation mode / tags are a muted line under the clause: touch has no hover, so a tooltip is not a place to keep them
       const meta = [c.permanence, c.activation_mode].filter(Boolean).join(" · ");
-      if (meta) row.appendChild(el("span", "muted", meta));
-      if (Array.isArray(c.tags) && c.tags.length) {
-        row.appendChild(tagEl("tags", "#" + c.tags.slice(0, 6).join(" #")));
-      }
-      p.appendChild(row);
+      const tags = Array.isArray(c.tags) && c.tags.length ? "#" + c.tags.slice(0, 6).join(" #") : "";
+      const detail = [meta, tags].filter(Boolean).join(" · ");
+      if (detail) txt.appendChild(el("span", "ck-crys-meta", detail));
+      row.appendChild(txt);
+      grid.appendChild(row);
     }
+    p.appendChild(grid);
     return p;
   }
 
@@ -2142,10 +2284,88 @@
   }
   // [MD-EXTRACT-END]
 
+  // The Patterns and Decisions sections are decorated on the Memory tab, never re-parsed: the section is drawn by its own markdown
+  // renderer (sectionDisplay, the same path every other section takes), then the rendered DOM is dressed in place. So whatever the
+  // markdown shows is still there (names with code spans, severity marks, bracket metadata, tails, lines that do not match), and an
+  // item the decoration does not recognise is left exactly as rendered.
+  // Patterns: in each list item the `| NNx` token (a direct text child, outside any code span) moves into a leading count chip; what
+  // came before it is the name, what follows is muted after it. A `{group}` line is a group label.
+  const MEM_COUNT = /\|\s*(\d+)x\b/;
+  function memDecoratePatterns(root) {
+    for (const p of root.querySelectorAll("p.md-p")) {
+      if (/^\s*\{[^}]*\}\s*$/.test(p.textContent)) p.classList.add("ck-mem-group");
+    }
+    for (const li of root.querySelectorAll("li.md-li")) {
+      let at = null, m = null;
+      for (const n of li.childNodes) {
+        if (n.nodeType !== 3) continue;
+        m = MEM_COUNT.exec(n.nodeValue);
+        if (m) { at = n; break; }
+      }
+      if (!at) continue;
+      const kids = Array.from(li.childNodes);
+      const name = el("span", "ck-mem-name"), rest = el("span", "ck-mem-rest");
+      const text = at.nodeValue, before = text.slice(0, m.index), after = text.slice(m.index + m[0].length);
+      let seen = false;
+      for (const n of kids) {
+        if (n === at) { seen = true; if (before) name.appendChild(document.createTextNode(before)); if (after) rest.appendChild(document.createTextNode(after)); }
+        else (seen ? rest : name).appendChild(n);
+      }
+      const t = el("span", "ck-mem-t");
+      t.append(name, rest);
+      li.replaceChildren(el("span", "ck-mem-n", m[1] + "x"), t);
+      li.classList.add("ck-mem-li");
+    }
+  }
+  // Decisions: an item (or paragraph) that begins with a `[decided|forwarded|carried ...]` bracket takes the bracket's date into a
+  // leading date column; the whole bracket (who, qualifier) stays visible as muted text. A later line of the same paragraph that
+  // opens with such a bracket gets its date inline. Anything else (a `[rejected ...]` line, prose) is left as rendered.
+  const MEM_BRACKET = /^(\s*)(\[(decided|forwarded|carried)\b([^\]]*)\])/;
+  function memWhen(m) {
+    const d = /,\s*(?:\d{4}-)?(\d\d-\d\d)/.exec(m[4]);
+    return m[3] === "decided" && d ? d[1] : m[3];
+  }
+  function memDecorateDecisions(root) {
+    for (const host of root.querySelectorAll("p.md-p, li.md-li")) {
+      // a paragraph's source lines are split at its <br>s into one block per line, so each decision line is its own row; a line that
+      // opens with no bracket (a continuation) stays a block of its own under the row above, its words untouched
+      const kids = Array.from(host.childNodes);
+      const lines = [[]];
+      for (const n of kids) { if (n.nodeName === "BR" && host.nodeName === "P") lines.push([]); else lines[lines.length - 1].push(n); }
+      const hits = lines.map((ln) => { const n = ln[0]; return n && n.nodeType === 3 ? MEM_BRACKET.exec(n.nodeValue) : null; });
+      if (!hits.some(Boolean)) continue;
+      host.replaceChildren();
+      lines.forEach((ln, i) => {
+        const m = hits[i];
+        const row = el("span", m ? "ck-mem-li" : "ck-mem-cont");
+        if (m) {
+          const first = ln[0];
+          first.nodeValue = first.nodeValue.slice(m[0].length);
+          const t = el("span", "ck-mem-text");
+          t.appendChild(el("span", "ck-mem-cite", m[1] + m[2]));
+          for (const n of ln) t.appendChild(n);
+          row.append(el("span", "ck-mem-when", memWhen(m)), t);
+        } else for (const n of ln) row.appendChild(n);
+        host.appendChild(row);
+      });
+      host.classList.add("ck-mem-dec");
+    }
+  }
+
   function renderSection(entry, sec) {
     const p = panel(entry);
     if (!sec) { p.appendChild(el("p", "empty", "—")); return p; }
-    p.appendChild(sectionDisplay(sec.body));  // markdown-rendered (edit shows raw)
+    const head = String(sec.heading || entry.heading || entry.title || "").trim().toLowerCase();
+    const disp = sectionDisplay(sec.body);   // markdown-rendered (edit shows raw)
+    // Patterns and Decisions are dressed in place on the Memory tab; a body the decoration finds nothing in stays the markdown it is
+    if (head === "patterns") { memDecoratePatterns(disp); disp.classList.add("ck-mem-pats"); }
+    else if (head === "decisions") { memDecorateDecisions(disp); disp.classList.add("ck-mem-decs"); }
+    p.appendChild(disp);
+    // a section with no text is left out of the Memory tab's neocortex card (a bare heading says nothing), unless it can be edited:
+    // then it is a slim row that keeps its Edit
+    const bare = !String(sec.body || "").trim();
+    if (bare) p.dataset.ckNoText = "1";
+    if (bare && isEditablePanel(entry)) { p.dataset.ckSlim = "1"; p.classList.add("ck-mem-slim"); p.appendChild(el("p", "empty", "empty")); }
     if (isEditablePanel(entry)) {
       // State (Class-A neocortex section) is editable in Slice 2b via the SAME
       // affordance config panels use — mark + stash; finalizePanels appends the bar.
@@ -2230,6 +2450,8 @@
       if (p.hasAttribute("data-clamp")) body.classList.add("clamped");
       row.style.display = "";
       body.dataset.editing = "";
+      const again = row.querySelector(".edit-btn");   // the way back in is where focus returns, not the page
+      if (again) again.focus();
     };
     cancel.addEventListener("click", restore);
     // Escape cancels the edit (not the whole modal): stopPropagation keeps it from
