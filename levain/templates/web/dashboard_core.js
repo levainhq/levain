@@ -4243,7 +4243,6 @@
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
     const sig = items.map(needsKey).join("\n");
     if (host.dataset.sig === sig && !host.hidden) return;
-    host.dataset.sig = sig;
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Needs you"));
     head.appendChild(el("span", "needs-count", String(items.length)));
@@ -4255,10 +4254,19 @@
     hist.title = "decided requests, outcomes and standing-rule proposals";
     hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
-    const grid = el("div", "needs-grid");
-    for (const it of items) grid.appendChild(it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
+    // the cards are kept by their stable id: a card whose item still waits is moved, never rebuilt, so the words typed into a
+    // question and an open "details" survive a change in what else waits; only a card whose item has gone is dropped
+    let grid = host.querySelector(".needs-grid");
+    const kept = new Map();
+    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
+    const idOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
+    const cards = items.map((it) => { const id = idOf(it); return (id && kept.get(id)) || (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)); });
+    if (!grid) grid = el("div", "needs-grid");
+    for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
+    while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
     host.replaceChildren(head, needsBar(items), grid);
     host.hidden = false;
+    host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
   // the Decisions focus view (decided requests, outcomes, proposals); false when this page has no Decisions panel
   function openDecisionsHistory(opener) {
