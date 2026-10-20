@@ -238,6 +238,11 @@
   }
 
   let closePick = null;       // the open passkey picker's close, if one is up (it holds busy)
+  // a picker left open while the page is put away (phone locked, app switched) would hold the whole list still,
+  // consent cards included, until someone came back to dismiss it: leaving the page dismisses it instead
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && closePick && closePick()) setTimeout(load, 0);
+  });
 
   function start(r, decision, signers, say, actions, ruling, go, what) {
     const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
@@ -509,7 +514,8 @@
                         + (r.session || "") + " in " + (r.repo || "") + " at " + (typeof r.base === "string" ? r.base.slice(0, 12) : "")));
     card.appendChild(digestLine("contract digest", r.digest));
     const det = el("details", "lists");
-    det.appendChild(el("summary", null, "details \u00b7 reads " + Number(r.read_count) + " files \u00b7 writes " + Number(r.write_count) + " files"));
+    const files = (n) => Number(n) + (Number(n) === 1 ? " file" : " files");
+    det.appendChild(el("summary", null, "details \u00b7 reads " + files(r.read_count) + " \u00b7 writes " + files(r.write_count)));
     for (const [label, entries] of [["read", r.read], ["write", r.write]]) {
       det.appendChild(el("div", "where", label));
       const ul = el("ul", "where");

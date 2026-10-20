@@ -384,3 +384,28 @@ def test_words_typed_while_a_get_is_in_flight_are_not_redrawn_away(world, tmp_pa
                      " document.querySelector('article.dispatch').dataset.mark || null]"},
         ])
     assert out["values"][5] == ["half a sentence", "1"], out
+
+
+# --- B5's review (1019+45): a picker left open while the page is put away held the whole list still -----------------
+
+HIDE = ("(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });"
+        " document.dispatchEvent(new Event('visibilitychange')); return 1; })()")
+
+
+@needs_browser
+def test_putting_the_page_away_dismisses_an_open_picker_and_polling_resumes(world, tmp_path: Path) -> None:
+    _two_passkeys(world, tmp_path)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": SIGN_TAP},                                             # opens the picker (it holds busy)
+            {"eval": PICKS},
+            {"eval": HIDE},
+            {"eval": PICKS},
+            {"eval": FETCH_HOOK},
+            {"eval": POLLS},
+            {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
+        ])
+    assert out["values"][2] >= 2 and out["values"][4] == 0, out             # the picker was up, then gone
+    assert out["values"][7] >= 3, out                                       # busy released: the list polls again
