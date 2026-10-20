@@ -6,7 +6,10 @@ needs). LAND (E1, "adopted"): one ``update-ref`` compare-and-swap moves a branch
 contract's ``base`` to a staged commit. A land is authorised by (A) the operator's signed authorise item over the
 run's ARTIFACT digest and the branch (:func:`authorise_payload`, its own namespace), or (B) a standing adoption rule
 whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules`); (C), the envelope, comes with the
-coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides.
+coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
+records a land judges are the job store's own (:meth:`levain.dispatch.jobs.JobStore.run_records`, as
+:meth:`~levain.dispatch.jobs.JobStore.record_verification` wrote them); :func:`land` takes none from its caller,
+so a record built over another staged tree has no way in.
 
 :func:`land` is F11 §6: on a verified or recommended job the floor runs in full and only then is ``authorised``
 written, its evidence the INTENT (authority, run, branch, staged commit, base, tree, artifact digest). That write is
@@ -884,8 +887,9 @@ def _fail_moved(store: JobStore, job: Job, line: str) -> Landing:
     return Landing(outcome="failed", job=out, message=line + note)
 
 
-def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Landing:
-    """An authorised job: decide on ``onto`` alone, from the intent (F11 §6); nothing mutable is read."""
+def _finish(store: JobStore, job: Job) -> Landing:
+    """An authorised job: decide on ``onto`` alone, from the intent (F11 §6); nothing mutable is read. The intent's
+    run record is the store's, and it must still be the one authorised."""
     intent = _intent(job)
     repo, onto, staged, base = job.repo, intent["onto"], intent["staged"], intent["base"]
     tip = _read_branch(repo, onto)
@@ -901,8 +905,8 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     shape = _commit_shape(repo, staged)
     if shape is None or shape[0] != [base] or shape[1] != intent["tree"]:
         return Landing(outcome="refused", job=job, message="the staged commit is no longer the one authorised")
-    mine = [r for r in records if r.problem() is None and r.run == intent["run"]]
-    if mine and artifact_digest(mine[0]) != intent["artifact_digest"]:
+    mine = [r for r in store.run_records(job.id) if r.run == intent["run"]]
+    if not mine or artifact_digest(mine[0]) != intent["artifact_digest"]:
         return Landing(outcome="refused", job=job, message="the run's record is no longer the one authorised")
     if _symbolic(repo, onto):
         return Landing(outcome="refused", job=job, message=f"refs/heads/{onto} is a symbolic ref")
@@ -927,26 +931,29 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
     return Landing(outcome="adopted", job=out, moved=True, message=f"{onto} -> {staged}")
 
 
-def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
+def land(store: JobStore, job_id: str, *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
          onto: str | None = None, human: tuple[Any, Any, Any] | None = None,
          rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
          now: str | None = None) -> Landing:
-    """F11 §6 for job ``job_id``. ``human`` is ``(payload, signature, authority)`` for (A); ``rules`` returns the
-    active adoption rules and their generation for (B) (``lambda: adoption_rules_at(control_store)``). A MOVED BASE
-    before authorisation fails the job only under an (A) item whose signature verifies (the human named that run and branch);
-    an unverified item or a rule land is refused and the job and its staged refs are kept. ``landing_tier`` has no
-    default. A verified/recommended job passes the floor and is authorised (the INTENT) before anything moves; an
-    authorised job goes straight to :func:`_finish`. A refused signature is a ``refused`` landing; a verifier that
-    cannot run (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
+    """F11 §6 for job ``job_id``, over the job's own run records (:meth:`JobStore.run_records`; a stored row that
+    does not match its digest raises :class:`levain.dispatch.jobs.JobStoreError`). ``human`` is ``(payload, signature,
+    authority)`` for (A); ``rules`` returns the active adoption rules and their generation for (B) (``lambda:
+    adoption_rules_at(control_store)``). A MOVED BASE before authorisation fails the job only under an (A) item
+    whose signature verifies (the human named that run and branch); an unverified item or a rule land is refused and
+    the job and its staged refs are kept. ``landing_tier`` has no default. A verified/recommended job passes the
+    floor and is authorised (the INTENT) before anything moves; an authorised job goes straight to :func:`_finish`.
+    A refused signature is a ``refused`` landing; a verifier that cannot run
+    (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
     if job.state == "authorised":
-        return _finish(store, job, records)
+        return _finish(store, job)
     stamp = now or utc_stamp(store._clock())
     payload = human[0] if human is not None else None
+    records = store.run_records(job.id)
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
                     policy=policy, now=stamp, human=payload if isinstance(payload, Mapping) else
                     ({} if human is not None else None), rules=rules)
@@ -993,7 +1000,7 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
         if again.state != "authorised":
             raise
         job = again
-    return _finish(store, job, records)
+    return _finish(store, job)
 
 
 def _human_refusal(store: JobStore, job: Job, human: tuple[Any, Any, Any], record: ArtifactRecord,
