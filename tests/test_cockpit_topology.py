@@ -349,7 +349,7 @@ def test_dispatch_contracts_are_tasks_with_ledger_outcomes_and_no_cost(tmp_path,
     assert [o["label"] for o in ta["outcomes"]][-1] == "verifier pass" and ta["outcomes"][-1]["ok"] is True
     assert any(o["label"] == "adopted (adopted)" and o["ok"] for o in ta["outcomes"])
     assert tb["state"] == "waiting" and tb["waits_on"] == [f"dispatch:{b.id}"] and tb["workers"] == []
-    assert ta["label"] == "dispatch · fix-lint" and "Fix the lint" not in json.dumps(v)    # the goal stays off
+    assert ta["label"] == "Fix the lint in a.py." and "Keep b as is" not in json.dumps(v)    # the goal's first line only
     assert ta["cost"] == tb["cost"] == {"usd": None, "tokens": None, "source": None}
     # a contract names no worker: the filing session stays where it was
     assert _stem("claude_code", "s-run") in next(t for t in v["tasks"] if t["kind"] == "unattached")["workers"]

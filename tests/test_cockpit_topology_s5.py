@@ -104,3 +104,14 @@ def test_conflicts_are_null_when_no_live_node_has_a_log(tmp_path, monkeypatch):
         f.unlink()
     v = ck.panel("topology", credential_class="none")["value"]
     assert v["conflicts"] is None            # nothing observed: not "no conflicts"
+
+
+def test_a_dispatch_task_is_labelled_by_its_contracts_goal(tmp_path, monkeypatch):
+    ck, _root, _src, cdir, _work = _rig(tmp_path, monkeypatch)
+    job = _file_dispatch(cdir, tmp_path, goal="Round the money totals to cents\nand nothing else")
+    other = _file_dispatch(cdir, tmp_path / "b", goal="G" * 80)
+    v = ck.panel("topology", credential_class="none")["value"]
+    ts = {t["id"]: t for t in v["tasks"]}
+    assert ts[f"dispatch:{job.id}"]["label"] == "Round the money totals to cents"
+    assert "nothing else" not in json.dumps(v)
+    assert len(ts[f"dispatch:{other.id}"]["label"]) == 48

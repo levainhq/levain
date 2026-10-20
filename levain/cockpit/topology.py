@@ -25,8 +25,8 @@ live nodes exist and none has a log).
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
 log holds it only inside text this token-free panel must not carry), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
 episodes (episodes carry no session) and running children (no hook records a subagent). What does reach the wire is
-display-safe: a consent task is its agent and tool, a question its number, a dispatch contract its template, never
-its goal or a request's body; but a file name, a branch name, a repository or directory basename and an open loop's
+display-safe: a consent task is its agent and tool, a question its number, a dispatch contract its goal's first
+line (``_wire``'d; else its template), never a request's body; but a file name, a branch name, a repository or directory basename and an open loop's
 text (all agent- or repository-controlled) are carried, each through ``_wire`` (display-safe, a basename without a
 path, at most ``LABEL_MAX`` characters).
 
@@ -344,11 +344,24 @@ def _question_tasks(open_qs: list[Any], worker_of: Callable[[str, str], str | No
     return tasks
 
 
+def _dispatch_label(job: Any) -> str:
+    """A dispatch task's name: the first line of the contract's own goal (the text the operator signed), else
+    ``dispatch · <template id>`` when the goal does not read."""
+    try:
+        first = next((ln for ln in job.contract.goal.splitlines() if ln.strip()), "")
+        if first.strip():
+            return _wire(first)
+    except Exception:  # noqa: BLE001 - a goal that does not read leaves the template's name
+        pass
+    return _wire(f"dispatch · {job.contract.template.template_id}")
+
+
 def _dispatch_tasks(directory: Path, now: datetime) -> tuple[list[dict[str, Any]], list[str]]:
     """A task per dispatch contract still open, or finished in the last ``DISPATCH_DONE_H`` hours, through the job
     store's and the outcome ledger's public readers. Neither store is created here: a directory without one has
-    no contracts (or no labels). A contract has no worker: the session that filed it is not running it, and the job
-    record names no session that does. Raises for a store that cannot be read."""
+    no contracts (or no labels). A contract has no worker: the session that filed it is not running it, and neither the job
+    record, its transitions nor the outcome ledger names a session that does; nor is any spend recorded (the contract's
+    budget is a cap), so ``cost`` stays NO_COST and "no agent attached" is the honest drawing. Raises for a store that cannot be read."""
     from levain.dispatch import jobs as djobs
     from levain.dispatch import outcomes as dout
 
@@ -384,7 +397,7 @@ def _dispatch_tasks(directory: Path, now: datetime) -> tuple[list[dict[str, Any]
                                  "ok": job.state == "adopted"})
             outcomes.sort(key=lambda o: o["at"], reverse=True)
             tasks.append({"id": f"dispatch:{job.id}", "kind": "dispatch",
-                          "label": _wire(f"dispatch · {job.contract.template.template_id}"),
+                          "label": _dispatch_label(job),
                           "state": state, "waits_on": [f"dispatch:{job.id}"] if state == "waiting" else [],
                           "card": None, "outcomes": outcomes, "cost": dict(NO_COST), "workers": []})
         except Exception:  # noqa: BLE001 - one job that does not build is counted, never the store
