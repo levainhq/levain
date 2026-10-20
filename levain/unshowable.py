@@ -9,10 +9,12 @@ A code point is UNSHOWABLE when its general category is control, format, surroga
 private use or unassigned; when it is a space other than U+0020; when it is a Default_Ignorable_Code_Point; or when it
 is U+2800 (the braille blank, a symbol that draws nothing).
 
-One contextual exception: a single U+FE0E or U+FE0F (text / emoji presentation) directly after a showable character
-is showable, so ordinary text such as "⚠️" passes. A selector at the start of the text, after another selector, or
-after a character that is itself unshowable (newline and tab included, even where ``allow`` tolerates them) is
-unshowable: a run of selectors could otherwise carry bits the reader never sees.
+One contextual exception: a single U+FE0E or U+FE0F (text / emoji presentation) directly after a character that has
+a text and an emoji form to choose between (a symbol, category So or Sm; a digit, ``#`` or ``*``, the keycap bases;
+‼ ⁉ 〽 〰) is showable, so ordinary text such as "⚠️" passes: there the selector visibly changes the glyph. Anywhere
+else (after a letter, at the start of the text, after another selector, after an unshowable character, newline and
+tab included even where ``allow`` tolerates them) it is unshowable: selectors after ordinary letters, or in a run,
+could carry bits the reader never sees.
 
 Stdlib only. It imports nothing from levain, so a module that must never reach ``levain.consent.hints`` (the cockpit's
 display guard) can use it.
@@ -35,7 +37,12 @@ _DEFAULT_IGNORABLE = (
     (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF),
 )
 _BRAILLE_BLANK = 0x2800
-_PRESENTATION = frozenset("︎️")
+_PRESENTATION = frozenset("\ufe0e\ufe0f")
+_PRESENTATION_BASES = frozenset("0123456789#*\u203c\u2049\u303d\u3030")
+
+
+def _presentation_base(ch: str) -> bool:
+    return ch in _PRESENTATION_BASES or unicodedata.category(ch) in ("So", "Sm")
 
 
 def is_unshowable(ch: str) -> bool:
@@ -54,13 +61,13 @@ def hidden(text: str, allow: str = "") -> list[int]:
     """The indices in ``text`` of every unshowable character, in order. A character in ``allow`` (for example
     ``"\\n\\t"``) is never reported, but it still counts as unshowable for the presentation-selector exception."""
     out: list[int] = []
-    prev_showable = False
+    prev_base = False
     for i, ch in enumerate(text):
-        if ch in _PRESENTATION and prev_showable:
-            prev_showable = False           # the one selector is shown; a second in the run is not
+        if ch in _PRESENTATION and prev_base:
+            prev_base = False               # the one selector is shown; a second in the run is not
             continue
         bad = is_unshowable(ch)
-        prev_showable = not bad
+        prev_base = not bad and _presentation_base(ch)
         if bad and ch not in allow:
             out.append(i)
     return out

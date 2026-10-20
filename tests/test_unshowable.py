@@ -37,9 +37,13 @@ TABLE = [
     ("ZWJ", "a‍b", [1]),
     ("SHY", "a­b", [1]),
     ("VS1", "a︀b", [1]),
-    ("VS16 after a letter", "a️b", []),
-    ("VS15 after a letter", "a︎b", []),
-    ("VS16 run of 3", "a️️️b", [2, 3]),
+    ("VS16 after a letter", "a️b", [1]),
+    ("VS15 after a letter", "a︎b", [1]),
+    ("VS16 run of 3", "a️️️b", [1, 2, 3]),
+    ("VS16 run of 3 after a symbol", "⚠️️️b", [2, 3]),
+    ("keycap digit + VS16", "1️", []),
+    ("double exclamation + VS16", "‼️", []),
+    ("arrow (Sm) + VS15", "↔︎", []),
     ("VS16 at start", "️ab", [0]),
     ("VS16 after a hidden char", "a​️b", [1, 2]),
     ("VS17 U+E0100", "a\U000e0100b", [1]),
@@ -124,5 +128,6 @@ def test_every_site_agrees_with_the_predicate(case: str, text: str, base: list[i
 
 def test_mark_formats_each_hidden_character() -> None:
     assert unshowable.mark("a‮b\nc") == "a⟨U+202E⟩b\nc"
-    assert unshowable.mark("a️️", "<{:X}>", allow="") == "a️<FE0F>"
+    assert unshowable.mark("⚠️️", "<{:X}>", allow="") == "⚠️<FE0F>"
+    assert unshowable.mark("a️", "<{:X}>", allow="") == "a<FE0F>"
     assert unshowable.mark("a​b", "") == "ab"
