@@ -264,7 +264,7 @@ def test_waiting_and_stalled_are_two_states_and_unattached_work_is_never_a_guess
     assert question[0]["label"].startswith("codex · question #")
     un = tasks["unattached"]
     assert un["kind"] == "unattached" and un["state"] == "stuck"   # a stalled worker sits there
-    assert set(un["workers"]) == {_stem("claude_code", s) for s in ("s-stall", "s-run", "s-done", "s-old")}
+    assert set(un["workers"]) == {_stem("claude_code", s) for s in ("s-stall", "s-run")}     # active ones only
     assert not ({w for t in v["tasks"] if t["kind"] != "unattached" for w in t["workers"]} & set(un["workers"]))
     # every cost is "not tracked" on this branch, never a guess
     assert all(t["cost"] == {"usd": None, "tokens": None, "source": None} for t in v["tasks"])
@@ -345,14 +345,14 @@ def test_dispatch_contracts_are_tasks_with_ledger_outcomes_and_no_cost(tmp_path,
     assert "dispatch" not in v["unreadable"], v["errors"]
     ds = {t["id"]: t for t in v["tasks"] if t["kind"] == "dispatch"}
     ta, tb = ds[f"dispatch:{a.id}"], ds[f"dispatch:{b.id}"]
-    assert ta["state"] == "done" and ta["workers"] == [_stem("claude_code", "s-run")]
+    assert ta["state"] == "done" and ta["workers"] == []        # the filer is not the worker
     assert [o["label"] for o in ta["outcomes"]][-1] == "verifier pass" and ta["outcomes"][-1]["ok"] is True
     assert any(o["label"] == "adopted (adopted)" and o["ok"] for o in ta["outcomes"])
     assert tb["state"] == "waiting" and tb["waits_on"] == [f"dispatch:{b.id}"] and tb["workers"] == []
     assert ta["label"] == "dispatch · fix-lint" and "Fix the lint" not in json.dumps(v)    # the goal stays off
     assert ta["cost"] == tb["cost"] == {"usd": None, "tokens": None, "source": None}
-    # s-run is on a contract now: it leaves the unattached task
-    assert _stem("claude_code", "s-run") not in next(t for t in v["tasks"] if t["kind"] == "unattached")["workers"]
+    # a contract names no worker: the filing session stays where it was
+    assert _stem("claude_code", "s-run") in next(t for t in v["tasks"] if t["kind"] == "unattached")["workers"]
 
 
 def test_a_consent_directory_with_no_dispatch_store_creates_none(tmp_path, monkeypatch):
@@ -397,7 +397,9 @@ def test_lost_if_closed_counts_dirty_files_and_unpushed_commits_on_a_real_repo(t
     assert seat["dirty"] == 0 and seat["unpushed"] == 0 and seat["branches"] == [], seat
     # the worktree folds into its main repository's group
     groups = {n["id"]: n["group"] for n in v["nodes"]}
-    assert groups[_stem("claude_code", "in-main")] == groups[_stem("claude_code", "in-wt")] == "repo:ledgerline"
+    gid = groups[_stem("claude_code", "in-main")]
+    assert gid == groups[_stem("claude_code", "in-wt")] and gid.startswith("repo:") and "ledgerline" not in gid
+    assert next(g for g in v["groups"] if g["id"] == gid)["label"] == "ledgerline"
     assert [e for e in v["errors"] if "ledgerline" in e] == []
     assert _panel(v)["status"] == "ok"                                    # the engine's contract holds the feed
 
@@ -665,3 +667,167 @@ def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():
     assert all(t["workers"] == [] for t in tasks)
     # the recent-touch heuristic is gone, not renamed
     assert not hasattr(topo, "SPORE_QUIET_DAYS")
+
+
+# --- F12a fix 2, lane B: one wire normaliser, empty-but-blind, workers, unattached, group ids, rate ---------------
+
+def _marker_whole(s: str) -> bool:
+    """Every ``⟨`` opens a ``⟨U+XXXX⟩`` marker that is complete: a cut never leaves half of one."""
+    import re
+
+    return re.sub(r"⟨U\+[0-9A-F]{4,6}⟩", "", s).count("⟨") == 0 and "⟩" not in re.sub(r"⟨U\+[0-9A-F]{4,6}⟩", "", s)
+
+
+@pytest.mark.parametrize("raw,base,want", [
+    ("a\\b.txt", True, "a⟨U+005C⟩b.txt"),
+    ("src/a.py", True, "src⟨U+002F⟩a.py"),
+    ("src/a.py", False, "src/a.py"),                   # a label may carry a slash (a branch is feature/x)
+    ("ㅤ", True, "⟨U+3164⟩"),
+    (" ", True, "(unnamed)"),
+    ("", False, "(unnamed)"),
+    ("\n\t ", False, "(unnamed)"),
+    ("a‮b", True, "a⟨U+202E⟩b"),
+    ("a   b\nc", False, "a b c"),
+    (None, False, "None"),
+])
+def test_one_wire_normaliser_maps_every_hostile_string_to_something_the_validator_accepts(raw, base, want):
+    from levain.cockpit.display_safe import visible
+
+    got = topo._wire(raw, base=base)
+    assert got == want
+    assert visible(got) == got and got and len(got) <= topo.LABEL_MAX
+
+
+def test_the_normaliser_cut_never_splits_a_marker():
+    for lead in range(40, 50):
+        got = topo._wire("x" * lead + "‮" * 4 + "tail")
+        assert len(got) <= topo.LABEL_MAX and _marker_whole(got.removesuffix("…")), (lead, got)
+    assert topo._wire("x" * 200).endswith("…") and len(topo._wire("x" * 200)) == topo.LABEL_MAX
+
+
+def _stub_scan(names: list[str], branch: str | None = "main"):
+    def scan(trees):
+        return ({str(top): {"dirty": len(names), "dirty_names": list(names), "branch": branch, "unpushed": 1}
+                 for (_c, _g, top), _label in trees}, [])
+    return scan
+
+
+@pytest.mark.parametrize("names", [["a\\b.txt"], [" "], ["ㅤ"], ["a‮txt.exe"], ["x" * 60], ["a/b"]])
+def test_a_hostile_file_name_leaves_the_panel_a_value_never_a_fault(tmp_path, names):
+    repo = _repo(tmp_path / "work" / "ledgerline")
+    root = tmp_path / "inst"
+    _session(root, "s", str(repo), timedelta(minutes=2))
+    read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
+                                hub_label=lambda c: "Sage", home=str(tmp_path), scan=_stub_scan(names))
+    v = read(ReadContext(datetime.now(timezone.utc))).value
+    p = _panel(v)
+    assert p["status"] in ("ok", "partial"), p
+    got = _lost(v, _stem("claude_code", "s"))["dirty_names"]
+    assert len(got) == 1 and "/" not in got[0] and "\\" not in got[0] and got[0]
+
+
+def test_hostile_names_on_a_real_repo_and_a_hostile_directory_name(tmp_path):
+    repo = _repo(tmp_path / "work" / "ledgerline")
+    (repo / " ").write_text("x")
+    (repo / "a\\b.txt").write_text("x")
+    weird = tmp_path / "work" / "ㅤ"
+    weird.mkdir()
+    root = tmp_path / "inst"
+    _session(root, "in-repo", str(repo), timedelta(minutes=2))
+    _session(root, "in-weird", str(weird), timedelta(minutes=2))
+    read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
+                                hub_label=lambda c: "Sage", home=str(tmp_path))
+    v = read(ReadContext(datetime.now(timezone.utc))).value
+    assert _panel(v)["status"] in ("ok", "partial"), _panel(v)
+    names = _lost(v, _stem("claude_code", "in-repo"))["dirty_names"]
+    assert sorted(names) == ["(unnamed)", "a⟨U+005C⟩b.txt"], names
+
+
+def test_an_all_blind_read_is_not_an_empty_panel():
+    from levain.cockpit.engine import Cockpit as C
+
+    blind = {"nodes": [], "tasks": [], "unreadable": ["decisions", "questions"]}
+    assert C._value_empty("topology", blind) is False
+    assert C._value_empty("topology", {"nodes": [], "tasks": [], "unreadable": []}) is True
+    assert C._value_empty("topology", {"nodes": [], "tasks": []}) is True
+    v = {**_good(), "groups": [], "nodes": [], "conflicts": [], "tasks": [], "lost_if_closed": [],
+         "unreadable": ["decisions"], "errors": ["decisions: no consent queue is attached to this cockpit"]}
+    assert _panel(v)["status"] != "empty"
+
+
+def test_a_dispatch_filers_session_is_not_its_worker_and_only_a_record_waits(tmp_path, monkeypatch):
+    from levain.cockpit.consent import utc_stamp
+    from levain.dispatch.jobs import JobStore
+    from tests.test_dispatch_contract import POLICY, make_repo, registry, submission
+
+    _ck, _root, _src, cdir, _work = _rig(tmp_path, monkeypatch)
+    path, base = make_repo(tmp_path / "dispatch-repo")
+    now = datetime.now(timezone.utc)
+    store = JobStore(cdir)
+    j, _cap = store.file(submission(path, base, expires_at=utc_stamp(now + timedelta(hours=2))),
+                         resolve_template=registry(), policy=POLICY, filer_session="s-run", idem_key=None)
+    seen = {}
+    for to, cause in (("filed", None), ("signed", "signature"), ("running", "slot_taken"),
+                      ("verifying", "runs_exited"), ("verified", "verifier_pass")):
+        if cause is not None:
+            store._transition(j.id, to, cause)
+        tasks, errs = topo._dispatch_tasks(cdir, now)
+        t = next(x for x in tasks if x["id"] == f"dispatch:{j.id}")
+        assert t["workers"] == [], (to, t)               # the filing session ("s-run") is no worker, in any state
+        seen[to] = t["state"]
+    # filed and verified wait on a person (a record); the states the job runtime holds are running, never silence
+    assert seen == {"filed": "waiting", "signed": "running", "running": "running", "verifying": "running",
+                    "verified": "waiting"}, seen
+
+
+def test_unattached_is_for_active_sessions_only_and_is_never_done(tmp_path):
+    root = tmp_path / "inst"
+    work = tmp_path / "w"
+    for n in ("run", "idle"):
+        (work / n).mkdir(parents=True)
+    _session(root, "s-run", str(work / "run"), timedelta(minutes=3))
+    _log(root, "claude_code", "s-run", [("prompt", timedelta(minutes=3)), ("tool", timedelta(seconds=30))])
+    _session(root, "s-idle", str(work / "idle"), timedelta(minutes=8))
+    _log(root, "claude_code", "s-idle", [("prompt", timedelta(minutes=8)), ("reply", timedelta(minutes=7))])
+    mk = lambda: topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,  # noqa: E731
+                                      hub_label=lambda c: "x", home=str(tmp_path))
+    v = mk()(ReadContext(datetime.now(timezone.utc))).value
+    un = next(t for t in v["tasks"] if t["kind"] == "unattached")
+    assert un["workers"] == [_stem("claude_code", "s-run")] and un["state"] == "running"
+    assert _stem("claude_code", "s-idle") in {n["id"] for n in v["nodes"]}      # still in the Agents lens
+    # only idle sessions: no unattached task at all, never a `done` one
+    for p in (root / ".levain" / "sessions").glob(f"{_stem('claude_code', 's-run')[8:]}*"):
+        p.unlink()
+    v = mk()(ReadContext(datetime.now(timezone.utc))).value
+    assert [t for t in v["tasks"] if t["kind"] == "unattached"] == [], v["tasks"]
+    assert all(t["state"] != "done" for t in v["tasks"] if t["kind"] == "unattached")
+
+
+def test_same_basename_repos_are_two_groups_with_distinct_ids_and_disambiguated_labels(tmp_path):
+    a = _repo(tmp_path / "alpha" / "ledger")
+    b = _repo(tmp_path / "beta" / "ledger")
+    c = _repo(tmp_path / "alpha" / "solo")
+    root = tmp_path / "inst"
+    for sid, r in (("a", a), ("b", b), ("c", c)):
+        _session(root, sid, str(r), timedelta(minutes=2))
+    read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
+                                hub_label=lambda c: "x", home=str(tmp_path), scan=_stub_scan([]))
+    v = read(ReadContext(datetime.now(timezone.utc))).value
+    assert len(v["groups"]) == 3 and len({g["id"] for g in v["groups"]}) == 3
+    labels = sorted(g["label"] for g in v["groups"])
+    assert labels == ["ledger (alpha)", "ledger (beta)", "solo"], labels
+    assert all(g["repo"] in ("ledger", "solo") for g in v["groups"])
+    assert str(tmp_path) not in json.dumps(v)                       # the id is a hash of the gitdir, never its path
+    by_node = {n["id"]: n["group"] for n in v["nodes"]}
+    assert by_node[_stem("claude_code", "a")] != by_node[_stem("claude_code", "b")]
+    assert _panel(v)["status"] == "ok"
+
+
+def test_a_session_with_no_log_has_no_rate_not_a_zero(tmp_path, monkeypatch):
+    ck, _root, _src, _cdir, _work = _rig(tmp_path, monkeypatch)
+    nodes = {n["id"]: n for n in ck.panel("topology", credential_class="none")["value"]["nodes"]}
+    assert nodes[_stem("claude_code", "s-wait")]["rate"] is None          # no log was written for it
+    assert nodes[_stem("claude_code", "s-run")]["rate"] == pytest.approx(0.6)
+    v = _good()
+    v["nodes"][0]["rate"] = None
+    assert _panel(v)["status"] == "ok"
