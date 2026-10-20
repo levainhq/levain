@@ -103,12 +103,15 @@ def _root_owned_ancestors(path: Path, *, lstat: Callable[[str], os.stat_result] 
     The deepest part of ``path`` that exists is resolved through every link, and it and every one of
     the RESOLVED path's ancestors must be root's and writable by root alone, so a link anywhere above
     is judged by where it really leads. ``path`` itself must not be a link: setup would follow it and
-    install root's code wherever it points."""
+    install root's code wherever it points. A path that cannot be examined (a dangling link above it, a
+    component that is not a directory, no permission) is refused, never raised."""
     try:
         if stat.S_ISLNK(lstat(str(path)).st_mode):
             return False, f"{path} is a symlink; refusing to install root's code through it"
     except FileNotFoundError:
         pass
+    except OSError as e:
+        return False, f"cannot examine {path} ({e.strerror or e}); refusing"
     deepest = path
     while True:
         try:
@@ -118,9 +121,18 @@ def _root_owned_ancestors(path: Path, *, lstat: Callable[[str], os.stat_result] 
             if deepest.parent == deepest:
                 return False, f"no part of {path} exists"
             deepest = deepest.parent
-    real = Path(realpath(str(deepest)))
+        except OSError as e:
+            return False, f"cannot examine {deepest} ({e.strerror or e}); refusing"
+    try:
+        real = Path(realpath(str(deepest)))
+    except OSError as e:
+        return False, f"cannot resolve {deepest} ({e.strerror or e}); refusing"
     for d in (real, *real.parents):
-        st = lstat(str(d))
+        try:
+            st = lstat(str(d))
+        except OSError as e:
+            shown = d if real == deepest else f"{d} (where {deepest} leads)"
+            return False, f"cannot examine {shown} ({e.strerror or e}); refusing to install root's code below it"
         if stat.S_ISLNK(st.st_mode):
             return False, f"{d} became a symlink while it was checked; refusing"
         if st.st_uid != 0 or st.st_mode & 0o022:

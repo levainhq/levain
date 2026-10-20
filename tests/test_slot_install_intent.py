@@ -1,5 +1,5 @@
-"""CONTRACT §25 (c7.7): the install lock and the intent journal; and the L3 r1 triage's Linux twin of F6
-(a running unit whose file changed is restarted). Plan assertions, fakes, and pytest tmp files only."""
+"""CONTRACT §25 (c7.7): the install lock and the intent journal. Plan assertions, fakes, and pytest tmp
+files only."""
 from __future__ import annotations
 
 import os
@@ -11,7 +11,7 @@ import pytest
 
 import levain
 from levain.firing import hands
-from levain.slot import Refused, intent as intent_mod, units
+from levain.slot import Refused, intent as intent_mod
 from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
@@ -309,67 +309,3 @@ def test_undo_reads_intent(host):
     undo2 = plan_undo(parse_install_argv(["undo"]), _set_up(host, intent=rj, host_ids={"_levain_s0": s0}),
                       accounts={}, shared_groups=())
     assert s0 in undo2.retired_after and any(s.why.startswith("tombstone _levain_s0") for s in undo2.steps)
-
-
-# --- TRIAGE r1, A1 report: a running Linux unit whose file changed is restarted ---------------------------
-
-
-class _Systemd:
-    def __init__(self, active=()):
-        self.active, self.calls = set(active), []
-
-    def __call__(self, argv, **kw):
-        argv = tuple(argv)
-        self.calls.append(argv[1:])
-        verb = argv[1]
-        if verb == "is-active":
-            return subprocess.CompletedProcess(argv, 0 if argv[-1] in self.active else 3)
-        if verb in ("restart", "daemon-reload"):
-            return subprocess.CompletedProcess(argv, 0)
-        if verb == "enable":
-            self.active.add(argv[-1])
-            return subprocess.CompletedProcess(argv, 0)
-        raise AssertionError(argv)
-
-
-def _apply(steps, systemd, disk):
-    for s in steps:
-        if s.write:
-            disk[s.write[0]] = s.write[1].encode()
-        elif s.call:
-            ok, why = s.call()
-            assert ok, why
-        else:
-            systemd(s.argv)
-
-
-@pytest.mark.parametrize("case", ["fresh", "active-unchanged", "active-changed", "inactive-changed"])
-def test_systemd_restart_only_an_active_changed_unit(case):
-    svc = units.by_name("control")
-    name, text = units.systemd_name(svc), units.systemd_unit_text(svc)
-    path = units.systemd_path(name)
-    disk = {}
-    if case == "active-unchanged":
-        disk[path] = text.encode()
-    elif case in ("active-changed", "inactive-changed"):
-        disk[path] = text.replace("RestartSec=1", "RestartSec=9").encode()
-        assert disk[path] != text.encode()
-    systemd = _Systemd((name,) if case.startswith("active") else ())
-    steps = units.install_steps("linux", [svc], run=systemd, read=lambda p: disk.get(p))
-    _apply(steps, systemd, disk)
-    restarts = [c for c in systemd.calls if c[0] == "restart"]
-    assert disk[path] == text.encode() and name in systemd.active
-    assert restarts == ([("restart", name)] if case == "active-changed" else [])
-    if case == "active-changed":
-        assert systemd.calls.index(("daemon-reload",)) < systemd.calls.index(("restart", name))
-
-
-def test_systemd_record_step_comes_before_its_write():
-    steps = units.install_steps("linux", units.services_for("linux"))
-    reload_at = next(i for i, s in enumerate(steps) if s.argv and s.argv[-1] == "daemon-reload")
-    for s in units.services_for("linux"):
-        path = units.systemd_path(units.systemd_name(s))
-        w = next(i for i, x in enumerate(steps) if x.write and x.write[0] == path)
-        rec = next(i for i, x in enumerate(steps) if x.call and str(path) in x.why)
-        restart = next(i for i, x in enumerate(steps) if x.call and x.why.startswith(f"restart {units.systemd_name(s)}"))
-        assert rec < w < reload_at < restart

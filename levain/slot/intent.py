@@ -23,7 +23,7 @@ from typing import Callable, Iterator, Mapping
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs
-from levain.slot import Refused
+from levain.slot import Refused, write_all
 from levain.slot.ids import RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, in_own_range, is_levain_account
 
 INTENT_FORMAT = "levain-intent/1"
@@ -167,8 +167,9 @@ def read_intent(host: HostOS, *, path: Path | None = None) -> Intent | None:
 
 def write_intent_atomically(path: Path, text: str) -> tuple[bool, str]:
     """Write ``text`` to ``path`` 0600 so a reader sees the old journal or the whole new one, never part
-    of one, and the new one survives a crash once this returns: a fresh temp file, fsynced, renamed
-    over the path, the directory fsynced."""
+    of one, and the new one survives a crash once this returns ok: a fresh temp file written whole,
+    fsynced, renamed over the path, the directory fsynced. A write that cannot finish is a failed step,
+    with the temp file removed and the path untouched."""
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     try:
@@ -182,10 +183,14 @@ def write_intent_atomically(path: Path, text: str) -> tuple[bool, str]:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         os.fchmod(fd, 0o600)
-        os.write(fd, text.encode("utf-8"))
+        write_all(fd, text.encode("utf-8"))
         os.fsync(fd)
-    finally:
+    except OSError as e:
+        # Nothing is renamed: a journal that is not whole is never put where a reader would trust it.
         os.close(fd)
+        tmp.unlink(missing_ok=True)
+        return False, f"could not write the intent journal {tmp}: {e.strerror or e}"
+    os.close(fd)
     os.replace(tmp, path)
     dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:

@@ -407,6 +407,20 @@ def check_account_ids(host: HostOS, accounts: Mapping[str, int]) -> None:
             raise Refused("bad-token", f"{name}: uid {uid!r} is not in its §1.1 range")
 
 
+def _abandoned_setup(facts: HostFacts) -> Intent | None:
+    """CONTRACT §25 (c7.7a): the setup journal undo runs against when there is no operator record (the
+    setup died before writing it), or None when undo takes its ordinary path. With no record, only the
+    journal's operator may run it, by the name the caller's uid resolves to; a live lease still refuses."""
+    j = facts.intent
+    if facts.operator_record is not None or j is None or j.verb != "setup":
+        return None
+    if facts.live_leases > 0:
+        raise Refused("live-lease", f"undo refuses while {facts.live_leases} lease(s) are live")
+    if facts.caller_uid == 0 or facts.caller_name != j.operator:
+        raise Refused("operator-mismatch", f"the interrupted setup was for {j.operator!r}")
+    return j
+
+
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
               shared_groups: Iterable[str]) -> InstallPlan:
     """``accounts``: every live Levain account the directory service holds, name -> uid (== gid);
@@ -417,10 +431,22 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     lo0 aliases, the pf rules and pf's enable reference), the install sudoers rule, the intent journal,
     the operator record LAST. Every step is safe to re-run. The store and the root import tree stay.
     With a journal (§25), the accounts and groups it names that are present at their journaled ids are
-    tombstoned and deleted with the rest."""
+    tombstoned and deleted with the rest. With no operator record and a SETUP journal (the setup died
+    before its record), undo runs against the journal alone, for its operator, and ends by removing the
+    journal: there is no record to remove."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
-    preflight(cmd, facts)
+    abandoned = _abandoned_setup(facts)
+    if abandoned is None:
+        preflight(cmd, facts)
+        rec = facts.operator_record
+        assert rec is not None and isinstance(rec.get("name"), str)
+        operator = str(rec["name"])
+    else:
+        # §25 (c7.7a): only the journal speaks for what that setup made, so the directory service's
+        # reports are set aside and the journal's own names, at their journaled ids, are undone.
+        operator = abandoned.operator
+        accounts, shared_groups = {}, ()
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
@@ -435,8 +461,6 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
             else:
                 journaled_groups.append(name)
         check_account_ids(host, accounts)
-    rec = facts.operator_record
-    assert rec is not None and isinstance(rec.get("name"), str)
     groups = list(dict.fromkeys(g for g in (*shared_groups, *journaled_groups) if g in SHARED_GROUPS))
     retired_after = frozenset(facts.retired) | frozenset(accounts.values())
     path = RETIRED_IDS_PATH[host]
@@ -453,7 +477,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         steps.append(Step(f"stop every process of {name}, and check they are gone", call=lambda u=uid: _kill_all(u)))
     for name in sorted(accounts):
         steps += tombstone_steps(host, name)
-    steps += ungroup_steps(host, str(rec["name"]))
+    steps += ungroup_steps(host, operator)
     steps += delete_group_steps(host, groups)
     # Slot confinement goes only after every slot process is stopped and its account tombstoned.
     if host == "linux":
@@ -464,7 +488,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     steps += remove_install_sudoers_steps(host)
     # Just before the record (§25): until undo is complete a re-run still reads what the journal names.
     steps.append(intent_remove_step(host))
-    steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
+    if abandoned is None:
+        steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
     check_tools(facts, steps, verb="undo")
     return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
 

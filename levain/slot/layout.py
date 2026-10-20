@@ -304,7 +304,9 @@ def ungroup_steps(host: HostOS, operator: str) -> list[Step]:
     with everything below it, so no deleted gid stays on a dir or a file for a later group to inherit.
     The walk never follows a link (``-P``) and a link's own group is the one changed (``-h``), so it never
     leaves the tree. Run after every slot process is stopped, so nothing new lands mid-walk. A dir
-    already gone is skipped."""
+    already gone is skipped. Known edge: the walk resets every entry below, the operator's own files
+    and any carrying another group included, so the operator keeps access by owner but loses any
+    group-based permission set under a store dir."""
     chgrp = "/usr/bin/chgrp" if host == "darwin" else _abs("chgrp")
     test = _tools(host)["test"]
     return [Step(f"give {r.path} and everything below it back to {ROOT_GROUP[host]} "

@@ -180,102 +180,83 @@ def _read_or_none(path: Path) -> bytes | None:
         return None
 
 
-class _PlistChanges:
-    """Whether each LaunchDaemon's plist on disk differed from the one setup is about to write, recorded
-    BEFORE the write (after it the two always agree). launchd keeps running the definition it loaded, so
-    a job that is loaded AND changed is booted out and bootstrapped again; an unchanged loaded job is
-    left running."""
+def _differs(read: Callable[[Path], bytes | None], path: Path, text: str) -> bool:
+    return read(path) != text.encode("utf-8")
 
-    def __init__(self, run: Callable[..., object] | None = None,
-                 read: Callable[[Path], bytes | None] = _read_or_none) -> None:
-        self.changed: dict[str, bool] = {}
-        self._run, self._read = run, read
 
-    def record(self, label: str, path: Path, text: str) -> tuple[bool, str]:
-        self.changed[label] = self._read(path) != text.encode("utf-8")
+def _unload_launchd_if_changed(label: str, path: Path, text: str, run: Callable[..., object] | None,
+                               read: Callable[[Path], bytes | None]) -> tuple[bool, str]:
+    """Boot out a loaded job whose plist on disk differs from the one about to be written. launchd keeps
+    running the definition it loaded, so the job must be out before the new file lands; the bootstrap
+    step that follows the write loads the new one. Decided from disk when the step runs, with nothing
+    carried in memory: wherever a run dies, the re-run finds either a loaded job whose plist still
+    differs, which it boots out, or a job that is not loaded, which its bootstrap step loads from the
+    new file."""
+    import subprocess
+
+    absent, _ = _launchd_job_absent(label, run)
+    if absent or not _differs(read, path, text):
         return True, ""
-
-    def reload_if_changed(self, label: str) -> tuple[bool, str]:
-        """Boot out a loaded job whose plist changed, so the bootstrap step after this loads the new one."""
-        import subprocess
-
-        if label not in self.changed:
-            return False, f"{label}: no record of whether its plist changed (the record step did not run)"
-        absent, _ = _launchd_job_absent(label, self._run)
-        if absent or not self.changed[label]:
-            return True, ""
-        (self._run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True)
-        return _launchd_job_absent(label, self._run)
+    (run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True)
+    return _launchd_job_absent(label, run)
 
 
-class _UnitChanges:
-    """Linux twin of :class:`_PlistChanges`: whether each unit file on disk differed from the one setup
-    is about to write, recorded BEFORE the write. ``enable --now`` starts a stopped unit with the new
-    definition but leaves a running one on the old, so a unit that changed and is active is restarted
-    once, after ``daemon-reload``; an unchanged or inactive one is left to ``enable --now``."""
+def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run: Callable[..., object] | None,
+                          read: Callable[[Path], bytes | None]) -> tuple[bool, str]:
+    """Linux twin of :func:`_unload_launchd_if_changed`: stop an active unit whose file on disk differs
+    from the one about to be written. ``enable --now`` after ``daemon-reload`` starts a stopped unit on
+    the new definition but leaves a running one on the old, so stopping it first is what makes the new
+    definition take, and a run that dies after the stop leaves it stopped for the re-run to start."""
+    import subprocess
 
-    def __init__(self, systemctl: str, run: Callable[..., object] | None = None,
-                 read: Callable[[Path], bytes | None] = _read_or_none) -> None:
-        self.changed: dict[str, bool] = {}
-        self._systemctl, self._run, self._read = systemctl, run, read
-
-    def record(self, name: str, path: Path, text: str) -> tuple[bool, str]:
-        self.changed[name] = self._read(path) != text.encode("utf-8")
+    if not _differs(read, path, text):
         return True, ""
+    run = run or subprocess.run
 
-    def restart_if_changed(self, name: str) -> tuple[bool, str]:
-        import subprocess
+    def active() -> bool:
+        return getattr(run([systemctl, "is-active", "--quiet", name], capture_output=True), "returncode", 1) == 0
 
-        if name not in self.changed:
-            return False, f"{name}: no record of whether its unit changed (the record step did not run)"
-        if not self.changed[name]:
-            return True, ""
-        run = self._run or subprocess.run
-        systemctl = self._systemctl
-        if getattr(run([systemctl, "is-active", "--quiet", name], capture_output=True), "returncode", 1) != 0:
-            return True, ""
-        r = run([systemctl, "restart", name], capture_output=True)
-        ok = getattr(r, "returncode", 1) == 0
-        return ok, "" if ok else f"systemctl restart {name} failed"
+    if not active():
+        return True, ""
+    run([systemctl, "stop", name], capture_output=True)
+    if active():
+        return False, f"{name} is still active after systemctl stop"
+    return True, ""
 
 
 def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..., object] | None = None,
                   read: Callable[[Path], bytes | None] = _read_or_none) -> list[Step]:
-    """Write each of ``services``' units, then start each in :func:`start_order`. A unit already running
-    is restarted only when its definition changed (``run``/``read``: launchctl or systemctl, and the
-    unit file read)."""
+    """Write each of ``services``' units, then start each in :func:`start_order` (``run``/``read``:
+    launchctl or systemctl, and the unit file read). A running job whose file is about to change is
+    unloaded (macOS) or stopped (Linux) just BEFORE its write, and the start steps bring it up on the new
+    file; an unchanged running job is left running. Crash window: a run that dies between the unload and
+    the start leaves that service down until setup or repair is run again."""
     names = {x.name for x in services}
     chosen = [s for s in services_for(host) if s.name in names]
     steps: list[Step] = []
     if host == "darwin":
-        changes = _PlistChanges(run, read)
         for s in chosen:
             label, path, text = launchd_label(s), launchd_path(s), launchd_plist_text(s)
-            steps.append(Step(f"note whether {path} on disk differs from the one about to be written",
-                              call=lambda lb=label, p=path, t=text: changes.record(lb, p, t)))
+            steps.append(Step(f"boot out {label} if it is loaded and {path} is about to change",
+                              call=lambda lb=label, p=path, t=text: _unload_launchd_if_changed(lb, p, t, run, read)))
             steps.append(Step(f"write the LaunchDaemon {label} ({s.title}, as {s.user})",
                               write=(path, text, 0o644), validate=("/usr/bin/plutil", "-lint")))
         for s in chosen:
             label = launchd_label(s)
-            steps.append(Step(f"boot out {label} if it is loaded and its plist changed",
-                              call=lambda lb=label: changes.reload_if_changed(lb)))
             steps.append(Step(f"start {label}", ("/bin/launchctl", "bootstrap", "system", str(launchd_path(s))),
                               skip_if=("/bin/launchctl", "print", f"system/{label}")))
         return steps
     if not chosen:
         return steps
     systemctl = _abs("systemctl")
-    unit_changes = _UnitChanges(systemctl, run, read)
     for s in chosen:
         name, text = systemd_name(s), systemd_unit_text(s)
         path = systemd_path(name)
-        steps.append(Step(f"note whether {path} on disk differs from the one about to be written",
-                          call=lambda n=name, p=path, t=text: unit_changes.record(n, p, t)))
+        steps.append(Step(f"stop {name} if it is active and {path} is about to change",
+                          call=lambda n=name, p=path, t=text: _stop_unit_if_changed(systemctl, n, p, t, run, read)))
         steps.append(Step(f"write the systemd unit {name} ({s.title}, as {s.user})", write=(path, text, 0o644)))
     steps.append(Step("tell systemd about the units", (systemctl, "daemon-reload")))
     for name in start_order(host, chosen):
-        steps.append(Step(f"restart {name} if it is active and its unit changed",
-                          call=lambda n=name: unit_changes.restart_if_changed(n)))
         steps.append(Step(f"enable and start {name}", (systemctl, "enable", "--now", name)))
     return steps
 

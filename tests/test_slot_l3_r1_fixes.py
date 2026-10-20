@@ -227,15 +227,6 @@ def test_launchd_reload_only_a_loaded_changed_job(case):
     assert verbs == {"fresh": ["bootstrap"], "loaded-unchanged": [], "loaded-changed": ["bootout", "bootstrap"]}[case]
 
 
-def test_launchd_record_step_comes_before_its_write():
-    steps = units.install_steps("darwin", units.SERVICES)
-    for s in units.services_for("darwin"):
-        path = units.launchd_path(s)
-        w = next(i for i, x in enumerate(steps) if x.write and x.write[0] == path)
-        rec = next(i for i, x in enumerate(steps) if x.call and str(path) in x.why)
-        assert rec < w
-
-
 @pytest.mark.parametrize("host", HOSTS)
 def test_install_steps_take_any_iterable(host):
     want = units.install_steps(host, tuple(units.services_for(host)))

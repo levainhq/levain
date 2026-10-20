@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from levain.firing.hands import Step
-from levain.slot import Refused
+from levain.slot import Refused, write_all
 from levain.slot.ids import SlotId, in_own_range, loopback_alias
 
 ANCHOR = "com.apple/levain"
@@ -110,19 +110,23 @@ def _token_gone(r: "subprocess.CompletedProcess[str]") -> bool:
     return any(t in text for t in PF_TOKEN_GONE)
 
 
-def _read_token(token_path: Path) -> tuple[str | None, str]:
-    """(the stored token, or None; a note). A file that holds no token names nothing pf could release,
-    so it is removed rather than left to wedge every later undo."""
+def _read_token(token_path: Path) -> tuple[bool, str | None, str]:
+    """(whether the path could be read, the stored token or None, a note). A file that holds no token
+    names nothing pf could release, so it is removed rather than left to wedge every later undo. A path
+    that cannot be read (a directory, say) is reported unreadable and left as it is: nothing is
+    unlinked that might not be the token file."""
     try:
         token = token_path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
-        return None, ""
+        return True, None, ""
     except UnicodeDecodeError:
         token = ""
+    except OSError as e:
+        return False, None, f"cannot read the pf token {token_path}: {e.strerror or e}"
     if re.fullmatch(r"[0-9]{1,20}", token):
-        return token, ""
+        return True, token, ""
     token_path.unlink(missing_ok=True)
-    return None, f"{token_path} held no pf token; removed it (nothing to release)"
+    return True, None, f"{token_path} held no pf token; removed it (nothing to release)"
 
 
 def _release(token: str, run: Run) -> tuple[bool, str]:
@@ -142,10 +146,14 @@ def _write_token(token_path: Path, token: str) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         os.fchmod(fd, 0o600)
-        os.write(fd, f"{token}\n".encode("ascii"))
+        write_all(fd, f"{token}\n".encode("ascii"))
         os.fsync(fd)
-    finally:
+    except OSError:
+        # The old token stays; a torn new one is never renamed over it.
         os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    os.close(fd)
     os.replace(tmp, token_path)
     dfd = os.open(token_path.parent, os.O_RDONLY)
     try:
@@ -157,8 +165,11 @@ def _write_token(token_path: Path, token: str) -> None:
 def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
     """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
     file. No file, or a file holding no token, = nothing to release. The file goes only once pf
-    confirms the reference is gone (released now, or already dropped); any other failure keeps it."""
-    token, note = _read_token(token_path)
+    confirms the reference is gone (released now, or already dropped); any other failure keeps it. A
+    token path that cannot be read is a failure, and nothing is removed."""
+    readable, token, note = _read_token(token_path)
+    if not readable:
+        return False, note
     if token is None:
         return True, note
     ok, why = _release(token, run)
@@ -171,9 +182,12 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
     one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
-    completes holds one recorded reference. A crash between ``-E`` and the token write leaves one reference
-    with no record; pf then stays enabled, which is the fail-closed side (known edge)."""
-    old, note = _read_token(token_path)
+    completes holds one recorded reference. A crash between ``-E`` and the token write, or a token write
+    that fails (it raises), leaves one reference with no record; pf then stays enabled, which is the
+    fail-closed side (known edge). A token path that cannot be read is refused before ``-E``."""
+    readable, old, note = _read_token(token_path)
+    if not readable:
+        return False, note
     r = run([PFCTL, "-E"], capture_output=True, text=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "pfctl -E failed").strip()
