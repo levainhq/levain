@@ -118,8 +118,9 @@ def default_directory() -> Path:
 def _one_line(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise DispatchError(f"{name} must be a string")
-    if unshowable.first_hidden(value, allow="", selectors=False) is not None:
-        raise DispatchError(f"{name} must be one line of plain text: no control characters")
+    hidden = unshowable.describe(value, selectors=False)
+    if hidden is not None:
+        raise DispatchError(f"{name} must be one line of plain text that shows as itself: it holds {hidden}")
     if not 1 <= len(value.strip()) <= _FIELD_MAX or value != value.strip():
         raise DispatchError(f"{name} must be 1 to {_FIELD_MAX} characters with no edge whitespace")
     return value

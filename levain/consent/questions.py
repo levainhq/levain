@@ -212,8 +212,9 @@ def _has_control(text: str, selectors: bool = True) -> bool:
 def _line(name: str, value: Any, low: int, high: int) -> str:
     if not isinstance(value, str):
         raise ConsentError(f"{name} must be a string")
-    if _has_control(value):
-        raise ConsentError(f"{name} must be one line of plain text: no control characters")
+    hidden = unshowable.describe(value)
+    if hidden is not None:
+        raise ConsentError(f"{name} must be one line of plain text that shows as itself: it holds {hidden}")
     value = value.strip()
     if not low <= len(value) <= high:
         raise ConsentError(f"{name} must be {low} to {high} characters")
@@ -420,7 +421,7 @@ class QuestionStore:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
                 or _has_control(agent_session_id, selectors=False)):
-            raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters with no control characters")
+            raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters that show as themselves")
         if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd, selectors=False):
             raise ConsentError("cwd must be an absolute path")
         what = _line("what", what, 1, _WHAT_MAX)

@@ -40,7 +40,7 @@ import unicodedata
 from bisect import bisect_right
 from typing import Callable, Iterator
 
-__all__ = ["first_hidden", "hidden", "is_unshowable", "mark"]
+__all__ = ["describe", "first_hidden", "hidden", "is_unshowable", "mark"]
 
 _CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 
@@ -234,3 +234,13 @@ def mark(text: str, fmt: str | Callable[[int], str] = "⟨U+{:04X}⟩", allow: s
         return text
     parts.append(text[last:])
     return "".join(parts)
+
+
+def describe(text: str, allow: str = "", selectors: bool = True) -> str | None:
+    """The first unshowable character in ``text`` named for a refusal message (``U+202E (RIGHT-TO-LEFT OVERRIDE) at
+    character 3``), or ``None``; ``allow`` and ``selectors`` as in :func:`hidden`."""
+    found = first_hidden(text, allow, selectors=selectors)
+    if found is None:
+        return None
+    i, ch = found
+    return f"U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}) at character {i + 1}"
