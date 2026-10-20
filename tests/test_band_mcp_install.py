@@ -575,3 +575,53 @@ def test_is_levain_launcher_reads_the_dispatch_shape():
     assert not ok(t("/usr/bin/wrapper", [*DISPATCH_ARGS, "claude_code"]), None, server="levain_dispatch")
     assert not ok(t("/v/bin/python3", [*DISPATCH_ARGS, "claude_code", "--dispatch-dir", "/x"]), None,
                   server="levain_dispatch")
+
+
+def test_the_settings_template_allows_no_dispatch_tool():
+    """The dispatch door needs the operator's approval on every call: no allow rule levain writes names it."""
+    template = Path(inst.__file__).parent / "templates" / "adapters" / "claude-code" / "settings.template.json"
+    allow = json.loads(template.read_text(encoding="utf-8"))["permissions"]["allow"]
+    assert allow and not [a for a in allow if a.startswith("mcp__levain_dispatch")]
+
+
+DISPATCH_ROW = "levain_dispatch MCP registered"
+
+
+def _dispatch_rows(results) -> list:
+    return [r for r in results if r.name == DISPATCH_ROW]
+
+
+def test_doctor_cc_dispatch_row_ok_then_warn(make_install):
+    install = make_install()
+    (row,) = _dispatch_rows(doctor._check_claude_code(install))
+    assert row.ok and not row.warn and "levain.dispatch.mcp" in row.detail, row
+    mcp = install / ".mcp.json"
+    data = json.loads(mcp.read_text(encoding="utf-8"))
+    data["mcpServers"]["levain_dispatch"]["command"] = "/opt/wrap/levain-dispatch"
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    (row,) = _dispatch_rows(doctor._check_claude_code(install))
+    assert row.ok and row.warn and ".levain/pending/.mcp.json" in row.hint, row
+    data["mcpServers"]["levain_dispatch"]["command"] = sys.executable
+    data["mcpServers"]["levain_dispatch"]["env"] = {"PYTHONPATH": "/x"}
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    (row,) = _dispatch_rows(doctor._check_claude_code(install))
+    assert row.ok and row.warn and "carries env" in row.detail, row
+
+
+def test_doctor_cc_dispatch_row_absent_names_update_or_the_hand_merge(make_install):
+    install = make_install()
+    mcp = install / ".mcp.json"
+    data = json.loads(mcp.read_text(encoding="utf-8"))
+    del data["mcpServers"]["levain_dispatch"]
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    (row,) = _dispatch_rows(doctor._check_claude_code(install))
+    assert row.ok and row.warn and "missing" in row.detail and "levain dispatch file" in row.detail, row
+    assert row.hint == "levain update", row
+    # a .mcp.json that diverged from levain's render: update keeps it whole and stages its own render
+    data["mcpServers"]["github"] = {"type": "stdio", "command": "gh-mcp", "args": []}
+    mcp.write_text(json.dumps(data), encoding="utf-8")
+    install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
+    _refresh(install)
+    assert "levain_dispatch" not in json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
+    (row,) = _dispatch_rows(doctor._check_claude_code(install))
+    assert row.warn and "by hand" in row.hint and ".levain/pending/.mcp.json" in row.hint, row

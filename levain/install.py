@@ -2015,9 +2015,9 @@ def _claude_code_files(
 BAND_SERVER = "levain_band"
 _BAND_ARGS = ("-P", "-m", "levain.consent.band_mcp", "--agent")
 # The dispatch door (levain.dispatch.mcp): the planner's filing door, registered beside the band in the same workspace
-# .mcp.json and by the same rule. It never signs and confers no authority; Claude Code still asks before each call,
-# since no settings allow-rule names its tools. Codex is not registered yet (its config.toml block, env and approval
-# mode are a separate ruling).
+# .mcp.json and by the same rule. It never signs and confers no authority; in Claude Code each call needs the
+# operator's approval (an interactive session asks, a headless one is refused), since no allow rule levain writes
+# names its tools. Codex is not registered yet (ruled 10-19: it lands with X1, approvals on).
 DISPATCH_SERVER = "levain_dispatch"
 _DISPATCH_ARGS = ("-P", "-m", "levain.dispatch.mcp", "--agent")
 

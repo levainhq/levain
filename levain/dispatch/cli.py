@@ -25,7 +25,8 @@ CLASS, never by its text: git could not run (:class:`levain.dispatch.contract.Gi
 log that cannot be read or trusted (:class:`levain.dispatch.jobs.JobStoreError`,
 :class:`levain.dispatch.capability.CapabilityRecordError`, an operating system or database error, a ``ValueError``
 from below), a signature verifier that cannot run (:class:`levain.authority.VerifierUnavailable`) or an ssh-keygen
-that cannot run to sign (:class:`SignerUnavailable`). Every exit 3 from ``sign`` or ``cancel`` also says what did NOT
+that cannot run to sign (:class:`SignerUnavailable`). Every exit 3 from ``sign``, ``cancel`` or a ``config`` verb
+that changes the store, and every fault reading the configuration a filing resolves through, also says what did NOT
 happen. The command line's own refusals are :class:`InputRefused`, so nothing raised below it reads as "refused".
 
 CONFIGURATION is the operator's too (``levain dispatch config``, the F3 store :mod:`levain.dispatch.control`):
@@ -36,7 +37,12 @@ takes an item signed elsewhere, and ``show`` reads the active configuration back
 are refused to an agent, as ``sign`` is; ``show`` is open. :func:`resolvers` reads the template registry and the
 provider policy from that store, in one verified read, so a filing resolves through what the operator signed; with
 no store, ``file`` refuses (every contract would be R2, which is never dispatched), and a store that cannot be
-trusted is exit 3 with nothing filed. Stdlib only.
+trusted is exit 3 with nothing filed. Under a detected agent, ``file`` refuses ``--data-root`` and ``--dispatch-dir``:
+a planner's filing resolves through the configuration in the dispatch directory, verified against the cockpit its
+consent hooks name, never through a store or a cockpit the planner names. ``config accept`` asks the store's own
+judgement (:meth:`levain.dispatch.control.ControlStore.check`, which writes nothing) before it shows the item, so an
+item the store would refuse is refused before any question. The summary above each y/N names the head the item
+builds on (generation and digest). ``config show`` writes every non-ASCII character as its escape. Stdlib only.
 
 Known edges: a read path made of homoglyphs shows as the path it imitates (a write path is bounded by the operator's
 template, so only what is read can be dressed up). ``file`` reports a template the active configuration refuses (one
@@ -70,8 +76,8 @@ from levain.dispatch.jobs import (
 )
 from levain.dispatch.policy import ProviderPolicy
 
-__all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "InputRefused", "SignerUnavailable", "add_parsers", "agent_caller",
-           "confirm_summary", "file_job", "job_view", "planner_capability", "render", "resolvers", "run_dispatch"]
+__all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnamed", "InputRefused", "SignerUnavailable",
+           "add_parsers", "agent_caller", "confirm_summary", "file_job", "job_view", "planner_capability", "render", "resolvers", "run_dispatch"]
 
 EXIT_OK, EXIT_REFUSED, EXIT_FAULT = 0, 2, 3
 # a contract is a few kilobytes; the bound only stops a stray file from being read whole
@@ -83,6 +89,16 @@ NO_REGISTRY = "no template registry is set up; every contract is R2, which is ne
 class InputRefused(DispatchError):
     """The command line's own refusal: no terminal to ask on, a file it cannot read, a flag that does not fit, a
     signing key that would not sign. The message says why, and nothing changed."""
+
+
+class CockpitUnnamed(InputRefused):
+    """No single cockpit to verify against: the consent hooks in the dispatch directory name none or several, or the
+    one named holds no cockpit. ``door`` says it as the operator's fix, for a caller (the MCP door) that has no
+    ``--data-root`` to pass."""
+
+    def __init__(self, message: str, door: str) -> None:
+        super().__init__(message)
+        self.door = door
 
 
 class SignerUnavailable(Exception):
@@ -122,19 +138,21 @@ def resolvers(directory: Path | None = None, data_root: Path | None = None,
     """The template registry and the provider policy a filing resolves through, read from the signed control store
     in ``directory`` (default: the dispatch directory), verified against the cockpit ``data_root`` names (default:
     the one the consent hooks there name, as ``sign`` finds it). ``None`` when there is no control store: nothing is
-    configured, so every contract is R2. A store that cannot be trusted raises
-    :class:`levain.dispatch.control.ControlStateUnavailable` (a fault: nothing was filed); a store with no provider
-    policy accepted refuses (:class:`DispatchError`)."""
+    configured, so every contract is R2. A store that cannot be trusted or read raises
+    :class:`levain.dispatch.control.ControlStateUnavailable` (a fault: nothing was filed), whatever the error below
+    it; no single cockpit named is :class:`CockpitUnnamed`; a store with no provider policy accepted refuses
+    (:class:`DispatchError`)."""
     from levain.dispatch.jobs import default_dispatch_dir
 
     d = Path(directory) if directory is not None else default_dispatch_dir()
     if not os.path.lexists(d / dctl.DB_NAME):
         return None
+    root = Path(data_root) if data_root is not None else None
     try:
-        root = Path(data_root) if data_root is not None else None
         active = dctl.ControlStore(d, authority=_authority_source(d, root)).active()
-    except dctl.ControlStateUnavailable as exc:
-        raise dctl.ControlStateUnavailable(f"{exc}; nothing was filed") from None
+    except (dctl.ControlStateUnavailable, sqlite3.Error, OSError, ValueError) as exc:
+        raise dctl.ControlStateUnavailable(f"the configuration could not be read ({type(exc).__name__}: "
+                                           f"{str(exc)[:200]}); nothing was filed") from None
     config = _ActiveConfiguration(active)
     return dregistry.resolver(config), dregistry.active_policy(config)
 
@@ -143,6 +161,12 @@ def _safe(text: object) -> str:
     """``text`` with every character a terminal could act on (or show as something else) written as its escape."""
     return "".join((f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
                    if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
+
+
+def _ascii(text: object) -> str:
+    """``text`` terminal-safe (:func:`_safe`) with every other non-ASCII character written as its escape too, so a
+    homoglyph shows as what it is."""
+    return _safe(text).encode("ascii", "backslashreplace").decode("ascii")
 
 
 # --- the planner's identity and capability ----------------------------------------------------------------------------
@@ -173,6 +197,21 @@ def _refuse_an_agent(verb: str) -> None:
         raise InputRefused(f"`levain dispatch {verb}` is the operator's own act, and this process runs under "
                            f"{agent} (an agent's process or environment): an agent never signs or cancels for the "
                            "operator. Run it from your own terminal.")
+
+
+def _refuse_gate_flags(args: argparse.Namespace) -> None:
+    """Under a detected agent, ``file`` takes no ``--data-root`` or ``--dispatch-dir``: either would let the planner
+    name the store or the cockpit its own filing is verified against, so choose its own gate. An intent check, as
+    :func:`_refuse_an_agent` is."""
+    agent = agent_caller()
+    if agent is None:
+        return
+    for flag, value in (("--data-root", args.data_root), ("--dispatch-dir", args.dispatch_dir)):
+        if value is not None:
+            raise InputRefused(f"{flag} is refused to a planner, and this process runs under {agent} (an agent's "
+                               "process or environment): a filing resolves through the configuration in the "
+                               "dispatch directory, verified against the cockpit its consent hooks name. File "
+                               "without it.")
 
 
 def planner_session(agent: str | None, session: str | None) -> tuple[str | None, str]:
@@ -411,16 +450,22 @@ def _authority_source(directory: Path, data_root: Path | None) -> Any:
     from levain.consent.answering import hook_roots
     from levain.consent.queue import authority_source
 
+    fix = (f"the operator sets cockpit_data_root, in the consent settings in {directory} (claude_code.json, "
+           "codex.json), to the one cockpit whose authority log holds their key; `levain doctor` shows what they "
+           "name. A planner cannot fix this")
     if data_root is not None:
         root = data_root.expanduser()
     else:
         roots = hook_roots(directory)
         if len(roots) != 1:
-            raise InputRefused("name the cockpit data root with --data-root (the consent hooks here name "
-                             + ("none" if not roots else f"{len(roots)}: {', '.join(map(str, roots))}") + ")")
+            named = "none" if not roots else f"{len(roots)}: {', '.join(map(str, roots))}"
+            raise CockpitUnnamed(f"name the cockpit data root with --data-root (the consent hooks here name {named})",
+                                 f"the dispatch configuration is verified against the cockpit the consent hooks in "
+                                 f"the dispatch directory name, and they name {named}; {fix}")
         root = roots[0]
     if not (root / "cockpit.db").is_file():
-        raise InputRefused(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root")
+        raise CockpitUnnamed(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root",
+                             f"the cockpit the consent hooks name ({root}) holds no cockpit.db; {fix}")
     return authority_source(root / "cockpit.db", anchor=anchor_path(root))
 
 
@@ -582,8 +627,9 @@ def _item_view(kind: str, generation: int, item_store: str, store_id: str, prev:
 
 
 def _confirm_item(args: argparse.Namespace, verb: str, kind: str, generation: int, store_id: str, change: str,
-                  top: int, out: Any) -> None:
-    """y/N right below a fixed-height summary of the item; refused without a terminal unless ``--yes``."""
+                  top: int, head: str, out: Any) -> None:
+    """y/N right below a fixed-height summary of the item, the store's head (generation ``top``, digest ``head``)
+    among it; refused without a terminal unless ``--yes``."""
     if args.yes:
         return
     if not _is_tty():
@@ -591,6 +637,7 @@ def _confirm_item(args: argparse.Namespace, verb: str, kind: str, generation: in
                            f"`levain dispatch config {verb}` in your own terminal")
     print("\n".join([f"---- you are about to {verb} a configuration item ----", f"  kind        {kind}",
                      f"  generation  {generation} (the store is at {top})", f"  store       {store_id}",
+                     f"  builds on   generation {top}, {head or '(none: the store is empty)'}",
                      f"  change      {change} (in full above)"]),
           file=sys.stderr if args.json else out, flush=True)
     try:
@@ -673,13 +720,31 @@ def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], N
         kinds = {k: _kind_summary(k, items[k], items) for k in dctl.KINDS if k in items}
         emit({"configured": True, "store": str(path), "store_id": store.store_id(), "trust_root": store.trust_root(),
               "generation": top, "head": head, "kinds": {k: v[0] for k, v in kinds.items()}},
-             "\n".join(_safe(line) for line in [
+             "\n".join(_ascii(line) for line in [
                  f"levain dispatch config: store {store.store_id()}, generation {top}, head {head or '(none)'}",
                  f"  trust root       {store.trust_root()}",
                  *[f"  {k:<16} " + (f"(generation {kinds[k][0]['generation']})  {kinds[k][1]}" if k in kinds
                                     else "(none accepted)") for k in dctl.KINDS]]))
         return EXIT_OK
     _refuse_an_agent(f"config {cmd}")
+    try:
+        return _change_config(args, cmd, d, out, emit)
+    except _FAULTS as exc:
+        raise _NotDone(exc, _config_fault_not_done(cmd, d)) from exc
+
+
+def _config_fault_not_done(cmd: str, directory: Path) -> str:
+    """What a ``config`` verb that faulted before its item reached the store did NOT do."""
+    if cmd == "init":
+        if not os.path.lexists(directory / dctl.DB_NAME):
+            return "nothing was pinned (no control store was created)"
+        return ("whether the store was pinned is not known (it exists, and the fault came after it was opened): read "
+                "it with `levain dispatch config show`")
+    return f"nothing was {'signed' if cmd == 'sign' else 'accepted'}; the store was not given an item"
+
+
+def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: Callable[[Any, str], None]) -> int:
+    """``config init|sign|accept``; a fault after an item reached the store is a :class:`_NotDone` already."""
     if cmd == "init":
         authority = _authority_source(d, args.data_root)
         dctl.ControlStore.init(d, args.trust_root, authority=authority)
@@ -708,7 +773,7 @@ def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], N
         if signer_fp != root:
             raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only the "
                                "root's signature is accepted. Nothing was signed")
-        _confirm_item(args, "sign", args.kind, top + 1, sid, change, top, out)
+        _confirm_item(args, "sign", args.kind, top + 1, sid, change, top, head, out)
         try:
             signature = _sign_bytes(sign, item)
         except SignerUnavailable as exc:
@@ -720,15 +785,17 @@ def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], N
             signature = _read_input(args.signature, dctl.SIGNATURE_MAX, "signature").decode("utf-8")
         except UnicodeDecodeError:
             raise InputRefused("the signature file is not UTF-8 text") from None
-        parsed = dctl.parse_item(raw)
+        dctl.parse_item(raw)
         store = _control(args, d)
-        items, top, _head = _verified(store)
+        # the store's own judgement first, writing nothing: an item it would refuse is refused before the view and
+        # the question; accept judges again in its write transaction
+        parsed = store.check(raw, signature)
+        items, top, head = _verified(store)
         sid = store.store_id()
-        # the store judges the generation, the chain link, the store id and the signature; the view shows them
         lines, change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
                                    items.get(parsed.kind))
         print("\n".join(lines), file=view_out, flush=True)
-        _confirm_item(args, "accept", parsed.kind, parsed.generation, sid, change, top, out)
+        _confirm_item(args, "accept", parsed.kind, parsed.generation, sid, change, top, head, out)
         accepted = _accept_guarded(store, raw, signature, top)
     emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest},
          f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}.")
@@ -744,6 +811,8 @@ def _run(args: argparse.Namespace, out: Any) -> int:
 
     if cmd == "config":
         return _run_config(args, out, emit)
+    if cmd == "file":
+        _refuse_gate_flags(args)
     store = _store(args)
     if cmd == "file":
         submission = _read_contract(args.contract)
@@ -903,7 +972,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                    help="A replay with the same key and contract returns the same job (and no capability).")
     f.add_argument("--data-root", dest="data_root", type=Path, default=None,
                    help="The cockpit data root the dispatch configuration is verified against (default: the one the "
-                        "consent hooks in the dispatch directory name).")
+                        "consent hooks in the dispatch directory name). Refused under an agent, as --dispatch-dir "
+                        "is for file.")
     planner(f)
     sh = sub.add_parser("show", help="One job, resolved as the signer sees it.")
     sh.add_argument("job")

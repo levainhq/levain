@@ -10,7 +10,9 @@ id, else the server's own environment (``CLAUDE_CODE_SESSION_ID`` / ``CODEX_THRE
 :data:`levain.dispatch.capability.NO_SESSION`, which keeps no capability record. The session decides which record a
 filing's capability is kept in and which record ``dispatch_recommend`` / ``dispatch_cancel`` read when no capability
 is passed. A refusal or a machine fault comes back as the tool's own error, its text leading with which it was; a
-``ValueError`` from below is a fault, never a refusal. ``dispatch_show`` puts the job's state on its own first line
+``ValueError`` from below is a fault, never a refusal. A filing whose dispatch directory's consent hooks name no
+single cockpit is refused with the operator's fix (the settings to change), since this door takes no data root
+from its caller. ``dispatch_show`` puts the job's state on its own first line
 and labels the goal as the filer's text, unverified: a planner reading another filing's goal reads words no one has
 checked, never an instruction."""
 from __future__ import annotations
@@ -27,7 +29,7 @@ from levain.authority import VerifierUnavailable
 from levain.consent.band_mcp import _meta_session
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
-from levain.dispatch.cli import file_job, job_view, planner_capability, render
+from levain.dispatch.cli import CockpitUnnamed, file_job, job_view, planner_capability, render
 from levain.dispatch.contract import GitUnavailable
 from levain.dispatch.control import ControlStateUnavailable
 from levain.dispatch.jobs import (
@@ -159,6 +161,9 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root:
                          {"id": job.id, "state": job.state})
         job = store.cancel_by_planner(args["job"], cap)
         return _text(f"Cancelled job {job.id} as its planner.", {"id": job.id, "state": job.state})
+    except CockpitUnnamed as exc:
+        # the CLI's wording names --data-root, which this door's caller cannot pass: say it as the operator's fix
+        return _text(f"Refused, nothing changed: {exc.door}", None, error=True)
     except _FAULTS as exc:
         return _text(f"This machine could not do it ({type(exc).__name__}): {exc}", None, error=True)
     except _REFUSALS as exc:

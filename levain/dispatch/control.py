@@ -31,7 +31,10 @@ in one write transaction, so two accepts cannot both take one generation. Every 
 and re-verifies the signature on the latest item of each kind (the newest item among them) against the pinned key
 under a fresh authority replay, and REFUSES (:class:`ControlStateUnavailable`) when anything does not hold: no
 store, no pin, a damaged, missing or reordered row, a broken link, a signature that no longer verifies, a root key
-since revoked, an authority log that cannot be read. An unreadable configuration is never an empty one.
+since revoked, an authority log that cannot be read, a signature verifier that cannot run. A log or verifier that
+cannot be used is :class:`ControlStateUnavailable` at :meth:`ControlStore.init` and :meth:`ControlStore.accept`
+too: a fault on this machine, never a refusal of the item. :meth:`ControlStore.check` makes accept's judgement and
+writes nothing. An unreadable configuration is never an empty one.
 ``ControlStore.active`` omits the adoption rules; the intent is that they reach a reader only through
 :func:`levain.dispatch.registry.active_adoption_rules`, re-judged against the configuration active then.
 
@@ -59,6 +62,10 @@ before the newest fails the walk on read, and an old item cannot be re-signed in
   ``ssh-keygen`` once per configuration kind present (cost, not safety).
 - The R0 CamelCase test rule is casefolded, so a source file whose name ends in ``test`` (``Latest.java``) is refused
   at registration: a visible, fail-safe false positive.
+- An operator signature over a truncated head adopts the truncation: the next item chains to the head the store
+  shows, so signing it ratifies that rollback. The signing tool shows the head an item builds on (generation and
+  digest) above its y/N, so an operator who keeps a last-seen head can notice; S1 removes the same-user writer
+  (10-19).
 - The signing tool (``levain dispatch config sign``, :mod:`levain.dispatch.cli`) shows the item before the touch:
   kind, generation, store id, prev, and its difference from the active configuration.
 Nothing executes on this configuration here; ``levain dispatch file`` resolves through it. Stdlib only.
@@ -228,11 +235,13 @@ def _signer_problem(snapshot: AuthoritySnapshot, trust_root: str, message: bytes
     if len(signature) > SIGNATURE_MAX:
         return f"the configuration signature is over {SIGNATURE_MAX} characters"
     kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
+    # a verifier that cannot run is a fault on this machine, never a signature that does not verify
     try:
         ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
                              namespace=CONFIG_NAMESPACE, **kwargs)
     except VerifierUnavailable as exc:
-        return f"the configuration signature could not be verified: {exc}"
+        raise ControlStateUnavailable(f"the configuration signature could not be verified (the verifier could not "
+                                      f"run): {str(exc)[:200]}") from None
     return None if ok else "the configuration signature does not verify as the pinned trust root's"
 
 
@@ -289,8 +298,9 @@ class ControlStore:
         try:
             snapshot = authority()
         except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
-            raise ConfigRefused(f"the authority log could not be read: {type(exc).__name__}: "
-                                f"{str(exc)[:200]}") from None
+            # a fault on this machine, not a refusal of the fingerprint
+            raise ControlStateUnavailable(f"the authority log could not be read: {type(exc).__name__}: "
+                                          f"{str(exc)[:200]}") from None
         problem = _root_problem(snapshot, trust_root_fp)
         if problem is not None:
             raise ConfigRefused(f"{problem}; it is not pinned")
@@ -397,39 +407,50 @@ class ControlStore:
             return self._chain(conn, self._snapshot())
 
     # --- the public operations -----------------------------------------------------------------------------------
+    def _judge(self, conn: sqlite3.Connection, parsed: ConfigItem, signature: Any) -> None:
+        """Every check :meth:`accept` makes, in the caller's transaction, writing nothing: the signature against the
+        pinned trust root under a fresh authority replay, this store's id, the next generation, the chain link and
+        the body for its kind against the active configuration."""
+        meta = _meta(conn)
+        snapshot = self._snapshot()
+        problem = _signer_problem(snapshot, meta["trust_root"], parsed.text.encode("utf-8"), signature,
+                                  self._ssh_keygen)
+        if problem is not None:
+            raise ConfigRefused(problem)
+        if parsed.store_id != meta["store_id"]:
+            raise ConfigRefused("the item was signed for another control store (its store_id is not this store's)")
+        active, top, head = self._chain(conn, snapshot)
+        if parsed.generation <= top:
+            raise ConfigRefused(f"generation {parsed.generation} is not above the highest accepted ({top}); an "
+                                "older or replayed item is refused")
+        if parsed.generation != top + 1:
+            raise ConfigRefused(f"generation {parsed.generation} skips: the next is {top + 1}")
+        if parsed.prev != head:
+            raise ConfigRefused(f"generation {parsed.generation} does not chain to the head (its prev is not "
+                                f"item {top}'s digest)")
+        problem = registry.body_refusal(parsed.kind, parsed.body, active)
+        if problem is not None:
+            raise ConfigRefused(f"{parsed.kind}: {problem}")
+
+    def check(self, item: Any, signature: Any) -> ConfigItem:
+        """The judgement :meth:`accept` would make of ``item`` and ``signature`` now, in a read transaction that
+        writes nothing: the parsed item when it would be accepted, else :class:`ConfigRefused` saying why. For a
+        tool that asks the operator only about an item the store would take; :meth:`accept` judges again."""
+        parsed = parse_item(item)
+        with self._guard(), read_transaction(self._connect) as conn:
+            self._judge(conn, parsed, signature)
+        return parsed
+
     def accept(self, item: Any, signature: Any) -> ConfigItem:
         """Verify ``item`` (its canonical bytes or text) and ``signature`` against the pinned trust root under the
         store's authority source (replayed INSIDE the write transaction), check it is for this store, at the next
         generation and chained to the verified head, and its body for its kind against the active configuration,
         and store it; all one write transaction. Raises :class:`ConfigRefused` saying why, or
-        :class:`ControlStateUnavailable` when the store cannot be trusted."""
+        :class:`ControlStateUnavailable` when the store cannot be trusted, its authority log cannot be read or the
+        signature verifier cannot run."""
         parsed = parse_item(item)
         with self._guard(), write_transaction(self._connect) as conn:
-            meta = _meta(conn)
-            try:
-                snapshot = self._authority()
-            except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
-                raise ConfigRefused(f"the authority log could not be read: {type(exc).__name__}: "
-                                    f"{str(exc)[:200]}") from None
-            problem = _signer_problem(snapshot, meta["trust_root"], parsed.text.encode("utf-8"), signature,
-                                      self._ssh_keygen)
-            if problem is not None:
-                raise ConfigRefused(problem)
-            if parsed.store_id != meta["store_id"]:
-                raise ConfigRefused("the item was signed for another control store (its store_id is not this "
-                                    "store's)")
-            active, top, head = self._chain(conn, snapshot)
-            if parsed.generation <= top:
-                raise ConfigRefused(f"generation {parsed.generation} is not above the highest accepted ({top}); an "
-                                    "older or replayed item is refused")
-            if parsed.generation != top + 1:
-                raise ConfigRefused(f"generation {parsed.generation} skips: the next is {top + 1}")
-            if parsed.prev != head:
-                raise ConfigRefused(f"generation {parsed.generation} does not chain to the head (its prev is not "
-                                    f"item {top}'s digest)")
-            problem = registry.body_refusal(parsed.kind, parsed.body, active)
-            if problem is not None:
-                raise ConfigRefused(f"{parsed.kind}: {problem}")
+            self._judge(conn, parsed, signature)
             conn.execute("INSERT INTO items (generation, kind, item, signature, accepted_at) VALUES (?, ?, ?, ?, ?)",
                          (parsed.generation, parsed.kind, parsed.text, signature, utc_stamp(self._now())))
         return parsed

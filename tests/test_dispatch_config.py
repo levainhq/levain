@@ -396,3 +396,179 @@ def test_the_mcp_door_files_through_the_same_configuration(capsys, ddir, root, k
     result = reply["result"]
     assert not result["isError"], result
     assert result["structuredContent"]["result"]["state"] == "filed"
+
+
+# --- fix round 1 ------------------------------------------------------------------------------------------------------
+
+def _tty(monkeypatch, answer="y"):
+    """A terminal whose operator answers ``answer``; the prompts asked are recorded."""
+    prompts = []
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+    return prompts
+
+
+def accept_cli(capsys, ddir, root, item, sig, *extra):
+    return run(capsys, "config", "accept", item, sig, "--dispatch-dir", str(ddir), "--data-root", root, *extra)
+
+
+def test_accept_refuses_a_bad_signature_before_it_asks(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    init(capsys, ddir, root, keys)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    with open(item, "rb") as fh:
+        raw = fh.read()
+    (tmp_path / "item.sig").write_text(keys["phone"].sign(raw, ctl.CONFIG_NAMESPACE))
+    prompts = _tty(monkeypatch)
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig)
+    assert code == 2 and "does not verify" in out, out
+    assert prompts == [] and "the item" not in out          # refused before the view and before any question
+    assert store(ddir, root).generation() == 0
+
+
+def test_accept_refuses_an_item_for_another_store(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    init(capsys, ddir, root, keys)
+    item = ctl.item_bytes("verifiers", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    (tmp_path / "item.json").write_bytes(item)
+    (tmp_path / "item.sig").write_text(keys["laptop"].sign(item, ctl.CONFIG_NAMESPACE))
+    prompts = _tty(monkeypatch)
+    code, out, _ = accept_cli(capsys, ddir, root, str(tmp_path / "item.json"), str(tmp_path / "item.sig"))
+    assert code == 2 and "another control store" in out and prompts == []
+    assert store(ddir, root).generation() == 0
+
+
+def test_accept_refuses_a_body_its_kind_refuses_before_it_asks(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    init(capsys, ddir, root, keys)
+    # a template whose verifier is not registered: the verifiers item goes first
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "templates", [tmpl()])
+    prompts = _tty(monkeypatch)
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig)
+    assert code == 2 and "not registered" in out and prompts == []
+    assert store(ddir, root).generation() == 0
+
+
+def test_accept_declined_on_the_terminal_accepts_nothing(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    prompts = _tty(monkeypatch, answer="n")
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig)
+    assert code == 2 and "not confirmed; nothing was accepted" in out and len(prompts) == 1
+    assert store(ddir, root).generation() == 3
+
+
+def test_a_verifier_that_cannot_run_at_accept_is_a_fault(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    from levain.authority import VerifierUnavailable
+
+    init(capsys, ddir, root, keys)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+
+    def cannot_run(*a, **k):
+        raise VerifierUnavailable("ssh-keygen could not run")
+
+    monkeypatch.setattr(ctl, "verify_link_sig", cannot_run)
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig, "--yes")
+    assert code == 3 and "could not do it" in out and "nothing was accepted" in out, out
+    assert "refused" not in out
+
+
+def test_an_unreadable_authority_log_at_init_is_a_fault(capsys, ddir, tmp_path, keys):
+    bad = tmp_path / "bad-cockpit"
+    bad.mkdir()
+    (bad / "cockpit.db").write_bytes(b"this is not a database" * 100)
+    code, out, _ = run(capsys, "config", "init", "--trust-root", keys["laptop"].fp, "--dispatch-dir", str(ddir),
+                       "--data-root", str(bad))
+    assert code == 3 and "could not do it" in out and "nothing was pinned" in out, out
+    assert not (ddir / ctl.DB_NAME).exists()
+
+
+def test_a_fault_after_the_item_committed_says_the_store_moved(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    real = ctl.ControlStore.accept
+
+    def committed_then_faulted(self, item, signature):
+        real(self, item, signature)
+        raise ctl.ControlStateUnavailable("the control store cannot be read: disk I/O error")
+
+    monkeypatch.setattr(ctl.ControlStore, "accept", committed_then_faulted)
+    changed = dict(VERIFIERS)
+    del changed["pytest-ip"]
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", changed, "--yes")
+    assert code == 3 and "is now generation 4 (was 3)" in out, out
+    assert "nothing was accepted" not in out
+    assert store(ddir, root).generation() == 4
+
+
+def test_a_store_fault_before_the_touch_says_nothing_was_signed(capsys, ddir, root, keys, tmp_path, no_touch):
+    init(capsys, ddir, root, keys)
+    (ddir / ctl.DB_NAME).write_bytes(b"this is not a database" * 100)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    assert code == 3 and "ControlStateUnavailable" in out and "nothing was signed" in out, out
+    assert no_touch.calls == 0
+    item =ctl.item_bytes("verifiers", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    (tmp_path / "item.json").write_bytes(item)
+    (tmp_path / "item.sig").write_text("x")
+    code, out, _ = accept_cli(capsys, ddir, root, str(tmp_path / "item.json"), str(tmp_path / "item.sig"), "--yes")
+    assert code == 3 and "nothing was accepted" in out, out
+
+
+@pytest.mark.parametrize("fault", [OSError("disk gone"), __import__("sqlite3").OperationalError("locked")])
+def test_resolvers_says_nothing_was_filed_for_every_store_fault(capsys, ddir, root, keys, monkeypatch, fault):
+    init(capsys, ddir, root, keys)
+
+    def faulted(self):
+        raise fault
+
+    monkeypatch.setattr(ctl.ControlStore, "active", faulted)
+    with pytest.raises(ctl.ControlStateUnavailable, match="nothing was filed"):
+        dcli.resolvers(ddir, root)
+
+
+def test_the_mcp_door_names_the_operators_fix_when_no_cockpit_is_named(capsys, ddir, root, keys, tmp_path, repo):
+    from levain.dispatch import mcp
+    configure(capsys, ddir, root, keys, tmp_path)
+    path, base = repo
+    sub = submission(path, base, expires_at=utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2)))
+    reply = mcp.handle("codex", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                 "params": {"name": "dispatch_file", "arguments": {"contract": sub}}},
+                       directory=ddir)
+    result = reply["result"]
+    text = result["content"][0]["text"]
+    assert result["isError"] and text.startswith("Refused, nothing changed"), text
+    assert "--data-root" not in text and "cockpit_data_root" in text and "the operator" in text, text
+
+
+@pytest.mark.parametrize("flag", ["--data-root", "--dispatch-dir"])
+def test_file_refuses_a_gate_flag_under_an_agent(capsys, ddir, root, keys, tmp_path, repo, monkeypatch, flag):
+    configure(capsys, ddir, root, keys, tmp_path)
+    monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
+    argv = ["file", _contract(tmp_path, repo), flag, root if flag == "--data-root" else str(ddir)]
+    code, out, _ = run(capsys, *argv)
+    assert code == 2 and flag in out and "claude_code" in out, out
+    assert JobStore(ddir).list() == []
+
+
+def test_show_escapes_a_homoglyph_in_the_summary(capsys, ddir, root, keys, tmp_path):
+    configure(capsys, ddir, root, keys, tmp_path)
+    routes = {"routes": [{"route": "openrouter/glм", "provider": "openrouter", "upstream": "https://x.invalid",
+                          "credential": "keychain:or", "models": [{"requested": "glm-5", "backend": "z-ai/glm-5"}],
+                          "body_policy": {}, "retention_claim": "none"}]}
+    assert sign(capsys, ddir, root, keys, tmp_path, "routemap", routes, "--yes")[0] == 0
+    code, out, _ = run(capsys, "config", "show", "--dispatch-dir", str(ddir), "--data-root", root)
+    assert code == 0 and "openrouter/gl\\u043c" in out and "м" not in out, out
+
+
+def test_the_confirm_summary_shows_the_head_it_builds_on(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    top, head = store(ddir, root).head()
+    _tty(monkeypatch)
+    changed = dict(VERIFIERS)
+    del changed["pytest-ip"]
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", changed)
+    assert code == 0, out
+    summary = out[out.index("---- you are about to sign"):]
+    assert f"builds on   generation {top}, {head}" in summary, summary
+    top, head = store(ddir, root).head()
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig)
+    assert code == 0, out
+    summary = out[out.index("---- you are about to accept"):]
+    assert f"builds on   generation {top}, {head}" in summary, summary
