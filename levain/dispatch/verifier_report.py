@@ -16,6 +16,11 @@ event's digest and the :class:`VerifierRun` the supervisor minted, and returns t
 :class:`ReportRefused` with one name of :data:`REFUSALS`. The envelope has no ``format`` member;
 :data:`ENVELOPE_FORMAT_NAME` is documentation only.
 
+The minted run is not trusted as given either (:func:`run_problem`, refusal ``verifier-entry``): its entry is exactly
+the contract's seven fields in their syntax, its steps the ticket step shape, the entry's ``steps_digest`` is
+recomputed over those steps and its ``driver_input_digest`` is the run's, so an envelope that echoes the entry back is
+bound to the steps and the driver input it claims.
+
 Known edge: no S1 code writes the envelope yet, so this is checked against fixture bytes that follow the contract's
 envelope field for field; the ``.exit`` member types are this module's reading of the contract, which names the
 members but not their types. Stdlib only.
@@ -23,10 +28,12 @@ members but not their types. Stdlib only.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from levain import unshowable
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
@@ -34,7 +41,7 @@ from levain.dispatch import DispatchError
 __all__ = [
     "ENVELOPE_FORMAT_NAME", "EXIT_KEYS", "MAX_ENVELOPE_BYTES", "MAX_REPORT_BYTES", "MAX_STEPS", "NOTE_MAX",
     "REFUSALS", "REPORT_FORMAT", "VERIFIER_KEYS", "ReportRefused", "StepVerdict", "VerifierReport", "VerifierRun",
-    "body_problem", "check_envelope",
+    "body_problem", "check_envelope", "run_problem",
 ]
 
 REPORT_FORMAT = "levain-dispatch-verifier-report/1"
@@ -55,13 +62,22 @@ _ENVELOPE_KEYS = frozenset({"session", "ticket", "verifier", "driver_input_diges
 _BODY_KEYS = frozenset({"format", "result", "steps"})
 _STEP_KEYS = frozenset({"step", "verdict", "note"})
 _VERDICTS = ("pass", "fail")
+# the resolved entry's syntax and the ticket step shape, as the contract writes them
+_VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}")
+_DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_KINDS = ("black-box", "in-process")
+_TICKET_STEP_KEYS = frozenset({"argv", "wall_s"})
+_ARGV_MAX = 64
+_ARG_MAX_BYTES = 4 << 10
 
-# every name check_envelope refuses with, closed: no envelope bytes to read; the event's digest is not the file's; the
+# every name check_envelope refuses with, closed: the minted run is not the contract's entry and steps; no envelope
+# bytes to read; the event's digest is not the file's; the
 # file is over the cap; it does not parse or is not canonical; its members are not the envelope's; session, ticket,
 # verifier entry, driver input or input bundle is not the one minted; its .exit records are not one per ticket step of
 # the right shape; the body's format, members, step list or count is wrong; its result disagrees with its steps
 REFUSALS = (
-    "report-missing", "report-digest-mismatch", "report-too-large", "report-not-canonical", "envelope-members",
+    "verifier-entry", "report-missing", "report-digest-mismatch", "report-too-large", "report-not-canonical", "envelope-members",
     "envelope-session", "envelope-ticket", "envelope-verifier", "envelope-driver-input", "envelope-input-bundle",
     "envelope-steps",
     "report-format", "report-body", "report-step-count", "report-result-disagrees",
@@ -123,6 +139,52 @@ def _exit_ok(rec: Any) -> bool:
             and _int(rec["truncated_bytes"]) and _int(rec["lingering_killed"]))
 
 
+def _ticket_step_ok(step: Any) -> bool:
+    if not isinstance(step, Mapping) or set(step) != _TICKET_STEP_KEYS:
+        return False
+    argv, wall = step["argv"], step["wall_s"]
+    if not isinstance(argv, (list, tuple)) or not 1 <= len(argv) <= _ARGV_MAX:
+        return False
+    for arg in argv:
+        if not isinstance(arg, str) or "\x00" in arg:
+            return False
+        try:
+            if len(arg.encode("utf-8")) > _ARG_MAX_BYTES:
+                return False
+        except UnicodeEncodeError:
+            return False
+    return type(wall) is int and wall > 0
+
+
+def run_problem(run: VerifierRun) -> str | None:
+    """Why the minted ``run`` is not a contract verifier entry and its ticket steps (module docstring), or ``None``."""
+    entry, steps = run.verifier, run.steps
+    if not isinstance(entry, Mapping) or set(entry) != VERIFIER_KEYS:
+        return "the verifier entry's members are not the contract's seven"
+    if not all(isinstance(entry[k], str) for k in VERIFIER_KEYS):
+        return "the verifier entry's members are text"
+    if _VERIFIER_ID.fullmatch(entry["verifier_id"]) is None:
+        return "the verifier_id is not [a-z0-9-]{1,48}"
+    if _DRIVER_TEMPLATE.fullmatch(entry["driver_template"]) is None:
+        return "the driver_template is not [a-z0-9_]{1,48}"
+    if entry["declared_kind"] not in _KINDS:
+        return "the declared_kind is not black-box or in-process"
+    for k in ("verifier_artifact_digest", "driver_template_digest", "steps_digest", "driver_input_digest"):
+        if _DIGEST.fullmatch(entry[k]) is None:
+            return f"the {k} is not sha256:<64 hex>"
+    if not isinstance(steps, (list, tuple)) or not 1 <= len(steps) <= MAX_STEPS:
+        return f"the ticket's steps are a list of 1 to {MAX_STEPS}"
+    if not all(_ticket_step_ok(s) for s in steps):
+        return (f"a ticket step is not {{argv: 1 to {_ARGV_MAX} strings of at most {_ARG_MAX_BYTES} bytes and no "
+                "NUL, wall_s: a positive int}")
+    canon = canonical_bytes([{"argv": list(s["argv"]), "wall_s": s["wall_s"]} for s in steps])
+    if entry["steps_digest"] != "sha256:" + hashlib.sha256(canon).hexdigest():
+        return "the entry's steps_digest is not the digest of the ticket's steps"
+    if entry["driver_input_digest"] != run.driver_input_digest:
+        return "the entry's driver_input_digest is not the run's"
+    return None
+
+
 def body_problem(body: Any) -> tuple[str, str] | None:
     """``(refusal name, why)`` when ``body`` is not a ``levain-dispatch-verifier-report/1`` body, else ``None``. The
     step count against the ticket is the envelope's check, not this one."""
@@ -144,6 +206,8 @@ def body_problem(body: Any) -> tuple[str, str] | None:
             return "report-body", f"step {k}'s verdict is not pass or fail"
         if not isinstance(s["note"], str) or len(s["note"]) > NOTE_MAX:
             return "report-body", f"step {k}'s note is not text of at most {NOTE_MAX} characters"
+        if unshowable.first_hidden(s["note"], allow="", selectors=False) is not None:
+            return "report-body", f"step {k}'s note is not one line of plain text"
     if (body["result"] == "pass") != all(s["verdict"] == "pass" for s in steps):
         return "report-result-disagrees", f"the body says {body['result']} and its steps say otherwise"
     return None
@@ -152,6 +216,9 @@ def body_problem(body: Any) -> tuple[str, str] | None:
 def check_envelope(raw: bytes | None, *, expected: VerifierRun, event_digest: str) -> VerifierReport:
     """The checked envelope ``raw`` for the session ``expected`` names, whose terminal event carried
     ``event_digest``; raises :class:`ReportRefused` at the first check that fails (module docstring)."""
+    why = run_problem(expected)
+    if why is not None:
+        raise ReportRefused("verifier-entry", why)
     if not isinstance(raw, bytes):
         raise ReportRefused("report-missing", "no envelope bytes were read")
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()

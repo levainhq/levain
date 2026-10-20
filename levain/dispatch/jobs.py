@@ -90,7 +90,7 @@ from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import sign as dsign
 from levain.dispatch.contract import ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract
 from levain.dispatch.policy import ProviderPolicy
-from levain.dispatch.verifier_report import ReportRefused, VerifierRun, check_envelope
+from levain.dispatch.verifier_report import ReportRefused, VerifierRun, check_envelope, run_problem
 
 if TYPE_CHECKING:
     from levain.dispatch.adopt import ArtifactRecord
@@ -123,9 +123,13 @@ _EVIDENCE_MAX = 4000
 _JOB_ID = re.compile(r"dj-[0-9a-f]{32}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _EVENT_NAME_MAX = 256
+_SESSION_TERMINAL = ("RETAINED", "HELD")
 # the verifier_refused evidence when the minted verifier entry is not the template's: the ticket can only name the
 # template's verifier at mint, and the writer still does not trust that
 NOT_THE_TEMPLATES = "verifier-not-the-template's"
+# the verifier_refused evidence when the minted run is not a contract entry and its steps (the envelope check's own
+# refusal name, so one cause reads the same from either place)
+ENTRY_REFUSED = "verifier-entry"
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
@@ -376,6 +380,10 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
         raise DispatchError("the verifier's terminal event is a session state event")
     if event.get("session") != run.session or event.get("ticket") != run.ticket:
         raise DispatchError("the session event is another session's or another ticket's")
+    # the report rides only the transition into a terminal session state; any other state reaching here is a
+    # supervisor bug, never a verifier outcome
+    if event.get("state") not in _SESSION_TERMINAL:
+        raise DispatchError(f"the session event's state is not {' or '.join(_SESSION_TERMINAL)}")
     if not isinstance(event.get("at"), str):
         raise DispatchError("the session event carries no at stamp")
     has_digest, has_refused = "verifier_report_digest" in event, "verifier_report_refused" in event
@@ -786,8 +794,9 @@ class JobStore:
         ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
         ``tree`` the run's artifact tree, ``model`` the run's ``{requested, answered, backend_identity}``.
 
-        A refused event, a minted verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`, checked
-        before anything is staged) or an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses fails
+        A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
+        verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
+        staged, or an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses fails
         the job with cause ``verifier_refused``, the evidence the refusal's name, and writes no record. A report that
         checks: the run's commit is staged (:func:`levain.dispatch.adopt.stage_commit`, ``verified_at`` the event's
         ``at``, so the staged sha re-derives from the record alone), its record built and judged by
@@ -821,7 +830,11 @@ class JobStore:
             raise DispatchError(f"run {str(run.run)[:8]} is not one of the template's runs 0..{template.k - 1}")
         entry = run.verifier if isinstance(run.verifier, Mapping) else {}
         name: str | None = None
-        if (entry.get("verifier_id"), entry.get("verifier_artifact_digest"), entry.get("declared_kind")) != (
+        # the minted entry and steps are judged before anything else reads them: an entry that is not the contract's
+        # seven fields, or steps its steps_digest does not bind, is the supervisor's infrastructure failing
+        if run_problem(run) is not None:
+            name = ENTRY_REFUSED
+        elif (entry.get("verifier_id"), entry.get("verifier_artifact_digest"), entry.get("declared_kind")) != (
                 template.verifier_id, template.verifier_hash, template.verifier_kind):
             name = NOT_THE_TEMPLATES
         elif refused is not None:
@@ -850,13 +863,19 @@ class JobStore:
             problem = adopt.artifact_problem(repo, job, record)
             if problem is not None:
                 raise DispatchError(problem)
+        lost: str | None = None
         with self._swept() as (conn, stamp):
             current = self._must_load(conn, job.id)
             if current.state != "verifying":
-                raise TransitionRefused(f"job {job.id} is {current.state}; only a verifying job records its "
-                                        "verifier")
-            if record is None:
+                lost = current.state
+            elif record is None:
                 assert name is not None
+                # another writer may have recorded this run since the pre-read: its record stands, and this
+                # writer's infrastructure failure is refused rather than failing a job that holds it
+                if conn.execute("SELECT 1 FROM run_records WHERE job_id = ? AND run = ?",
+                                (job.id, run.run)).fetchone() is not None:
+                    raise TransitionRefused(f"run {run.run} of job {job.id} is already recorded; a run record is "
+                                            "never replaced")
                 self._apply(conn, job.id, "failed", "verifier_refused", stamp, name)
             else:
                 try:
@@ -873,22 +892,32 @@ class JobStore:
                                 json.dumps({"run": record.run, "step": failure.step, "note": failure.note},
                                            sort_keys=True))
                 else:
-                    passed = {r for r, text in conn.execute(
-                        "SELECT run, record FROM run_records WHERE job_id = ?", (job.id,))
-                        if json.loads(text)["verifier"]["result"] == "pass"}
+                    passed: set[int] = set()
+                    for r, text in conn.execute("SELECT run, record FROM run_records WHERE job_id = ?", (job.id,)):
+                        try:
+                            result = json.loads(text)["verifier"]["result"]
+                        except (TypeError, ValueError, KeyError):
+                            raise JobStoreError(f"run {r} of job {job.id} holds a record that cannot be read; the "
+                                                "dispatch store is damaged") from None
+                        if result == "pass":
+                            passed.add(r)
                     if passed == set(range(template.k)):
                         self._apply(conn, job.id, "verified", "verifier_pass", stamp,
                                     json.dumps({"runs": template.k}, sort_keys=True))
             out = self._load(conn, job.id)
         assert out is not None
-        if out.state == "failed":
+        if out.state == "failed" and (lost is None or record is not None):
             # a failed job can never land, so its staged refs (this run's and every run that passed before it) are
-            # clutter in the operator's repo: deleted once the failure is durable; a record keeps its sha, and only
-            # ever is read. A ref git keeps, or git not answering, leaves clutter and nothing worse, so it never raises
+            # clutter in the operator's repo. This covers the failures this writer makes, and a job this writer staged
+            # for and then found failed by another; a job that ends by lapse or cancel is swept by F11-s2's land verb.
+            # Deleted once the failure is durable; a record keeps its sha, and only ever is read. A ref git keeps, or
+            # git not answering, leaves clutter and nothing worse, so it never raises
             try:
                 adopt._delete_staged(repo, job.id)
             except adopt.GitFault:
                 pass
+        if lost is not None:
+            raise TransitionRefused(f"job {job.id} is {lost}; only a verifying job records its verifier")
         return out
 
     def run_records(self, job_id: str) -> list[ArtifactRecord]:

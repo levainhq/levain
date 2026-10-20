@@ -1027,7 +1027,8 @@ def stage_commit(repo: str, *, job_id: str, run: int, contract_digest: str, base
     ``levain dispatch`` dated ``verified_at``, a message naming the job, the run, the contract digest and the tree)
     and point :func:`staged_ref` at it (created, never moved); returns its sha. The same inputs make the same sha, so
     a call whose ref already points at exactly that sha returns it (a crash between the ref and the record it was made
-    for must not wedge the retry); a ref that points anywhere else is a :class:`DispatchError`."""
+    for must not wedge the retry); a ref that points anywhere else, or is symbolic, is a :class:`DispatchError`, and a
+    create that fails with no ref after it is a :class:`GitFault` carrying git's words."""
     when = f"{int(parse_stamp(verified_at).timestamp())} +0000"
     env = {"GIT_AUTHOR_NAME": _STAGE_NAME, "GIT_AUTHOR_EMAIL": _STAGE_EMAIL, "GIT_AUTHOR_DATE": when,
            "GIT_COMMITTER_NAME": _STAGE_NAME, "GIT_COMMITTER_EMAIL": _STAGE_EMAIL, "GIT_COMMITTER_DATE": when}
@@ -1035,16 +1036,34 @@ def stage_commit(repo: str, *, job_id: str, run: int, contract_digest: str, base
     sha = _git_ok(repo, "commit-tree", "--no-gpg-sign", tree, "-p", base, feed=message,
                   extra_env=env).decode("ascii").strip()
     ref = staged_ref(job_id, run)
-    held = _read_ref(repo, ref)
+    held = _staged_held(repo, ref)
     if held is None:
-        if _git(repo, "update-ref", "--no-deref", ref, sha, "0" * len(sha)).returncode == 0:
+        cp = _git(repo, "update-ref", "--no-deref", ref, sha, "0" * len(sha))
+        if cp.returncode == 0:
             return sha
-        # another writer created it between the read and the create: judge what it holds
-        held = _read_ref(repo, ref)
+        # another writer created it between the read and the create: judge what it holds; no ref at all means the
+        # create failed for its own reason, which git's words say
+        held = _staged_held(repo, ref)
+        if held is None:
+            detail = cp.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise GitFault(f"git update-ref could not create {ref}: "
+                           f"{detail[-1][:200] if detail else cp.returncode}")
     if held != sha:
-        raise DispatchError(f"{ref} already points at {str(held)[:64]}, not this run's staged commit {sha}; a staged "
-                            "ref is never moved")
+        raise DispatchError(f"{ref} already points at {held[:64]}, not this run's staged commit {sha}; a staged "
+                            "ref is never moved, and the staged commit is dated by the event, so a retry carries the "
+                            "event that staged it")
     return sha
+
+
+def _staged_held(repo: str, ref: str) -> str | None:
+    """The object the staged ``ref`` names, or ``None`` when it does not exist; a symbolic ref is refused, never
+    followed (its target can move, and the staged ref would move with it)."""
+    cp = _git(repo, "symbolic-ref", "-q", ref)
+    if cp.returncode == 0:
+        raise DispatchError(f"{ref} is a symbolic ref; a staged ref is a direct ref, never followed")
+    if cp.returncode != 1:
+        raise GitFault(f"git symbolic-ref failed in {repo} (exit {cp.returncode})")
+    return _read_ref(repo, ref)
 
 
 def _read_ref(repo: str, ref: str) -> str | None:

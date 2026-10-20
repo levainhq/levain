@@ -202,7 +202,38 @@ def test_staging_again_returns_the_held_commit_and_never_moves_a_ref(repo, jstor
     later = utc_stamp(NOW + timedelta(minutes=7))
     with pytest.raises(DispatchError, match="never moved"):
         stage_commit(str(repo[0]), verified_at=later, **kw)
+    with pytest.raises(DispatchError, match="dated by the event"):
+        stage_commit(str(repo[0]), verified_at=later, **kw)
     assert git(repo[0], "rev-parse", staged_ref(job.id, 0)) == a
+
+
+def test_a_symbolic_staged_ref_is_refused_never_followed(repo, jstore, cstore, tmp_path):
+    from levain.dispatch import DispatchError
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    kw = dict(job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree, verified_at=VERIFIED_AT)
+    sha = stage_commit(str(repo[0]), **kw)
+    git(repo[0], "update-ref", "-d", staged_ref(job.id, 0))
+    # a branch at exactly the staged sha, and the staged name a symref to it: following it would accept a ref that
+    # moves when the branch does
+    git(repo[0], "update-ref", "refs/heads/elsewhere", sha)
+    git(repo[0], "symbolic-ref", staged_ref(job.id, 0), "refs/heads/elsewhere")
+    with pytest.raises(DispatchError, match="symbolic ref"):
+        stage_commit(str(repo[0]), **kw)
+
+
+def test_a_create_that_fails_with_no_ref_after_is_a_git_fault_carrying_gits_words(repo, jstore, cstore, tmp_path):
+    from levain.dispatch.adopt import GitFault
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    # a ref beneath the staged name: the staged ref cannot be created and does not exist
+    git(repo[0], "update-ref", staged_ref(job.id, 0) + "/x", repo[1])
+    with pytest.raises(GitFault) as exc:
+        stage_commit(str(repo[0]), job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree,
+                     verified_at=VERIFIED_AT)
+    assert "None" not in str(exc.value) and staged_ref(job.id, 0) in str(exc.value)
 
 
 # --- (a) crash after the swap, before adopted ----------------------------------------------------------------------

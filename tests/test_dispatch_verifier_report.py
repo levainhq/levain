@@ -113,6 +113,7 @@ CASES = {
     "report-step-count": lambda: refused_name(canon(envelope_map(vrun(), body(("pass",))))),
     "report-result-disagrees": lambda: refused_name(canon(envelope_map(vrun(), body(("pass", "fail"),
                                                                                      result="pass")))),
+    "verifier-entry": lambda: refused_name(*envelope(minted(extra="x")), run=minted(extra="x")),
 }
 
 
@@ -195,3 +196,57 @@ def test_a_body_over_its_cap_inside_an_envelope_under_its_own_is_too_large():
     raw = canon(envelope_map(vrun(), b))
     assert len(raw) <= vr.MAX_ENVELOPE_BYTES
     assert refused_name(raw) == "report-too-large"
+
+
+# --- the minted run itself (L3 r1 F1, F5) --------------------------------------------------------------------------
+
+def steps_digest(steps) -> str:
+    return "sha256:" + hashlib.sha256(canonical_bytes([dict(s) for s in steps])).hexdigest()
+
+
+def minted(steps=STEPS, *, digest=None, **over) -> VerifierRun:
+    """A run whose entry is ENTRY with ``over`` applied and its steps_digest recomputed over ``steps`` (unless a
+    ``digest`` is given), so a case isolates the one thing it breaks."""
+    entry = {**ENTRY, "steps_digest": digest or steps_digest(steps), **over}
+    entry = {k: v for k, v in entry.items() if v is not ...}
+    return VerifierRun(job_id="dj-" + "0" * 32, run=0, session="v-0", ticket="t-0", verifier=entry, steps=steps,
+                       driver_input_digest=ENTRY["driver_input_digest"], input_bundle_digest="sha256:" + "e" * 64)
+
+
+@pytest.mark.parametrize("run", [
+    minted(driver_template=...),
+    minted(extra="x"),
+    minted(verifier_id="Pytest_BB"),
+    minted(verifier_id="x" * 49),
+    minted(driver_template="pytest-bb"),
+    minted(declared_kind="white-box"),
+    minted(verifier_artifact_digest="sha256:" + "B" * 64),
+    minted(driver_template_digest="sha256:" + "c" * 63),
+    minted(digest="sha256:" + "9" * 64),
+    minted(driver_input_digest="sha256:" + "8" * 64),
+    minted(()),
+    minted(tuple({"argv": ["true"], "wall_s": 1} for _ in range(17))),
+    minted(({"argv": ["true"], "wall_s": 1, "env": {}},)),
+    minted(({"argv": [], "wall_s": 1},)),
+    minted(({"argv": ["x"] * 65, "wall_s": 1},)),
+    minted(({"argv": ["a\x00b"], "wall_s": 1},)),
+    minted(({"argv": ["x" * 4097], "wall_s": 1},)),
+    minted(({"argv": [1], "wall_s": 1},)),
+    minted(({"argv": ["true"], "wall_s": True},)),
+    minted(({"argv": ["true"], "wall_s": 0},)),
+], ids=lambda r: str(r.verifier.get("verifier_id")) + "/" + str(len(r.steps)))
+def test_a_minted_run_that_is_not_the_contracts_entry_and_steps_is_refused(run):
+    raw, digest = envelope(run)
+    with pytest.raises(ReportRefused) as exc:
+        check_envelope(raw, expected=run, event_digest=digest)
+    assert exc.value.name == "verifier-entry"
+    assert vr.run_problem(run) is not None
+
+
+def test_a_minted_run_of_the_contracts_shape_has_no_problem():
+    assert vr.run_problem(vrun()) is None and vr.run_problem(minted(({"argv": ["x" * 4096], "wall_s": 900},))) is None
+
+
+@pytest.mark.parametrize("note", ["passed\nFAIL: forged", "a\x00b", "ok ‮deliaf", "a\tb"])
+def test_a_note_that_cannot_show_as_itself_is_refused(note):
+    assert (body_problem(body(steps=[{"step": 0, "verdict": "pass", "note": note}])) or (None,))[0] == "report-body"
