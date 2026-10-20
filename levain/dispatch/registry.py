@@ -29,9 +29,11 @@ item may change a verifier a template names (replacing a verifier and its templa
 first, so refusing it would leave no order that works); the resolver then refuses that template until a templates
 item agreeing with it is accepted, so a stale pairing never resolves.
 
-An ADOPTION RULE names an R0 template whose verifier is black-box, the template's content hash (an edited template
-is a new hash, so a rule never carries over to content it was not signed for) and the rule's own criteria (DESIGN
-§3.2: contrast-clean is necessary, never sufficient). A rule is judged when it is accepted AND again on every read
+An ADOPTION RULE names the repository it lands in (an absolute path in contract.py's normal form), an R0 template
+whose verifier is black-box, the template's content hash (an edited template is a new hash, so a rule never carries
+over to content it was not signed for) and the rule's own criteria (DESIGN §3.2: contrast-clean is necessary, never
+sufficient). The criteria are a closed, typed vocabulary (F11 §5, :func:`parse_criteria`): free text was checked by
+nothing when a job landed, so a rule holding any is refused when it is accepted and raises when it is read. A rule is judged when it is accepted AND again on every read
 (:func:`active_adoption_rules`), against the templates and verifiers active THEN: a later templates or verifiers
 item can leave a rule pointing at content or a verifier it was not signed for, and such a rule raises rather than
 reads. The intent is that this reader is the only way to the rules: the store's public reader is meant to leave
@@ -43,6 +45,7 @@ Stdlib only.
 from __future__ import annotations
 
 import hashlib
+import os
 import posixpath
 import re
 from collections.abc import Callable, Mapping
@@ -55,9 +58,9 @@ from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text_problem
 
 __all__ = [
-    "ADOPTION_RULE_KEYS", "EXECUTION_BEARING_DIRS", "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS",
+    "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS", "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS",
     "ROUTE_KEYS", "TEMPLATE_FORMAT", "TEMPLATE_KEYS", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules",
-    "active_policy", "body_refusal", "execution_bearing", "r0_write_refusal", "resolver", "template_content_hash",
+    "active_policy", "body_refusal", "execution_bearing", "parse_criteria", "r0_write_refusal", "resolver", "template_content_hash",
     "template_from_mapping",
 ]
 
@@ -66,7 +69,15 @@ TEMPLATE_FORMAT = "levain-dispatch-template/1"
 TEMPLATE_KEYS = frozenset({"id", "content_hash", "tier", "executor", "models", "k", "verifier_id", "verifier_hash",
                            "verifier_kind", "write_paths", "provider", "route", "tool_versions"})
 VERIFIER_KEYS = frozenset({"artifact_hash", "kind"})
-ADOPTION_RULE_KEYS = frozenset({"template_id", "template_hash", "verifier_kind", "criteria"})
+ADOPTION_RULE_KEYS = frozenset({"repo", "template_id", "template_hash", "verifier_kind", "criteria"})
+# F11 §5: the closed vocabulary of a rule's criteria; each criterion is an object with exactly one of these keys
+CRITERION_KEYS = ("onto", "max_changed_lines", "max_bytes", "max_files", "paths", "no_new_files", "max_age_hours")
+# a rule names onto AND at least one of these: a blast-radius bound the operator chose
+CRITERION_BOUNDS = ("max_changed_lines", "max_bytes", "max_files", "paths")
+# the upper bound of each integer criterion (each is also at least 1)
+CRITERION_INT_MAX = {"max_changed_lines": 1_000_000, "max_bytes": 1 << 30, "max_files": 10_000,
+                     "max_age_hours": 24 * 366}
+_BRANCH_MAX = 255
 ROUTE_KEYS = frozenset({"route", "provider", "upstream", "credential", "models", "body_policy", "retention_claim"})
 _ENTRIES_MAX = 256
 _TEXT_MAX = 1024
@@ -309,6 +320,82 @@ def _routemap(body: Any) -> str | None:
     return None
 
 
+def _rule_repo_problem(repo: Any) -> str | None:
+    # contract.py's form for a repo: an absolute path in its normal form (a rule is matched to a contract's repo by
+    # equality, so it must be written the way contracts carry it)
+    if not isinstance(repo, str) or not repo or "\x00" in repo or len(repo) > _TEXT_MAX:
+        return "an adoption rule's repo is an absolute path"
+    if not repo.startswith("/") or os.path.normpath(repo) != repo:
+        return f"an adoption rule's repo {repo[:120]!r} must be an absolute path in its normal form"
+    return None
+
+
+def _positive_int(value: Any, name: str) -> str | None:
+    high = CRITERION_INT_MAX[name]
+    if type(value) is not int or not 1 <= value <= high:
+        return f"criterion {name} is an integer from 1 to {high}"
+    return None
+
+
+def parse_criteria(criteria: Any, write_paths: frozenset[str]) -> tuple[tuple[str, Any], ...]:
+    """A rule's criteria (F11 §5) as ``(key, value)`` pairs in their written order, every value checked; raises
+    :class:`DispatchError` saying why not. ``write_paths`` is the template's write set: a ``paths`` entry is one of
+    its paths (compared without case) or a directory, written ``dir/``, above at least one of them."""
+    if not isinstance(criteria, list) or not criteria or len(criteria) > _ENTRIES_MAX:
+        raise DispatchError("criteria is a non-empty list of typed criteria")
+    out: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    folded = {p.casefold() for p in write_paths}
+    for c in criteria:
+        if not isinstance(c, dict) or len(c) != 1:
+            raise DispatchError(f"a criterion is an object with exactly one of {list(CRITERION_KEYS)} (free text is "
+                                "checked by nothing, so it is refused)")
+        (key, value), = c.items()
+        if key not in CRITERION_KEYS:
+            raise DispatchError(f"criterion {str(key)[:64]!r} is not one of {list(CRITERION_KEYS)}")
+        if key in seen:
+            raise DispatchError(f"criterion {key} is named twice")
+        seen.add(key)
+        if key == "onto":
+            if not isinstance(value, list) or not value or len(value) > _ENTRIES_MAX:
+                raise DispatchError("criterion onto is a non-empty list of branch names")
+            for b in value:
+                if not isinstance(b, str) or not b or len(b) > _BRANCH_MAX or b.startswith("refs/") or \
+                        b.casefold().startswith("levain/") or path_text_problem(b, "a branch") is not None:
+                    raise DispatchError(f"criterion onto names {str(b)[:64]!r}, which is not a bare branch outside "
+                                        "levain/")
+            if len(set(value)) != len(value):
+                raise DispatchError("criterion onto names a branch twice")
+            value = tuple(value)
+        elif key == "paths":
+            if not isinstance(value, list) or not value or len(value) > _ENTRIES_MAX:
+                raise DispatchError("criterion paths is a non-empty list")
+            for p in value:
+                if not isinstance(p, str) or not p:
+                    raise DispatchError("criterion paths lists text paths")
+                if p.endswith("/"):
+                    d = p.casefold()
+                    if not any(f.startswith(d) for f in folded):
+                        raise DispatchError(f"criterion paths names {p[:80]!r}, above none of the template's write "
+                                            "paths")
+                elif p.casefold() not in folded:
+                    raise DispatchError(f"criterion paths names {p[:80]!r}, which the template does not write")
+            value = tuple(value)
+        elif key == "no_new_files":
+            if value is not True:
+                raise DispatchError("criterion no_new_files is true")
+        else:
+            problem = _positive_int(value, key)
+            if problem is not None:
+                raise DispatchError(problem)
+        out.append((key, value))
+    if "onto" not in seen:
+        raise DispatchError("a rule's criteria name onto (the branches it may land on)")
+    if not seen & set(CRITERION_BOUNDS):
+        raise DispatchError(f"a rule's criteria name at least one bound of {list(CRITERION_BOUNDS)}")
+    return tuple(out)
+
+
 def _adoption_rules(body: Any, active: Mapping[str, Any]) -> str | None:
     if not isinstance(body, list) or len(body) > _ENTRIES_MAX:
         return f"an adoption_rules body is a list of at most {_ENTRIES_MAX} rules"
@@ -335,13 +422,13 @@ def _adoption_rules(body: Any, active: Mapping[str, Any]) -> str | None:
                     "black-box verifier may adopt by rule")
         if rule["template_hash"] != template.content_hash:
             return f"the adoption rule for {tid} is bound to another template content hash than the active one"
-        criteria = rule["criteria"]
-        if not isinstance(criteria, list) or not criteria or len(criteria) > _ENTRIES_MAX:
-            return f"the adoption rule for {tid} names its own criteria: a non-empty list"
-        for c in criteria:
-            problem = _text(c, "a criterion")
-            if problem is not None:
-                return f"the adoption rule for {tid}: {problem}"
+        problem = _rule_repo_problem(rule["repo"])
+        if problem is not None:
+            return f"the adoption rule for {tid}: {problem}"
+        try:
+            parse_criteria(rule["criteria"], template.write_paths)
+        except DispatchError as exc:
+            return f"the adoption rule for {tid}: {exc}"
     return None
 
 
@@ -402,10 +489,12 @@ def resolver(control_store: _ConfigStore) -> Callable[[str], ResolvedTemplate | 
 @dataclass(frozen=True)
 class AdoptionRule:
     """An adoption rule as :func:`active_adoption_rules` reads it: judged against the active configuration."""
+    repo: str
     template_id: str
     template_hash: str
     verifier_kind: str
-    criteria: tuple[str, ...]
+    # the typed criteria (F11 §5) as (key, value) pairs, in the order written
+    criteria: tuple[tuple[str, Any], ...]
 
 
 def active_adoption_rules(control_store: _ConfigStore) -> tuple[AdoptionRule, ...]:
@@ -420,8 +509,14 @@ def active_adoption_rules(control_store: _ConfigStore) -> tuple[AdoptionRule, ..
     problem = _adoption_rules(item.body, active)
     if problem is not None:
         raise DispatchError(f"the active adoption rules no longer hold: {problem}")
-    return tuple(AdoptionRule(template_id=r["template_id"], template_hash=r["template_hash"],
-                              verifier_kind=r["verifier_kind"], criteria=tuple(r["criteria"])) for r in item.body)
+    out = []
+    for r in item.body:
+        template = _active_template(active, r["template_id"])
+        assert template is not None                  # _adoption_rules just judged it active
+        out.append(AdoptionRule(repo=r["repo"], template_id=r["template_id"], template_hash=r["template_hash"],
+                                verifier_kind=r["verifier_kind"],
+                                criteria=parse_criteria(r["criteria"], template.write_paths)))
+    return tuple(out)
 
 
 def active_policy(control_store: _ConfigStore) -> ProviderPolicy:

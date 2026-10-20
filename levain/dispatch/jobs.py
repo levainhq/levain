@@ -88,8 +88,9 @@ FORMAT = "levain-dispatch-jobs/1"
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
 _SIGN_SKEW = timedelta(minutes=2)
-# the causes a human signed for: a cancel signed before the latest of these is stale
-_HUMAN_SIGNED = frozenset({"signature", "human_authorises", "human_adoption_rule"})
+# the causes a human signed for: a cancel signed before the latest of these is stale. A rule firing is not one: it is
+# dated when it fires, not when the human signed the rule, so it never makes a fresher human cancel look stale
+_HUMAN_SIGNED = frozenset({"signature", "human_authorises"})
 _AGENT_MAX = 64
 _ACCESS_BY_OTHERS = 0o077
 _SESSION_MAX = 256
@@ -121,6 +122,10 @@ def _edges() -> dict[tuple[str, str], frozenset[str]]:
         ("recommended", "authorised"): {"human_authorises", "human_adoption_rule"},
         ("authorised", "adopted"): {"adopted"},
         ("authorised", "cancelled"): {"human_cancel"},
+        # the verifier ran on the contract's base; a target that no longer reads it fails the result (F11 §6)
+        ("verified", "failed"): {"base_moved"},
+        ("recommended", "failed"): {"base_moved"},
+        ("authorised", "failed"): {"base_moved"},
     }
     for state in BEFORE_AUTHORISED:
         edges.setdefault((state, "failed"), set()).update(_SERVICE_FAILURES)
@@ -232,6 +237,14 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS cancel_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, "
     "signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
     *_append_only("cancel_signatures", "a cancel is written once"),
+    # the human authorise item (F11 (A)): the operator's signature over one run's ARTIFACT digest and its landing
+    # branch, kept beside the contract signature and the cancel, never in their tables; a job is authorised once
+    "CREATE TABLE IF NOT EXISTS authorise_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), "
+    "payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
+    *_append_only("authorise_signatures", "an authorisation is written once"),
+    "CREATE TRIGGER IF NOT EXISTS authorise_signatures_no_replace BEFORE INSERT ON authorise_signatures "
+    "WHEN EXISTS (SELECT 1 FROM authorise_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'an authorisation is never replaced'); END",
     # the agent that filed a job, as the filing door named it: beside the jobs table, never a column of it, so a store
     # made before it gains the table and keeps its rows; a job filed with no agent named has no row
     "CREATE TABLE IF NOT EXISTS job_filers (job_id TEXT PRIMARY KEY REFERENCES jobs(id), agent TEXT NOT NULL)",
@@ -659,6 +672,40 @@ class JobStore:
             self._apply(conn, job.id, "cancelled", "human_cancel", stamp,
                         json.dumps({"signer_fp": payload["signer_fp"], "reason": payload["reason"]},
                                    sort_keys=True))
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def authorise(self, job_id: str, *, cause: str, evidence: str,
+                  human: tuple[Any, Any, AuthoritySource, Callable[..., str | None]] | None = None) -> Job:
+        """``verified``/``recommended`` -> ``authorised`` for ``cause`` with the INTENT ``evidence`` (F11 §6 step 1),
+        in one write transaction. ``human`` is ``(payload, signature, authority, refusal)`` for the human authorise
+        item: ``authority`` is replayed afresh inside the transaction, ``refusal(payload, signature, snapshot, job,
+        ssh_keygen=...)`` judges it (``levain.dispatch.adopt.authorise_refusal``), and the signed item is stored in
+        ``authorise_signatures`` with the transition; refusals and machine faults are told apart as :meth:`sign`
+        tells them. Without ``human`` the cause must not be ``human_authorises``."""
+        if (cause == "human_authorises") != (human is not None):
+            raise TransitionRefused("human_authorises is written with the human's signed item, and only it")
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state not in ("verified", "recommended"):
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a verified or recommended job is "
+                                        "authorised")
+            if human is not None:
+                payload, signature, authority, refusal = human
+                if type(authority) is not AuthoritySource:
+                    raise SignatureRefused("authority must be the AuthoritySource authority_source() returns")
+                snapshot = _replay(authority)
+                problem = refusal(payload, signature, snapshot, job, ssh_keygen=self._ssh_keygen)
+                if problem is None and payload["signed_at"] > utc_stamp(parse_stamp(stamp) + _SIGN_SKEW):
+                    problem = "the authorisation is dated in the future"
+                if problem is not None:
+                    raise SignatureRefused(problem)
+                conn.execute("INSERT INTO authorise_signatures (job_id, payload, signature, signer_fp, at) "
+                             "VALUES (?, ?, ?, ?, ?)",
+                             (job.id, dsign.sign_message(payload).decode("utf-8"), signature, payload["signer_fp"],
+                              stamp))
+            self._apply(conn, job.id, "authorised", cause, stamp, evidence)
             out = self._load(conn, job.id)
         assert out is not None
         return out

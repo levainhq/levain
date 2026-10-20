@@ -234,9 +234,13 @@ def test_routemap_refusals(store, log, keys, body, match):
 
 # --- adoption rules ------------------------------------------------------------------------------------------------
 
+RULE_REPO = "/srv/repo"
+CRITERIA = [{"onto": ["main"]}, {"max_changed_lines": 40}]
+
+
 def rule(**over):
-    r = {"template_id": "fix-lint", "template_hash": tmpl()["content_hash"], "verifier_kind": "black-box",
-         "criteria": ["the black-box suite passes", "contrast-clean across both models"]}
+    r = {"repo": RULE_REPO, "template_id": "fix-lint", "template_hash": tmpl()["content_hash"],
+         "verifier_kind": "black-box", "criteria": CRITERIA}
     r.update(over)
     return r
 
@@ -246,8 +250,8 @@ def test_an_adoption_rule_for_a_black_box_r0_template_is_accepted(store, log, ke
     assert active_adoption_rules(store) == ()
     accept(store, log, keys, "adoption_rules", 4, [rule()])
     assert active_adoption_rules(store) == (AdoptionRule(
-        template_id="fix-lint", template_hash=tmpl()["content_hash"], verifier_kind="black-box",
-        criteria=("the black-box suite passes", "contrast-clean across both models")),)
+        repo=RULE_REPO, template_id="fix-lint", template_hash=tmpl()["content_hash"], verifier_kind="black-box",
+        criteria=(("onto", ("main",)), ("max_changed_lines", 40))),)
 
 
 def test_the_raw_adoption_rules_are_never_read_out(store, log, keys):
@@ -317,8 +321,28 @@ def test_an_adoption_rule_for_an_in_process_verifier_is_refused(store, log, keys
 @pytest.mark.parametrize("over, match", [
     ({"template_id": "fix-docs"}, "not an active template"),
     ({"template_hash": "sha256:" + "0" * 64}, "another template content hash"),
-    ({"criteria": []}, "own criteria"),
-    ({"criteria": ["ok", ""]}, "criterion"),
+    ({"criteria": []}, "non-empty list"),
+    ({"criteria": ["ok", ""]}, "free text is checked by nothing"),
+    ({"criteria": ["contrast-clean", "diff under 40 lines"]}, "free text is checked by nothing"),
+    ({"criteria": [{"onto": ["main"], "max_files": 2}]}, "exactly one of"),
+    ({"criteria": [{"onto": ["main"]}, {"bogus": 1}]}, "'bogus' is not one of"),
+    ({"criteria": [{"onto": ["main"]}, {"max_files": 2}, {"max_files": 3}]}, "named twice"),
+    ({"criteria": [{"max_files": 2}]}, "name onto"),
+    ({"criteria": [{"onto": ["main"]}, {"no_new_files": True}]}, "at least one bound"),
+    ({"criteria": [{"onto": ["main"]}, {"max_files": 0}]}, "integer from 1"),
+    ({"criteria": [{"onto": ["main"]}, {"max_files": True}]}, "integer from 1"),
+    ({"criteria": [{"onto": ["main"]}, {"max_bytes": (1 << 30) + 1}]}, "integer from 1"),
+    ({"criteria": [{"onto": ["main"]}, {"max_age_hours": 2.5}, {"max_files": 1}]}, "float"),
+    ({"criteria": [{"onto": ["main"]}, {"paths": []}]}, "non-empty list"),
+    ({"criteria": [{"onto": ["main"]}, {"paths": ["src/other.py"]}]}, "does not write"),
+    ({"criteria": [{"onto": ["main"]}, {"paths": ["lib/"]}]}, "above none"),
+    ({"criteria": [{"onto": ["main"]}, {"no_new_files": False}, {"max_files": 1}]}, "no_new_files is true"),
+    ({"criteria": [{"onto": ["levain/x"]}, {"max_files": 1}]}, "not a bare branch"),
+    ({"criteria": [{"onto": ["refs/heads/main"]}, {"max_files": 1}]}, "not a bare branch"),
+    ({"criteria": [{"onto": []}, {"max_files": 1}]}, "non-empty list of branch"),
+    ({"repo": "relative/repo"}, "absolute path in its normal form"),
+    ({"repo": "/srv/../repo"}, "absolute path in its normal form"),
+    ({"repo": ""}, "repo is an absolute path"),
 ])
 def test_adoption_rule_refusals(store, log, keys, over, match):
     base_config(store, log, keys)
@@ -337,3 +361,23 @@ def test_an_adoption_rule_missing_its_template_hash_is_refused(store, log, keys)
     r = rule()
     del r["template_hash"]
     refused(store, log, keys, "adoption_rules", 4, [r], "exactly")
+
+
+def test_every_typed_criterion_is_accepted_and_read_back_in_order(store, log, keys):
+    base_config(store, log, keys)
+    crit = [{"onto": ["main", "dev"]}, {"max_changed_lines": 40}, {"max_bytes": 4096}, {"max_files": 3},
+            {"paths": ["src/a.py", "src/sub/"]}, {"no_new_files": True}, {"max_age_hours": 12}]
+    accept(store, log, keys, "adoption_rules", 4, [rule(criteria=crit)])
+    (got,) = active_adoption_rules(store)
+    assert got.criteria == (("onto", ("main", "dev")), ("max_changed_lines", 40), ("max_bytes", 4096),
+                            ("max_files", 3), ("paths", ("src/a.py", "src/sub/")), ("no_new_files", True),
+                            ("max_age_hours", 12))
+
+
+def test_a_stored_text_criteria_rule_raises_on_read(store, log, keys, monkeypatch):
+    # a rule accepted under an older reader (text criteria) lands nothing: the re-judging read raises
+    base_config(store, log, keys)
+    accept(store, log, keys, "adoption_rules", 4, [rule()])
+    monkeypatch.setattr(registry, "CRITERION_KEYS", ("onto", "max_files"))
+    with pytest.raises(DispatchError, match="no longer hold"):
+        active_adoption_rules(store)
