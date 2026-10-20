@@ -3,19 +3,31 @@ control store (real keys, real SQLite): templates (computed content hash, the R0
 cross-check), verifiers, the provider policy, the route map and adoption rules (re-judged on every read)."""
 from __future__ import annotations
 
+import hashlib
+import inspect
+
 import pytest
 
+from levain.contracts.canon import canonical_bytes
 from levain.dispatch import DispatchError
 from levain.dispatch import control as ctl
 from levain.dispatch import registry
 from levain.dispatch.contract import _path_problem
 from levain.dispatch.registry import (
-    EXECUTION_BEARING_DIRS, EXECUTION_BEARING_FILES, R0_SOURCE_EXTENSIONS, AdoptionRule, active_adoption_rules,
-    execution_bearing, r0_write_refusal, resolver, template_content_hash,
+    EXECUTION_BEARING_DIRS, EXECUTION_BEARING_FILES, R0_SOURCE_EXTENSIONS, VERIFIER_FORMAT, AdoptionRule,
+    active_adoption_rules, execution_bearing, r0_write_refusal, resolver, template_content_hash, verifier_ticket,
 )
+from levain.dispatch.contract import SUBMISSION_KEYS
+from levain.dispatch.verifier_report import VERIFIER_KEYS as report_keys
+from levain.dispatch.verifier_report import VerifierRun, contract_entry, run_problem
 from tests.test_dispatch_contract import POLICY
 from tests import test_dispatch_control as tc
-from tests.test_dispatch_control import BB, IP, VERIFIERS, accept, base_config, tmpl
+from tests.test_dispatch_control import (
+    BB, BB_ENTRY, IP, IP_ENTRY, VERIFIERS, accept, base_config, tmpl, vbody, ventry,
+)
+
+# the same verifier id running other commands: a new artifact, so a new digest
+OTHER_BB = ventry("pytest-bb", "black-box", argv=("python3", "-m", "pytest", "-x"))
 
 # the control tests' fixtures: real keys, a real authority log, a pinned store
 keys, log, cdir, store = tc.keys, tc.log, tc.cdir, tc.store
@@ -29,7 +41,7 @@ def refused(store, log, keys, kind, gen, body, match):
 # --- templates -----------------------------------------------------------------------------------------------------
 
 def test_the_content_hash_is_computed_never_taken(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     t = tmpl()
     t["content_hash"] = "sha256:" + "a" * 64
     refused(store, log, keys, "templates", 2, [t], "is not its computed hash")
@@ -110,17 +122,17 @@ def test_the_r0_write_rule(path, verdict):
 
 @pytest.mark.parametrize("path, verdict", [(p, v) for p, v in R0_PATHS if v is not None])
 def test_an_r0_template_writing_a_refused_path_is_refused_whole(store, log, keys, path, verdict):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [tmpl(write_paths=["src/a.py", path])], verdict)
 
 
 def test_an_r1_template_is_not_held_to_the_r0_rule(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     accept(store, log, keys, "templates", 2, [tmpl(tier="R1", k=1, write_paths=["src/a.py", "package.json"])])
 
 
 def test_a_plain_source_path_passes(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     accept(store, log, keys, "templates", 2, [tmpl(write_paths=[p for p, v in R0_PATHS if v is None])])
     assert resolver(store)("fix-lint") is not None
 
@@ -133,7 +145,7 @@ def test_the_rule_lists_are_casefolded_and_scripts_are_not_source():
 
 
 def test_r2_is_never_a_template(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [tmpl(tier="R2")], "R2 is never a template")
 
 
@@ -145,12 +157,12 @@ def test_r2_is_never_a_template(store, log, keys):
     ({"tool_versions": [["levain", "1.0.0"], ["codex", "0.50.0"]]}, "sorted"),
 ])
 def test_template_problems_refuse_the_item(store, log, keys, over, match):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [tmpl(**over)], match)
 
 
 def test_extra_keys_and_twice_listed_templates_refuse(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [{**tmpl(), "note": "x"}], "a template is exactly")
     refused(store, log, keys, "templates", 2, [tmpl(), tmpl()], "listed twice")
     refused(store, log, keys, "templates", 2, {"fix-lint": tmpl()}, "a list")
@@ -159,29 +171,29 @@ def test_extra_keys_and_twice_listed_templates_refuse(store, log, keys):
 # --- the verifier cross-check --------------------------------------------------------------------------------------
 
 def test_an_unknown_verifier_is_refused(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [tmpl(verifier_id="pytest-none")], "not registered")
 
 
 def test_templates_before_their_verifiers_are_refused(store, log, keys):
     refused(store, log, keys, "templates", 1, [tmpl()], "not registered")
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     accept(store, log, keys, "templates", 2, [tmpl()])
 
 
 @pytest.mark.parametrize("over, match", [
     ({"verifier_hash": IP}, "verifier_hash is not"),
-    ({"verifier_kind": "in-process"}, "registered black-box"),
+    ({"verifier_kind": "in-process"}, "declared black-box"),
 ])
 def test_a_template_disagreeing_with_its_verifier_is_refused(store, log, keys, over, match):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     refused(store, log, keys, "templates", 2, [tmpl(**over)], match)
 
 
 def test_a_replaced_verifier_stops_its_stale_templates_resolving(store, log, keys):
     base_config(store, log, keys)
-    new = "sha256:" + "e" * 64
-    accept(store, log, keys, "verifiers", 4, {**VERIFIERS, "pytest-bb": {"artifact_hash": new, "kind": "black-box"}})
+    new = OTHER_BB["verifier_artifact_digest"]
+    accept(store, log, keys, "verifier", 4, vbody(OTHER_BB, IP_ENTRY))
     with pytest.raises(DispatchError, match="verifier_hash is not"):
         resolver(store)("fix-lint")
     accept(store, log, keys, "templates", 5, [tmpl(verifier_hash=new)])
@@ -189,14 +201,30 @@ def test_a_replaced_verifier_stops_its_stale_templates_resolving(store, log, key
 
 
 @pytest.mark.parametrize("body, match", [
-    ([], "a mapping"),
-    ({"pytest-bb": {"artifact_hash": BB}}, "exactly"),
-    ({"pytest-bb": {"artifact_hash": "sha256:xyz", "kind": "black-box"}}, "sha256"),
-    ({"pytest-bb": {"artifact_hash": BB, "kind": "grey-box"}}, "kind"),
-    ({"-bad": {"artifact_hash": BB, "kind": "black-box"}}, "verifier id"),
+    ([], "exactly"),
+    ({"pytest-bb": {"artifact_hash": BB, "kind": "black-box"}}, "exactly"),          # Levain 0.11's body shape
+    ({"format": "levain-verifier-config/2", "verifiers": []}, "format"),
+    ({"format": VERIFIER_FORMAT, "verifiers": {}}, "a list"),
+    (vbody({k: v for k, v in BB_ENTRY.items() if k != "steps"}), "exactly"),
+    (vbody(BB_ENTRY, BB_ENTRY), "listed twice"),
+    (vbody(dict(BB_ENTRY, steps_digest="sha256:xyz")), "sha256"),
+    (vbody(ventry("pytest-bb", "grey-box")), "declared_kind"),
+    (vbody(ventry("Pytest-BB", "black-box")), "verifier id"),
+    (vbody(ventry("p" * 49, "black-box")), "verifier id"),
+    (vbody(ventry("pytest-bb", "black-box", driver_template="Output-Compare")), "driver_template"),
+    (vbody(ventry("pytest-bb", "black-box", driver_template="no_such_driver")), "not a template this levain ships"),
+    (vbody(ventry("pytest-bb", "black-box", driver_template_digest="sha256:" + "0" * 64)),
+     "not the digest of the output_compare template"),
+    (vbody(dict(BB_ENTRY, steps_digest="sha256:" + "0" * 64)), "steps_digest is not"),
+    (vbody(dict(BB_ENTRY, driver_input_digest="sha256:" + "0" * 64)), "driver_input_digest is not"),
+    (vbody(dict(BB_ENTRY, verifier_artifact_digest="sha256:" + "0" * 64)), "not the digest of what runs"),
+    (vbody(ventry("pytest-bb", "black-box", steps=[])), "runtime helper refuses"),
+    (vbody(ventry("pytest-bb", "black-box", steps=[{"argv": ["x"], "wall_s": 901}])), "runtime helper refuses"),
+    (vbody(ventry("pytest-bb", "black-box", steps=[{"argv": ["a\x00b"], "wall_s": 1}])), "runtime helper refuses"),
+    (vbody(ventry("pytest-bb", "black-box", driver_input=[1])), "driver_input is an object"),
 ])
 def test_verifier_body_refusals(store, log, keys, body, match):
-    refused(store, log, keys, "verifiers", 1, body, match)
+    refused(store, log, keys, "verifier", 1, body, match)
 
 
 # --- provider policy and route map ---------------------------------------------------------------------------------
@@ -258,7 +286,7 @@ def test_the_raw_adoption_rules_are_never_read_out(store, log, keys):
     base_config(store, log, keys)
     accept(store, log, keys, "adoption_rules", 4, [rule()])
     assert "adoption_rules" not in store.active()
-    assert set(store.active()) == {"verifiers", "templates", "provider_policy"}
+    assert set(store.active()) == {"verifier", "templates", "provider_policy"}
 
 
 def test_a_rule_whose_template_was_replaced_stops_reading(store, log, keys):
@@ -283,15 +311,14 @@ def test_a_rule_whose_verifier_was_replaced_stops_reading(store, log, keys):
     # the L2 scenario: same template content, but its verifier is no longer the registered one
     base_config(store, log, keys)
     accept(store, log, keys, "adoption_rules", 4, [rule()])
-    accept(store, log, keys, "verifiers", 5, {**VERIFIERS, "pytest-bb": {"artifact_hash": "sha256:" + "e" * 64,
-                                                                         "kind": "black-box"}})
+    accept(store, log, keys, "verifier", 5, vbody(OTHER_BB, IP_ENTRY))
     with pytest.raises(DispatchError, match="verifier_hash is not"):
         active_adoption_rules(store)
 
 
 def test_a_rule_is_refused_at_accept_when_its_verifier_disagrees(store, log, keys):
     base_config(store, log, keys)
-    accept(store, log, keys, "verifiers", 4, {**VERIFIERS, "pytest-bb": {"artifact_hash": IP, "kind": "black-box"}})
+    accept(store, log, keys, "verifier", 4, vbody(OTHER_BB, IP_ENTRY))
     refused(store, log, keys, "adoption_rules", 5, [rule()], "verifier_hash is not")
 
 
@@ -300,7 +327,7 @@ def test_a_rule_is_refused_at_accept_when_its_verifier_disagrees(store, log, key
 def test_a_template_the_code_now_refuses_fails_only_its_own_id(store, log, keys, monkeypatch):
     # a stored template that the current rules refuse (here: the deny list gains a file it writes) raises when THAT
     # id is resolved, naming it; the other templates still resolve
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     accept(store, log, keys, "templates", 2, [tmpl(), tmpl(id="fix-docs", write_paths=["src/a.py", "docs/x.md"])])
     monkeypatch.setattr(registry, "EXECUTION_BEARING_FILES", registry.EXECUTION_BEARING_FILES + ("x.md",))
     resolve = resolver(store)
@@ -310,7 +337,7 @@ def test_a_template_the_code_now_refuses_fails_only_its_own_id(store, log, keys,
 
 
 def test_an_adoption_rule_for_an_in_process_verifier_is_refused(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     t = tmpl(verifier_id="pytest-ip", verifier_hash=IP, verifier_kind="in-process")
     accept(store, log, keys, "templates", 2, [t])
     refused(store, log, keys, "adoption_rules", 3, [rule(template_hash=t["content_hash"])], "verifier is in-process")
@@ -350,7 +377,7 @@ def test_adoption_rule_refusals(store, log, keys, over, match):
 
 
 def test_an_adoption_rule_for_an_r1_template_is_refused(store, log, keys):
-    accept(store, log, keys, "verifiers", 1, VERIFIERS)
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
     t = tmpl(tier="R1", k=1)
     accept(store, log, keys, "templates", 2, [t])
     refused(store, log, keys, "adoption_rules", 3, [rule(template_hash=t["content_hash"])], "only an R0 template")
@@ -439,3 +466,167 @@ def test_doctor_has_no_adoption_row_without_a_control_store(tmp_path, monkeypatc
 
     monkeypatch.setattr(install, "_consent_queue_dir", lambda: tmp_path)
     assert doctor._check_dispatch_adoption_rules() == []
+
+
+# --- the verifier item (CONTRACT §3.5 VERIFIER IDENTITY) -----------------------------------------------------------
+
+def test_an_entry_pins_what_runs_and_every_digest_is_checked():
+    # the artifact digest is over exactly the five fields that decide what runs
+    five = {k: BB_ENTRY[k] for k in ("driver_template", "driver_template_digest", "steps_digest",
+                                     "driver_input_digest", "declared_kind")}
+    assert BB == "sha256:" + hashlib.sha256(canonical_bytes(five)).hexdigest()
+    shipped = registry.driver_template_path("output_compare")
+    assert shipped is not None and shipped.parent.name == "verifier_drivers"
+    assert registry.driver_template_digest("output_compare") == \
+        "sha256:" + hashlib.sha256(shipped.read_bytes()).hexdigest()
+    for name in ("__init__", "_x", "../dispatch/registry", "Output_Compare", "no_such_driver"):
+        assert registry.driver_template_path(name) is None, name
+    assert registry.body_refusal("verifier", VERIFIERS, {}) is None
+
+
+def test_a_symlinked_template_is_not_a_shipped_one(tmp_path, monkeypatch):
+    from levain import verifier_drivers
+
+    (tmp_path / "__init__.py").write_text("")
+    (tmp_path / "real.py").write_text("x = 1\n")
+    (tmp_path / "linked.py").symlink_to(tmp_path / "real.py")
+    monkeypatch.setattr(verifier_drivers, "__file__", str(tmp_path / "__init__.py"))
+    assert registry.driver_template_path("real") == tmp_path / "real.py"
+    assert registry.driver_template_path("linked") is None
+
+
+def test_a_steps_list_over_its_byte_cap_is_refused(store, log, keys):
+    steps = [{"argv": ["x" * 4000] * 8, "wall_s": 1}] * 2
+    refused(store, log, keys, "verifier", 1, vbody(ventry("big", "black-box", steps=steps,
+                                                           steps_digest="sha256:" + "0" * 64)),
+            "over 32768 bytes")
+
+
+def test_a_template_verifier_id_takes_the_contract_rule(store, log, keys):
+    accept(store, log, keys, "verifier", 1, VERIFIERS)
+    refused(store, log, keys, "templates", 2, [tmpl(verifier_id="pytest.bb")], r"must match \[a-z0-9-\]\{1,48\}")
+
+
+def test_an_in_process_verifier_is_accepted_and_never_adopts_by_rule(store, log, keys):
+    accept(store, log, keys, "verifier", 1, vbody(IP_ENTRY))
+    accept(store, log, keys, "templates", 2, [tmpl(verifier_id="pytest-ip", verifier_hash=IP,
+                                                   verifier_kind="in-process")])
+    accept(store, log, keys, "provider_policy", 3, POLICY.to_mapping())
+    assert resolver(store)("fix-lint").verifier_kind == "in-process"
+    refused(store, log, keys, "adoption_rules", 4, [rule(verifier_kind="in-process")], "only a black-box")
+
+
+def test_the_ticket_is_derived_from_the_active_entry(store, log, keys):
+    base_config(store, log, keys)
+    t = verifier_ticket(store.active(), verifier_id="pytest-bb")
+    assert t == {"verifier_generation": 1, "verifier_id": "pytest-bb", "verifier_steps": BB_ENTRY["steps"],
+                 "driver_input_digest": BB_ENTRY["driver_input_digest"], "entry": BB_ENTRY}
+    # a copy: changing what was handed out changes nothing stored
+    t["verifier_steps"].append({"argv": ["rm", "-rf", "/"], "wall_s": 1})
+    t["entry"]["steps"].clear()
+    assert verifier_ticket(store.active(), verifier_id="pytest-bb")["verifier_steps"] == BB_ENTRY["steps"]
+    # a newer verifier item is the one a ticket reads: its generation, its steps
+    accept(store, log, keys, "verifier", 4, vbody(OTHER_BB, IP_ENTRY))
+    t = verifier_ticket(store.active(), verifier_id="pytest-bb")
+    assert t["verifier_generation"] == 4 and t["verifier_steps"] == OTHER_BB["steps"]
+    with pytest.raises(DispatchError, match="not in the active verifier item"):
+        verifier_ticket(store.active(), verifier_id="pytest-none")
+    with pytest.raises(DispatchError, match="no verifier item is active"):
+        verifier_ticket({}, verifier_id="pytest-bb")
+
+
+def test_no_job_input_reaches_the_ticket_steps():
+    # the ticket takes the active items and an id, nothing else; a planner's submission and a template have no
+    # member that could carry steps
+    params = inspect.signature(verifier_ticket).parameters
+    assert list(params) == ["items", "verifier_id"] and params["verifier_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "verifier_steps" not in SUBMISSION_KEYS and "verifier_steps" not in registry.TEMPLATE_KEYS
+    with pytest.raises(DispatchError, match="exactly"):
+        registry.template_from_mapping({**tmpl(), "verifier_steps": [{"argv": ["sh"], "wall_s": 1}]})
+
+
+def test_the_ticket_entry_projects_to_the_minted_run(store, log, keys):
+    base_config(store, log, keys)
+    t = verifier_ticket(store.active(), verifier_id="pytest-bb")
+    entry = contract_entry(t["entry"])
+    assert set(entry) == report_keys and set(registry.VERIFIER_KEYS) == report_keys | {"steps", "driver_input"}
+    run = VerifierRun(job_id="dj-" + "0" * 32, run=0, session="v-0", ticket="t-0", verifier=entry,
+                      steps=t["verifier_steps"], driver_input_digest=t["driver_input_digest"],
+                      input_bundle_digest="sha256:" + "e" * 64)
+    assert run_problem(run) is None
+
+
+def plant_0_11_verifiers(store, log, keys, monkeypatch, gen):
+    """A Levain 0.11 ``verifiers`` item and a templates item naming it, accepted under 0.11's judge: this code refuses
+    both, so the body judge is set aside for the two accepts (the signature, chain and generation still apply)."""
+    old_bb = "sha256:" + "b" * 64
+    with monkeypatch.context() as m:
+        m.setattr(registry, "body_refusal", lambda kind, body, active: None)
+        accept(store, log, keys, "verifiers", gen, {"pytest-bb": {"artifact_hash": old_bb, "kind": "black-box"}})
+        accept(store, log, keys, "templates", gen + 1, [tmpl(verifier_hash=old_bb)])
+
+
+def test_a_0_11_verifiers_item_is_kept_unread_with_the_way_out(store, log, keys, monkeypatch):
+    plant_0_11_verifiers(store, log, keys, monkeypatch, 1)
+    # the store stays readable: the legacy item chains and verifies
+    assert set(store.active()) == {"verifiers", "templates"} and store.generation() == 2
+    line = registry.legacy_verifiers_problem(store.active())
+    assert "generation 1" in line and "no longer read" in line and registry.RESIGN_VERIFIERS in line
+    with pytest.raises(DispatchError, match="pytest-bb, which is not registered"):
+        resolver(store)("fix-lint")
+    with pytest.raises(DispatchError, match=r"no verifier item is active; the verifiers item at generation 1"):
+        verifier_ticket(store.active(), verifier_id="pytest-bb")
+    # a new one is refused, naming the way out
+    refused(store, log, keys, "verifiers", 3, {"x": {"artifact_hash": BB, "kind": "black-box"}},
+            "no longer accepted; sign a new verifier item")
+    # the way out works: a verifier item, then a templates item pinning its artifact
+    accept(store, log, keys, "verifier", 3, VERIFIERS)
+    accept(store, log, keys, "templates", 4, [tmpl()])
+    assert resolver(store)("fix-lint").verifier_hash == BB
+    assert verifier_ticket(store.active(), verifier_id="pytest-bb")["verifier_generation"] == 3
+
+
+def doctor_rows(store, monkeypatch):
+    from levain import doctor
+    from levain import install
+    from levain.dispatch import cli as dcli
+
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: store.directory)
+    monkeypatch.setattr(dcli, "_authority_source", lambda directory, data_root: store._authority)
+    return doctor._check_dispatch_verifiers()
+
+
+def test_doctor_checks_each_entry_against_the_installed_template(store, log, keys, monkeypatch):
+    accept(store, log, keys, "provider_policy", 1, POLICY.to_mapping())
+    (row,) = doctor_rows(store, monkeypatch)
+    assert (row.ok, row.warn, row.detail) == (True, False, "no verifier item is accepted")
+    accept(store, log, keys, "verifier", 2, VERIFIERS)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert row.ok and not row.warn and row.name == "dispatch verifiers"
+    assert "generation 2: 2 verifier(s), every driver template matches" in row.detail
+    assert "in-process, forgeable by the code under test: pytest-ip" in row.detail
+    # an upgrade that changed the template: red before any run, with the way out
+    monkeypatch.setattr(registry, "driver_template_digest", lambda name: "sha256:" + "f" * 64)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert not row.ok and "pytest-bb (driver output_compare: the installed template differs)" in row.detail
+    assert registry.RESIGN_VERIFIERS in row.hint
+    monkeypatch.setattr(registry, "driver_template_digest", lambda name: None)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert not row.ok and "not shipped by this levain" in row.detail
+
+
+def test_doctor_warns_on_a_0_11_verifiers_item(store, log, keys, monkeypatch):
+    plant_0_11_verifiers(store, log, keys, monkeypatch, 1)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert row.ok and row.warn and "no longer read" in row.detail and "no verifier runs" in row.detail
+    accept(store, log, keys, "verifier", 3, VERIFIERS)
+    (row,) = doctor_rows(store, monkeypatch)
+    assert row.ok and not row.warn and "the 0.11 verifiers item is no longer read" in row.detail
+
+
+def test_doctor_has_no_verifier_row_without_a_control_store(tmp_path, monkeypatch):
+    from levain import doctor
+    from levain import install
+
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: tmp_path)
+    assert doctor._check_dispatch_verifiers() == []

@@ -22,12 +22,26 @@ instructions in Markdown). An ordinary module, ``__init__.py`` included, is what
 eligible. Matching casefolds both sides (the target disk is case-insensitive) and looks at every depth
 (``pkg/tests/x.py`` is a test).
 
-The VERIFIERS kind maps a verifier id to its artifact hash and kind; a template naming an unknown verifier, or one
-whose ``verifier_hash`` or ``verifier_kind`` disagrees with the registered verifier, is refused when it is accepted.
-That check reads the ACTIVE verifiers, so acceptance order matters: the verifiers item goes first. A later verifiers
-item may change a verifier a template names (replacing a verifier and its templates takes two items, verifiers
-first, so refusing it would leave no order that works); the resolver then refuses that template until a templates
-item agreeing with it is accepted, so a stale pairing never resolves.
+The VERIFIER kind is the S1 contract's (§3.5 VERIFIER IDENTITY): one signed item serves dispatch and CONTROL, so its
+envelope kind is ``verifier`` and its body ``levain-verifier-config/1``, ``{"format", "verifiers": [entry, ...]}``.
+An entry is exactly :data:`VERIFIER_KEYS`: the contract's seven fields plus the ``steps`` and ``driver_input`` their
+digests are over (dispatch needs the bytes, to mint ``verifier_steps`` and to stage ``driver_input.json``; CONTROL
+reads only the digests). Every digest is CHECKED at accept: ``steps_digest`` and ``driver_input_digest`` over the
+canonical bytes they name, ``driver_template_digest`` over the bytes of the template this levain ships
+(:func:`driver_template_digest`), and ``verifier_artifact_digest`` over what runs (:func:`verifier_artifact_digest`).
+A template's ``verifier_hash`` must equal its verifier's ``verifier_artifact_digest`` and its ``verifier_kind`` the
+``declared_kind``; a template naming an unknown verifier, or disagreeing, is refused when it is accepted. That check
+reads the ACTIVE verifier item, so acceptance order matters: the verifier item goes first. A later verifier item may
+change a verifier a template names (replacing a verifier and its templates takes two items, verifier first, so
+refusing it would leave no order that works); the resolver then refuses that template until a templates item
+agreeing with it is accepted, so a stale pairing never resolves. An in-process entry is accepted and shown as
+forgeable by the code under test; only a black-box one may adopt by rule. A ticket's verifier fields are DERIVED from
+the active entry (:func:`verifier_ticket`), never taken from a planner or a job.
+
+Levain 0.11 signed a ``verifiers`` kind (a mapping of id to artifact hash and kind). A stored item of that kind still
+chains and verifies, so the store stays readable, but it is no longer READ: nothing resolves against it, a new one is
+refused, and ``levain dispatch config show`` and ``levain doctor`` say so with the way out
+(:func:`legacy_verifiers_problem`). A signed item is never rewritten in place.
 
 An ADOPTION RULE names the repository it lands in (an absolute path in contract.py's normal form), an R0 template
 whose verifier is black-box, the template's content hash (an edited template is a new hash, so a rule never carries
@@ -51,26 +65,38 @@ import posixpath
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
-from levain.contracts.canon import canonical_bytes
+from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
 from levain.dispatch.contract import ResolvedTemplate
 from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text_problem
+from levain.dispatch.verifier_report import _steps_problem
 
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
     "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS", "ROUTE_KEYS", "TEMPLATE_FORMAT", "TEMPLATE_KEYS",
-    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at", "active_policy",
-    "body_refusal", "execution_bearing", "legacy_rule_problem", "parse_criteria", "r0_write_refusal", "resolver",
-    "template_content_hash", "template_from_mapping",
+    "LEGACY_KINDS", "MAX_DRIVER_INPUT_BYTES", "MAX_STEPS_BYTES", "RESIGN_RULES", "RESIGN_VERIFIERS",
+    "VERIFIER_FORMAT", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at",
+    "active_policy", "active_verifier_entries", "body_refusal", "driver_template_digest", "driver_template_path",
+    "execution_bearing", "legacy_rule_problem", "legacy_verifiers_problem", "parse_criteria", "r0_write_refusal",
+    "resolver", "template_content_hash", "template_from_mapping", "verifier_artifact_digest", "verifier_ticket",
 ]
 
-KINDS = ("adoption_rules", "provider_policy", "routemap", "templates", "verifiers")
+KINDS = ("adoption_rules", "provider_policy", "routemap", "templates", "verifier")
+# kinds a stored item may carry that are no longer accepted or read (module docstring)
+LEGACY_KINDS = ("verifiers",)
 TEMPLATE_FORMAT = "levain-dispatch-template/1"
 TEMPLATE_KEYS = frozenset({"id", "content_hash", "tier", "executor", "models", "k", "verifier_id", "verifier_hash",
                            "verifier_kind", "write_paths", "provider", "route", "tool_versions"})
-VERIFIER_KEYS = frozenset({"artifact_hash", "kind"})
+VERIFIER_FORMAT = "levain-verifier-config/1"
+VERIFIER_KEYS = frozenset({"verifier_id", "verifier_artifact_digest", "declared_kind", "driver_template",
+                           "driver_template_digest", "steps", "steps_digest", "driver_input", "driver_input_digest"})
+# the canonical bytes of an entry's steps; the step count and each step's bounds are S1's runtime grammar's
+MAX_STEPS_BYTES = 32 * 1024
+# mirrors the contract's V25 (the driver_input cap), written here because S1 has no such constant
+MAX_DRIVER_INPUT_BYTES = 256 * 1024
 ADOPTION_RULE_KEYS = frozenset({"repo", "template_id", "template_hash", "verifier_kind", "criteria"})
 # F11 §5: the closed vocabulary of a rule's criteria; each criterion is an object with exactly one of these keys
 CRITERION_KEYS = ("onto", "max_changed_lines", "max_bytes", "max_files", "paths", "no_new_files", "max_age_hours")
@@ -84,8 +110,9 @@ ROUTE_KEYS = frozenset({"route", "provider", "upstream", "credential", "models",
 _ENTRIES_MAX = 256
 _TEXT_MAX = 1024
 _SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-# a verifier id, in the shape a template's verifier_id must have (the contract module's name rule)
-_VERIFIER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:/+-]{0,127}")
+# a verifier id and a driver template name, as the S1 contract writes them; a template's verifier_id has the same shape
+_VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}")
+_DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}")
 _VERIFIER_KINDS = ("black-box", "in-process")
 
 # The extensions an R0 write path may have, casefolded: source a verifier tests, and the docs and styles beside it.
@@ -205,6 +232,9 @@ def template_from_mapping(t: Any) -> ResolvedTemplate:
     problem = template.problem()
     if problem is not None:
         raise DispatchError(f"template {str(t['id'])[:64]!r}: {problem}")
+    if _VERIFIER_ID.fullmatch(template.verifier_id) is None:
+        raise DispatchError(f"template {template.template_id}: verifier_id {template.verifier_id[:64]!r} must match "
+                            f"{_VERIFIER_ID.pattern}")
     computed = template_content_hash(t)
     if t["content_hash"] != computed:
         raise DispatchError(f"template {template.template_id}: content_hash {t['content_hash']} is not its computed "
@@ -221,12 +251,12 @@ def _verifier_mismatch(template: ResolvedTemplate, verifiers: Mapping[str, Any])
     v = verifiers.get(template.verifier_id)
     if v is None:
         return f"template {template.template_id} names verifier {template.verifier_id}, which is not registered"
-    if v["artifact_hash"] != template.verifier_hash:
+    if v["verifier_artifact_digest"] != template.verifier_hash:
         return (f"template {template.template_id}'s verifier_hash is not verifier {template.verifier_id}'s "
-                "registered artifact hash")
-    if v["kind"] != template.verifier_kind:
+                "verifier_artifact_digest")
+    if v["declared_kind"] != template.verifier_kind:
         return (f"template {template.template_id} calls verifier {template.verifier_id} {template.verifier_kind}; "
-                f"it is registered {v['kind']}")
+                f"it is declared {v['declared_kind']}")
     return None
 
 
@@ -248,21 +278,114 @@ def _templates(body: Any, verifiers: Mapping[str, Any]) -> str | None:
     return None
 
 
-# --- the other kinds -----------------------------------------------------------------------------------------------
+# --- verifiers -----------------------------------------------------------------------------------------------------
 
-def _verifiers(body: Any) -> str | None:
-    if not isinstance(body, dict) or len(body) > _ENTRIES_MAX:
-        return f"a verifiers body is a mapping of at most {_ENTRIES_MAX} verifiers"
-    for vid, v in body.items():
-        if not isinstance(vid, str) or _VERIFIER_ID.fullmatch(vid) is None:
-            return f"verifier id {str(vid)[:64]!r} must match {_VERIFIER_ID.pattern}"
-        if not isinstance(v, dict) or set(v) != VERIFIER_KEYS:
-            return f"verifier {vid} is exactly {sorted(VERIFIER_KEYS)}"
-        if not isinstance(v["artifact_hash"], str) or _SHA256_DIGEST.fullmatch(v["artifact_hash"]) is None:
-            return f"verifier {vid}'s artifact_hash must be sha256:<64 hex>"
-        if v["kind"] not in _VERIFIER_KINDS:
-            return f"verifier {vid}'s kind {v['kind']!r} is not one of {_VERIFIER_KINDS}"
+def _sha256(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def driver_template_path(name: str) -> Path | None:
+    """The driver template ``name`` this levain package ships (``levain/verifier_drivers/<name>.py``), or ``None``
+    when ``name`` is not a template name or no such regular file ships (a symlink is not one)."""
+    if not isinstance(name, str) or _DRIVER_TEMPLATE.fullmatch(name) is None:
+        return None
+    from levain import verifier_drivers
+
+    path = Path(verifier_drivers.__file__).parent / f"{name}.py"
+    if name.startswith("_") or path.is_symlink() or not path.is_file():
+        return None
+    return path
+
+
+def driver_template_digest(name: str) -> str | None:
+    """The SHA-256 of the shipped template ``name``'s bytes (what an entry's ``driver_template_digest`` pins), or
+    ``None`` when no such template ships."""
+    path = driver_template_path(name)
+    return None if path is None else _sha256(path.read_bytes())
+
+
+def verifier_artifact_digest(entry: Mapping[str, Any]) -> str:
+    """The verifier ARTIFACT's digest: exactly what runs, the canonical ``{driver_template, driver_template_digest,
+    steps_digest, driver_input_digest, declared_kind}``, so a template's ``verifier_hash`` pins all of it."""
+    return _sha256(canonical_bytes({k: entry[k] for k in ("driver_template", "driver_template_digest", "steps_digest",
+                                                          "driver_input_digest", "declared_kind")}))
+
+
+def _verifier_entry_problem(e: Any) -> str | None:
+    if not isinstance(e, dict) or set(e) != VERIFIER_KEYS:
+        return f"a verifier entry is exactly {sorted(VERIFIER_KEYS)}"
+    vid = e["verifier_id"]
+    if not isinstance(vid, str) or _VERIFIER_ID.fullmatch(vid) is None:
+        return f"verifier id {str(vid)[:64]!r} must match {_VERIFIER_ID.pattern}"
+    for name in ("verifier_artifact_digest", "driver_template_digest", "steps_digest", "driver_input_digest"):
+        if not isinstance(e[name], str) or _SHA256_DIGEST.fullmatch(e[name]) is None:
+            return f"verifier {vid}'s {name} must be sha256:<64 hex>"
+    if e["declared_kind"] not in _VERIFIER_KINDS:
+        return f"verifier {vid}'s declared_kind {str(e['declared_kind'])[:64]!r} is not one of {_VERIFIER_KINDS}"
+    tname = e["driver_template"]
+    if not isinstance(tname, str) or _DRIVER_TEMPLATE.fullmatch(tname) is None:
+        return f"verifier {vid}'s driver_template {str(tname)[:64]!r} must match {_DRIVER_TEMPLATE.pattern}"
+    shipped = driver_template_digest(tname)
+    if shipped is None:
+        return f"verifier {vid}'s driver_template {tname} is not a template this levain ships"
+    if e["driver_template_digest"] != shipped:
+        return (f"verifier {vid}'s driver_template_digest is not the digest of the {tname} template this levain "
+                f"ships ({shipped})")
+    problem = _steps_problem(e["steps"])
+    if problem is not None:
+        return f"verifier {vid}: {problem}"
+    steps = canonical_bytes(e["steps"])
+    if len(steps) > MAX_STEPS_BYTES:
+        return f"verifier {vid}'s steps are over {MAX_STEPS_BYTES} bytes as canonical JSON"
+    if e["steps_digest"] != _sha256(steps):
+        return f"verifier {vid}'s steps_digest is not the digest of its steps"
+    if not isinstance(e["driver_input"], dict):
+        return f"verifier {vid}'s driver_input is an object"
+    driver_input = canonical_bytes(e["driver_input"])
+    if len(driver_input) > MAX_DRIVER_INPUT_BYTES:
+        return f"verifier {vid}'s driver_input is over {MAX_DRIVER_INPUT_BYTES} bytes as canonical JSON"
+    if e["driver_input_digest"] != _sha256(driver_input):
+        return f"verifier {vid}'s driver_input_digest is not the digest of its driver_input"
+    if e["verifier_artifact_digest"] != verifier_artifact_digest(e):
+        return (f"verifier {vid}'s verifier_artifact_digest is not the digest of what runs "
+                f"({verifier_artifact_digest(e)})")
     return None
+
+
+def _verifier(body: Any) -> str | None:
+    if not isinstance(body, dict) or set(body) != {"format", "verifiers"}:
+        return 'a verifier body is exactly {"format", "verifiers"}'
+    if body["format"] != VERIFIER_FORMAT:
+        return f"a verifier body's format is {VERIFIER_FORMAT!r}"
+    entries = body["verifiers"]
+    if not isinstance(entries, list) or len(entries) > _ENTRIES_MAX:
+        return f"verifiers is a list of at most {_ENTRIES_MAX} entries"
+    seen: set[str] = set()
+    for e in entries:
+        problem = _verifier_entry_problem(e)
+        if problem is not None:
+            return problem
+        if e["verifier_id"] in seen:
+            return f"verifier {e['verifier_id']} is listed twice"
+        seen.add(e["verifier_id"])
+    return None
+
+
+RESIGN_VERIFIERS = ("sign a new verifier item (format levain-verifier-config/1, each entry naming a driver template "
+                    "this levain ships): `levain dispatch config sign verifier <body.json>`")
+
+
+def legacy_verifiers_problem(items: Mapping[str, Any]) -> str | None:
+    """The line for a stored Levain 0.11 ``verifiers`` item among ``items`` (kind -> its latest item), or ``None``
+    when there is none. Such an item is not read, never migrated: its ids and hashes say nothing of what runs."""
+    item = items.get("verifiers")
+    if item is None:
+        return None
+    return (f"the verifiers item at generation {item.generation} is Levain 0.11's shape and is no longer read; "
+            f"templates resolve against the active verifier item only; {RESIGN_VERIFIERS}")
+
+
+# --- the other kinds -----------------------------------------------------------------------------------------------
 
 
 def _provider_policy(body: Any) -> str | None:
@@ -471,8 +594,37 @@ def _active_template(active: Mapping[str, Any], template_id: str) -> ResolvedTem
 
 
 def _active_verifiers(active: Mapping[str, Any]) -> Mapping[str, Any]:
-    item = active.get("verifiers")
-    return {} if item is None else item.body
+    item = active.get("verifier")
+    return {} if item is None else {e["verifier_id"]: e for e in item.body["verifiers"]}
+
+
+def active_verifier_entries(active: Mapping[str, Any]) -> tuple[int, tuple[Mapping[str, Any], ...]]:
+    """``(generation, entries)`` of the active ``verifier`` item in ``active`` (kind -> its item, as
+    ``ControlStore.active`` returns it); ``(0, ())`` when none is accepted. A stored 0.11 ``verifiers`` item is not
+    among them."""
+    item = active.get("verifier")
+    if item is None:
+        return 0, ()
+    return item.generation, tuple(item.body["verifiers"])
+
+
+def verifier_ticket(items: Mapping[str, Any], *, verifier_id: str) -> dict[str, Any]:
+    """A verifier ticket's fields for ``verifier_id``, DERIVED from the active ``verifier`` item in ``items`` (kind ->
+    its item): ``{verifier_generation, verifier_id, verifier_steps, driver_input_digest, entry}``, the generation
+    the item's, the steps and the driver input digest copied from its entry, ``entry`` the whole activated entry (a
+    copy). Nothing a planner or a job supplies reaches them. Raises :class:`DispatchError` when no verifier item is
+    active or it has no such id."""
+    item = items.get("verifier")
+    if item is None:
+        legacy = legacy_verifiers_problem(items)
+        raise DispatchError("no verifier item is active" + (f"; {legacy}" if legacy else ""))
+    entry = next((e for e in item.body["verifiers"] if e["verifier_id"] == verifier_id), None)
+    if entry is None:
+        raise DispatchError(f"verifier {str(verifier_id)[:64]!r} is not in the active verifier item (generation "
+                            f"{item.generation})")
+    entry = parse(canonical_bytes(entry))         # a copy: the stored item's body is never handed out
+    return {"verifier_generation": item.generation, "verifier_id": entry["verifier_id"],
+            "verifier_steps": entry["steps"], "driver_input_digest": entry["driver_input_digest"], "entry": entry}
 
 
 def body_refusal(kind: str, body: Any, active: Mapping[str, Any]) -> str | None:
@@ -480,8 +632,10 @@ def body_refusal(kind: str, body: Any, active: Mapping[str, Any]) -> str | None:
     each with a ``body``); ``None`` when it can."""
     if kind == "templates":
         return _templates(body, _active_verifiers(active))
-    if kind == "verifiers":
-        return _verifiers(body)
+    if kind == "verifier":
+        return _verifier(body)
+    if kind in LEGACY_KINDS:
+        return f"kind {kind!r} is Levain 0.11's verifier shape and is no longer accepted; {RESIGN_VERIFIERS}"
     if kind == "provider_policy":
         return _provider_policy(body)
     if kind == "routemap":

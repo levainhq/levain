@@ -727,9 +727,14 @@ def _kind_summary(kind: str, item: dctl.ConfigItem, items: dict[str, dctl.Config
     if kind == "templates":
         ids = [str(t.get("id")) for t in body if isinstance(t, dict)]
         return {"generation": gen, "ids": ids}, ", ".join(ids) or "(no templates)"
-    if kind == "verifiers":
-        kinds = {str(v): str(spec.get("kind")) for v, spec in body.items()}
-        return {"generation": gen, "verifiers": kinds}, ", ".join(f"{v} ({k})" for v, k in kinds.items())
+    if kind == "verifier":
+        entries = [e for e in body.get("verifiers", []) if isinstance(e, dict)]
+        data = {str(e.get("verifier_id")): {"declared_kind": str(e.get("declared_kind")),
+                                             "driver_template": str(e.get("driver_template"))} for e in entries}
+        text = [f"{vid} ({v['declared_kind']}, driver {v['driver_template']}"
+                + ("; forgeable by the code under test)" if v["declared_kind"] == "in-process" else ")")
+                for vid, v in data.items()]
+        return {"generation": gen, "verifiers": data}, ", ".join(text) or "(no verifiers)"
     if kind == "provider_policy":
         providers = sorted(body.get("providers", {}))
         return ({"generation": gen, "providers": providers, "never": len(body.get("never", []))},
@@ -759,13 +764,18 @@ def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], N
         store = _control(args, d)
         items, top, head = _verified(store)
         kinds = {k: _kind_summary(k, items[k], items) for k in dctl.KINDS if k in items}
-        emit({"configured": True, "store": str(path), "store_id": store.store_id(), "trust_root": store.trust_root(),
-              "generation": top, "head": head, "kinds": {k: v[0] for k, v in kinds.items()}},
+        legacy = dregistry.legacy_verifiers_problem(items)
+        data = {"configured": True, "store": str(path), "store_id": store.store_id(), "trust_root": store.trust_root(),
+                "generation": top, "head": head, "kinds": {k: v[0] for k, v in kinds.items()}}
+        if legacy is not None:
+            data["no_longer_read"] = {"verifiers": {"generation": items["verifiers"].generation, "why": legacy}}
+        emit(data,
              "\n".join(_ascii(line) for line in [
                  f"levain dispatch config: store {store.store_id()}, generation {top}, head {head or '(none)'}",
                  f"  trust root       {store.trust_root()}",
                  *[f"  {k:<16} " + (f"(generation {kinds[k][0]['generation']})  {kinds[k][1]}" if k in kinds
-                                    else "(none accepted)") for k in dctl.KINDS]]))
+                                    else "(none accepted)") for k in dctl.KINDS],
+                 *([f"  {'verifiers':<16} NO LONGER READ: {legacy}"] if legacy is not None else [])]))
         return EXIT_OK
     _refuse_an_agent(f"config {cmd}")
     try:
@@ -794,7 +804,7 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
         emit({"store": str(store.path), "store_id": sid, "trust_root": store.trust_root()},
              f"levain dispatch config: the control store {store.path} (store id {sid}) is pinned to "
              f"{store.trust_root()}. Sign its first item with `levain dispatch config sign <kind> <body.json> "
-             "--signing-key <that key>` (verifiers before templates).")
+             "--signing-key <that key>` (the verifier item before templates).")
         return EXIT_OK
     view_out = sys.stderr if args.json else out
     if cmd == "sign":

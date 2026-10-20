@@ -43,7 +43,7 @@ from levain.slot.runtime_grammar import _verifier_steps
 __all__ = [
     "ENVELOPE_FORMAT_NAME", "EXIT_KEYS", "MAX_ENVELOPE_BYTES", "MAX_REPORT_BYTES", "MAX_STEPS", "NOTE_MAX",
     "REFUSALS", "REPORT_FORMAT", "VERIFIER_KEYS", "ReportRefused", "StepVerdict", "VerifierReport", "VerifierRun",
-    "body_problem", "check_envelope", "run_problem",
+    "body_problem", "check_envelope", "contract_entry", "run_problem",
 ]
 
 REPORT_FORMAT = "levain-dispatch-verifier-report/1"
@@ -154,6 +154,13 @@ def _steps_problem(steps: Any) -> str | None:
         # text): its own stdin parse refuses it before the validator runs, so the validator does not name it
         return "a ticket step holds a value the runtime helper's stdin parse refuses"
     return None
+
+
+def contract_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The contract's seven-field verifier object (:data:`VERIFIER_KEYS`) projected from an activated registry
+    entry, which also holds the ``steps`` and ``driver_input`` the digests are over: what ``VerifierRun.verifier``
+    and the envelope's ``verifier`` carry. Raises :class:`KeyError` when a field is missing."""
+    return {k: entry[k] for k in sorted(VERIFIER_KEYS)}
 
 
 def run_problem(run: VerifierRun) -> str | None:
