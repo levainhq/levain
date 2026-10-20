@@ -107,10 +107,10 @@ def test_a_past_frame_has_no_streams_no_tickers_and_no_breathing_while_the_live_
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     past = _streaming()
     past["replay"] = True
-    out = _run(tmp_path, src, [*PRIME, {"eval": SPYI}, {"eval": _paint(_streaming(), "agents")}, {"eval": STILL},
-                               {"eval": "(window.__iv = 0, 1)"}, {"eval": _paint(past, "agents")}, {"eval": STILL},
-                               {"eval": _paint(_value(), "work")}, {"eval": STILL}, {"eval": _paint({**_value(), "replay": True}, "work")}, {"eval": STILL}])
-    live, still, wlive, wstill = (json.loads(out[i]) for i in (-8, -5, -3, -1))
+    # paint and probe in ONE synchronous eval: a poll that repaints the real card between two steps cannot land in the middle of a read
+    both = lambda value, lens: {"eval": "(() => { window.__iv = 0; %s; return %s; })()" % (_paint(value, lens), STILL)}  # noqa: E731
+    out = _run(tmp_path, src, [*PRIME, {"eval": SPYI}, both(_streaming(), "agents"), both(past, "agents"), both(_value(), "work"), both({**_value(), "replay": True}, "work")])
+    live, still, wlive, wstill = (json.loads(out[i]) for i in (-4, -3, -2, -1))
     assert live["still"] is False and int(live["streams"]) > 0 and int(live["particles"]) > 0 and live["iv"] >= 1 and live["pulse"] not in (None, "none"), live       # the control
     assert still["still"] is True and still["streams"] == "0" and still["particles"] == "0" and still["iv"] == 0 and still["pulse"] == "none", still
     assert wlive["breathe"] not in (None, "none"), wlive
