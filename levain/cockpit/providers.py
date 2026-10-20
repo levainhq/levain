@@ -170,6 +170,47 @@ SPORE_EMPTY = {
 }
 
 
+def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
+    """The Morning card's "Where to begin": read from the install's own Tray and Open loops, never set by anything else. What is late
+    leads (earliest first), then what is due today or a handoff still inside its claim, then the hottest open loop. With nothing in
+    either it says so and names the two real ways to fill it: a thought dropped in the Tray, and ``levain state``."""
+    def clip(text: Any) -> str:
+        t = " ".join(str(text).split())
+        return t if len(t) <= TOP_MAX_BEGIN else t[:TOP_MAX_BEGIN - 1] + "…"
+
+    def read(ctx: ReadContext) -> Result:
+        v = _view(source, ctx)
+        bad = _view_fault(v, "open_spores")
+        if bad:
+            return bad
+        today = ctx.today
+        late, due = [], []
+        for s in v.tray:
+            d = parse_date(s.next)
+            if d and d > today:
+                continue                                    # held until its surface date
+            if d and d < today:
+                late.append((d, s))
+            elif d == today or (not d and s.disposition == "handoff"):
+                due.append(s)
+        late.sort(key=lambda t: t[0])
+        first = [s for _d, s in late] + due
+        loops = sorted(v.open_spores, key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
+        lines: list[dict[str, str]] = []
+        for i, s in enumerate(first[:3]):
+            lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
+        if loops:
+            lines.append({"label": "loop", "text": clip(loops[0].text)})
+        if not lines:
+            return Read(value={"headline": "Nothing set for today yet",
+                               "lines": [{"label": "set", "text": "Drop a thought in the Tray, or say what you are on with `levain state \"...\"`."}]})
+        return Read(value={"headline": "", "lines": lines})
+    return read
+
+
+TOP_MAX_BEGIN = 110
+
+
 def _spore_provider(
     source: SubstrateSource, bucket: str, *, apply_hold: bool = True
 ) -> Callable[[ReadContext], Result]:
@@ -1313,6 +1354,8 @@ def build_default_cockpit(
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
                              region="brief", rank=0, optional=True, empty="No state line.",
                              verbs=("operator_state",)))
+    ck.register(ProviderSpec("begin", "brief", "Where to begin", "gauge", _where_to_begin(source),
+                             region="brief", rank=5, empty="Nothing set for today yet.", edit_class=CLASS_C))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
     # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's

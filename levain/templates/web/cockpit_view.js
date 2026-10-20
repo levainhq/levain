@@ -188,6 +188,30 @@
     return { verb: c.verb, fields: fields };
   }
 
+  // Now's rows in date order with the heading each sits under. Overdue and undated (waiting on you) rows lead as TODAY / OVERDUE,
+  // each later day within a week is "TUE 10-20", anything further is LATER.
+  function nowByDate(rows, nowMs) {
+    const d0 = new Date(nowMs);
+    const day = (y, m, d) => Date.UTC(y, m, d);
+    const today = day(d0.getFullYear(), d0.getMonth(), d0.getDate());
+    const iso = (r) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String((r.facets || {}).due || "")); return m ? day(+m[1], +m[2] - 1, +m[3]) : null; };
+    const keyed = rows.map((r, i) => ({ r: r, i: i, t: iso(r) }));
+    const rank = (k) => (k.t === null ? today : k.t);     // undated: due now
+    keyed.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
+    const label = new Map();
+    const names = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    for (const k of keyed) {
+      const t = rank(k);
+      let text;
+      if (t < today) text = "OVERDUE";
+      else if (t === today) text = "TODAY";
+      else if (t - today <= 7 * 86400000) { const d = new Date(t); text = names[d.getUTCDay()] + " " + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0"); }
+      else text = "LATER";
+      label.set(k.r.id, text);
+    }
+    return { rows: keyed.map((k) => k.r), label: label };
+  }
+
   function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
@@ -210,7 +234,12 @@
       const declared = Array.isArray(head.facets) ? head.facets : Array.isArray(panel.facets) ? panel.facets : [];
       const addressed = !!rfield || declared.indexOf("for") >= 0;
       if (compose) out.compose = compose;
-      out.lines = (panel.rows || []).map((r) => {
+      // Now reads as a dated list, as the mock draws it: what is late and what is due today first, then each day of the next seven by
+      // date ("TUE 10-20"), one line per item. A row with no date is due now (a decision waiting on you).
+      const nowRows = head.id === "now" ? nowByDate(panel.rows || [], nowMs || Date.now()) : null;
+      const srcRows = nowRows ? nowRows.rows : (panel.rows || []);
+      if (nowRows) out.note = "next 7 days";
+      out.lines = srcRows.map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
         const prov = r.provenance ? r.provenance.label : "";
@@ -231,6 +260,7 @@
         }
         if (typeof r.id === "string" && r.id) line.key = r.id;
         if (grouped) line.grp = grp;
+        if (nowRows) { line.grp = nowRows.label.get(r.id) || ""; line.meta = ""; }
         if (head.id === "jobs") {
           // Build's Results: a finished job is a result: ok or failed, what ran, and when (never the raw result body)
           const jf = r.facets || {};
@@ -290,7 +320,7 @@
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
-      out.hays = (panel.rows || []).map((r) => hayOfRow(r, fields));
+      out.hays = srcRows.map((r) => hayOfRow(r, fields));
       out.typed = true;
       out.count = isNum(panel.count) ? panel.count : null;
       if (panel.degraded && panel.degraded.length) {
@@ -1094,7 +1124,24 @@
       // English word at its head is capitalised (an identifier or a path is left as written).
       const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
+      else if (n && Array.isArray(d.lines) && d.lines.length && d.lines[0] && typeof d.lines[0].text === "string" && !s.ctx.alerted) {
+        // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
+        host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
+      }
       else if (d.note) host.appendChild(el("div", "sub", d.note));
+      return;
+    }
+    if (d.kind === "status-dots" && d.pid === "doctor" && (d.metrics || []).some((m) => m.status === "ok" || m.status === "warn" || m.status === "bad")) {
+      // the face is one answer: how many checks are ok, and the worst one named ("hooks · 1 warning"); the rows are the focus view's
+      const ms = d.metrics || [];
+      const graded = ms.filter((m) => m.status === "ok" || m.status === "warn" || m.status === "bad");
+      const okN = graded.filter((m) => m.status === "ok").length;
+      const worst = graded.find((m) => m.status === "bad") || graded.find((m) => m.status === "warn");
+      s.units = 1; s.hidden = ms.length;     // the checks behind the face: the tile opens them in the focus view
+      const head = el("div", "bigrow");
+      head.append(el("div", "big num", okN + "/" + graded.length), el("span", "bl", "ok"));
+      host.appendChild(head);
+      host.appendChild(el("div", "sub", worst ? worst.label + " · " + (worst.value == null ? worst.status : worst.value) : "nothing needs attention"));
       return;
     }
     if (d.kind === "status-dots") {
@@ -1869,15 +1916,25 @@
     }
     return repoMatchers;
   }
+  // The work lists' rows (Tray, Open loops, Keep, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
+  // mock draws it; every other row keeps it at the head of its text. `tagHome` is where that tag lives for a row.
+  const META_TAG_PANELS = ["tray", "loops", "keep", "now"];
+  function tagHome(row, clause) {
+    const panel = row.closest("[data-ck-panel]");
+    const inMeta = !!panel && META_TAG_PANELS.indexOf(panel.dataset.ckPanel) >= 0 && row.classList.contains("row");
+    return { inMeta: inMeta, host: inMeta ? row : clause };
+  }
   function tintRepos() {
     const sky = root.LevainSky;
     const matchers = matchersOf(sky);
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
       if (!clause) continue;
+      const home = tagHome(row, clause);
+      if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo (Build's loops)
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
       // the row means, or move a hue slot
-      const had = clause.querySelector(":scope > .rp-tag");
+      const had = home.host.querySelector(":scope > .rp-tag:not(.k7-repo)");
       // a row with a structured `repo` facet the sky's registry knows is tagged from it alone, in the registry's
       // spelling (so its length and count are the registry's bounds); any other row is read by its words
       const facet = (row.dataset.repoFacet || "").toLowerCase();
@@ -1885,8 +1942,8 @@
       let hit;
       if (known) hit = [known[0]];
       else {
-        let text = row.textContent;
-        if (had) { const c = row.cloneNode(true); c.querySelector(":scope > .clause > .rp-tag").remove(); text = c.textContent; }
+        // the pieces of the row are joined by a space: a badge ("handoff") and the text that follows it are not one word
+        let text = Array.from(row.children).filter((c) => c !== had).map((c) => c.textContent).join(" ");
         hit = matchers.find(([, re]) => re.test(text));
       }
       const key = hit && sky && typeof sky.hueKey === "function" ? sky.hueKey(hit[0]) : "";
@@ -1896,7 +1953,8 @@
       if (key) {
         const tag = el("span", "rp-tag", hit[0]);
         tag.dataset.repo = key;
-        clause.insertBefore(tag, clause.firstChild);
+        if (home.inMeta) row.insertBefore(tag, row.querySelector(":scope > .verb-actions"));   // null: appended
+        else clause.insertBefore(tag, clause.firstChild);
       }
       // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);

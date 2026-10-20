@@ -37,9 +37,10 @@ def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
             return Fault("memory: no health read")
         numbers: list[dict[str, Any]] = []
         today = v.jar.today if v.jar is not None else None      # known on a young store too (status no_history)
-        if today is not None:
-            numbers.append({"label": "today", "value": today, "unit": "episodes"})
+        # one set of numbers, the total leading: "52 episodes · 16 today · 15 open spores" ("today" is a part of the total, not a second count)
         numbers.append({"label": "episodes", "value": h.total_episodes, "unit": None})
+        if today is not None:
+            numbers.append({"label": "today", "value": today, "unit": None})
         out: dict[str, Any] = {"numbers": numbers}
         if "open_spores" in v.errors:
             out["note"] = "open spores unreadable"
@@ -73,7 +74,7 @@ def _checks(install: Path) -> list[tuple[str, list[Any]]]:
 
 def _dot(label: str, results: list[Any]) -> dict[str, Any]:
     if not results:
-        return {"label": label, "value": "nothing here to check", "unit": None, "status": "unknown", "read": None}
+        return {"label": label, "value": None, "unit": None, "status": "unknown", "read": "nothing to check", "detail": "nothing here to check"}
     failed = [r for r in results if not r.ok]
     warned = [r for r in results if r.ok and r.warn]
     if failed:

@@ -26,7 +26,8 @@ def test_hovering_a_row_never_changes_its_height(tmp_path: Path) -> None:
     ])
     before, after = vals[1], vals[2]
     assert before[0] == after[0], vals
-    assert float(before[1]) == 0.0 and float(after[1]) > 0.0, vals
+    # a Tray row's Resolve and Snooze are always on the row (K10 S4, the mock), so there is no fade to move anything
+    assert float(before[1]) == 1.0 and float(after[1]) == 1.0, vals
 
 
 @needs_browser
@@ -41,10 +42,10 @@ def test_at_most_three_verbs_show_and_the_rest_sit_in_the_overflow_menu(tmp_path
         fs: cs.fontSize, h: b.getBoundingClientRect().height, border: cs.borderTopWidth,
         rowfs: getComputedStyle({ROW}.querySelector('.clause')).fontSize, menuHidden: v.querySelector('.verb-menu').hidden}}; }})()"""}])
     got = vals[1]
-    assert got["vis"] == ["edit", "schedule", "dismiss", "···"], got
-    assert got["menu"] == ["reclassify", "metabolize"], got
+    assert got["vis"] == ["Snooze", "Resolve", "···"]      # DOM order; CSS draws Resolve first, got
+    assert got["menu"] == ["edit", "reclassify", "metabolize"], got
     # a copy of each inline verb waits in the menu for a narrow row (container query); it shows nowhere on a wide one
-    assert got["dups"] == ["edit:none", "schedule:none", "dismiss:none"], got
+    assert got["dups"] == ["Resolve:none", "Snooze:none"], got
     assert (got["haspopup"], got["expanded"], got["menuHidden"]) == ("menu", "false", True), got
     assert got["fs"] == "12px" and got["h"] == 24 and got["border"] == "0px" and got["rowfs"] == "13px", got
 
@@ -60,8 +61,8 @@ def test_the_overflow_menu_opens_and_closes_by_keyboard(tmp_path: Path) -> None:
                  "document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
                  "return [v.querySelector('.verb-more').getAttribute('aria-expanded'), v.querySelector('.verb-menu').hidden, document.activeElement.textContent]; })()"},
     ])
-    assert vals[1] == ["true", False, "reclassify"], vals
-    assert vals[2] == "metabolize", vals
+    assert vals[1] == ["true", False, "edit"], vals
+    assert vals[2] == "reclassify", vals
     assert vals[3] == ["false", True, "···"], vals
 
 

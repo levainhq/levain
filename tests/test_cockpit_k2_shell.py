@@ -223,10 +223,11 @@ def test_the_two_light_blocks_agree_and_the_three_tokens_are_the_phones() -> Non
     assert "background: var(--base); color-scheme: dark;" not in css
 
 
-def test_no_panel_carries_a_colour_strip_and_orange_is_for_what_waits() -> None:
+def test_panels_carry_the_subsystem_stripe_of_variant_b_and_orange_is_for_what_waits() -> None:
+    # K2 r2 deleted the stripes; Phill 10-14 chose variant B and said 10-20 "where is all the fucking colors we designed": restored (K10 S4)
     css = (WEB / "dashboard.css").read_text(encoding="utf-8")
-    assert "stripe" not in css
-    assert 'data-ck-panel="tray"], [data-ck-panel="loops"]' not in css       # the strips were selected by panel id
+    assert "--stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3)" in css
+    assert 'content: ""; position: absolute; inset: 0 0 auto 0; height: 2px' in css
 
 
 # ---- L3 r1 (K2_L3r1.md): G the band's wrap line through the manifest, H the deep link after the token strip, C-F ----

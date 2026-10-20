@@ -33,7 +33,7 @@ class TestDefaultLayout:
 
     def test_brief_holds_the_state_line(self, regions) -> None:
         r, _ = regions
-        assert r["brief"] == ["state"]
+        assert r["brief"] == ["state", "begin"]      # the state line, then Where to begin (read from the Tray and Open loops)
 
     def test_health_is_a_widget(self, regions) -> None:
         r, heads = regions

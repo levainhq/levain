@@ -1686,7 +1686,7 @@ body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !importa
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
 /* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--accent); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 100%; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
@@ -1997,3 +1997,34 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
+
+/* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
+   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
+   Tray: what is late reads first, with a red stripe and "overdue N d" in red; Resolve and Snooze are always on the row, never hover-only. */
+body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
+body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
+body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
+body.ke:not([data-mode="build"]) [data-ck-panel="loops"] .row[data-heat] { border-left: 3px solid var(--heat); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] { border-left: 3px solid var(--bad); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }
+body.ke [data-ck-panel="tray"] .row .verb-actions { opacity: 1; }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { box-shadow: inset 0 0 0 1px var(--hair); border-radius: var(--r-md); padding: 0 var(--sp-4); background: transparent; }
+
+/* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
+body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+
+/* Board work lists: the repo chip sits in the meta line (the mock), the Tray's filter and order bar give way to the rows, and its held-back line closes the list */
+body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }
+body.ke [data-ck-panel="tray"] .ep-search { display: none; }
+body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
+body.ke [data-ck-panel="now"] .ep-search { display: none; }
+/* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
+body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+.grp-col { display: contents; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
+@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; } }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }
