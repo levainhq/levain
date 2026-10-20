@@ -1516,11 +1516,12 @@ class ConsentQueue:
                                       "AND decision = ?", (request.id, payload["signer_fp"],
                                                            payload["decision"])).fetchone() is not None:
                 return                      # this (request, signer, decision) is kept already
-            if head_problem(head) is None and head_refusal(conn, head, noun="ruling" if gap else "answer") is not None:
-                return                      # not the log's head of its size: a stale head is never kept
             fulls = {enrolled: full(conn, enrolled) for enrolled in (False, True)}
             if all(fulls.values()):
                 return
+            # after the cap: the head check hashes the log up to the head's size
+            if head_problem(head) is None and head_refusal(conn, head, noun="ruling" if gap else "answer") is not None:
+                return                      # not the log's head of its size: a stale head is never kept
             if queue_id is None:
                 queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
         if authority is not None and named and fulls[authority.key(payload["signer_fp"]) is not None]:
