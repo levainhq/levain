@@ -291,4 +291,6 @@ def test_stdout_gone_during_the_final_drain_is_counted_not_zero(tmp_path: Path, 
     err = r.stderr()
     assert "your terminal refused the session's output" in err
     assert int(re.search(r"your terminal did not take the session's last (\d+) bytes", err).group(1)) >= 2 * 65536
-    assert "run `reset`" in err.splitlines()[-1]
+    # FX6 r4-4: the untaken reset is said on the failure line, not as "run `reset`" to a terminal that is gone.
+    assert "the reset of the reporting modes the session turned on did not reach it" in err
+    assert "run `reset`" not in err
