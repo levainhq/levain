@@ -6,6 +6,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Export with your organisation's names.** `levain consent receipts export --format agentboundary --names FILE` maps
+  Levain's own names (the actor, the approver's key, the policy, the capability, the working directory) to the aliases
+  your verifier expects, before each receipt is hashed and chained. It renames; it never changes what happened. A file
+  that sets a decision, a status, an actor type, a time, or what the run was (the agent's framework or model, the tool's
+  name, the environment, any version but the policy's) is refused and nothing is exported. An authority name maps one to
+  one, a permission-dialog approval is never relabelled, and every renamed field is marked `synthesized`. The names file
+  is part of each receipt's id, so a renamed export never reuses an unrenamed receipt's id. Against the AgentBoundary
+  v0.2-alpha conformance scenarios, Levain's receipts pass 26 of 54 as Levain writes them and 41 of 54 with a names file.
+
 ## [0.11.10] — 2026-10-20
 
 ### Added
