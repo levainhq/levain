@@ -560,3 +560,18 @@ def test_final_budget_takes_ascii_digits_only(run, repo, tmp_path, monkeypatch):
     _drop, thread = make_thread(run, repo, monkeypatch)
     err = run("envelope", "echo", thread, "--where", f"{repo}=.", "--budget", "hours=²", rc=1).err
     assert "--budget is" in err
+
+
+def test_final_stop_earlier_takes_a_time_a_person_types_or_a_duration(run, repo, tmp_path, monkeypatch):
+    # the residue run: `--stop-earlier 2026-10-20T23:06:36Z` was refused, the store wanting its own microsecond form
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    eid = got["body"]["envelope_id"]
+    typed = (datetime.now(timezone.utc) + timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert run.json("envelope", "narrow", eid, "--stop-earlier", typed)["written"] is True
+    assert run.json("envelope", "narrow", eid, "--stop-earlier", "30m")["written"] is True
+    stop = run.json("envelope", "show", eid, "--data-root", run.root)["threads"][0]["effective"]["stop_at"]
+    left = datetime.fromisoformat(stop) - datetime.now(timezone.utc)
+    assert timedelta(minutes=28) < left <= timedelta(minutes=30)
+    assert "a time with its zone" in run("envelope", "narrow", eid, "--stop-earlier", "2026-10-20T23:06:36", rc=1).err

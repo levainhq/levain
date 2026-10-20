@@ -181,6 +181,23 @@ def _parse_stop(text: str) -> timedelta:
     return span
 
 
+def _parse_stop_earlier(text: str) -> str:
+    """``--stop-earlier`` as the store's stamp: a duration from now (``30m``, ``1h``) or a time with its zone
+    (``2026-10-20T23:06:36Z``, ``...-04:00``)."""
+    m = _DURATION.fullmatch(text.strip())
+    if m is not None and (m.group(1) or m.group(2)):
+        return utc_stamp(_tick().replace(microsecond=0) + timedelta(hours=int(m.group(1) or 0),
+                                                                     minutes=int(m.group(2) or 0)))
+    try:
+        at = datetime.fromisoformat(text.strip())
+    except ValueError:
+        at = None
+    if at is None or at.tzinfo is None:
+        raise CoordError(f"--stop-earlier is a duration from now like 30m, or a time with its zone like "
+                         f"2026-10-20T23:06:36Z (got {text[:40]!r})")
+    return utc_stamp(at.astimezone(timezone.utc))
+
+
 def env_lifetime() -> timedelta:
     from levain.dispatch.contract import MAX_LIFETIME
 
@@ -772,7 +789,7 @@ def run_envelope_narrow(args: argparse.Namespace, out: Any) -> int:
     if args.envelope_cmd == "kill":
         kind, value, what, done = "kill", "", "ended", "already ended"
     elif args.stop_earlier is not None:
-        kind, value = "stop_earlier", args.stop_earlier
+        kind, value = "stop_earlier", _parse_stop_earlier(args.stop_earlier)
         what, done = f"narrowed (stop moved earlier to {value})", f"already narrowed (stop already {value} or earlier)"
     else:
         kind, value = "drop_effect", args.drop_effect
@@ -1070,8 +1087,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     en = e_sub.add_parser("narrow", help="Narrow an envelope: stop it earlier or drop one effect.")
     en.add_argument("envelope_id")
     g = en.add_mutually_exclusive_group(required=True)
-    g.add_argument("--stop-earlier", dest="stop_earlier", metavar="STAMP")
-    g.add_argument("--drop-effect", dest="drop_effect", metavar="IDENTITY")
+    g.add_argument("--stop-earlier", dest="stop_earlier", metavar="WHEN",
+                   help="Stop sooner: a duration from now (30m, 1h) or a time with its zone (2026-10-20T23:06:36Z).")
+    g.add_argument("--drop-effect", dest="drop_effect", metavar="IDENTITY",
+                   help="Drop one effect, by the identity `levain envelope show` prints beside it.")
     en.add_argument("--thread", default=None, metavar="THREAD")
     common(en)
     for p in (ee, es, ea, esh, el, ek, en):
