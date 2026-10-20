@@ -77,6 +77,11 @@
    "namespace": "levain-dispatch-config",
    "status": "reserved",
    "owner": "levain/dispatch/control.py"
+  },
+  {
+   "namespace": "levain-allowed-signers",
+   "status": "reserved",
+   "owner": "levain/qbroker/signers.py"
   }
  ],
  "families": [

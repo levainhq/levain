@@ -39,6 +39,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-dispatch-config": ("reserved", "levain/dispatch/control.py",
                                "a human-signed dispatch configuration item (templates, verifiers, provider policy, "
                                "route map, adoption rules) under a monotonic generation"),
+    "levain-allowed-signers": ("reserved", "levain/qbroker/signers.py",
+                               "the dispatch trust root's signature over the answer-signer snapshot "
+                               "(CONTRACT c6 §3.7)"),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers
