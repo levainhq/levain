@@ -203,24 +203,26 @@ def _unload_launchd_if_changed(label: str, path: Path, text: str, run: Callable[
 
 def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run: Callable[..., object] | None,
                           read: Callable[[Path], bytes | None]) -> tuple[bool, str]:
-    """Linux twin of :func:`_unload_launchd_if_changed`: stop an active unit whose file on disk differs
-    from the one about to be written. ``enable --now`` after ``daemon-reload`` starts a stopped unit on
-    the new definition but leaves a running one on the old, so stopping it first is what makes the new
-    definition take, and a run that dies after the stop leaves it stopped for the re-run to start."""
+    """Linux twin of :func:`_unload_launchd_if_changed`: stop a unit whose file on disk differs from the
+    one about to be written. ``enable --now`` after ``daemon-reload`` starts a stopped unit on the new
+    definition but leaves a running one on the old, so stopping it first is what makes the new definition
+    take, and a run that dies after the stop leaves it stopped for the re-run to start.
+
+    The stop is unconditional, never gated on ``is-active``: a ``Restart=always`` unit waiting out its
+    restart delay reads as not active, and would come back on the old cached definition. An explicit
+    stop cancels that pending restart (the stop-before-upgrade order of Debian's maintainer scripts).
+    Success is read from ``ActiveState`` afterwards: ``inactive`` or ``failed``."""
     import subprocess
 
-    if not _differs(read, path, text):
+    on_disk = read(path)
+    if on_disk is None or on_disk == text.encode("utf-8"):   # no file yet: nothing runs from it
         return True, ""
     run = run or subprocess.run
-
-    def active() -> bool:
-        return getattr(run([systemctl, "is-active", "--quiet", name], capture_output=True), "returncode", 1) == 0
-
-    if not active():
-        return True, ""
-    run([systemctl, "stop", name], capture_output=True)
-    if active():
-        return False, f"{name} is still active after systemctl stop"
+    run([systemctl, "stop", name], capture_output=True)   # a unit systemd never loaded: non-zero, harmless
+    r = run([systemctl, "show", "-p", "ActiveState", "--value", name], capture_output=True, text=True)
+    state = (getattr(r, "stdout", "") or "").strip()
+    if state not in ("inactive", "failed"):
+        return False, f"{name} is {state or 'in an unknown state'} after systemctl stop"
     return True, ""
 
 

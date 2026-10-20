@@ -57,8 +57,11 @@ class _Systemd:
     """A fake systemctl: ``known`` is what the last daemon-reload read from disk; ``active`` maps a unit to
     the definition it was started with."""
 
-    def __init__(self, disk, active=None):
+    def __init__(self, disk, active=None, pending_restart=None):
+        # ``pending_restart``: a Restart=always unit between its exit and its restart, on the definition
+        # it will come back on (systemd reports it "activating"; ``is-active`` says no).
         self.disk, self.active, self.calls = disk, dict(active or {}), []
+        self.pending = dict(pending_restart or {})
         self.known = dict(disk)
 
     def __call__(self, argv, **kw):
@@ -69,12 +72,20 @@ class _Systemd:
             return subprocess.CompletedProcess(argv, 0 if name in self.active else 3)
         if verb == "stop":
             self.active.pop(name, None)
+            self.pending.pop(name, None)
             return subprocess.CompletedProcess(argv, 0)
+        if verb == "show":
+            state = "active" if name in self.active else "activating" if name in self.pending else "inactive"
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{state}\n")
         if verb == "restart":
             self.active[name] = self.known[units.systemd_path(name)]
             return subprocess.CompletedProcess(argv, 0)
         if verb == "daemon-reload":
             self.known = dict(self.disk)
+            # the pending restart fires on the definition it was holding, not the reloaded file
+            for n, d in self.pending.items():
+                self.active.setdefault(n, d)
+            self.pending.clear()
             return subprocess.CompletedProcess(argv, 0)
         if verb == "enable":
             self.active.setdefault(name, self.known[units.systemd_path(name)])
@@ -150,11 +161,24 @@ def test_unit_unloaded_before_write_only_when_running_and_changed(host, case):
     assert disk[path] == text.encode() and _running(host, fake).get(name) == text.encode()
     unload = "bootout" if host == "darwin" else "stop"
     unloads = [i for i, c in enumerate(fake.calls) if c[0] == unload]
-    if case == "running-changed":
+    # Linux stops a changed unit whether or not it reads active (r3: a pending auto-restart reads inactive).
+    if case == "running-changed" or (host == "linux" and case == "stopped-changed"):
         assert len(unloads) == 1 and unloads[0] < fake.calls.index(("WRITE", path))
     else:
         assert unloads == []
     assert not any(c[0] == "restart" for c in fake.calls)
+
+
+def test_linux_changed_unit_in_a_pending_restart_comes_back_on_the_new_definition():
+    """r3 (codex MED): a Restart=always unit between its exit and its restart reads not-active; gating
+    the stop on ``is-active`` let it restart on the old definition at the daemon-reload."""
+    svc = units.by_name("control")
+    name, path, text = _unit("linux", svc)
+    old = _old(text, "linux").encode()
+    disk = {path: old}
+    fake = _Systemd(disk, pending_restart={name: old})
+    _apply(units.install_steps("linux", [svc], run=fake, read=lambda p: disk.get(p)), fake, disk)
+    assert fake.active.get(name) == text.encode()
 
 
 @pytest.mark.parametrize("host", HOSTS)
