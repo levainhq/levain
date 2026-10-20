@@ -403,6 +403,23 @@ def test_answer_refusal_names_why(L, broker, keys):
     assert "seal" in answer_refusal(tampered, payload, sig, snap, later)
 
 
+def test_the_seam_reasons_come_from_the_shared_consent_check(L, broker, keys):
+    """The answer check is levain.consent.queue.answer_refusal's (its wording); the namespace check stays the seam's."""
+    rid = filed(broker)
+    payload, sig = write_answer(L, rid, keys["operator"])
+    row = row_of(L, rid)
+    later = NOW + timedelta(seconds=10)
+    snap = SignersSource(L / "policy", L / "routes" / "trust.pub").current()
+    assert answer_refusal(row, {**payload, "signer_fp": "SHA256:" + "A" * 43}, sig, snap, later) \
+        == "the signer is not an enrolled key"
+    assert answer_refusal(row, {k: v for k, v in payload.items() if k != "signer_fp"}, sig, snap, later) \
+        == "the answer is not an answer record"
+    assert answer_refusal(row, payload, sig, snap, later) is None
+    write_signers(L, keys, 3, [keys["operator"].signer(namespaces=["levain-dispatch-contract"])])
+    narrow = SignersSource(L / "policy", L / "routes" / "trust.pub").current()
+    assert answer_refusal(row, payload, sig, narrow, later) == "the signer may not sign in levain-consent-answer"
+
+
 # --- wire + sockets --------------------------------------------------------------------------------------------
 
 @pytest.fixture

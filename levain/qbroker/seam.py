@@ -1,19 +1,19 @@
 """levain.qbroker.seam — THE VERIFY SEAM: whether an answer row is authority for a broker-filed request.
 
-:func:`answer_refusal` is the one check every ``ANSWER?`` passes. It must be the consent queue's own answer check
-(``ConsentQueue._refusal`` in ``levain/consent/queue.py``) applied to the broker's row. That check is not
-reachable as a pure function today: it is a private method of a queue bound to its cockpit authority log. So this
-module composes the smallest pure pieces that check itself calls (the sealed request and its digest,
-``answer_message``, ``head_problem``, ``parse_stamp``, ``class_covers``, the passkey check, ``verify_link_sig``),
-and the field comparisons between them restate that check's one for one (they cannot be called apart from it).
-The signer is a :class:`levain.qbroker.signers.AllowedSigner`, read through the same attributes as the queue's
-authority key (``active``, ``key_class``, ``custody``, ``public_key``, ``fingerprint``; CONTRACT c7 §3.7), so the
-tier rule (``class_covers``) and the passkey custody check are the queue's. The differences:
+:func:`answer_refusal` is the one check every ``ANSWER?`` passes. Its answer check IS the consent queue's own:
+:func:`levain.consent.queue.answer_refusal`, called with the broker's row's sealed request and queue id, and the
+answer-signer snapshot as its ``authority`` (a :class:`levain.qbroker.signers.AllowedSigner` reads as an authority
+key: ``active``, ``key_class``, ``custody``, ``public_key``, ``fingerprint``; CONTRACT c7 §3.7). What this module adds
+around that call, and nothing else:
 
-- namespaces: a snapshot signer lists the namespaces it may sign in, checked here; the queue's check has no such
-  step.
-- receipts head: a broker request has no receipt log, so the head is checked for its shape only (what the queue's
-  own check does; the apply-time ``head_refusal`` has no log to read here).
+- the snapshot: a missing or unverifiable one makes no answer authority.
+- the row: its stored request must be the seal of its fields, and its hold must not have ended.
+- namespaces: a snapshot signer lists the namespaces it may sign in; one that may not sign in
+  ``levain-consent-answer`` is refused here, before the shared check (which has no such step).
+
+The receipts head: a broker request has no receipt log, so the head is checked for its shape only (what the
+shared check does; the apply-time ``head_refusal`` has no log to read here). The unchained answer format is never
+accepted (``unchained_ok`` stays off).
 
 Stdlib only.
 """
@@ -24,11 +24,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from levain.authority import PASSKEY, VerifierUnavailable, verify_link_sig
-from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
-from levain.consent.queue import _ANSWER_KEYS, class_covers
-from levain.consent.receipt_log import head_problem
-from levain.consent.record import ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message
+from levain.cockpit.consent import ConsentError, utc_stamp
+from levain.consent import queue as consent_queue
+from levain.consent.record import ANSWER_NAMESPACE, ExternalGateRequest
 from levain.qbroker.signers import SignersSnapshot
 
 __all__ = ["answer_refusal", "request_of"]
@@ -47,11 +45,6 @@ def request_of(fields: Any) -> ExternalGateRequest | None:
         return None
 
 
-# SEAM GAP (routed to B2): replace this body with one call to a pure consent-side check, e.g.
-# levain.consent.queue.answer_refusal(request, queue_id, payload, signature, authority, *, ssh_keygen=None), whose
-# ``authority`` is any object whose key(fp) has the ATTRIBUTES public_key, fingerprint, active, key_class, custody:
-# a SignersSnapshot already is one (signers.AllowedSigner). The namespace check below is not in that check and
-# stays here, before the call.
 def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers: SignersSnapshot | None,
                    now: datetime, *, ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not authority for the request ``row`` holds; ``None`` when it is."""
@@ -62,58 +55,10 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
         return "the request row's seal does not match its fields"
     if request.expires_at <= utc_stamp(now):
         return f"the request's hold ended {request.expires_at}"
-    if not isinstance(payload, Mapping) or set(payload) != _ANSWER_KEYS:
-        return "the answer is not an answer record"
-    if payload["format"] != ANSWER_FORMAT:
-        return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
-    problem = head_problem(payload["receipts_head"])
-    if problem is not None:
-        return f"the answer's {problem}"
-    if payload["queue_id"] != row.get("queue_id"):
-        return "the answer names another queue"
-    if payload["request_id"] != request.id:
-        return "the answer is for another request"
-    if payload["request_digest"] != request.digest:
-        return "the answer signs another version of this request"
-    if payload["expires_at"] != request.expires_at:
-        return "the answer names another expiry"
-    signed_at = payload["signed_at"]
-    try:
-        parse_stamp(signed_at)
-    except ConsentError:
-        return "the answer's signed_at is not a timestamp"
-    if signed_at < request.received_at:
-        return "the answer was signed before the request was filed"
-    if signed_at >= request.expires_at:
-        return "the answer was signed after the request expired"
-    decision = payload["decision"]
-    if decision not in DECISIONS:
-        return f"decision {decision!r} is not one of {DECISIONS}"
-    signer = signers.key(payload["signer_fp"])
-    if signer is None:
-        return "the signer is not in the answer-signer snapshot"
-    if ANSWER_NAMESPACE not in signer.namespaces:
-        return f"the signer may not sign in {ANSWER_NAMESPACE}"
-    if not signer.active:
-        return "the signer is not active"
-    if decision == "allow" and not class_covers(signer.key_class, request.tier):
-        return f"key class {signer.key_class} does not cover {request.tier}"
-    if not isinstance(signature, str) or not signature:
-        return "the answer carries no signature"
-    if signer.custody == PASSKEY:
-        from levain.consent.passkey import answer_signature_problem
-
-        problem = answer_signature_problem(signature, signer.public_key)
-        if problem is not None:
-            return problem
-    try:
-        message = answer_message(dict(payload))
-    except ConsentError as exc:
-        return f"the answer cannot be encoded: {exc}"
-    kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
-    try:
-        ok = verify_link_sig(message, signature, public_key=signer.public_key, fingerprint=signer.fingerprint,
-                             namespace=ANSWER_NAMESPACE, **kwargs)
-    except VerifierUnavailable as exc:
-        return f"the answer could not be verified: {exc}"
-    return None if ok else "the answer's signature does not verify"
+    if isinstance(payload, Mapping):
+        payload = dict(payload)         # one copy: the namespace check and the shared check read the same record
+        signer = signers.key(payload.get("signer_fp"))
+        if signer is not None and ANSWER_NAMESPACE not in signer.namespaces:
+            return f"the signer may not sign in {ANSWER_NAMESPACE}"
+    return consent_queue.answer_refusal(request, row.get("queue_id"), payload, signature, signers,
+                                        ssh_keygen=ssh_keygen)
