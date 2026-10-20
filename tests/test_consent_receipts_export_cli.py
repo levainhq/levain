@@ -80,3 +80,62 @@ def test_format_is_required_and_closed(queue_dir, capsys):
             cli.main(["consent", "receipts", "export", *argv])
         assert e.value.code == 2
     assert capsys.readouterr().out == ""
+
+
+# --- L3 r1 (1019+49): stdout encoding, a closed pipe, a filesystem with no hard links, a bad ~user -----------------
+_ARGS = ["consent", "receipts", "export", "--format", "agentboundary", "--queue-dir"]
+
+
+def test_stdout_is_utf8_json_whatever_the_stream_encoding(tmp_path, monkeypatch, capsys):
+    import io
+
+    root = tmp_path / "café"                          # every receipt's target.resource_id is its working directory
+    root.mkdir()
+    queue_dir = build_scratch(root)[0].directory
+
+    raw = io.BytesIO()
+    ascii_out = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+    monkeypatch.setattr("sys.stdout", ascii_out)
+    rc = cli.main(_ARGS + [str(queue_dir)])
+    ascii_out.flush()
+    assert rc == 0
+    got = raw.getvalue().decode("utf-8")
+    assert json.loads(got) == ab.export(queue_dir).receipts
+    assert any(ord(c) > 127 for c in got)             # the scratch queue holds non-ASCII text, so this is exercised
+
+
+def test_a_closed_pipe_on_stdout_is_a_quiet_exit_1(queue_dir, monkeypatch, capsys):
+    import io
+    import os
+
+    r, w = os.pipe()
+    os.close(r)
+    piped = io.TextIOWrapper(io.FileIO(w, "wb"), encoding="utf-8")
+    monkeypatch.setattr("sys.stdout", piped)
+    assert cli.main(_ARGS + [str(queue_dir)]) == 1
+    piped.close()
+
+
+def test_out_on_a_filesystem_with_no_hard_links_still_writes_and_never_clobbers(queue_dir, tmp_path, monkeypatch,
+                                                                               capsys):
+    import errno
+    import os
+
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_links)
+    target = tmp_path / "r.json"
+    rc = cli.main(_ARGS + [str(queue_dir), "--out", str(target)])
+    assert rc == 0
+    assert json.loads(target.read_text(encoding="utf-8")) == ab.export(queue_dir).receipts
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+    capsys.readouterr()
+    assert cli.main(_ARGS + [str(queue_dir), "--out", str(target)]) == 1      # exists: refused, kept
+    assert json.loads(target.read_text(encoding="utf-8")) == ab.export(queue_dir).receipts
+
+
+def test_out_naming_a_user_that_does_not_exist_is_a_clean_error(queue_dir, capsys):
+    rc = cli.main(_ARGS + [str(queue_dir), "--out", "~levain_user_that_does_not_exist_1019/r.json"])
+    out, err = capsys.readouterr()
+    assert rc == 1 and out == "" and err.startswith("levain consent receipts export:")
