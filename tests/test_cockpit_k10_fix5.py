@@ -312,7 +312,7 @@ HOST = ("""(async () => { const V = window.LevainTopologyView; const host = docu
     if (m === 'hang') return new Promise(() => {}); if (m === 'sup') return Promise.resolve('superseded');
     if (m === 'sup-once') return Promise.resolve(window.__sup++ === 0 ? 'superseded' : 'applied'); return Promise.resolve('applied'); }},
     repaint: () => { host.replaceChildren(V.render(V.replayValue() || window.__live, opts)); }};
-  const pl = await window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full'); window.__live = pl.value; opts.repaint(); return 1; })()""")
+  const pl = await window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full'); window.__live = pl.value; window.__opts = opts; opts.repaint(); return 1; })()""")
 H_INFO = ("JSON.stringify({badge: (%s || {}).textContent || null, err: (%s || {}).textContent || null, replaying: window.LevainTopologyView.replaying(), "
           "rshown: (%s || {dataset: {}}).dataset.rshown || null, max: +%s.getAttribute('aria-valuemax'), resumes: window.__resumes, "
           "urls: (window.__urls || []).filter(u => u.includes('at=')).length})") % (
@@ -368,9 +368,9 @@ def test_escape_outside_the_card_ignores_a_hidden_dialog_but_not_a_visible_one(t
     shown = ("(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.id = 'dlg'; d.style.cssText = 'position:fixed;top:0;left:0;width:50px;height:50px'; "
              "document.body.appendChild(d); return 1; })()")
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": shown}, {"eval": esc}, {"eval": "document.getElementById('dlg').remove(); 1"},
-                               {"eval": hidden}, {"eval": esc}])
-    assert out[-4] is True, out                                   # a visible dialog keeps its own Esc
-    assert out[-1] is False, out                                  # a hidden one does not swallow the card's
+                               {"eval": hidden}, {"eval": esc}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": "window.LevainTopologyView.replaying()"}])
+    assert out[-6] is True, out                                   # a visible dialog keeps its own Esc
+    assert out[-1] is False, out                                  # a hidden one does not swallow the card's (FIX7: the return to live is async, so this waits for it)
 
 
 @needs_browser
@@ -380,3 +380,49 @@ def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_t
                                {"until": "document.querySelector('#k7-sessions .tv[data-lens=agents]')"}, SLEEP(300), {"eval": INFO}])
     got = json.loads(out[-1])
     assert got["replaying"] is False and got["paused"] is False and got["badge"] is None and got["rat"] is None, got
+
+
+# --- FIX7: ONE return path (returnToLive): the stale pre-replay live value is never painted unmarked --------------------------------------------
+
+
+@needs_browser
+def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_unlabelled_stale_value(tmp_path, monkeypatch):
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'false'; 1"}, {"eval": H_LIVE},
+                                            {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 8000}, {"eval": H_INFO},
+                                            {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE}, SLEEP(200), {"eval": H_INFO}])
+    failed, retry = json.loads(out[-5]), json.loads(out[-1])
+    assert failed["resumes"] == 1 and "could not return to live" in failed["badge"] and "Live tries again" in failed["badge"], failed
+    assert retry["resumes"] == 2, retry                                                                           # the retry asked the page for a new live read
+    assert retry["replaying"] is True and retry["badge"] == "returning to live…" and retry["rshown"] not in (None, "live"), retry   # still the labelled frame
+
+
+@needs_browser
+def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
+                                            {"eval": "document.querySelector('#h6 [data-tv=agents]').click(); 1"}, SLEEP(300), {"eval": H_INFO},
+                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    mid, done = json.loads(out[-5]), json.loads(out[-1])
+    assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid
+    assert done["replaying"] is False and done["badge"] is None, done
+
+
+@needs_browser
+def test_a_hung_resume_times_out_to_the_failed_label_and_live_tries_again(tmp_path, monkeypatch):
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE},
+                                            SLEEP(10800), {"eval": "window.__opts.repaint(); 1"}, {"eval": H_INFO},     # the page's own card shares the module state: repaint the host by hand
+                                            {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    failed, done = json.loads(out[-5]), json.loads(out[-1])
+    assert "timed out" in failed["err"] and failed["replaying"] is True and failed["rshown"] not in (None, "live"), failed
+    assert "Live tries again" in failed["badge"], failed
+    assert done["replaying"] is False and done["resumes"] == 2, done
+
+
+@needs_browser
+def test_a_visibility_hidden_dialog_does_not_block_escape(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    esc = "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return window.LevainTopologyView.replaying(); })()"
+    hidden = ("(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.style.cssText = 'position:fixed;top:0;left:0;width:50px;height:50px;visibility:hidden'; "
+              "document.body.appendChild(d); return 1; })()")
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": hidden}, {"eval": esc}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000},
+                               {"eval": "window.LevainTopologyView.replaying()"}])
+    assert out[-1] is False, out                                                                                 # the hidden dialog did not swallow the card's Esc

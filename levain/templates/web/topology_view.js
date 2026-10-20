@@ -957,14 +957,14 @@
   // quiet 250 ms), with at most one past read in flight (a newer one aborts the older), and never with an empty T. While T is set the topology's
   // live refetch is paused (`paused()`, read by cockpit_view.refetchPanel) and the badge says so; Live (or Esc) drops T and resumes it.
   // What the past read could not rebuild (`unreadable`) is drawn as unknown. The histogram is the activity panel's events bucketed by `at`.
-  const WINDOW_MS = 14 * 3600e3, STEP_MS = 5 * 60e3, MIN_MS = 60e3, KEY_MS = 250, LO_MARGIN_MS = 2 * MIN_MS, HIST_STALE_MS = 60e3;
+  const WINDOW_MS = 14 * 3600e3, STEP_MS = 5 * 60e3, MIN_MS = 60e3, KEY_MS = 250, LO_MARGIN_MS = 2 * MIN_MS, HIST_STALE_MS = 60e3, RETURN_MS = 10e3;
   const UNKNOWN_WORDS = { spores: "open loops", lost_if_closed: "what closing would lose", context: "model and tokens", session_logs: "rate and state from the session logs",
                           conflicts: "file conflicts", decisions: "decisions", questions: "questions" };
   // Two times are kept apart. `at` is the REQUESTED T (set when a scrub goes out; non-null = the live refetch is paused); `cat` is the COMMITTED T (the
   // T whose answer is `value`). The badge says "live paused" only over `value` with cat === at; while a read is out it says "loading" and the
   // frame drawn (the previous committed one, or the live value) is named. `tok` is a monotonic request token: an answer whose token is not the
   // latest is dropped (no AbortController needed). `ret`: Live was asked and the frame stays, labelled, until the live read lands.
-  const R = { at: null, cat: null, value: null, err: "", busy: false, ret: false, anchor: null, anchoredAt: 0, tok: 0, rtok: 0, ctl: null, timer: null, pend: null,
+  const R = { at: null, cat: null, value: null, err: "", busy: false, ret: false, anchor: null, anchoredAt: 0, tok: 0, rtok: 0, ctl: null, timer: null, pend: null, rtimer: null,
               refocus: false, keyed: false, opts: null, cur: null, hist: null, histAt: 0, histBusy: false, escBound: false };
   const mono = () => (root.performance && typeof root.performance.now === "function" ? root.performance.now() : Date.now());
   const minuteOf = (ms) => Math.floor(ms / MIN_MS) * MIN_MS;
@@ -975,7 +975,7 @@
   function replayValue() { return replaying() ? R.value : null; }
   const replaySig = () => [R.at, R.cat, R.err, R.busy, R.ret];
   function abortFlight() { R.tok++; if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
-  function clearReplay() { R.at = null; R.cat = null; R.value = null; R.anchor = null; R.busy = false; R.err = ""; R.ret = false; R.keyed = false; R.refocus = false; R.rtok++; }
+  function clearReplay() { R.at = null; R.cat = null; R.value = null; R.anchor = null; R.busy = false; R.err = ""; R.ret = false; R.keyed = false; R.refocus = false; R.rtok++; if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; } }
   // the live read behind the paused one: the page's refetch (cockpit_view.refetchPanel). Resolves {ok: true} once the live value is drawn ("applied", or
   // "fault", which draws the fault as live does), else {ok: false, msg}: a rejection, a throw, a `false` (the board was redrawn under the read) or a
   // "superseded" that no newer read settled. A superseded read is followed by asking again (the newer owner is superseded in turn), at most 3 times.
@@ -995,30 +995,37 @@
     };
     return attempt(1);
   }
-  // silent: the caller is already repainting and is leaving (the view went away, or replay did): the state is dropped now, nothing is kept.
-  // Otherwise (Live, Esc, Back to live) the committed frame stays on screen, labelled "returning to live…", until the live read lands.
-  function leaveReplay(silent) {
+  // ONE way back to the live topology (K10 fix7): the Live pill, Back to live, Esc, a Work<->Agents lens switch and the retry after a failure all call it.
+  // The committed frame (if any) stays drawn, labelled "returning to live…", while the live read goes out (bounded by RETURN_MS); replay is cleared only
+  // when that read is drawn ("applied", or "fault", which draws as live draws it). A false / rejection / timeout keeps the frame, labelled "could not
+  // return to live — Live tries again"; calling this again, while returning or failed, starts a new attempt (a new token). With no committed frame (a first
+  // scrub still loading) the scrub is cancelled by the token bump and the live value drawn is the one that was never replaced: live never left.
+  function returnToLive() {
     abortFlight();
-    const had = R.at !== null, frame = R.value !== null && R.cat !== null;
-    if (!had && !R.ret && R.err === "") return;
-    if (R.ret && !had && !R.err) { if (silent) { clearReplay(); } return; }       // already on the way back (a failed return is retried)
-    if (R.ret && !had && silent) { clearReplay(); return; }
-    if (silent || !had || !frame) {
-      clearReplay();
-      if (had) resumeLive();
-      if (!silent && R.opts && R.opts.repaint) R.opts.repaint();
-      return;
-    }
     const rt = ++R.rtok;
+    if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; }
     // R.anchor stays until the live read lands: a scrub made while returning is windowed by the live clock, never by the historical frame's as_of
     R.at = null; R.busy = false; R.err = ""; R.ret = true; R.keyed = false; R.refocus = false;
-    if (R.opts && R.opts.repaint) R.opts.repaint();
-    resumeLive().then((res) => {
+    const settle = (res) => {
       if (R.rtok !== rt || !R.ret) return;
+      if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; }
       if (res.ok) clearReplay();
-      else R.err = "could not return to live: " + res.msg + " (Live tries again)";   // the frame stays, labelled; the Live pill retries
+      else R.err = "could not return to live: " + res.msg + " (Live tries again)";   // the frame stays, labelled; Live asks again
       if (R.opts && R.opts.repaint) R.opts.repaint();
-    });
+    };
+    R.rtimer = root.setTimeout(() => { R.rtimer = null; settle({ ok: false, msg: "the live read timed out" }); }, RETURN_MS);
+    if (R.opts && R.opts.repaint) R.opts.repaint();
+    resumeLive().then(settle);
+  }
+  // teardown only: the view went away (tab left, no card, list mode, replay flag gone). Nothing is drawn, so nothing is kept; every other exit is returnToLive.
+  function leaveReplay(silent) {
+    if (!silent) { if (replaying() || R.err) returnToLive(); return; }
+    abortFlight();
+    if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; }
+    const had = R.at !== null;
+    if (!had && !R.ret && R.err === "") return;
+    clearReplay();
+    if (had) resumeLive();
   }
   // one past read: T goes out once, the answer is kept only if no newer request superseded it (the token), and the frame already committed keeps its
   // own label while this one loads. A 400 that names the window re-anchors on a fresh live read and retries once.
@@ -1108,7 +1115,8 @@
       const t = ev.target, tag = t && t.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
       const d = root.document, inCard = [t, d.activeElement].some((n) => n && n.closest && n.closest(".k7-card, .tv"));
-      const shown = (n) => (typeof n.checkVisibility === "function" ? n.checkVisibility() : n.getClientRects().length > 0);
+      const shown = (n) => (typeof n.checkVisibility === "function" ? n.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+        : n.getClientRects().length > 0 && !(root.getComputedStyle && root.getComputedStyle(n).visibility === "hidden"));
       if (!inCard && Array.from(d.querySelectorAll(".modal-overlay, dialog[open], [role=\"dialog\"], [aria-modal=\"true\"]")).some(shown)) return;
       leaveReplay(false);
     });
@@ -1159,7 +1167,7 @@
     pill.type = "button";
     pill.setAttribute("aria-pressed", R.at === null ? "true" : "false");
     pill.append(el("i", "tv-livedot"), "Live");
-    pill.addEventListener("click", () => { if (R.at !== null || R.err) leaveReplay(false); });
+    pill.addEventListener("click", () => { if (replaying() || R.err) returnToLive(); });
     // T from a pointer, minute-aligned and inside the window; the right edge is live
     const tAt = (clientX) => { const r = track.getBoundingClientRect(); const k = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width))); return minuteOf(lo0 + k * WINDOW_MS); };
     const commit = (T, keyed) => { if (T >= hi) { leaveReplay(false); return; } replayTo(Math.max(loNow(), T), est(), { keyed }); };
@@ -1212,7 +1220,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { if (id !== which && replaying()) leaveReplay(true); keep(LENS_KEY, id); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
+    bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { keep(LENS_KEY, id); if (id !== which && replaying()) returnToLive(); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
@@ -1222,7 +1230,7 @@
     if (o.replay && replaying()) {
       const at = (ms) => clock(new Date(ms).toISOString());
       // requested is not committed: "live paused" only over the value whose as_of is T; while a read is out the badge says what is drawn
-      const text = R.ret && R.err ? "could not return to live — showing replay " + (R.cat !== null ? at(R.cat) : "")
+      const text = R.ret && R.err ? "could not return to live — Live tries again" + (past && R.cat !== null ? " · showing replay " + at(R.cat) : "")
         : R.ret ? "returning to live…"
         : R.busy ? "loading replay " + at(R.at) + "… " + (past && R.cat !== null ? "showing replay " + at(R.cat) : "showing live")
         : "replay " + at(R.at) + " — live paused";
@@ -1233,7 +1241,7 @@
       if (!R.ret || R.err) {
         const back = el("button", "tv-rback", "Back to live");
         back.type = "button";
-        back.addEventListener("click", () => leaveReplay(false));
+        back.addEventListener("click", returnToLive);
         wrapB.append(back);
       }
       body.appendChild(wrapB);
@@ -1252,6 +1260,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, leaveReplay, hourMarks };
+  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);
