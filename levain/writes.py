@@ -178,7 +178,7 @@ class WriteScope:
       non-install substrate) → those kinds are refused; State + the Class-B verbs do
       not need it.
     - ``context_json`` — OPTIONAL. The operator's live-context contract
-      (``{state, state_set_at, state_source}``) — the WRITE-peer of the read path's
+      (``{state, state_set_at, state_source, state_run}``) — the WRITE-peer of the read path's
       ``SubstrateSource.context_json`` (the same path, mirrored read/write like
       ``anneal`` is). Locates the target for the Class-A ``operator_state`` edit
       (operator live-state, last-writer-wins — no backup/undo, distinct from the
@@ -1101,11 +1101,12 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     bounded by ``dashboard.STATE_MAX_TEXT_LEN`` with an allowlisted provenance tag. The text is stored verbatim apart from whitespace collapse and
     is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``.
 
-    A line SET (not cleared, not re-set to the same text) also appends one raw ``observation``
-    episode tagged ``felt,state`` to ``scope.anneal.episodic_db`` (``write_state`` computes
-    both): an INPUT the consolidate reads, like any episode, never a write into the felt layer.
-    The result's ``episode`` says what happened; a failed episode leaves the line set and
-    reports ``episode_error``."""
+    A line SET (not a clear) also records one raw ``observation`` episode tagged ``felt,state`` in
+    ``scope.anneal.episodic_db`` (``write_state`` computes both; one per run of the same text, so
+    a re-set adds none): an INPUT the consolidate reads, like any episode, never a write into the
+    felt layer. The result's ``episode`` says what happened; a failed episode leaves the line set
+    and reports ``episode_error`` (no warning is raised: one raised by a ``-W error`` filter
+    would fail a set that has already landed)."""
     ctx = scope.context_json
     if ctx is None:
         raise EditError(
@@ -1138,8 +1139,6 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
                               "episode": done.episode}
     if done.episode == "failed":    # the line is set; its felt episode is not: say so, never fail the set
         result["episode_error"] = done.episode_error
-        warnings.warn(f"state line set but its felt episode was not written ({done.episode_error})",
-                      RuntimeWarning, stacklevel=2)
     return result
 
 
