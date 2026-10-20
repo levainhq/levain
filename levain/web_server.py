@@ -358,6 +358,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # The manifest mapper (levain.cockpit; design §7): builds the dashboard's view from
     # /cockpit/manifest.json, so the dashboard page is the cockpit renderer (the default page).
     "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
+    # The topology's renderer (F12b): the work view drawn in the Build tab's Sessions card from the topology panel's value.
+    "/topology_view.js": ("topology_view.js", "text/javascript; charset=utf-8"),
     # The ambient panel's sky: its own asset so the renderer and the sky evolve apart.
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
     # The change stream's client: one fetch-read stream per page, through the page's own read transport.

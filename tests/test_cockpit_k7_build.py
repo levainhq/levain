@@ -21,6 +21,8 @@ from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 BUILD = "#write_token=T&build"
 ROWS = "[...document.querySelectorAll('#k7-sessions .k7-srow')]"
+# F12b made the topology the default view of the Sessions card at 1440: these tests are about the list, so they choose it first
+LIST_VIEW = {"eval": "(() => { try { localStorage.setItem('levain_cockpit_topology_mode', 'list'); } catch (_) {} return 1; })()"}
 
 
 def _stem(agent: str, sid: str) -> str:
@@ -251,7 +253,7 @@ def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, mo
              "repo: (r.querySelector('.k7-repo') || {}).textContent, cwd: r.querySelector('.k7-cwd').textContent, said: r.querySelector('.k7-tool').textContent, "
              "meter: r.querySelector('.k7-meter-v').textContent, fill: r.querySelector('.k7-bar > i').style.width, when: r.querySelector('.k7-when').textContent}))})")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
     got = json.loads(out[-1])
     assert got["head"].startswith("Sessions 3 2 live · 1 quiet"), got
     assert "Who is working right now, and how much room they have left." in got["gloss"], got
@@ -273,7 +275,7 @@ def test_a_session_at_the_warn_line_is_marked_over_for_both_agents_and_the_label
     probe = ("JSON.stringify(" + ROWS + ".map(r => [r.querySelector('.k7-agent').textContent, r.querySelector('.k7-meter').classList.contains('over'), "
              "(r.querySelector('.k7-over') || {textContent: ''}).textContent, r.querySelector('.k7-meter-v').textContent]))")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
     got = json.loads(out[-1])
     cx = [r for r in got if r[0] == "codex"][0]
     cc = [r for r in got if r[0] == "claude_code" and r[1]][0]                   # the live Claude Code row (the quiet one reads nothing)
@@ -290,7 +292,7 @@ def test_a_quiet_session_with_a_pending_request_shows_waiting_and_two_pending_sa
     q.file(agent="claude_code", agent_session_id=SID_CC, tool_name="Write", tool_input={}, cwd=CWD_CC, hold=timedelta(minutes=5), event_id="e9")
     probe = "JSON.stringify(" + ROWS + ".map(r => [r.classList.contains('live'), r.classList.contains('waiting'), r.querySelector('.k7-tool').textContent]))"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
     rows = json.loads(out[-1])
     assert [False, True, "waiting on a decision (Edit)"] in rows, rows         # quiet, and it still waits
     assert [True, True, "waiting on a decision (Write +1)"] in rows, rows       # two pending: the newest, and one more
@@ -304,7 +306,7 @@ def test_a_present_limits_panel_that_cannot_be_read_draws_not_counting_on_every_
         raise RuntimeError("limits store unreadable")
     _limits_module(monkeypatch, boom)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
                      {"eval": "JSON.stringify([...document.querySelectorAll('#k7-sessions .k7-limits')].map(l => [l.textContent, l.className]))"}])["values"]
     assert json.loads(out[-1]) == [["limits: not counting", "k7-limits over"]] * 3
 
@@ -316,7 +318,7 @@ def test_a_tick_moves_the_ago_words_in_place_and_keeps_the_focus_on_all_details(
              "ago: [...document.querySelectorAll('#k7-sessions .k7-tool[data-k7-at]')].map(t => t.textContent)})")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/{BUILD}", [
-            DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-open')"},
+            DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"},   # the list is up before the focus is placed
             {"eval": "document.querySelector('#k7-sessions .k7-open').focus(); 1"}, {"eval": probe},
             {"eval": "new Promise(r => setTimeout(r, 7000))"}, {"eval": probe}])["values"]
     before, after = json.loads(out[-3]), json.loads(out[-1])
@@ -347,7 +349,7 @@ def test_the_limits_line_is_drawn_amber_over_and_red_not_counting(tmp_path, monk
         {"agent": "codex", "session": SID_CX, "halted": None, "counting": False, "metrics": []},
         {"agent": "claude_code", "session": "zq-session-id-q-8814", "counting": True, "halted": {"kind": "tool calls"}, "metrics": []}]})
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
                      {"eval": "JSON.stringify([...document.querySelectorAll('#k7-sessions .k7-limits')].map(l => [l.textContent, l.className]))"}])["values"]
     assert sorted(json.loads(out[-1])) == [["halted: tool calls", "k7-limits over"], ["limits: not counting", "k7-limits over"],
                                            ["tool calls 412/500", "k7-limits amber"]]
@@ -358,7 +360,7 @@ def test_without_the_limits_panel_the_page_draws_no_limits_line(tmp_path, monkey
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     monkeypatch.setitem(sys.modules, "levain.consent.limits", None)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-srow')"},
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"},
                      {"eval": "JSON.stringify([document.querySelectorAll('#k7-sessions .k7-srow').length, document.querySelectorAll('#k7-sessions .k7-limits').length])"}])["values"]
     assert json.loads(out[-1]) == [3, 0]                 # the three rows are drawn, none carries a limits line
 

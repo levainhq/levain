@@ -3631,6 +3631,7 @@
     const undecided = c.state === "undecided";
     const row = el("div", "row consent-row" + (pending || undecided ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-consent-row", "");
+    if (c.id) row.dataset.card = "consent:" + c.id;     // the id the topology's waiting tasks name (topology_view.js)
     const head = el("div", "consent-head");
     head.appendChild(el("span", "consent-agent", c.agent || "agent"));
     head.appendChild(el("b", "consent-tool", c.tool));
@@ -3789,6 +3790,7 @@
     const open = q.state === "open";
     const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
     row.setAttribute("data-question-row", "");
+    if (q.id) row.dataset.card = String(q.id);
     const head = el("div", "consent-head");
     head.appendChild(el("span", "consent-agent", q.agent || "agent"));
     head.appendChild(el("b", "consent-tool", "question #" + q.n));
