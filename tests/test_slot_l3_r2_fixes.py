@@ -162,11 +162,23 @@ def test_unit_unloaded_before_write_only_when_running_and_changed(host, case):
     unload = "bootout" if host == "darwin" else "stop"
     unloads = [i for i, c in enumerate(fake.calls) if c[0] == unload]
     # Linux stops a changed unit whether or not it reads active (r3: a pending auto-restart reads inactive).
-    if case == "running-changed" or (host == "linux" and case == "stopped-changed"):
+    if case == "running-changed" or (host == "linux" and case in ("stopped-changed", "fresh")):
         assert len(unloads) == 1 and unloads[0] < fake.calls.index(("WRITE", path))
     else:
         assert unloads == []
     assert not any(c[0] == "restart" for c in fake.calls)
+
+
+def test_linux_running_unit_whose_file_was_deleted_comes_back_on_the_new_definition():
+    """r4 (complement + codex MED): an absent file is no proof nothing runs; systemd keeps a loaded unit
+    whose file was deleted, so the stop must not be skipped."""
+    svc = units.by_name("control")
+    name, path, text = _unit("linux", svc)
+    disk = {}
+    fake = _Systemd(disk, active={name: _old(text, "linux").encode()})
+    fake.known = {path: _old(text, "linux").encode()}
+    _apply(units.install_steps("linux", [svc], run=fake, read=lambda p: disk.get(p)), fake, disk)
+    assert fake.active.get(name) == text.encode()
 
 
 def test_linux_changed_unit_in_a_pending_restart_comes_back_on_the_new_definition():

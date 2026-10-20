@@ -214,8 +214,9 @@ def _stop_unit_if_changed(systemctl: str, name: str, path: Path, text: str, run:
     Success is read from ``ActiveState`` afterwards: ``inactive`` or ``failed``."""
     import subprocess
 
-    on_disk = read(path)
-    if on_disk is None or on_disk == text.encode("utf-8"):   # no file yet: nothing runs from it
+    # Only an identical file skips the stop. An absent file is no proof nothing runs: systemd keeps a
+    # loaded unit whose file was deleted, and stopping a unit it never loaded is harmless.
+    if not _differs(read, path, text):
         return True, ""
     run = run or subprocess.run
     run([systemctl, "stop", name], capture_output=True)   # a unit systemd never loaded: non-zero, harmless
