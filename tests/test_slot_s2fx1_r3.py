@@ -405,3 +405,39 @@ def test_forwarder_ready_read_raising_abandons_the_forwarder(env, monkeypatch):
     (f,) = la.of("forwarder")
     assert f["pid"] in la.killed and table.of(S0) == []
     assert la.of("vendor") == [] and _no_active(w, s)
+
+
+# --- N1 / F-M5: Claude Code's token is ANTHROPIC_AUTH_TOKEN; ANTHROPIC_API_KEY is never in its env ------------------
+
+def test_claude_token_env_is_auth_token_and_api_key_is_absent_everywhere():
+    """VM N1: CC 2.1.303 stops at "Detected a custom API key ... use this API key?" on ANTHROPIC_API_KEY; with the
+    token as ANTHROPIC_AUTH_TOKEN it reaches the input box. No rendered env and no exec-time name, in any variant,
+    holds ANTHROPIC_API_KEY; a brokered Claude egress session carries ANTHROPIC_AUTH_TOKEN. Codex is unchanged."""
+    from levain.slot import render as RD
+    from tests.test_slot_s2b_render import egress, every_variant
+    assert RD.TOKEN_ENV == {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}
+    n = 0
+    for blob, facts in every_variant():
+        names = set(RD.secret_env_names(blob, facts))
+        for env in RD.render_env(blob, facts).values():
+            names |= set(env)
+        assert "ANTHROPIC_API_KEY" not in names, (facts.vendor, facts.kind, facts.auth)
+        n += 1
+    assert n > 1
+    blob, facts = egress()
+    assert "ANTHROPIC_AUTH_TOKEN" in RD.secret_env_names(blob, facts)
+
+
+def test_api_key_reintroduced_into_a_claude_env_is_refused(monkeypatch):
+    from levain.slot import render as RD
+    from tests.test_slot_s2b_render import egress
+    real = RD._base_env
+    monkeypatch.setattr(RD, "_base_env", lambda *a: {**real(*a), "ANTHROPIC_API_KEY": "x"})
+    blob, facts = egress()
+    with pytest.raises(Refused) as e:
+        RD.render_env(blob, facts)
+    assert e.value.name == "env-forbidden"
+    monkeypatch.setattr(RD, "TOKEN_ENV", {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY"})
+    with pytest.raises(Refused):
+        RD.secret_env_names(blob, facts)
+    RD.check_env_absent("codex", ["ANTHROPIC_API_KEY"])          # Codex: no such rule

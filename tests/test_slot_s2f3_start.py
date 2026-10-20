@@ -355,7 +355,7 @@ def test_vendor_env_holds_handles_clone_and_forwarder_do_not(env):
     token = w.control.handles(s).token
     assert w.main(["start", s])[1]["ok"]
     (v,) = la.of("vendor")
-    assert v["spec"]["extra_env"] == {"ANTHROPIC_API_KEY": token}
+    assert v["spec"]["extra_env"] == {"ANTHROPIC_AUTH_TOKEN": token}
     for r in la.of("clone") + la.of("forwarder"):
         assert r["spec"]["extra_env"] == {}
     for r in la.spawns:

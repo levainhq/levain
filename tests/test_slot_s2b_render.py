@@ -138,7 +138,7 @@ def test_vendor_env_exact():
     assert env["GIT_CONFIG_GLOBAL"] == f"{L}/root/gitconfig" and env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["TERM"] == "xterm-256color"
     # no handle is ever rendered (§3.2: start adds them at exec)
-    assert rd.secret_env_names(blob, facts) == ("ANTHROPIC_API_KEY",)
+    assert rd.secret_env_names(blob, facts) == ("ANTHROPIC_AUTH_TOKEN",)
     assert not set(rd.secret_env_names(blob, facts)) & set(env)
     # dispatch: no own loopback; codex brokered: no ANTHROPIC_BASE_URL (its base URL is the provider block)
     blob, facts = egress(kind="dispatch", vendor="codex")
@@ -154,7 +154,7 @@ def test_vendor_env_exact():
                          hook_templates={"levain_queue": HookTemplate(b"x", "PreToolUse")})
     env = rd.render_env(blob, facts)["slot"]
     assert env["LEVAIN_QUEUE_SOCKET"] == "/private/var/run/levain/qb/slot3/q.sock"
-    assert rd.secret_env_names(blob, facts) == ("ANTHROPIC_API_KEY", "LEVAIN_QUEUE_CAP")
+    assert rd.secret_env_names(blob, facts) == ("ANTHROPIC_AUTH_TOKEN", "LEVAIN_QUEUE_CAP")
     # Linux: the netns forwarder's 47100, no own loopback alias, Linux prefix
     blob, facts = egress("linux")
     env = rd.render_env(blob, facts)["slot"]
