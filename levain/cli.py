@@ -567,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_answer_parser(cs_sub)
     _add_consent_away_parser(cs_sub)
     _add_consent_rule_parser(cs_sub)
+    _add_consent_receipts_parser(cs_sub)
     _add_push_parser(subparsers)
     _add_band_parsers(subparsers)
 
@@ -1417,6 +1418,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_team(subparsers)
 
+    from levain.webpush.cli import register as _register_webpush
+
+    _register_webpush(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 
@@ -1588,6 +1593,85 @@ def _add_consent_ledger_parser(consent_sub: argparse._SubParsersAction) -> None:
     common(recon_p)
     for p in (counts_p, digest_p, window_p, recon_p):
         p.set_defaults(func=_cmd_consent_ledger)
+
+
+def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> None:
+    """`levain consent receipts verify` (Q11): the queue's receipts as a Merkle log, checked against every signed
+    answer's head."""
+    receipts_p = consent_sub.add_parser(
+        "receipts", help="The consent queue's receipts, as a log every signed answer covers.",
+        description=(
+            "Every signed answer and late ruling carries the head (size and Merkle root) of the queue's receipt "
+            "log when it was built, under the signer's own key. `verify` recomputes the log from the receipts and "
+            "re-verifies each stored signed answer as delivery does, then checks its head against the log."))
+    sub = receipts_p.add_subparsers(dest="receipts_cmd", required=True)
+    verify_p = sub.add_parser(
+        "verify", help="Check every signed answer's receipts head against the log.",
+        description=(
+            "Prints the number of receipts, the last signed head that matches (its size, root, signer and when it "
+            "was signed), the unsigned tail (receipts after it, which no signature covers yet), the answers "
+            "signed before chaining, any signer revoked since it signed, and each mismatch by request id. Exits "
+            "0 when every signed head matches (an answer signed before chaining or by a key revoked since is "
+            "listed, not failed); non-zero for a head that does not match, a signature that does not verify, a "
+            "key never enrolled, or a store that cannot be read (a store from before the current format is "
+            "read only once migrated: `levain consent pending` migrates it). Reads the store read-only."))
+    verify_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                          help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+    verify_p.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                          help="The cockpit data root whose authority log verifies the signatures. Default: the one "
+                               "the queue's hook settings name for each request's agent; another one is refused.")
+    verify_p.add_argument("--path", type=Path, default=None,
+                          help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
+    verify_p.set_defaults(func=_cmd_consent_receipts_verify)
+
+
+def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from levain.authority import anchor_path
+    from levain.consent.queue import AnswerRefused, QueueStoreError, authority_source
+    from levain.consent.receipt_log import verify
+
+    try:
+        qdir = _consent_queue_dir(args)
+
+        def authority_for(request: object) -> object:
+            root = _answer_root(args, qdir, request)
+            return authority_source(root / "cockpit.db", anchor=anchor_path(root))
+
+        report = verify(qdir, authority_for=authority_for)
+    except (AnswerRefused, OSError, QueueStoreError, sqlite3.Error, *_cockpit_refusals()) as exc:
+        print(f"levain consent receipts verify: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    if report.receipts is None:                     # no log could be read: the store, or a receipt sqlite cannot decode
+        print(_term_safe(f"UNREADABLE: {report.unreadable}"))
+        print("levain consent receipts verify: no log could be read, so nothing was verified", file=sys.stderr)
+        return 1
+    print(f"receipts: {report.receipts}")
+    last = report.last_signed
+    if last is None:
+        print("last signed head: none (no signed answer covers any receipt)")
+    else:
+        print(_term_safe(f"last signed head: size {last.size} root {last.root}"))
+        print(_term_safe(f"  signed by {last.signer_fp} at {last.signed_at} ({last.via}, request {last.request_id})"))
+    print(f"unsigned tail: {report.unsigned_tail} receipt(s) after the last signed head")
+    print(f"signed heads matching: {report.signed}")
+    for rid in report.unchained:
+        print(_term_safe(f"signed before chaining: {rid}"))
+    for rev in report.revoked:
+        print(_term_safe(f"signer revoked since: {rev.signer_fp} (request {rev.request_id}; "
+                         + ("its head matches" if rev.head_checked else "signed before chaining")
+                         + "; it delivers nothing now)"))
+    for rid, why in report.mismatches:
+        print(_term_safe(f"MISMATCH {rid}: {why}"))
+    if report.unreadable is not None:
+        print(_term_safe(f"UNREADABLE: {report.unreadable}"))
+    if not report.ok:
+        what = (f"{len(report.mismatches)} signed answer(s) do not match the log" if report.mismatches
+                else "the receipts cannot be read as a log")
+        print(f"levain consent receipts verify: {what}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_consent_ledger(args: argparse.Namespace) -> int:
@@ -2436,11 +2520,11 @@ def _answer_root(args: argparse.Namespace, qdir: Path, request: object) -> Path:
 
 def _cmd_consent_answer(args: argparse.Namespace) -> int:
     from levain.authority import anchor_path
-    from levain.cockpit.consent import ConsentError, utc_stamp
+    from levain.cockpit.consent import ConsentError
     from levain.cockpit.keys import ssh_signer
     from levain.consent.answering import refuse_cut_display
     from levain.consent.queue import AnswerRefused, ConsentQueue, QueueStoreError, authority_source
-    from levain.consent.record import ANSWER_NAMESPACE, answer_message, answer_payload
+    from levain.consent.record import ANSWER_NAMESPACE, answer_message
 
     try:
         qdir = _consent_queue_dir(args)
@@ -2454,8 +2538,8 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
         root = _answer_root(args, qdir, request)
         queue = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
         signer_fp, sign = ssh_signer(args.signing_key, namespace=ANSWER_NAMESPACE)
-        payload = answer_payload(queue_id=queue.queue_id, request=request, decision=args.decision,
-                                 signer_fp=signer_fp, signed_at=utc_stamp(_utc_now()))
+        # the queue's own record: it carries the head of its receipt log (Q11), which the answer then signs
+        payload = queue.answer_payload(request.id, args.decision, signer_fp)
         print(_term_safe(f"answering {request.id}: {args.decision.upper()}"))
         for label, value in (("agent", f"{request.agent} (session {request.agent_session_id})"),
                              ("tool", request.tool_name),
@@ -2463,7 +2547,9 @@ def _cmd_consent_answer(args: argparse.Namespace) -> int:
                              ("cwd", request.cwd), ("tier", request.tier),
                              ("filed", f"{request.received_at}, hold ends {request.expires_at}"),
                              ("input digest", request.tool_input_digest),
-                             ("request digest", payload["request_digest"]), ("signer", signer_fp)):
+                             ("request digest", payload["request_digest"]),
+                             ("receipts head", f"{payload['receipts_head']['size']} receipt(s), root "
+                                               f"{payload['receipts_head']['root']}"), ("signer", signer_fp)):
             print(f"  {label:<15} {_term_safe(value)}")
         sys.stdout.flush()
         signature = sign(answer_message(payload))
@@ -2632,7 +2718,9 @@ def _cmd_consent_rule(args: argparse.Namespace) -> int:
                              ("input as filed", request.display[len(request.tool_name) + 1:]),
                              ("cwd", request.cwd), ("tier", request.tier),
                              ("undecided since", gapped.undecided_at),
-                             ("request digest", payload["request_digest"]), ("signer", signer_fp)):
+                             ("request digest", payload["request_digest"]),
+                             ("receipts head", f"{payload['receipts_head']['size']} receipt(s), root "
+                                               f"{payload['receipts_head']['root']}"), ("signer", signer_fp)):
             print(f"  {label:<15} {_term_safe(value)}")
         sys.stdout.flush()
         ruling = queue.answer_late(request.id, payload, sign(ruling_message(payload)))
@@ -2653,7 +2741,7 @@ def _cmd_consent_rule(args: argparse.Namespace) -> int:
         print("  delivery: not attempted (--no-deliver); `levain consent deliver` delivers it")
         return 0
     try:
-        got = deliver(queue, ruling.request_id, notify=agent_notify(qdir, request.agent))
+        got = deliver(queue, ruling.request_id, notify=agent_notify(qdir, request.agent, ruling.request_id))
     except Exception as exc:  # noqa: BLE001 - the ruling stands; its next hook or `consent deliver` delivers it
         print(f"  delivery: failed ({_term_safe(type(exc).__name__)}: {_term_safe(exc)}); the ruling stands and "
               "lands at the session's next step, or `levain consent deliver`")
@@ -2684,7 +2772,7 @@ def _cmd_consent_deliver(args: argparse.Namespace) -> int:
             if queue.ruling_delivered(g.request.id) is not None:
                 print("  delivery: delivered: an earlier resume in this run carried it")
                 continue
-            d = deliver(queue, g.request.id, notify=agent_notify(qdir, g.request.agent))
+            d = deliver(queue, g.request.id, notify=agent_notify(qdir, g.request.agent, g.request.id))
         except Exception as exc:  # noqa: BLE001 - one ruling's error never stops the rest
             print(f"  delivery: failed ({_term_safe(type(exc).__name__)}: {_term_safe(exc)})")
             failed += 1

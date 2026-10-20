@@ -2445,6 +2445,8 @@ def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(AMBIENT_OUTCOMES)}, got {e['outcome']!r}")
     if not _is_str(v.get("legend")) or not v["legend"].strip():
         raise _bad(spec, "value.legend", "must be a non-empty string (one line saying what the encoding means)")
+    if "dialect" in v and v["dialect"] not in ("levain", "flow"):
+        raise _bad(spec, "value.dialect", f"is optional and must be 'levain' or 'flow' when present, got {v['dialect']!r}")
     return v
 
 

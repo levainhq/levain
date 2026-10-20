@@ -463,8 +463,8 @@
      clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
   .scope-wrap, svg.scope { --series-1: oklch(0.78 0.12 200); --series-2: oklch(0.74 0.15 300); }
   svg.scope .ch1 { stroke: var(--series-1); }
-  svg.scope .ch2 { stroke: var(--series-2); }
-  svg.scope .ch3 { stroke: var(--accent); }
+  svg.scope .ch2 { stroke: var(--accent); }
+  svg.scope .ch3 { stroke: var(--series-2); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: var(--sp-2); align-items: center; margin: 0 0 var(--sp-3); }
@@ -488,8 +488,8 @@
   .scope-ch:hover { border-color: var(--line-hot); }
   .scope-ch[aria-pressed="true"] { border-color: currentColor; }
   .scope-ch.ch1 { color: var(--series-1); }
-  .scope-ch.ch2 { color: var(--series-2); }
-  .scope-ch.ch3 { color: var(--accent); }
+  .scope-ch.ch2 { color: var(--accent); }
+  .scope-ch.ch3 { color: var(--series-2); }
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
   .scope-wrap[data-solo="ch1"] svg.scope polyline:not(.ch1),
@@ -1536,10 +1536,14 @@ body.ke .ck-widgets .wbody { flex-direction: row; align-items: baseline; gap: va
 body.ke .ck-widgets .w .big { font-size: 20px; }
 body.ke .ck-widgets .w .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 body.ke .ck-widgets .w .sub ~ .sub, body.ke .ck-widgets .w .xnote { display: none; }
-body.ke .ck-widgets .w .row { flex-wrap: nowrap; white-space: nowrap; }
+body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: nowrap; min-width: 0; }   /* each figure stays whole; a row too wide for the strip tile wraps its figures instead of running past the edge */
 body.ke .ck-widgets .w .xbody { flex-direction: row; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex-wrap: nowrap; min-width: 0; }
-body.ke .ck-widgets .w .dots { flex-direction: row; gap: var(--sp-5); }
+body.ke .ck-widgets .w .dots { flex-direction: row; flex-wrap: wrap; min-width: 0; gap: var(--sp-1) var(--sp-5); }   /* a strip tile's dots wrap inside the box (the height fit then counts what does not fit), never run past its edge */
 body.ke .ck-widgets .w .op .v { margin-left: var(--sp-3); }
+/* a status row in a narrow tile wraps: the value drops under its label (right-aligned) rather than running past the body that clips it; the status word is never cut */
+body.ke .ck-widgets .w .op { flex-wrap: wrap; row-gap: 0; min-width: 0; }
+body.ke .ck-widgets .w .op .op-l { min-width: 0; overflow-wrap: anywhere; }
+body.ke .ck-widgets .w .op .v { max-width: 100%; overflow-wrap: anywhere; }
 body.ke .ck-card.w[data-signal="on"] .big { color: var(--accent); }
 body.ke .ck-widgets > .ck-card.w[data-signal="on"] { box-shadow: inset 3px 0 0 var(--accent); }
 body.ke .ck-widgets[data-shape="tiles"] { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); background: none; border: 0; border-radius: 0; overflow: visible; }
@@ -1589,6 +1593,94 @@ body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel { grid-column:
 body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; grid-column: 1 / -1; }
 body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="tray"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="loops"] { order: 1; }
 body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="now"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="keep"] { order: 2; }
+
+/* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
+   Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
+.k7-sess, .k7-zt, .k7-zg, .k7-opend, .row > .k7-repo { display: none; }
+body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: var(--sec); }
+.k7-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
+.k7-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
+.k7-head span { font-size: var(--fs-meta); color: var(--meta); }
+.k7-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; min-width: 0; }
+.k7-card-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) var(--sp-6) var(--sp-4); }
+.k7-card-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
+.k7-card-h .ck-count { margin: 0; }
+.k7-sum, .k7-stats { font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
+.k7-sp { flex: 1 1 0; }
+.k7-mode-slot:empty { display: none; }
+.k7-card-h .k7-open { display: inline-flex; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-3); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
+.k7-card-h .k7-open:hover { background: var(--card-2); color: var(--text); }
+.k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
+.k7-card.k7-lone { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; text-align: left; border-style: dashed; border-color: var(--hair-2); background: none; }
+.k7-card.k7-lone .k7-card-h { padding: var(--sp-4) var(--sp-5); flex: none; }
+.k7-card.k7-lone .k7-none { padding: var(--sp-4) var(--sp-5) var(--sp-4) 0; flex: 1 1 240px; }
+.k7-none.err { color: var(--bad); }
+.k7-srow { display: grid; grid-template-columns: 14px minmax(170px, 1.1fr) minmax(220px, 1.6fr) minmax(190px, 1fr) minmax(96px, auto); align-items: center; gap: var(--sp-4) var(--sp-6);
+  padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--hair); }
+.k7-sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--meta); justify-self: center; }
+.k7-sdot.live { background: var(--ok); }
+.k7-who { min-width: 0; }
+.k7-who-t { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.k7-agent { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
+.k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
+.k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag); background: color-mix(in oklch, var(--tag) 15%, transparent); }
+.k7-cwd { color: var(--meta); font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-now { min-width: 0; color: var(--text); font-size: var(--fs-body); }
+.k7-srow.quiet .k7-now .k7-tool { color: var(--label); }
+.k7-tool { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k7-limits { font-size: var(--fs-meta); color: var(--meta); }
+.k7-limits.amber { color: var(--warn); }
+.k7-limits.over { color: var(--bad); }
+.k7-meter { min-width: 0; }
+.k7-meter-h { display: flex; justify-content: space-between; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); letter-spacing: .08em; color: var(--label); }
+.k7-meter-v { letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.k7-bar { height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden; margin-top: var(--sp-1); }
+.k7-bar > i { display: block; height: 100%; background: var(--label); }
+.k7-meter.waiting .k7-bar > i { background: var(--accent); }
+.k7-meter.unread .k7-meter-v { color: var(--meta); }
+.k7-meter.over .k7-bar > i { background: var(--bad); }
+.k7-meter.over .k7-meter-v { color: var(--bad); }
+.k7-over { margin-left: auto; margin-right: var(--sp-2); padding: 0 var(--sp-2); border-radius: 3px; background: var(--bad); color: var(--bg, #fff); letter-spacing: .08em; }
+.k7-when { text-align: right; color: var(--label); font-size: var(--fs-meta); white-space: nowrap; }
+.k7-srow.waiting .k7-now .k7-tool { color: var(--text); }
+@media (max-width: 720px) {
+  .k7-srow { grid-template-columns: 14px minmax(0, 1fr); }
+  .k7-srow > .k7-now, .k7-srow > .k7-meter, .k7-srow > .k7-when { grid-column: 2; }
+  .k7-when { text-align: left; }
+}
+/* Results & edits */
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-title:not(.k7-zt),
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-gloss:not(.k7-zg) { display: none; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { display: block; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
+body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
+@media (min-width: 721px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] { grid-template-rows: auto 1fr; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { grid-column: 2; grid-row: 2; align-self: start; }
+}
+body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
+  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
+body.ke .ck-zgrid .panel.k7-results-none .phead { padding: 0; flex: none; }
+body.ke .ck-zgrid .panel.k7-results-none .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; color: var(--label); font-size: var(--fs-body); }
+body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
+@media (max-width: 720px) {
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { order: 3; }
+}
+body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
+body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
+body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
+/* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--accent); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 100%; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
 
 /* F7: an empty provider is its header line, one sentence and its action: a single dashed row (Team without a ledger, an Inbox with no
    source). Never a card with a body gap, never an empty box. The action opens the compose box under the line. */
@@ -1651,3 +1743,108 @@ body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:pl
 body.ke .deck { min-height: 100vh; display: flex; flex-direction: column; }
 body.ke .deck > main.frame { flex: 1 0 auto; }
 body.ke .deck > * { flex-shrink: 0; }
+
+/* ── the Memory tab (K6): one neocortex card, crystals beside cognition, identity as one list ───────────────────────── */
+body.ke .ck-zgrid > .ck-mem-card, body.ke .ck-zgrid > .ck-mem-row { grid-column: 1 / -1; }
+body.ke .ck-zgrid .ck-mem-card { height: auto; max-height: none; background: var(--card); border: 1px solid var(--hair); }
+body.ke .ck-mem-card > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-mem-card > .phead .ck-count { margin-left: 0; }
+body.ke .ck-mem-meta { font: var(--fw-regular) var(--fs-meta)/1.3 var(--sans); color: var(--label); }
+body.ke .ck-mem-card > .pbody { max-height: none; overflow: visible; }
+body.ke .ck-mem-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: var(--sp-8, 40px); align-items: start; }
+body.ke .ck-mem-cols.ck-mem-one { grid-template-columns: minmax(0, 1fr); }
+body.ke .ck-mem-col { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-zgrid .panel.ck-mem-nest { height: auto; max-height: none; border: 0; border-radius: 0; background: none; overflow: visible; padding: 0; margin: 0; }
+/* the size classes cap a card's height; a nested section is never cut, so its cap is lifted at their specificity (heights only) */
+body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-short, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-medium, body.ke .ck-zgrid .panel.ck-mem-nest.ck-h-tall { height: auto; max-height: none; }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest { padding: var(--sp-5) 0 0; margin-top: var(--sp-5); border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .ck-mem-col > .ck-mem-nest:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+body.ke .ck-zgrid .ck-mem-nest > .phead { padding: 0 0 var(--sp-3); }
+body.ke .ck-zgrid .ck-mem-nest > .phead h2 { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
+body.ke .ck-mem-nest > .phead > :not(h2) { display: none; }
+body.ke .ck-zgrid .ck-mem-nest > .pbody { padding: 0; max-height: none; overflow: visible; }
+body.ke .ck-mem-nest .edit-trigger-row { margin-top: var(--sp-2); }
+body.ke .ck-mem-pats .md-ul, body.ke .ck-mem-pats .md-ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-pats .md-li::before, body.ke .ck-mem-pats .md-li::marker { content: none; display: none; }
+body.ke .ck-mem-decs .md-li::before { content: none; display: none; }
+body.ke .ck-mem-dec { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-dec > .ck-mem-li, body.ke .ck-mem-dec > .ck-mem-cont { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
+body.ke .ck-mem-dec > .ck-mem-cont { grid-template-columns: minmax(0, 1fr); padding-left: calc(3.2rem + var(--sp-4)); }
+body.ke .ck-mem-decs { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-decs .md-p, body.ke .ck-mem-pats .md-p { margin: 0; }
+body.ke .ck-mem-li { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); gap: var(--sp-4); align-items: baseline; }
+body.ke .ck-mem-n { font: var(--fw-bold) var(--fs-meta)/1.5 var(--mono); color: var(--accent); }
+body.ke .ck-mem-t { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-mem-name { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; }
+body.ke .ck-mem-rest, body.ke .ck-mem-cite { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.4; overflow-wrap: anywhere; }
+body.ke .ck-mem-group { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); padding-top: var(--sp-3); }
+body.ke .ck-mem-group:first-child { padding-top: 0; }
+body.ke .ck-zgrid .panel.ck-mem-slim { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-3); }
+body.ke .ck-zgrid .ck-mem-slim > .phead { padding: 0; }
+body.ke .ck-zgrid .ck-mem-slim .edit-trigger-row { margin: 0; }
+body.ke .ck-mem-slim > .pbody { flex: 1 1 auto; min-width: 0; }
+body.ke .ck-mem-slim > .pbody:has(.editor) { flex-basis: 100%; }
+body.ke .ck-mem-slim .empty { margin: 0; color: var(--label); }
+body.ke .ck-mem-when { font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--label); }
+body.ke .ck-mem-text { overflow-wrap: anywhere; min-width: 0; }
+body.ke .ck-mem-text .ck-mem-when { margin-right: var(--sp-2); }
+/* crystals beside cognition */
+body.ke .ck-mem-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: var(--gap); align-items: start; }
+body.ke .ck-zgrid .ck-mem-row > .panel { height: auto; min-height: 0; max-height: none; min-width: 0; }
+body.ke .ck-mem-row > .panel > .phead { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
+body.ke .ck-zgrid .ck-mem-row .pbody { max-height: none; overflow: visible; }
+body.ke .ck-crys { align-content: start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 var(--sp-8, 40px); }
+body.ke .ck-crys .row { display: flex; flex-wrap: nowrap; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-bottom: 1px solid var(--hair); }
+body.ke .ck-crys .lvl { color: var(--accent); font: var(--fw-bold) var(--fs-lead)/1 var(--round); min-width: 2rem; }
+body.ke .ck-crys .lvl { flex: none; }
+body.ke .ck-crys-t { display: flex; flex-direction: column; gap: 2px; flex: 1 1 0; min-width: 0; }
+body.ke .ck-crys .name { font: var(--fw-regular) var(--fs-meta)/1.4 var(--mono); overflow-wrap: break-word; word-break: normal; min-width: 0; }
+body.ke .ck-crys .ck-crys-meta { color: var(--label); font-size: var(--fs-micro, var(--fs-meta)); line-height: 1.3; overflow-wrap: anywhere; }
+body.ke .ck-crys .clause { flex: none; color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap { display: flex; flex-direction: column; gap: var(--sp-2); }
+body.ke .ck-mem-cog .scope-plot { display: flex; gap: var(--sp-6); align-items: center; }
+body.ke .ck-mem-cog .scope-box { flex: 1 1 0; min-width: 0; min-height: 0; }
+body.ke .ck-mem-cog .scope-box svg.scope { height: 150px; border: 0; background: none; }
+body.ke .ck-mem-cog .scope-legend { flex: 0 0 auto; flex-direction: column; gap: var(--sp-3); margin: 0; }
+body.ke .ck-mem-cog .scope-ch { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0 var(--sp-2); text-align: left; }
+body.ke .ck-mem-cog .scope-ch::before { content: ""; display: block; width: 10px; height: 2px; background: currentColor; margin-bottom: 2px; }
+body.ke .ck-mem-cog .scope-ch-l { font-weight: var(--fw-bold); color: var(--text); }
+body.ke .ck-mem-cog .scope-ch-v { color: var(--label); font-size: var(--fs-meta); }
+body.ke .ck-mem-cog .scope-wrap > .note { display: none; }
+/* identity: one card of rows. Each identity card IS its row: title | one-line summary | the card's own Edit. The body of the card is
+   flattened into the row's grid (display: contents), the summary is the card's own first paragraph cut to one line, and the editor, when
+   opened, takes the next row of the same card. Nothing is hidden and no node is added. */
+body.ke .ck-mem-ident .ck-mem-meta { margin-left: 0; }
+body.ke .ck-mem-ilist { display: flex; flex-direction: column; }
+body.ke .ck-zgrid .panel.ck-mem-rowcard { display: grid; grid-template-columns: minmax(8rem, 15rem) minmax(0, 1fr) auto; column-gap: var(--sp-6); align-items: center; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }
+body.ke .ck-zgrid .panel.ck-mem-rowcard:first-child { border-top: 0; }
+body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; padding: 0; }
+body.ke .ck-mem-rowcard > .phead h2 { font: var(--fw-semibold) var(--fs-body, 14px)/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); }
+body.ke .ck-mem-rowcard > .pbody { display: contents; }
+body.ke .ck-mem-rowcard .pbody > * { display: none; }
+body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { display: block; grid-column: 2; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; }
+body.ke .ck-mem-rowcard .section-display > * { display: none; }
+body.ke .ck-mem-rowcard .section-display > .md-p:first-of-type { display: block; }
+body.ke .ck-mem-rowcard .md-p { margin: 0; color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .ck-mem-rowcard .pbody > .err { color: var(--bad); white-space: normal; }
+body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { display: block; grid-column: 3; grid-row: 1; margin: 0; padding: 0; }
+body.ke .ck-mem-rowcard > .ext-note, body.ke .ck-mem-rowcard .pbody > .ext-note { display: block; grid-column: 1 / -1; grid-row: 2; margin: var(--sp-1) 0 0; }
+body.ke .ck-mem-rowcard .edit-btn { text-transform: capitalize; min-height: 32px; }
+body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { display: block; grid-column: 1 / -1; grid-row: 3; margin-top: var(--sp-3); }
+body.ke .ck-mem-rowcard:has(.text-editor:not([hidden])) .md-p, body.ke .ck-mem-rowcard:has(.editor) .md-p { display: none; }
+@media (max-width: 720px) {
+  body.ke .ck-mem-cols, body.ke .ck-mem-row, body.ke .ck-crys { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-mem-cog .scope-plot { flex-direction: column; align-items: stretch; }
+  body.ke .ck-mem-cog .scope-box { flex: none; }
+  body.ke .ck-mem-cog .scope-legend { flex-direction: row; flex-wrap: wrap; }
+  body.ke .ck-zgrid .panel.ck-mem-rowcard { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-1); }
+  body.ke .ck-mem-rowcard > .phead { grid-column: 1; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .section-display, body.ke .ck-mem-rowcard .pbody > .md-p:first-of-type, body.ke .ck-mem-rowcard .pbody > .err, body.ke .ck-mem-rowcard .pbody > .empty { grid-column: 1 / -1; grid-row: 2; }
+  body.ke .ck-mem-rowcard > .edit-trigger-row, body.ke .ck-mem-rowcard .pbody > .edit-trigger-row { grid-column: 2; grid-row: 1; }
+  body.ke .ck-mem-rowcard .pbody > .text-editor:not([hidden]), body.ke .ck-mem-rowcard .pbody > .editor { grid-row: 4; }
+  body.ke .ck-mem-rowcard > .ext-note, body.ke .ck-mem-rowcard .pbody > .ext-note { grid-row: 3; }
+}
+/* the retired Health strip: its figures are the Cognition card's header and chart (the Morning glance keeps its own Health tile) */
+body.ke[data-mode="memory"] .ck-widgets { display: none; }
+body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
+body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }

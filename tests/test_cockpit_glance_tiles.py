@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
@@ -157,3 +159,27 @@ def test_openability_is_one_rule_faults_revoke_it_and_a_heading_never_stands_alo
     assert out[2][0] == 0 and out[2][1] == 0, out
     assert out[3] == ["button", None, "button"], out
     assert out[4][0] == ["ext-grouphead:g1", "row:row g1", "xnote:+1 more"] and out[4][1] is True, out
+
+
+@needs_browser
+@pytest.mark.parametrize("width", [800, 880])
+def test_tiles_keep_a_minimum_width_at_half_screen_laptop_width(tmp_path: Path, width: int) -> None:
+    """The column count follows the tile count AND the room: at ~800px (past the 720px phone rule, a half-screen laptop) rows of
+    four left tiles of 170-230px and multi-figure tiles clipped. Five, six and eight tiles: none under 200px. 880px is the boundary a
+    cap that ignores the grid gap misses (four columns of ~182px)."""
+    _root, src, _ids = _install(tmp_path)
+    probe = ("(async () => { await new Promise(r => setTimeout(r, 400)); const w = document.querySelector('.ck-widgets'); const K = window.LevainCockpitKinds;"
+             " const seed = w.children[0]; const run = (n) => { while (w.children.length < n) w.appendChild(seed.cloneNode(true));"
+             " while (w.children.length > n) w.lastChild.remove(); K.fillGrids();"
+             " const cards = [...w.children].filter(c => c.offsetParent !== null);"
+             " return [w.dataset.shape, cards.length, Math.round(Math.min(...cards.map(c => c.getBoundingClientRect().width)))]; };"
+             " return [6, 7, 9].map(run); })()   // one seeded child is hidden: 5, 6 and 8 shown")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": width, "h": 900, "dpr": 1}},
+            {"until": "document.querySelector('.ck-widgets') && document.querySelector('.ck-widgets').children.length > 0 && 1"},
+            {"eval": probe},
+        ])["values"]
+    for shape, n, narrowest in out[1]:
+        assert shape == "tiles" and n > 4, out
+        assert narrowest >= 200, f"a tile is {narrowest}px wide at {width}px with {n} tiles: {out}"

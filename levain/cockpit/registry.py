@@ -80,6 +80,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "undoable": ("bool", _is_bool),
     "crystal_level": ("int", _is_int),
     "permanence": ("str", _is_str),
+    "activation_mode": ("str", _is_str),
     "last_activated_on": ("date|null", _opt(_is_str)),
     "tags": ("list[str]", _is_str_list),
     "legacy_meta": ("str", _is_str),
@@ -112,6 +113,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_n": ("int", _is_int),
     "question_state": ("enum", _enum("open", "answered")),
     "question_options": ("int", _is_int),
+    "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
 

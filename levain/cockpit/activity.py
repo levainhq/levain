@@ -778,6 +778,6 @@ def activity_reader(*, install_root: Path | None, episodic_db: Path,
             events.sort(key=lambda e: (_parse(e["at"]) or start, e["kind"]))
         # the window is its length only: a clock-stamped start/end would change the value on every read, so an
         # idle install would stream panel-changed for ever
-        return Read(value={"events": events, "legend": LEGEND, "window": {"hours": ACTIVITY_WINDOW_H},
+        return Read(value={"events": events, "legend": LEGEND, "dialect": "levain", "window": {"hours": ACTIVITY_WINDOW_H},
                            "errors": errors, "unreadable": unreadable})
     return read

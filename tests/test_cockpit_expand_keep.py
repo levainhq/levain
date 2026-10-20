@@ -61,6 +61,8 @@ SCROLLER = ("(r) => { for (let n = r.parentElement; n; n = n.parentElement) "
 COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render; "
                  "L.render = function () { try { return o.apply(this, arguments); } finally { window.__r++; } }; 1")
 BOARD = "#board"
+# the fixture rows are capped to a 160-character title: they clamp only on a narrow card (a lone card now stretches to the page width)
+NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 
 
 def _assert_held(v: list[Any], opened: list[Any], held: list[Any], scroll: Any, why: str) -> None:
@@ -147,7 +149,8 @@ def _things(state: dict[str, Any], names: list[str], search: bool = False) -> An
 @needs_browser
 def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> None:
     """A typed panel whose data moved repaints its body without a board render: the row the reader opened stays open
-    and closable, found by its id (the other row moving must not shift the open state onto it)."""
+    and closable, found by its id (the other row moving must not shift the open state onto it).
+    The drive is NARROW (390px) because the three-line clamp only fires on a narrow card; wider, no row is clamped to expand."""
     from levain.cockpit.providers import build_default_cockpit
 
     _root, src = _install_long(tmp_path)
@@ -157,6 +160,7 @@ def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> Non
     rows = f"[...{panel}.querySelectorAll('.row')]"
     with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
         out = _drive(tmp_path, f"{url}/", [
+            NARROW,
             {"until": f"{panel} && {rows}.filter(r => r.classList.contains('has-more')).length === 2 && 1"},
             {"eval": _open_in("[data-ck-panel=things]", key="beta")},
             {"eval": COUNT_RENDERS},
@@ -174,7 +178,8 @@ def test_a_panel_repainted_in_place_keeps_an_expanded_row(tmp_path: Path) -> Non
 @needs_browser
 def test_a_store_search_answer_keeps_an_expanded_row(tmp_path: Path) -> None:
     """A searchable typed panel repaints a second time when its store search answers, after a refetch has restored its
-    rows: the row open among the answers stays open."""
+    rows: the row open among the answers stays open.
+    The drive is NARROW (390px) because the three-line clamp only fires on a narrow card; wider, no row is clamped to expand."""
     from levain.cockpit.providers import build_default_cockpit
 
     _root, src = _install_long(tmp_path)
@@ -184,6 +189,7 @@ def test_a_store_search_answer_keeps_an_expanded_row(tmp_path: Path) -> None:
     panel = f"document.querySelector('{sel}')"
     with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
         out = _drive(tmp_path, f"{url}/", [
+            NARROW,
             {"until": f"{panel} && {panel}.querySelector('.xfilter-input') && 1"},
             {"eval": f"(() => {{ const i = {panel}.querySelector('.xfilter-input'); i.value = 'old'; i.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"},
             {"until": f"{panel}.querySelectorAll('.row.has-more[data-keep-key^=old]').length > 0 && 1", "ms": 20000},

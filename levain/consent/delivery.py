@@ -707,9 +707,9 @@ def deliver_undelivered(queue: ConsentQueue, **kw: Any) -> list[Delivery]:
     return out
 
 
-def agent_notify(queue_dir: Path, agent: str) -> Callable[[str], Any] | None:
-    """The ping for a ruling's delivery under the request's own agent's settings (its notify command and phone URL),
-    or ``None`` when that agent has none configured."""
+def agent_notify(queue_dir: Path, agent: str, request_id: str | None = None) -> Callable[[str], Any] | None:
+    """The ping for a ruling's delivery under the request's own agent's settings (its notify command and phone URL,
+    and the phone's web push when pings are on), or ``None`` when that agent has no ping configured."""
     from levain.consent.adapters import claude_code, codex
 
     adapter = {_CLAUDE: claude_code, _CODEX: codex}.get(agent)
@@ -717,7 +717,8 @@ def agent_notify(queue_dir: Path, agent: str) -> Callable[[str], Any] | None:
         settings = adapter.load_settings(queue_dir) if adapter is not None else None
     except Exception:  # noqa: BLE001 - a ping is optional
         return None
-    if settings is None or not getattr(settings, "notify_argv", None):
+    if settings is None or not claude_code.ping_configured(settings, queue_dir):
         return None
     send = getattr(adapter, "notify", claude_code.notify)   # Codex shares Claude Code's notify seam
-    return lambda text: send(settings, text, cwd=queue_dir)
+    ref = None if request_id is None else f"request:{request_id}"
+    return lambda text: send(settings, text, cwd=queue_dir, kind="ruling", ref=ref)

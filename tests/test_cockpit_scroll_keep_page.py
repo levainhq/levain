@@ -16,9 +16,12 @@ from levain.web_server import make_server
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 
-# every direct child of the board is tall, so the page's height comes from the board (the thing a reload empties)
-TALL = ("(() => { const s = document.createElement('style'); s.textContent = '#board > * { min-height: 900px; }';"
-        " document.head.appendChild(s); return document.documentElement.scrollHeight; })()")
+# the page's height comes from rules that match what a repaint RECREATES (inline styles on the existing children would
+# be thrown away with them, and the page would shrink for the wrong reason). The page's CSP (style-src 'self') refuses a
+# <style> element, but a rule inserted through the CSSOM into an existing stylesheet applies. No padding on #board itself:
+# an emptied board must make the page SHORT, or the clamp this guards never happens.
+TALL = ("(() => { const ss = document.styleSheets[0]; ss.insertRule('#board > * { min-height: 1600px !important; }', ss.cssRules.length);"
+        " return document.documentElement.scrollHeight; })()")
 # count the renders (the boot code calls LevainDashboard.render on every load) without changing what they do
 COUNT = ("(() => { const L = window.LevainDashboard, r = L.render; window.__renders = 0;"
          " L.render = function () { try { return r.apply(this, arguments); } finally { window.__renders++; } }; return 1; })()")

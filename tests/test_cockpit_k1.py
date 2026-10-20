@@ -1094,7 +1094,8 @@ class TestSession2Gaps:
             "now": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
-            "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C"}      # the Team zone's one card: this install root has no team ledger
+            "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",
+            "notifications": None}      # the Team zone's one card: this install root has no team ledger
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
         assert sections and all(c in ("A", "B", "C") for c in sections.values())
 
@@ -1111,6 +1112,17 @@ class TestSession2CompactNow:
         for r in now["rows"]:
             assert tray[r["id"]]["version"] == r["version"] and tray[r["id"]]["group"] == r["group"]
         assert now["count"] == full["count"]
+
+
+class TestK6CrystalMode:
+    def test_a_crystal_row_carries_its_activation_mode_to_the_page(self, env) -> None:
+        """The Memory tab draws a crystal's mode (K6 r3, codex): the row must carry it as a facet, not only in stored."""
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(
+            '{"crystal": [{"name": "good", "status": "crystallized", "level": 2, "explanation": "x",'
+            ' "activation_mode": "always", "permanence": "permanent"}]}')
+        rows = ck.panel("crystals")["rows"]
+        assert [r["facets"].get("activation_mode") for r in rows] == ["always"]
 
 
 class TestL3R4Fixes:
