@@ -2037,27 +2037,74 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
   .tv-more { justify-self: start; }
   .tv-no-tasks { grid-column: 2; grid-row: 2; }
 }
-/* the Agents lens: the hub, then one column per group, one row per node */
-.tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); }
-.tv-hub { align-self: center; display: flex; align-items: baseline; gap: var(--sp-4); padding: var(--sp-3) var(--sp-6); border: 1px solid var(--hair-2); border-radius: var(--r-pill); background: var(--card-2); }
-.tv-hub b { font: var(--fw-bold) var(--fs-lead) var(--round); color: var(--text); }
-.tv-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: var(--sp-5); align-items: start; }
-.tv-col { position: relative; display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; padding-top: var(--sp-5); border-top: 1px solid var(--hair-2); }
-.tv-col::before { content: ""; position: absolute; top: calc(-1 * var(--sp-5)); left: 50%; height: var(--sp-5); border-left: 1px solid var(--hair-2); }
-.tv-col-h { display: flex; align-items: center; gap: var(--sp-3); }
-.tv-col-h b { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
-.tv-node { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card-2); min-width: 0; }
-.tv-node .tv-dot { margin-top: .45em; }
-.tv-node.sub { margin-left: var(--sp-5); }
-.tv-node.waiting { border-color: var(--accent-line); background: var(--accent-soft); }
-.tv-node.stalled { border-style: dashed; border-color: var(--warn); }
-.tv-node.errored { border-color: var(--bad); }
-.tv-node.idle { background: none; }
-.tv-node-b { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
-.tv-node-t { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
-.tv-node-t b { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow-wrap: anywhere; }
-.tv-node-m, .tv-node-f { font-size: var(--fs-meta); color: var(--label); overflow-wrap: anywhere; }
-.tv-node-f { color: var(--meta); }
+/* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
+.tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
+.tv-stage { position: relative; min-width: 0; overflow: hidden; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.tv-graph { position: relative; z-index: 1; display: block; width: 100%; height: auto; }
+.tv-particles { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; color: var(--text); }
+:root[data-theme="light"] .tv-particles { color: var(--label); }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .tv-particles { color: var(--label); } }
+.tv-hint { position: absolute; z-index: 2; top: var(--sp-4); right: var(--sp-5); color: var(--meta); font-size: var(--fs-micro); pointer-events: none; }
+.tv-gring { fill: none; stroke: var(--hair); stroke-width: 1; stroke-dasharray: 1 5; stroke-linecap: round; opacity: .9; }
+.tv-edge { fill: none; stroke: var(--hair-2); stroke-width: 1.1; opacity: .55; }
+.tv-edge.hub { stroke-width: 1.4; }
+.tv-edge.still { stroke: var(--hair); stroke-dasharray: 2 4; opacity: .9; }
+.tv-edge.waiting { stroke: var(--accent-line); opacity: .8; }
+.tv-confline { fill: none; stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 5 4; opacity: .9; }
+.tv-confchip { fill: var(--base); stroke: var(--warn); stroke-width: 1; }
+.tv-conftext { fill: var(--warn); font: var(--fw-semibold) 11px var(--mono); }
+.tv-hubhalo { fill: none; stroke: var(--hair-2); stroke-width: 1.5; opacity: .5; }
+.tv-hubbody { fill: var(--card-2); stroke: var(--hair-2); stroke-width: 1.5; }
+.tv-hubcore { fill: var(--meta); }
+.tv-hubcore.run, .tv-gcore.run { fill: var(--ok); }
+.tv-lblbg { fill: var(--base); fill-opacity: .88; }
+.tv-hubname { fill: var(--text); font: var(--fw-bold) 14px var(--round); }
+.tv-hubsub, .tv-gsub { fill: var(--meta); font: var(--fw-medium) 11px var(--mono); }
+.tv-gbody { fill: var(--card-2); stroke: var(--hair-2); stroke-width: 1.6; }
+.tv-ggroup.waiting .tv-gbody { stroke: var(--accent-line); }
+.tv-gcore { fill: var(--meta); opacity: .7; }
+.tv-gcore.run { opacity: .85; }
+.tv-gname { fill: var(--text); font: var(--fw-bold) 13px var(--round); }
+.tv-gnode { outline: none; }
+.tv-hit { fill: transparent; }
+.tv-ring { fill: var(--card-2); stroke-width: 1.8; stroke: var(--meta); }
+.tv-core { fill: var(--meta); }
+.tv-gnode:hover .tv-ring, .tv-gnode:focus-visible .tv-ring { stroke-width: 2.6; }
+.tv-gnode.running .tv-ring { stroke: var(--ok); stroke-opacity: .55; }
+.tv-gnode.running .tv-core { fill: var(--ok); }
+.tv-gnode.stalled .tv-ring { stroke: var(--warn); stroke-dasharray: 3.2 3; }
+.tv-gnode.stalled .tv-core { fill: var(--warn); }
+.tv-gnode.errored .tv-ring { stroke: var(--bad); }
+.tv-gnode.errored .tv-x { fill: none; stroke: var(--bad); stroke-width: 2; stroke-linecap: round; }
+.tv-gnode.idle .tv-ring { opacity: .9; }
+.tv-gnode.idle .tv-core { opacity: .8; }
+.tv-gnode.waiting .tv-ring { stroke: var(--accent); }
+.tv-gnode.waiting .tv-core { fill: var(--accent); }
+.tv-glow { fill: var(--accent); stroke: none; }
+.tv-pulse { fill: none; stroke: var(--accent); stroke-width: 2; opacity: .62; transform-box: fill-box; transform-origin: center; }
+.tv-gnode-risk { fill: var(--warn); }
+.tv-facebg { fill: var(--base); fill-opacity: .82; }
+.tv-tagpill { fill: var(--accent); }
+.tv-facetag { fill: var(--meta); font: var(--fw-bold) 10px var(--round); }
+.tv-gnode.waiting .tv-facetag { fill: var(--on-accent); }
+.tv-gnode.errored .tv-facetag { fill: var(--bad); }
+.tv-gnode.stalled .tv-facetag { fill: var(--warn); }
+.tv-face1 { fill: var(--text); font: var(--fw-semibold) 12px var(--round); }
+.tv-gnode.idle .tv-face1 { fill: var(--label); }
+.tv-face2 { fill: var(--label); font: var(--fw-medium) 11px var(--mono); }
+.tv-face2.unk { fill: var(--meta); }
+.tv-face3 { fill: var(--meta); font: var(--fw-medium) 11px var(--mono); }
+.tv-gnode.tv-open { cursor: pointer; }
+.tv-gnode.tv-open:focus-visible .tv-facebg { stroke: var(--accent); stroke-width: 2; }
+.tv-tip { position: absolute; z-index: 3; min-width: 190px; max-width: 280px; padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); color: var(--text); font-size: var(--fs-meta); pointer-events: none; box-shadow: 0 6px 24px color-mix(in oklch, var(--base), black 55%); }
+.tv-tip[hidden] { display: none; }
+.tv-tip b { display: block; margin-bottom: var(--sp-2); font: var(--fw-bold) var(--fs-body) var(--round); overflow-wrap: anywhere; }
+.tv-tl { display: inline-block; min-width: 76px; color: var(--meta); }
+.tv-lg { display: inline-block; flex: none; width: 10px; height: 10px; box-sizing: border-box; border-radius: 50%; border: 2px solid var(--meta); background: none; }
+.tv-lg.waiting { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 25%, transparent); }
+.tv-lg.errored { border-color: var(--bad); }
+.tv-lg.stalled { border: 2px dashed var(--warn); }
+.tv-lg.running { border-color: var(--ok); }
 .tv-lit { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* F12c: Lost if closed, its own panel. Beside the Sessions card from 1440 px (360 px wide), under it below; phone: a stacked card. */
 .k7-sess-wrap > .panel { grid-column: auto; }      /* the page's generic panel span is for the board grid, not this wrap */
@@ -2084,8 +2131,9 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .lc-ok, .lc-unread { margin-left: auto; white-space: nowrap; color: var(--ok); }
 .lc-unread { color: var(--meta); }
 .lc-foot { margin: var(--sp-4) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); font-size: var(--fs-micro); color: var(--meta); }
-@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec, .tv-node.waiting { animation: tv-breathe 3.2s ease-in-out 3; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
+@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
+@keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
