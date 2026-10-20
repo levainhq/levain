@@ -2,8 +2,12 @@
 
 ``levain consent rule 1 allow --session <sid>`` on an ended Claude Code session printed "a process naming this session
 may be running" with no claude process alive: :func:`levain.consent.delivery.session_named_running` matched the id as
-a substring of any command line, the rule command's own included, so a late ruling was never auto-resumed. The tests
-(all but the unreadable-list one) run real processes whose command lines carry the id and read them through ``ps``.
+a substring of any command line, the rule command's own included, so a late ruling was never auto-resumed.
+
+A ``False`` is only true of the process list it read, and any machine running a ``claude -c`` or a ``--resume`` picker
+(every dev seat runs inside one) reads ``None``. So every test that asserts ``False`` reads a list it controls: a
+synthetic one, or the real ``ps`` cut down to the processes the test started (:func:`ps_only`). The ``True`` and
+``None`` tests read the whole real list: no stray process can turn either into another answer.
 """
 from __future__ import annotations
 
@@ -19,11 +23,30 @@ import pytest
 from levain.consent import delivery as dv
 
 _WAIT = "import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text('up'); time.sleep(60)"
+_REAL_RUN = subprocess.run
 
 
 @pytest.fixture
 def session():
     return str(uuid.uuid4())
+
+
+@pytest.fixture
+def ps_only(monkeypatch):
+    """Make ``ps`` (and only ``ps``: ``lsof`` stays real) show the given lines, or the real list's lines for the given
+    pids. Call it with ``lines=[...]`` and/or ``pids=[...]``."""
+    def use(lines=(), pids=()):
+        keep = {str(p) for p in pids}
+
+        def run(argv, *a, **k):
+            if argv[0] != "ps":
+                return _REAL_RUN(argv, *a, **k)
+            real = _REAL_RUN(argv, *a, **k).stdout.splitlines() if keep else []
+            shown = [ln for ln in real if ln.strip().partition(" ")[0] in keep] + list(lines)
+            return subprocess.CompletedProcess(argv, 0, "\n".join(shown) + "\n", "")
+
+        monkeypatch.setattr(dv.subprocess, "run", run)
+    return use
 
 
 @pytest.fixture
@@ -49,70 +72,110 @@ def spawn(tmp_path):
         proc.wait()
 
 
-def test_a_process_that_only_mentions_the_session_does_not_count(spawn, session):
-    spawn("levain", "consent", "rule", "1", "allow", "--session", session, "--agent", "claude_code")
-    spawn("tail", "-f", f"/Users/x/.claude/projects/-w/{session}.jsonl")
-    spawn("vim", f"--session={session}", "notes about resume", session)            # a "resume" with no codex token
+@pytest.fixture
+def standin(tmp_path):
+    """Start a harmless stand-in named ``claude`` or ``codex`` (a shell script that sleeps, first on PATH), never the
+    real CLI: ps then shows ``/bin/sh <dir>/<name> <args>``, the interpreter first and the name second. ``start.bindir``
+    is the stand-ins' directory, for a test that names one by its full path."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("claude", "codex"):
+        (bindir / name).write_text("#!/bin/sh\nsleep 60\n")
+        (bindir / name).chmod(0o755)
+    procs = []
+
+    def start(*argv: str, cwd: Path | None = None) -> subprocess.Popen:
+        proc = subprocess.Popen(list(argv), env={**os.environ, "PATH": f"{bindir}:/bin:/usr/bin"}, cwd=cwd,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(proc)
+        time.sleep(0.2)
+        assert proc.poll() is None
+        return proc
+
+    start.bindir = bindir
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+# a child that runs the check over the real ps cut down to its parent's line: the parent's own argv is the subject
+_CHILD = (f"import os, subprocess, sys; sys.path.insert(0, {str(Path(dv.__file__).parents[2])!r}); "
+          "from levain.consent import delivery as dv; real = subprocess.run; parent = str(os.getppid())\n"
+          "def run(argv, *a, **k):\n"
+          "    got = real(argv, *a, **k)\n"
+          "    if argv[0] != 'ps': return got\n"
+          "    lines = [ln for ln in got.stdout.splitlines() if ln.strip().partition(' ')[0] == parent]\n"
+          "    return subprocess.CompletedProcess(argv, 0, '\\n'.join(lines) + '\\n', '')\n"
+          "dv.subprocess.run = run\n"
+          "print(dv.session_named_running(sys.argv[1]))")
+
+
+def test_a_process_that_only_mentions_the_session_does_not_count(ps_only, session):
+    ps_only(lines=[f"101 levain consent rule 1 allow --session {session} --agent claude_code",
+                   f"102 tail -f /Users/x/.claude/projects/-w/{session}.jsonl",
+                   f"103 vim --session={session} notes about resume {session}"])  # a "resume" with no codex token
     assert dv.session_named_running(session) is False
 
 
-def test_the_calling_process_itself_never_counts(spawn, session, monkeypatch):
-    proc = spawn("claude", "--resume", session)                 # stands in for this process, whatever its argv
-    monkeypatch.setattr(dv.os, "getpid", lambda: proc.pid)
+def test_the_calling_process_itself_never_counts(ps_only, session):
+    ps_only(lines=[f"{os.getpid()} claude --resume {session}"])     # stands in for this process, whatever its argv
     assert dv.session_named_running(session) is False
 
 
-def test_an_ancestor_that_only_mentions_the_session_does_not_count(spawn, session, tmp_path):
+def test_an_ancestor_that_only_mentions_the_session_does_not_count(session, tmp_path):
     """The rule command run from a shell: the shell and the command both name the id; neither resumes it."""
-    child = (f"import sys; sys.path.insert(0, {str(Path(dv.__file__).parents[2])!r}); "
-             "from levain.consent import delivery as dv; print(dv.session_named_running(sys.argv[1]))")
     script = tmp_path / "rule.sh"
     script.write_text(f'"{sys.executable}" -c "$1" "$2" --session "$2"; echo done\n')
-    got = subprocess.run(["/bin/sh", str(script), child, session, "levain", "consent", "rule", "--session", session],
+    got = subprocess.run(["/bin/sh", str(script), _CHILD, session, "levain", "consent", "rule", "--session", session],
                          capture_output=True, text=True, timeout=60)
     assert got.stdout.split() == ["False", "done"], got.stderr
 
 
-def test_a_limits_extend_caller_does_not_count_itself(spawn, session, tmp_path):
+def test_a_limits_extend_caller_does_not_count_itself(ps_only, spawn, session, tmp_path):
     """Q13 L4 Case R: `levain limits --queue-dir <q> extend <sid> --hold 120` was the only process naming the sid, and
     its own check read it as a running session, so the lifted halt resumed nothing."""
-    child = (f"import sys; sys.path.insert(0, {str(Path(dv.__file__).parents[2])!r}); "
-             "from levain.consent import delivery as dv; print(dv.session_named_running(sys.argv[1]))")
-    got = subprocess.run([sys.executable, "-c", child, session, "/v/bin/levain", "limits", "--queue-dir",
+    script = tmp_path / "extend.sh"
+    script.write_text(f'"{sys.executable}" -c "$1" "$2"; echo done\n')
+    got = subprocess.run(["/bin/sh", str(script), _CHILD, session, "/v/bin/levain", "limits", "--queue-dir",
                           str(tmp_path / "consent"), "extend", session, "--hold", "120"],
                          capture_output=True, text=True, timeout=60)
-    assert got.stdout.split() == ["False"], got.stderr
-    spawn("/v/bin/levain", "limits", "--queue-dir", str(tmp_path / "consent"), "extend", session, "--hold", "120")
+    assert got.stdout.split() == ["False", "done"], got.stderr
+    proc = spawn("/v/bin/levain", "limits", "--queue-dir", str(tmp_path / "consent"), "extend", session, "--hold",
+                 "120")
+    ps_only(pids=[proc.pid])
     assert dv.session_named_running(session) is False             # nor does another extend of it
 
 
 def test_an_ancestor_that_resumes_the_session_counts(session, tmp_path):
-    """A hook of a running resume delivering to its own session: the session is running, never resumed again."""
-    child = (f"import sys; sys.path.insert(0, {str(Path(dv.__file__).parents[2])!r}); "
-             "from levain.consent import delivery as dv; print(dv.session_named_running(sys.argv[1]))")
-    script = tmp_path / "hook.sh"
-    script.write_text(f'"{sys.executable}" -c "$1" "$2"; echo done\n')
-    got = subprocess.run(["/bin/sh", str(script), child, session, "claude", "-p", "--resume", session],
-                         capture_output=True, text=True, timeout=60)
+    """A hook of a running resume delivering to its own session: the session is running, never resumed again. The
+    ancestor is a stand-in named ``claude`` run as ``claude -p --resume <id>``, which runs the check."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "claude").write_text('#!/bin/sh\n"$LV_PY" -c "$LV_CHILD" "$LV_SID"; echo done\n')
+    (bindir / "claude").chmod(0o755)
+    got = subprocess.run([str(bindir / "claude"), "-p", "--resume", session], capture_output=True, text=True,
+                         timeout=60, env={**os.environ, "LV_PY": sys.executable, "LV_CHILD": _CHILD,
+                                          "LV_SID": session})
     assert got.stdout.split() == ["True", "done"], got.stderr
 
 
 @pytest.mark.parametrize("argv", [
     ("claude", "-p", "--resume={s}", "--permission-mode", "bypassPermissions", "levain: ruling on gap #1"),
-    ("/Users/x/.local/bin/claude", "--bg", "--resume", "{s}"),
+    ("{bin}/claude", "--bg", "--resume", "{s}"),
     ("claude", "-r", "{s}"),
-    ("/opt/homebrew/bin/codex", "exec", "resume", "-c", "k=v", "{s}", "it's the answer"),
+    ("{bin}/codex", "exec", "resume", "-c", "k=v", "{s}", "it's the answer"),
     ("codex", "resume", "{s}"),
 ])
-def test_a_real_resume_of_the_session_counts(spawn, session, argv):
-    spawn(*(a.format(s=session) for a in argv))
+def test_a_real_resume_of_the_session_counts(standin, session, argv):
+    standin(*(a.format(s=session, bin=standin.bindir) for a in argv))
     assert dv.session_named_running(session) is True
 
 
-def test_a_resume_of_another_session_does_not_count(spawn, session):
+def test_a_resume_of_another_session_does_not_count(ps_only, session):
     other = str(uuid.uuid4())
-    spawn("claude", f"--resume={other}", "--session", session)
-    spawn("codex", "exec", "resume", other, f"look at {session}")
+    ps_only(lines=[f"201 claude --resume={other} --session {session}",
+                   f"202 codex exec resume {other} look at {session}"])
     assert dv.session_named_running(session) is False
 
 
@@ -129,31 +192,6 @@ def test_an_unreadable_process_list_is_none(session, monkeypatch):
 
 # fix r1 (L3 r1 on the self-match fix, project_memory/1019-seatB/b3/resume_FIX_r1.md)
 
-@pytest.fixture
-def standin(tmp_path):
-    """Start a harmless stand-in named ``claude`` or ``codex`` (a shell script that sleeps, first on PATH), never the
-    real CLI: ps then shows ``/bin/sh <dir>/<name> <args>``, the interpreter first and the name second."""
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    for name in ("claude", "codex"):
-        (bindir / name).write_text("#!/bin/sh\nsleep 60\n")
-        (bindir / name).chmod(0o755)
-    procs = []
-
-    def start(*argv: str) -> subprocess.Popen:
-        proc = subprocess.Popen(list(argv), env={**os.environ, "PATH": f"{bindir}:/bin:/usr/bin"},
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        procs.append(proc)
-        time.sleep(0.2)
-        assert proc.poll() is None
-        return proc
-
-    yield start
-    for proc in procs:
-        proc.kill()
-        proc.wait()
-
-
 @pytest.mark.parametrize("argv", [("claude", "--session-id", "{s}"), ("claude", "-p", "--session-id={s}", "go")])
 def test_r1_a_fresh_run_with_the_session_id_counts(standin, session, argv):
     standin(*(a.format(s=session) for a in argv))
@@ -169,23 +207,25 @@ def test_r1_a_fresh_run_with_the_session_id_counts(standin, session, argv):
     ("codex", "exec", "resume", "my-named-session", "go on"),
 ])
 def test_r2_a_resume_without_a_session_id_is_indeterminate_and_holds(standin, session, argv, tmp_path):
-    standin(*argv)
+    standin(*argv, cwd=tmp_path)                    # a -c / --continue holds only a session of its own directory
     assert dv.session_named_running(session) is None
     meta = {"invocation": "-p", "cwd": str(tmp_path), "codex_pid": 999999}
     got = dv.route("codex", session, meta, running=lambda pid, started=None: False)
     assert got[0] == "hook" and got[1].startswith("a resume without a session id is running"), got
 
 
-def test_r2_an_id_less_word_in_a_prompt_or_another_tool_does_not_count(standin, spawn, session):
+def test_r2_an_id_less_word_in_a_prompt_or_another_tool_does_not_count(ps_only, standin, spawn, session):
     other = str(uuid.uuid4())
-    standin("codex", "exec", "please", "resume", "the", "work")          # "resume" inside a prompt
-    standin("claude", "-p", f"--resume={other}", "--permission-mode", "bypassPermissions", "use", "python", "-c")
-    spawn("python3", "-c", "x", "claude", "-c")                           # claude is not the program here
+    procs = [standin("codex", "exec", "please", "resume", "the", "work"),          # "resume" inside a prompt
+             standin("claude", "-p", f"--resume={other}", "--permission-mode", "bypassPermissions", "use", "python",
+                     "-c"),
+             spawn("python3", "-c", "x", "claude", "-c")]                          # claude is not the program here
+    ps_only(pids=[p.pid for p in procs])
     assert dv.session_named_running(session) is False
 
 
-def test_r3_an_upper_case_id_counts_for_claude(spawn, session):
-    spawn("claude", "--resume", session.upper())
+def test_r3_an_upper_case_id_counts_for_claude(standin, session):
+    standin("claude", "--resume", session.upper())
     assert dv.session_named_running(session) is True
 
 
@@ -193,3 +233,64 @@ def test_r3_an_upper_case_id_counts_for_claude(spawn, session):
 def test_r4_attached_short_resume_forms_count(standin, session, form):
     standin("claude", "-p", form.format(s=session))
     assert dv.session_named_running(session) is True
+
+
+# fix r2 (L3 r2, project_memory/1019-seatB/b4/resume_FIX_r2.md)
+
+@pytest.mark.parametrize("line, want", [
+    ("codex resume my-session compare {o}", None),             # a name resumes; the UUID is the prompt's
+    ("codex exec resume my-session --json {s}", None),
+    ("codex exec resume --output-schema {o} {s} go", True),    # an option's value is not the selector
+    ("codex exec resume --skip-git-repo-check -c k=v {s} go", True),
+    ("codex exec resume -o {s} {o} go", False),
+    ("codex resume --last {s}", None),
+])
+def test_f1_the_codex_selector_is_the_first_positional_word(ps_only, session, line, want):
+    ps_only(lines=["301 " + line.format(s=session, o=uuid.uuid4())])
+    assert dv.session_named_running(session) is want
+
+
+@pytest.mark.parametrize("line, want", [
+    ("worker --session-id {s}", False),
+    ("worker -r={s}", False),
+    ("worker -r{s}", False),
+    ("worker --resume {s}", False),
+    ("grep claude -c file", False),
+    ("vim claude -c notes", False),
+    ("python3 -c x claude --resume", False),
+    ("/Users/x/.local/share/claude/versions/2.1.304 --resume {s}", True),       # the native install's argv[0]
+    ("/Users/x/.local/share/claude/versions/2.1.304 --resume /Users/x/.claude/projects/-w/{s}.jsonl -n seat", True),
+    ("/Users/x/.local/share/claude/versions/2.1.304 --resume /Users/x/.claude/projects/-w/{o}.jsonl", False),
+    ("/Users/x/.local/share/claude/versions/2.1.304 --resume", None),
+    ("node /x/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume {s}", True),
+    ("node /x/lib/node_modules/@anthropic-ai/claude-code/cli.js -r my-name", None),
+    ("env FOO=1 claude -r {s}", True),
+    ("/bin/zsh /x/bin/claude --session-id {s}", True),
+    ("env FOO=1 codex resume {s}", True),
+    ("node /opt/homebrew/bin/codex exec resume --last", None),
+])
+def test_f2_only_a_claude_or_codex_process_counts(ps_only, session, line, want):
+    ps_only(lines=["401 " + line.format(s=session, o=uuid.uuid4())])
+    assert dv.session_named_running(session) is want
+
+
+def test_f4_a_continue_holds_only_a_session_of_its_own_directory(ps_only, standin, session, tmp_path):
+    here, there = tmp_path / "here", tmp_path / "there"
+    here.mkdir()
+    there.mkdir()
+    (tmp_path / "link").symlink_to(here)
+    procs = [standin("claude", "-c", cwd=here), standin("claude", "-p", "--continue", "go on", cwd=here)]
+    ps_only(pids=[p.pid for p in procs])
+    assert dv.session_named_running(session, str(here)) is None
+    assert dv.session_named_running(session, str(tmp_path / "link")) is None    # both sides resolved
+    assert dv.session_named_running(session, str(there)) is False
+    assert dv.session_named_running(session) is None                            # no directory to compare: holds
+    for cwd, held in ((there, False), (here, True)):
+        meta = {"invocation": "-p", "cwd": str(cwd), "codex_pid": 999999}
+        got = dv.route("codex", session, meta, running=lambda pid, started=None: False)
+        assert got[1].startswith("a resume without a session id is running") is held, got
+
+
+def test_f4_a_continue_whose_directory_cannot_be_read_holds(ps_only, session, tmp_path):
+    ps_only(lines=["2147483000 claude --continue"])              # no such process: lsof reads no cwd
+    assert dv.session_named_running(session, str(tmp_path)) is None

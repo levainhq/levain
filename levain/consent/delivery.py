@@ -507,11 +507,14 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     (``meta``) and the session's state read now, with no side effect: ``(route, reason, argv, cwd)``, the route
     ``hook``, ``stop_resume``, ``resumed`` (``argv`` without its prompt, in ``cwd``) or ``none`` (see the module
     docstring). ``noun`` names the text in the reason (a ruling, a question's answer). Shared by :func:`plan` and the
-    question band's delivery. ``named`` (default :func:`session_named_running`) is the last guard before a resume: a
+    question band's delivery. ``named`` (default :func:`session_named_running`, given the directory recorded in
+    ``meta``, so a ``claude -c`` elsewhere does not hold it) is the last guard before a resume: a
     recorded process that has ended does not mean the SESSION has (an earlier resume, or the operator's own
     ``codex resume``, runs under a new process), so any running process whose command line resumes the session id
     leaves the text to its next hook."""
-    named = named if named is not None else session_named_running
+    if named is None:
+        def named(sid: str) -> bool | None:
+            return session_named_running(sid, meta.get("cwd"))
     target = base_session(session)
     lands = f"the {noun} lands at its next step"
     if agent == _CLAUDE:
@@ -561,46 +564,126 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
 
 
-def _resumes(tokens: list[str], session: str) -> bool | None:
-    """Whether the argv ``tokens`` run ``session``: ``True`` for Claude Code's ``--resume <id>``, ``--resume=<id>``,
-    ``-r <id>``, ``-r=<id>``, ``-r<id>``, ``--session-id <id>`` or ``--session-id=<id>`` (a fresh run that keeps
-    the id), or Codex's ``resume`` subcommand (``codex resume``, ``codex exec resume``) after a ``codex`` token with
-    ``<id>`` the first UUID after it (the id precedes the prompt, so an id quoted in another resume's prompt does not
-    count); ids compare case-insensitively and only as a whole token, never inside another (a path, a ``--session``).
-    ``None`` for a resume that names no session id and so may be resuming this one: a ``claude`` process (its first or
-    second token, a script's interpreter being the first) with ``-c`` / ``--continue``, or ``--resume`` / ``-r`` with
-    no UUID (the picker, a name); a ``codex`` one whose ``resume`` has ``--last`` or no UUID after it (a name, the
-    picker). ``False`` otherwise."""
+# a process that may be one of the two CLIs is read past these to its executable; their options (and env's
+# assignments) are skipped, so the first other word is the program
+_INTERPRETERS = frozenset({"sh", "bash", "zsh", "node", "env"})
+
+# the options of `codex resume` / `codex exec resume` that take a separate value [measured: codex-cli 0.162.1
+# --help]; any other option is read as a switch, so the first word after the options is the session selector
+_CODEX_VALUED = frozenset({
+    "-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env", "-i", "--image", "-m",
+    "--model", "--local-provider", "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a",
+    "--ask-for-approval", "--thread-source", "--cyber-access-program", "--output-schema", "-o",
+    "--output-last-message",
+})
+
+# :func:`_resumes` for a `claude -c` / `--continue`: it resumes the latest session of its OWN directory, so which
+# session it holds is told by its cwd (:func:`_continues_in`)
+_CONTINUE = "continue"
+
+
+def _agent_cli(exe: str) -> str | None:
+    """``claude`` or ``codex`` when the executable path ``exe`` is that CLI, else ``None``. Claude Code's native
+    install runs as ``.../claude/versions/<version>`` (its basename is the version, not ``claude``), and its npm
+    install as ``node .../claude-code/cli.js``."""
+    path = Path(exe)
+    if path.name in ("claude", "codex"):
+        return path.name
+    if path.parent.name == "versions" and path.parent.parent.name == "claude":
+        return "claude"
+    if path.name == "cli.js" and "claude-code" in path.parts:
+        return "claude"
+    return None
+
+
+def _program(tokens: list[str]) -> tuple[str | None, int]:
+    """Which agent CLI the argv ``tokens`` run and the index of its executable token: argv[0] itself, or, when argv[0]
+    is an interpreter (:data:`_INTERPRETERS`), the first word after its options (``/bin/sh <dir>/claude``,
+    ``node <dir>/cli.js``, ``env FOO=1 codex``). ``(None, -1)`` for any other program, so a word ``claude`` in another
+    tool's arguments (``grep claude -c file``) is never read as the CLI."""
+    if not tokens:
+        return None, -1
+    at = 0
+    interpreter = os.path.basename(tokens[0])
+    if interpreter in _INTERPRETERS:
+        at = 1
+        while at < len(tokens) and (tokens[at].startswith("-") or (interpreter == "env" and "=" in tokens[at])):
+            at += 1
+        if at >= len(tokens):
+            return None, -1
+    name = _agent_cli(tokens[at])
+    return (name, at) if name else (None, -1)
+
+
+def _claude_selector(value: str) -> str | None:
+    """The session id a Claude Code ``--resume`` value names: the UUID itself, or the stem of a transcript path
+    (``--resume <dir>/<uuid>.jsonl``); ``None`` for a name, a search term or nothing."""
+    if _UUID.fullmatch(value):
+        return value
+    stem = os.path.basename(value)
+    if stem.endswith(".jsonl") and _UUID.fullmatch(stem[:-6]):
+        return stem[:-6]
+    return None
+
+
+def _codex_selector(after: list[str]) -> tuple[str | None, bool]:
+    """``(selector, last)`` for the words after Codex's ``resume``: the first positional word once its options and
+    their values (:data:`_CODEX_VALUED`) are passed, and whether ``--last`` was among those options. A UUID later in
+    the prompt is never the selector."""
+    last, i = False, 0
+    while i < len(after):
+        tok = after[i]
+        if tok == "--":
+            return (after[i + 1] if i + 1 < len(after) else None), last
+        if not tok.startswith("-") or tok == "-":
+            return tok, last
+        last = last or tok == "--last"
+        i += 2 if (tok in _CODEX_VALUED and "=" not in tok) else 1
+    return None, last
+
+
+def _resumes(tokens: list[str], session: str) -> bool | str | None:
+    """Whether the argv ``tokens`` run ``session``. Only a process that IS one of the CLIs counts (:func:`_program`).
+    ``True`` for a Claude Code ``--resume <id>``, ``--resume=<id>``, ``-r <id>``, ``-r=<id>``, ``-r<id>``,
+    ``--session-id <id>`` or ``--session-id=<id>`` (a fresh run that keeps the id), the id also read from a transcript
+    path (:func:`_claude_selector`), or a Codex ``resume`` (``codex resume``, ``codex exec resume``) whose session
+    selector (:func:`_codex_selector`) is the id; ids compare case-insensitively and only as a whole token.
+    ``None`` for a resume that names no session id and so may be resuming this one: a Claude ``--resume`` / ``-r``
+    with no id (the picker, a name), a Codex ``resume`` with ``--last``, no selector or one that is not a UUID (a
+    name). :data:`_CONTINUE` for a Claude ``-c`` / ``--continue``. ``False`` otherwise. The id-less forms are read
+    only in the leading option run (:func:`_options`), so a ``-c`` or ``resume`` inside a prompt does not count."""
+    prog, at = _program(tokens)
+    if prog is None:
+        return False
     want = session.lower()
-    low = [t.lower() for t in tokens]
-    for i, tok in enumerate(low):
+    rest = [t.lower() for t in tokens[at + 1:]]
+    if prog == "codex":
+        lead = _options(rest, words=("exec",))
+        if "resume" not in lead:
+            return False
+        selector, last = _codex_selector(rest[lead.index("resume") + 1:])
+        if last or selector is None or not _UUID.fullmatch(selector):
+            return None
+        return selector == want
+    for i, tok in enumerate(rest):
         if tok in (f"--resume={want}", f"--session-id={want}", f"-r={want}", f"-r{want}"):
             return True
-        if tok in ("--resume", "-r", "--session-id") and low[i + 1:i + 2] == [want]:
+        if tok in ("--resume", "-r", "--session-id") and i + 1 < len(rest) and _claude_selector(rest[i + 1]) == want:
             return True
-        if tok == "resume" and any(os.path.basename(t) == "codex" for t in tokens[:i]):
-            first = next((t for t in low[i + 1:] if _UUID.fullmatch(t)), None)
-            if first == want:
-                return True
-    head = [os.path.basename(t) for t in tokens[:2]]
-    if "claude" in head:
-        rest = _options(low[head.index("claude") + 1:])
-        for i, tok in enumerate(rest):
-            if tok in ("-c", "--continue"):
+        if tok.startswith("--resume=") and _claude_selector(tok.split("=", 1)[1]) == want:
+            return True
+    opts = _options(rest)
+    continues = False
+    for i, tok in enumerate(opts):
+        if tok in ("-c", "--continue"):
+            continues = True
+        elif tok in ("--resume", "-r"):
+            if not (i + 1 < len(opts) and _claude_selector(opts[i + 1])):
                 return None
-            if tok in ("--resume", "-r") and not (rest[i + 1:i + 2] and _UUID.fullmatch(rest[i + 1])):
-                return None
-            if tok.startswith(("--resume=", "-r")) and tok not in ("-r", "--resume") and not _UUID.fullmatch(
-                    tok.split("=", 1)[1] if "=" in tok else tok[2:]):
-                return None
-    if "codex" in head:
-        rest = low[head.index("codex") + 1:]
-        lead = _options(rest, words=("exec",))
-        if "resume" in lead:
-            after = rest[lead.index("resume") + 1:]
-            if "--last" in _options(after) or not any(_UUID.fullmatch(t) for t in after):
-                return None
-    return False
+        elif tok.startswith(("--resume=", "-r")) and not _claude_selector(
+                tok.split("=", 1)[1] if "=" in tok else tok[2:]):
+            return None
+    return _CONTINUE if continues else False
 
 
 def _options(tokens: list[str], words: tuple[str, ...] = ()) -> list[str]:
@@ -619,24 +702,51 @@ def _options(tokens: list[str], words: tuple[str, ...] = ()) -> list[str]:
     return out
 
 
-def session_named_running(session: str) -> bool | None:
-    """Whether a running process resumes ``session`` (:func:`_resumes`, read from ``ps``'s command lines), ``None``
-    when the process list cannot be read or a resume that names no session id is running (``codex resume --last``,
-    ``claude -c``: it may be resuming this one, and which session it holds is not in its command line), so the caller
-    starts no resume. A process that only mentions the id (``levain consent rule --session <id>``, its shell,
-    ``tail -f`` of the transcript) does not count, and this process never does. An ancestor that IS a resume of the
-    session counts: the session is then running (a hook of it delivering)."""
-    if not session_ok(session):
+#: how long :func:`session_named_running` may spend reading the process list and the cwds it needs, in seconds
+NAMED_BUDGET = 5.0
+
+
+def _continues_in(pid: str, cwd: Any, deadline: float) -> bool | None:
+    """Whether the ``claude -c`` process ``pid`` runs in ``cwd`` (both resolved), read with ``lsof``; ``None`` when
+    ``cwd`` is not a path or the process's cwd cannot be read before ``deadline``."""
+    left = deadline - time.monotonic()
+    if not isinstance(cwd, str) or not cwd or left <= 0:
         return None
     try:
-        got = subprocess.run(["ps", "-axww", "-o", "pid=,args="], capture_output=True, text=True, timeout=5,
-                             stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+        got = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fn", "-p", pid], capture_output=True, text=True,
+                             timeout=left, stdin=subprocess.DEVNULL,
+                             env={"PATH": "/usr/sbin:/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    path = next((ln[1:] for ln in got.stdout.splitlines() if ln.startswith("n")), None)
+    if not path:
+        return None
+    return os.path.realpath(path) == os.path.realpath(cwd)
+
+
+def session_named_running(session: str, cwd: Any = None) -> bool | None:
+    """Whether a running process resumes ``session`` (:func:`_resumes`, read from ``ps``'s command lines), ``None``
+    when the process list cannot be read or a resume that names no session id may be resuming it (``codex resume
+    --last``, a ``--resume`` picker: which session it holds is not in its command line), so the caller starts no
+    resume. A ``claude -c`` / ``--continue`` can only be resuming a session started in its own directory: it counts
+    (``None``) only when its cwd is ``cwd``, the directory ``session`` was started in, or when either cannot be read.
+    A process that only mentions the id (``levain consent rule --session <id>``, its shell, ``tail -f`` of the
+    transcript) does not count, and this process never does. An ancestor that IS a resume of the session counts: the
+    session is then running (a hook of it delivering)."""
+    if not session_ok(session):
+        return None
+    deadline = time.monotonic() + NAMED_BUDGET
+    try:
+        got = subprocess.run(["ps", "-axww", "-o", "pid=,args="], capture_output=True, text=True,
+                             timeout=NAMED_BUDGET, stdin=subprocess.DEVNULL,
+                             env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return None
     if got.returncode != 0:
         return None
     me = str(os.getpid())
     idless = False
+    continuing: list[str] = []
     for line in got.stdout.splitlines():
         pid, _, args = line.strip().partition(" ")
         if pid == me:
@@ -650,8 +760,16 @@ def session_named_running(session: str) -> bool | None:
         readings = (_resumes(quoted, session), _resumes(args.split(), session))
         if True in readings:
             return True
-        idless = idless or None in readings
-    return None if idless else False
+        if None in readings:
+            idless = True
+        elif _CONTINUE in readings:
+            continuing.append(pid)
+    if idless:
+        return None
+    # the cwds are read after the whole list, so a match on the id is never delayed by lsof
+    if any(_continues_in(pid, cwd, deadline) is not False for pid in continuing):
+        return None
+    return False
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:
