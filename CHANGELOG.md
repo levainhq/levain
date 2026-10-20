@@ -7,6 +7,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
+  authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
+  intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
+  were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
+  `detach`, `add` and `state` fix a split or close a thread.
+
+### Known edges
+- The coordinator session that reads drops and splits them comes later; until then a thread is named with
+  `levain drops split`. The phone drop sheet comes later too.
+
+## [0.11.12] — 2026-10-20
+
+### Added
 - **Adoption rules now say exactly what they check.** An adoption rule names the repository it lands in and a short
   list of typed checks: which branches it may land on, plus at least one limit (changed lines, bytes, files, or the
   paths it may touch; optionally no new files, or a maximum age). Free-text criteria are refused.
@@ -17,15 +30,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - **The dispatch job store moves to format 2** the first time this version opens it. Your jobs are kept. After that,
     Levain 0.11.10 refuses to open the store, so do not downgrade.
   - `levain doctor` has a new row, "dispatch adoption rules".
-- **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
-  authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
-  intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
-  were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
-  `detach`, `add` and `state` fix a split or close a thread.
+
+### Fixed
+- Setting your state line, from the cockpit, the web page, the terminal view, the phone app or
+  `levain state`, now also saves it once, word for word, as a memory episode tagged `felt,state`, so
+  your next consolidate can read how you said things were. Before, only the live line changed and
+  your memory never saw it. Setting the same words again while the line is still live, or clearing it, saves nothing new.
+  If the memory store is missing or busy, the line is still set: `levain state` prints a note and the
+  web response says `episode: failed`, and setting the same words again delivers the episode.
+- That saved copy outlives the line. The line itself disappears after 12 hours or on
+  `levain state --clear`; the episode stays in memory until you delete it. To delete it, tombstone
+  it from the Recent episodes panel of the writable cockpit (`levain web --write`) or the terminal view.
 
 ### Known edges
-- The coordinator session that reads drops and splits them comes later; until then a thread is named with
-  `levain drops split`. The phone drop sheet comes later too.
 - Adoption itself has no command yet (the `authorise` and `land` verbs and the phone card come in F11-s2).
 
 ## [0.11.11] — 2026-10-20
