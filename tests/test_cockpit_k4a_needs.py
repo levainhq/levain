@@ -56,11 +56,13 @@ def test_the_strip_lists_what_waits_loudest_first_and_a_bare_install_has_no_stri
         got = _drive(tmp2, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
             {"eval": f"JSON.stringify({{kinds: {CARDS}.map(c => c.dataset.needsCard), tools: {CARDS}.map(c => (c.querySelector('.consent-tool')||{{}}).textContent),"
                      " head: document.querySelector('#ck-needs').innerText.slice(0, 40),"
+                     " order: (document.querySelector('#ck-needs .needs-order') || {textContent: ''}).textContent,"
                      " above: document.getElementById('ck-needs').getBoundingClientRect().top > document.getElementById('ck-hero').getBoundingClientRect().top})"}])["values"][-1]
     got = json.loads(got)
-    assert got["kinds"] == ["consent", "consent", "question"], got      # the soonest expiry first, the question after the clocked ones
-    assert got["tools"][:2] == ["Bash", "Write"], got
+    assert got["kinds"] == ["question", "consent", "consent"], got      # as the mock draws it: the open question first, then the clocked requests, soonest expiry first
+    assert got["tools"][1:] == ["Bash", "Write"], got
     assert got["head"].lower().startswith("needs you") and got["above"] is True, got
+    assert "questions first, then soonest to expire" in got["order"].lower(), got
 
 
 @needs_browser
@@ -112,7 +114,7 @@ def test_the_decisions_tile_names_the_top_item_and_a_click_goes_to_the_strip_wit
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
             {"eval": f"{TILE}.innerText.replace(/\\s+/g, ' ')"},
             {"eval": f"(async () => {{ {TILE}.click(); await new Promise(r => setTimeout(r, 300)); return [!document.getElementById('levain-modal'), !!document.activeElement.closest('#ck-needs')]; }})()"}])["values"]
-    assert "Bash" in out[-2] and "codex" in out[-2], out                # the soonest expiry is named, not just counted
+    assert "question #1" in out[-2], out                                # the top item is named, not just counted: the open question leads, as the mock's tile does
     assert out[-1] == [True, True], out                                  # no modal; focus is in the strip
 
 
@@ -136,7 +138,7 @@ def test_time_left_reads_in_whole_units_never_minutes_and_seconds(tmp_path: Path
             {"eval": "JSON.stringify({cards: [...document.querySelectorAll('#ck-needs .needs-left')].map(n => n.textContent),"
                      " tile: " + TILE + ".innerText.replace(/\\s+/g, ' ')})"}])["values"][-1]
     got = json.loads(got)
-    assert got["cards"][0].endswith(" m left") and not any(__import__("re").search(r"\d+m\d+s", c) for c in got["cards"]), got
+    assert got["cards"][1].endswith(" m left") and not any(__import__("re").search(r"\d+m\d+s", c) for c in got["cards"]), got
     assert not __import__("re").search(r"\d+m\d+s", got["tile"]), got
 
 

@@ -4117,7 +4117,8 @@
 
   // ---- The Needs-you strip (K4, F4 a / F11 a) ----
   // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the
-  // Decisions panel, the requests on a clock first (soonest expiry), then the questions. The strip is absent when nothing waits
+  // Decisions panel, as the mock draws them: the open questions first (they block work and have no clock), then the requests on a
+  // clock, soonest expiry first. The strip is absent when nothing waits
   // (never an empty strip), and on a tab that is not Morning or Board it is the header alone. A consent card carries no rec:
   // Allow and Deny weigh the same and the hint line is what informs (F11 a). A question keeps its rec, which is the agent's
   // words and authorises nothing. This page signs nothing: the card says to answer on the phone, and its buttons copy the CLI
@@ -4132,7 +4133,7 @@
     }
     const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
     consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
-    return consents.concat(questions);
+    return questions.concat(consents);
   }
   const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
   // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
@@ -4253,6 +4254,7 @@
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
     head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    head.appendChild(el("span", "needs-order ext-meta", "questions first, then soonest to expire"));
     const hist = el("button", "needs-history", "all decisions");
     hist.type = "button";
     hist.title = "decided requests, outcomes and standing-rule proposals";
