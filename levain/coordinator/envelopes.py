@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from levain.authority import AuthoritySnapshot
+from levain.authority import AuthoritySnapshot, VerifierUnavailable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import RULING_SKEW
@@ -44,8 +44,7 @@ from levain.coordinator import envelope as env
 from levain.coordinator.store import (
     SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256,
 )
-from levain.authority import VerifierUnavailable
-from levain.dispatch.adopt import branch_problem
+from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME
 
 __all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStore"]
@@ -112,7 +111,8 @@ def _git_toplevel(repo: str) -> str | None:
     """The realpath of ``repo``'s work tree top, by git itself; None when it is not one (a bare repo included)."""
     try:
         cp = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True, timeout=30,
-                            env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+                            env={**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+                                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.TimeoutExpired):
         return None
     if cp.returncode != 0:
@@ -145,7 +145,11 @@ class EnvelopeStore(CoordStore):
             if _git_toplevel(w["repo"]) != w["repo"]:
                 raise CoordError(f"where repo {w['repo'][:120]} is not a git work tree's top, by its real path")
         for land in body["lands"]:
-            problem = branch_problem(land["repo"], land["onto"])
+            try:
+                problem = branch_problem(land["repo"], land["onto"])
+            except GitFault as exc:
+                raise CoordError(f"a land onto {land['onto'][:80]} could not be checked on this machine: "
+                                 f"{str(exc)[:160]}") from None
             if problem is not None:
                 raise CoordError(f"a land onto {land['onto'][:80]}: {problem}")
         return body, authority.key(payload["signer_fp"]).key_class
@@ -179,6 +183,8 @@ class EnvelopeStore(CoordStore):
             raise CoordError(f"the envelope was signed at {payload['signed_at']}, more than "
                              f"{int(SIGN_SKEW.total_seconds())} s from the store's clock ({now}); sign it again")
         stop = parse_stamp(body["stop_at"])
+        if stop <= signed:
+            raise CoordError("the envelope stops before it was signed")
         if stop <= clock:
             raise CoordError(f"the envelope's stop time {body['stop_at']} has passed")
         if stop - signed > MAX_LIFETIME:
@@ -489,23 +495,33 @@ class EnvelopeStore(CoordStore):
     def ceiling_refusal(self, envelope_id: str, thread_id: str, *, effect: tuple[str, Mapping[str, Any]] | None = None,
                         scope: tuple[str, Sequence[str]] | None = None) -> str | None:
         """Why the cumulative ceiling of ``envelope_id`` for ``thread_id`` (it and every successor since, each by its
-        effective envelope: a narrowing counts for good) does not hold ``effect`` (``(list, object)``) or ``scope``
-        (``(repo, paths)``); None when it does. Liveness is :meth:`live_refusal`'s question, not this one."""
+        effective envelope: a narrowing counts for good) does not hold ``effect`` (``(list, object)``, matched by its
+        target) or ``scope`` (``(repo, paths)``); None when it does. Liveness is :meth:`chain_live_refusal`'s question."""
         with read_transaction(self._connect) as conn:
-            for eid in self._chain(conn, envelope_id, thread_id):
-                eff = self._effective(conn, eid, thread_id)
-                if effect is not None:
-                    kind, obj = effect
-                    if env.effect_key(kind, obj) not in {env.effect_key(kind, e) for e in eff[kind]}:
-                        return f"envelope {eid} does not hold that {kind[:-1]}"
-                if scope is not None:
-                    repo, paths = scope
-                    allowed = {w["repo"]: tuple(w["paths"]) for w in eff["where"]}
-                    if repo not in allowed:
-                        return f"envelope {eid} does not reach {repo[:120]}"
-                    for p in paths:
-                        if not env.path_within(p, allowed[repo]):
-                            return f"envelope {eid} does not reach {p[:120]} in {repo[:120]}"
+            return self._ceiling_refusal(conn, envelope_id, thread_id, effect, scope)
+
+    def _ceiling_refusal(self, conn: sqlite3.Connection, envelope_id: str, thread_id: str,
+                         effect: tuple[str, Mapping[str, Any]] | None,
+                         scope: tuple[str, Sequence[str]] | None) -> str | None:
+        key = None
+        if effect is not None:
+            try:
+                kind, obj = effect
+                key = env.effect_key(kind, obj)
+            except (env.EnvelopeError, KeyError, TypeError, ValueError):
+                return "the effect asked for is not a land, push or publish this reader knows"
+        for eid in self._chain(conn, envelope_id, thread_id):
+            eff = self._effective(conn, eid, thread_id)
+            if key is not None and key not in {env.effect_key(kind, e) for e in eff[kind]}:
+                return f"envelope {eid} does not hold that {kind[:-1]}"
+            if scope is not None:
+                repo, paths = scope
+                allowed = {w["repo"]: tuple(w["paths"]) for w in eff["where"]}
+                if repo not in allowed:
+                    return f"envelope {eid} does not reach {str(repo)[:120]}"
+                for p in paths:
+                    if not env.path_within(p, allowed[repo]):
+                        return f"envelope {eid} does not reach {str(p)[:120]} in {repo[:120]}"
         return None
 
     def envelope_refused(self, drop_id: str) -> str | None:
@@ -518,27 +534,38 @@ class EnvelopeStore(CoordStore):
 
     def chain_live_refusal(self, envelope_id: str, thread_id: str, *, authority: AuthoritySnapshot) -> str | None:
         """Why a job bound to ``envelope_id`` may not continue for ``thread_id``: ``envelope_id`` itself not live, or the
-        current head of its supersede chain not live (C0 §4.5: both, plus the ceiling); None when both are."""
-        refused = self.live_refusal(envelope_id, thread_id, authority=authority)
+        current head of its supersede chain not live (C0 §4.5: both, plus the ceiling); None when both are. One read
+        transaction and one clock (:meth:`_chain_live_refusal` is the entry an authorising write calls on its own)."""
+        with read_transaction(self._connect) as conn:
+            return self._chain_live_refusal(conn, self._stamp(), envelope_id, thread_id, authority)
+
+    def _chain_live_refusal(self, conn: sqlite3.Connection, now: str, envelope_id: str, thread_id: str,
+                            authority: AuthoritySnapshot) -> str | None:
+        refused = self._live_refusal(conn, now, envelope_id, thread_id, authority, False)
         if refused is not None:
             return refused
-        with read_transaction(self._connect) as conn:
-            head = self._chain(conn, envelope_id, thread_id)[-1]
+        head = self._chain(conn, envelope_id, thread_id)[-1]
         if head == envelope_id:
             return None
-        refused = self.live_refusal(head, thread_id, authority=authority)
+        refused = self._live_refusal(conn, now, head, thread_id, authority, False)
         return None if refused is None else f"the chain's current envelope is not live: {refused}"
 
     def ceiling_criteria(self, envelope_id: str, thread_id: str, kind: str,
                          effect: Mapping[str, Any]) -> list[list[dict[str, Any]]] | None:
-        """For a land, every criteria list in the chain that targets ``effect``'s key, all of which must hold together
-        (a supersede that edits criteria narrows by conjunction); None when some member does not hold it."""
-        if self.ceiling_refusal(envelope_id, thread_id, effect=(kind, effect)) is not None:
-            return None
-        key = env.effect_key(kind, effect)
+        """Every criteria list in the chain that targets ``effect``'s key, exactly one per chain member, all of which
+        must hold together (a supersede that edits criteria narrows by conjunction); None when some member does not
+        hold it. One read transaction."""
         with read_transaction(self._connect) as conn:
-            return [e.get("criteria", []) for eid in self._chain(conn, envelope_id, thread_id)
-                    for e in self._effective(conn, eid, thread_id)[kind] if env.effect_key(kind, e) == key]
+            if self._ceiling_refusal(conn, envelope_id, thread_id, (kind, effect), None) is not None:
+                return None
+            key = env.effect_key(kind, effect)
+            out = []
+            for eid in self._chain(conn, envelope_id, thread_id):
+                match = [e for e in self._effective(conn, eid, thread_id)[kind] if env.effect_key(kind, e) == key]
+                if len(match) != 1:
+                    return None
+                out.append(match[0].get("criteria", []))
+            return out
 
     def authority_refusal(self, envelope_id: str, thread_id: str, *, authority: AuthoritySnapshot | None = None,
                           effect: tuple[str, Mapping[str, Any]] | None = None,

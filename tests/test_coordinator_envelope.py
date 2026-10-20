@@ -364,7 +364,8 @@ def test_stop_more_than_a_day_after_signing_is_refused(ctx):
 
 def test_stop_already_passed_is_refused(ctx):
     d, t = ctx.plain_thread("too late")
-    _b, signed = ctx.worded(d, t, issued_at=utc_stamp(NOW - 2 * HOUR), stop_at=utc_stamp(NOW - HOUR))
+    _b, signed = ctx.worded(d, t, issued_at=utc_stamp(NOW - 2 * HOUR), stop_at=utc_stamp(NOW - timedelta(seconds=30)),
+                            signed_at=NOW - timedelta(seconds=90))
     with pytest.raises(CoordError, match="has passed"):
         ctx.accept(signed)
 
@@ -554,3 +555,56 @@ def test_an_attenuation_with_a_non_text_value_is_a_coord_error(ctx, structured_t
     _d, b, _t = structured_thread
     with pytest.raises(CoordError):
         ctx.store.attenuate(b["envelope_id"], "drop_effect", ["x"])
+
+
+# --- L3 round 1 findings, each pinned ---------------------------------------------------------------------------
+
+def test_a_git_fault_checking_a_land_still_keeps_the_words(ctx, monkeypatch):
+    # codex MED: branch_problem's GitFault is a fault, never a lost drop
+    from levain.coordinator import envelopes
+    from levain.dispatch.adopt import GitFault
+
+    def broken(*_a, **_k):
+        raise GitFault("git timed out")
+
+    monkeypatch.setattr(envelopes, "branch_problem", broken)
+    d, fresh, _b, _s = ctx.structured("still keep these words")
+    assert fresh and d.envelope_id is None and d.words == "still keep these words"
+    assert "could not be checked on this machine" in ctx.store.envelope_refused(d.drop_id)
+
+
+def test_an_envelope_that_stops_before_it_was_signed_is_refused(ctx):
+    # codex LOW: signed 12:01 within the skew, stop 12:00:30 ahead of the 12:00 clock
+    d, t = ctx.plain_thread("sign late")
+    _b, signed = ctx.worded(d, t, lands=[ctx.land("main")], signed_at=NOW + timedelta(minutes=1),
+                            stop_at=utc_stamp(NOW + timedelta(seconds=30)))
+    with pytest.raises(CoordError, match="stops before it was signed"):
+        ctx.accept(signed)
+
+
+def test_the_whole_repo_candidate_is_inside_only_a_whole_repo_scope():
+    assert env.path_within(".", (".",)) is True
+    assert env.path_within(".", ("src/",)) is False
+
+
+def test_a_push_named_twice_is_refused(ctx):
+    d = ctx.plain("push twice")
+    push = {"repo": ctx.path, "remote": "origin", "url": "https://example.invalid/r.git", "branch": "main"}
+    b = ctx.body(d.drop_id, d.words, pushes=[push, dict(push)])
+    with pytest.raises(env.EnvelopeError, match="names one target twice"):
+        env.parse_body(canonical(b))
+
+
+@pytest.mark.parametrize("effect", [("pushs", {}), ("lands", {"repo": "/x"}), ("lands", None)])
+def test_a_malformed_effect_is_a_refusal_line_never_a_crash(ctx, structured_thread, effect):
+    _d, b, t = structured_thread
+    assert "not a land, push or publish" in ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, effect=effect)
+
+
+def test_an_inherited_git_dir_does_not_answer_for_the_where_repo(ctx, monkeypatch, tmp_path):
+    # complement: a GIT_DIR from a hook or wrapper must not decide which repo a where names
+    other = tmp_path / "other"
+    _git("init", "-q", str(other))
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    d, _fresh, _b, _s = ctx.structured("from inside a hook")
+    assert d.envelope_id is not None, ctx.store.envelope_refused(d.drop_id)

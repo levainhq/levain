@@ -383,6 +383,9 @@ class CoordStore:
             raise CoordError("a drop id is dr- and 32 hex")
         elif conn.execute("SELECT 1 FROM drops WHERE drop_id = ?", (drop_id,)).fetchone() is not None:
             raise DropConflict(f"drop {drop_id} is already stored; nothing was written")
+        if envelope_id is not None and (not isinstance(envelope_id, str)
+                                        or re.fullmatch(r"ev-[0-9a-f]{32}", envelope_id) is None):
+            raise CoordError("an envelope id is ev- and 32 hex")
         conn.execute(
             "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
             "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "

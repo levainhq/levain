@@ -51,7 +51,6 @@ PAYLOAD_KEYS = frozenset({"format", "store_id", "envelope_id", "digest", "signer
 BUDGET_KEYS = ("tool_calls", "tokens", "dollars_cents", "hours")
 EFFECT_LISTS = ("lands", "pushes", "publishes")
 ORIGINS = ("structured", "worded")
-ONTO_FROM = ("drop", "picker", "inferred")
 
 BODY_MAX = 64 * 1024
 FIELD_MAX = 256
@@ -136,8 +135,10 @@ def path_within(path: Any, allowed: tuple[str, ...]) -> bool:
     repo; ``dir/`` a directory; anything else one exact file). Byte for byte, never casefolded (C0 §4.3). The
     CANDIDATE is held to the same shape as a signed path (NFC, no empty, '.', '..' or .git segment): a path that is not
     one is never inside anything, so ``src/../.git/hooks/x`` is not under ``src/`` and nothing reaches a .git dir."""
+    if path == ".":
+        return "." in allowed
     try:
-        if path == "." or _rel_path(path, "a path") != path:
+        if _rel_path(path, "a path") != path:
             return False
     except EnvelopeError:
         return False
@@ -273,6 +274,15 @@ def parse_body(text: Any) -> dict[str, Any]:
         _criteria(land["criteria"], f"lands[{i}].criteria", scope[repo])
     if len({(x["repo"], x["onto"]) for x in lands}) != len(lands):
         raise EnvelopeError("lands names one repo and branch twice")
+    for kind in ("pushes", "publishes"):
+        if not isinstance(body[kind], list):
+            break
+        try:
+            keys = [effect_key(kind, e) for e in body[kind]]
+        except (KeyError, TypeError):
+            break  # the shape checks below say what is wrong
+        if len(set(keys)) != len(keys):
+            raise EnvelopeError(f"{kind} names one target twice")
     for i, p in enumerate(_list(body["pushes"], "pushes")):
         p = _exact(p, {"repo", "remote", "url", "branch"}, f"pushes[{i}]")
         if _repo(p["repo"], f"pushes[{i}].repo") not in scope:
