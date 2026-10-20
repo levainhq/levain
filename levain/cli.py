@@ -572,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_publish_parser(subparsers)
     _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
+    _add_dispatch_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -2483,6 +2484,13 @@ def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
 def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
     """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
     from levain.consent.band import add_parsers
+
+    add_parsers(subparsers)
+
+
+def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain dispatch``: the dispatch job's planner and operator door (``levain.dispatch.cli``)."""
+    from levain.dispatch.cli import add_parsers
 
     add_parsers(subparsers)
 

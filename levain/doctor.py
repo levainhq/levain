@@ -3278,6 +3278,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
+    results.append(_check_dispatch_server(
+        install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
     return results
 
@@ -3322,6 +3324,43 @@ def _check_band_server(where: str, server: object, agent: str, codex_home: Path 
                                            f"({sys.executable})", "levain update", warn=True)
     return CheckResult(BAND_ROW, True, f"{where}: {command} -P -m levain.consent.band_mcp "
                                        f"--agent {agent}")
+
+
+DISPATCH_ROW = "levain_dispatch MCP registered"
+
+
+def _check_dispatch_server(install: Path, server: object) -> CheckResult:
+    """The dispatch door's MCP server is registered in the workspace .mcp.json as levain writes it. Advisory only (a
+    WARN, never a FAIL): a planner files with `levain dispatch file` without it. `levain update` rewrites a .mcp.json
+    only while it is levain's last render; one carrying anything else is kept whole and levain's render is staged in
+    .levain/pending/, so the hint names the hand merge when that render is there."""
+    from levain.install import DISPATCH_SERVER, PENDING_REL, _is_levain_launcher
+
+    pending = install.joinpath(*PENDING_REL, ".mcp.json")
+    merge = (f"`levain update` keeps your .mcp.json whole, since it is not levain's last render; merge the "
+             f"levain_dispatch entry from {'/'.join(PENDING_REL)}/.mcp.json (staged by `levain update`) by hand")
+    if not isinstance(server, dict):
+        return CheckResult(DISPATCH_ROW, True, "missing from .mcp.json: a planner can still file with "
+                                               "`levain dispatch file`, not with the dispatch_file tool",
+                           merge if pending.is_file() else "levain update", warn=True)
+    command = server.get("command")
+    if not _is_levain_launcher({"mcp_servers": {DISPATCH_SERVER: server}}, None, server=DISPATCH_SERVER,
+                               agent="claude_code"):
+        args = server.get("args")
+        shown = " ".join(str(a) for a in args) if isinstance(args, list) else repr(args)
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json starts it as `{command} {shown}`, not levain's launcher "
+                                               "(<python> -P -m levain.dispatch.mcp --agent claude_code)",
+                           merge, warn=True)
+    extra = sorted(str(k) for k in server if k not in _BAND_KEYS)
+    if extra:  # an `env` or any other key changes what the server runs
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json's levain_dispatch entry carries {', '.join(extra)} beside "
+                                               "levain's launcher: it may not run the door levain ships",
+                           merge, warn=True)
+    if not _is_this_python(command):
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json starts it with `{command}`, not this levain's Python "
+                                               f"({sys.executable})", "levain update", warn=True)
+    return CheckResult(DISPATCH_ROW, True, f".mcp.json: {command} -P -m levain.dispatch.mcp --agent claude_code "
+                                           "(each call needs the operator's approval)")
 
 
 BAND_ALLOW_ROW = "settings levain_band ask allowed"

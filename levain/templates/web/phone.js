@@ -56,15 +56,20 @@
     const signs = Array.isArray(data.sign_pending) ? data.sign_pending : [];
     // questions an agent filed: answered by a tap or words, unsigned (an answer authorises nothing)
     const asks = Array.isArray(data.questions) ? data.questions : [];
-    const waiting = rows.length + gaps.length + signs.length + asks.length;
+    // dispatch jobs a planner filed (levain dispatch): a contract to sign with a passkey, or a live job to cancel
+    const jobs = Array.isArray(data.dispatch_pending) ? data.dispatch_pending : [];
+    const waiting = rows.length + gaps.length + signs.length + asks.length + jobs.length;
     const unread = (Number(data.sign_overflow) > 0 ? " \u00b7 " + Number(data.sign_overflow) + " more sign requests not shown" : "")
-      + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "");
+      + (Number(data.questions_overflow) > 0 ? " \u00b7 " + Number(data.questions_overflow) + " more questions not shown" : "")
+      + (Number(data.dispatch_overflow) > 0 ? " \u00b7 " + Number(data.dispatch_overflow) + " more dispatch jobs not shown" : "");
     const qnote = typeof data.questions_note === "string" && data.questions_note ? data.questions_note : "";
-    // a store fault is never "nothing waiting": the page says it cannot see the agents' questions
-    $("status").textContent = (waiting ? waiting + " waiting on you" : qnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
-      + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + unread + (last ? " \u00b7 last: " + last : "");
-    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...rows.map((r) => row(r, false)),
-                         ...gaps.map((r) => row(r, true)));
+    const dnote = typeof data.dispatch_note === "string" && data.dispatch_note ? data.dispatch_note : "";
+    // a store fault is never "nothing waiting": the page says it cannot see the agents' questions or dispatch jobs
+    $("status").textContent = (waiting ? waiting + " waiting on you" : qnote || dnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
+      + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + (dnote ? " \u00b7 dispatch jobs unavailable: " + dnote : "")
+      + unread + (last ? " \u00b7 last: " + last : "");
+    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
+                         ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
     const ours = enrolled.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -232,7 +237,14 @@
     return card;
   }
 
-  function start(r, decision, signers, say, actions, ruling, go) {
+  let closePick = null;       // the open passkey picker's close, if one is up (it holds busy)
+  // a picker left open while the page is put away (phone locked, app switched) would hold the whole list still,
+  // consent cards included, until someone came back to dismiss it: leaving the page dismisses it instead
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && closePick && closePick()) setTimeout(load, 0);
+  });
+
+  function start(r, decision, signers, say, actions, ruling, go, what) {
     const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -243,14 +255,41 @@
     // the OS refuses it), else among every enrolled one (the OS then offers every passkey for this name, and a
     // pick of another device's key is refused at verify)
     const choices = known.length ? known : signers;
-    say("more than one passkey is enrolled for this name; pick the one this phone holds:");
-    for (const old of actions.querySelectorAll(".pick")) old.remove();
+    if (closePick) closePick();   // a second picker replaces the first
+    if (busy) return;
+    // `what` names the act the pick signs ("to SIGN job …"), so the picker never reads as a bare key choice
+    say(what ? "pick a passkey " + what + " (more than one is enrolled for this name; pick the one this phone holds):"
+             : "more than one passkey is enrolled for this name; pick the one this phone holds:");
+    // the picker holds the list still like any ceremony: busy is taken while it is up, released by a pick (run takes
+    // it again) or by dismissing it
+    busy++;
+    const picks = [];
+    // close() releases busy once: a second activation queued before the first one's redraw (or a later picker's
+    // replace) finds it closed and does nothing, so busy never goes below 0 and a pick never runs twice
+    let closed = false;
+    const close = () => {
+      if (closed) return false;
+      closed = true;
+      picks.forEach((x) => x.remove());
+      busy--;
+      if (closePick === dismiss) closePick = null;
+      return true;
+    };
+    // every dismissal that is not a pick (the dismiss button, a second picker, the page put away) also clears the
+    // "pick a passkey" line, which the note store would otherwise draw again over a card with no picker under it
+    const dismiss = () => { if (!close()) return false; say(""); return true; };
+    closePick = dismiss;
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => run(fp, known.length ? local[fp] : null));
-      actions.appendChild(p);
+      p.addEventListener("click", () => { if (close()) run(fp, known.length ? local[fp] : null); });
+      picks.push(p);
     }
+    const x = el("button", "quiet pick", "dismiss");
+    x.type = "button";
+    x.addEventListener("click", dismiss);
+    picks.push(x);
+    picks.forEach((b) => actions.appendChild(b));
   }
 
   // the one tap on a question's push option: the ruling's challenge for the linked request, the passkey, then the
@@ -423,6 +462,148 @@
       .finally(() => { busy--; setTimeout(load, 1500); });
   }
 
+  // a stored stamp (UTC ISO, microseconds) in this phone's local time to the minute; the record keeps the raw stamp,
+  // and a value that does not parse is shown as it came
+  function readable(iso) {
+    const d = typeof iso === "string" ? new Date(iso.replace(/(\.\d{3})\d+/, "$1")) : null;
+    if (!d || isNaN(d.getTime())) return String(iso || "");
+    return d.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
+
+  // a blob hash: the 12-char head, the whole hash on a tap (what the signature binds is reachable in full)
+  function blobTap(full) {
+    const short = full.slice(0, 12);
+    if (full.length <= 12) return el("code", "dg-val", full);
+    const code = el("code", "dg-val", short);
+    code.tabIndex = 0;
+    code.setAttribute("role", "button");
+    let open = false;
+    const flip = () => { open = !open; code.textContent = open ? full : short; };
+    code.addEventListener("click", flip);
+    code.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); flip(); } });
+    return code;
+  }
+
+  const reasons = new Map();  // job id -> the cancel reason being typed, kept across redraws (open while present)
+
+  // a dispatch job (levain.dispatch.phone): built with the phone app's card markup (row, title, chips, acts) so one
+  // restyle covers both. It shows what the passkey signs: the contract's goal in full (exactly what the executor is
+  // sent), its facts, where the read files are sent and by what, and the digest, with the read and write lists and
+  // every other field the laptop's `levain dispatch show` prints behind "details" (their counts on the closed card).
+  // Sign signs the DIGEST (T2); Cancel is the human cancel, signed in its own namespace, with an optional reason. The
+  // two are equal weight and nothing here recommends either: the server's words are the only verdicts shown
+  function dispatchCard(r) {
+    const t = r.template && typeof r.template === "object" ? r.template : {};
+    const b = r.budget && typeof r.budget === "object" ? r.budget : {};
+    const card = el("article", "row dispatch");
+    card.dataset.job = r.id;
+    const repo = typeof r.repo === "string" ? r.repo.replace(/\/+$/, "").split("/").pop() : "";
+    card.appendChild(el("div", "title", (t.id || "dispatch job") + (repo ? " in " + repo : "")));
+    const chips = el("div", "chips");
+    const filed = r.state === "filed";
+    // the job id and its state are on the closed card (the id is what the picker and the laptop's `levain dispatch show` name)
+    for (const text of ["dispatch", "job " + r.id, "state " + r.state, r.agent || "no agent named", filed ? "sign by " + readable(r.lease_end) : r.state,
+                        "contract expires " + readable(r.expires_at)]) chips.appendChild(el("span", "chip", text));
+    card.appendChild(chips);
+    card.appendChild(el("pre", "display", typeof r.goal === "string" ? r.goal : ""));
+    const models = Array.isArray(t.models) ? t.models.join(", ") : "";
+    const q = (v) => (v === undefined || v === null || v === "" ? "?" : String(v));   // a missing field is "?", never "undefined"
+    card.appendChild(el("div", "where facts", [q(t.id), q(t.tier), models + " (k=" + q(t.k) + ")",
+      q(b.tool_calls) + " tool calls, " + q(b.tokens) + " tokens, " + q(b.dollars_cents) + " cents",
+      (t.verifier_kind || "") + " verifier " + (t.verifier_id || "")].join(" \u00b7 ")));
+    // where the read files leave this machine, on the closed card
+    card.appendChild(el("div", "where sent", "sent to " + (t.provider || "?") + " via " + (t.route || "?") + " \u00b7 executor " + (t.executor || "?")));
+    card.appendChild(el("div", "where", "grant " + (Array.isArray(r.grant) ? r.grant.join(", ") : "") + " over the write list, from "
+                        + (r.session || "") + " in " + (r.repo || "") + " at " + (typeof r.base === "string" ? r.base.slice(0, 12) : "")));
+    card.appendChild(digestLine("contract digest", r.digest));
+    const det = el("details", "lists");
+    const files = (n) => Number(n) + (Number(n) === 1 ? " file" : " files");
+    det.appendChild(el("summary", null, "details \u00b7 reads " + files(r.read_count) + " \u00b7 writes " + files(r.write_count)));
+    for (const [label, entries] of [["read", r.read], ["write", r.write]]) {
+      det.appendChild(el("div", "where", label));
+      const ul = el("ul", "where");
+      for (const e of (Array.isArray(entries) ? entries : [])) {
+        const li = el("li", null, e.path + "  ");
+        if (e.mode === "new") li.append("(new file)");
+        else li.append(e.mode + " ", blobTap(String(e.blob || "")));
+        ul.appendChild(li);
+      }
+      det.appendChild(ul);
+    }
+    const tools = Array.isArray(t.tool_versions) ? t.tool_versions.map((p) => (Array.isArray(p) ? p.join(" ") : String(p))).join(", ") : "";
+    const history = Array.isArray(r.history) ? r.history : [];
+    for (const line of [
+      "template " + (t.id || "") + " " + (t.content_hash || ""),
+      "verifier " + (t.verifier_id || "") + " " + (t.verifier_hash || ""),
+      "tools " + (tools || "(none)"),
+      "template write paths " + (Array.isArray(t.write_paths) ? t.write_paths.join(", ") : ""),
+      "policy " + (r.policy_hash || ""),
+      "base " + (r.base || "") + " tree " + (r.base_tree || ""),
+      "signer " + (r.signer_fp || "(not signed)"),
+      "filed " + (r.filed_at || "") + " \u00b7 lease ends " + (r.lease_end || "") + " \u00b7 expires " + (r.expires_at || ""),
+      ...history.map((h) => "history " + h.seq + " " + h.to_state + " " + h.cause + " " + h.at + (h.evidence ? " " + h.evidence : "")),
+    ]) det.appendChild(el("div", "where bound", line));
+    card.appendChild(det);
+    const note = el("div", "note");
+    const key = "dispatch\u0000" + r.id;   // never a consent id
+    const say = (text, kind) => { notes.set(key, [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
+    if (notes.has(key)) say(notes.get(key)[0], notes.get(key)[1]);
+    const signers = Array.isArray(r.signers) ? r.signers : [];
+    if (!signers.length && !notes.has(key)) say(r.signer_note || "no passkey enrolled for this name can sign a dispatch job");
+    const acts = el("div", "acts");
+    // Cancel's first tap reveals the optional reason; the next tap signs the cancel with whatever it holds (empty too)
+    const reasonBox = el("input", "reason");
+    reasonBox.type = "text";
+    reasonBox.placeholder = "reason (optional)";
+    reasonBox.setAttribute("aria-label", "reason for cancelling job " + r.id + " (optional)");
+    reasonBox.hidden = !reasons.has(r.id);
+    reasonBox.value = reasons.get(r.id) || "";
+    reasonBox.addEventListener("input", () => reasons.set(r.id, reasonBox.value));
+    // load() holds still while the box has focus; the next poll redraws once it has lost it
+    const offer = (label, cancel) => {
+      const btn = el("button", "dact", label);
+      btn.type = "button";
+      btn.disabled = !usable || !signers.length;
+      const what = (cancel ? "to CANCEL job " : "to SIGN job ") + r.id;
+      btn.addEventListener("click", () => {
+        if (cancel && reasonBox.hidden) { reasonBox.hidden = false; reasons.set(r.id, reasonBox.value); reasonBox.focus(); return; }
+        start(r, null, signers, say, acts, false, (fp, rawId) => dispatchRun(r, fp, rawId, say, cancel, cancel ? reasonBox.value : ""), what);
+      });
+      acts.appendChild(btn);
+    };
+    if (r.can_sign) offer("Sign with passkey", false);
+    if (r.can_cancel) offer("Cancel with passkey", true);
+    card.append(reasonBox, acts, note);
+    return card;
+  }
+
+  function dispatchRun(r, fp, rawId, say, cancel, reason) {
+    if (busy) return;
+    busy++;
+    const base = "/dispatch/" + encodeURIComponent(r.id) + "/";
+    say("asking for the " + (cancel ? "cancel" : "signature") + " to sign\u2026");
+    call("POST", base + (cancel ? "cancel-challenge" : "challenge"), cancel ? { signer_fp: fp, reason: reason || "" } : { signer_fp: fp }).then((c) => {
+      if (!c.ok) return say(why(c), "bad");
+      say("confirm with your passkey to " + (cancel ? "cancel the job" : "sign the contract") + "\u2026");
+      const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+      return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + (cancel ? "cancel" : "answer"), {
+        payload: c.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
+        client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }).then((a) => {
+        // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing changed
+        if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see where the job stands", "bad");
+        if (!a.ok) return say((cancel ? "not cancelled: " : "not signed: ") + why(a), "bad");
+        if (cancel) reasons.delete(r.id);
+        last = (cancel ? "cancelled " : "signed ") + (r.template && r.template.id || r.id);
+        say((cancel ? "cancelled" : "signed") + " \u00b7 by " + a.body.signer_fp + " \u00b7 job " + a.body.state, "ok");
+      }), (e) => {
+        if (rawId && e && e.name === "NotAllowedError") forget(fp);
+        say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + (cancel ? "the job is not cancelled" : "nothing was signed"), "bad");
+      });
+    }).catch((e) => say("the page failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
+      .finally(() => { busy--; setTimeout(load, 1500); });
+  }
+
   // enrolment: the created credential is kept, so a failed key-line call retries only that call, never makes another
   // kept for this tab (across a reload too) until the key line is sent, so a retry never makes a second passkey
   const MADE = "levain-phone-made";
@@ -477,12 +658,22 @@
       .finally(() => { busy--; });
   }
 
+  // what holds the list still: a ceremony or an open picker (busy), words being typed into a question's box, or a
+  // focused cancel reason (a redraw would wipe the words and dismiss the keyboard)
+  function held() {
+    if (busy) return true;
+    if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return true;
+    return !!(document.activeElement && document.activeElement.matches("input.reason"));
+  }
+
   function load() {
-    if (busy) return;
-    // a redraw would wipe words being typed into a question's box (and dismiss the keyboard)
-    if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return;
+    if (held()) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
-    call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
+    call("GET", "/consent.json").then((r) => {
+      // re-checked here, not only before the GET: any hold that began while it was in flight keeps the list still
+      if (held()) return;
+      if (r.ok) draw(r.body); else $("status").textContent = why(r);
+    });
   }
 
   $("refresh").addEventListener("click", load);
