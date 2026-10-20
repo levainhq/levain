@@ -12,10 +12,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
   were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
   `detach`, `add` and `state` fix a split or close a thread.
+- **`levain envelope`: sign what a piece of work may do, once.** An envelope names where the work may happen (repos
+  and paths), which lasting steps it may take (land onto a branch, push, publish), a budget and a stop time, and you
+  sign it with an enrolled key. `levain envelope echo` writes one for threads you name and shows it in plain words;
+  `levain envelope sign` shows it again in full, asks y/N, and signs it. `levain drop --envelope SPEC "words"` signs one
+  as you send the drop. You can narrow or kill an envelope at any time without signing (`levain envelope kill`,
+  `levain envelope narrow`); only a wider one needs a new signature.
 
 ### Known edges
 - The coordinator session that reads drops and splits them comes later; until then a thread is named with
   `levain drops split`. The phone drop sheet comes later too.
+- Nothing acts on an envelope yet: until Levain's separate-user setup is in place, every step that needs your say
+  still asks you each time, and `levain envelope show` says so. Signing from the phone comes later.
 
 ## [0.11.12] — 2026-10-20
 
