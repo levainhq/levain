@@ -647,6 +647,9 @@ def _names_resume(tokens: list[str], want: str) -> bool:
             return True
         if tok == "resume" and _codex_selector(tokens[i + 1:])[0] == want:
             return True
+        # ps does not quote: a transcript path with a space splits, and its last piece still ends with the file name
+        if tok.endswith(f"/{want}.jsonl") and any(t in ("--resume", "-r") for t in tokens[:i]):
+            return True
     return False
 
 

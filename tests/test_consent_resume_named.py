@@ -310,6 +310,8 @@ _NATIVE = "/Users/John Doe/.local/share/claude/versions/2.1.304"
     ("time nice -n 5 codex exec resume {s} go", True),
     ("sudo -u phill codex resume --skip-git-repo-check {s}", True),
     (_SPACED + " --resume {s}", True),
+    (_NATIVE + " --resume /Users/John Doe/.claude/projects/-w/{s}.jsonl", True),   # r4 LOW 1: the path splits
+    ("tail -f /Users/x/.claude/projects/-w/{s}.jsonl", False),                     # no resume option before it
     ("node --require x /x/lib/node_modules/@anthropic-ai/claude-code/cli.js -r {s}", True),
     ("worker --resume {s}", True),
     ("worker -r{s}", True),
