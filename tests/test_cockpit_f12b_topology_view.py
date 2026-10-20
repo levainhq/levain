@@ -49,6 +49,7 @@ def _value() -> dict:
                   task("t-stuck", "spore", "stuck", label="constraint step"),
                   task("t-fail", "dispatch", "failed", label="guard test", outcomes=[{"label": "guard test failed", "at": "2026-10-19T15:04:00Z", "ok": False}]),
                   task("t-wait", "consent", "waiting", label="git push origin main", waits_on=["consent:abc"], card="consent:abc", workers=["n1", "n3"]),
+                  task("t-sign", "dispatch", "waiting", label="release 0.4.1", waits_on=["consent:abc"], card="dispatch:s1", workers=["n1"]),
                   task("unattached", "unattached", "running", label="unattached work", workers=["n4"])],
         "conflicts": [{"path": "money.py", "nodes": ["n1", "n4"]}], "counts": {"tokens_today": 2400000},
         "as_of": "2026-10-19T15:13:00Z", "lost_if_closed": [], "errors": [], "unreadable": [],
@@ -74,7 +75,7 @@ def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7
 def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_as_not_tracked(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
-    probe = ("JSON.stringify({lens: %s.dataset.lens, groups: [...%s.querySelectorAll('.tv-group')].map(g => g.dataset.group), "
+    probe = ("JSON.stringify({lens: %s.dataset.lens, recs: %s.querySelectorAll('.tv-wl .tv-rec').length, "
              "strip: [...%s.querySelectorAll('.tv-stat')].map(s => s.dataset.k + '=' + s.textContent.replace(/\\s+/g, ' ')), "
              "cols: %s.querySelectorAll('.tv-col').length, "
              "tasks: [...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.state, t.dataset.kind, "
@@ -84,14 +85,14 @@ def test_the_work_lens_is_the_default_at_1440_and_draws_the_providers_own_nulls_
     got = json.loads(out[-1])
     assert got["lens"] == "work" and got["cols"] == 0, got                              # Work, not Agents
     assert got["pressed"] == ["topology"], got                                          # topology is the default view at 1440
-    assert got["groups"] == ["waiting", "stuck", "unattached"], got                     # loudest first; no task is running (a spore has no worker)
+    assert got["recs"] >= 1, got                                                        # the pending consents are records in the left column
+    assert not any(t[1] in ("consent", "question") for t in got["tasks"]), got          # ... and not centre cards
     by = {t[1]: t for t in got["tasks"]}
-    assert by["consent"][0] == "waiting" and by["consent"][2] == "cost not tracked" and by["consent"][3], got   # a worker chip on it
     assert by["spore"][0] == "stuck" and by["spore"][2] == "cost not tracked" and by["spore"][3] == [], got  # a spore carries no session
     assert any(t[0] != "waiting" and t[1] == "unattached" for t in got["tasks"]), got                              # the codex session: no task, none guessed
     strip = dict(s.split("=", 1) for s in got["strip"])
     assert strip["conflicts"] == "conflicts not tracked" and strip["tokens"] == "tokens today not tracked", got
-    assert strip["groups"] == "3 groups" and strip["nodes"] == "3 nodes", got
+    assert list(strip) == ["tasks", "waiting", "stuck", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["stuck"] == "2 stuck", got
 
 
 @needs_browser
@@ -142,11 +143,11 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
 
 
 @needs_browser
-def test_a_click_on_a_waiting_task_opens_the_card_it_waits_on(tmp_path, monkeypatch):
+def test_a_click_on_a_waiting_record_opens_the_card_it_waits_on(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [
-        {"until": TV + " && " + TV + ".querySelector('.tv-task.waiting.tv-open')"},
-        {"eval": TV + ".querySelector('.tv-task.waiting.tv-open').click(); 1"},
+        {"until": TV + " && " + TV + ".querySelector('.tv-rec.tv-open')"},
+        {"eval": TV + ".querySelector('.tv-rec.tv-open').click(); 1"},
         {"until": "document.querySelector('.modal-overlay [data-card^=\"consent:\"].tv-lit')"},
         {"eval": "JSON.stringify([!!document.querySelector('.modal-overlay'), document.querySelector('[data-card^=\"consent:\"].tv-lit').className])"}])
     assert "timeout" not in json.dumps(out[-2]), out
@@ -157,19 +158,49 @@ def test_a_click_on_a_waiting_task_opens_the_card_it_waits_on(tmp_path, monkeypa
 
 
 @needs_browser
-def test_tasks_group_loudest_first_waiting_and_stuck_never_merge_and_unattached_is_last(tmp_path, monkeypatch):
+def test_three_columns_records_left_tasks_centre_outcomes_right_on_the_tasks_own_row(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify({groups: [...%s.querySelectorAll('.tv-group')].map(g => g.dataset.group), "
-             "tags: [...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, t.dataset.state, (t.querySelector('.tv-tag') || {textContent: ''}).textContent]), "
-             "waiting_open: !!%s.querySelector('.tv-task.waiting.tv-open'), stuck_open: !!%s.querySelector('.tv-task.stuck.tv-open')})") % ((TV,) * 4)
+    probe = ("JSON.stringify({order: [...%s.querySelectorAll('.tv-task')].map(t => t.dataset.task), "
+             "recs: [...%s.querySelectorAll('.tv-rec')].map(r => [r.dataset.rec, r.dataset.card, Math.round(r.getBoundingClientRect().right)]), "
+             "task_left: Math.round(%s.querySelector('.tv-task').getBoundingClientRect().left), "
+             "tags: Object.fromEntries([...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, (t.querySelector('.tv-tag') || {textContent: ''}).textContent])), "
+             "outs: [...%s.querySelectorAll('.tv-outs')].map(o => [o.dataset.task, Math.round(o.getBoundingClientRect().left), "
+             "Math.abs(o.getBoundingClientRect().top - %s.querySelector('.tv-task[data-task=' + o.dataset.task + ']').getBoundingClientRect().top) < 2]), "
+             "legend: (%s.querySelector('.tv-legend') || {textContent: ''}).textContent, "
+             "waiting_open: !!%s.querySelector('.tv-task.waiting.tv-open'), stuck_open: !!%s.querySelector('.tv-task.stuck.tv-open')})") % ((TV,) * 9)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])
-    assert got["groups"] == ["waiting", "failed", "stuck", "running", "done", "unattached"], got
-    tags = {t[0]: t for t in got["tags"]}
-    assert tags["t-wait"][1:] == ["waiting", "waiting on you"] and tags["t-stuck"][1:] == ["stuck", "stuck"], got
-    assert got["waiting_open"] is True and got["stuck_open"] is False, got              # only a record can be opened; silence has none
-    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": TV + ".querySelector('.tv-task.waiting').click(); window.__opened"}])
-    assert out[-1] == "consent:abc", out                                                 # the click names the card the task waits on
+    assert got["order"] == ["t-sign", "t-fail", "t-stuck", "t-run", "t-done", "unattached"], got      # loudest state first, unattached last; the consent is no centre card
+    assert [r[0] for r in got["recs"]] == ["t-wait", "t-sign"], got                                    # the consent and the contract waiting on a signature
+    assert all(r[2] <= got["task_left"] for r in got["recs"]), got                                     # records sit left of the tasks
+    assert got["outs"] and all(o[1] > got["task_left"] and o[2] for o in got["outs"]), got              # outcomes sit right of them, on the task's own row
+    assert got["tags"]["t-sign"] == "waiting on you" and got["tags"]["t-stuck"] == "stuck", got
+    assert "waiting = a pending record you can answer; stuck = silence, no record" in got["legend"], got
+    assert got["waiting_open"] is True and got["stuck_open"] is False, got                              # only a record can be opened; silence has none
+    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": TV + ".querySelector('.tv-rec').click(); window.__opened"}])
+    assert out[-1] == "consent:abc", out                                                                 # the click names the card the record is
+
+
+@needs_browser
+def test_a_line_joins_a_record_to_the_task_waiting_on_it_and_a_task_to_its_outcomes(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = "JSON.stringify([...%s.querySelectorAll('.tv-link')].map(p => p.getAttribute('class').replace('tv-link ', '')).sort())" % TV
+    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"until": TV + ".querySelector('.tv-link')"}, {"eval": probe}])
+    # record -> t-sign (it waits on the consent), the contract's own record -> t-sign, t-done -> its check, t-fail -> its cross
+    assert json.loads(out[-1]) == ["bad", "ok", "waiting", "waiting"], out
+    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}], first=NARROW)
+    assert json.loads(out[-1]) == [], out                                                                # stacked: no side to draw lines on
+
+
+@needs_browser
+def test_below_the_column_width_the_records_then_tasks_then_outcomes_stack(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("JSON.stringify({rec: Math.round(%s.querySelector('.tv-rec').getBoundingClientRect().top), task: Math.round(%s.querySelector('.tv-task').getBoundingClientRect().top), "
+             "out_below: (() => { const o = %s.querySelector('.tv-outs'), t = %s.querySelector('.tv-task[data-task=' + o.dataset.task + ']'); "
+             "return o.getBoundingClientRect().top >= t.getBoundingClientRect().bottom - 1; })()})") % ((TV,) * 4)
+    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}], first=NARROW)
+    got = json.loads(out[-1])
+    assert got["rec"] < got["task"] and got["out_below"] is True, got
 
 
 @needs_browser
@@ -183,6 +214,7 @@ def test_null_is_drawn_as_unknown_and_a_real_zero_stays_a_zero(tmp_path, monkeyp
                                {"eval": _paint(v, "agents")}, {"eval": probe}])
     work, agents = json.loads(out[-3]), json.loads(out[-1])
     assert work["costs"]["t-stuck"] == "cost not tracked" and work["costs"]["t-fail"] == "cost not tracked", work
+    assert "t-wait" not in work["costs"], work                                                           # a consent is a record on the left, not a task card
     assert work["costs"]["t-done"] == "$2.10 dispatch", work
     assert work["costs"]["t-run"] == "$0.00 · 5K tok ledger", work                # an explicit 0.0 is a zero, never "not tracked"
     assert work["costs"]["unattached"] is None, work                                    # no cost line on unattached work
@@ -217,8 +249,10 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
              "conf: (%s.querySelector('.tv-conf') || {innerText: ''}).textContent})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])["strip"]
-    assert got == {"groups": "2 groups", "nodes": "5 nodes", "running": "1 running", "waiting": "1 waiting on you",
-                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got
+    assert got == {"tasks": "6 tasks", "waiting": "2 waiting on you", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
+                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead, as drawn
+    out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}])
+    assert json.loads(out[-1])["strip"]["nodes"] == "5 nodes", out                                       # the Agents lens keeps its own strip
     assert "money.py" in json.loads(out[-1])["conf"] and "claude_code · ledgerline" in json.loads(out[-1])["conf"] and "codex · tally" in json.loads(out[-1])["conf"]
 
 
@@ -239,6 +273,7 @@ def test_no_horizontal_scroll_at_1440_and_at_390_in_either_lens(tmp_path, monkey
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
     v["tasks"][4]["label"] = "an unbroken " + "x" * 46                                   # the 48-character label the wire allows
+    v["tasks"][5]["label"] = "an unbroken " + "z" * 46
     v["nodes"][0]["label"] = "claude_code · " + "y" * 33
     probe = ("JSON.stringify({page: document.documentElement.scrollWidth - document.documentElement.clientWidth, "
              "tv: %s.scrollWidth - %s.clientWidth, card: document.querySelector('#k7-sessions .k7-card').scrollWidth - document.querySelector('#k7-sessions .k7-card').clientWidth})") % (TV, TV)
@@ -256,7 +291,7 @@ def test_a_long_group_shows_its_first_four_and_one_button_for_the_rest(tmp_path,
     v = _value()
     base = v["tasks"][2]
     v["tasks"] += [{**base, "id": f"t-more-{i}", "label": f"loop {i}"} for i in range(5)]          # six stuck in all
-    probe = "JSON.stringify([...%s.querySelectorAll('.tv-group.stuck .tv-task')].filter(t => !t.hidden).length)" % TV
+    probe = "JSON.stringify([...%s.querySelectorAll('.tv-task[data-state=stuck]')].filter(t => !t.hidden).length)" % TV
     # the real card repaints through cockpit_view.js; the button asks it to, so here the click is checked on the drawn state only
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": "(" + TV + ".querySelector('.tv-more') || {}).textContent"}])
     assert json.loads(out[-2]) == 4 and out[-1] == "show 2 more", out
