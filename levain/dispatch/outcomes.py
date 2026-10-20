@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import parse_stamp
@@ -118,7 +118,7 @@ def default_directory() -> Path:
 def _one_line(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise DispatchError(f"{name} must be a string")
-    if any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in value):
+    if unshowable.first_hidden(value, allow="") is not None:
         raise DispatchError(f"{name} must be one line of plain text: no control characters")
     if not 1 <= len(value.strip()) <= _FIELD_MAX or value != value.strip():
         raise DispatchError(f"{name} must be 1 to {_FIELD_MAX} characters with no edge whitespace")

@@ -70,7 +70,6 @@ import subprocess
 import sys
 import tarfile
 import time
-import unicodedata
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -79,6 +78,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from levain import unshowable
 from levain.consent.push import TRUSTED_PATH, _fsync_dir, _private_dir, append_line
 from levain.launch import NETWORK, child_env
 
@@ -129,7 +129,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NPM_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _NPM_ACCESS = ("default", "public", "restricted")
 _ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
-_UNSHOWABLE = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 class PublishRefused(ValueError):
@@ -184,10 +183,10 @@ class PublishResult:
 
 
 def _showable(name: str, text: str) -> None:
-    for ch in text:
-        if unicodedata.category(ch) in _UNSHOWABLE:
-            raise PublishRefused(f"the {name} carries an invisible or direction-changing character (U+{ord(ch):04X}); "
-                                 "the operator could not read what he is asked to allow")
+    found = unshowable.first_hidden(text, allow="")
+    if found is not None:
+        raise PublishRefused(f"the {name} carries an invisible or direction-changing character "
+                             f"(U+{ord(found[1]):04X}); the operator could not read what he is asked to allow")
 
 
 def canonical_target(url: str) -> str:
@@ -657,7 +656,7 @@ def _clean(text: str) -> str:
     """``text`` without terminal escapes or invisible characters (a tool's coloured output stays readable in the
     receipt and on the agent's terminal)."""
     text = _ESCAPES.sub("", text)
-    return "".join(c for c in text if c in "\n\t" or unicodedata.category(c) not in _UNSHOWABLE)
+    return unshowable.mark(text, "", allow="\n\t")
 
 
 def resolve_tool(index: str) -> list[str]:

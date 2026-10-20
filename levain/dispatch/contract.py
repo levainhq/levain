@@ -42,6 +42,7 @@ from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
+from levain import unshowable
 from levain.cockpit.consent import ConsentError, parse_stamp
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical, canonical_bytes, parse
@@ -77,9 +78,6 @@ _VERIFIER_KINDS = ("black-box", "in-process")
 _GLOB = frozenset("*?[")
 # tool class names that are a shell under another name; refused with the Bash message, not the unknown-class one
 _SHELLISH = re.compile(r"(?i).*(bash|shell|zsh|exec|terminal|command|powershell|cmd|^sh$|^run$).*")
-# what can show differently from what is signed: control, format, surrogate, separators, private use, unassigned
-# (the categories the consent path's text rule refuses, mirrored here)
-_UNSHOWABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 # a path under /dev/null cannot exist (/dev/null is not a directory), so git reads no graft file through it
 _NO_GRAFT_FILE = "/dev/null/levain-dispatch-no-grafts"
 
@@ -98,14 +96,12 @@ _GitUnavailable = GitUnavailable
 
 
 def _text_problem(text: str, what: str) -> str | None:
-    # prose (a goal): what is signed must show as what it is; newline, tab and the plain space are prose
-    for ch in text:
-        if ch in "\n\t ":
-            continue
-        category = unicodedata.category(ch)
-        if category in _UNSHOWABLE or category == "Zs":
-            return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
-                    "from what is signed")
+    # prose (a goal): what is signed must show as what it is (levain.unshowable); newline and tab are prose
+    found = unshowable.first_hidden(text, allow="\n\t")
+    if found is not None:
+        ch = found[1]
+        return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
+                "from what is signed")
     return None
 
 

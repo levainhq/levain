@@ -12,10 +12,10 @@ dict to ``render_lines``."""
 
 from __future__ import annotations
 
-import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
+from levain import unshowable
 from levain.cockpit.engine import ALIASES, ROW_ENGINE_KINDS, Cockpit
 
 LOCAL_CREDENTIAL = {"class": "none", "device_class": None}
@@ -43,16 +43,9 @@ def snapshot(cockpit: Cockpit, credential: dict[str, Any] | None = None, profile
 
 
 def visible(text: Any) -> str:
-    """Control and bidi characters shown as ``<U+XXXX>``: a field the kernel sent can never move
-    the cursor or reorder the line (design §7)."""
-    out = []
-    for ch in str(text):
-        cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf", "Cs", "Zl", "Zp"):
-            out.append(f"<U+{ord(ch):04X}>")
-        else:
-            out.append(ch)
-    return "".join(out)
+    """Every unshowable character (:mod:`levain.unshowable`, newline and tab included) shown as
+    ``<U+XXXX>``: a field the kernel sent can never move the cursor or reorder the line (design §7)."""
+    return unshowable.mark(str(text), "<U+{:04X}>", allow="")
 
 
 def _age(iso: str | None, now: datetime) -> str:

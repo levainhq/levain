@@ -6,24 +6,16 @@ for the compact Decisions row, and that module must never reach the hints (a hin
 """
 from __future__ import annotations
 
-import unicodedata
 from typing import Any
+
+from levain import unshowable
 
 __all__ = ["visible"]
 
-# blank-looking characters outside Cf/Cc/Zs: line and paragraph separators, Hangul fillers, braille blank,
-# combining grapheme joiner, Mongolian free variation selectors
-_BLANKS = "\u2028\u2029\u3164\u2800\u115f\u1160\uffa0\u034f\u180b\u180c\u180d"
-
 
 def visible(text: Any) -> Any:
-    """``text`` with every Unicode format or control character (Cf, Cc except newline and tab, Zs spaces other than
-    U+0020, and the blank-looking ones in ``_BLANKS``) shown as a visible ``<U+XXXX>`` marker. Not a string: returned as is."""
+    """``text`` with every unshowable character (:mod:`levain.unshowable`; newline and tab are kept) shown as a
+    visible ``⟨U+XXXX⟩`` marker. Not a string: returned as is."""
     if not isinstance(text, str):
         return text
-    return "".join(f"⟨U+{ord(ch):04X}⟩" if _hidden(ch) else ch for ch in text)
-
-
-def _hidden(ch: str) -> bool:
-    cat = unicodedata.category(ch)
-    return (cat in ("Cf", "Cc") and ch not in "\n\t") or ch in _BLANKS or (cat == "Zs" and ch != " ")
+    return unshowable.mark(text, "⟨U+{:04X}⟩", allow="\n\t")
