@@ -68,8 +68,10 @@ class Reader(Protocol):
     def wait(self) -> None: ...
 
 
-#: ``run_as(uid, gid, fn, wfd)``: run ``fn(wfd)`` as ``uid``/``gid`` and own ``wfd`` (close it when ``fn`` ends).
-RunAs = Callable[[int, int, Callable[[int], None], int], Reader]
+#: ``run_as(uid, gid, fn, wfd, keep)``: run ``fn(wfd)`` as ``uid``/``gid`` with the ``keep`` fds left open, and own
+#: ``wfd`` (close it when ``fn`` ends). ``keep`` is the staging dirfd when root holds one (§5.4 step 2: the reader opens
+#: the name "under the staging dirfd"), else empty.
+RunAs = Callable[[int, int, Callable[[int], None], int, Sequence[int]], Reader]
 
 
 @dataclass(frozen=True)
@@ -115,15 +117,18 @@ class _Forked:
             self._reaped = True
 
 
-def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int) -> Reader:
-    """The real ``run_as``: fork; the child closes every fd but 0-2 and ``wfd``, drops + asserts, runs ``fn`` and
-    ``_exit``s (70 if the drop or ``fn`` raised, having written nothing more). Only root can run it."""
+def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: Sequence[int] = (), *,
+                drop: Callable[[int, int], None] = drop_to_lease_peer) -> Reader:
+    """The real ``run_as``: fork; the child closes every fd but 0-2, ``wfd`` and ``keep`` (the staging dirfd: closing
+    it made every real render refuse ``staging-open-failed``, VM run X4), drops + asserts, runs ``fn`` and ``_exit``s
+    (70 if the drop or ``fn`` raised, having written nothing more). Only root can run it with the real ``drop``; a test
+    runs the real fork with a no-op one as its own uid."""
     pid = os.fork()
-    if pid == 0:   # pragma: no cover - the child; exercised only as root (VM row)
+    if pid == 0:   # pragma: no cover - the child (coverage does not follow a fork)
         code = 0
         try:
-            _close_fds_except([wfd])
-            drop_to_lease_peer(uid, gid)
+            _close_fds_except([wfd, *keep])
+            drop(uid, gid)
             fn(wfd)
         except BaseException:   # noqa: BLE001 - the child never returns into the parent's stack
             code = 70
@@ -144,7 +149,7 @@ class _Threaded:
         self._t.join(timeout=30)
 
 
-def thread_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int) -> Reader:
+def thread_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: Sequence[int] = ()) -> Reader:
     """An in-process ``run_as`` for unit tests (no fork, no drop: the caller is not root). ``fn`` runs on a thread
     and ``wfd`` is closed when it ends."""
     stop = threading.Event()
@@ -173,8 +178,9 @@ def _send_refusal(wfd: int, name: str) -> None:
 
 
 def reader(staging: int | str | os.PathLike[str], name: str, cap: int, cap_refusal: str, wfd: int) -> None:
-    """The reader's whole job, after the drop. ``staging``: a dirfd, or the staging dir's path (opened here, as the
-    lease peer, so root never opens it either)."""
+    """The reader's whole job, after the drop. ``staging``: the staging dirfd root opened (the dir itself, an entry
+    of root's own ``L/staging/``; root opens nothing IN it, §5.4 step 2), kept open across the fork by ``run_as``'s
+    ``keep``; or the staging dir's path, opened here as the lease peer."""
     dfd = None
     try:
         if isinstance(staging, int):
@@ -278,7 +284,8 @@ def stage_copy(staging: int | str | os.PathLike[str], name: str, cap: int, heade
     proc = None
     try:
         proc = run_as(staging_uid, staging_gid,
-                      lambda w: reader(staging, name, cap, cap_refusal, w), wfd)
+                      lambda w: reader(staging, name, cap, cap_refusal, w), wfd,
+                      (staging,) if isinstance(staging, int) else ())
         wfd = -1   # run_as owns it now
         pipe = _Pipe(rfd, deadline, clock, poll_slice)
         tag = pipe.exactly(1)
