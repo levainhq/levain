@@ -4205,6 +4205,8 @@
     const card = el("div", "needs-card needs-consent");
     card.dataset.needsCard = "consent";
     if (c.id) card.dataset.needsId = "consent:" + c.id;
+    card.dataset.needsExpires = String(c.expiresAt);
+    card.dataset.needsState = String(c.state);
     needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
       const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
       left.dataset.consentExpires = c.expiresAt;
@@ -4262,7 +4264,26 @@
     const kept = new Map();
     if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
     const idOf = (it) => (it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : ""));
-    const cards = items.map((it) => { const id = idOf(it); return (id && kept.get(id)) || (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)); });
+    // a card kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
+    // one whose state changed is rebuilt unless words are typed into it or its details are open (then it is kept as it is)
+    const fresh = (it) => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
+    const keep = (card, it) => {
+      if (it.kind !== "consent") return card;
+      const st = it.c.state;
+      if (card.dataset.needsState !== undefined && card.dataset.needsState !== st) {
+        const ta = card.querySelector("textarea");
+        const open = card.querySelector("details[open]");
+        if (!(ta && ta.value) && !open) return consentCard(it.c);
+      }
+      const exp = String(it.c.expiresAt);
+      if (card.dataset.needsExpires !== exp) {
+        card.dataset.needsExpires = exp;
+        const left = card.querySelector(".consent-left");
+        if (left) { left.dataset.consentExpires = exp; left.textContent = consentLeft(it.c.expiresAt); }
+      }
+      return card;
+    };
+    const cards = items.map((it) => { const id = idOf(it); const k = id && kept.get(id); return k ? keep(k, it) : fresh(it); });
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);

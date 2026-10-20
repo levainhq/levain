@@ -373,3 +373,27 @@ def test_the_two_server_views_count_a_spores_age_from_the_same_local_day(monkeyp
         else:
             monkeypatch.setenv("TZ", old)
         time.tzset()
+
+
+@needs_browser
+def test_a_kept_consent_card_takes_the_new_expiry_when_the_same_id_comes_back_extended(tmp_path: Path, monkeypatch) -> None:
+    """L3 r2 (complement LOW): the card is kept by id, but its countdown must follow a consent whose expiry moved."""
+    _waiting(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    new = "2099-01-01T00:00:00+00:00"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+            {"until": "document.querySelector('#ck-needs .consent-left')"},
+            {"eval": "(() => { window.__card = document.querySelector('#ck-needs .needs-consent');"
+                     " window.__before = window.__card.querySelector('.consent-left').dataset.consentExpires;"
+                     " const f = window.fetch; window.fetch = async (...a) => { const r = await f(...a);"
+                     " const t = await r.clone().text(); if (!/expires_at/.test(t)) return r;"
+                     f" return new Response(t.replace(/\"expires_at\":\\s*\"[^\"]*\"/g, '\"expires_at\": \"{new}\"'), {{status: r.status, headers: r.headers}}); }};"
+                     " return window.__before; })()"},
+            {"eval": "window.LevainCockpitView.refetchPanel('decisions').then((r) => JSON.stringify({ r: r, "
+                     " same: document.querySelector('#ck-needs .needs-consent') === window.__card,"
+                     " before: window.__before, after: document.querySelector('#ck-needs .needs-consent .consent-left').dataset.consentExpires,"
+                     " all: [...document.querySelectorAll('#ck-needs .needs-consent .consent-left')].map((e) => e.dataset.consentExpires)}))"}])["values"]
+    got = json.loads(out[-1])
+    assert got["before"] != new and got["after"] == new, got
+    assert got["same"] is True, got              # the card was kept, not rebuilt
