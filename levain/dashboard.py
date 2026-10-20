@@ -2043,7 +2043,7 @@ def run_state(
     if text is not None:
         try:
             done = write_state(context_json, text, source=source,
-                               episodic_db=install_root / ".levain" / "memory.db")
+                               episodic_db=SubstrateSource.local(install_root).anneal.episodic_db)
         except (ValueError, OSError) as exc:
             print(f"state not set: {exc}", file=sys.stderr)
             return 2
