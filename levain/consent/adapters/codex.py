@@ -401,6 +401,14 @@ def ruling_context(queue: ConsentQueue, session: str) -> str | None:
     lines = []
     for ruling in queue.claim_rulings_for(AGENT, session):
         got = queue.get(ruling.request_id)
+        if got is not None and got[0].tool_name == "levain_limit":   # Q13: a limit has no action to do
+            from levain.consent.limits import ruling_text
+
+            text = ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory,
+                               request_id=ruling.request_id)
+            if text:
+                lines.append(text)
+            continue
         what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
         text = RULING_TEXT.get(ruling.ruling)
         if text is not None:
@@ -498,6 +506,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
                      "retry it and do not achieve it another way.")
     if tool_input is None:
         tool_input = {}
+    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home, codex_dir=codex_dir)
+    if limited is not None:
+        return _with_rulings(limited, queue, session)   # a late End on the limit reaches a halted Codex session
     try:
         send_repings(queue, settings)
     except Exception:
@@ -507,6 +518,25 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
     out = _gate_call(event, queue, settings, tool_name, tool_input, cwd, session, home=home, codex_dir=codex_dir,
                      sleep=sleep, still_away=still_away)
     return _with_rulings(out, queue, session)
+
+
+def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
+            tool_input: Any, cwd: str, *, home: Path | None, codex_dir: Path | None) -> dict[str, Any] | None:
+    """Q13 after the queue halt is read (:func:`levain.consent.limits.check`); ``None`` lets the call on to the gate.
+    No hook output stops a Codex turn (``continue: false`` would void the deny), so a limit halt is the limits store's
+    own: every later call of the session is denied until an Extend lifts it. A GATED call held and then extended is
+    denied with a retry line, so the gate's own hold runs in a fresh hook."""
+    from levain.consent import limits
+
+    hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)
+    got = limits.check(AGENT, event, queue, session, tool_name, tool_input, hold=hold, cwd=cwd,
+                       notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
+    if got.go:
+        if got.extended and gate_class(tool_name, tool_input, cwd, home=home, codex_dir=codex_dir,
+                                       protected=protected_paths(Path(queue.directory), settings)) is not None:
+            return _deny(limits.retry_text(got.extended))
+        return None
+    return _deny(got.text)
 
 
 def _with_rulings(out: dict[str, Any] | None, queue: ConsentQueue, session: str) -> dict[str, Any] | None:
