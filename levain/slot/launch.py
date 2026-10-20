@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slot", type=_slot, default=None, metavar="N", help="Ask for this slot (default: a free one).")
     p.add_argument("--auth", choices=AUTHS, default="brokered",
                    help="brokered: Levain's gateway holds the API key (default); passthrough: the slot's own "
-                        "vendor login.")
+                        "vendor login (with --login only, for now).")
     p.add_argument("--login", action="store_true",
                    help="A login session: sign the slot in to the vendor (needs --auth passthrough).")
     return p
@@ -56,6 +56,10 @@ def parse(argv: Sequence[str]) -> Any:
         # DECISION: a login session exists to store the slot's own vendor credential (§5.1 prepare: kind `login`
         # is the passthrough first login); a brokered slot never holds one.
         raise Refused("login-needs-passthrough", "--login signs the slot in; use it with --auth passthrough")
+    if args.auth == "passthrough" and not args.login:
+        # An interactive passthrough session needs `start`'s identity gate (§5.1 confirm-identity), not built
+        # yet: refused here, before a slot is taken, rather than by `start` after one was.
+        raise Refused("passthrough-needs-identity-gate", "--auth passthrough runs only with --login for now")
     return Request(vendor=args.vendor, repo=args.repo, auth=args.auth,
                    kind="login" if args.login else "interactive", slot=args.slot)
 
@@ -71,9 +75,16 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Optional[Callable[[Any], 
     except Refused as e:
         err.write(f"levain session: refused {e.name}: {e.detail}\n")
         return 1
-    if run is None:
-        from levain.slot.supervisor import run_session as run
-    return 1 if run(req) != 0 else 0
+    try:
+        if run is None:
+            from levain.slot.supervisor import run_session as run
+        return 1 if run(req) != 0 else 0
+    except Refused as e:        # Seams() refuses a host it has no layout for (`unsupported-host`)
+        err.write(f"levain session: refused {e.name}: {e.detail}\n")
+        return 1
+    except OSError as e:        # DECISION: an OS failure no step named, by its errno text, never a traceback
+        err.write(f"levain session: refused os-error: {e}\n")
+        return 1
 
 
 def register(subparsers: Any) -> None:
