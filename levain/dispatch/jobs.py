@@ -7,13 +7,15 @@ CAPABILITY: a random token only the filing session holds, of which the store kee
 signs the contract's digest (:meth:`JobStore.sign`); from there the job is queued for a slot, run, verified, perhaps
 RECOMMENDED by the planner (:meth:`JobStore.recommend`, advisory: it confers no authority), authorised by a human
 signature or a human-signed adoption rule, and adopted. It fails on what the service itself observes (a lapsed
-lease, a budget cap, a floor refusal, a failed verifier) and is cancelled by the filing planner (its capability) at
+lease, a budget cap, a floor refusal, a failed verifier, a landing branch that no longer reads the base the
+verifier ran on) and is cancelled by the filing planner (its capability) at
 any state before authorised, or by the human at any non-terminal state. Adopted, failed and cancelled are terminal.
 
 :data:`EDGES` is the one table of allowed transitions: (from, to) -> the causes that may take it. Every transition is
 checked against it inside its write transaction, against the current state read in that same transaction, so two
-writers can never both move a job from one state. Most causes have no public method yet (runs, the verifier and
-adoption are later slices); the table names them all.
+writers can never both move a job from one state. Runs and the verifier have no public method yet (later
+slices); authorisation is :meth:`JobStore.authorise`, which :func:`levain.dispatch.adopt.land` calls. The table names
+every cause.
 
 Every filed job holds a LEASE: an unsigned contract lapses :data:`UNSIGNED_LEASE` after filing (or at its expiry, if
 sooner), a signed one at the expiry its digest binds. Every read and every write first sweeps (:meth:`JobStore.sweep`)
@@ -27,8 +29,9 @@ same path, or one an ancestor of the other (``src/sub`` and ``src/sub/deep.py`` 
 or runaway planner cannot hold a file past its lease.
 
 By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human
-signed for that result, and only a human releases it (adoption, or the human cancel, :meth:`JobStore.cancel_by_human`,
-whose signed item is kept append-only beside the contract signature). The lease protects against a planner that
+signed for that result, and only adoption, the human cancel (:meth:`JobStore.cancel_by_human`, whose signed item is
+kept append-only beside the contract signature) or a moved base releases it: a land that finds its branch no longer at
+the base the verifier ran on fails the job (``base_moved``), because the authorised result was judged on that base. The lease protects against a planner that
 abandons a job, and an authorised job is no longer the planner's. A human cancel signed before the job's latest
 human-signed transition (the contract signature, a later authorisation) is refused: a stale cancel never kills a job
 the operator signed for after it.
@@ -36,7 +39,7 @@ the operator signed for after it.
 The store is ``<directory>/dispatch.db``, the consent directory by default (:func:`default_dispatch_dir`), in a
 directory that is the operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse
 UPDATE, DELETE and an INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature, its
-one human cancel, the agent that filed it and the store's own metadata are rows written once, and a job's state is its
+one human cancel, its one human authorisation, the agent that filed it and the store's own metadata are rows written once, and a job's state is its
 latest transition. Every connection the store opens turns foreign keys on. At creation the store draws a random
 ``store_id``, which every contract signature binds, so a signature made for a job in one store is refused by another.
 

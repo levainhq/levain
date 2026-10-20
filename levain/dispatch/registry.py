@@ -60,7 +60,7 @@ from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
     "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS", "ROUTE_KEYS", "TEMPLATE_FORMAT", "TEMPLATE_KEYS",
-    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "active_policy", "body_refusal",
+    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at", "active_policy", "body_refusal",
     "execution_bearing", "legacy_rule_problem", "parse_criteria", "r0_write_refusal", "resolver", "template_content_hash", "template_from_mapping",
 ]
 
@@ -523,10 +523,16 @@ def active_adoption_rules(control_store: _ConfigStore) -> tuple[AdoptionRule, ..
     bound to the active template's content hash, its verifier still the registered one). Raises when the store
     cannot be read or verified or any rule no longer holds: a rule is never read out against content it was not
     signed for. No rules accepted reads as none, which adopts nothing."""
+    return adoption_rules_at(control_store)[1]
+
+
+def adoption_rules_at(control_store: _ConfigStore) -> tuple[int, tuple[AdoptionRule, ...]]:
+    """:func:`active_adoption_rules` with the generation of the item they come from (0 when none is accepted), both
+    from ONE verified read, so a land records the generation of the rules it was judged by."""
     active = control_store._verified_items()
     item = active.get("adoption_rules")
     if item is None:
-        return ()
+        return 0, ()
     problem = _adoption_rules(item.body, active)
     if problem is not None:
         raise DispatchError(f"the active adoption rules no longer hold: {problem}")
@@ -537,7 +543,7 @@ def active_adoption_rules(control_store: _ConfigStore) -> tuple[AdoptionRule, ..
         out.append(AdoptionRule(repo=r["repo"], template_id=r["template_id"], template_hash=r["template_hash"],
                                 verifier_kind=r["verifier_kind"],
                                 criteria=parse_criteria(r["criteria"], template.write_paths)))
-    return tuple(out)
+    return item.generation, tuple(out)
 
 
 def active_policy(control_store: _ConfigStore) -> ProviderPolicy:

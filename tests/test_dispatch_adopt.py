@@ -18,7 +18,7 @@ from levain.dispatch.adopt import (
     stage_commit, staged_ref,
 )
 from levain.dispatch.jobs import JobStore
-from levain.dispatch.registry import active_adoption_rules, active_policy, resolver
+from levain.dispatch.registry import active_adoption_rules, adoption_rules_at, active_policy, resolver
 from tests import test_dispatch_control as tc
 from tests.test_dispatch_contract import NOW
 from tests.test_dispatch_control import BB, Clock, accept, base_config
@@ -141,7 +141,7 @@ def human(job, rec, keys, log, *, onto="main", key="laptop"):
 
 def by_rule(jstore, cstore, job, recs, *, onto="main", tier=T2, **kw):
     return land(jstore, job.id, recs, landing_tier=tier, resolve_template=resolver(cstore),
-                policy=active_policy(cstore), onto=onto, rules=lambda: active_adoption_rules(cstore), **kw)
+                policy=active_policy(cstore), onto=onto, rules=lambda: adoption_rules_at(cstore), **kw)
 
 
 def by_human(jstore, cstore, job, recs, h, *, tier=T2, **kw):
@@ -235,14 +235,24 @@ def test_a_checked_out_branch_prints_his_merge_and_a_retry_adopts(jstore, cstore
 
 # --- (c) a moved base ----------------------------------------------------------------------------------------------
 
-def test_a_moved_base_fails_the_job_and_releases_its_files(jstore, cstore, repo, log, keys, tmp_path):
+def test_a_moved_base_fails_the_job_only_under_a_verified_authorisation(jstore, cstore, repo, log, keys, tmp_path):
     path, base = repo
     with_rule(cstore, log, keys, repo)
     job = verified_job(jstore, cstore, repo)
     recs = runs(repo, job, tmp_path, A_FIX)
     git(path, "update-ref", "refs/heads/main", git(path, "commit-tree", f"{base}^{{tree}}", "-p", base,
                                                    feed=b"his\n"))
+    staged = git(path, "for-each-ref", f"refs/heads/levain/dispatch/{job.id}/")
+    assert staged
+    # a rule land, and an item whose signature is garbage (L1 1020+17, run), refuse and keep the job and its refs
     out = by_rule(jstore, cstore, job, recs)
+    assert out.outcome == "refused" and "MOVED BASE" in out.message and out.job.state == "verified"
+    payload, _sig, source = human(job, recs[0], keys, log)
+    out = by_human(jstore, cstore, job, recs, (payload, "garbage-signature", source))
+    assert out.outcome == "refused" and jstore.get(job.id).state == "verified"
+    assert git(path, "for-each-ref", f"refs/heads/levain/dispatch/{job.id}/") == staged
+    # the human's verified authorisation of that run on that branch fails it and releases its files
+    out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))
     assert out.outcome == "failed" and out.job.state == "failed" and out.job.history[-1].cause == "base_moved"
     assert out.job.history[-2].to_state == "verified"                              # no intent was written
     assert git(path, "for-each-ref", f"refs/heads/levain/dispatch/{job.id}/") == ""    # staged refs deleted
@@ -505,3 +515,164 @@ def test_a_graft_file_in_the_repository_is_not_read(jstore, cstore, repo, log, k
     (path / ".git/info/grafts").write_text(f"{recs[0].staged_commit} {other}\n")
     out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))
     assert out.outcome == "adopted", out.message
+
+
+# --- L2 1020+17 (each from a run) ----------------------------------------------------------------------------------
+
+def test_a_case_variant_of_a_branch_is_refused_and_moves_nothing(jstore, cstore, repo, log, keys, tmp_path):
+    # on a case-insensitive disk refs/heads/Main is main's loose file: a land onto "Main" moved a checked-out main
+    path, base = repo
+    git(path, "checkout", "-q", "main")
+    assert "differs only in case" in adopt.branch_problem(str(path), "Main")
+    assert "not a branch here, as written" in adopt.branch_problem(str(path), "nope")
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log, onto="Main"))
+    assert out.outcome == "refused" and out.job.state == "verified"
+    assert git(path, "rev-parse", "main") == base
+
+
+def test_a_branch_differing_only_in_case_from_another_is_refused(repo, monkeypatch):
+    path, _base = repo
+    real = adopt._git_ok
+
+    def two_names(r, *args, **kw):
+        if args[:1] == ("for-each-ref",):
+            return b"refs/heads/main\nrefs/heads/MAIN\nrefs/heads/work\n"     # packed refs can hold both
+        return real(r, *args, **kw)
+
+    monkeypatch.setattr(adopt, "_git_ok", two_names)
+    assert "differs only in case" in adopt.branch_problem(str(path), "main")
+
+
+def test_parents_are_read_with_the_commit_graph_off(repo, monkeypatch):
+    # a forged commit-graph reported base as a staged commit's parent while the object held another (L2, run)
+    path, base = repo
+    seen = []
+    real = subprocess.run
+
+    def spy(argv, **kw):
+        seen.append(argv)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(adopt.subprocess, "run", spy)
+    adopt._commit_shape(str(path), base)
+    assert seen and all("core.commitGraph=false" in a for a in seen)
+
+
+def test_the_printed_merge_quotes_the_worktree_path(jstore, cstore, repo, log, keys, tmp_path):
+    path, base = repo
+    wt = tmp_path / "his tree; touch PWNED"
+    git(path, "worktree", "add", "-q", str(wt), "main")
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))
+    assert out.outcome == "merge"
+    assert out.command == f"git -C '{os.path.realpath(wt)}' merge --ff-only {recs[0].staged_commit}"
+
+
+def test_a_worktree_path_with_a_control_character_prints_nothing(jstore, cstore, repo, log, keys, tmp_path):
+    path, base = repo
+    wt = tmp_path / "wt"
+    git(path, "worktree", "add", "-q", str(wt), "main")
+    (gitdir,) = (path / ".git" / "worktrees").iterdir()
+    (gitdir / "gitdir").write_text(f"{tmp_path}/x\n; touch PWNED #/.git\n")
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    out = by_human(jstore, cstore, job, recs, human(job, recs[0], keys, log))
+    assert out.outcome == "refused" and "control characters" in out.message and not out.command
+    assert git(path, "rev-parse", "main") == base
+
+
+# --- L1 1020+17 ----------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("winner", ["adopted", "failed"])
+def test_a_land_that_loses_the_authorise_race_reports_the_winners_outcome(winner, jstore, cstore, repo, log, keys,
+                                                                          tmp_path, monkeypatch):
+    path, base = repo
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    real = JobStore.authorise
+    raced = []
+
+    def racing(self, job_id, **kw):
+        if not raced:                       # the other land wins inside this land's window
+            raced.append(1)
+            real(self, job_id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+                {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": base,
+                 "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2",
+                 "rule": {"generation": 4, "index": 0}}))
+            if winner == "adopted":
+                self._transition(job_id, "adopted", "adopted", evidence="{}")
+            else:
+                self._transition(job_id, "failed", "base_moved", evidence="{}")
+        return real(self, job_id, **kw)
+
+    monkeypatch.setattr(JobStore, "authorise", racing)
+    out = by_rule(jstore, cstore, job, recs)
+    assert out.outcome == winner and out.job.state == winner
+
+
+def test_line_counts_stay_linear_past_the_budget_and_bound_from_above():
+    import time
+
+    old, new = b"\n" * 8000 + b"x\n", b"\n" * 8000 + b"y\n" + b"\n" * 8000
+    t = time.monotonic()
+    added, deleted = adopt._line_counts(old, new, [adopt._LINE_DIFF_BUDGET])
+    assert time.monotonic() - t < 2                  # 8,000 repeated lines took 9 s before the budget (L1, run)
+    exact = adopt._line_counts(old, new, [10 ** 12])
+    assert added >= exact[0] and deleted >= exact[1]
+    # inside the budget the count is exact, and the common head and tail never count
+    assert adopt._line_counts(b"a\nb\nc\n", b"a\nB\nc\n", [100]) == (1, 1)
+
+
+@pytest.mark.parametrize("criterion, change, holds", [
+    ({"no_new_files": True}, {"src/new.py": b"n = 1\n"}, False),
+    ({"no_new_files": True}, {"src/a.py": b"a = 2\n"}, True),
+    ({"paths": ["src/a.py"]}, {"src/b.py": b"b = 9\n"}, False),
+    ({"paths": ["src/"]}, {"src/b.py": b"b = 9\n"}, True),
+    ({"max_bytes": 3}, {"src/a.py": b"a = 2\n"}, False),
+    ({"max_bytes": 64}, {"src/a.py": b"a = 2\n"}, True),
+    ({"max_files": 1}, {"src/a.py": b"a = 2\n", "src/b.py": b"b = 9\n"}, False),
+    ({"max_files": 2}, {"src/a.py": b"a = 2\n", "src/b.py": b"b = 9\n"}, True),
+])
+def test_each_typed_criterion_is_evaluated(criterion, change, holds, jstore, cstore, repo, tmp_path):
+    job = verified_job(jstore, cstore, repo)
+    rec = runs(repo, job, tmp_path, change, k=1)[0]
+    changes = adopt.change_set(str(repo[0]), rec.base, rec.staged_commit)
+    failure = adopt.criteria_failure([next(iter(criterion.items()))], changes, onto="main",
+                                     verified_at=rec.verified_at, now=rec.verified_at)
+    assert (failure is None) == holds, failure
+
+
+def test_max_age_hours_is_evaluated(jstore, cstore, repo, tmp_path):
+    job = verified_job(jstore, cstore, repo)
+    rec = runs(repo, job, tmp_path, A_FIX, k=1)[0]
+    changes = adopt.change_set(str(repo[0]), rec.base, rec.staged_commit)
+    later = utc_stamp(NOW + timedelta(hours=3))
+    assert adopt.criteria_failure([("max_age_hours", 2)], changes, onto="main", verified_at=rec.verified_at,
+                                  now=later) is not None
+    assert adopt.criteria_failure([("max_age_hours", 4)], changes, onto="main", verified_at=rec.verified_at,
+                                  now=later) is None
+
+
+def test_an_item_signed_in_another_namespace_is_refused(jstore, cstore, repo, log, keys, tmp_path):
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    payload, _sig, source = human(job, recs[0], keys, log)
+    other = keys["laptop"].sign(authorise_message(payload), "levain-dispatch-cancel")
+    out = by_human(jstore, cstore, job, recs, (payload, other, source))
+    assert out.outcome == "refused" and "does not verify" in out.message
+
+
+def test_a_rule_land_records_the_generation_of_the_rules_it_was_judged_by(jstore, cstore, repo, log, keys,
+                                                                          tmp_path):
+    import json
+
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    out = by_rule(jstore, cstore, job, runs(repo, job, tmp_path, A_FIX))
+    assert out.outcome == "adopted"
+    intent = json.loads(next(h for h in out.job.history if h.to_state == "authorised").evidence)
+    assert intent["rule"] == {"generation": 4, "index": 0}

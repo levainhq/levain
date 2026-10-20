@@ -74,3 +74,15 @@ def test_the_floor_seam_reads_the_real_tier(world):
     real = partial(landing_tier, queue_dir=world["queue_dir"], home=world["home"], codex_dir=world["codex_dir"])
     assert _tier(real, world["repo"], ("src/app.py",)) == "T2"
     assert _tier(real, world["repo"], ("src/app.py", ".claude/settings.json")) == "T3"
+
+
+def test_a_symlinked_agent_config_directory_is_judged_as_written(world, tmp_path):
+    # the floor once handed the classifier only the resolved path: .claude -> ../elsewhere landed settings at T2
+    from functools import partial
+
+    from levain.dispatch.adopt import _tier
+
+    (tmp_path / "elsewhere").mkdir()
+    os.symlink("../elsewhere", os.path.join(world["repo"], ".claude"))
+    real = partial(landing_tier, queue_dir=world["queue_dir"], home=world["home"], codex_dir=world["codex_dir"])
+    assert _tier(real, world["repo"], (".claude/settings.json",)) == "T3"

@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -77,6 +78,9 @@ MAX_BLOB_BYTES = 1 << 20
 MAX_TOTAL_BYTES = 8 << 20
 # git's own binary test: a NUL in the first 8000 bytes
 _BINARY_PROBE = 8000
+# the line-pair work one change set's exact line counts may spend (old middle lines x new middle lines, summed);
+# past it a file's counts are the upper bound _line_counts names
+_LINE_DIFF_BUDGET = 4_000_000
 GIT_TIMEOUT = 60
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -177,7 +181,10 @@ def _git(repo: str, *args: str, feed: bytes | None = None,
     """git, hardened (module docstring); returns the completed process, its output as bytes. Raises
     :class:`GitFault` when git cannot run."""
     try:
+        # core.commitGraph=false: a commit-graph file in the object store can report a parent the commit object does
+        # not hold (L2 1020+17, run), so parents and ancestry are read from the objects themselves
         argv = [push.git_bin(), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                "-c", "core.commitGraph=false",
                 f"--git-dir={_git_dir(repo)}", *args]
     except push.PushRefused as exc:
         raise GitFault(str(exc)) from None
@@ -244,6 +251,14 @@ def branch_problem(repo: str, onto: Any) -> str | None:
         return f"the branch {onto[:80]!r} is not a branch name as written"
     if onto.casefold().startswith("levain/"):
         return f"the branch {onto[:80]!r} is under levain/, which is never a land target"
+    # the name as git lists it, byte for byte: on a case-insensitive disk git reads and writes a loose
+    # refs/heads/Main as main's file, so a case variant would move main while the worktree check missed it
+    listed = _git_ok(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").decode("utf-8", "surrogateescape")
+    names = [r[len("refs/heads/"):] for r in listed.splitlines() if r.startswith("refs/heads/")]
+    if any(n != onto and n.casefold() == onto.casefold() for n in names):
+        return f"the branch {onto[:80]!r} differs only in case from another branch here; name it exactly"
+    if onto not in names:
+        return f"refs/heads/{onto[:80]} is not a branch here, as written"
     if _symbolic(repo, onto):
         return f"refs/heads/{onto[:80]} is a symbolic ref"
     return None
@@ -295,8 +310,22 @@ def _lines(data: bytes) -> list[bytes]:
     return data.splitlines(keepends=True)
 
 
-def _line_counts(old: bytes, new: bytes) -> tuple[int, int]:
+def _line_counts(old: bytes, new: bytes, budget: list[int]) -> tuple[int, int]:
+    """``(added, deleted)``: exact (a line diff of what is left once the common first and last lines are set aside)
+    while ``budget`` (one list per change set, decremented) holds the pair's size product, else the UPPER bound
+    ``(len(new middle), len(old middle))``. A line diff is quadratic on repeated lines (L1 1020+17: 8,000 blank lines
+    took 9 s), and an upper bound only ever refuses more under ``max_changed_lines``."""
     a, b = _lines(old), _lines(new)
+    head = 0
+    while head < len(a) and head < len(b) and a[head] == b[head]:
+        head += 1
+    tail = 0
+    while tail < len(a) - head and tail < len(b) - head and a[-1 - tail] == b[-1 - tail]:
+        tail += 1
+    a, b = a[head:len(a) - tail], b[head:len(b) - tail]
+    if len(a) * len(b) > budget[0]:
+        return len(b), len(a)
+    budget[0] -= len(a) * len(b)
     added = deleted = 0
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
         if tag in ("replace", "delete"):
@@ -364,6 +393,7 @@ def change_set(repo: str, base: str, staged: str) -> ChangeSet | str:
             contents[sha] = out_b[nl + 1:nl + 1 + size]
             pos = nl + 1 + size + 1
     entries = []
+    budget = [_LINE_DIFF_BUDGET]
     for path, status, om, nm, osha, nsha in rows:
         non_blob = any(not _absent(m, s) and m == _GITLINK for m, s in ((om, osha), (nm, nsha)))
         old = b"" if _absent(om, osha) or om == _GITLINK else contents[osha]
@@ -372,7 +402,7 @@ def change_set(repo: str, base: str, staged: str) -> ChangeSet | str:
         if non_blob or binary:
             added = deleted = None
         else:
-            added, deleted = _line_counts(old, new)
+            added, deleted = _line_counts(old, new, budget)
         entries.append(Change(path=path, status=status, old_mode=om, new_mode=nm, old_blob=osha, new_blob=nsha,
                               old_size=sizes.get(osha, 0), new_size=sizes.get(nsha, 0), added=added,
                               deleted=deleted, binary=binary, non_blob=non_blob))
@@ -539,7 +569,7 @@ class Floor:
     record: ArtifactRecord | None = None
     changes: ChangeSet | None = None
     tier: str | None = None
-    rule: tuple[int | None, int] | None = None
+    rule: tuple[int, int] | None = None
 
 
 def _refuse(line: str) -> Floor:
@@ -547,7 +577,9 @@ def _refuse(line: str) -> Floor:
 
 
 def _tier(landing_tier: Callable[[str, tuple[str, ...]], str], repo: str, paths: Sequence[str]) -> str | None:
-    absolute = tuple(os.path.realpath(os.path.join(repo, p)) for p in paths)
+    # joined and normalised, never resolved here: the classifier judges each path as written AND as resolved, and a
+    # path resolved first loses the written half (a .claude symlink would land .claude/settings.json at T2)
+    absolute = tuple(os.path.normpath(os.path.join(repo, p)) for p in paths)
     try:
         tier = landing_tier(repo, absolute)
     except Exception:                                    # fail closed: whatever it raised, nothing lands
@@ -643,10 +675,10 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
           landing_tier: Callable[[str, tuple[str, ...]], str],
           resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy, now: str,
           human: Mapping[str, Any] | None = None,
-          rules: Callable[[], Sequence[dregistry.AdoptionRule]] | None = None,
-          rule_generation: int | None = None) -> Floor:
-    """F11 §4 for (A) (``human`` is the signed payload) or (B) (``rules`` returns the active adoption rules). The
-    first failure decides. Raises :class:`GitFault` when git cannot run."""
+          rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Floor:
+    """F11 §4 for (A) (``human`` is the signed payload) or (B) (``rules`` returns the active adoption rules and
+    their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`). The first failure decides.
+    Raises :class:`GitFault` when git cannot run."""
     repo = job.repo
     # 1. state, and the branch the authority names
     if job.state not in ("verified", "recommended"):
@@ -695,7 +727,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
     tier = _tier(landing_tier, repo, changes.paths)
     if tier is None:
         return _refuse("the landing tier could not be read; nothing lands")
-    rule_ref: tuple[int | None, int] | None = None
+    rule_ref: tuple[int, int] | None = None
     if rules is not None:
         # 5. contrast-clean, the record half and the change half
         if tier != "T2":
@@ -706,13 +738,14 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(problem)
         # 6. the rule
         try:
-            active = tuple(rules())
+            generation, listed = rules()
+            active = tuple(listed)
         except DispatchError as exc:
             return _refuse(f"the adoption rules cannot be read: {str(exc)[:200]}")
         index, failure = _rule_for(active, job, onto, changes, record, now)
         if failure is not None:
             return _refuse(failure)
-        rule_ref = (rule_generation, index)
+        rule_ref = (generation, index)
     # 7. the target
     problem = branch_problem(repo, onto)
     if problem is not None:
@@ -726,7 +759,8 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
             return _refuse(f"{onto} already contains run {r.run}'s staged commit, a merge Levain did not make "
                            "under an authority; it is not an adoption")
     if tip != record.base:
-        return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True)
+        return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True,
+                     record=record, changes=changes, tier=tier)
     return Floor(failure=None, record=record, changes=changes, tier=tier, rule=rule_ref)
 
 
@@ -811,7 +845,11 @@ def _finish(store: JobStore, job: Job, records: Sequence[ArtifactRecord]) -> Lan
         return Landing(outcome="refused", job=job, message=f"refs/heads/{onto} is a symbolic ref")
     wt = _worktree_of(repo, onto)
     if wt is not None:
-        command = f"git -C {wt} merge --ff-only {staged}"
+        # the path comes from a file in .git an agent can write: never a control character, always quoted
+        if not wt.isprintable():
+            return Landing(outcome="refused", job=job, message=f"{onto} is checked out in a worktree whose path "
+                                                               "holds control characters; nothing is printed to run")
+        command = f"git -C {shlex.quote(wt)} merge --ff-only {staged}"
         return Landing(outcome="merge", job=job, command=command,
                        message=f"{onto} is checked out in {wt}; Levain never touches a worktree. Run: {command}")
     cp = _git(repo, "update-ref", "--no-deref", f"refs/heads/{onto}", staged, base)
@@ -827,10 +865,12 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
          onto: str | None = None, human: tuple[Any, Any, Any] | None = None,
-         rules: Callable[[], Sequence[dregistry.AdoptionRule]] | None = None,
-         rule_generation: int | None = None, now: str | None = None) -> Landing:
+         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
+         now: str | None = None) -> Landing:
     """F11 §6 for job ``job_id``. ``human`` is ``(payload, signature, authority)`` for (A); ``rules`` returns the
-    active adoption rules for (B) (``lambda: active_adoption_rules(control_store)``). ``landing_tier`` has no
+    active adoption rules and their generation for (B) (``lambda: adoption_rules_at(control_store)``). A MOVED BASE
+    before authorisation fails the job only under an (A) item whose signature verifies (the human named that run and
+    branch); an unverified item or a rule land is refused and the job and its staged refs are kept. ``landing_tier`` has no
     default. A verified/recommended job passes the floor and is authorised (the INTENT) before anything moves; an
     authorised job goes straight to :func:`_finish`. A refused signature is a ``refused`` landing; a verifier that
     cannot run (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`)
@@ -844,9 +884,14 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
     payload = human[0] if human is not None else None
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
                     policy=policy, now=stamp, human=payload if isinstance(payload, Mapping) else
-                    ({} if human is not None else None), rules=rules, rule_generation=rule_generation)
+                    ({} if human is not None else None), rules=rules)
     if verdict.moved:
-        return _fail_moved(store, job, verdict.failure or "MOVED BASE")
+        line = verdict.failure or "MOVED BASE"
+        if human is not None and verdict.record is not None and verdict.tier is not None and \
+                _human_refusal(store, job, human, verdict.record, verdict.tier) is None:
+            return _fail_moved(store, job, line)
+        return Landing(outcome="refused", job=job, message=f"{line}; nothing was failed or deleted (only a verified "
+                                                            "authorisation fails a job on a moved base)")
     if verdict.failure is not None:
         return Landing(outcome="refused", job=job, message=verdict.failure)
     record, changes = verdict.record, verdict.changes
@@ -871,13 +916,34 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
     except SignatureRefused as exc:
         return Landing(outcome="refused", job=job, message=str(exc))
     except TransitionRefused:
-        # another land authorised (or ended) the job after this one's floor read it: the authorisation written
-        # first is the authority, so finish from ITS intent; any other state is the refusal it was
+        # another land authorised the job after this one's floor read it: the authorisation written first is the
+        # authority, so finish from ITS intent, or report where that land already took the job
         again = store.get(job.id)
-        if again is None or again.state != "authorised":
+        if again is None:
+            raise
+        if again.state == "adopted":
+            return Landing(outcome="adopted", job=again, message="another land adopted this job")
+        if again.state == "failed" and again.history[-1].cause == "base_moved":
+            return Landing(outcome="failed", job=again, message="another land found the base moved")
+        if again.state != "authorised":
             raise
         job = again
     return _finish(store, job, records)
+
+
+def _human_refusal(store: JobStore, job: Job, human: tuple[Any, Any, Any], record: ArtifactRecord,
+                   tier: str) -> str | None:
+    """Why the (A) item does not verify for ``record``'s run on the branch it names, judged as
+    :meth:`JobStore.authorise` judges it (a fresh replay of the authority), writing nothing."""
+    from levain.consent.queue import AuthoritySource
+    from levain.dispatch.jobs import _replay
+
+    payload, signature, authority = human
+    if not isinstance(payload, Mapping) or type(authority) is not AuthoritySource:
+        return "no authorise item to verify"
+    return authorise_refusal(payload, signature, _replay(authority), job, run=record.run,
+                             artifact=artifact_digest(record), onto=str(payload.get("onto")), tier=tier,
+                             ssh_keygen=store._ssh_keygen)
 
 
 def _bound_refusal(*, run: int, artifact: str, onto: str, tier: str) -> Callable[..., str | None]:
