@@ -1068,6 +1068,10 @@
   .panel-hero .legendbar { padding-inline: var(--gutter); }
   .sky-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-5); flex-wrap: wrap; padding-bottom: var(--sp-5); }
   .sky-summary { font-size: var(--fs-meta); color: var(--meta); line-height: var(--lh-prose); min-width: 0; }
+  .sky-bar.sky-head { flex-wrap: nowrap; justify-content: flex-start; padding-bottom: var(--sp-3); }
+  .sky-head .sky-summary { display: flex; align-items: baseline; gap: var(--sp-4); flex: 1; }
+  .sky-head .sky-head-title { font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); letter-spacing: var(--track-tight); }
+  .sky-head .sky-head-win { margin-left: auto; font-size: var(--fs-micro); }
   .sky-summary b { color: var(--label); font-weight: var(--fw-semibold); }
   .sky-toggle { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; flex: none; }
   .sky-toggle:hover { color: var(--text); border-color: var(--hair-2); }
@@ -1176,6 +1180,10 @@ body.ke .sky-hero { display: block; border: 0; }
 body.ke .sky-hero .plot { padding: 0; min-height: 200px; }
 body.ke .ck-sky .xbody { padding: 0; }
 body.ke .skycard .ck-legend { border-top: 1px solid var(--hair); }
+/* the Build tab's strip is the compact band the mock draws: its key is not part of it */
+body.ke[data-mode="build"] .skycard .ck-legend { display: none; }
+body.ke[data-mode="build"] #ck-sky { padding: 0 var(--sp-6) var(--sp-3); }
+body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }
 body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }
 /* a tab with no sky (Memory) or no band content draws no hole */
 body.ke[data-mode="memory"] .skycol { display: none; }
@@ -1190,6 +1198,30 @@ body.ke .ck-briefcard { padding: var(--sp-6); }
 .ck-brief-body .xbody.has-side .brief-line { grid-column: 1; }
 .brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-3); align-self: start; }
 .brief-side .side-line { margin: 0; font-size: var(--fs-body); line-height: var(--lh-list); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+
+/* Where to begin as a card with a head: the lead and what follows it on the left, the Threads column on the right */
+body.ke .ck-briefcard:has(.brief-card) { padding-top: var(--sp-5); }
+body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
+.brief-card .brief-head { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-5); }
+.brief-card .brief-head h3 { margin: 0; font: var(--fw-bold) var(--fs-title)/1.2 var(--round); letter-spacing: var(--track-tight); }
+.brief-card .brief-head .sp { flex: 1; }
+.brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
+.brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); }
+.brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr); }
+.brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
+.brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
+.brief-card .lead-then .k { margin-right: var(--sp-2); }
+.brief-card .lead-more { margin-top: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
+.brief-card .lead-item { margin: 0; font-size: var(--fs-meta); line-height: var(--lh-list); color: var(--meta); }
+.brief-card .lead-item .k { margin-right: var(--sp-2); }
+.brief-card .brief-overnight { margin-top: var(--sp-4); display: flex; gap: var(--sp-4); align-items: baseline; flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
+.brief-card .brief-overnight .mono { font-family: var(--mono); font-size: var(--fs-micro); color: var(--label); }
+.brief-card .brief-threads .k { margin-bottom: var(--sp-3); }
+.brief-card .thread { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }
+.brief-card .thread .t { flex: 1; min-width: 0; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brief-card .thread .pill { flex: none; color: var(--meta); font: var(--fw-regular) var(--fs-micro) var(--mono); }
+.brief-card .thread .rp-tag { flex: none; margin-right: 0; }
+@media (max-width: 720px) { .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr); row-gap: var(--sp-5); } }
 
 /* WIDGETS: one answer each, equal widths in one row */
 body.ke .ck-widgets[hidden] { display: none; }

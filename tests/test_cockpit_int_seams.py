@@ -31,15 +31,15 @@ out.lev = lev.textContent; out.flow = flow.textContent;
     assert "waiting on you" not in out["flow"] and "review that failed" in out["flow"] and "decision made" in out["flow"]
 
 
-def test_i2_the_build_tab_mounts_the_sky_large_the_others_compact(tmp_path: Path) -> None:
+def test_i2_the_build_tab_mounts_the_sky_as_the_compact_strip_the_others_full(tmp_path: Path) -> None:
     out = run_node(r"""
 const sizes = {};
 for (const m of ["morning", "board", "build", "memory"]) { globalThis.document.body.dataset.mode = m; sizes[m] = K.skySize(); }
 out.sizes = sizes;
 """, tmp_path)
-    assert out["sizes"] == {"morning": "compact", "board": "compact", "build": "large", "memory": "compact"}
+    assert out["sizes"] == {"morning": "compact", "board": "compact", "build": "strip", "memory": "compact"}
     css = (WEB / "dashboard.css").read_text(encoding="utf-8")
-    assert 'body.ke[data-mode="build"] .sky-hero .plot' not in css      # no fixed floor under the large plot: it was the dead space
+    assert 'body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }' in css      # no floor under the strip's plot: the mock's band is ~85 px
     assert re.search(r"size: skySize\(\)", (WEB / "cockpit_view.js").read_text(encoding="utf-8"))
 
 
