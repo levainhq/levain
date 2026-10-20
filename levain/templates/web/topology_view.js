@@ -422,7 +422,7 @@
   // faces are SVG (every one a real element a test or a screen reader can reach); only the particle streams are a canvas under it.
   // A stream's density is the node's rate (events per minute). A null rate, a rate of 0 and an idle node have NO stream, never a decoration;
   // the loop runs only while some edge streams, adapts to the frame time, and draws nothing under prefers-reduced-motion.
-  const MIN_LW = 760;                      // the graph is laid out at no less than this width and scaled down to fit a narrower card
+  const MIN_LW = 920;                      // the graph is laid out at no less than this width and scaled down to fit a narrower card
   const MIN_H = 540;
   const RING_H = [0.2, 0.34];
   const PARTICLE_CAP = 1500;
