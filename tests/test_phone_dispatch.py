@@ -184,4 +184,5 @@ def test_a_faulting_keys_source_keeps_the_consent_cards_and_lists_the_jobs_unsig
     assert [r["id"] for r in body["pending"]] == [rid]                       # the consent card survives the fault
     (row,) = body["dispatch_pending"]
     assert row["id"] == job.id and row["signers"] == [] and "keys db" in row["signer_note"]
+    assert row["can_sign"] is False and row["can_cancel"] is True          # no signer: nothing offers to sign
     assert body["dispatch_overflow"] == 0

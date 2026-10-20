@@ -99,7 +99,7 @@ class DispatchPhone:
         out = {k: v[k] for k in v if k not in ("filer_agent", "filer_session")}
         out.update({"kind": "dispatch", "agent": v["filer_agent"], "session": v["filer_session"],
                     "read_count": len(v["read"]), "write_count": len(v["write"]),
-                    "can_sign": job.state == "filed" and job.lease_end > now, "can_cancel": job.state not in TERMINAL,
+                    "can_sign": job.state == "filed" and job.lease_end > now and bool(signers), "can_cancel": job.state not in TERMINAL,
                     "signers": signers, "signer_note": signer_note})
         return out
 
