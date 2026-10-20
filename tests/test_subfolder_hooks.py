@@ -36,13 +36,18 @@ def cc_local_layout(monkeypatch):
                         lambda ws: Path(os.path.abspath(ws)) / ".claude" / "settings.local.json")
 
 
+@pytest.fixture
+def real_version_read():
+    """Requested by a test of the real version reader: :func:`_no_real_version_read` then leaves it in place."""
+
+
 @pytest.fixture(autouse=True)
 def _no_real_version_read(monkeypatch, request):
-    """No test spawns the real ``claude --version`` (doctor._check_claude_code reads it); the two tests of the
-    real reader (a fake binary on PATH, and the memo itself) keep it."""
+    """No test spawns the real ``claude --version`` (doctor._check_claude_code reads it), except one that requests
+    :func:`real_version_read`."""
     from levain.consent import canary
 
-    if "_u5_" in request.node.name or "_v3_v4_" in request.node.name:
+    if "real_version_read" in request.fixturenames:
         return
     monkeypatch.setattr(canary, "agent_version", lambda agent, **_: None)
 
@@ -696,10 +701,15 @@ def test_r3_u2_update_writes_nothing_when_the_local_file_stops_it(make_install):
     doc["hooks"]["Stop"] = 7
     lfile.write_text(json.dumps(doc), encoding="utf-8")
     before = {p: p.read_bytes() for p in (lfile, shared, cc / "CLAUDE.md", inst.activation_receipt_path(cc))}
-    tree = {p: p.read_bytes() for p in cc.rglob("*") if p.is_file()}  # the hook pin files and consent settings too
+    # the hook pin files under the install, and the consent settings in the queue dir (outside it)
+    roots = (cc, inst._consent_queue_dir())
+    settings = inst._consent_queue_dir() / "claude_code.json"
+    settings.unlink()  # create-only: a refresh the stop did not stop would create it again
+    snap = lambda: {p: p.read_bytes() for r in roots if r.exists() for p in r.rglob("*") if p.is_file()}  # noqa: E731
+    tree = snap()
     r, text = _refresh(cc)
     assert r.stopped_local
-    assert {p: p.read_bytes() for p in cc.rglob("*") if p.is_file()} == tree
+    assert snap() == tree and not settings.exists()
     assert "/".join(LOCAL) in r.review and not r.refreshed and "not lists" in text, text
     assert "NOT refreshed, none of them" in text, text
     assert hook.read_bytes() == old
@@ -759,7 +769,8 @@ def test_r3_u4_the_layout_git_calls_never_run_a_git_from_path(tmp_path, monkeypa
     assert not marker.exists()
 
 
-def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tmp_path, monkeypatch, capsys):
+def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tmp_path, monkeypatch, capsys,
+                                                                 real_version_read):
     cc = make_install("cc")
     fake = tmp_path / "fakebin"
     fake.mkdir()
@@ -773,7 +784,7 @@ def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tm
     assert count.read_text(encoding="utf-8").count("x") == 1
 
 
-def test_r4_v3_v4_version_memo_is_per_context_and_a_failure_rereads(monkeypatch):
+def test_r4_v3_v4_version_memo_is_per_context_and_a_failure_rereads(monkeypatch, real_version_read):
     from levain.consent import canary
 
     reads = iter([None, "2.1.300", "9.9.9"])
