@@ -35,7 +35,7 @@ STAMPS: tuple[str, ...] = ("grant", "answer", "ruling", "own_rules", "classifier
 # authority stamp (it authorised nothing), so a ``refused`` row's stamp is ``unknown`` (or ``pending``).
 OUTCOMES: tuple[str, ...] = ("accepted", "refused", "unknown")
 CLAUDE_STATES: tuple[str, ...] = ("no_source", "no_tool_use_id", "missing_file", "unreadable", "no_result",
-                                  "no_decision", "decided")
+                                  "result_oversized", "no_decision", "decided")
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 _BYPASS_MODE = "bypassPermissions"
 _USER_SOURCES = frozenset({"user_permanent", "user_temporary"})

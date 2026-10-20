@@ -473,12 +473,22 @@ cases.a_token_required_manifest_read_without_a_token_prompts_then_rereads = asyn
 cases.a_hidden_character_row_offers_no_inline_text_edit = async () => {
   const env = makeEnv();
   env.fx.panels.loops.rows[0].body = "one​two";
-  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0], { id: "spore:spore-2", body: "plain" }));
+  env.fx.panels.loops.rows[0].text_hidden = true;           // as the server's levain.unshowable flags it
+  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+    { id: "spore:spore-2", body: "plain", text_hidden: false }));
+  // a leading combining mark: the page's escape keeps it, the server's predicate calls it hidden
+  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+    { id: "spore:spore-3", body: "̀x", text_hidden: true }));
+  // the page never judges: an escape it would make does not lock a row the server did not flag
+  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+    { id: "spore:spore-4", body: "a​b", text_hidden: false }));
   await env.start();
-  const [a, b] = env.view().open_spores;
-  ok(/hidden characters/.test(a.text_locked || ""), "the altered row is locked with a reason");
+  const [a, b, c, d] = env.view().open_spores;
+  ok(/hidden characters/.test(a.text_locked || ""), "the flagged row is locked with a reason");
   ok(a.text.indexOf("<U+200B>") >= 0, "and still shows the marker");
   ok(b.text_locked === undefined, "a plain row is not");
+  ok(/hidden characters/.test(c.text_locked || ""), "a row the server flags is locked though the escape kept its text");
+  ok(d.text_locked === undefined, "the lock follows the server's flag, not the page's escape");
 };
 
 cases.offered_verbs_lists_only_what_a_postable_action_offers = async () => {

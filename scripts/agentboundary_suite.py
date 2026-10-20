@@ -40,8 +40,11 @@ scenario's world, NOT Levain's own values (each is a post-export override, liste
     runtime's own ``_apply_inject`` (imported, private).
 
 Nothing else is overridden in the STRICT run: the receipt keeps Levain's actor, agent, tool capability, target, policy
-name/version and approver id. A second, informational run (BOUND) also rewrites those to the scenario's names, to show
-how much of the strict result is naming rather than structure; it is not a conformance claim.
+name/version and approver id. NAMES is STRICT with an operator's names file handed to the exporter
+(``ab.export(names=...)``): the product path, the names set inside the export so the hash covers them, and no
+post-export rename. A third, informational run (BOUND) rewrites those names after the export instead (actor.type
+included, which a names file may not set), to show how much of the strict result is naming rather than structure; it
+is not a conformance claim.
 
 Grading is the suite's own ``agentboundary.cli._run_one`` (private; reused, unsupported by the vendor).
 """
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import shutil
 import subprocess
@@ -163,8 +167,9 @@ class LevainImplementation(Implementation):
     Implementation. ``bind_names=True`` is the informational BOUND run (see the module docstring)."""
 
     def __init__(self, keydir: Path, workdir: Path, *, bind_names: bool = False, fallback_signed_allow: bool = False, levain_version: str = "0.0.0-suite",
-                 keys: dict[str, _Key] | None = None) -> None:
+                 keys: dict[str, _Key] | None = None, names_file: bool = False) -> None:
         self.keydir, self.workdir, self.bind_names, self.levain_version = keydir, workdir, bind_names, levain_version
+        self.names_file = names_file
         self.fallback_signed_allow = fallback_signed_allow
         self._keys: dict[str, _Key] = keys if keys is not None else {
             "laptop": _Key(keydir, "laptop"), "stranger": _Key(keydir, "stranger")}
@@ -297,7 +302,18 @@ class LevainImplementation(Implementation):
                                                 tool_input=arguments, cwd=cwd, phase="post", received_at=clock.now)
             note += " + post row"
             self.trace[f"{self._n:03d}"] = note
-        exported = ab.export(queue.directory)
+        names = None
+        if self.names_file:
+            # NAMES: the operator's names file, built from the scenario's names and keyed by LEVAIN's own values (read
+            # off Levain's own export, as an operator would), handed to the exporter; no name is rewritten after the
+            # export. Each authority name is pinned one to one; the approver map names the one key that signed
+            stranger = note.startswith("approval refused (approver-not-authorized")
+            levains = ab.export(queue.directory).receipts
+            assert len(levains) == 1, f"expected one terminal receipt, got {len(levains)}"
+            names = ab.load_names(json.dumps(_names_file(
+                action, policy, tool, levains[0], approver_id,
+                keys["stranger"] if stranger else akey), ensure_ascii=False).encode("utf-8"))
+        exported = ab.export(queue.directory, names=names)
         assert len(exported.receipts) == 1, f"expected one terminal receipt, got {len(exported.receipts)}"
         receipt = copy.deepcopy(exported.receipts[0])
 
@@ -333,6 +349,39 @@ class LevainImplementation(Implementation):
                     receipt.pop("receipt_hash", None)
                     receipt["receipt_hash"] = ab.receipt_hash(receipt)
         return RuntimeOutcome(decision=decision, receipt=receipt, arguments=arguments)
+
+
+def _names_file(action: dict[str, Any], policy: dict[str, Any], tool: str, levain: dict[str, Any],
+                approver_id: str | None, approver_key: _Key | None) -> dict[str, Any]:
+    """The names file an operator running the scenario's world would write: each rule's ``when`` is a value LEVAIN
+    wrote (read off ``levain``, Levain's own receipt of the request: its policy name and version, actor id,
+    capability and working directory, and the signer ``ssh-key:<fp>``), each ``set`` the scenario's name for it.
+    Aliases only: ``actor.type`` and the run's own facts (the agent's framework, model and versions, the tool's name
+    and version, the target system and environment) are never set, so a scenario that needs one of them to differ
+    from what Levain recorded still fails on it. Every authority name (policy name and version, capability, resource
+    id, approver id) is set only by a rule whose ``when`` pins exactly that field to Levain's value (the version: the
+    name and the version), so each maps one to one; the approver map names the one key that signed (the enrolled
+    approver's, or for an unauthorised approver the stranger's whose refused answer the queue kept), never a second
+    key."""
+    def strs(block: dict[str, Any], fields: tuple[str, ...], prefix: str) -> dict[str, str]:
+        return {f"{prefix}.{f}": block[f] for f in fields if isinstance(block.get(f), str) and block[f]}
+
+    pname, pver = ((policy["name"], str(policy["version"])) if policy is not IMPLICIT_DENY_POLICY
+                   else ("implicit.deny", "0"))
+    scen_tool, scen_target = action.get("tool", {}), action.get("target", {})
+    lname, lver = levain["policy"]["name"], levain["policy"]["version"]
+    rules: list[dict[str, Any]] = [
+        {"when": {"policy.name": lname}, "set": {"policy.name": pname}},
+        {"when": {"policy.name": lname, "policy.version": lver}, "set": {"policy.version": pver}},
+        {"when": {"actor.id": levain["actor"]["id"]},
+         "set": strs(action.get("actor", {}), ("id", "display_name"), "actor")},
+        {"when": {"tool.capability": levain["tool"]["capability"]}, "set": strs(scen_tool, ("capability",), "tool")},
+        {"when": {"target.resource_id": levain["target"]["resource_id"]},
+         "set": strs(scen_target, ("resource_id",), "target")}]
+    if approver_id and approver_key is not None:
+        rules.append({"when": {"approval.approver.id": f"ssh-key:{approver_key.fp}"},
+                      "set": {"approval.approver.id": approver_id}})
+    return {"format": ab.NAMES_FORMAT, "rules": [r for r in rules if r["set"]]}
 
 
 def _reprovenance(receipt: dict[str, Any], default: str = "synthesized") -> None:
@@ -399,10 +448,11 @@ def _kind(r: dict[str, Any]) -> str:
     return "N/E" if any("NOT EXPRESSIBLE" in f for f in r["failures"]) else "FAIL"
 
 
-def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace) -> None:
+def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace, names) -> None:
     n = len(strict)
     cnt = lambda rs: sum(r["passed"] for r in rs)                       # noqa: E731
     ne = sum(_kind(r) == "N/E" for r in strict)
+    names_fail = [r for r in names if not r["passed"]]
     out = [f"# Levain through the AgentBoundary conformance suite ({n} scenarios)", "",
            f"Generated by `scripts/agentboundary_suite.py` on {_now()}; agentboundary {agentboundary.__version__}.", "",
            f"- **STRICT: {cnt(strict)} / {n} pass** (26 / 54 before S-R2, the refused-answer export; 27 / 54 before "
@@ -416,7 +466,26 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace) 
            f"block). It exercises the exporter on the scenarios STRICT could not reach; it is not Levain's allow.",
            f"- **BOUND (informational): {cnt(bound)} / {n}** (42 / 54 before S-R2). FALLBACK plus a rewrite of actor, agent, tool, target, "
            f"policy name/version and approver id to the scenario's names. Not a conformance claim: it shows how much "
-           f"of the result is naming rather than structure.", "",
+           f"of the result is naming rather than structure.",
+           f"- **NAMES (the product path): {cnt(names)} / {n}** (42 / 54 before names fix r2, which made the run's own "
+           f"facts unsettable: the agent's framework, model and versions, the tool's name and version, the target "
+           f"system and environment; 35-staging-environment-validates moved to FAIL because Levain recorded `dev` and "
+           f"a names file no longer rewrites where an action ran. 42 / 54 before names fix r1 too). STRICT (an "
+           f"`allow` is a standing grant) with an operator's names file handed to the exporter (`export(names=...)`, "
+           f"the CLI's `--names`): each rule keyed by a value Levain wrote (read off Levain's own receipt: its policy "
+           f"name and version, actor id, capability, cwd, the signer's `ssh-key:<fp>`) sets the scenario's alias for "
+           f"it, and the exporter renames before provenance, score and hash; with a names file every `receipt_id` is "
+           f"derived with the digest of the file's validated rules, so it never reuses an unrenamed receipt's id. Every authority name "
+           f"(policy name and version, capability, resource id, approver id) is set only by a rule whose `when` pins "
+           f"exactly that field to Levain's value (the version: name and version), and the approver map names only "
+           f"the key that signed. NO name is rewritten after the export (only O1-O3 below, as in STRICT). A names "
+           f"file may set aliases only, never facts, so `actor.type` stays `agent` and `target.environment` `dev`.", "",
+           "## NAMES: what still fails, by reason", "",
+           "Every NAMES failure, with the reviewed reason. None is naming: the names file closed every naming "
+           "failure STRICT had.", ""]
+    for r in names_fail:
+        out.append(f"- **{r['scenario']}**: {NAMES_REASONS.get(r['scenario'], 'not reviewed: ' + '; '.join(r['failures']))}")
+    out += ["",
            "## What the shim is, and its honest limit", "",
            "AgentBoundary's policy language (capability rules, approver lists, windows) is EMULATED by the shim; Levain "
            "has tiers and grants, not capability rules. What the suite tests is that Levain's real queue, through the "
@@ -482,16 +551,17 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace) 
            "## Remaining STRICT FAILs, by category", "",
            "- **Naming (Levain names its own policy `levain.consent.<tier>` and approver `ssh-key:<fp>`; the scenario's "
            "verifier context knows others; BOUND shows the structure is accepted):** 01, 02, 17, 18, 25, 28, 29, 31, 32, "
-           "38, 43, 44, 48, 53, plus the naming half of 19, 35, 36, 41, 42, 45.",
+           "38, 43, 44, 48, 53, plus the naming half of 19, 35, 36, 41, 42, 45. The NAMES run is where these close: "
+           "see the NAMES section above for what is left.",
            "- **Shim emulation gap:** none left that is known. 49 is a suite assumption (the runner's "
            "`replace_in_payload` needs the emitted receipt to echo `action.target`; Levain's resource id is the cwd).",
            "- **Exporter mapping:** 35 (`target.environment`), 42 (`approval-missing` vs `expired`).",
            "- **Real Levain semantic mismatch:** the list above.", "",
-           "## Matrix", "", "| scenario | strict | fallback | bound | queue ended as (strict / fallback) |",
-           "|---|---|---|---|---|"]
-    for i, (a, f, b) in enumerate(zip(strict, fallback, bound)):
+           "## Matrix", "", "| scenario | strict | fallback | names | bound | queue ended as (strict / fallback) |",
+           "|---|---|---|---|---|---|"]
+    for i, (a, f, b, m) in enumerate(zip(strict, fallback, bound, names)):
         k = f"{i + 1:03d}"
-        out.append(f"| {a['scenario']} | {_kind(a)} | {_kind(f)} | {_kind(b)} | "
+        out.append(f"| {a['scenario']} | {_kind(a)} | {_kind(f)} | {_kind(m)} | {_kind(b)} | "
                    f"{strict_trace.get(k, 'n/a')} / {fb_trace.get(k, '')} |")
     out += ["", "## Failures, with diagnosis", "",
             "Strict failures are listed with their fallback / bound outcome. N/E scenarios share one cause and are "
@@ -539,6 +609,35 @@ DIAGNOSES: dict[str, str] = {
     '46-refusal-claims-execution': "EXPORTER CHANGE (R11, was PASS at R10). A human deny now exports with NO approval block (a denial is not an approval); the scenario injects execution.status = success, and a v0.2-alpha receipt claiming success must carry an approval, so the schema rejects it before LEVEL_2_REFUSAL_EXECUTED can fire. Not a shim artefact.", '01-merge-allow': "NAMING (answered by a consent-mcp grant on `mcp__<server>__<tool>`). `policy.decision = allow` holds; only `policy.name` (`levain.consent.T2` vs the scenario's) differs. FALLBACK/BOUND answer by a signed allow, whose decision is `require-approval`, so they fail on that instead (informational).", '20-numeric-arguments-validate': "NOT EXPRESSIBLE: a float argument has no consent-mcp field kind (str, int, bool, strs, path, paths).", '34-empty-arguments-validate': "NOT EXPRESSIBLE: a consent-mcp grant must declare 1 to 32 fields, so a no-argument MCP tool cannot be granted.", '39-nested-arguments-canonical': "NOT EXPRESSIBLE: an object argument has no consent-mcp field kind.", '28-honest-completeness-passes': "NAMING in STRICT (LEVEL_4_POLICY_DOWNGRADE only; the grant-allow receipt has no approval block, so the completeness score now matches). FALLBACK ARTIFACT otherwise: its signed allow adds an approval block the injected provenance map does not list.", '49-envelope-payload-tampered': "SUITE ASSUMPTION. The runner's `replace_in_payload` finds `pull/14` (the scenario's `target.resource_id`) in the emitted receipt and raises if it is absent. Levain's `resource_id` is the request's cwd, so STRICT/FALLBACK crash in the suite's grading (`GradingError`). BOUND restores the target and passes. The suite assumes an implementation echoes `action.target`.", '19-actor-human-validates': "FALLBACK: naming (policy downgrade) and `actor.type` `agent` where the scenario's action is a human actor. Levain's hook actors are always agents (a semantic gap, by design).", '36-dev-environment-validates': "FALLBACK: `actor.type` agent vs the scenario's human actor (naming).", '35-staging-environment-validates': "FALLBACK: `target.environment` is Levain's fixed `dev` (synthesized), the scenario's is `staging` (naming)."}
 
 
+# scenario name -> the reviewed reason it still fails in NAMES (filled in after reading the run, as DIAGNOSES)
+_NO_STATIC_DENY = ("by design: no static policy deny. A deny is a human's signed answer (policy.decision "
+                   "`require-approval`, refusal `deny` / `operator-denied`); `policy.decision` is a fact, never a name.")
+_NO_ESCALATE = ("by design: no escalate. The nearest state is `undecided` (policy.decision `require-approval`); "
+                "`policy.decision` is a fact.")
+_ACTOR_TYPE = ("by design: `actor.type` is a FACT (what kind of actor acted) and a names file may not set it; Levain's "
+               "hook actors are agents, the scenario's actor is human.")
+_NOT_EXPRESSIBLE = "NOT EXPRESSIBLE (as STRICT): a consent-mcp grant cannot declare these arguments, so no allow exists."
+NAMES_REASONS: dict[str, str] = {
+    "04-merge-deny": _NO_STATIC_DENY, "41-refusal-policy-deny": _NO_STATIC_DENY + " Also `operator-denied` is "
+    "not `policy-deny` (a refusal reason is a fact).",
+    "16-deny-with-execution-success": _NO_STATIC_DENY + " The injected success then fails the schema (a "
+    "require-approval success needs an approval block) before LEVEL_4_DENY_EXECUTED can fire.",
+    "05-refund-escalate": _NO_ESCALATE, "45-refusal-escalation-unresolved": _NO_ESCALATE,
+    "19-actor-human-validates": _ACTOR_TYPE, "36-dev-environment-validates": _ACTOR_TYPE,
+    "35-staging-environment-validates": "by design (names fix r2): `target.environment` is a FACT (the spec: it MUST "
+    "be prod, staging or dev, where the action ran) and a names file may not set it; Levain records `dev` "
+    "(synthesized: the hook carries no environment), the scenario's action ran in `staging`. Passed at r1, when a "
+    "names file could rewrite it.",
+    "20-numeric-arguments-validate": _NOT_EXPRESSIBLE + " (a float argument)",
+    "34-empty-arguments-validate": _NOT_EXPRESSIBLE + " (a grant declares 1 to 32 fields; this tool has none)",
+    "39-nested-arguments-canonical": _NOT_EXPRESSIBLE + " (an object argument)",
+    "42-refusal-approval-missing": "exporter mapping / queue-state choice: a missing approval is a lapse, exported "
+    "`expired` / `approval-window-elapsed`, not `require-approval` / `approval-missing` (refusal fields are facts).",
+    "46-refusal-claims-execution": "by design (R11): a human deny has NO approval block, so the injected "
+    "`execution.status = success` fails the schema before LEVEL_2_REFUSAL_EXECUTED can fire.",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dirs", nargs="+", type=Path)
@@ -561,10 +660,13 @@ def main(argv: list[str] | None = None) -> int:
         bound_impl = LevainImplementation(keydir, _mk(tmp / "bound"), bind_names=True, fallback_signed_allow=True,
                                           keys=strict_impl._keys)
         bound = _run(scenarios, bound_impl)
+        names_impl = LevainImplementation(keydir, _mk(tmp / "names"), names_file=True, keys=strict_impl._keys)
+        names = _run(scenarios, names_impl)
         print("STRICT\n" + _matrix(strict) + "\n\nFALLBACK (informational)\n" + _matrix(fallback)
+              + "\n\nNAMES (the product path: STRICT plus an operator's names file)\n" + _matrix(names)
               + "\n\nBOUND (informational)\n" + _matrix(bound))
         if ns.results:
-            _write_results(ns.results, strict, fallback, bound, strict_impl.trace, fb_impl.trace)
+            _write_results(ns.results, strict, fallback, bound, strict_impl.trace, fb_impl.trace, names)
     finally:
         if not ns.keep:
             shutil.rmtree(tmp, ignore_errors=True)

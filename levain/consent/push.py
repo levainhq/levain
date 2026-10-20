@@ -581,7 +581,7 @@ def _rewrites(mirror: Path, remote: str) -> list[str]:
     hits = []
     for line in r.stdout.splitlines():
         key, _, value = line.partition(" ")
-        if value and remote.lower().startswith(value.lower()):
+        if remote.lower().startswith(value.lower()):   # an empty prefix: git rewrites every URL
             hits.append(f"{key} = {value}")
     return hits
 

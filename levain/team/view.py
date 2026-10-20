@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from typing import Any
 
+from levain.cockpit import display_safe
 from levain.http_guards import GuardedHandler
 from levain.web_server import load_web_asset
 
@@ -154,6 +155,13 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
 # .row / .etype / .sid / .tier / .clause. team_view.css only adds what the cockpit has no class for.
 
 def _e(s: Any) -> str:
+    # every field here is peer-written (a signed entry's owner, summary, reason, paths): hidden characters are shown as
+    # markers before escaping, so `client:acme\u200b` cannot pass for `client:acme` (entry_v1's schema is frozen)
+    return html.escape(display_safe.visible(str(s)), quote=True)
+
+
+def _attr(s: Any) -> str:
+    # an attribute the page reads back (a search key, an input's value): escaped only, so it round-trips as typed
     return html.escape(str(s), quote=True)
 
 
@@ -173,7 +181,7 @@ def _row(c: dict, why: str = "", paths: bool = True) -> str:
         note.append(f"re-check: <code>{_e(c['recheck'])}</code>")
     src = f"pack {c['pack']}" if c["pack"] else c["recorded_by"]
     note.append(f"recorded by {_e(src)} · {_e(c['age'])}")
-    return (f'<div class="row" data-q="{_e(q)}"><span class="etype">{_e(label)}</span>'
+    return (f'<div class="row" data-q="{_attr(q)}"><span class="etype">{_e(label)}</span>'
             f'<span class="sid">{_e(c["id"])}</span>'
             + (f'<span class="tier">owner {_e(c["owner"])}</span>' if c["owner"] else "")
             + (f'<span class="why">{_e(why)}</span>' if why else "")
@@ -229,7 +237,7 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
                    m["held_count"],
                    p3 or _empty("Everything in force has a holder and a fresh recheck."))
 
-    groups = "".join(f'<div class="group" data-g="{_e(g["path"].lower())}"><h3>{_e(g["path"])}</h3>'
+    groups = "".join(f'<div class="group" data-g="{_attr(g["path"].lower())}"><h3>{_e(g["path"])}</h3>'
                      f'{"".join(_row(c, paths=False) for c in g["entries"])}</div>' for g in m["in_force"])
     total = m["in_force_count"]
     pane4 = _panel(4, "mind", "In force", "The canon, by path: every entry no one has superseded.", total,
@@ -244,8 +252,8 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
     else:
         pathbar = ""
     pathfilter = (f'<div class="ep-search pathfilter">{"" if not pf else ""}'
-                  f'<input class="ep-search-input" id="path-q" type="search" data-current="{_e(pf)}" '
-                  f'value="{_e(pf)}" placeholder="what governs…  a file path or glob, then Enter (narrows all four panes)" '
+                  f'<input class="ep-search-input" id="path-q" type="search" data-current="{_attr(pf)}" '
+                  f'value="{_attr(pf)}" placeholder="what governs…  a file path or glob, then Enter (narrows all four panes)" '
                   f'aria-label="narrow all four panes to one path or glob"></div>')
 
     return ("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"

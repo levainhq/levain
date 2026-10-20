@@ -95,7 +95,21 @@ class DispatchPhone:
         from levain.dispatch.cli import job_view
         from levain.dispatch.jobs import TERMINAL
 
-        v = job_view(job)
+        from levain.cockpit.display_safe import visible
+
+        def shown(x: Any) -> Any:
+            if isinstance(x, str):
+                return visible(x)
+            if isinstance(x, dict):
+                return {k: shown(e) for k, e in x.items()}
+            if isinstance(x, (list, tuple)):
+                return tuple(map(shown, x)) if isinstance(x, tuple) else [shown(e) for e in x]
+            return x
+
+        # display only, every string the planner or the filing agent wrote (goal, repo, paths, template, grant, the
+        # filer, each history cause and its evidence) included: what the card signs is built from the stored job
+        # (``sign_payload``), never from this record
+        v = shown(job_view(job))
         out = {k: v[k] for k in v if k not in ("filer_agent", "filer_session")}
         out.update({"kind": "dispatch", "agent": v["filer_agent"], "session": v["filer_session"],
                     "read_count": len(v["read"]), "write_count": len(v["write"]),

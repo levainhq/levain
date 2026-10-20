@@ -28,12 +28,12 @@ import os
 import re
 import secrets
 import stat
-import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.dispatch import DispatchError
 
 __all__ = ["AGENTS", "DIR_NAME", "FORMAT", "NO_SESSION", "CapabilityRecordError", "keep", "preflight", "recall",
@@ -68,7 +68,7 @@ def session_problem(session: Any) -> str | None:
         return "no session was named"
     if len(session) > _SESSION_MAX:
         return f"the session id is over {_SESSION_MAX} characters"
-    if any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in session):
+    if unshowable.first_hidden(session, allow="", selectors=False) is not None:
         return "the session id holds a control character"
     if _SUBAGENT in session:
         return "the session is a subagent's"

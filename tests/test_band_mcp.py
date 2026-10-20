@@ -146,7 +146,7 @@ def test_a_line_separator_in_the_question_round_trips_and_never_splits_the_reply
     ])
     assert out.isascii() and len(out.splitlines()) == 3            # three replies, three lines, for any splitter
     r1, r2, r3 = (json.loads(x) for x in out.splitlines())
-    assert r1["result"]["isError"] is True and "no control characters" in r1["result"]["content"][0]["text"]
+    assert r1["result"]["isError"] is True and "shows as itself" in r1["result"]["content"][0]["text"]
     assert r2["result"]["isError"] is False and accented in r2["result"]["content"][0]["text"]
     assert r3["error"]["message"] == f"method not found: {method}"
     (q,) = _store(tmp_path).open_questions()

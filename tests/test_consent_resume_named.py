@@ -300,6 +300,9 @@ def test_f4_a_continue_whose_directory_cannot_be_read_holds(ps_only, session, tm
 
 _SPACED = "/Users/x/Library/Application Support/Claude/claude-code/2.1.304/claude"
 _NATIVE = "/Users/John Doe/.local/share/claude/versions/2.1.304"
+# a pid no process can hold (above Linux PID_MAX_LIMIT, 2**22, and macOS's 99999), so a row's cwd can never be
+# read: a small number such as 501 is a live process of the runner's user on some CI hosts
+_NO_PID = 2 ** 22 + 1
 
 
 @pytest.mark.parametrize("line, want", [
@@ -328,7 +331,7 @@ _NATIVE = "/Users/John Doe/.local/share/claude/versions/2.1.304"
     (_SPACED + " --resume", None),
     (_NATIVE + " -r my-name", None),
     ("node --require x /x/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume", None),
-    ("nohup claude -c", None),                                # its cwd cannot be read (pid 501 is synthetic)
+    ("nohup claude -c", None),                                # its cwd cannot be read (_NO_PID)
     # still not a resume of the session
     ("levain consent rule --session {s}", False),
     ("worker --session-id {s}", False),
@@ -337,7 +340,9 @@ _NATIVE = "/Users/John Doe/.local/share/claude/versions/2.1.304"
     ("caffeinate -i codex exec resume {o} look at {s}", False),
 ])
 def test_r3_the_argv_reading_fails_closed(ps_only, session, line, want, tmp_path):
-    ps_only(lines=["501 " + line.format(s=session, o=uuid.uuid4())])
+    with pytest.raises(ProcessLookupError):
+        os.kill(_NO_PID, 0)
+    ps_only(lines=[f"{_NO_PID} " + line.format(s=session, o=uuid.uuid4())])
     assert dv.session_named_running(session, str(tmp_path)) is want
 
 

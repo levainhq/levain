@@ -17,6 +17,8 @@ import re
 import secrets
 from datetime import datetime, timezone
 
+from levain import unshowable
+
 SCHEMA_VERSION = 1
 TYPES = ("decision", "constraint", "finding", "question", "tension", "ack", "retire")
 KINDS = ("ruling", "practice")
@@ -136,6 +138,11 @@ def validate(entry: dict, known: dict[str, dict] | None = None, *, scan: bool = 
             raise EntryError(f"{f} is longer than {n} characters")
     if entry.get("owner") and not entry["owner"].isprintable():
         raise EntryError("owner must be printable text")
+    # A WRITE gate, like the secret scrub: an owner a person reads must show as what it is (levain.unshowable, a
+    # name, so no presentation selector either). On read (scan=False) only the printable rule above applies, so a
+    # ruling recorded before this rule is still enforced.
+    if scan and entry.get("owner") and unshowable.first_hidden(entry["owner"], allow="", selectors=False) is not None:
+        raise EntryError("owner must be text that shows as itself: no hidden or invisible characters")
     t = entry["type"]
     if t not in TYPES:
         raise EntryError(f"type must be one of {', '.join(TYPES)}")

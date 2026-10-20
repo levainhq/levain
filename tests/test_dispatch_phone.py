@@ -340,6 +340,29 @@ def test_the_record_carries_every_field_the_laptop_render_shows(world) -> None:
                                                           job.contract.template.provider, job.contract.template.route)
 
 
+def test_every_planner_or_agent_string_on_the_card_is_shown_visibly(world, monkeypatch) -> None:
+    """Not only goal, repo and paths: a hidden character in the template, the grant, the filer or a history cause or
+    its evidence reaches the card marked, never raw."""
+    from levain.dispatch import cli as dcli
+
+    real = dcli.job_view
+
+    def tainted(job):
+        v = real(job)
+        rlo = "‮"
+        v["template"] = {**v["template"], "id": v["template"]["id"] + rlo}
+        v["grant"] = [g + rlo for g in v["grant"]]
+        v["filer_agent"], v["filer_session"] = "claude" + rlo, "sess" + rlo
+        v["history"] = [{**h, "cause": f"c{rlo}", "evidence": {"note": f"e{rlo}"}} for h in v["history"]]
+        return v
+
+    monkeypatch.setattr(dcli, "job_view", tainted)
+    file_job(world)
+    (r,) = phone_for(world).pending()[0]
+    assert "‮" not in json.dumps(r, ensure_ascii=False)
+    assert r["agent"] == "claude⟨U+202E⟩" and r["history"][0]["cause"] == "c⟨U+202E⟩"
+
+
 def test_a_dispatch_dir_that_is_a_file_is_a_note_never_a_raise(world, tmp_path: Path) -> None:
     flat = tmp_path / "flat"
     flat.write_text("a file, not a directory")

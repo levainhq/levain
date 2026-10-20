@@ -297,11 +297,13 @@ def test_git_env_keeps_home_and_ssh_auth_sock(world, monkeypatch):
 
 
 @pytest.mark.parametrize("key,value", [("insteadOf", "{url}"), ("pushInsteadOf", "{url}"),
-                                       ("insteadOf", "file://{root}/"), ("insteadOf", "FILE://{root}/")])
+                                       ("insteadOf", "file://{root}/"), ("insteadOf", "FILE://{root}/"),
+                                       ("insteadOf", ""), ("pushInsteadOf", "")])  # empty: git prefixes every URL
 def test_e_an_insteadof_rewrite_of_the_pin_refuses(world, key, value):
     v = value.format(url=world.url, root=world.root)
     (world.home / ".gitconfig").write_text(f"[url \"{world.evil_url}\"]\n\t{key} = {v}\n")
-    with pytest.raises(push.PushRefused, match="rewrites the pinned remote"):
+    # an empty prefix also rewrites the local read of the branch, which refuses first: either way, nothing moves
+    with pytest.raises(push.PushRefused, match="rewrites the pinned remote" if v else "rewrites the pinned remote|could not read branch"):
         world.run()
     assert world.remote_sha("refs/heads/claude/x") is None
     assert world.git(f"--git-dir={world.evil}", "for-each-ref").stdout == ""

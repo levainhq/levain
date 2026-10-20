@@ -59,13 +59,13 @@ import os
 import re
 import sqlite3
 import sys
-import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
 
@@ -122,12 +122,33 @@ def answer_line(question: Question) -> str | None:
     return f"{head}, in words: {_escaped(a.value)}"
 
 
+def _hand_escaped(cp: int) -> str:
+    """``\\uXXXX`` for one code point, a UTF-16 surrogate pair of them past U+FFFF: written by hand, because
+    ``json.dumps`` leaves DEL (U+007F) raw even with ``ensure_ascii``."""
+    if cp > 0xFFFF:
+        cp -= 0x10000
+        return f"\\u{0xD800 + (cp >> 10):04x}\\u{0xDC00 + (cp & 0x3FF):04x}"
+    return f"\\u{cp:04x}"
+
+
 def _escaped(text: str) -> str:
-    """``text`` as a JSON string with every control, format and line or paragraph separator character escaped too
-    (``json.dumps`` escapes only U+0000-U+001F): NEL (U+0085), U+2028 and a bidi override all arrive as ``\\uXXXX``,
-    a character past U+FFFF as its UTF-16 surrogate pair (``json.dumps`` of the one character), so it round-trips."""
-    return "".join(c if not (unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp"))
-                   else json.dumps(c)[1:-1] for c in json.dumps(text, ensure_ascii=False))
+    """``text`` as a JSON string with every unshowable character (:mod:`levain.unshowable`; newline and tab
+    included) written as ``\\uXXXX`` (:func:`_hand_escaped`): DEL, NEL (U+0085), U+2028 and a bidi override all
+    arrive escaped, a character past U+FFFF as its surrogate pair, so ``json.loads`` gives ``text`` back (except a
+    lone high surrogate directly before a lone low one: JSON reads that escaped pair as one character, and has no
+    other spelling for it). Every other character is ``json.dumps``'s own spelling of it (a quote and a backslash
+    escaped, the rest raw)."""
+    # judged on ``text`` itself, never on the JSON: there a selector after a newline would follow the letter of ``\n``.
+    # The runs between hidden characters hold no control and no lone surrogate (both are hidden), so json.dumps
+    # escapes only a quote or a backslash in them.
+    parts: list[str] = []
+    last = 0
+    for i in unshowable.hidden(text):
+        parts.append(json.dumps(text[last:i], ensure_ascii=False)[1:-1])
+        parts.append(_hand_escaped(ord(text[i])))
+        last = i + 1
+    parts.append(json.dumps(text[last:], ensure_ascii=False)[1:-1])
+    return '"' + "".join(parts) + '"'
 
 
 def question_context(directory: Path | str, agent: str, session: str | None) -> str | None:

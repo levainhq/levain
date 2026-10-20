@@ -316,3 +316,64 @@ def test_an_absent_tree_under_a_workspace_subdir_this_process_cannot_write_refus
             C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
     finally:
         sub.chmod(0o755)
+
+
+def _masks(argv: list[str]) -> list[str]:
+    return [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == "/dev/null"]
+
+
+def test_an_absent_git_config_global_outside_home_is_masked_read_only(home: Path, monkeypatch) -> None:
+    # L3 r1 (complement + codex HIGH): the persistence files never reached the bwrap plan, so outside
+    # $HOME's frozen top level bash could plant the config the cockpit's git status reads.
+    ent, ws = _entity(home)
+    cfg = Path("/tmp/x/operator.gitconfig")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    host = str(C._host_spelling(cfg))
+    if cfg.exists():
+        assert host in _ro_binds(argv)
+    else:
+        assert host in _masks(argv)
+
+
+def test_an_existing_git_config_global_outside_home_is_bound_read_only(
+        home: Path, tmp_path: Path, monkeypatch) -> None:
+    ent, ws = _entity(home)
+    cfg = tmp_path / "elsewhere" / "operator.gitconfig"
+    cfg.parent.mkdir()
+    cfg.write_text("[user]\n\tname = x\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    assert str(C._host_spelling(cfg)) in _ro_binds(argv)
+    assert argv.index(str(C._host_spelling(cfg))) < _first_mask(argv)
+
+
+def _derived_includes(home: Path, monkeypatch, *paths: Path) -> None:
+    listing = "".join(f"file:{home / '.gitconfig'}\0include.path\n{p}\0" for p in paths)
+    monkeypatch.setattr(C, "_run_git_config",
+                        lambda args, environ: listing if "--get-regexp" in args else None)
+
+
+def test_an_absent_derived_git_file_under_a_dir_this_user_owns_keeps_its_mask(
+        home: Path, tmp_path: Path, monkeypatch) -> None:
+    # L3 r3 (codex HIGH): a directory this user owns but cannot write today is one a same-uid
+    # confined process can chmod back and plant the include in, so it keeps the mask.
+    ent, ws = _entity(home)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    under_own = ro / "sub" / "inc.cfg"
+    writable = tmp_path / "rw" / "inc.cfg"
+    writable.parent.mkdir()
+    existing = tmp_path / "rw" / "present.cfg"
+    existing.write_text("[x]\n")
+    _derived_includes(home, monkeypatch, under_own, writable, existing)
+    ro.chmod(0o555)
+    try:
+        policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
+        assert under_own in policy.persistence_write_files
+        argv, _ = C._bwrap_plan(policy)
+    finally:
+        ro.chmod(0o755)
+    assert str(C._host_spelling(under_own)) in _masks(argv)
+    assert str(C._host_spelling(writable)) in _masks(argv)
+    assert str(C._host_spelling(existing)) in _ro_binds(argv)
