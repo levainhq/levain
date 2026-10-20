@@ -128,6 +128,7 @@
   // is the ⤢ trigger to restore focus to on close; `modalEpisodeQuery` persists the
   // modal's episode search across refresh-rebuilds (the supersede — see renderEpisodes).
   let currentView = null;
+  let lastOpts = null;   // the options the last draw was made with: a layout change (K5) redraws the same view the same way
   let modalKey = null;
   let modalGlance = false;   // the open view came from a glance tile: it shows that tile's own typed panel, whatever the entry's kind
   let modalReturnFocus = null;
@@ -255,6 +256,7 @@
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
+    lastOpts = opts;
 
     const board = document.getElementById("board");
     if (!board) return;
@@ -468,6 +470,9 @@
       if (p.dataset.editable === "1" && p._levainEdit) {
         p.appendChild(buildEditRow(p, p._levainEdit.entry, p._levainEdit.doc));
       }
+      // K5: a zone card's collapse and move controls, in the same draw as its body (dashPass keeps them right after a repaint)
+      const zgrid = p.closest(".ck-zgrid");
+      if (zgrid && !emptyProvider(p)) layoutControls(zgrid, p);
     }
   }
 
@@ -805,20 +810,28 @@
     const cards = [];
     for (const c of zone.cards) {
       const entries = c.panels.map((id) => byId.get(id)).filter(Boolean);
-      if (entries.length) cards.push({ entries: entries, size: c.size, span: c.span, tabs: c.tabs });
+      if (entries.length) cards.push({ entries: entries, size: c.size, span: c.span, tabs: c.tabs, key: entries[0].id });
     }
     if (!cards.length) return;
+    const laid = ckArrange(zone.id, cards);   // K5: the saved order; null for a zone the layout does not reach (the Memory and Identity compositions)
     const sec = el("section", "ck-zone");
     sec.dataset.zone = zone.id;
     // the title is the manifest's; the one-line gloss beside it is page chrome (a zone the page has no gloss for gets none)
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", zone.title));
     if (Object.hasOwn(ZONE_GLOSS, zone.id)) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
+    if (laid) {   // K5: the bar's Reset layout has no room on a phone, so each laid-out zone's head carries a copy there (CSS shows it under 480px)
+      const zr = el("button", "layoutreset ck-zreset", "Reset layout");
+      zr.type = "button";
+      zr.setAttribute("data-layout-reset", "");
+      head.appendChild(zr);
+    }
     sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
     const entryOf = new Map();   // node -> its manifest entry (the Memory tab's composition reads it)
     grid.dataset.ckRegion = "zone";
     grid.dataset.ckZone = zone.id;
+    if (laid) grid._ckOrder = laid;
     // rows: sequential fill, the way a 3-column grid auto-places spans
     const rows = [];
     let used = CK_COLUMNS + 1;
@@ -835,6 +848,7 @@
           const node = renderPanelSafe(e, view) || ckPlaceholder(e);
           if (CLAMP_KINDS.has(e.kind)) node.setAttribute("data-clamp", "");
           ckAttrs(node, e, ckKindOf(e, (view.extra_panels || {})[e.id]));
+          node.dataset.ckCard = c.key;
           // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
           if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
           node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
@@ -878,6 +892,99 @@
   // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
   // direct, full-width child.
   const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, now: 0, loops: 1, keep: 1 });
+  // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
+  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, now: 1, loops: 0, keep: 1 });
+  // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
+  // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
+  // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
+  const CK_NO_LAYOUT = new Set(["mind", "identity"]);
+  const layoutKit = () => { const K = window.LevainCockpitKinds; return K && K.layoutOrder ? K : null; };
+  // the cards in their drawn order (the saved order over the kernel's), their keys left on the zone's grid for the move buttons
+  function ckArrange(zoneId, cards) {
+    const K = layoutKit();
+    if (!K || CK_NO_LAYOUT.has(zoneId)) return null;
+    // a zone that holds both stack sides starts from the stacks' own top-to-bottom, not the kernel's
+    const sided = cards.filter((c) => CK_STACK_SIDE[c.key] !== undefined);
+    if (sided.some((c) => CK_STACK_SIDE[c.key] === 0) && sided.some((c) => CK_STACK_SIDE[c.key] === 1)) {
+      const sorted = sided.slice().sort((a, b) => CK_STACK_RANK[a.key] - CK_STACK_RANK[b.key]);   // stable: equal ranks keep the kernel's order
+      let n = 0;
+      for (let i = 0; i < cards.length; i++) if (CK_STACK_SIDE[cards[i].key] !== undefined) cards[i] = sorted[n++];
+    }
+    const order = K.layoutOrder(zoneId, cards.map((c) => c.key));
+    const at = new Map(order.map((k, i) => [k, i]));
+    cards.sort((a, b) => at.get(a.key) - at.get(b.key));
+    return order;
+  }
+  // the nearest card in `dir` (-1 earlier, +1 later) on the same stack side; -1 when there is none
+  function ckNeighbor(grid, key, dir) {
+    const order = grid._ckOrder || [];
+    const side = (k) => (grid.classList.contains("ck-twocol") && CK_STACK_SIDE[k] !== undefined ? CK_STACK_SIDE[k] : -1);
+    const i = order.indexOf(key);
+    if (i < 0) return -1;
+    for (let j = i + dir; j >= 0 && j < order.length; j += dir) if (side(order[j]) === side(key)) return j;
+    return -1;
+  }
+  function ckRedraw() {
+    if (!currentView || hasUnsavedEdit()) return;   // a draft in an open editor is not thrown away for a reorder; the saved order shows on the next draw
+    renderKeepingPlace(currentView, lastOpts);
+  }
+  function ckMove(grid, key, dir, focusCls) {
+    const K = layoutKit(), j = ckNeighbor(grid, key, dir);
+    if (!K || j < 0) return;
+    const order = grid._ckOrder.slice(), to = order[j];
+    order.splice(order.indexOf(key), 1);
+    order.splice(order.indexOf(to) + (dir > 0 ? 1 : 0), 0, key);
+    K.setLayoutOrder(grid.dataset.ckZone, order);
+    ckRedraw();
+    // the redraw rebuilt the buttons: a keyboard user stays on the control they pressed (or its partner, when this card is now at the end)
+    const node = document.querySelector('.ck-zgrid[data-ck-zone="' + grid.dataset.ckZone + '"] [data-ck-card="' + key + '"]');
+    const btn = node && (node.querySelector(".phead .ck-lay-" + focusCls + ":not(:disabled)") || node.querySelector(".phead .ck-lay-btn:not(:disabled)"));
+    if (btn) btn.focus();
+  }
+  function ckButton(cls, glyph, label, onclick) {
+    const b = el("button", "ck-lay-btn " + cls, glyph);
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    b.addEventListener("click", onclick);
+    return b;
+  }
+  // idempotent: dashPass calls it for every panel of a zone grid after every repaint. A dashed F7 line gets none.
+  function layoutControls(grid, p) {
+    const K = layoutKit(), head = p.querySelector(":scope > .phead"), body = p.querySelector(":scope > .pbody");
+    let box = head ? head.querySelector(":scope > .ck-lay") : null;
+    const on = !!(K && head && body && grid._ckOrder && p.dataset.ckCard && !p.classList.contains("ck-dash"));
+    if (!on) {
+      if (box) box.remove();
+      p.classList.remove("ck-collapsed");
+      return;
+    }
+    const key = p.dataset.ckCard, id = p.dataset.ckPanel;
+    const name = (head.querySelector("h2") || {}).textContent || id;
+    const folded = K.layoutCollapsed().has(id);
+    p.classList.toggle("ck-collapsed", folded);
+    if (!box) {
+      box = el("span", "ck-lay");
+      box.appendChild(ckButton("ck-lay-up", "↑", "Move " + name + " earlier", () => ckMove(grid, key, -1, "up")));
+      box.appendChild(ckButton("ck-lay-down", "↓", "Move " + name + " later", () => ckMove(grid, key, 1, "down")));
+      const fold = ckButton("ck-lay-fold", "", "", () => {
+        const now = !p.classList.contains("ck-collapsed");
+        K.setLayoutCollapsed(id, now);
+        layoutControls(grid, p);
+      });
+      box.appendChild(fold);
+      head.appendChild(box);
+    }
+    if (!body.id) body.id = "ck-pb-" + id.replace(/[^\w-]/g, "_");
+    box.querySelector(".ck-lay-up").disabled = ckNeighbor(grid, key, -1) < 0;
+    box.querySelector(".ck-lay-down").disabled = ckNeighbor(grid, key, 1) < 0;
+    const fold = box.querySelector(".ck-lay-fold");
+    fold.setAttribute("aria-expanded", folded ? "false" : "true");
+    fold.setAttribute("aria-controls", body.id);
+    const fl = (folded ? "Expand " : "Collapse ") + name;
+    fold.setAttribute("aria-label", fl);
+    fold.title = fl;
+  }
   function stackColumns(grid) {
     const kids = Array.from(grid.children);
     const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
@@ -936,6 +1043,7 @@
         if (act) act.remove();
         p.classList.remove("ck-dash-open");
       }
+      layoutControls(grid, p);
     }
   }
   // The zone grids' layout (which columns are live, which card takes its row) is measured after layout. A repaint inside a grid (a card
@@ -4522,5 +4630,5 @@
     finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
   }
 
-  window.LevainDashboard = { render: renderKeepingPlace, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
