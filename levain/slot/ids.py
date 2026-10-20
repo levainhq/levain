@@ -90,6 +90,14 @@ class SlotId:
         return f"{self.tag}.scope"
 
 
+def loopback_alias(slot: SlotId) -> str:
+    """macOS: the lo0 alias egress slot n owns, ``127.0.1.<n+1>`` (CONTRACT §24, V27). A verifier pair
+    has none (the none class gets no own loopback, §24)."""
+    if slot.slot_class != "egress":
+        raise Refused("bad-token", f"{slot.tag} has no loopback alias")
+    return f"127.0.1.{slot.index + 1}"
+
+
 def is_levain_account(name: str) -> bool:
     m = SLOT_NAME_RE.fullmatch(name)
     return name in SINGLETONS or (m is not None and int(m.group(2)) < INDEX_SPACE)

@@ -263,7 +263,8 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         confinement = [*bwrap.bwrap_steps(apparmor_userns_restricted=restricted), *netns.netns_steps(alloc.slots)]
         boot_dirs = tmpfiles_steps(host, alloc.slots)
     else:
-        confinement = pf.load_steps(alloc.slots, alloc.ids)
+        # Each egress slot's lo0 alias (§24) before the rules that name it.
+        confinement = [*pf.alias_steps(alloc.slots), *pf.load_steps(alloc.slots, alloc.ids)]
         boot_dirs = []
     steps: list[Step] = [
         *row_steps(host, early),
@@ -322,8 +323,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     ``shared_groups``: the shared groups present. Order (§23): the runtime sudoers rule first (no new
     runtime-helper calls), every service stopped and its unit removed, ids retired, processes stopped,
     accounts tombstoned, every dir naming a shared group given back to root's group, the shared groups
-    deleted, slot confinement removed (Linux netns + the slots' bwrap + tmpfiles.d; macOS the pf
-    rules and pf's enable reference), the install sudoers rule, the operator record LAST. Every step
+    deleted, slot confinement removed (Linux netns + the slots' bwrap + tmpfiles.d; macOS the slots'
+    lo0 aliases, the pf rules and pf's enable reference), the install sudoers rule, the operator record LAST. Every step
     is safe to re-run. The store and the root import tree stay."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
@@ -354,7 +355,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     if host == "linux":
         steps += netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
     else:
-        steps += pf.unload_steps()
+        # The slots' lo0 aliases go before the rules guarding them are flushed (§24).
+        steps += pf.alias_undo_steps(slots_of(accounts)) + pf.unload_steps()
     steps += remove_install_sudoers_steps(host)
     steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
     check_tools(facts, steps)
@@ -394,8 +396,9 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
                        *bwrap.copy_steps()]
     else:
         # The rules re-rendered for every slot in service, the new ones with it, so no slot runs
-        # without its pf rules.
-        confinement = pf.load_steps(in_service + alloc.slots, {**accounts, **alloc.ids})
+        # without its pf rules; every egress slot's alias (§24) added where lo0 lacks it.
+        confinement = [*pf.alias_steps(in_service + alloc.slots),
+                       *pf.load_steps(in_service + alloc.slots, {**accounts, **alloc.ids})]
     steps = [
         *account_steps(host, made),
         *membership_steps(host, membership_pairs(made, None)),

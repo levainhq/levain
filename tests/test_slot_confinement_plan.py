@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -19,7 +20,7 @@ from levain.firing import hands
 from levain.slot import Refused, bwrap, netns, pf, root_tree, service_boot, units
 from levain.slot.accounts import SLOT_MARKER
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId
+from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId, loopback_alias
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.layout import IMPORT_TREE, RUN, install_helper_path, runtime_helper_path, service_entry_path
 
@@ -379,11 +380,21 @@ def test_service_entry_exits_without_run_dir(tmp_path):
 # --- §8.3 / §23 pf rules -------------------------------------------------------------------------------
 
 
-GOLDEN_ANCHOR = """# Levain session slots (CONTRACT §8.3). Written by the install helper; removed by its undo verb.
-pass out quick proto tcp from any to 127.0.0.1 port 47100 user 3999
-block out quick proto {tcp udp} user 3999
-pass out quick proto tcp from any to 127.0.0.1 port 47101 user 3997
-block out quick proto {tcp udp} user 3997
+GOLDEN_ANCHOR = """# Levain session slots (CONTRACT §8.3, §24). Written by the install helper; removed by its undo verb.
+block in quick proto tcp from any to ! 127.0.1.1 user 3999 flags S/SA
+block in quick proto tcp from any to ! 127.0.1.2 user 3997 flags S/SA
+block in quick inet6 proto tcp from any to any user { 3999 3997 } flags S/SA
+block in quick on lo0 proto tcp from any to 127.0.1.1 user != 3999 flags S/SA
+block in quick on lo0 proto tcp from any to 127.0.1.2 user != 3997 flags S/SA
+pass in quick on lo0 proto tcp from any to 127.0.1.1 user 3999 keep state
+pass in quick on lo0 proto tcp from any to 127.0.1.2 user 3997 keep state
+pass out quick on lo0 proto tcp from any to 127.0.0.1 port 47100 user 3999 keep state
+pass out quick on lo0 proto tcp from any to 127.0.0.1 port 47101 user 3997 keep state
+pass out quick on lo0 proto tcp from any to 127.0.1.1 user 3999 keep state
+pass out quick on lo0 proto tcp from any to 127.0.1.2 user 3997 keep state
+block out quick proto { tcp udp } user 3999
+block out quick proto { tcp udp } user 3997
+block out quick on lo0 proto { tcp udp } from any to { 127.0.1.1 127.0.1.2 }
 block out quick proto {tcp udp} user 3995
 block out quick proto {tcp udp} user 3994
 """
@@ -403,16 +414,150 @@ def test_pf_anchor_golden():
     rules = pf.anchor_rules(every, ids)
     for n in range(32):
         uid = ids[f"_levain_s{n}"]
-        i = rules.index(f"pass out quick proto tcp from any to 127.0.0.1 port {47100 + n} user {uid}")
-        assert rules[i + 1] == f"block out quick proto {{tcp udp}} user {uid}"
+        gw = rules.index(f"pass out quick on lo0 proto tcp from any to 127.0.0.1 port {47100 + n} user {uid} keep state")
+        own = rules.index(f"pass out quick on lo0 proto tcp from any to 127.0.1.{n + 1} user {uid} keep state")
+        assert gw < own < rules.index(f"block out quick proto {{ tcp udp }} user {uid}")
     verifier_uids = {str(ids[x]) for s in every if s.slot_class == "none" for x in s.accounts}
-    assert not [r for r in rules if r.startswith("pass") and r.rsplit(" ", 1)[1] in verifier_uids]
-    assert len(rules) == 2 * 32 + 2 * 16
+    passed = {u for r in rules if r.startswith("pass") for u in re.findall(r"\buser (\d+)", r)}
+    assert len(passed) == 32 and not passed & verifier_uids
+    assert len(rules) == 6 * 32 + 2 + 2 * 16
     assert not [r for r in rules if "_levain" in r]                      # §23: numeric uids only
     assert _refusal(pf.gwport, SlotId("none", 0)) == "bad-token"
     # a uid outside §1.1's slot range (or none at all) is refused, never rendered
     assert _refusal(pf.anchor_rules, [SlotId("egress", 0)], {"_levain_s0": 0}) == "bad-token"
     assert _refusal(pf.anchor_rules, [SlotId("egress", 0)], {}) == "bad-token"
+
+
+#: The anchor R-M1b measured as PASSING (§24), copied verbatim: slot A uid 621 on alias 127.0.1.21,
+#: slot B uid 622 on 127.0.1.22, the front-port stand-in 127.0.0.1:47100 for both. Never edit it to
+#: match the renderer; a rule that differs from it is a rule the VM did not measure.
+MEASURED_RM1B = """\
+# lvrm1b: A=621 alias 127.0.1.21, B=622 alias 127.0.1.22, gateway 127.0.0.1:47100
+# inbound guards (inbound user = the LISTENER owner, pf.conf(5)); decided on the SYN only
+block in quick proto tcp from any to ! 127.0.1.21 user 621 flags S/SA
+block in quick proto tcp from any to ! 127.0.1.22 user 622 flags S/SA
+block in quick inet6 proto tcp from any to any user { 621 622 } flags S/SA
+block in quick on lo0 proto tcp from any to 127.0.1.21 user != 621 flags S/SA
+block in quick on lo0 proto tcp from any to 127.0.1.22 user != 622 flags S/SA
+pass in quick on lo0 proto tcp from any to 127.0.1.21 user 621 keep state
+pass in quick on lo0 proto tcp from any to 127.0.1.22 user 622 keep state
+# outbound (outbound user = the socket that sends)
+pass out quick on lo0 proto tcp from any to 127.0.0.1 port 47100 user 621 keep state
+pass out quick on lo0 proto tcp from any to 127.0.0.1 port 47100 user 622 keep state
+pass out quick on lo0 proto tcp from any to 127.0.1.21 user 621 keep state
+pass out quick on lo0 proto tcp from any to 127.0.1.22 user 622 keep state
+block out quick proto { tcp udp } user 621
+block out quick proto { tcp udp } user 622
+block out quick on lo0 proto { tcp udp } from any to { 127.0.1.21 127.0.1.22 }
+"""
+
+
+def _measured(subs, drop=()):
+    """MEASURED_RM1B's rules (comments dropped), each ``(old, new)`` of ``subs`` applied in order, then
+    the lines still naming any of ``drop`` removed."""
+    out = []
+    for line in MEASURED_RM1B.splitlines():
+        if line.startswith("#"):
+            continue
+        for old, new in subs:
+            line = line.replace(old, new)
+        if not any(d in line for d in drop):
+            out.append(line)
+    return out
+
+
+def test_pf_alias_rules_golden():
+    """§24, V27: the egress rules ARE the measured R-M1b anchor, rule for rule and in its order (pf is
+    first-match on `quick`), with numeric uids, each slot's own alias and its own front port."""
+    # one slot: e0 owns 127.0.1.1 and front port 47100; B's lines (and B in each list) normalised away
+    one = _measured([("{ 621 622 }", "{ 621 }"), ("{ 127.0.1.21 127.0.1.22 }", "{ 127.0.1.21 }"),
+                     ("127.0.1.21", "127.0.1.1"), ("621", "3999")], drop=("622", "127.0.1.22"))
+    assert len(one) == 8
+    assert pf.anchor_rules([SlotId("egress", 0)], {"_levain_s0": 3999}) == one
+    # two slots: e20 / e21 own exactly the measured aliases; each gets its OWN front port
+    ids = {"_levain_s20": 3961, "_levain_s21": 3959}
+    two = _measured([("port 47100 user 621", "port 47120 user 621"), ("port 47100 user 622", "port 47121 user 622"),
+                     ("621", "3961"), ("622", "3959")])
+    assert len(two) == 14
+    assert pf.anchor_rules([SlotId("egress", 21), SlotId("egress", 20)], ids) == two
+    # the none class is unchanged and follows the egress block
+    rules = pf.anchor_rules([SlotId("egress", 20), SlotId("egress", 21), SlotId("none", 0)],
+                            {**ids, "_levain_v0": 3995, "_levain_c0": 3994})
+    assert rules == two + ["block out quick proto {tcp udp} user 3995", "block out quick proto {tcp udp} user 3994"]
+    # no egress slot: no alias rule at all (an empty `{ }` list would not load)
+    assert pf.anchor_rules([SlotId("none", 0)], {"_levain_v0": 3995, "_levain_c0": 3994}) == rules[-2:]
+
+
+def test_loopback_alias_v27():
+    """V27: egress slot n owns 127.0.1.<n+1>, n < 64; a verifier pair owns none."""
+    assert loopback_alias(SlotId("egress", 0)) == "127.0.1.1"
+    assert loopback_alias(SlotId("egress", 63)) == "127.0.1.64"
+    assert len({loopback_alias(SlotId("egress", n)) for n in range(64)}) == 64
+    assert _refusal(loopback_alias, SlotId("none", 0)) == "bad-token"
+    assert _refusal(SlotId, "egress", 64) == "out-of-range"
+
+
+_LO0 = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\toptions=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>
+\tinet 127.0.0.1 netmask 0xff000000
+\tinet6 ::1 prefixlen 128
+\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+\tinet 127.0.1.21 netmask 0xffffffff
+\tnd6 options=201<PERFORMNUD,DAD>
+"""
+
+
+def test_pf_alias_skip_if_reads_ifconfig(tmp_path):
+    """§24: the alias skip_if reads `ifconfig lo0` (a fake here, printing the measured output) and
+    matches the inet address field exactly: no prefix match, no regex dot, no inet6 line."""
+    fake = tmp_path / "ifconfig"
+    fake.write_text(f"#!/bin/sh\n[ \"$1\" = lo0 ] || exit 2\ncat <<'EOF'\n{_LO0}EOF\n")
+    fake.chmod(0o755)
+
+    def rc(argv):
+        return subprocess.run(list(argv), capture_output=True).returncode
+
+    assert rc(pf.alias_present("127.0.1.21", str(fake))) == 0
+    assert rc(pf.alias_absent("127.0.1.21", str(fake))) == 1
+    for other in ("127.0.1.2", "127.0.1.211", "127.0.1.2x", "127x0.1.21", "::1", "0xffffffff"):
+        assert rc(pf.alias_present(other, str(fake))) == 1, other
+        assert rc(pf.alias_absent(other, str(fake))) == 0, other
+    # the plan's steps use exactly these tests, on the real ifconfig path
+    add = pf.alias_steps([SlotId("egress", 20)])
+    rem = pf.alias_undo_steps([SlotId("egress", 20)])
+    assert add[0].skip_if == pf.alias_present("127.0.1.21") and pf.IFCONFIG in add[0].skip_if[2]
+    assert rem[0].skip_if == pf.alias_absent("127.0.1.21")
+
+
+def test_pf_alias_steps_in_plans():
+    """§24: setup and replenish add every egress slot's lo0 alias (the measured form, a /32) before the
+    rules load; undo removes them after every slot is stopped and tombstoned, before the flush; the
+    verifier class gets none; Linux plans name no alias (its netns isolates)."""
+    def add(n):
+        return ("/sbin/ifconfig", "lo0", "alias", f"127.0.1.{n + 1}", "netmask", "255.255.255.255")
+
+    plan = _plan("darwin", 2, 1)
+    argvs = [s.argv for s in plan.steps]
+    assert [a for a in argvs if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1)]
+    anchor_write = next(i for i, s in enumerate(plan.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
+    assert max(argvs.index(add(0)), argvs.index(add(1))) < anchor_write
+    assert pf.alias_steps(plan.allocation.slots) == [s for s in plan.steps if s.argv[:1] == ("/sbin/ifconfig",)]
+    ids = dict(plan.allocation.ids)
+    rep = plan_replenish(parse_install_argv(["replenish"]),
+                         _set_up("darwin", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
+                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
+    rargv = [s.argv for s in rep.steps]
+    assert [a for a in rargv if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1), add(2)]
+    assert rargv.index(add(2)) < next(i for i, s in enumerate(rep.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
+    undo = _undo("darwin", ids)
+    uargv = [s.argv for s in undo.steps]
+    rems = [i for i, a in enumerate(uargv) if a[:3] == ("/sbin/ifconfig", "lo0", "-alias")]
+    assert [uargv[i][3] for i in rems] == ["127.0.1.1", "127.0.1.2"]
+    last_tomb = max(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
+    flush = uargv.index(("/sbin/pfctl", "-a", "com.apple/levain", "-F", "all"))
+    assert last_tomb < min(rems) and max(rems) < flush
+    for p in _every_plan("linux"):
+        assert not [s for s in p.steps if "ifconfig" in " ".join([*s.argv, *s.skip_if]) or "alias" in s.why]
 
 
 def test_pf_anchor_plan_and_undo():
