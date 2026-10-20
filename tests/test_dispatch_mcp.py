@@ -35,7 +35,7 @@ def ddir(tmp_path, monkeypatch):
     os.chmod(d, 0o700)
     for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(dcli, "resolvers", lambda: (registry(), POLICY))
+    monkeypatch.setattr(dcli, "resolvers", lambda *a, **k: (registry(), POLICY))
     return d
 
 
@@ -112,7 +112,7 @@ def test_show_list_and_recommend(ddir, repo):
 def test_a_refused_filing_is_the_tools_error_and_no_registry_says_so(ddir, repo, monkeypatch):
     out = call(ddir, "dispatch_file", {"contract": contract(repo, grant=["Bash"])})["result"]
     assert out["isError"] is True and out["content"][0]["text"].startswith("Refused")
-    monkeypatch.setattr(dcli, "resolvers", lambda: None)
+    monkeypatch.setattr(dcli, "resolvers", lambda *a, **k: None)
     out = call(ddir, "dispatch_file", {"contract": contract(repo)})["result"]
     assert out["isError"] is True and "no template registry is set up" in out["content"][0]["text"]
 

@@ -1,6 +1,6 @@
 """``levain dispatch``: the real CLI over a real store, a real git repo and real ssh keys in a real signed authority log.
-The template registry does not exist yet (F3), so the tests inject one through the Python API (:func:`resolvers`);
-every other path runs as the operator would run it. Exit codes are graded by the CLASS of what went wrong."""
+The tests inject a template registry through the Python API (:func:`resolvers`; the signed one is
+tests/test_dispatch_config.py's); every other path runs as the operator would run it. Exit codes are graded by the CLASS of what went wrong."""
 from __future__ import annotations
 
 import json
@@ -37,7 +37,7 @@ def ddir(tmp_path, monkeypatch):
     # the operator's terminal: no agent session in the environment, and the registry injected through the API
     for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "CODEX_SANDBOX"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(dcli, "resolvers", lambda: (registry(), POLICY))
+    monkeypatch.setattr(dcli, "resolvers", lambda *a, **k: (registry(), POLICY))
     # the suite itself runs under claude or codex; the operator's terminal has neither for an ancestor
     from levain.consent import band
     monkeypatch.setattr(band, "_ancestors", lambda: iter([]))
@@ -72,7 +72,7 @@ def file_one(capsys, ddir, contract_file, session="sess-1"):
 
 
 def test_file_with_no_registry_refuses_with_exit_2(capsys, ddir, contract_file, monkeypatch):
-    monkeypatch.setattr(dcli, "resolvers", lambda: None)
+    monkeypatch.setattr(dcli, "resolvers", lambda *a, **k: None)
     code, out, _ = run(capsys, "file", str(contract_file), "--dispatch-dir", str(ddir), "--agent", "codex")
     assert code == 2
     assert "no template registry is set up; every contract is R2, which is never dispatched" in out
@@ -688,3 +688,12 @@ def test_a_fault_after_a_planner_cancel_committed_does_not_claim_it_cancelled_no
                        "sess-1")
     assert code == 3 and "cancelled nothing" not in out, out
     assert f"job {job_id} is cancelled" in out and "is not known" in out, out
+
+
+def test_a_cancel_of_an_unknown_job_refuses_before_saying_how_it_would_cancel(capsys, ddir, keys, log):
+    # b1 L4 known edge: "cancelling as the operator, signed" was printed before the unknown id was refused
+    code, out, _ = run(capsys, "cancel", "dj-" + "0" * 32, "--dispatch-dir", str(ddir), "--agent", "claude_code",
+                       "--session", "sess-1", "--signing-key", str(keys["laptop"].path), "--data-root",
+                       str(log.path.parent), "--yes")
+    assert code == 2 and "no dispatch job" in out, out
+    assert "cancelling as the operator" not in out
