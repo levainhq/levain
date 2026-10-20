@@ -1,0 +1,1048 @@
+"""The per-OS second wall a session's processes start behind (CONTRACT §8, §9; plan §2d 1-3, §2e 1-2, §2e 7,
+§2f 8).
+
+Two halves, one module:
+
+* the PLAN half (pure, runs in the root helper): :func:`launch_spec` decides who a target runs as, where, with
+  which env file and profile; :func:`macos_launch_argv` and :func:`linux_launch_argv` wrap it in the per-OS
+  launch path; :func:`macos_egress_ready` is ``start``'s pf + alias check; :func:`check_profile_text` is the
+  apply-time ``syscall`` guard.
+* the STAGE half (:func:`stage_main`, this module run as ``__main__`` by the root interpreter): the last hop
+  before the target. It reads the spec from a pipe (never argv: the spec carries the session's handles,
+  §3.2), drops to the target's principal and PROVES the drop (:func:`drop_and_assert`), reads the rendered
+  env file, guards the profile, changes to the target's cwd, closes every fd off the allowlist and execs.
+  Any failure = the stage exits :data:`STAGE_EXIT` and nothing is exec'd.
+
+macOS (§8.2): ``launchctl asuser <uid>`` -> the stage (drop + assert -> ``RLIMIT_NPROC`` -> profile guard)
+-> ``sandbox-exec -f <S>/root/profile.sb <target>``, the R-M2 method (``vm/rm2_launch.sh``): sandbox-exec
+compiles and applies the profile, then execs the target, so a profile that fails to apply never reaches the
+target [not run: R-M2 never fed it a failing profile; a 2g row]. The front (§8.2 last sentence): the stage
+alone, no ``asuser``, no profile.
+
+Linux (§9): the forked root child joins the session's cgroup, then ``nsenter --net=/run/netns/levain-{e,v}<n>``
+-> Levain's bwrap copy, run as root, builds the §9.2 allow-listed root and the per-session mount, IPC, PID
+and UTS namespaces -> the stage (drop + assert) -> the target. That is R-L1's measured view (``vm/n3.sh``:
+ro ``/usr`` ``/etc``, ``bin``/``sbin``/``lib`` links into ``/usr``, a fresh ``/proc``, rbind ``/dev`` with a
+fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap instead of hand mounts.
+
+Targets: ``vendor``, ``clone`` (§5.4 step 3: by the SAME path as the vendor), ``step`` (a verifier step,
+§5.6 step 2), ``driver`` (§5.6 step 3), ``forwarder`` (Linux egress, §9.1) and ``front`` (§5.1 render (4)).
+
+⛔ Nothing here is ever run on the host by a test: every OS act is a seam (:class:`OsCalls`) and every
+argv is asserted as text. No ``syscall`` operation may reach a profile (trg-069, §8).
+"""
+from __future__ import annotations
+
+import errno
+import os
+import re
+import resource
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
+
+from levain.slot import Refused
+
+#: The format of the stage's spec (canonical JSON on the spec pipe). Internal to the helper and its own
+#: stage, never a file or a wire another principal reads.
+SPEC_FORMAT = "levain-wall-spec/1"
+
+#: CONTRACT §11 V3: ``RLIMIT_NPROC`` per slot, "macOS min with kern.maxprocperuid".
+NPROC = 2048
+
+#: DECISION: the stage's exit status for every refusal; outside the shell's 126/127 and a signal's 128+n.
+STAGE_EXIT = 121
+
+#: DECISION: the fd the spec pipe's read end sits on in the stage. Closed before the target's exec.
+SPEC_FD = 3
+
+SPEC_CAP = 64 * 1024
+ENV_CAP = 64 * 1024
+PROFILE_CAP = 1024 * 1024
+
+TARGETS = ("vendor", "clone", "step", "driver", "forwarder", "front")
+#: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)).
+_ONE_EXTRA_FD = frozenset({"vendor", "front"})
+#: Only these targets carry handles or a TERM (§3.2: start adds token + cap at the VENDOR's exec).
+_EXTRA_ENV = frozenset({"vendor", "front"})
+
+LAUNCHCTL = "/bin/launchctl"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+GIT = "/usr/bin/git"
+#: DECISION: fixed paths, not a PATH search, so the argv is the same on every host that builds it.
+NSENTER = "/usr/bin/nsenter"
+CGROUP_ROOT = "/sys/fs/cgroup/levain.slice"     # CONTRACT §7.3
+NETNS_DIR = "/run/netns"
+FORWARDER_PORT = 47100                          # CONTRACT §3.4, §9.1: the forwarder's port inside the netns
+
+_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_MODULE = re.compile(r"levain(\.[a-z_][a-z0-9_]*)+")
+
+_STEP_ARGS, _STEP_ARG_BYTES = 64, 4096          # CONTRACT §5.6: argv <= 64 strings of <= 4 KiB, no NUL
+
+
+# --- principals ------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Who a target becomes. ``gid == uid`` (§1.1); ``groups`` is EXACTLY the account's own group plus the
+    one shared group its row grants (§1.2): ``levain-slots`` for a slot account, ``levain-gwfronts`` for a
+    front. Never another slot's group: ``<S>`` is ``root : _levain_s<n> 0750``, so a second slot group is
+    the listing of a second session (T:2/test_other_slot_cannot_list_session)."""
+
+    name: str
+    uid: int
+    gid: int
+    groups: Tuple[int, ...]
+
+
+def principal(host: str, name: str, ids: Mapping[str, int], shared: Mapping[str, int]) -> Principal:
+    from levain.slot.ids import RANGES, SINGLETONS, in_own_range
+
+    uid = ids.get(name)
+    if name in SINGLETONS or not in_own_range(host, name, uid):
+        raise Refused("bad-token", f"{name}: uid {uid!r} is not a session account in its §1.1 range")
+    assert isinstance(uid, int)
+    grp = "levain-gwfronts" if name.startswith("_levain_gw") else "levain-slots"
+    sg = shared.get(grp)
+    if not isinstance(sg, int) or isinstance(sg, bool) or sg not in RANGES[host].shared:
+        raise Refused("bad-token", f"{grp}: gid {sg!r} is not in the §1.1 shared range")
+    return Principal(name, uid, uid, (uid, sg))
+
+
+def target_account(slot, target: str) -> str:
+    """The account a target runs as (§1, §5.4, §5.6): an egress slot's vendor, clone and forwarder run as
+    ``_levain_s<n>``, its front as ``_levain_gw<n>``; a verifier pair's clone and steps run as the CHILD
+    ``_levain_c<n>``, its driver as ``_levain_v<n>``. Any other pairing is refused."""
+    first, second = slot.accounts
+    if slot.slot_class == "egress":
+        table = {"vendor": first, "clone": first, "forwarder": first, "front": second}
+    else:
+        table = {"clone": second, "step": second, "driver": first}
+    if target not in table:
+        raise Refused("bad-token", f"target {target!r} does not run in a {slot.slot_class} slot")
+    return table[target]
+
+
+# --- the spec ----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Spec:
+    """What the stage does, decided by the plan half. ``env_file``: the rendered env (§3.4), parsed by the
+    stage; ``extra_env``: the handles + TERM ``start`` adds at exec (§3.2), never in argv. ``profile``: macOS
+    slot targets only. ``resolve``: look ``argv[0]`` up on the env's PATH as the target (verifier steps)."""
+
+    target: str
+    uid: int
+    gid: int
+    groups: Tuple[int, ...]
+    nproc: Optional[int]
+    env_file: Optional[str]
+    extra_env: Tuple[Tuple[str, str], ...]
+    profile: Optional[str]
+    cwd: str
+    argv: Tuple[str, ...]
+    resolve: bool
+    keep_fds: Tuple[int, ...]
+
+    def to_json(self) -> bytes:
+        from levain.contracts import canon
+
+        return canon.canonical_bytes({
+            "format": SPEC_FORMAT, "target": self.target, "uid": self.uid, "gid": self.gid,
+            "groups": list(self.groups), "nproc": self.nproc, "env_file": self.env_file,
+            "extra_env": dict(self.extra_env), "profile": self.profile, "cwd": self.cwd,
+            "argv": list(self.argv), "resolve": self.resolve, "keep_fds": list(self.keep_fds)})
+
+
+_SPEC_KEYS = frozenset({"format", "target", "uid", "gid", "groups", "nproc", "env_file", "extra_env", "profile",
+                        "cwd", "argv", "resolve", "keep_fds"})
+
+
+def _is_int(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _abs_path(v: object) -> bool:
+    return (isinstance(v, str) and v.startswith("/") and "\x00" not in v
+            and str(PurePosixPath(v)) == v and ".." not in PurePosixPath(v).parts)
+
+
+def _check_spec(s: Spec) -> None:
+    """The shape every spec must have, checked by the plan half when it builds one AND by the stage when it
+    reads one (the stage trusts its root parent, but never runs a spec it would not have built)."""
+    if s.target not in TARGETS:
+        raise Refused("spec-malformed", f"target {s.target!r}")
+    if not (_is_int(s.uid) and _is_int(s.gid) and s.uid > 0 and s.gid > 0):
+        raise Refused("drop-to-root", f"uid {s.uid!r} gid {s.gid!r}")
+    if not s.groups or not all(_is_int(g) and g > 0 for g in s.groups) or len(set(s.groups)) != len(s.groups) \
+            or s.gid not in s.groups:
+        raise Refused("spec-malformed", f"groups {list(s.groups)!r}")
+    if s.nproc is not None and not (_is_int(s.nproc) and s.nproc > 0):
+        raise Refused("spec-malformed", f"nproc {s.nproc!r}")
+    for p in (s.env_file, s.profile):
+        if p is not None and not _abs_path(p):
+            raise Refused("spec-malformed", f"path {p!r}")
+    if not _abs_path(s.cwd):
+        raise Refused("spec-malformed", f"cwd {s.cwd!r}")
+    if not s.argv or not all(isinstance(a, str) and "\x00" not in a for a in s.argv) or not s.argv[0]:
+        raise Refused("spec-malformed", "argv")
+    if not s.resolve and not _abs_path(s.argv[0]):
+        raise Refused("target-off-list", f"argv[0] {s.argv[0]!r} is not an absolute path")
+    for k, v in s.extra_env:
+        if not (isinstance(k, str) and _ENV_KEY.fullmatch(k) and isinstance(v, str) and "\x00" not in v):
+            raise Refused("spec-malformed", f"extra env key {k!r}")
+    if len({k for k, _ in s.extra_env}) != len(s.extra_env):
+        raise Refused("spec-malformed", "extra env key repeated")
+    if s.extra_env and s.target not in _EXTRA_ENV:
+        raise Refused("spec-malformed", f"{s.target} takes no extra env")
+    if not all(_is_int(f) and f > 2 and f != SPEC_FD for f in s.keep_fds) or len(set(s.keep_fds)) != len(s.keep_fds):
+        raise Refused("spec-malformed", f"keep_fds {list(s.keep_fds)!r}")
+    if len(s.keep_fds) > (1 if s.target in _ONE_EXTRA_FD else 0):
+        raise Refused("fd-off-list", f"{s.target} keeps {list(s.keep_fds)!r}")
+
+
+def parse_spec(data: bytes) -> Spec:
+    from levain.contracts import ContractError, canon
+
+    if len(data) > SPEC_CAP:
+        raise Refused("spec-malformed", "over the cap")
+    try:
+        obj = canon.parse(data)
+    except (ContractError, ValueError) as e:
+        raise Refused("spec-malformed", str(e)) from None
+    if not isinstance(obj, dict) or set(obj) != _SPEC_KEYS or obj["format"] != SPEC_FORMAT \
+            or canon.canonical_bytes(obj) != data:
+        raise Refused("spec-malformed", "keys, format or bytes")
+    if not isinstance(obj["groups"], list) or not isinstance(obj["argv"], list) \
+            or not isinstance(obj["keep_fds"], list) or not isinstance(obj["extra_env"], dict) \
+            or not isinstance(obj["resolve"], bool) or not isinstance(obj["target"], str):
+        raise Refused("spec-malformed", "types")
+    s = Spec(obj["target"], obj["uid"], obj["gid"], tuple(obj["groups"]), obj["nproc"], obj["env_file"],
+             tuple(sorted(obj["extra_env"].items())), obj["profile"], obj["cwd"], tuple(obj["argv"]),
+             obj["resolve"], tuple(obj["keep_fds"]))
+    _check_spec(s)
+    return s
+
+
+def _session_dir(host: str, session: str) -> PurePosixPath:
+    from levain.slot.grammar import SESSION_RE
+    from levain.slot.layout import STORE
+
+    if not isinstance(session, str) or not SESSION_RE.fullmatch(session):
+        raise Refused("bad-token", f"session {session!r}")
+    return PurePosixPath(str(STORE[host])) / "live" / session
+
+
+def _under(path: str, root: PurePosixPath) -> bool:
+    return _abs_path(path) and PurePosixPath(path).parent == root
+
+
+def module_argv(host: str, module: str, *args: str) -> Tuple[str, ...]:
+    """Run a Levain module from the root-owned import tree, the way the entry scripts do (§23): the
+    interpreter isolated (``-IS``), the tree the ONE path added, the module run as ``__main__``."""
+    from levain.slot.layout import IMPORT_TREE
+    from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
+
+    if not _MODULE.fullmatch(module):
+        raise Refused("bad-token", f"module {module!r}")
+    boot = (f"import sys; sys.path.insert(0, {str(IMPORT_TREE[host])!r}); import runpy; m = sys.argv.pop(1); "
+            "runpy.run_module(m, run_name='__main__', alter_sys=True)")
+    return (ROOT_PYTHON[host], PY_FLAGS, "-c", boot, module) + tuple(args)
+
+
+def clone_argv(session_dir: PurePosixPath) -> Tuple[str, ...]:
+    """§5.4 step 3: the slot (verifier: the child) clones its repo from the bundle into the empty dir root
+    made. No hooks, no template; ``GIT_CONFIG_NOSYSTEM=1`` and the rendered global config come from the env
+    file (§3.4)."""
+    return (GIT, "-c", "core.hooksPath=/dev/null", "clone", "--template=", str(session_dir / "in" / "repo.bundle"),
+            str(session_dir / "repo"))
+
+
+def _check_step_argv(argv: Sequence[str]) -> None:
+    if not 0 < len(argv) <= _STEP_ARGS or not all(
+            isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES
+            for a in argv) or not argv[0]:
+        raise Refused("spec-malformed", "verifier step argv (§5.6: <= 64 strings of <= 4 KiB, no NUL)")
+
+
+def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str, int], shared: Mapping[str, int],
+                argv: Sequence[str] = (), env_file: Optional[str] = None, profile: Optional[str] = None,
+                extra_env: Optional[Mapping[str, str]] = None, keep_fds: Iterable[int] = (),
+                front_module: Optional[str] = None) -> Spec:
+    """The stage's spec for ``target`` of ``slot``'s ``session``. Every path is derived from the session id
+    (§5: no argv token or stdin field is a path); ``env_file`` / ``profile`` may only name a file in the
+    rendered layer ``<S>/root/`` (lane B renders them; this module takes their paths, never their text).
+
+    * ``vendor``: ``argv[0]`` under the vendor prefix (§2.1), cwd ``<S>/repo`` (claude fails in an
+      unreadable cwd, 1c C15), one extra fd (its pty), the handles in ``extra_env``.
+    * ``clone``: :func:`clone_argv`, cwd ``<S>/repo`` (root made it empty, slot-owned, §5.4 step 3).
+    * ``step``: the ticket's argv, resolved on the env's PATH as the child, cwd ``<S>/repo`` (§5.6 step 2).
+    * ``driver``: a template argv (the root interpreter or the import tree), cwd ``<S>/driver``; ``<S>/repo``
+      is child 0700, unreadable to it by design (§5.6 step 3).
+    * ``forwarder`` (Linux): Levain's TCP->unix relay, cwd ``<S>/tmp``.
+    * ``front``: drop + assert only (§8.2 last sentence): no profile, no ``RLIMIT_NPROC`` (V3 is per SLOT),
+      no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe).
+    """
+    from levain.slot.layout import IMPORT_TREE, RUN
+    from levain.slot.root_tree import ROOT_PYTHON, VENDOR_PREFIX
+
+    if host not in ("darwin", "linux"):
+        raise Refused("unsupported-host", repr(host))
+    if target not in TARGETS:
+        raise Refused("bad-token", f"target {target!r}")
+    who = principal(host, target_account(slot, target), ids, shared)
+    S = _session_dir(host, session)
+    root_layer = S / "root"
+    argv = tuple(argv)
+    resolve = False
+    if target == "vendor":
+        prefix = PurePosixPath(str(VENDOR_PREFIX[host]))
+        if not argv or not _abs_path(argv[0]) or prefix not in PurePosixPath(argv[0]).parents:
+            raise Refused("target-off-list", f"vendor {argv[:1]!r} is not under {prefix}")
+        cwd = S / "repo"
+    elif target == "clone":
+        if argv:
+            raise Refused("spec-malformed", "clone builds its own argv")
+        argv, cwd = clone_argv(S), S / "repo"
+    elif target == "step":
+        _check_step_argv(argv)
+        cwd, resolve = S / "repo", True
+    elif target == "driver":
+        tree = PurePosixPath(str(IMPORT_TREE[host]))
+        if not argv or not _abs_path(argv[0]) or (argv[0] != ROOT_PYTHON[host]
+                                                   and tree not in PurePosixPath(argv[0]).parents):
+            raise Refused("target-off-list", f"driver {argv[:1]!r} is neither {ROOT_PYTHON[host]} nor under {tree}")
+        cwd = S / "driver"
+    elif target == "forwarder":
+        if host != "linux":
+            raise Refused("unsupported-host", "the forwarder is Linux's (§9.1); macOS slots dial the front's port")
+        if argv:
+            raise Refused("spec-malformed", "the forwarder builds its own argv")
+        sock = PurePosixPath(str(RUN[host])) / "gw" / f"slot{slot.index}" / "gw.sock"
+        argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock))
+        cwd = S / "tmp"
+    else:   # front
+        if argv:
+            raise Refused("spec-malformed", "the front's argv is its module's")
+        argv = module_argv(host, front_module or "")
+        cwd = PurePosixPath("/")
+
+    slot_target = target != "front"
+    if env_file is None and target in ("vendor", "clone", "step", "driver"):
+        # A verifier renders two env files (§3.4: the driver's HOME is <S>/driver, the child's <S>).
+        env_file = str(root_layer / ("driver.env" if target == "driver" else "env"))
+    if env_file is not None and (target in ("front", "forwarder") or not _under(env_file, root_layer)):
+        raise Refused("view-path-off-list", f"env file {env_file!r} is not in {root_layer}")
+    if host == "darwin" and slot_target:
+        profile = profile if profile is not None else str(root_layer / "profile.sb")
+        if not _under(profile, root_layer):
+            raise Refused("view-path-off-list", f"profile {profile!r} is not in {root_layer}")
+    elif profile is not None:
+        raise Refused("spec-malformed", f"{host} {target}: no profile on this path")
+    spec = Spec(target, who.uid, who.gid, who.groups, NPROC if slot_target else None, env_file,
+                tuple(sorted((extra_env or {}).items())), profile, str(cwd), argv, resolve, tuple(keep_fds))
+    _check_spec(spec)
+    return spec
+
+
+def stage_argv(host: str, spec_fd: int = SPEC_FD) -> Tuple[str, ...]:
+    """The stage: this module run as ``__main__`` by the root interpreter, reading its spec from ``spec_fd``."""
+    return module_argv(host, "levain.slot.wall", "--spec-fd", str(spec_fd))
+
+
+# --- macOS (§8.2) ----------------------------------------------------------------------------------------------
+
+
+def macos_launch_argv(spec: Spec, *, spec_fd: int = SPEC_FD) -> Tuple[str, ...]:
+    """§8.2: ``launchctl asuser <uid>`` (the slot's bootstrap namespace, measured to cut pasteboard and
+    screenshots, runs/macos-RD2) -> the stage, which drops, asserts, sets ``RLIMIT_NPROC`` and execs the
+    target under ``sandbox-exec -f <profile>``. The front skips ``asuser`` and the profile."""
+    _check_spec(spec)
+    if spec.target == "front":
+        if spec.profile is not None:
+            raise Refused("spec-malformed", "the front runs with no profile")
+        return stage_argv("darwin", spec_fd)
+    if spec.profile is None:
+        raise Refused("spec-malformed", f"a macOS {spec.target} runs under its profile")
+    return (LAUNCHCTL, "asuser", str(spec.uid)) + stage_argv("darwin", spec_fd)
+
+
+# --- Linux (§9) ----------------------------------------------------------------------------------------------
+
+#: §9.2: the host top-level names the view carries as links into /usr, never as binds.
+_USR_LINKS = ("/bin", "/sbin", "/lib", "/lib64")
+
+
+def read_host_links(readlink: Callable[[str], str] = os.readlink) -> dict:
+    """Each of ``/bin /sbin /lib /lib64`` -> its link target on this host, or None where the host has no
+    such link (``/lib64`` is absent on arm64, R-L1 N3c ``ls /``)."""
+    out: dict = {}
+    for p in _USR_LINKS:
+        try:
+            out[p] = readlink(p)
+        except FileNotFoundError:
+            out[p] = None
+        except OSError as e:
+            if e.errno != errno.EINVAL:   # EINVAL = a real directory: refused below, by name
+                raise
+            out[p] = ""
+    return out
+
+
+def read_netns_names(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> frozenset:
+    """The namespaces ``ip`` itself knows (``ip netns list``: ``<name>`` or ``<name> (id: <k>)`` per line),
+    as :mod:`levain.slot.netns` reads them. ``ip`` failing is not "none listed": it raises."""
+    from levain.firing.hands import _abs
+    from levain.launch import child_env
+
+    r = run([_abs("ip"), "netns", "list"], capture_output=True, text=True, env=child_env())
+    if r.returncode != 0:
+        raise Refused("netns-missing", f"ip netns list failed: {(r.stderr or '').strip()}")
+    return frozenset(line.split()[0] for line in r.stdout.splitlines() if line.strip())
+
+
+def cgroup_dir(slot, session: str, leaf: Optional[str] = None) -> str:
+    """§7.3: ``/sys/fs/cgroup/levain.slice/{e,v}<n>.scope/<session>/``; a verifier step its own child cgroup
+    (§5.6 step 2). DECISION: leaf ``step<k>`` per step and ``driver`` for the driver; every other target
+    sits in the session's own cgroup."""
+    _session_dir("linux", session)
+    if leaf is not None and not re.fullmatch(r"step(0|[1-9][0-9]?)|driver", leaf):
+        raise Refused("bad-token", f"cgroup leaf {leaf!r}")
+    base = f"{CGROUP_ROOT}/{slot.cgroup}/{session}"
+    return base if leaf is None else f"{base}/{leaf}"
+
+
+def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_links: Mapping[str, Optional[str]],
+                    ro_prefixes: Optional[Iterable[str]] = None) -> Tuple[str, ...]:
+    """The bwrap arguments for the §9.2 root view, an ALLOW-LIST: anything not named here is absent from the
+    slot's root (R-L1 N3: a socket under ``/var/lib`` is then ``FileNotFoundError``, not a guarded path).
+
+    ro ``/usr`` ``/etc`` + the vendor and import prefixes (bound only where ``/usr`` does not already hold
+    them) · ``/bin /sbin /lib /lib64`` as the host's links into ``/usr`` · a fresh ``/proc`` (a new PID
+    namespace) · ``/dev`` bound with a fresh ``/dev/shm`` · tmpfs ``/tmp /var/tmp /run`` · rw ``<S>`` · the
+    slot's socket dirs: ``R/gw/slot<n>/`` (egress), ``R/qb/slot<n>/`` (queue grant), ``R/planner/slot<n>/``
+    (planner kind). No ``/sys``. Per-session IPC, PID and UTS namespaces (§9.1, plan §2e 7); bwrap always
+    makes the mount namespace. The network namespace is joined by ``nsenter``, never unshared here.
+    [not run: R-L1 built this view with hand mounts + ``pivot_root``; bwrap run AS ROOT building it (``/dev``
+    recursion, no ``--cap-*`` so the slot's own nested bwrap keeps a full bounding set) is a 2g row.]
+
+    A ro prefix off the allow-list, a socket grant the slot's class or kind does not carry, or a host link
+    that does not point into ``/usr`` = ``view-path-off-list``, by name."""
+    from levain.slot.layout import IMPORT_TREE, RUN
+    from levain.slot.root_tree import VENDOR_PREFIX
+
+    S = _session_dir("linux", session)
+    allowed = (str(VENDOR_PREFIX["linux"]), str(IMPORT_TREE["linux"]))
+    prefixes = tuple(allowed if ro_prefixes is None else ro_prefixes)
+    for p in prefixes:
+        if p not in allowed:
+            raise Refused("view-path-off-list", f"ro {p!r}: only {', '.join(allowed)} join /usr and /etc")
+    if slot.slot_class == "none":
+        if kind != "verifier":
+            raise Refused("bad-token", f"a verifier pair runs kind verifier, not {kind!r}")
+        if queue_grant:
+            raise Refused("view-path-off-list", "a none-class session reaches no Levain socket (§1)")
+    elif kind == "verifier":
+        raise Refused("bad-token", "kind verifier runs in a verifier pair")
+
+    args = ["--unshare-ipc", "--unshare-pid", "--unshare-uts",
+            "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
+    for p in prefixes:
+        pp = PurePosixPath(p)
+        if PurePosixPath("/usr") not in pp.parents and PurePosixPath("/etc") not in pp.parents:
+            args += ["--ro-bind", p, p]
+    for name in _USR_LINKS:
+        target = host_links.get(name)
+        if target is None:
+            continue
+        resolved = PurePosixPath(target if target.startswith("/") else f"/{target}")
+        if not target or ".." in resolved.parts or PurePosixPath("/usr") not in resolved.parents:
+            raise Refused("view-path-off-list", f"{name} -> {target!r} is not a link into /usr (§9.2)")
+        args += ["--symlink", target, name]
+    args += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
+             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
+             "--bind", str(S), str(S)]
+    if slot.slot_class == "egress":
+        R = PurePosixPath(str(RUN["linux"]))
+        grants = ["gw"] + (["qb"] if queue_grant else []) + (["planner"] if kind == "planner" else [])
+        for g in grants:
+            d = str(R / g / f"slot{slot.index}")
+            args += ["--bind", d, d]
+    args += ["--chdir", "/"]
+    return tuple(args)
+
+
+@dataclass(frozen=True)
+class LinuxLaunch:
+    """``cgroup``: the dir whose ``cgroup.procs`` the forked root child joins before it execs ``argv``
+    (None for the front, which runs in the host's namespaces: it needs upstream TCP)."""
+
+    cgroup: Optional[str]
+    argv: Tuple[str, ...]
+
+
+def require_netns(slot, names: Iterable[str]) -> str:
+    """§1.3: ``start`` refuses ``netns-missing`` rather than ever run a slot in the host's namespace."""
+    if slot.netns not in set(names):
+        raise Refused("netns-missing", slot.netns)
+    return f"{NETNS_DIR}/{slot.netns}"
+
+
+def linux_launch_argv(spec: Spec, *, slot, session: str, kind: str, queue_grant: bool = False,
+                      netns_names: Callable[[], Iterable[str]] = read_netns_names,
+                      host_links: Optional[Mapping[str, Optional[str]]] = None,
+                      cgroup_leaf: Optional[str] = None, spec_fd: int = SPEC_FD) -> LinuxLaunch:
+    """§9: ``nsenter --net=<the slot's netns>`` -> Levain's bwrap copy (root; the §9.2 view) -> the stage.
+    The netns is checked against ``ip netns list`` first (``netns-missing``); ``nsenter`` failing to open it
+    is a second, fail-closed refusal (no exec). The front: the stage alone."""
+    from levain.slot.bwrap import LEVAIN_BWRAP
+
+    _check_spec(spec)
+    if spec.profile is not None:
+        raise Refused("spec-malformed", "Linux runs no Seatbelt profile")
+    if spec.target == "front":
+        return LinuxLaunch(None, stage_argv("linux", spec_fd))
+    if spec.target in ("step", "driver") and cgroup_leaf is None:
+        raise Refused("spec-malformed", "a verifier step and the driver each run in their own cgroup (§5.6)")
+    ns = require_netns(slot, netns_names())
+    view = linux_view_args(slot, session, kind=kind, queue_grant=queue_grant,
+                           host_links=read_host_links() if host_links is None else host_links)
+    argv = (NSENTER, f"--net={ns}", "--", str(LEVAIN_BWRAP)) + view + ("--",) + stage_argv("linux", spec_fd)
+    return LinuxLaunch(cgroup_dir(slot, session, cgroup_leaf), argv)
+
+
+# --- macOS start check: the live pf anchor + the slot's alias (carried item F5) ---------------------------------
+
+_PF_NOISE = ("No ALTQ support in kernel", "ALTQ related functions disabled")
+
+
+def _pf_expand(tokens: list) -> list:
+    """``{ a b }`` lists -> every combination, as pf prints a rule it expanded."""
+    for i, t in enumerate(tokens):
+        if t.startswith("{"):
+            j = next(k for k in range(i, len(tokens)) if tokens[k].endswith("}"))
+            inner = " ".join(tokens[i:j + 1]).strip("{} ").split()
+            return [r for v in inner for r in _pf_expand(tokens[:i] + [v] + tokens[j + 1:])]
+    return [tokens]
+
+
+def _ipv4(s: str) -> bool:
+    return re.fullmatch(r"(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}", s) is not None
+
+
+def pf_printed(rule: str) -> list:
+    """The lines ``pfctl -sr`` prints for one rule in the shapes :func:`levain.slot.pf.anchor_rules` writes
+    (measured: runs/s1-1c-macos/raw/C08_C09_pf_lo0.txt): ``block`` -> ``block drop``; lists expanded;
+    ``inet`` added beside an IPv4 address; ``from any to any`` -> ``all``; ``user N`` / ``port N`` ->
+    ``user = N`` / ``port = N``; a tcp ``pass … keep state`` gains ``flags S/SA``. A shape it does not know is
+    refused (``pf-rule-unparsed``), so a change in pf.py's rules fails the check closed, never open."""
+    out = []
+    try:
+        expanded = _pf_expand(rule.replace("{", " { ").replace("}", " } ").split())
+    except StopIteration:   # an unclosed list
+        raise Refused("pf-rule-unparsed", rule) from None
+    for t in expanded:
+        t = [x for x in t if x not in ("{", "}")]
+        try:
+            i = 0
+            action = t[i]; i += 1
+            if action not in ("block", "pass"):
+                raise ValueError(action)
+            direction = t[i]; i += 1
+            if direction not in ("in", "out") or t[i] != "quick":
+                raise ValueError(direction)
+            i += 1
+            iface = af = None
+            if t[i] == "on":
+                iface, i = t[i + 1], i + 2
+            if t[i] in ("inet", "inet6"):
+                af, i = t[i], i + 1
+            if t[i] != "proto":
+                raise ValueError(t[i])
+            proto, i = t[i + 1], i + 2
+            src = dst = "any"
+            neg = False
+            if i < len(t) and t[i] == "from":
+                src = t[i + 1]
+                if t[i + 2] != "to":
+                    raise ValueError("to")
+                i += 3
+                if t[i] == "!":
+                    neg, i = True, i + 1
+                dst, i = t[i], i + 1
+            port = user = flags = None
+            keep = False
+            while i < len(t):
+                if t[i] == "port":
+                    port, i = t[i + 1], i + 2
+                elif t[i] == "user":
+                    if t[i + 1] == "!=":
+                        user, i = ("!=", t[i + 2]), i + 3
+                    else:
+                        user, i = ("=", t[i + 1]), i + 2
+                elif t[i] == "flags":
+                    flags, i = t[i + 1], i + 2
+                elif t[i:i + 2] == ["keep", "state"]:
+                    keep, i = True, i + 2
+                else:
+                    raise ValueError(t[i])
+        except (IndexError, ValueError):
+            raise Refused("pf-rule-unparsed", rule) from None
+        if src != "any":
+            raise Refused("pf-rule-unparsed", rule)
+        if af is None and _ipv4(dst):
+            af = "inet"
+        if action == "pass" and proto == "tcp" and keep and flags is None:
+            flags = "S/SA"
+        parts = ["block drop" if action == "block" else "pass", direction, "quick"]
+        parts += [f"on {iface}"] if iface else []
+        parts += [af] if af else []
+        parts += [f"proto {proto}"]
+        parts += ["all"] if dst == "any" and not neg and port is None else [f"from any to {'! ' if neg else ''}{dst}"]
+        parts += [f"port = {port}"] if port else []
+        parts += [f"user {user[0]} {user[1]}"] if user else []
+        parts += [f"flags {flags}"] if flags else []
+        parts += ["keep state"] if keep else []
+        out.append(" ".join(parts))
+    return out
+
+
+def expected_slot_rules(slot, ids: Mapping[str, int]) -> frozenset:
+    """The printed lines the live anchor must hold for ``slot``: :func:`levain.slot.pf.anchor_rules` for that
+    slot alone (its rules name only its own uid and alias once their lists are expanded), so the expected
+    text has ONE source."""
+    from levain.slot.pf import anchor_rules
+
+    return frozenset(line for r in anchor_rules([slot], ids) for line in pf_printed(r))
+
+
+def check_egress_ready(slot, ids: Mapping[str, int], *, pf_text: str, ifconfig_text: str) -> None:
+    """Carried item F5: an egress slot on macOS starts only while (1) the LIVE sub-anchor holds every line of
+    its rules and (2) lo0 is UP and carries its alias (§24, V27). Missing either = refused by name."""
+    from levain.slot.ids import loopback_alias
+
+    if slot.slot_class != "egress":
+        raise Refused("bad-token", f"{slot.tag}: only an egress slot has pf rules to check")
+    live = {" ".join(line.split()) for line in pf_text.splitlines()
+            if line.strip() and not line.startswith(_PF_NOISE)}
+    if any("<__automatic" in line for line in live):
+        # pfctl's optimizer can fold similar rules into a table [not run: from pfctl(8) -o basic; the 1c VM
+        # had 2 egress slots and showed none]; the lines are then not the ones loaded, so refuse, never guess.
+        raise Refused("pf-anchor-not-loaded", "the live anchor holds an optimizer table; its rules cannot be read back")
+    missing = sorted(expected_slot_rules(slot, ids) - live)
+    if missing:
+        raise Refused("pf-anchor-not-loaded", f"{slot.tag}: {len(missing)} rule(s) absent, first: {missing[0]}")
+    alias = loopback_alias(slot)
+    lines = ifconfig_text.splitlines()
+    head = lines[0] if lines else ""
+    m = re.match(r"lo0: flags=[0-9a-fA-F]+<([^>]*)>", head)
+    if m is None or "UP" not in m.group(1).split(","):
+        raise Refused("loopback-alias-down", f"lo0 is not up: {head!r}")
+    if not any(f.split()[:2] == ["inet", alias] for f in lines[1:]):
+        raise Refused("loopback-alias-down", f"lo0 has no inet {alias} ({slot.tag})")
+
+
+def _read_cmd(argv: Sequence[str], run) -> str:
+    from levain.launch import child_env
+
+    r = run(list(argv), capture_output=True, text=True, env=child_env())
+    if r.returncode != 0:
+        raise Refused("pf-anchor-not-loaded", f"{' '.join(argv)}: {(r.stderr or r.stdout or '').strip()}")
+    return r.stdout
+
+
+def macos_egress_ready(slot, ids: Mapping[str, int], *,
+                       run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> None:
+    """:func:`check_egress_ready` on the live reads: ``pfctl -a com.apple/levain -sr`` (§23's sub-anchor,
+    the one doctor reads) and ``ifconfig lo0``. Root only; the reads are the ``run`` seam."""
+    from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL
+
+    check_egress_ready(slot, ids, pf_text=_read_cmd((PFCTL, "-a", ANCHOR, "-sr"), run),
+                       ifconfig_text=_read_cmd((IFCONFIG, "lo0"), run))
+
+
+# --- the profile guard (§8; trg-069) -------------------------------------------------------------------------------
+
+
+def check_profile_text(text: str) -> None:
+    """Refuse a profile that names a ``syscall`` operation, before anything applies it. Comments (``;`` to the
+    end of a line, ``#| … |#``) are skipped, so a template may say why the rule is absent; everything else
+    counts, string literals included (SBPL is a Scheme: a string can become an operation name). A profile
+    this scanner cannot read to its end is refused too."""
+    code = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == ";":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("#|", i):
+            j = text.find("|#", i + 2)
+            if j < 0:
+                raise Refused("profile-unreadable", "an unterminated #| comment")
+            i = j + 2
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise Refused("profile-unreadable", "an unterminated string")
+            code.append(text[i:j + 1])
+            i = j + 1
+        else:
+            code.append(c)
+            i += 1
+    if "syscall" in "".join(code).lower():
+        raise Refused("profile-syscall-rule", "a profile may never name a syscall operation (trg-069)")
+
+
+# --- the stage -----------------------------------------------------------------------------------------------------
+
+
+def _read_fd(fd: int, cap: int) -> bytes:
+    chunks, size = [], 0
+    try:
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            size += len(b)
+            if size > cap:
+                raise Refused("spec-malformed", "over the cap")
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _read_file(path: str, cap: int) -> bytes:
+    """A regular file, its last component never followed, at most ``cap`` bytes."""
+    import stat
+
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
+            raise Refused("view-path-off-list", f"{path}: not a regular file within {cap} bytes")
+        data = b""
+        while len(data) <= cap:
+            b = os.read(fd, 65536)
+            if not b:
+                return data
+            data += b
+        raise Refused("view-path-off-list", f"{path}: grew past {cap} bytes")
+    finally:
+        os.close(fd)
+
+
+def _darwin_kernel_groups() -> list:
+    """The KERNEL's supplementary groups on macOS. ``os.getgroups()`` there returns the directory service's
+    list for the euid's user, which ``setgroups`` does not change (Python docs, os.getgroups), so it cannot
+    prove a drop; libSystem's plain ``getgroups`` symbol returns the list the process holds (getgroups(2)
+    [not run after a real drop: a 2g row])."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.getgroups
+    fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint32)]
+    n = fn(0, None)
+    if n < 0:
+        raise OSError(ctypes.get_errno(), "getgroups")
+    buf = (ctypes.c_uint32 * max(n, 1))()
+    n = fn(len(buf), buf)
+    if n < 0:
+        raise OSError(ctypes.get_errno(), "getgroups")
+    return [int(buf[i]) for i in range(n)]
+
+
+def _linux_caps() -> dict:
+    out = {}
+    with open("/proc/self/status", encoding="ascii") as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            if k in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+                out[k] = int(v.strip(), 16)
+    return out
+
+
+def _list_fds() -> list:
+    d = "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd"
+    out = []
+    for name in os.listdir(d):
+        fd = int(name)
+        try:
+            os.fstat(fd)
+        except OSError as e:
+            if e.errno == errno.EBADF:   # the listing's own fd, closed by the time it returns
+                continue
+            raise
+        out.append(fd)
+    return sorted(out)
+
+
+def _access_x(path: str) -> bool:
+    import stat
+
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode) and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def _write_text(path: str, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.write(fd, text.encode("ascii"))
+    finally:
+        os.close(fd)
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="ascii") as fh:
+        return fh.read()
+
+
+@dataclass
+class OsCalls:
+    """Every OS act the stage takes. ``getresuid`` / ``getresgid`` / ``capabilities``: Linux only (macOS has no
+    public ``getresuid``, plan §2f 8: there the drop is PROVED by ``seteuid(0)`` / ``setegid(0)`` failing)."""
+
+    setgroups: Callable = os.setgroups
+    setgid: Callable = os.setgid
+    setuid: Callable = os.setuid
+    getuid: Callable = os.getuid
+    geteuid: Callable = os.geteuid
+    getgid: Callable = os.getgid
+    getegid: Callable = os.getegid
+    getgroups: Callable = os.getgroups
+    seteuid: Callable = os.seteuid
+    setegid: Callable = os.setegid
+    getrlimit: Callable = resource.getrlimit
+    setrlimit: Callable = resource.setrlimit
+    getresuid: Optional[Callable] = None
+    getresgid: Optional[Callable] = None
+    capabilities: Optional[Callable] = None
+    read_fd: Callable = _read_fd
+    read_file: Callable = _read_file
+    chdir: Callable = os.chdir
+    list_fds: Callable = _list_fds
+    close: Callable = os.close
+    set_inheritable: Callable = os.set_inheritable
+    access_x: Callable = _access_x
+    execve: Callable = os.execve
+    dup2: Callable = os.dup2
+    getpid: Callable = os.getpid
+    write_file: Callable = _write_text   # the Linux cgroup join (exec_launch)
+    read_text: Callable = _read_text
+
+
+def real_os_calls() -> OsCalls:
+    c = OsCalls()
+    if sys.platform == "darwin":
+        c.getgroups = _darwin_kernel_groups
+    elif sys.platform.startswith("linux"):
+        c.getresuid, c.getresgid, c.capabilities = os.getresuid, os.getresgid, _linux_caps
+    return c
+
+
+def _do(step: str, fn: Callable, *args) -> None:
+    try:
+        fn(*args)
+    except OSError as e:
+        raise Refused("drop-failed", f"{step}: {e.strerror or e}") from None
+
+
+def _proved_fail(step: str, fn: Callable) -> None:
+    try:
+        fn(0)
+    except OSError as e:
+        if e.errno == errno.EPERM:
+            return
+        raise Refused("drop-assert", f"{step}(0) failed with errno {e.errno}, not EPERM") from None
+    raise Refused("privilege-regained", f"{step}(0) succeeded after the drop")
+
+
+def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optional[int] = NPROC,
+                    os_calls: Optional[OsCalls] = None) -> None:
+    """In the child, before its exec (§8.2, plan §2e 1 + §2f 8): ``setgroups`` -> ``setgid`` -> ``setuid``, each
+    checked; then ASSERT real and effective uid and gid are the target's (and, on Linux, the saved ids, and
+    no capability left), the supplementary groups are EXACTLY ``groups``, the uid is not 0; PROVE
+    ``seteuid(0)`` and ``setegid(0)`` fail (EPERM); then ``RLIMIT_NPROC`` (``None``: not set, the front).
+    Raises :class:`Refused` at the first step that is not proven; the caller then exits without exec.
+
+    The groups are SET to an explicit list, never cleared (``setpriv --clear-groups``): with an empty list a
+    root-launched process ran the 0750 ``levain-slots`` bwrap copy it should not reach, mechanism undiagnosed
+    (s1-1d D12, R-L2 control B). An explicit set is what R-L1's view runs used (``setpriv --groups``), and on
+    macOS ``setgroups`` also opts the credential out of the directory service's dynamic membership, so the
+    kernel list is the whole truth the assertion reads [not run: XNU's documented setgroups semantics; a 2g
+    row reads ``id`` and a group-only file as the dropped slot]."""
+    c = os_calls or real_os_calls()
+    groups = tuple(groups)
+    if not (_is_int(uid) and _is_int(gid)) or uid == 0 or gid == 0 or 0 in groups:
+        raise Refused("drop-to-root", f"uid {uid!r} gid {gid!r} groups {list(groups)!r}")
+    if gid not in groups or len(set(groups)) != len(groups):
+        raise Refused("drop-assert", f"groups {list(groups)!r} must hold gid {gid} once")
+    _do("setgroups", c.setgroups, list(groups))
+    _do("setgid", c.setgid, gid)
+    _do("setuid", c.setuid, uid)
+    got = (c.getuid(), c.geteuid(), c.getgid(), c.getegid())
+    if got != (uid, uid, gid, gid):
+        raise Refused("drop-assert", f"real/effective uid, gid = {got}, want {(uid, uid, gid, gid)}")
+    if c.getresuid is not None and tuple(c.getresuid()) != (uid, uid, uid):
+        raise Refused("drop-assert", f"saved uid: {tuple(c.getresuid())}")
+    if c.getresgid is not None and tuple(c.getresgid()) != (gid, gid, gid):
+        raise Refused("drop-assert", f"saved gid: {tuple(c.getresgid())}")
+    have = list(c.getgroups())
+    if sorted(have) != sorted(groups):
+        raise Refused("drop-assert", f"groups {sorted(have)}, want exactly {sorted(groups)}")
+    if c.capabilities is not None:
+        caps = c.capabilities()
+        if any(caps.get(k, 1) for k in ("CapPrm", "CapEff", "CapAmb")):
+            raise Refused("drop-assert", f"capabilities left after the drop: {caps}")
+    _proved_fail("seteuid", c.seteuid)
+    _proved_fail("setegid", c.setegid)
+    if nproc is not None:
+        soft, hard = c.getrlimit(resource.RLIMIT_NPROC)
+        # V3 "macOS min with kern.maxprocperuid": never ask for more than the hard limit already allows,
+        # which an unprivileged process cannot raise.
+        lim = nproc if hard == resource.RLIM_INFINITY or hard >= nproc else hard
+        _do("setrlimit", c.setrlimit, resource.RLIMIT_NPROC, (lim, lim))
+        if tuple(c.getrlimit(resource.RLIMIT_NPROC)) != (lim, lim):
+            raise Refused("drop-assert", f"RLIMIT_NPROC is {c.getrlimit(resource.RLIMIT_NPROC)}, want {(lim, lim)}")
+
+
+def parse_env(data: bytes) -> dict:
+    """The rendered env file (§3.4), R-M2's shape: UTF-8, one ``KEY=VALUE`` per LF-terminated line, the value
+    everything after the first ``=``, no quoting. No CR, no NUL, no blank line, no repeated key. Errors name
+    the line, never a value (the file holds no secret, but the habit costs nothing)."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("env-malformed", "not UTF-8") from None
+    if "\x00" in text or "\r" in text or (text and not text.endswith("\n")):
+        raise Refused("env-malformed", "NUL, CR or an unterminated last line")
+    env: dict = {}
+    for n, line in enumerate(text.split("\n")[:-1], 1):
+        key, sep, value = line.partition("=")
+        if not sep or not _ENV_KEY.fullmatch(key):
+            raise Refused("env-malformed", f"line {n}")
+        if key in env:
+            raise Refused("env-malformed", f"line {n}: {key} repeated")
+        env[key] = value
+    return env
+
+
+def _resolve(name: str, env: Mapping[str, str], c: OsCalls) -> str:
+    """A verifier step's ``argv[0]`` on the session env's PATH, looked up AS THE CHILD (after the drop). A
+    name with a ``/`` is taken as written (relative to the cwd, ``<S>/repo``)."""
+    if "/" in name:
+        return name
+    for d in env.get("PATH", "").split(":"):
+        if d.startswith("/") and c.access_x(f"{d.rstrip('/')}/{name}"):
+            return f"{d.rstrip('/')}/{name}"
+    raise Refused("target-not-found", f"{name!r} on the session PATH")
+
+
+def _close_fds(keep: frozenset, c: OsCalls) -> None:
+    """§3.1 step 4: every fd off the allowlist is closed (Python's own are CLOEXEC; an inherited one may not
+    be), the kept ones made inheritable, and the result re-listed: an fd still open off the list = refused."""
+    for fd in c.list_fds():
+        if fd not in keep:
+            c.close(fd)
+    for fd in sorted(keep):
+        c.set_inheritable(fd, True)
+    left = sorted(set(c.list_fds()) - keep)
+    if left:
+        raise Refused("fd-off-list", f"still open: {left}")
+
+
+def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, err=None) -> int:
+    """The stage, in order: spec -> drop + assert (+ ``RLIMIT_NPROC``) -> the env file -> the profile guard ->
+    cwd -> the target's path -> the fd allowlist -> exec (macOS slot targets: ``sandbox-exec -f <profile>``).
+    Returns :data:`STAGE_EXIT` on any refusal or error, having exec'd nothing; a real ``execve`` never
+    returns."""
+    c = os_calls or real_os_calls()
+    try:
+        spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
+        drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c)
+        env = parse_env(c.read_file(spec.env_file, ENV_CAP)) if spec.env_file else {}
+        for k, v in spec.extra_env:
+            if k in env:
+                raise Refused("env-conflict", f"{k} is the rendered env's")
+            env[k] = v
+        argv = list(spec.argv)
+        if spec.profile is not None:
+            if sys.platform != "darwin":
+                raise Refused("spec-malformed", "a Seatbelt profile on a host that is not macOS")
+            try:
+                text = c.read_file(spec.profile, PROFILE_CAP).decode("utf-8")
+            except UnicodeDecodeError:
+                raise Refused("profile-unreadable", "not UTF-8") from None
+            check_profile_text(text)
+        c.chdir(spec.cwd)
+        path = _resolve(argv[0], env, c) if spec.resolve else argv[0]
+        if spec.profile is not None:
+            path, argv = SANDBOX_EXEC, [SANDBOX_EXEC, "-f", spec.profile, path] + argv[1:]
+        _close_fds(frozenset({0, 1, 2}) | frozenset(spec.keep_fds), c)
+        c.execve(path, argv, env)
+    except Refused as e:
+        _say(err, f"levain wall: refused {e.name}" + (f": {e.detail}" if e.detail else ""))
+        return STAGE_EXIT
+    except Exception as e:   # anything unforeseen: still no exec. The type and errno only: never a value.
+        code = getattr(e, "errno", None)
+        _say(err, f"levain wall: refused stage-error: {type(e).__name__}" + (f" errno {code}" if code else ""))
+        return STAGE_EXIT
+    return STAGE_EXIT
+
+
+def _say(err, line: str) -> None:
+    try:
+        (err or sys.stderr).write(line + "\n")
+        (err or sys.stderr).flush()
+    except Exception:
+        pass
+
+
+def exec_launch(argv: Sequence[str], spec_read_fd: int, *, cgroup: Optional[str] = None,
+                os_calls: Optional[OsCalls] = None) -> None:
+    """The forked root child's half (the runtime helper calls it after ``fork``): put the spec pipe's read end
+    on :data:`SPEC_FD`; on Linux join ``cgroup`` and PROVE it (``/proc/self/cgroup``) — the cgroup is the
+    kill domain END and §5.6 rely on, so a process outside it is never started; then exec the launch argv
+    with an empty env (every hop reads its own: the stage parses the env file). Raises on any failure; the
+    child then exits without exec. The parent writes :meth:`Spec.to_json` to the pipe's write end and
+    closes it; it never holds the lease fd (§3.1)."""
+    c = os_calls or real_os_calls()
+    if spec_read_fd != SPEC_FD:
+        c.dup2(spec_read_fd, SPEC_FD)
+        c.close(spec_read_fd)
+    c.set_inheritable(SPEC_FD, True)
+    if cgroup is not None:
+        c.write_file(f"{cgroup}/cgroup.procs", f"{c.getpid()}\n")
+        want = "0::" + cgroup[len("/sys/fs/cgroup"):]
+        if want not in c.read_text("/proc/self/cgroup").splitlines():
+            raise Refused("cgroup-not-joined", cgroup)
+    c.execve(argv[0], list(argv), {})
+
+
+def main(argv: Sequence[str]) -> int:
+    if len(argv) != 2 or argv[0] != "--spec-fd" or not re.fullmatch(r"[3-9]|[1-9][0-9]{1,3}", argv[1]):
+        _say(None, "levain wall: refused bad-token: usage: --spec-fd N")
+        return STAGE_EXIT
+    return stage_main(int(argv[1]))
+
+
+if __name__ == "__main__":
+    os._exit(main(sys.argv[1:]))
+
+
+__all__ = ["FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
+           "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
+           "drop_and_assert", "exec_launch", "expected_slot_rules", "launch_spec", "linux_launch_argv",
+           "linux_view_args", "macos_egress_ready", "macos_launch_argv", "module_argv", "parse_env", "parse_spec",
+           "pf_printed", "principal", "read_host_links", "read_netns_names", "real_os_calls", "require_netns",
+           "stage_argv", "stage_main", "target_account"]
