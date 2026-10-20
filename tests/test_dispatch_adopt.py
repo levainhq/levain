@@ -756,3 +756,17 @@ def test_a_finisher_whose_cas_moved_the_branch_says_so_when_another_recorded_it(
     monkeypatch.setattr(adopt, "_after_cas", lambda: adopt._finish(jstore, stale, recs))   # B, inside A's window
     out = adopt._finish(jstore, stale, recs)
     assert out.outcome == "adopted" and out.moved and recs[0].staged_commit in out.message
+
+
+def test_a_cancel_after_this_lands_cas_reports_the_move(jstore, cstore, repo, log, keys, tmp_path, monkeypatch):
+    # the codex-1 known edge: a human cancel wins between the CAS and the adopted write; the move is said, flagged
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    monkeypatch.setattr(adopt, "_after_cas", lambda: jstore._transition(job.id, "cancelled", "human_cancel"))
+    out = adopt._finish(jstore, stale, recs)
+    assert out.outcome == "refused" and out.moved and "git revert" in out.message
+    assert git(repo[0], "rev-parse", "main") == recs[0].staged_commit

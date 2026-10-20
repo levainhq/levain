@@ -850,12 +850,13 @@ def _settled(store: JobStore, job: Job, *, landed: str | None = None) -> Landing
         return Landing(outcome="adopted", job=again, message="another land adopted this job")
     note = (f"; this land had already moved the branch to {landed}: revert it with `git revert` if it is unwanted"
             if landed else "")
+    moved = bool(landed)
     if again.state == "failed" and again.history[-1].cause == "base_moved":
-        return Landing(outcome="failed", job=again, message="another land found the base moved" + note)
+        return Landing(outcome="failed", job=again, moved=moved, message="another land found the base moved" + note)
     if again.state == "authorised":
-        return Landing(outcome="refused", job=again, message="the job was authorised by another land; run land "
-                                                             "again to finish it" + note)
-    return Landing(outcome="refused", job=again, message=f"the job is {again.state}" + note)
+        return Landing(outcome="refused", job=again, moved=moved,
+                       message="the job was authorised by another land; run land again to finish it" + note)
+    return Landing(outcome="refused", job=again, moved=moved, message=f"the job is {again.state}" + note)
 
 
 def _move(store: JobStore, job: Job, to: str, cause: str, evidence: str) -> Job | None:
