@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.10] — 2026-10-20
+
 ### Added
 - **Context meter in the Sessions view.** Each Claude Code and Codex session shows how much context it holds now ("context
   142K"; Codex "context 80K of 258K"), and says when it passes 200K (a fixed warn line, not the model's window). Read from
