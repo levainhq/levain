@@ -9,6 +9,8 @@ TIOCSTI) is row 2g's.
 """
 from __future__ import annotations
 
+import faulthandler
+import functools
 import json
 import os
 import signal
@@ -18,12 +20,40 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
 from levain.slot import Refused
 from levain.slot import supervisor as SV
 from levain.slot.stage import make_bundle
+
+
+class Hung(BaseException):
+    """A test past its bound. BaseException, not TimeoutError: TimeoutError is an OSError, which the supervisor
+    catches (``refused os-error``) and would turn a hang into a plain return."""
+
+
+def bounded(seconds: float) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """A hang FAILS within ``seconds`` instead of wedging the suite, with the stdlib alone (CI has no pytest-timeout):
+    SIGALRM raises :class:`Hung` in the test (the main thread), and faulthandler dumps every thread and exits the
+    process 30 s later should the test's own cleanup hang too. POSIX only, as these pty tests are."""
+    def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            def hung(signum: int, frame: Any) -> None:
+                raise Hung(f"{fn.__name__} did not finish within {seconds:g} s")
+            old = signal.signal(signal.SIGALRM, hung)
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            faulthandler.dump_traceback_later(seconds + 30, exit=True)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                faulthandler.cancel_dump_traceback_later()
+                signal.signal(signal.SIGALRM, old)
+        return run
+    return wrap
 
 SESSION = "s-0123456789abcdef"
 
@@ -273,7 +303,7 @@ def test_start_output_reaches_the_terminal_filtered(tmp_path: Path, monkeypatch:
     assert "hello ☕ done".encode() in out.replace(b"\r", b"")   # a UTF-8 char split across two writes, intact
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_large_paste_while_the_vendor_writes_does_not_deadlock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                ) -> None:
     n = 300_000
@@ -283,7 +313,7 @@ def test_large_paste_while_the_vendor_writes_does_not_deadlock(tmp_path: Path, m
     assert f"got={n}".encode() in rig.out.read_bytes()
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_operator_input_is_not_starved_by_streaming_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Input reaches a vendor whose output never stops. NOT a guard on same-pass starvation (a `continue` after the
     # master read stays green here: the reader outpaces this writer); that shape is held by the loop's structure.

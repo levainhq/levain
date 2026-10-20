@@ -16,7 +16,7 @@ import pytest
 
 from levain.slot import supervisor as SV
 from tests.test_slot_s2fx5_relay_exit import FX5_HELPER, closing, drain, stalled
-from tests.test_slot_s2s_supervisor import Rig, isolated_git  # noqa: F401
+from tests.test_slot_s2s_supervisor import Rig, bounded, isolated_git  # noqa: F401
 from tests.test_slot_s2fx3_supervisor import rig as fx3_rig
 
 FX6_HOOKS = r'''
@@ -58,7 +58,7 @@ def no_ctty(r: Rig) -> None:
 
 # --- r4-1: a stop signal that ended the relay is honoured by the final drain ------------------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_stop_signal_abandons_the_rest_at_once_on_a_terminal_that_trickles(tmp_path: Path,
                                                                             monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(SV, "FINAL_DRAIN_MAX_S", 8.0)
@@ -100,7 +100,7 @@ def test_stop_signal_abandons_the_rest_at_once_on_a_terminal_that_trickles(tmp_p
 
 # --- r4-2: a master still written after the helper exited is read for a bounded time ---------------------------------
 
-@pytest.mark.timeout(30)
+@bounded(30)
 def test_a_process_left_writing_after_the_helper_exited_does_not_hold_the_relay(tmp_path: Path,
                                                                                 monkeypatch: pytest.MonkeyPatch
                                                                                 ) -> None:
@@ -133,7 +133,7 @@ def test_a_process_left_writing_after_the_helper_exited_does_not_hold_the_relay(
 
 # --- r4-3: the after-exit cap admits only the room left, and counts the rest ------------------------------------------
 
-@pytest.mark.timeout(30)
+@bounded(30)
 def test_after_exit_cap_holds_to_the_byte_and_counts_the_excess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                  ) -> None:
     monkeypatch.setattr(SV, "_OUTPUT_MAX", 64)
@@ -157,7 +157,7 @@ def test_after_exit_cap_holds_to_the_byte_and_counts_the_excess(tmp_path: Path, 
 
 # --- r4-4: "run `reset`" is not said to a terminal that is gone -------------------------------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_reset_advice_is_folded_into_the_failure_line_when_stdout_failed(tmp_path: Path,
                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="modesbig", FAKE_CHUNKS="2", FAKE_CHUNK="65536")

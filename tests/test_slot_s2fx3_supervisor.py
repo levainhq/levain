@@ -26,7 +26,8 @@ from levain.slot import Refused
 from levain.slot import launch as L
 from levain.slot import supervisor as SV
 from levain.slot.supervisor import TermFilter
-from tests.test_slot_s2s_supervisor import FAKE_HELPER, SESSION, Rig, _docs, _plant, isolated_git, make_repo  # noqa: F401
+from tests.test_slot_s2s_supervisor import (FAKE_HELPER, SESSION, Rig, _docs, _plant, bounded,  # noqa: F401
+                                          isolated_git, make_repo)
 
 HOOKS = r'''
 hang = os.environ.get("FAKE_HANG", "")
@@ -131,7 +132,7 @@ def _spawn_failing(r: Rig, verb: str, exc: BaseException, started: list) -> None
     r.seams.spawn = spawn
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_teardown_helper_unrunnable_is_named_and_start_still_ends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                   ) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="wait")
@@ -146,7 +147,7 @@ def test_teardown_helper_unrunnable_is_named_and_start_still_ends(tmp_path: Path
     assert r.calls[-1] == ("close",)
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_teardown_raising_anything_still_ends_start_and_closes_the_pty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                        ) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="wait")
@@ -201,7 +202,7 @@ def test_launch_main_names_a_refusal_or_os_failure_from_the_run() -> None:
 
 # --- g4-2: a hung helper is ended by a stop signal or its deadline ----------------------------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_stop_signal_ends_a_hung_render_then_tears_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_HANG="render")
     r.seams.helper_deadline_s = {"render": 20.0}      # a broken stop path then shows as helper-timeout, not a hang
@@ -216,7 +217,7 @@ def test_stop_signal_ends_a_hung_render_then_tears_down(tmp_path: Path, monkeypa
     assert r.calls[-1] == ("close",)
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_deadline_ends_a_helper_deaf_to_sigterm_with_sigkill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_HANG="render", FAKE_DEAF="1")
     r.seams.helper_deadline_s = {"render": 1.0}
@@ -227,7 +228,7 @@ def test_deadline_ends_a_helper_deaf_to_sigterm_with_sigkill(tmp_path: Path, mon
     assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "teardown"]
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_a_hung_teardown_is_bounded_and_says_the_session_stays_leased(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                       ) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_HANG="teardown")
@@ -237,7 +238,7 @@ def test_a_hung_teardown_is_bounded_and_says_the_session_stays_leased(tmp_path: 
     assert gone(pid_of(r, "teardown"))
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_teardown_after_a_stop_is_not_cut_short_by_that_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # The first SIGTERM ends the session; teardown, which runs after it, must still run to its answer.
     r = rig(tmp_path, monkeypatch, FAKE_START="wait")
@@ -248,7 +249,7 @@ def test_teardown_after_a_stop_is_not_cut_short_by_that_stop(tmp_path: Path, mon
 
 # --- g4-3: a terminal that is not reading never stalls the relay or teardown -----------------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_stalled_terminal_does_not_block_a_stop_or_teardown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="forever")
     r.seams.start_grace_s = 1.0
@@ -269,7 +270,7 @@ def test_stalled_terminal_does_not_block_a_stop_or_teardown(tmp_path: Path, monk
     assert re.search(r"your terminal did not take the session's last \d+ bytes", err)
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_a_slow_terminal_gets_every_byte(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     n = 4 << 20                              # past the output cap: the master waits, nothing is dropped
     r = rig(tmp_path, monkeypatch, FAKE_START="big", FAKE_BIG=str(n))
@@ -295,7 +296,7 @@ def test_a_slow_terminal_gets_every_byte(tmp_path: Path, monkeypatch: pytest.Mon
     assert got.count(b"Q") == n
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_input_still_reaches_the_vendor_while_his_terminal_is_stalled(tmp_path: Path,
                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
     # The terminal takes nothing until the vendor has seen the operator's key: a relay blocked in a write to it
@@ -401,7 +402,7 @@ def test_supervisor_resets_passed_modes_when_the_session_ends(tmp_path: Path, mo
     assert out.endswith(b"\x1b[?1000;1004;1006l")
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_modes_are_reset_on_a_stop_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="wait")
     r.helper.write_text(FX3_HELPER.replace('open(os.path.join(store, "started"), "w").close()\n        while not',
@@ -472,7 +473,7 @@ def test_malformed_prepare_answer_is_refused_and_left_to_the_lease_close(tmp_pat
 
 # --- g4-9: the relay ends on the helper's exit whatever stdin does; `start` is TERMed, KILLed, reaped -------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_relay_ends_when_the_helper_exits_though_the_operator_keeps_typing(tmp_path: Path,
                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch)
@@ -496,7 +497,7 @@ def test_relay_ends_when_the_helper_exits_though_the_operator_keeps_typing(tmp_p
     assert "claude exited 3" in r.stderr()
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_relay_ends_on_the_drained_master_when_no_hangup_comes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                ) -> None:
     # With the helper as the pty's session leader, its exit hangs the pty up and the master reads EIO. Without a
@@ -522,7 +523,7 @@ def test_relay_ends_on_the_drained_master_when_no_hangup_comes(tmp_path: Path, m
     assert time.monotonic() - t0 < 30
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_start_deaf_to_every_signal_is_killed_and_reaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="immortal")
     r.seams.start_grace_s = 0.5

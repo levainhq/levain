@@ -14,7 +14,7 @@ import pytest
 
 from levain.slot import supervisor as SV
 from tests.test_slot_s2fx3_supervisor import FX3_HELPER, gone, rig as fx3_rig, stop_when  # noqa: F401
-from tests.test_slot_s2s_supervisor import SESSION, Rig, isolated_git  # noqa: F401
+from tests.test_slot_s2s_supervisor import SESSION, Rig, bounded, isolated_git  # noqa: F401
 
 FX5_HOOKS = r'''
     if mode in ("trickle", "modesbig"):
@@ -74,7 +74,7 @@ def closing(*fds: int) -> None:
 
 # --- r3-C1: the vendor exited, the master is drained, his terminal is stalled: straight to the bounded drain ----------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_vendor_exit_with_a_stalled_terminal_goes_to_the_bounded_drain_and_teardown(tmp_path: Path,
                                                                                     monkeypatch: pytest.MonkeyPatch
                                                                                     ) -> None:
@@ -96,7 +96,7 @@ def test_vendor_exit_with_a_stalled_terminal_goes_to_the_bounded_drain_and_teard
     assert left >= 4 * 65536                 # all of it was still held, and all of it is counted
 
 
-@pytest.mark.timeout(30)
+@bounded(30)
 def test_master_past_the_cap_is_still_read_once_the_helper_exited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                    ) -> None:
     # The buffer is full and his terminal stalled when the helper exits with more (and `start`'s line) in the pty:
@@ -122,7 +122,7 @@ def test_master_past_the_cap_is_still_read_once_the_helper_exited(tmp_path: Path
     assert re.search(r"your terminal did not take the session's last \d+ bytes", err)
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_a_slow_terminal_that_keeps_taking_bytes_keeps_the_final_drain(tmp_path: Path,
                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     # Bounded on a terminal taking NOTHING, not on the clock: one that is slow but reading gets every byte.
@@ -155,7 +155,7 @@ def test_a_slow_terminal_that_keeps_taking_bytes_keeps_the_final_drain(tmp_path:
 
 # --- r3-C2: the reset gets its own attempt after the drain gave up, and says so last when not taken ------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_reset_is_sent_after_the_abandoned_rest_led_by_can(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="modesbig", FAKE_CHUNKS="2", FAKE_CHUNK="65536")
     out_r, out_w = stalled()
@@ -179,7 +179,7 @@ def test_reset_is_sent_after_the_abandoned_rest_led_by_can(tmp_path: Path, monke
     assert "run `reset`" not in err
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_reset_not_taken_is_said_on_the_runs_last_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="modesbig", FAKE_CHUNKS="1", FAKE_CHUNK="600")
     out_r, out_w = stalled()
@@ -198,7 +198,7 @@ def test_reset_not_taken_is_said_on_the_runs_last_line(tmp_path: Path, monkeypat
 
 # --- r3-C3: held status lines are released bounded and non-blocking, with a count -------------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_held_status_lines_never_block_the_runs_return(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch)
     err_r, err_w = stalled()                 # his stderr is the stalled one this time
@@ -219,7 +219,7 @@ def test_held_status_lines_never_block_the_runs_return(tmp_path: Path, monkeypat
     assert r.calls[-1] == ("close",)         # the lease closed before the held lines were tried
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_held_lines_a_resumed_stderr_takes_are_written_with_none_counted(tmp_path: Path,
                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
     r = rig(tmp_path, monkeypatch)
@@ -247,7 +247,7 @@ def test_held_lines_a_resumed_stderr_takes_are_written_with_none_counted(tmp_pat
 
 # --- r3-C4: a stdout that refuses a write ends the relay into teardown, its loss counted -------------------------------
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_stdout_error_mid_session_ends_the_relay_into_teardown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                ) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="forever")
@@ -267,7 +267,7 @@ def test_stdout_error_mid_session_ends_the_relay_into_teardown(tmp_path: Path, m
     assert f"session {SESSION} ended RETAINED" in err
 
 
-@pytest.mark.timeout(60)
+@bounded(60)
 def test_stdout_gone_during_the_final_drain_is_counted_not_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                                 ) -> None:
     r = rig(tmp_path, monkeypatch, FAKE_START="modesbig", FAKE_CHUNKS="2", FAKE_CHUNK="65536")
