@@ -170,8 +170,9 @@ def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.
 def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
     """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
     an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
-    one cannot be released, the new one is given back and the old token stays recorded: a re-run holds
-    one reference, never two, and never one with no record."""
+    one cannot be released, the new one is given back and the old token stays recorded, so a re-run that
+    completes holds one recorded reference. A crash between ``-E`` and the token write leaves one reference
+    with no record; pf then stays enabled, which is the fail-closed side (known edge)."""
     old, note = _read_token(token_path)
     r = run([PFCTL, "-E"], capture_output=True, text=True)
     if r.returncode != 0:
