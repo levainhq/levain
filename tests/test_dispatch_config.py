@@ -572,3 +572,149 @@ def test_the_confirm_summary_shows_the_head_it_builds_on(capsys, ddir, root, key
     assert code == 0, out
     summary = out[out.index("---- you are about to accept"):]
     assert f"builds on   generation {top}, {head}" in summary, summary
+
+
+# --- fix round 2 ------------------------------------------------------------------------------------------------------
+
+def _move(ddir, root, keys, tmp_path, name="moved"):
+    """Another item accepted into the store, as a second terminal would: the head moves by one."""
+    d = tmp_path / name
+    d.mkdir()
+    changed = dict(VERIFIERS)
+    changed.pop("pytest-ip", None)
+    item, sig = _elsewhere(ddir, root, keys, d, "verifiers", changed)
+    with open(item, "rb") as fh:
+        raw = fh.read()
+    with open(sig) as fh:
+        store(ddir, root).accept(raw, fh.read())
+
+
+def _touches(monkeypatch):
+    calls = []
+    real = dcli._sign_bytes
+
+    def counted(sign, message):
+        calls.append(message)
+        return real(sign, message)
+
+    monkeypatch.setattr(dcli, "_sign_bytes", counted)
+    return calls
+
+
+def test_sign_refuses_before_the_touch_when_the_store_moved_during_the_question(capsys, ddir, root, keys, tmp_path,
+                                                                                 monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    touches = _touches(monkeypatch)
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: _move(ddir, root, keys, tmp_path) or "y")
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    assert code == 2 and "the store moved to generation 4 while you were confirming; nothing was signed" in out, out
+    assert touches == [] and store(ddir, root).generation() == 4
+
+
+def test_accept_refuses_when_the_store_moved_during_the_question(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: _move(ddir, root, keys, tmp_path) or "y")
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig)
+    assert code == 2 and "the store moved to generation 4 while you were confirming; nothing was accepted" in out, out
+    assert store(ddir, root).generation() == 4
+
+
+def test_a_refusal_at_accept_after_the_touch_says_the_signature_is_spent(capsys, ddir, root, keys, tmp_path,
+                                                                        monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+
+    def refused(self, item, signature):
+        raise ctl.ConfigRefused("the head moved under the item")
+
+    monkeypatch.setattr(ctl.ControlStore, "accept", refused)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    assert code == 2, out
+    assert ("signed but not accepted: the head moved under the item; this signature cannot be used, re-run config "
+            "sign") in out, out
+
+
+def test_a_signer_fault_reads_the_generation_again(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+
+    def moved_then_faulted(sign_, message):
+        _move(ddir, root, keys, tmp_path)
+        raise dcli.SignerUnavailable("ssh-keygen timed out")
+
+    monkeypatch.setattr(dcli, "_sign_bytes", moved_then_faulted)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    assert code == 3 and "the store is now generation 4 (was 3)" in out, out
+    assert "still 3" not in out
+
+    def unreadable_then_faulted(sign_, message):
+        (ddir / ctl.DB_NAME).write_bytes(b"this is not a database" * 100)
+        raise dcli.SignerUnavailable("ssh-keygen timed out")
+
+    monkeypatch.setattr(dcli, "_sign_bytes", unreadable_then_faulted)
+    code, out, _ = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--yes")
+    assert code == 3 and "nothing was signed" in out and "could not be read again" in out, out
+    assert "still" not in out
+
+
+def test_accept_shows_the_head_check_judged(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    configure(capsys, ddir, root, keys, tmp_path)
+    item, sig = _elsewhere(ddir, root, keys, tmp_path, "verifiers", VERIFIERS)
+    real = ctl.ControlStore.check
+
+    def checked_then_moved(self, item_, signature):
+        parsed = real(self, item_, signature)
+        _move(ddir, root, keys, tmp_path)
+        return parsed
+
+    monkeypatch.setattr(ctl.ControlStore, "check", checked_then_moved)
+    code, out, _ = accept_cli(capsys, ddir, root, item, sig, "--yes")
+    assert code == 2 and "the store moved to generation 4 after the item was checked; nothing was accepted" in out, out
+    assert "the item" not in out.split("refused")[0]      # nothing was shown from the second read
+
+
+def _no_cockpit_reply(ddir, repo, data_root=None):
+    from levain.dispatch import mcp
+    path, base = repo
+    sub = submission(path, base, expires_at=utc_stamp(datetime.now(timezone.utc) + timedelta(hours=2)))
+    reply = mcp.handle("codex", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                 "params": {"name": "dispatch_file", "arguments": {"contract": sub}}},
+                       directory=ddir, data_root=data_root)
+    result = reply["result"]
+    assert result["isError"], result
+    return result["content"][0]["text"]
+
+
+def test_the_mcp_doors_cockpit_refusal_names_who_named_the_cockpit(capsys, ddir, root, keys, tmp_path, repo):
+    configure(capsys, ddir, root, keys, tmp_path)
+    empty = tmp_path / "no-cockpit"
+    empty.mkdir()
+    text = _no_cockpit_reply(ddir, repo, data_root=empty)
+    assert "the --data-root flag" in text and "consent hooks" not in text and str(empty) in text, text
+    text = _no_cockpit_reply(ddir, repo)
+    assert "consent hooks" in text and "--data-root" not in text, text
+
+
+def test_json_with_a_terminal_keeps_the_prompt_off_stdout(capsys, ddir, root, keys, tmp_path, monkeypatch):
+    import sys
+    init(capsys, ddir, root, keys)
+    monkeypatch.setattr(dcli, "_is_tty", lambda: True)
+
+    def real_input(prompt=""):
+        # what input() does: the prompt goes to stdout
+        sys.stdout.write(prompt)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", real_input)
+    code, out, err = sign(capsys, ddir, root, keys, tmp_path, "verifiers", VERIFIERS, "--json")
+    assert code == 0, out
+    assert json.loads(out)["generation"] == 1
+    assert "[y/N]" in err
+
+
+def test_the_item_view_escapes_every_field_as_the_body_is_escaped():
+    lines, _ = dcli._item_view("verifiersм", 2, "abcм", "abc", "sha256:м", {"k": "м"}, None)
+    text = "\n".join(lines)
+    assert text.isascii(), text
+    assert "verifiers\\u043c" in text and "abc\\u043c" in text and "sha256:\\u043c" in text

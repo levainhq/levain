@@ -47,7 +47,12 @@ builds on (generation and digest). ``config show`` writes every non-ASCII charac
 Known edges: a read path made of homoglyphs shows as the path it imitates (a write path is bounded by the operator's
 template, so only what is read can be dressed up). ``file`` reports a template the active configuration refuses (one
 that no longer loads, or whose verifier no longer agrees) as a refusal, exit 2. The configuration is read once per
-filing, so a configuration item accepted while a filing resolves applies to the next filing, not that one.
+filing, so a configuration item accepted while a filing resolves applies to the next filing, not that one. An
+idempotent ``file`` retry after a configuration change resolves through the new configuration, so it can refuse or
+differ: it needs a lost response and an accepted change inside the retry window, and the job and its kept capability
+survive, so nothing is lost (10-19). The MCP door returns a store fault's text (paths, database words) to the planner,
+which runs as the same OS user and can read those paths already; S1 changes the principal (10-19). ``levain update``
+re-adds a hand-deleted ``levain_dispatch`` entry to the workspace ``.mcp.json``, the same rule as the band (10-19).
 """
 from __future__ import annotations
 
@@ -431,11 +436,20 @@ def _confirm(args: argparse.Namespace, job: Job, what: str, out: Any) -> None:
                            f"`levain dispatch {what} {job.id}` in your own terminal")
     print("\n".join(confirm_summary(job, what)), file=sys.stderr if args.json else out, flush=True)
     try:
-        answer = input(f"{what} this job? [y/N] ")
+        answer = _ask(args, f"{what} this job? [y/N] ")
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
         raise InputRefused(f"not confirmed; nothing was done and job {job.id} is unchanged")
+
+
+def _ask(args: argparse.Namespace, prompt: str) -> str:
+    """The operator's answer to ``prompt``; under ``--json`` the prompt goes to stderr, so stdout stays one JSON
+    document."""
+    if not args.json:
+        return input(prompt)
+    print(prompt, end="", file=sys.stderr, flush=True)
+    return input("")
 
 
 def _authority(args: argparse.Namespace, store: JobStore) -> Any:
@@ -464,8 +478,11 @@ def _authority_source(directory: Path, data_root: Path | None) -> Any:
                                  f"the dispatch directory name, and they name {named}; {fix}")
         root = roots[0]
     if not (root / "cockpit.db").is_file():
+        named_by = "the --data-root flag" if data_root is not None else "the consent hooks"
         raise CockpitUnnamed(f"{root} holds no cockpit (no cockpit.db); name the cockpit data root with --data-root",
-                             f"the cockpit the consent hooks name ({root}) holds no cockpit.db; {fix}")
+                             f"the cockpit {named_by} name{'s' if data_root is not None else ''} ({root}) holds no "
+                             f"cockpit.db; " + (fix if data_root is None else "the operator names a cockpit data root "
+                                                "that holds one. A planner cannot fix this"))
     return authority_source(root / "cockpit.db", anchor=anchor_path(root))
 
 
@@ -603,9 +620,11 @@ def _item_view(kind: str, generation: int, item_store: str, store_id: str, prev:
     """The item as shown before it is signed or accepted, in a fixed shape (kind, generation, store, prev, then the
     body as a unified diff against the active body of its kind, or in full under "new kind"), and a one-line count
     of the change for the summary above the prompt."""
-    store_line = item_store if item_store == store_id else f"{item_store} (NOT this store, {store_id})"
+    shown_store = _ascii(item_store)
+    store_line = shown_store if item_store == store_id else f"{shown_store} (NOT this store, {_ascii(store_id)})"
+    kind = _ascii(kind)
     lines = ["levain dispatch config: the item", f"  kind        {kind}", f"  generation  {generation}",
-             f"  store       {store_line}", f"  prev        {prev or '(none: the first item)'}"]
+             f"  store       {store_line}", f"  prev        {_ascii(prev) or '(none: the first item)'}"]
     new = _pretty(body)
     if active is None:
         lines.append(f"  new kind: no {kind} item is active; its body in full:")
@@ -635,13 +654,13 @@ def _confirm_item(args: argparse.Namespace, verb: str, kind: str, generation: in
     if not _is_tty():
         raise InputRefused(f"config {verb} asks y/N on the operator's terminal and this process has none; run "
                            f"`levain dispatch config {verb}` in your own terminal")
-    print("\n".join([f"---- you are about to {verb} a configuration item ----", f"  kind        {kind}",
+    print("\n".join([f"---- you are about to {verb} a configuration item ----", f"  kind        {_ascii(kind)}",
                      f"  generation  {generation} (the store is at {top})", f"  store       {store_id}",
                      f"  builds on   generation {top}, {head or '(none: the store is empty)'}",
                      f"  change      {change} (in full above)"]),
           file=sys.stderr if args.json else out, flush=True)
     try:
-        answer = input(f"{verb} {kind} as generation {generation}? [y/N] ")
+        answer = _ask(args, f"{verb} {_ascii(kind)} as generation {generation}? [y/N] ")
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
@@ -661,6 +680,26 @@ def _config_not_done(store: dctl.ControlStore, top: int) -> str:
         return f"nothing was accepted; generation is still {top}"
     return (f"the configuration is now generation {now} (was {top}); the store faulted, so whether this item is the "
             "one accepted is not known: read it with `levain dispatch config show`")
+
+
+def _head_unmoved(store: dctl.ControlStore, top: int, head: str, when: str, done: str) -> None:
+    """Refuse when the verified head is no longer generation ``top`` with digest ``head``: what the operator saw
+    (or what was judged) is not what the store holds now."""
+    now, now_head = _verified(store)[1:]
+    if (now, now_head) != (top, head):
+        raise InputRefused(f"the store moved to generation {now} {when}; nothing was {done}, re-run")
+
+
+def _sign_fault_not_done(store: dctl.ControlStore, top: int, head: str) -> str:
+    """What a ``config sign`` whose signer faulted did NOT do, with the head read again."""
+    try:
+        now, now_head = _verified(store)[1:]
+    except (*_FAULTS, DispatchError):
+        return ("nothing was signed or accepted; the generation could not be read again: read it with "
+                "`levain dispatch config show`")
+    if (now, now_head) == (top, head):
+        return f"nothing was signed or accepted; generation is still {top}"
+    return f"nothing was signed or accepted; the store is now generation {now} (was {top})"
 
 
 def _accept_guarded(store: dctl.ControlStore, item: bytes, signature: str, top: int) -> dctl.ConfigItem:
@@ -774,11 +813,16 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
             raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only the "
                                "root's signature is accepted. Nothing was signed")
         _confirm_item(args, "sign", args.kind, top + 1, sid, change, top, head, out)
+        _head_unmoved(store, top, head, "while you were confirming", "signed")
         try:
             signature = _sign_bytes(sign, item)
         except SignerUnavailable as exc:
-            raise _NotDone(exc, f"nothing was signed or accepted; generation is still {top}") from exc
-        accepted = _accept_guarded(store, item, signature, top)
+            raise _NotDone(exc, _sign_fault_not_done(store, top, head)) from exc
+        try:
+            accepted = _accept_guarded(store, item, signature, top)
+        except dctl.ConfigRefused as exc:
+            raise dctl.ConfigRefused(f"signed but not accepted: {exc}; this signature cannot be used, re-run config "
+                                     "sign") from None
     else:   # accept
         raw = _read_input(args.item, dctl.ITEM_MAX_BYTES, "configuration item")
         try:
@@ -791,11 +835,16 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
         # the question; accept judges again in its write transaction
         parsed = store.check(raw, signature)
         items, top, head = _verified(store)
+        # the view shows the head check judged against, or nothing
+        if (top, head) != (parsed.generation - 1, parsed.prev):
+            raise InputRefused(f"the store moved to generation {top} after the item was checked; nothing was "
+                               "accepted, re-run")
         sid = store.store_id()
         lines, change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
                                    items.get(parsed.kind))
         print("\n".join(lines), file=view_out, flush=True)
         _confirm_item(args, "accept", parsed.kind, parsed.generation, sid, change, top, head, out)
+        _head_unmoved(store, top, head, "while you were confirming", "accepted")
         accepted = _accept_guarded(store, raw, signature, top)
     emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest},
          f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}.")
