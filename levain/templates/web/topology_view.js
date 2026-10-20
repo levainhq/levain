@@ -426,6 +426,7 @@
   const MIN_H = 540;
   const RING_H = [0.2, 0.34];
   const PARTICLE_CAP = 1500;
+  const EDGE_STEP_MAX = 8;                 // particles one edge may spawn in one step (the cap above takes the rest of the way)
   let ticker = null;                       // the one interval that keeps run times honest between repaints (no repaint, no signature change)
   let streamStop = null;                   // stops the one particle loop
 
@@ -483,7 +484,7 @@
     const H = Math.max(MIN_H, Math.round(70 + Math.max(need("L"), need("R"))));
     const hub = { x: LW / 2, y: H / 2 + 6, r: 30 };
     const gx0 = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
-    const pos = {}, gpos = {};
+    const pos = new Map(), gpos = new Map();               // keyed by wire id in a Map: an id such as "__proto__" is an id
     const placed = new Set();
     for (const sd of ["L", "R"]) {
       const dir = sd === "L" ? -1 : 1, list = side[sd], gaps = gapOf(list);
@@ -495,18 +496,18 @@
           if (placed.has(n.id)) return;
           placed.add(n.id);
           const x = hub.x + dir * (gx0 + 120) - dir * Math.min(30 * depth, 90);
-          pos[n.id] = { id: n.id, x, y, side: dir, depth }; ys.push(y); y += pitch;
+          pos.set(n.id, { id: n.id, x, y, side: dir, depth }); ys.push(y); y += pitch;
           for (const k of mine) if (k.parent === n.id) put(k, depth + 1);
         };
         for (const n of mine) if (!n.parent || !ids.has(n.parent)) put(n, 0);
         for (const n of mine) put(n, 0);                 // a parent cycle has no root: the rest sit at the column's own level
         const gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
-        gpos[g.id === null ? "" : g.id] = { id: g.id, label: g.label, x: hub.x + dir * gx0, y: gy, r: 16 };
+        gpos.set(g.id === null ? "" : g.id, { id: g.id, label: g.label, x: hub.x + dir * gx0, y: gy, r: 16 });
         y += 26;
       }
     }
     for (const n of nodes) {
-      const f = faceOf(n, v.as_of), p = pos[n.id];
+      const f = faceOf(n, v.as_of), p = pos.get(n.id);
       let w = Math.max(measure(f.l1, "l1"), measure(f.l2, "l2"), measure(f.l3, "l2"));
       if (f.tag) w = Math.max(w, measure(f.tag, "tag") + 16);
       p.tw = w + 6;
@@ -531,12 +532,11 @@
     for (const n of arr(v.nodes)) { const k = L.gkey(n); gRate.set(k, (gRate.get(k) || 0) + (streams(n) ? n.rate : 0)); }
     const out = [];
     let i = 0;
-    for (const k of Object.keys(L.gpos)) {
-      const gp = L.gpos[k];
+    for (const [k, gp] of L.gpos) {
       out.push({ kind: "hub", id: k, rate: gRate.get(k) || 0, state: null, e: mkEdge({ x: gp.x, y: gp.y }, { x: L.hub.x, y: L.hub.y }, (gp.x < L.hub.x ? -1 : 1) * 0.1 * (i++ % 2 ? 1 : -1)) });
     }
     for (const n of arr(v.nodes)) {
-      const a = L.pos[n.id], to = n.parent && L.pos[n.parent] && byId.has(n.parent) ? L.pos[n.parent] : L.gpos[L.gkey(n)];
+      const a = L.pos.get(n.id), to = n.parent && L.pos.has(n.parent) && byId.has(n.parent) ? L.pos.get(n.parent) : L.gpos.get(L.gkey(n));
       out.push({ kind: "node", id: n.id, rate: streams(n) ? n.rate : 0, state: n.state, e: mkEdge({ x: a.x, y: a.y }, { x: to.x, y: to.y }, 0.12 * (a.y < to.y ? 1 : -1)) });
     }
     return out;
@@ -548,17 +548,17 @@
     const nodes = arr(v.nodes), running = nodes.filter((n) => n.state === "running").length, h = L.hub;
     const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " \u00b7 " + running + " running";
     const hw = Math.max(measure(hsub, "l2"), 70);
-    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42, hw + 14, 40), hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: {}, faces: {}, rings: [] };
-    for (const k of Object.keys(L.gpos)) {
-      const gp = L.gpos[k], mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
+    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42, hw + 14, 40), hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: new Map(), faces: new Map(), rings: [] };
+    for (const [k, gp] of L.gpos) {
+      const mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
       const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
       const lw = Math.max(measure(gp.label, "group"), measure(sub, "l2")), ly = gp.y + gp.r + 18;
-      out.groups[k] = { sub, ly, rect: box(gp.x - lw / 2 - 7, ly - 14, lw + 14, 36) };
+      out.groups.set(k, { sub, ly, rect: box(gp.x - lw / 2 - 7, ly - 14, lw + 14, 36) });
     }
     for (const n of nodes) {
-      const P = L.pos[n.id], f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting";
+      const P = L.pos.get(n.id), f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting";
       const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 66 : 50, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
-      out.faces[n.id] = box(bx, P.y - (f.tag ? 30 : 13), bw, bh);
+      out.faces.set(n.id, box(bx, P.y - (f.tag ? 30 : 13), bw, bh));
       out.rings.push(box(P.x - 17, P.y - 17, 34, 34));
     }
     return out;
@@ -578,14 +578,14 @@
   function conflictArcs(v, L, measure, boxes) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
     const bx = boxes || graphBoxes(v, L, measure);
-    const obstacles = [bx.hub, bx.hubBody, ...Object.values(bx.groups).map((g) => g.rect), ...Object.values(bx.faces), ...bx.rings];
+    const obstacles = [bx.hub, bx.hubBody, ...Array.from(bx.groups.values()).map((g) => g.rect), ...Array.from(bx.faces.values()), ...bx.rings];
     for (const c of arr(v.conflicts)) {
       if (!isObj(c) || typeof c.path !== "string") continue;
-      const ids = arr(c.nodes).filter((id) => L.pos[id] && byId.has(id));
+      const ids = arr(c.nodes).filter((id) => L.pos.has(id) && byId.has(id));
       for (let k = 1; k < ids.length; k++) {
-        const A = L.pos[ids[0]], B = L.pos[ids[k]];
+        const A = L.pos.get(ids[0]), B = L.pos.get(ids[k]);
         const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2, dx = B.x - A.x, dy = B.y - A.y, ln = Math.hypot(dx, dy) || 1;
-        const gp = L.gpos[L.gkey(byId.get(ids[0]))] || L.hub;
+        const gp = L.gpos.get(L.gkey(byId.get(ids[0]))) || L.hub;
         const sg = ((-dy / ln) * (mx - gp.x) + (dx / ln) * (my - gp.y)) >= 0 ? -1 : 1;
         const cx = mx + (-dy / ln) * 62 * sg, cy = my + (dx / ln) * 62 * sg;
         const at = (t) => ({ x: (1 - t) * (1 - t) * A.x + 2 * t * (1 - t) * cx + t * t * B.x, y: (1 - t) * (1 - t) * A.y + 2 * t * (1 - t) * cy + t * t * B.y });
@@ -648,13 +648,13 @@
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
     svg.appendChild(hg);
     // the groups: "N agents · M running"
-    for (const k of Object.keys(L.gpos)) {
-      const gp = L.gpos[k], mem = nodes.filter((n) => L.gkey(n) === k);
+    for (const [k, gp] of L.gpos) {
+      const mem = nodes.filter((n) => L.gkey(n) === k);
       const run = mem.filter((n) => n.state === "running").length, wait = mem.some((n) => n.state === "waiting");
       const gg = sv("g", { "data-group": k }, "tv-ggroup" + (wait ? " waiting" : ""));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: gp.r }, "tv-gbody"));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: 4 }, "tv-gcore" + (run ? " run" : "")));
-      const sub = bxs.groups[k].sub, ly = bxs.groups[k].ly, gr = bxs.groups[k].rect;
+      const bg = bxs.groups.get(k), sub = bg.sub, ly = bg.ly, gr = bg.rect;
       gg.appendChild(sv("rect", { x: num(gr.x), y: num(gr.y), width: num(gr.w), height: gr.h, rx: 7 }, "tv-lblbg"));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly), "text-anchor": "middle" }, "tv-gname", gp.label));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly + 15), "text-anchor": "middle" }, "tv-gsub", sub));
@@ -663,7 +663,7 @@
     // the nodes, each with its face
     const tickers = [];
     for (const n of nodes) {
-      const P = L.pos[n.id], f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting", r = wait ? 11 : 9;
+      const P = L.pos.get(n.id), f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting", r = wait ? 11 : 9;
       const g = sv("g", { "data-node": n.id, "data-state": n.state }, "tv-gnode " + n.state);
       g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: 17 }, "tv-hit"));
       if (wait) {
@@ -675,7 +675,7 @@
       else g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: wait ? 5.5 : n.state === "idle" ? 3.2 : 4.4 }, "tv-core"));
       // the face sits outward of the node
       const tx = P.x + dir * (wait ? 26 : 17), anchor = dir === 1 ? "start" : "end", top = P.y - 22;
-      const fr = bxs.faces[n.id];
+      const fr = bxs.faces.get(n.id);
       g.appendChild(sv("rect", { x: num(fr.x), y: num(fr.y), width: num(fr.w), height: fr.h, rx: 6 }, "tv-facebg"));
       if (f.tag) {
         const tw = measure(f.tag, "tag") + 14, px = dir === 1 ? tx - 3 : tx - tw + 3;
@@ -719,12 +719,12 @@
   }
 
   // ---- the particles: a canvas under the graph, drawn only while some edge streams ----
-  function startStreams(canvas, stage, edges, getScale) {
+  function startStreams(canvas, stage, edges, getScale, still) {
     const reduced = !!(root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches);
-    const live = edges.filter((e) => e.rate > 0);
+    const live = still ? [] : edges.filter((e) => e.rate > 0);        // a frame from the ledger draws no stream
     stage.dataset.streams = String(live.length);
     stage.dataset.particles = "0";
-    stage.dataset.motion = reduced ? "off" : "on";
+    stage.dataset.motion = reduced || still ? "off" : "on";
     if (reduced || !live.length || !canvas.getContext || typeof root.requestAnimationFrame !== "function") return null;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
@@ -732,8 +732,10 @@
     let quality = 1, ema = 16.7, last = 0, n = 0, stopped = false, raf = 0, color = "";
     const step = (dt) => {
       for (const ed of live) {
-        ed.acc = (ed.acc || 0) + ed.rate * (ed.kind === "hub" ? 5 : 10) * quality * dt;
-        while (ed.acc >= 1) { ed.acc -= 1; PART.push({ ed, t: 0, sp: 0.22 + Math.random() * 0.22, off: Math.random() + Math.random() - 1, sz: 1.3 + Math.random() * 1.3, hub: ed.kind === "hub" }); }
+        // bounded BEFORE it accumulates: a finite wire rate can scale to Infinity, and an unbounded accumulator is an unbounded loop
+        const inc = ed.rate * (ed.kind === "hub" ? 5 : 10) * quality * dt;
+        ed.acc = Math.min(EDGE_STEP_MAX, (ed.acc || 0) + (Number.isFinite(inc) ? Math.max(0, inc) : EDGE_STEP_MAX));
+        for (let spawned = 0; ed.acc >= 1 && spawned < EDGE_STEP_MAX; spawned++) { ed.acc -= 1; PART.push({ ed, t: 0, sp: 0.22 + Math.random() * 0.22, off: Math.random() + Math.random() - 1, sz: 1.3 + Math.random() * 1.3, hub: ed.kind === "hub" }); }
       }
       for (let i = PART.length - 1; i >= 0; i--) { const p = PART[i]; p.t += p.sp * dt * (p.ed.e.len > 200 ? 0.8 : 1.15); if (p.t >= 1) PART.splice(i, 1); }
       const cap = Math.round(PARTICLE_CAP * quality);
@@ -804,7 +806,7 @@
       canvas.width = Math.max(1, Math.round(cssW * dpr)); canvas.height = Math.max(1, Math.round(cssH * dpr));
       canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
       if (ticker) { root.clearInterval(ticker); ticker = null; }
-      if (g.tickers.length) {
+      if (g.tickers.length && !(opts && opts.still)) {          // a frame from the ledger is still: its durations are computed at T and do not advance
         const t0 = (root.performance && root.performance.now ? root.performance.now() : Date.now());
         const nowMs = () => (root.performance && root.performance.now ? root.performance.now() : Date.now());
         ticker = root.setInterval(() => {
@@ -813,7 +815,7 @@
           for (const t of g.tickers) t.el.textContent = t.text(t.ms + d);
         }, 20000);
       }
-      streamStop = startStreams(canvas, stage, edges, () => scale);
+      streamStop = startStreams(canvas, stage, edges, () => scale, !!(opts && opts.still));
       stage.dataset.nodes = String(arr(v.nodes).length);
       built = true;
     };
@@ -958,62 +960,110 @@
   const WINDOW_MS = 14 * 3600e3, STEP_MS = 5 * 60e3, MIN_MS = 60e3, KEY_MS = 250, LO_MARGIN_MS = 2 * MIN_MS, HIST_STALE_MS = 60e3;
   const UNKNOWN_WORDS = { spores: "open loops", lost_if_closed: "what closing would lose", context: "model and tokens", session_logs: "rate and state from the session logs",
                           conflicts: "file conflicts", decisions: "decisions", questions: "questions" };
-  const R = { at: null, value: null, err: "", busy: false, anchor: null, ctl: null, timer: null, pend: null, refocus: false, opts: null, cur: null, hist: null, histAt: 0, histBusy: false, escBound: false };
+  // Two times are kept apart. `at` is the REQUESTED T (set when a scrub goes out; non-null = the live refetch is paused); `cat` is the COMMITTED T (the
+  // T whose answer is `value`). The badge says "live paused" only over `value` with cat === at; while a read is out it says "loading" and the
+  // frame drawn (the previous committed one, or the live value) is named. `tok` is a monotonic request token: an answer whose token is not the
+  // latest is dropped (no AbortController needed). `ret`: Live was asked and the frame stays, labelled, until the live read lands.
+  const R = { at: null, cat: null, value: null, err: "", busy: false, ret: false, anchor: null, anchoredAt: 0, tok: 0, rtok: 0, ctl: null, timer: null, pend: null,
+              refocus: false, keyed: false, opts: null, cur: null, hist: null, histAt: 0, histBusy: false, escBound: false };
+  const mono = () => (root.performance && typeof root.performance.now === "function" ? root.performance.now() : Date.now());
   const minuteOf = (ms) => Math.floor(ms / MIN_MS) * MIN_MS;
   const isoMin = (ms) => new Date(minuteOf(ms)).toISOString().replace(/\.\d{3}Z$/, "Z");
-  function paused() { return R.at !== null; }
-  function replaying() { return R.at !== null; }
-  function replayValue() { return R.at !== null ? R.value : null; }
-  const replaySig = () => [R.at, R.err, R.busy];
-  function abortFlight() { if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
+  // paused only while the strip that owns the replay is on the page: a strip that is gone (the card was replaced, the tab left) pauses nothing
+  function paused() { return R.at !== null && !!(R.cur && R.cur.bars && R.cur.bars.isConnected); }
+  function replaying() { return R.at !== null || R.ret; }
+  function replayValue() { return replaying() ? R.value : null; }
+  const replaySig = () => [R.at, R.cat, R.err, R.busy, R.ret];
+  function abortFlight() { R.tok++; if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
+  function clearReplay() { R.at = null; R.cat = null; R.value = null; R.anchor = null; R.busy = false; R.err = ""; R.ret = false; R.keyed = false; R.refocus = false; R.rtok++; }
+  // the live read behind the paused one: the page's refetch (cockpit_view.refetchPanel); always a promise
+  function resumeLive() {
+    const rp = R.opts && R.opts.replay;
+    if (rp && typeof rp.resume === "function") { try { const p = rp.resume(); if (p && typeof p.then === "function") return p.then(() => {}, () => {}); } catch (_) { /* the next poll reads */ } }
+    return Promise.resolve();
+  }
+  // silent: the caller is already repainting and is leaving (the view went away, or replay did): the state is dropped now, nothing is kept.
+  // Otherwise (Live, Esc, Back to live) the committed frame stays on screen, labelled "returning to live…", until the live read lands.
   function leaveReplay(silent) {
     abortFlight();
-    const was = R.at !== null || R.err !== "";
-    R.at = null; R.value = null; R.anchor = null; R.busy = false; R.err = "";
-    if (!was) return;
-    const rp = R.opts && R.opts.replay;
-    if (rp && typeof rp.resume === "function") { try { const p = rp.resume(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* the next poll reads */ } }
-    if (!silent && R.opts && R.opts.repaint) R.opts.repaint();       // silent: the caller is already repainting
+    const had = R.at !== null, frame = R.value !== null && R.cat !== null;
+    if (!had && !R.ret && R.err === "") return;
+    if (R.ret && !had) { if (silent) { clearReplay(); } return; }       // already on the way back
+    if (silent || !had || !frame) {
+      clearReplay();
+      if (had) resumeLive();
+      if (!silent && R.opts && R.opts.repaint) R.opts.repaint();
+      return;
+    }
+    const rt = ++R.rtok;
+    R.at = null; R.busy = false; R.err = ""; R.ret = true; R.anchor = null; R.keyed = false; R.refocus = false;
+    if (R.opts && R.opts.repaint) R.opts.repaint();
+    resumeLive().then(() => { if (R.rtok !== rt || !R.ret) return; clearReplay(); if (R.opts && R.opts.repaint) R.opts.repaint(); });
   }
-  // one past read: T goes out once, the answer is kept only if no newer scrub superseded it
-  function replayTo(T, anchor) {
+  // one past read: T goes out once, the answer is kept only if no newer request superseded it (the token), and the frame already committed keeps its
+  // own label while this one loads. A 400 that names the window re-anchors on a fresh live read and retries once.
+  function replayTo(T, anchor, opt) {
     const o = R.opts, rp = o && o.replay;
     if (!rp || typeof rp.readJson !== "function" || !isNum(T)) return;
     abortFlight();
-    const prev = { at: R.at, value: R.value, anchor: R.anchor };
-    R.err = ""; R.at = T; R.busy = true; if (R.anchor === null) R.anchor = anchor;
+    const tok = ++R.tok, keyed = !!(opt && opt.keyed);
+    R.rtok++; R.ret = false;
+    R.err = ""; R.at = T; R.busy = true; R.keyed = keyed; R.refocus = keyed;
+    if (R.anchor === null) { R.anchor = anchor; R.anchoredAt = mono(); }
     const ctl = typeof root.AbortController === "function" ? new root.AbortController() : null;
     R.ctl = ctl;
     if (o.repaint) o.repaint();
     const fail = (msg) => {
-      if (R.ctl !== ctl) return;
+      if (R.tok !== tok) return;
       R.ctl = null; R.busy = false;
       R.err = "replay refused: " + msg;
-      if (prev.at !== null) { R.at = prev.at; R.value = prev.value; R.anchor = prev.anchor; }
-      else { R.at = null; R.value = null; R.anchor = null; if (typeof rp.resume === "function") { try { const p = rp.resume(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* next poll */ } } }
+      if (R.value !== null && R.cat !== null) R.at = R.cat;                // back to the frame that is committed
+      else { R.at = null; R.value = null; R.cat = null; R.anchor = null; resumeLive(); }
+      R.refocus = keyed;
       if (o.repaint) o.repaint();
+    };
+    const reanchor = (msg) => {
+      // the page's estimate of the server clock drifted: one fresh live read, then the same ask again inside the real window
+      rp.readJson("/cockpit/panel/topology.json?profile=full", ctl ? ctl.signal : undefined).then((pl) => {
+        if (R.tok !== tok) return;
+        const a = isObj(pl) && isObj(pl.value) ? Date.parse(pl.value.as_of) : NaN;
+        if (!isNum(a)) { fail(msg); return; }
+        R.anchor = a; R.anchoredAt = mono();
+        const hi = minuteOf(a), lo = hi - WINDOW_MS + LO_MARGIN_MS;
+        if (T >= hi) { fail(msg); return; }
+        replayTo(Math.max(T, lo), a, { keyed, retried: true });
+      }, (e) => { if (e && e.name === "AbortError") return; fail(msg); });
     };
     let p;
     try { p = rp.readJson("/cockpit/panel/topology.json?profile=full&at=" + encodeURIComponent(isoMin(T)), ctl ? ctl.signal : undefined); } catch (e) { fail(e && e.message ? e.message : String(e)); return; }
     p.then((pl) => {
-      if (R.ctl !== ctl) return;                                          // superseded: it changes nothing
+      if (R.tok !== tok) return;                                          // superseded: it changes nothing
       const val = isObj(pl) ? pl.value : null;
       if (!isObj(val) || !Array.isArray(val.nodes) || !Array.isArray(val.tasks) || !Array.isArray(val.groups) || !isObj(val.hub)) { fail("the past read was not a topology"); return; }
-      R.ctl = null; R.busy = false; R.value = val;
+      R.ctl = null; R.busy = false; R.value = val; R.cat = T; R.refocus = keyed;
       if (o.repaint) o.repaint();
-    }, (e) => { if (e && e.name === "AbortError") return; fail(e && e.message ? e.message : String(e)); });
+    }, (e) => {
+      if (e && e.name === "AbortError") return;
+      const msg = e && e.message ? e.message : String(e);
+      if (R.tok === tok && !(opt && opt.retried) && /inside the last/.test(msg)) { reanchor(msg); return; }
+      fail(msg);
+    });
   }
-  // activity per bucket, from the activity panel's events (the sky's own source); fetched once and again when stale, never while replaying
+  // activity per bucket, from the activity panel's events (the sky's own source). Read only for a strip that is on the page and visible, and only when
+  // the data is older than a minute (never per repaint); the strip is not yet attached when render returns, so the look is taken after it is.
   function ensureHist() {
-    const rp = R.opts && R.opts.replay;
-    if (!rp || typeof rp.readJson !== "function" || R.histBusy) return;
-    if (R.hist !== null && (R.at !== null || Date.now() - R.histAt < HIST_STALE_MS)) return;
-    R.histBusy = true;
-    rp.readJson("/cockpit/panel/activity.json?profile=full").then((pl) => {
-      const val = isObj(pl) ? pl.value : null;
-      R.hist = isObj(val) && Array.isArray(val.events) ? { events: val.events.filter(isObj).map((e) => Date.parse(e.at)).filter(isNum), unreadable: arr(val.unreadable).filter((x) => typeof x === "string") }
-                                                        : { fail: "no activity source" };
-    }, () => { R.hist = { fail: "activity not read" }; }).then(() => { R.histBusy = false; R.histAt = Date.now(); paintBars(R.cur); });
+    root.setTimeout(() => {
+      const rp = R.opts && R.opts.replay, c = R.cur;
+      if (!rp || typeof rp.readJson !== "function" || R.histBusy || !c || !c.bars.isConnected) return;
+      if (c.bars.offsetParent === null || (root.document && root.document.hidden)) return;
+      if (R.hist !== null && (R.at !== null || Date.now() - R.histAt < HIST_STALE_MS)) return;
+      R.histBusy = true; R.histAt = Date.now();
+      rp.readJson("/cockpit/panel/activity.json?profile=full").then((pl) => {
+        const val = isObj(pl) ? pl.value : null;
+        R.hist = isObj(val) && Array.isArray(val.events) ? { events: val.events.filter(isObj).map((e) => Date.parse(e.at)).filter(isNum), unreadable: arr(val.unreadable).filter((x) => typeof x === "string") }
+                                                          : { fail: "no activity source" };
+      }, () => { R.hist = { fail: "activity not read" }; }).then(() => { R.histBusy = false; R.histAt = Date.now(); paintBars(R.cur); });
+    }, 0);
   }
   function paintBars(cur, fresh) {
     if (!cur || (!fresh && !cur.bars.isConnected)) return;
@@ -1028,20 +1078,40 @@
     const top = Math.max(1, ...counts);
     counts.forEach((c, i) => { cur.bars.children[i].style.height = (c ? 3 + 24 * c / top : 2) + "px"; cur.bars.children[i].classList.toggle("on", c > 0); });
   }
+  // Esc ends a replay only when it is meant for the card: focus inside the topology card, or no dialog / overlay / palette open on the page.
+  // A text field, a select and a contenteditable keep their own Esc.
   function bindEsc() {
     if (R.escBound || !root.document || !root.document.addEventListener) return;
     R.escBound = true;
     root.document.addEventListener("keydown", (ev) => {
       if (ev.key !== "Escape" || R.at === null || ev.defaultPrevented) return;
-      const t = ev.target && ev.target.tagName;
-      if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") return;
+      const t = ev.target, tag = t && t.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
+      const d = root.document, inCard = [t, d.activeElement].some((n) => n && n.closest && n.closest(".k7-card, .tv"));
+      if (!inCard && d.querySelector(".modal-overlay, dialog[open], [role=\"dialog\"], [aria-modal=\"true\"]")) return;
       leaveReplay(false);
     });
   }
+  // the two-hour marks on the LOCAL clock: the first even local hour at or after lo, stepping a local hour at a time (any zone, any offset)
+  function hourMarks(lo, hi) {
+    const out = [], d = new Date(lo);
+    d.setMinutes(0, 0, 0);
+    if (d.getTime() < lo) d.setHours(d.getHours() + 1);
+    for (let k = 0; d.getTime() <= hi && k < 40; k++) {
+      if (d.getHours() % 2 === 0 && d.getMinutes() === 0) out.push({ ms: d.getTime(), label: String(d.getHours()).padStart(2, "0") + ":00" });
+      d.setHours(d.getHours() + 1);
+    }
+    return out;
+  }
   function replayStrip(v) {
-    const hi = minuteOf(R.anchor !== null ? R.anchor : Date.parse(v.as_of));
-    if (!isNum(hi)) return null;
-    const lo0 = hi - WINDOW_MS, lo = lo0 + LO_MARGIN_MS;
+    // the server's clock, estimated: the live as_of (kept as the anchor once a scrub is out) plus the page's own monotonic time since it was read.
+    // The browser's wall clock is never used, and the window does not freeze: the floor and the ceiling move with the estimate.
+    const A = R.anchor !== null ? { t: R.anchor, at: R.anchoredAt } : { t: Date.parse(v.as_of), at: mono() };
+    if (!isNum(A.t)) return null;
+    const est = () => A.t + (mono() - A.at);
+    const hi = minuteOf(est());
+    const lo0 = hi - WINDOW_MS;
+    const loNow = () => minuteOf(est()) - WINDOW_MS + LO_MARGIN_MS;
     const strip = el("div", "tv-replay");
     const cap = el("div", "tv-rcap");
     cap.append(el("b", null, "Replay"), el("span", null, "last 14 h, from the ledger"));
@@ -1053,13 +1123,9 @@
     const bars = el("div", "tv-rbars");
     for (let i = 0; i < 168; i++) bars.appendChild(el("i"));
     track.appendChild(bars);
-    for (let ms = Math.ceil(lo0 / 7200e3) * 7200e3; ms <= hi; ms += 7200e3) {
-      // two-hour marks on the local clock, as the mock labels them
-      const d = new Date(ms);
-      if (d.getMinutes() !== 0) continue;
-      if (d.getHours() % 2 !== 0) continue;
-      const h = el("span", "tv-rhr", String(d.getHours()).padStart(2, "0") + ":00");
-      h.style.left = ((ms - lo0) / WINDOW_MS * 100) + "%";
+    for (const m of hourMarks(lo0, hi)) {
+      const h = el("span", "tv-rhr", m.label);
+      h.style.left = ((m.ms - lo0) / WINDOW_MS * 100) + "%";
       track.appendChild(h);
     }
     const head = el("div", "tv-rhead" + (R.at === null ? " live" : ""));
@@ -1075,22 +1141,22 @@
     pill.addEventListener("click", () => { if (R.at !== null || R.err) leaveReplay(false); });
     // T from a pointer, minute-aligned and inside the window; the right edge is live
     const tAt = (clientX) => { const r = track.getBoundingClientRect(); const k = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width))); return minuteOf(lo0 + k * WINDOW_MS); };
-    const commit = (T) => { if (T >= hi) { leaveReplay(false); return; } replayTo(Math.max(lo, T), hi); };
+    const commit = (T, keyed) => { if (T >= hi) { leaveReplay(false); return; } replayTo(Math.max(loNow(), T), est(), { keyed }); };
     let down = false;
     track.addEventListener("pointerdown", (ev) => { down = true; track.classList.add("drag"); try { track.setPointerCapture(ev.pointerId); } catch (_) { /* no capture */ } place(tAt(ev.clientX)); });
     track.addEventListener("pointermove", (ev) => { if (down) place(tAt(ev.clientX)); });
-    track.addEventListener("pointerup", (ev) => { if (!down) return; down = false; track.classList.remove("drag"); commit(tAt(ev.clientX)); });
+    track.addEventListener("pointerup", (ev) => { if (!down) return; down = false; track.classList.remove("drag"); commit(tAt(ev.clientX), false); });
     track.addEventListener("pointercancel", () => { down = false; track.classList.remove("drag"); place(R.at !== null ? R.at : hi); });
     track.addEventListener("keydown", (ev) => {
       const dir = ev.key === "ArrowLeft" || ev.key === "ArrowDown" ? -1 : ev.key === "ArrowRight" || ev.key === "ArrowUp" ? 1 : 0;
       if (ev.key === "Escape") { ev.preventDefault(); leaveReplay(false); return; }
       if (!dir && ev.key !== "Home" && ev.key !== "End") return;
       ev.preventDefault();
-      const base = R.pend !== null ? R.pend : R.at !== null ? R.at : hi;
+      const lo = loNow(), base = R.pend !== null ? R.pend : R.at !== null ? R.at : hi;
       const T = ev.key === "Home" ? lo : ev.key === "End" ? hi : Math.max(lo, Math.min(hi, base + dir * STEP_MS));
-      R.pend = T; R.refocus = true; place(T);
+      R.pend = T; place(T);
       if (R.timer) root.clearTimeout(R.timer);
-      R.timer = root.setTimeout(() => { R.timer = null; const t = R.pend; R.pend = null; if (t !== null) commit(t); }, KEY_MS);
+      R.timer = root.setTimeout(() => { R.timer = null; const t = R.pend; R.pend = null; if (t !== null) commit(t, true); }, KEY_MS);
     });
     const note = el("span", "tv-rnote");
     strip.append(cap, track, pill, note);
@@ -1112,12 +1178,18 @@
   // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to,
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
-    const o = opts || {};
-    R.opts = o;
+    const o0 = opts || {};
+    R.opts = o0;
     const which = lens();
+    // a frame from the ledger: a value the server marked `replay`, or the value this module committed. It is STILL (no stream, no ticker, no breathe)
+    // and, when it is drawn through the strip, it carries its badge.
+    const past = isObj(v) && (v.replay === true || (R.value !== null && v === R.value));
+    const o = past ? Object.assign({}, o0, { still: true }) : o0;
     const w = el("div", "tv");
     w.dataset.lens = which;
-    if (o.replay && R.at !== null) w.classList.add("tv-replaying");
+    if (past) w.classList.add("tv-replaying");
+    if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
+    if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
     bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { keep(LENS_KEY, id); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
     w.appendChild(bar);
@@ -1126,14 +1198,22 @@
     const body = el("div", "tv-lensbody");
     body.appendChild(which === "agents" ? agentsLens(v, o) : workLens(v, o));
     // the paused line, said plainly where the graph is (the mock: top of the Agents stage, foot of the Work stage)
-    if (o.replay && R.at !== null) {
-      const b = el("div", "tv-rbadge", "replay " + clock(new Date(R.at).toISOString()) + " — live paused");
+    if (o.replay && replaying()) {
+      const at = (ms) => clock(new Date(ms).toISOString());
+      // requested is not committed: "live paused" only over the value whose as_of is T; while a read is out the badge says what is drawn
+      const text = R.ret ? "returning to live…"
+        : R.busy ? "loading replay " + at(R.at) + "… " + (past && R.cat !== null ? "showing replay " + at(R.cat) : "showing live")
+        : "replay " + at(R.at) + " — live paused";
+      const b = el("div", "tv-rbadge", text);
       b.setAttribute("role", "status");
-      const back = el("button", "tv-rback", "Back to live");
-      back.type = "button";
-      back.addEventListener("click", () => leaveReplay(false));
       const wrapB = el("div", "tv-rbadgewrap");
-      wrapB.append(b, back);
+      wrapB.append(b);
+      if (!R.ret) {
+        const back = el("button", "tv-rback", "Back to live");
+        back.type = "button";
+        back.addEventListener("click", () => leaveReplay(false));
+        wrapB.append(back);
+      }
       body.appendChild(wrapB);
     }
     w.appendChild(body);
@@ -1150,6 +1230,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, leaveReplay };
+  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

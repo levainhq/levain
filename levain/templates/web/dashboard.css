@@ -2196,6 +2196,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }

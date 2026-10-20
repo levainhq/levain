@@ -1988,6 +1988,8 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
+    // the Sessions card is on Build only: leaving Build ends its replay and stops its stream loop, coming back draws it again
+    try { paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
     // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
     if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
@@ -2223,7 +2225,14 @@
     const sec = k7Host();
     if (!sec) return;
     const s = Array.from(states).find((o) => o.pid === "sessions" && o.ctx && o.ctx.widget && o.p && o.p.isConnected);
-    if (!s || document.body.dataset.mode !== "build") { if (!s) { sec.hidden = true; k7Sig = ""; } return; }
+    if (!s || document.body.dataset.mode !== "build") {
+      // the card is not on screen (another tab, no Sessions card): its replay ends, its stream loop and tickers stop, and the live read is not left paused;
+      // the signature is cleared so coming back draws the card (and its stream) again
+      const T = root.LevainTopologyView;
+      if (T) { if (T.replaying && T.replaying()) T.leaveReplay(true); T.release(); k7Sig = ""; }
+      if (!s) { sec.hidden = true; k7Sig = ""; }
+      return;
+    }
     const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
     const now = Date.now();
     // the work view (topology_view.js): the topology panel's value, when the page has it and it holds anything to draw
@@ -2235,11 +2244,14 @@
     const epErr = ep ? ep.querySelector(".err") : null;
     const tfault = !TV ? "" : ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
     const tvLive = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    // replay lives only while the topology is on screen with a replay path (the head's flag and the page's transport); on any other exit it ends BEFORE
+    // anything below reads a value, so nothing is drawn from the past without its badge (the list, the Lost panel) and the live read is not left paused
+    const topoLive = !!(tvLive || tfault) && TV.mode(root.innerWidth) === "topology";
+    const canReplay = !!(topoLive && tvLive && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
+    if (TV && TV.replaying && TV.replaying() && !canReplay) TV.leaveReplay(true);
     // a scrubbed past is drawn in place of the live value (the read behind it may hold no work: an empty past is still the past)
     const tv = tvLive && TV.replaying && TV.replaying() ? (TV.replayValue() || tvLive) : tvLive;
     const topo = !!(tv || tfault) && TV.mode(root.innerWidth) === "topology";
-    if (TV && TV.replaying && TV.replaying() && !topo) TV.leaveReplay(true);       // no topology on screen: no replay, and the live read is not left paused
-    const canReplay = !!(topo && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
     const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", topo, tfault,
                                 tv ? TV.signature(tv, TV.lens()) : (ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
