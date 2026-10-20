@@ -1376,7 +1376,8 @@ class Cockpit:
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
         if kind == "topology":
-            return not value.get("nodes") and not value.get("tasks")
+            # empty only when it read everything and found nothing: a source it could not read is not "no work"
+            return not value.get("nodes") and not value.get("tasks") and not value.get("unreadable")
         key = {"line": "lines", "status-dots": "metrics", "metric-grid": "numbers", "roster": "rows",
                "log": "rows", "ambient": "events"}.get(kind)
         if key == "events" and "visual" in value:
@@ -2741,8 +2742,8 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         for k in ("started", "last_event"):
             if not _is_iso(n.get(k)):
                 raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
-        if not _is_num(n.get("rate")) or n["rate"] < 0:
-            raise _bad(spec, f"{w}.rate", "must be a non-negative finite number (events per minute)")
+        if n.get("rate") is not None and (not _is_num(n["rate"]) or n["rate"] < 0):
+            raise _bad(spec, f"{w}.rate", "must be a non-negative finite number (events per minute) or null (no log)")
     if "conflicts" not in v:
         raise _bad(spec, "value.conflicts", "is required (null when the source is not tracked)")
     if v["conflicts"] is not None:

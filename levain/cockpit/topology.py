@@ -19,16 +19,20 @@ each working tree past it named, and cached for ``LOST_CACHE_S``.
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
 log holds it only inside text this token-free panel must not carry), file conflicts (no hook records an Edit or
 Write path), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
-episodes (episodes carry no session) and running children (no hook records a subagent). Every agent-written word
-stays off the wire, as on the Decisions panel: a consent task is its agent and tool, a question its number, a
-dispatch contract its template, never its goal.
+episodes (episodes carry no session) and running children (no hook records a subagent). What does reach the wire is
+display-safe: a consent task is its agent and tool, a question its number, a dispatch contract its template, never
+its goal or a request's body; but a file name, a branch name, a repository or directory basename and an open loop's
+text (all agent- or repository-controlled) are carried, each through ``_wire`` (display-safe, a basename without a
+path, at most ``LABEL_MAX`` characters).
 
 A source that cannot be read is named in ``unreadable`` with its reason in ``errors``; unreadable session records
 are a ``Fault``, never an empty graph.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import subprocess
 import threading
 import time
@@ -50,12 +54,15 @@ DISPATCH_DONE_H = 14               # a finished contract stays on the board this
 LOST_WORKTREES_MAX = act.ACTIVITY_REPOS_MAX
 LOST_CACHE_S = 30.0
 LABEL_MAX = 48
+UNNAMED = "(unnamed)"
+_MARKER = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
 HUB_ID = "levain"
 UNATTACHED_ID = "unattached"
 NO_COST = {"usd": None, "tokens": None, "source": None}
 
 # the dispatch job's state as a task's (jobs.STATES); filed waits on the operator's signature, verified and
-# recommended on his authorisation: a record, so WAITING
+# recommended on his authorisation: a record, so WAITING. signed, queued and authorised are RUNNING because the job
+# runtime holds them (a record exists, it is not silence), with no worker named: the job record names no session.
 _JOB_STATE = {"filed": "waiting", "signed": "running", "queued": "running", "running": "running",
               "verifying": "running", "verified": "waiting", "recommended": "waiting", "authorised": "running",
               "adopted": "done", "cancelled": "done", "failed": "failed"}
@@ -69,10 +76,26 @@ def _iso(t: datetime) -> str:
     return t.astimezone(timezone.utc).isoformat()
 
 
-def _label(text: Any) -> str:
-    """Agent- or store-controlled text as one display-safe line of at most ``LABEL_MAX`` characters."""
-    s = visible(" ".join(str(text).split()))
-    return s if len(s) <= LABEL_MAX else s[:LABEL_MAX - 1] + "…"
+def _wire(text: Any, *, base: bool = False) -> str:
+    """The ONE normaliser every string this provider puts on the wire goes through: ``visible`` (no invisible or
+    format character); for a ``base`` name, ``/`` and ``\\`` shown as visible markers (a name is a basename, never a
+    path, and is never refused); whitespace collapsed to single spaces; an empty result the fixed ``UNNAMED``; then
+    the ``LABEL_MAX`` cut, which never splits a ``⟨U+XXXX⟩`` marker. The engine's validator refuses what this never
+    emits."""
+    s = visible(str(text))
+    if base:
+        s = s.replace("/", "⟨U+002F⟩").replace("\\", "⟨U+005C⟩")
+    s = " ".join(s.split())
+    if not s:
+        return UNNAMED
+    if len(s) <= LABEL_MAX:
+        return s
+    cut = LABEL_MAX - 1
+    for m in _MARKER.finditer(s):
+        if m.start() < cut < m.end():
+            cut = m.start()
+            break
+    return s[:cut] + "…"
 
 
 # --- the sessions ----------------------------------------------------------------------------------------------
@@ -110,16 +133,19 @@ def _records(install_root: Path, now: datetime) -> list[dict[str, Any]]:
     return out
 
 
-def _log_signal(install_root: Path, stem: str, now: datetime) -> tuple[datetime | None, str | None, float]:
+def _log_signal(install_root: Path, stem: str, now: datetime) -> tuple[datetime | None, str | None, float | None]:
     """From the session's event log (Q8), counts and stamps only, never a word of it: the newest event's time and
-    kind (prompt, reply, tool), and events per minute over the last ``RATE_WINDOW_S``. No log is (None, None, 0)."""
+    kind (prompt, reply, tool), and events per minute over the last ``RATE_WINDOW_S``. No log is (None, None, None):
+    the rate is unknown, never a zero."""
     from levain.cockpit.session_log import _event, _tail
 
     raw = _tail(install_root / ".levain" / "sessions" / f"{stem}.log.jsonl")
+    if not raw:
+        return None, None, None
     last_at: datetime | None = None
     last_kind: str | None = None
     recent = 0
-    for line in (raw or b"").split(b"\n"):
+    for line in raw.split(b"\n"):
         if not line.strip():
             continue
         ev = _event(line)
@@ -210,7 +236,7 @@ def _consent_tasks(listing: Any, worker_of: Callable[[str, str], str | None]) ->
             r = e.request
             card = f"{CONSENT_ROW_PREFIX}{r.id}"
             w = worker_of(r.agent, r.agent_session_id)
-            tasks.append({"id": card, "kind": "consent", "label": _label(f"{r.agent} · {r.tool_name}"),
+            tasks.append({"id": card, "kind": "consent", "label": _wire(f"{r.agent} · {r.tool_name}"),
                           "state": "waiting", "waits_on": [card], "card": card, "outcomes": [], "cost": dict(NO_COST),
                           "workers": [w] if w else []})
         except Exception:  # noqa: BLE001 - one entry that does not build is counted, never the source
@@ -227,19 +253,19 @@ def _question_tasks(open_qs: list[Any], worker_of: Callable[[str, str], str | No
         waits = [card]
         link = getattr(q, "link", None)
         if link is not None and isinstance(getattr(link, "request_id", None), str):
-            waits.append(f"{CONSENT_ROW_PREFIX}{_label(link.request_id)}")
+            waits.append(f"{CONSENT_ROW_PREFIX}{_wire(link.request_id)}")
         w = worker_of(q.agent, q.agent_session_id)
-        tasks.append({"id": card, "kind": "question", "label": _label(f"{q.agent} · question #{q.n}"),
+        tasks.append({"id": card, "kind": "question", "label": _wire(f"{q.agent} · question #{q.n}"),
                       "state": "waiting", "waits_on": waits, "card": card, "outcomes": [], "cost": dict(NO_COST),
                       "workers": [w] if w else []})
     return tasks
 
 
-def _dispatch_tasks(directory: Path, now: datetime, worker_of_session: Callable[[str], str | None]
-                    ) -> tuple[list[dict[str, Any]], list[str]]:
+def _dispatch_tasks(directory: Path, now: datetime) -> tuple[list[dict[str, Any]], list[str]]:
     """A task per dispatch contract still open, or finished in the last ``DISPATCH_DONE_H`` hours, through the job
     store's and the outcome ledger's public readers. Neither store is created here: a directory without one has
-    no contracts (or no labels). Raises for a store that cannot be read."""
+    no contracts (or no labels). A contract has no worker: the session that filed it is not running it, and the job
+    record names no session that does. Raises for a store that cannot be read."""
     from levain.dispatch import jobs as djobs
     from levain.dispatch import outcomes as dout
 
@@ -271,14 +297,13 @@ def _dispatch_tasks(directory: Path, now: datetime, worker_of_session: Callable[
                 continue
             outcomes = list(labels.get(job.id, []))
             if job.state in djobs.TERMINAL and last_at is not None:
-                outcomes.append({"label": _label(f"{job.state} ({last.cause.replace('_', ' ')})"), "at": _iso(last_at),
+                outcomes.append({"label": _wire(f"{job.state} ({last.cause.replace('_', ' ')})"), "at": _iso(last_at),
                                  "ok": job.state == "adopted"})
             outcomes.sort(key=lambda o: o["at"], reverse=True)
-            w = worker_of_session(job.filer_session)
             tasks.append({"id": f"dispatch:{job.id}", "kind": "dispatch",
-                          "label": _label(f"dispatch · {job.contract.template.template_id}"),
+                          "label": _wire(f"dispatch · {job.contract.template.template_id}"),
                           "state": state, "waits_on": [f"dispatch:{job.id}"] if state == "waiting" else [],
-                          "card": None, "outcomes": outcomes, "cost": dict(NO_COST), "workers": [w] if w else []})
+                          "card": None, "outcomes": outcomes, "cost": dict(NO_COST), "workers": []})
         except Exception:  # noqa: BLE001 - one job that does not build is counted, never the store
             bad += 1
     if bad:
@@ -293,7 +318,7 @@ def _spore_tasks(spores: list[Any]) -> list[dict[str, Any]]:
     tasks = []
     for s in spores[:SPORES_MAX]:
         workers: list[str] = []
-        tasks.append({"id": f"spore:{_label(s.id)}", "kind": "spore", "label": _label(s.text),
+        tasks.append({"id": f"spore:{_wire(s.id)}", "kind": "spore", "label": _wire(s.text),
                       "state": "running" if workers else "stuck", "waits_on": [], "card": None, "outcomes": [],
                       "cost": dict(NO_COST), "workers": workers})
     return tasks
@@ -365,9 +390,9 @@ def topology_reader(*, install_root: Path | None,
                 blind("questions", f"unreadable ({type(exc).__name__})")
 
         groups: dict[str, dict[str, Any]] = {}
+        parent_of: dict[str, str] = {}             # a repository group's parent directory's name, for a label clash
         nodes: list[dict[str, Any]] = []
         by_session: dict[tuple[str, str], str] = {}
-        by_sid: dict[str, str] = {}
         live: list[tuple[str, str]] = []           # (node id, cwd) of the sessions Lost-if-closed reads
         walked: dict[str, tuple[tuple[Path, Path, Path] | None, str | None]] = {}
 
@@ -382,13 +407,17 @@ def topology_reader(*, install_root: Path | None,
             found, _why = tree_of(cwd)
             if found is not None:
                 repo = act.repo_label(found[0])
-                gid = f"repo:{repo}"
-                groups.setdefault(gid, {"id": gid, "label": _label(repo), "repo": _label(repo)})
+                # the id is a hash of the common git dir, so two repositories with one basename are two groups
+                gid = "repo:" + hashlib.sha1(str(found[0]).encode("utf-8", "surrogateescape")).hexdigest()[:8]
+                if gid not in groups:
+                    main = found[0].parent if found[0].name == ".git" else found[0]
+                    parent_of[gid] = act._base(str(main.parent))
+                    groups[gid] = {"id": gid, "label": _wire(repo), "repo": _wire(repo)}
             else:
                 base = act._base(cwd) or "?"
-                gid = f"dir:{_label(base)}"
-                groups.setdefault(gid, {"id": gid, "label": _label(base), "repo": None})
-            last_log, last_kind, rate = (None, None, 0.0)
+                gid = f"dir:{_wire(base)}"
+                groups.setdefault(gid, {"id": gid, "label": _wire(base), "repo": None})
+            last_log, last_kind, rate = (None, None, None)
             age = (now - rec["_seen"]).total_seconds()
             if age < SESSION_ACTIVE_S:
                 last_log, last_kind, rate = _log_signal(install_root, stem, now)
@@ -397,18 +426,25 @@ def topology_reader(*, install_root: Path | None,
             card = waiting_card.get((agent, sid))
             _chip, reading = _context_chip(rec)
             tokens = reading.tokens if reading is not None and not reading.compacted else None
-            model = _label(reading.model) if reading is not None and reading.model else None
+            model = _wire(reading.model) if reading is not None and reading.model else None
             first = act._parse(rec.get("first_seen")) or rec["_seen"]
             state = _node_state(card is not None, (now - last).total_seconds(), last_kind)
             nodes.append({"id": nid, "group": gid, "parent": None,
-                          "label": _label(f"{agent} · {act._base(cwd) or '/'}"), "agent": _label(agent),
+                          "label": _wire(f"{agent} · {act._base(cwd) or '/'}"), "agent": _wire(agent),
                           "model": model, "state": state, "tool": None, "tokens": tokens,
                           "started": _iso(min(first, rec["_seen"])), "last_event": _iso(last), "rate": rate,
                           "card": card})
             by_session[(agent, sid)] = nid
-            by_sid.setdefault(sid, nid)
             if (now - last).total_seconds() < SESSION_ACTIVE_S:
                 live.append((nid, cwd))
+
+        clash: dict[str, int] = {}
+        for g in groups.values():
+            if g["id"] in parent_of:
+                clash[g["label"]] = clash.get(g["label"], 0) + 1
+        for g in groups.values():
+            if g["id"] in parent_of and clash[g["label"]] > 1:
+                g["label"] = _wire(f"{g['repo']} ({parent_of[g['id']]})")
 
         tasks: list[dict[str, Any]] = []
         worker_of = lambda a, s: by_session.get((a, s))  # noqa: E731
@@ -427,7 +463,7 @@ def topology_reader(*, install_root: Path | None,
             blind("dispatch", "no consent directory is attached, so no dispatch store to read")
         else:
             try:
-                got, errs = _dispatch_tasks(Path(ddir), now, lambda s: by_sid.get(s))
+                got, errs = _dispatch_tasks(Path(ddir), now)
                 tasks += got
                 errors += errs
             except Exception as exc:  # noqa: BLE001 - an unread store is named, never shown as no contracts
@@ -440,12 +476,12 @@ def topology_reader(*, install_root: Path | None,
             except Exception as exc:  # noqa: BLE001
                 blind("spores", f"unreadable ({type(exc).__name__})")
         on_task = {w for t in tasks for w in t["workers"]}
-        loose = [n for n in nodes if n["id"] not in on_task]
+        # unattached work is the work of sessions that are ACTIVE (running, waiting, stalled); an idle session
+        # leaves the Work lens (it stays a node), and no state here is ever `done`: silence is not completion
+        loose = [n for n in nodes if n["id"] not in on_task and n["state"] != "idle"]
         if loose:
-            states = {n["state"] for n in loose}
             tasks.append({"id": UNATTACHED_ID, "kind": "unattached", "label": "unattached work",
-                          "state": "stuck" if "stalled" in states else
-                                   ("running" if states & {"running", "waiting"} else "done"),
+                          "state": "stuck" if any(n["state"] == "stalled" for n in loose) else "running",
                           "waits_on": [], "card": None, "outcomes": [], "cost": dict(NO_COST),
                           "workers": [n["id"] for n in loose]})
 
@@ -455,11 +491,11 @@ def topology_reader(*, install_root: Path | None,
         for _nid, cwd in live:
             found, why = tree_of(cwd)
             if why is not None:
-                errors.append(f"{act._base(cwd)}: {why}")
+                errors.append(f"{_wire(act._base(cwd))}: {why}")
             if found is None or str(found[2]) in seen_tops:
                 continue
             seen_tops.add(str(found[2]))
-            trees.append((found, act._base(str(found[2]))))
+            trees.append((found, _wire(act._base(str(found[2])))))
         if len(trees) > LOST_WORKTREES_MAX:
             errors += [f"{label}: not read, past the cap of {LOST_WORKTREES_MAX} working trees"
                        for _f, label in trees[LOST_WORKTREES_MAX:]]
@@ -471,14 +507,14 @@ def topology_reader(*, install_root: Path | None,
             found, _why = tree_of(cwd)
             st = states.get(str(found[2])) if found is not None else None
             lost.append({"node": nid, "dirty": st["dirty"] if st else None,
-                         "dirty_names": st["dirty_names"] if st else [],
+                         "dirty_names": [_wire(n, base=True) for n in st["dirty_names"]] if st else [],
                          "unpushed": st["unpushed"] if st else None,
-                         "branches": [st["branch"]] if st and st["unpushed"] and st["branch"] else [],
+                         "branches": [_wire(st["branch"])] if st and st["unpushed"] and st["branch"] else [],
                          "uncaptured_episodes": None, "running_children": None})
 
         errors = list(dict.fromkeys(errors))
         return Read(value={
-            "hub": {"id": HUB_ID, "label": _label(hub_label(ctx) or "Levain")},
+            "hub": {"id": HUB_ID, "label": _wire(hub_label(ctx) or "Levain")},
             "groups": list(groups.values()), "nodes": nodes, "conflicts": None,
             "counts": {"tokens_today": None},
             # the minute, not the instant: a value stamped per read would change on every poll of an idle install
