@@ -695,8 +695,9 @@ def check_egress_ready(slot, ids: Mapping[str, int], *, pf_text: str, ifconfig_t
     live = {" ".join(line.split()) for line in pf_text.splitlines()
             if line.strip() and not line.startswith(_PF_NOISE)}
     if any("<__automatic" in line for line in live):
-        # pfctl's optimizer can fold similar rules into a table [not run: from pfctl(8) -o basic; the 1c VM
-        # had 2 egress slots and showed none]; the lines are then not the ones loaded, so refuse, never guess.
+        # pfctl's optimizer folds similar rules into a table (runs/s2-macos raw/M01c_pf_slots: 8 slots, 2
+        # tables); the lines are then not the ones loaded, so refuse, never guess. pf.load_steps loads with
+        # ``-o none`` so a Levain-loaded anchor never holds one.
         raise Refused("pf-anchor-not-loaded", "the live anchor holds an optimizer table; its rules cannot be read back")
     missing = sorted(expected_slot_rules(slot, ids) - live)
     if missing:
@@ -824,6 +825,26 @@ def _darwin_kernel_groups() -> list:
     return [int(buf[i]) for i in range(n)]
 
 
+def _darwin_maxprocperuid() -> int:
+    """``kern.maxprocperuid`` by ``sysctlbyname`` (an int, readable by any uid): the per-uid process ceiling
+    XNU clamps every ``RLIMIT_NPROC`` set to, silently (runs/s2-macos raw/M01d_M04: 2000 asked, 1333 read
+    back). Raises ``OSError`` when the read fails."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.sysctlbyname
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                   ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    val = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    if fn(b"kern.maxprocperuid", ctypes.byref(val), ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctlbyname kern.maxprocperuid")
+    if size.value != ctypes.sizeof(val):
+        raise OSError(errno.EINVAL, f"sysctlbyname kern.maxprocperuid: {size.value} bytes")
+    return int(val.value)
+
+
 def _linux_caps() -> dict:
     out = {}
     with open("/proc/self/status", encoding="ascii") as fh:
@@ -900,7 +921,7 @@ class OsCalls:
     """Every OS act the stage takes. ``getresuid`` / ``getresgid`` / ``capabilities`` / ``set_nnp`` /
     ``get_nnp``: Linux only (macOS has no public ``getresuid``, plan §2f 8: there the drop is PROVED by
     ``seteuid(0)`` / ``setegid(0)`` failing; XNU has no ``no_new_privs``: a setuid binary there is the
-    profile's to refuse)."""
+    profile's to refuse). ``maxprocperuid``: macOS only, ``kern.maxprocperuid`` (V3)."""
 
     setgroups: Callable = os.setgroups
     setgid: Callable = os.setgid
@@ -919,6 +940,7 @@ class OsCalls:
     capabilities: Optional[Callable] = None
     set_nnp: Optional[Callable] = None
     get_nnp: Optional[Callable] = None
+    maxprocperuid: Optional[Callable] = None
     read_fd: Callable = _read_fd
     read_file: Callable = _read_file
     chdir: Callable = os.chdir
@@ -938,6 +960,7 @@ def real_os_calls() -> OsCalls:
     c = OsCalls()
     if sys.platform == "darwin":
         c.getgroups = _darwin_kernel_groups
+        c.maxprocperuid = _darwin_maxprocperuid
     elif sys.platform.startswith("linux"):
         c.getresuid, c.getresgid, c.capabilities = os.getresuid, os.getresgid, _linux_caps
         c.set_nnp, c.get_nnp = _linux_set_nnp, _linux_get_nnp
@@ -959,6 +982,23 @@ def _proved_fail(step: str, fn: Callable) -> None:
             return
         raise Refused("drop-assert", f"{step}(0) failed with errno {e.errno}, not EPERM") from None
     raise Refused("privilege-regained", f"{step}(0) succeeded after the drop")
+
+
+def _nproc_target(nproc: int, c: OsCalls) -> int:
+    """V3 "macOS min with kern.maxprocperuid": min(``nproc``, the hard limit, which an unprivileged process
+    cannot raise, and on macOS ``kern.maxprocperuid``, which XNU clamps the set to without an error). A
+    ``maxprocperuid`` that cannot be read, or reads as no positive int, is refused: never a guessed ceiling."""
+    soft, hard = c.getrlimit(resource.RLIMIT_NPROC)
+    lim = nproc if hard == resource.RLIM_INFINITY or hard >= nproc else hard
+    if c.maxprocperuid is not None:
+        try:
+            per_uid = c.maxprocperuid()
+        except OSError as e:
+            raise Refused("drop-assert", f"kern.maxprocperuid unreadable: {e.strerror or e}") from None
+        if not _is_int(per_uid) or per_uid <= 0:
+            raise Refused("drop-assert", f"kern.maxprocperuid reads {per_uid!r}")
+        lim = min(lim, per_uid)
+    return lim
 
 
 def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optional[int] = NPROC,
@@ -1001,10 +1041,7 @@ def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optiona
     _proved_fail("seteuid", c.seteuid)
     _proved_fail("setegid", c.setegid)
     if nproc is not None:
-        soft, hard = c.getrlimit(resource.RLIMIT_NPROC)
-        # V3 "macOS min with kern.maxprocperuid": never ask for more than the hard limit already allows,
-        # which an unprivileged process cannot raise.
-        lim = nproc if hard == resource.RLIM_INFINITY or hard >= nproc else hard
+        lim = _nproc_target(nproc, c)
         _do("setrlimit", c.setrlimit, resource.RLIMIT_NPROC, (lim, lim))
         if tuple(c.getrlimit(resource.RLIMIT_NPROC)) != (lim, lim):
             raise Refused("drop-assert", f"RLIMIT_NPROC is {c.getrlimit(resource.RLIMIT_NPROC)}, want {(lim, lim)}")

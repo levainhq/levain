@@ -460,7 +460,8 @@ def signal_child(uid: int, sig: int, *, drop: Callable[[int], None] | None = Non
     (:func:`levain.slot.wall.drop_and_assert`: groups exactly ``{uid}``, gid ``uid`` (§1.1: gid == uid), real
     and effective ids, saved where the host reads them, all ``uid`` != 0, ``seteuid(0)`` proven to fail),
     THEN ``kill(-1, sig)``. A drop that is not proven raises before the kill, so nothing is signalled as root.
-    ``kill(-1)`` from a process that is not root reaches only processes of its own uid, never itself."""
+    ``kill(-1)`` from a process that is not root reaches only processes of its own uid; on macOS that includes
+    the caller (:func:`signal_as_uid` reaps a child its own stop-class signal stopped)."""
     (drop or _drop_to)(uid)
     kill(-1, sig)
 
@@ -469,14 +470,27 @@ def _drop_to(uid: int) -> None:
     drop_and_assert(uid, uid, (uid,), nproc=None)
 
 
+#: The signals whose default action stops the receiver. XNU's ``kill(-1)`` from a uid that is not root reaches
+#: the CALLER too (runs/s2-macos raw/F_M3_exp: the child read ``T`` and its write after the kill never ran).
+_STOP_SIGNALS = frozenset({signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU})
+
+
 def signal_as_uid(uid: int, sig: int, *, fork: Callable[[], int] = os.fork,
                   waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid,
                   child: Callable[[int, int], None] = signal_child,
-                  exit: Callable[[int], None] = os._exit) -> bool:
+                  exit: Callable[[int], None] = os._exit,
+                  kill: Callable[[int, int], None] = os.kill) -> bool:
     """macOS's signal (codex r1 3): fork; the child runs :func:`signal_child` and ``_exit``s
     :data:`SIGNAL_SENT`, or 70 if the drop or the kill raised (ESRCH included: nothing of the uid to signal);
     the parent reaps it. Returns whether the child signalled. Only root can run it (the drop; a target of 0
-    is refused by the drop itself, ``drop-to-root``, and the sweeps that call this ran :func:`check_target`)."""
+    is refused by the drop itself, ``drop-to-root``, and the sweeps that call this ran :func:`check_target`).
+
+    A stop-class ``sig`` stops the child too (its ``kill(-1)`` reaches its own uid, itself included), so the
+    reap waits with ``WUNTRACED``: a child seen STOPPED by ``sig`` counts as sent (``kill(-1)`` delivers to
+    every target in one call); a child stopped by any other signal does not. Either way the stopped child is
+    then SIGKILLed and reaped, so the call never blocks on it. The pid is this call's own unreaped child, so
+    the root kill cannot reach a reused pid. DECISION: a slot process stopping the child with ``sig`` before
+    its kill also reads as sent; the sweeps decide on their scans, the return only paces them."""
     pid = fork()
     if pid == 0:   # the child: never returns into the parent's stack
         code = SIGNAL_SENT
@@ -486,7 +500,15 @@ def signal_as_uid(uid: int, sig: int, *, fork: Callable[[], int] = os.fork,
             code = 70
         finally:
             exit(code)
-    _, status = waitpid(pid, 0)
+    _, status = waitpid(pid, os.WUNTRACED)
+    if os.WIFSTOPPED(status):
+        sent = sig in _STOP_SIGNALS and os.WSTOPSIG(status) == sig
+        try:
+            kill(pid, signal.SIGKILL)
+        except ProcessLookupError:   # already dead: still ours to reap
+            pass
+        waitpid(pid, 0)
+        return sent
     return os.WIFEXITED(status) and os.WEXITSTATUS(status) == SIGNAL_SENT
 
 

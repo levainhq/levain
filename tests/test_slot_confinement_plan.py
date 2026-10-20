@@ -566,9 +566,9 @@ def test_pf_anchor_plan_and_undo():
     plan = _plan("darwin", 2, 1)
     w = [s for s in plan.steps if s.write and s.write[0] == pf.ANCHOR_FILE]
     assert len(w) == 1 and w[0].write[1] == pf.anchor_text(plan.allocation.slots, plan.allocation.ids)
-    assert w[0].validate == ("/sbin/pfctl", "-n", "-a", "com.apple/levain", "-f")
+    assert w[0].validate == ("/sbin/pfctl", "-n", "-o", "none", "-a", "com.apple/levain", "-f")
     argvs = [s.argv for s in plan.steps if s.argv]
-    load = argvs.index(("/sbin/pfctl", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain"))
+    load = argvs.index(("/sbin/pfctl", "-o", "none", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain"))
     enable = next(i for i, s in enumerate(plan.steps) if s.call and "enable reference" in s.why)
     assert plan.steps.index(w[0]) < plan.steps.index(next(s for s in plan.steps if s.argv == argvs[load])) < enable
     # the rules load after every slot account exists
@@ -613,7 +613,7 @@ def test_pf_never_touches_pf_conf():
             blob = " ".join([s.why, *s.argv, *s.skip_if, *s.validate, str(s.write[0]) if s.write else ""])
             assert "/etc/pf.conf" not in blob, s.why
             if s.argv[:1] == ("/sbin/pfctl",) and "-f" in s.argv:
-                assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
+                assert s.argv[1:5] == ("-o", "none", "-a", "com.apple/levain"), s.argv
             if s.argv[:1] == ("/sbin/pfctl",) and "-F" in s.argv:
                 assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
     assert pf.ANCHOR == "com.apple/levain"
