@@ -718,10 +718,17 @@ def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLi
     return ([at_root] if at_root == beside else [at_root, beside]), shared
 
 
-# The line init and doctor print for a workspace whose hooks stay in settings.json (cc_levain_hooks_file).
-CC_HOOKS_ROOT_ONLY = ("levain's hooks run only when Claude Code starts at the workspace folder itself (a session "
-                      "started in a subfolder is not covered: the workspace is not the root of its own git "
-                      "repository)")
+# The line init and doctor print for a workspace whose hooks stay in settings.json (cc_levain_hooks_file). It names
+# no cause: the same branch covers a nested workspace, a linked worktree, no git, the home directory, a root not
+# owned by this user and Windows.
+CC_HOOKS_ROOT_ONLY = ("Claude Code reads levain's hooks only when it starts at the workspace folder itself (a session "
+                      "started in a subfolder is not covered)")
+
+
+def git_env() -> dict[str, str]:
+    """The environment for asking git about a workspace: this process's without any ``GIT_*`` variable, so a caller's
+    GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE (a git hook, an alias) cannot make git answer about another repository."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
 
 def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
@@ -738,7 +745,7 @@ def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
     ws = Path(os.path.abspath(install))
     shared = ws / ".claude" / "settings.json"
     local = ws / ".claude" / "settings.local.json"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # the workspace's git, not a caller's
+    env = git_env()
 
     def ask(*args: str) -> str | None:
         try:
@@ -755,7 +762,9 @@ def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
     if (top is None or common is None or os.path.realpath(top) != real
             or os.path.realpath(os.path.join(ws, common)) != os.path.join(real, ".git")):
         return shared
-    return local if cc_project_settings_files(ws)[0][0] == local else shared
+    # asked for a session started BELOW the workspace: for one started at it the file beside settings.json is this
+    # same file, so the home / ownership / Windows conditions would never show (L2 r2)
+    return local if cc_project_settings_files(ws / "levain-subfolder-probe")[0][0] == local else shared
 
 
 def cc_settings_aliased(install: str | os.PathLike[str]) -> bool:

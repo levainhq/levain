@@ -2926,7 +2926,9 @@ def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[Che
     one row saying a subfolder start is not covered. The expected file's hooks are checked when they hold a levain
     handler; else the other file's, when they do, with a WARN naming `levain update`. Also a WARN for levain's
     hooks in both files, for a levain command naming a missing script (a moved workspace), for the two files being
-    one (a link), and, in the local layout, for a command naming its script through ``${CLAUDE_PROJECT_DIR}``."""
+    one (a link), and, in the local layout, for a command naming its script through ``${CLAUDE_PROJECT_DIR}``, a
+    Claude Code too old to read the local file at the repository root, and a local file git tracks
+    (:func:`_cc_local_layout_rows`)."""
     from levain.host_guard import CC_HOOKS_ROOT_ONLY, cc_levain_hooks_file, cc_settings_aliased
     from levain.install import CC_LOCAL_SETTINGS_REL, _split_hooks
 
@@ -2973,7 +2975,7 @@ def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[Che
         hooks, label = other_hooks, other_label
         why = ("Claude Code reads settings.json only for a session started in the workspace folder: a session "
                "started in a subfolder runs no levain hook (no consent gate)" if in_local else
-               "this workspace is not its git repository's root, so Claude Code does not read that file for it")
+               f"for this workspace levain wires them in {want_label} (see the coverage row)")
         rows.append(CheckResult("levain hooks location", True, f"levain's hooks are in {other_label}: {why}",
                                 f"Run `levain update` to move them to {want_label}.", warn=True))
     else:
@@ -2995,7 +2997,48 @@ def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[Che
                                 "${CLAUDE_PROJECT_DIR}, which is the folder a session starts in, so from a "
                                 "subfolder the script is not found (the hook exits 2, which for UserPromptSubmit "
                                 "blocks the prompt)", "Run `levain update` to write absolute paths.", warn=True))
+    if in_local:
+        rows += _cc_local_layout_rows(install)
     return hooks, label, rows
+
+
+# The Claude Code release that reads settings.local.json at the git repository root (code.claude.com/docs/en/settings:
+# "Before v2.1.211, Claude Code kept the file in the starting directory"): below it a session started in a subfolder
+# does not load the root's file, so the local layout covers nothing beyond the workspace folder.
+CC_LOCAL_AT_ROOT = (2, 1, 211)
+
+
+def _cc_local_layout_rows(install: Path) -> list[CheckResult]:
+    """The local layout's two WARNs (L2 r2): the installed Claude Code is below :data:`CC_LOCAL_AT_ROOT` (the version
+    read as the consent canary reads it; an unreadable version gives no row), and git tracks
+    ``.claude/settings.local.json`` (it carries this machine's absolute paths, and Claude Code holds a tracked
+    file's allow rules until the folder is trusted)."""
+    from levain.consent.canary import agent_version
+    from levain.host_guard import git_env, parse_cc_version
+
+    rows: list[CheckResult] = []
+    version = parse_cc_version(agent_version("claude_code", timeout=10.0) or "")
+    if version is not None and version < CC_LOCAL_AT_ROOT:
+        floor = ".".join(map(str, CC_LOCAL_AT_ROOT))
+        rows.append(CheckResult("levain hooks: Claude Code version", True,
+                                f"Claude Code {'.'.join(map(str, version))} reads .claude/settings.local.json from "
+                                f"the folder a session starts in, not the repository root (from {floor} on it reads "
+                                "the root's), so a session started in a subfolder runs no levain hook",
+                                f"Update Claude Code to {floor} or later.", warn=True))
+    rel = ".claude/settings.local.json"
+    try:
+        r = subprocess.run(["git", "-C", str(install), "ls-files", "--", rel], capture_output=True, text=True,
+                           timeout=10, env=git_env())
+        tracked = r.returncode == 0 and bool(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        tracked = False
+    if tracked:
+        rows.append(CheckResult("levain hooks file tracked", True,
+                                f"git tracks {rel}: it holds this machine's absolute paths, and Claude Code holds a "
+                                "tracked file's allow rules until the folder is trusted",
+                                f"Untrack it (`git rm --cached {rel}`), then run `levain update`, which git-ignores "
+                                "it.", warn=True))
+    return rows
 
 
 def _entries_for(entries: Any, install: Path, script: str) -> list:

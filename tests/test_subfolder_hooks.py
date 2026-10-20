@@ -1,8 +1,9 @@
-"""Levain's Claude Code hooks live in the workspace's .claude/settings.local.json with absolute script paths, never
-in its settings.json (1019 subfolder-hook fix, Option B): Claude Code reads the project settings.json only for a
-session started in the workspace folder, and the local file at the git root, so only the local file reaches a
-session started in a subfolder (measured: project_memory/1019-q10/run9, 1019-subhook/run11). init renders and merges
-it, update migrates an install from before the move, doctor / verify / the resume gate check read it."""
+"""Levain's Claude Code hooks live in the workspace's .claude/settings.local.json with absolute script paths when
+the workspace is the toplevel of a main checkout, else in its settings.json (1019 subfolder-hook fix, Option B;
+host_guard.cc_levain_hooks_file): Claude Code reads the project settings.json only for a session started in the
+workspace folder, and the local file at the git root, so only the local file reaches a session started in a
+subfolder (measured: project_memory/1019-q10/run9, 1019-subhook/run11). init renders and merges it, update migrates
+between the layouts, doctor / verify / the resume gate check read it."""
 
 from __future__ import annotations
 
@@ -509,3 +510,125 @@ def test_s4_update_lists_a_local_file_with_a_non_list_event_and_writes_nothing(m
     r, text = _refresh(cc)
     assert ".claude/settings.local.json" in r.review and "not lists" in text, text
     assert lfile.read_bytes() == before and shared.read_bytes() == shared_before
+
+
+# --- fix r2 (b4/subhook_FIX_r2.md) -------------------------------------------------------------------------------
+
+def _nested_ws(tmp_path: Path) -> Path:
+    """A workspace nested in a bigger repo: the settings.json layout, by git's answer (not a monkeypatch)."""
+    _g("init", "-q", str(tmp_path / "outer"))
+    ws = tmp_path / "outer" / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    return ws
+
+
+def test_r2_t1_shared_layout_leaves_a_broken_local_file_alone(tmp_path, capsys, real_layout):
+    ws = _nested_ws(tmp_path)
+    lfile = ws.joinpath(*LOCAL)
+    lfile.write_bytes(b"{not json")
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    assert lfile.read_bytes() == b"{not json"
+    assert "left as it is (levain could not read it" in out and "holds levain's hooks" not in out, out
+    assert _levain_cmds(_json(ws / ".claude" / "settings.json"), ws)
+    r, text = _refresh(ws)
+    assert "/".join(LOCAL) not in r.review and "holds levain's hooks" not in text, text
+    assert "left as it is (levain could not read it" in text
+    assert lfile.read_bytes() == b"{not json"
+    row = _row(doctor._check_claude_code(ws), "/".join(LOCAL))
+    assert row.ok and row.warn  # a WARN in this layout, never a FAIL
+
+
+def test_r2_t1_shared_layout_still_refuses_a_parsing_file_with_levain_hooks_it_cannot_rewrite(
+        tmp_path, capsys, real_layout):
+    ws = _nested_ws(tmp_path)
+    mine = {"type": "command", "command": f'"/py" "{ws}/activation/hooks/session_start.py"'}
+    text = json.dumps({"hooks": {"Stop": "x", "SessionStart": [{"hooks": [mine]}]}})
+    ws.joinpath(*LOCAL).write_text(text, encoding="utf-8")
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 1 and "holds levain's hooks" in out, out
+    assert ws.joinpath(*LOCAL).read_text(encoding="utf-8") == text
+
+
+def test_r2_t2_the_gitignore_step_asks_the_workspace_s_git_not_the_caller_s(tmp_path, monkeypatch):
+    other = tmp_path / "other"
+    _g("init", "-q", str(other))
+    (other / ".git" / "info" / "exclude").write_text(".claude/settings.local.json\n", encoding="utf-8")
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    (ws / ".claude").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # no global excludes (Claude Code adds the file to them)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))  # a caller's repository (a git hook, an alias)
+    assert "GIT_DIR" not in host_guard.git_env()
+    line = inst._ensure_local_settings_ignored(ws)
+    assert line and "added to .claude/.gitignore" in line, line
+    assert (ws / ".claude" / ".gitignore").read_text().splitlines() == ["settings.local.json"]
+
+
+def test_r2_t3_the_root_only_line_names_no_cause():
+    assert "git" not in host_guard.CC_HOOKS_ROOT_ONLY
+    assert host_guard.CC_HOOKS_ROOT_ONLY.startswith(
+        "Claude Code reads levain's hooks only when it starts at the workspace folder itself")
+
+
+@pytest.mark.parametrize("version,warns", [("2.1.210", True), ("2.1.211", False), ("2.1.304", False), (None, False)])
+def test_r2_t4_doctor_warns_on_a_claude_code_too_old_for_the_root_local_file(make_install, monkeypatch, version,
+                                                                             warns):
+    from levain.consent import canary
+
+    cc = make_install("cc")
+    monkeypatch.setattr(canary, "agent_version", lambda agent, **_: version if agent == "claude_code" else None)
+    rows = [r for r in doctor._check_claude_code(cc) if r.name == "levain hooks: Claude Code version"]
+    if warns:
+        (row,) = rows
+        assert row.ok and row.warn and "2.1.210" in row.detail and "2.1.211" in row.hint
+    else:
+        assert not rows
+
+
+def test_r2_t4_no_version_row_in_the_settings_json_layout(tmp_path, capsys, real_layout, monkeypatch):
+    from levain.consent import canary
+
+    ws = _nested_ws(tmp_path)
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    monkeypatch.setattr(canary, "agent_version", lambda agent, **_: "2.1.100")
+    assert not [r for r in doctor._check_claude_code(ws) if r.name == "levain hooks: Claude Code version"]
+
+
+def test_r2_t5_doctor_warns_when_git_tracks_the_local_file(tmp_path, capsys, real_layout):
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    rc, out = _init_at(ws, tmp_path, capsys)
+    assert rc == 0, out
+    assert not [r for r in doctor._check_claude_code(ws) if r.name == "levain hooks file tracked"]
+    _g("-C", str(ws), "add", "-f", "/".join(LOCAL))
+    row = _row(doctor._check_claude_code(ws), "levain hooks file tracked")
+    assert row.ok and row.warn and "git rm --cached" in row.hint
+
+
+def test_r2_t6_a_claude_entry_not_owned_by_the_user_keeps_the_local_file_beside(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    (ws / ".claude").mkdir()
+    (ws / "sub").mkdir()
+    assert host_guard.cc_project_settings_files(ws / "sub")[0][0] == ws.joinpath(*LOCAL)
+    assert REAL_LAYOUT(ws) == ws.joinpath(*LOCAL)
+    real_owned = host_guard._owned
+    monkeypatch.setattr(host_guard, "_owned", lambda p: Path(p).name != ".claude" and real_owned(p))
+    assert host_guard.cc_project_settings_files(ws / "sub")[0] == [ws / "sub" / ".claude" / "settings.local.json"]
+    assert REAL_LAYOUT(ws) == ws / ".claude" / "settings.json"
+
+
+def test_r2_t7_the_local_file_is_replaced_whole_and_keeps_its_mode(tmp_path, init_into):
+    (tmp_path / "cc" / ".claude").mkdir(parents=True)
+    lfile = (tmp_path / "cc").joinpath(*LOCAL)
+    lfile.write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}), encoding="utf-8")
+    os.chmod(lfile, 0o640)
+    ino = os.stat(lfile).st_ino
+    cc = init_into("cc")
+    assert _levain_cmds(_json(lfile), cc)
+    st = os.stat(lfile)
+    assert st.st_ino != ino and (st.st_mode & 0o777) == 0o640  # temp file + os.replace, mode carried
+    assert not [p.name for p in (cc / ".claude").iterdir() if p.name.endswith(".tmp")]

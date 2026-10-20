@@ -413,8 +413,8 @@ def _resolve_install_python(install: Path) -> str:
 def _resolve_install_launcher(install: Path) -> list[str]:
     """Return the Python interpreter path the install's adapter is wired to.
 
-    Reads it from `.claude/settings.local.json` (Claude Code; `.claude/settings.json` on an install from
-    before levain's hooks moved there) or `~/.codex/hooks.json`
+    Reads it from the file levain wires Claude Code's hooks into (host_guard.cc_levain_hooks_file:
+    `.claude/settings.local.json` or `.claude/settings.json`, then the other one) or `~/.codex/hooks.json`
     via CODEX_HOME (Codex). Falls back to `sys.executable` when no config is
     available or no python can be extracted. The point is to test the same
     interpreter the harness will actually invoke at fire time, which may
@@ -459,9 +459,10 @@ def _resolve_install_launcher(install: Path) -> list[str]:
 
 # Claude Code's settings.template.json writes the hook command with a RUNTIME
 # harness placeholder, `${CLAUDE_PROJECT_DIR}`, that Claude Code substitutes at
-# fire time. `levain init` now fills it with the install path (levain's hooks
-# live in settings.local.json with absolute paths), but an install from before
-# that, until `levain update`, has a settings.json that literally contains
+# fire time. Where levain's hooks live in settings.local.json (host_guard.
+# cc_levain_hooks_file) `levain init` fills it with the install path; where
+# they live in settings.json, and on an install from before the local file
+# until `levain update`, the file literally contains
 # `${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py`. To match that
 # against this install's hooks dir we substitute it ourselves — the same
 # substitution doctor.py makes (see _hook_command_targets). Kept as a named
@@ -481,9 +482,9 @@ def _launcher_from_hooks_config(path: Path, install: Path) -> list[str] | None:
         {"hooks": {<event>: [{"hooks": [{"command": "..."}, ...]}]}}
 
     The script-path token may carry a RUNTIME harness placeholder
-    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — an install
-    from before levain's hooks moved to settings.local.json carries the template's
-    shape (the harness substitutes it at fire time). We substitute it here so the foreign-hook
+    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — settings.json
+    carries the template's shape wherever levain's hooks live there (the harness
+    substitutes it at fire time). We substitute it here so the foreign-hook
     filter can still locate the script inside THIS install. Without this the
     filter would reject every Claude Code install's command as "foreign" and
     verify-hooks would silently fall back to its own interpreter — testing the

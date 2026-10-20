@@ -273,8 +273,9 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     from levain.host_guard import cc_project_settings_files
 
     user = Path(config_dir) if config_dir else Path.home() / ".claude"
-    # the project files Claude Code loads for a session in cwd: settings.local.json (where levain wires the gate)
-    # at the git root and beside settings.json, and settings.json from cwd itself
+    # the project files Claude Code loads for a session in cwd: settings.local.json at the git root and beside
+    # settings.json, and settings.json from cwd itself (levain wires the gate in one of them, per workspace:
+    # host_guard.cc_levain_hooks_file)
     local, shared = cc_project_settings_files(cwd)
     project = Path(cwd) / ".claude"
     hook_files = [*local, shared, user / "settings.json"]
