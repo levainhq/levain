@@ -28,17 +28,27 @@ from below), a signature verifier that cannot run (:class:`levain.authority.Veri
 that cannot run to sign (:class:`SignerUnavailable`). Every exit 3 from ``sign`` or ``cancel`` also says what did NOT
 happen. The command line's own refusals are :class:`InputRefused`, so nothing raised below it reads as "refused".
 
-Until the template registry and the provider policy live in signed control state (F3), :func:`resolvers` has neither,
-and ``file`` refuses: every contract would be R2, which is never dispatched. Stdlib only.
+CONFIGURATION is the operator's too (``levain dispatch config``, the F3 store :mod:`levain.dispatch.control`):
+``init`` pins the operator's laptop key as the store's trust root, ``sign`` turns a body file into the next signed
+item (the registry judges the body first, and a body it refuses is refused before any key is touched; the item is
+shown, kind, generation, store, prev and a diff against the active body of its kind, before the touch), ``accept``
+takes an item signed elsewhere, and ``show`` reads the active configuration back. ``init``, ``sign`` and ``accept``
+are refused to an agent, as ``sign`` is; ``show`` is open. :func:`resolvers` reads the template registry and the
+provider policy from that store, in one verified read, so a filing resolves through what the operator signed; with
+no store, ``file`` refuses (every contract would be R2, which is never dispatched), and a store that cannot be
+trusted is exit 3 with nothing filed. Stdlib only.
 
 Known edges: a read path made of homoglyphs shows as the path it imitates (a write path is bounded by the operator's
-template, so only what is read can be dressed up). ``file`` reports a template resolver that raises as a refusal
-(exit 2), not a fault; revisited when F3's resolver is wired in.
+template, so only what is read can be dressed up). ``file`` reports a template the active configuration refuses (one
+that no longer loads, or whose verifier no longer agrees) as a refusal, exit 2. The configuration is read once per
+filing, so a configuration item accepted while a filing resolves applies to the next filing, not that one.
 """
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -51,6 +61,8 @@ from typing import Any, TypeVar
 from levain.authority import VerifierUnavailable
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
+from levain.dispatch import control as dctl
+from levain.dispatch import registry as dregistry
 from levain.dispatch import sign as dsign
 from levain.dispatch.contract import NEW, GitUnavailable, ResolvedTemplate
 from levain.dispatch.jobs import (
@@ -86,18 +98,45 @@ class _NotDone(Exception):
         self.fault, self.not_done = fault, not_done
 
 
-# machine faults first: GitUnavailable is a ContractRefused and JobStoreError a DispatchError, and each must be read
-# as the fault it is; a ValueError raised below the command line is a fault too (its own refusals are InputRefused)
-_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, SignerUnavailable,
-           sqlite3.Error, OSError, ValueError)
+# machine faults first: GitUnavailable is a ContractRefused, and JobStoreError and ControlStateUnavailable are
+# DispatchErrors, and each must be read as the fault it is; a ValueError raised below the command line is a fault too
+# (its own refusals are InputRefused)
+_FAULTS = (GitUnavailable, JobStoreError, dctl.ControlStateUnavailable, caps.CapabilityRecordError,
+           VerifierUnavailable, SignerUnavailable, sqlite3.Error, OSError, ValueError)
 _REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
 
-def resolvers() -> tuple[Callable[[str], ResolvedTemplate | None], ProviderPolicy] | None:
-    """The template registry and the provider policy a filing resolves through, or ``None``. ``None`` until F3
-    places both in signed, generation-checked control state: a policy or registry read from a file an agent can
-    write would let the planner choose its own gate."""
-    return None
+class _ActiveConfiguration:
+    """One verified read of the active configuration, answering the registry's readers (:func:`registry.resolver`,
+    :func:`registry.active_policy`) from it: the template and the policy a filing binds come from one generation."""
+
+    def __init__(self, active: Any) -> None:
+        self._active = active
+
+    def active(self) -> Any:
+        return self._active
+
+
+def resolvers(directory: Path | None = None, data_root: Path | None = None,
+              ) -> tuple[Callable[[str], ResolvedTemplate | None], ProviderPolicy] | None:
+    """The template registry and the provider policy a filing resolves through, read from the signed control store
+    in ``directory`` (default: the dispatch directory), verified against the cockpit ``data_root`` names (default:
+    the one the consent hooks there name, as ``sign`` finds it). ``None`` when there is no control store: nothing is
+    configured, so every contract is R2. A store that cannot be trusted raises
+    :class:`levain.dispatch.control.ControlStateUnavailable` (a fault: nothing was filed); a store with no provider
+    policy accepted refuses (:class:`DispatchError`)."""
+    from levain.dispatch.jobs import default_dispatch_dir
+
+    d = Path(directory) if directory is not None else default_dispatch_dir()
+    if not os.path.lexists(d / dctl.DB_NAME):
+        return None
+    try:
+        root = Path(data_root) if data_root is not None else None
+        active = dctl.ControlStore(d, authority=_authority_source(d, root)).active()
+    except dctl.ControlStateUnavailable as exc:
+        raise dctl.ControlStateUnavailable(f"{exc}; nothing was filed") from None
+    config = _ActiveConfiguration(active)
+    return dregistry.resolver(config), dregistry.active_policy(config)
 
 
 def _safe(text: object) -> str:
@@ -169,17 +208,18 @@ def planner_session(agent: str | None, session: str | None) -> tuple[str | None,
 
 def file_job(store: JobStore, submission: Any, *, agent: str | None, session: str, idem_key: str | None = None,
              resolved: tuple[Callable[[str], ResolvedTemplate | None], ProviderPolicy] | None = None,
-             ) -> tuple[Job, str | None, str]:
+             data_root: Path | None = None) -> tuple[Job, str | None, str]:
     """File ``submission`` for the planner ``agent``/``session`` and keep its capability in that session's record;
     returns the job, its capability (``None`` on an idempotent replay) and one sentence on where the capability is
-    kept. ``resolved`` is (template resolver, policy), :func:`resolvers` when not given.
+    kept. ``resolved`` is (template resolver, policy), :func:`resolvers` over the store's directory and
+    ``data_root`` when not given.
 
     The session's record is checked before the filing (:func:`levain.dispatch.capability.preflight`): a record that
     cannot be kept for a reason already on disk is a fault on this machine, and nothing is filed. A record that
     still fails after the filing does not undo it: the job IS filed, so the capability is shown this once with
     "NOT kept" and the call succeeds; a retry with the same ``idem_key`` is the idempotent replay, which files
     nothing new."""
-    resolved = resolved if resolved is not None else resolvers()
+    resolved = resolved if resolved is not None else resolvers(store.directory, data_root)
     if resolved is None:
         raise ContractRefused(NO_REGISTRY)
     resolve_template, policy = resolved
@@ -305,17 +345,23 @@ def _store(args: argparse.Namespace) -> JobStore:
     return JobStore(args.dispatch_dir.expanduser() if args.dispatch_dir is not None else None)
 
 
-def _read_contract(source: str) -> Any:
+def _read_input(source: str, limit: int, what: str) -> bytes:
+    """The bytes of file ``source`` (``-``: stdin), refused when it cannot be read or is over ``limit`` bytes."""
     try:
         if source == "-":
-            raw = sys.stdin.buffer.read(_CONTRACT_MAX + 1)
+            raw = sys.stdin.buffer.read(limit + 1)
         else:
             with open(Path(source).expanduser(), "rb") as fh:
-                raw = fh.read(_CONTRACT_MAX + 1)
+                raw = fh.read(limit + 1)
     except OSError as exc:
-        raise InputRefused(f"the contract file cannot be read: {exc.strerror or exc}") from None
-    if len(raw) > _CONTRACT_MAX:
-        raise InputRefused(f"the contract is over {_CONTRACT_MAX} bytes")
+        raise InputRefused(f"the {what} file cannot be read: {exc.strerror or exc}") from None
+    if len(raw) > limit:
+        raise InputRefused(f"the {what} is over {limit} bytes")
+    return raw
+
+
+def _read_contract(source: str) -> Any:
+    raw = _read_input(source, _CONTRACT_MAX, "contract")
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -354,17 +400,21 @@ def _confirm(args: argparse.Namespace, job: Job, what: str, out: Any) -> None:
 
 
 def _authority(args: argparse.Namespace, store: JobStore) -> Any:
-    """The authority source a laptop signature is verified against: ``--data-root``, else the one cockpit the
-    consent hooks in the dispatch directory verify against; refused before anything is signed when there is no
-    single cockpit there."""
+    return _authority_source(store.directory, args.data_root)
+
+
+def _authority_source(directory: Path, data_root: Path | None) -> Any:
+    """The authority source a laptop signature is verified against: ``data_root`` (``--data-root``), else the one
+    cockpit the consent hooks in ``directory`` (the dispatch directory) verify against; refused before anything is
+    signed when there is no single cockpit there."""
     from levain.authority import anchor_path
     from levain.consent.answering import hook_roots
     from levain.consent.queue import authority_source
 
-    if args.data_root is not None:
-        root = args.data_root.expanduser()
+    if data_root is not None:
+        root = data_root.expanduser()
     else:
-        roots = hook_roots(store.directory)
+        roots = hook_roots(directory)
         if len(roots) != 1:
             raise InputRefused("name the cockpit data root with --data-root (the consent hooks here name "
                              + ("none" if not roots else f"{len(roots)}: {', '.join(map(str, roots))}") + ")")
@@ -389,13 +439,18 @@ def _signer(args: argparse.Namespace, namespace: str, what: str) -> tuple[str, C
 
 
 def _signature(sign: Callable[[bytes], str], payload: dict[str, str]) -> str:
-    """``payload`` signed. An ssh-keygen that could not run or timed out (the chained cause) is
+    """``payload`` signed, as :func:`_sign_bytes` signs its message."""
+    return _sign_bytes(sign, dsign.sign_message(payload))
+
+
+def _sign_bytes(sign: Callable[[bytes], str], message: bytes) -> str:
+    """``message`` signed. An ssh-keygen that could not run or timed out (the chained cause) is
     :class:`SignerUnavailable`, a fault; a key that would not sign (a cancelled touch, a refusing exit) is the
     operator's refusal."""
     from levain.cockpit.keys import KeyError_
 
     try:
-        return sign(dsign.sign_message(payload))
+        return sign(message)
     except KeyError_ as exc:
         if isinstance(exc.__cause__ or exc.__context__, (OSError, subprocess.TimeoutExpired)):
             raise SignerUnavailable(str(exc)) from exc
@@ -467,18 +522,234 @@ def _signed_cancel(args: argparse.Namespace, store: JobStore, seen: dict[str, Jo
     return store.cancel_by_human(job.id, payload, _signature(sign, payload), authority)
 
 
+# --- configuration (the F3 control store) ----------------------------------------------------------------------------
+
+def _config_dir(args: argparse.Namespace) -> Path:
+    from levain.dispatch.jobs import default_dispatch_dir
+
+    return args.dispatch_dir.expanduser() if args.dispatch_dir is not None else default_dispatch_dir()
+
+
+def _control(args: argparse.Namespace, directory: Path) -> dctl.ControlStore:
+    """The control store in ``directory``, verified against the cockpit :func:`_authority_source` picks; refused,
+    pointing at ``config init``, when there is none."""
+    if not os.path.lexists(directory / dctl.DB_NAME):
+        raise InputRefused(f"there is no dispatch configuration store at {directory / dctl.DB_NAME}; create it with "
+                           "`levain dispatch config init --trust-root <your laptop key's fingerprint>`")
+    return dctl.ControlStore(directory, authority=_authority_source(directory, args.data_root))
+
+
+def _verified(store: dctl.ControlStore) -> tuple[dict[str, dctl.ConfigItem], int, str]:
+    """``(items, top, head)`` from ONE verified read: the latest item of every kind (adoption rules included), the
+    highest generation and its digest. The newest item is the latest of its own kind, so it is among the items."""
+    items = dict(store._verified_items())
+    newest = max(items.values(), key=lambda i: i.generation, default=None)
+    return items, (0 if newest is None else newest.generation), ("" if newest is None else newest.digest)
+
+
+def _pretty(body: Any) -> list[str]:
+    # the canonical value (keys sorted, as canonical() sorts them), one key per line, every non-ASCII character
+    # escaped so a homoglyph shows as what it is
+    return json.dumps(body, indent=2, sort_keys=True, ensure_ascii=True).split("\n")
+
+
+def _item_view(kind: str, generation: int, item_store: str, store_id: str, prev: str, body: Any,
+               active: dctl.ConfigItem | None) -> tuple[list[str], str]:
+    """The item as shown before it is signed or accepted, in a fixed shape (kind, generation, store, prev, then the
+    body as a unified diff against the active body of its kind, or in full under "new kind"), and a one-line count
+    of the change for the summary above the prompt."""
+    store_line = item_store if item_store == store_id else f"{item_store} (NOT this store, {store_id})"
+    lines = ["levain dispatch config: the item", f"  kind        {kind}", f"  generation  {generation}",
+             f"  store       {store_line}", f"  prev        {prev or '(none: the first item)'}"]
+    new = _pretty(body)
+    if active is None:
+        lines.append(f"  new kind: no {kind} item is active; its body in full:")
+        lines += [f"    +{line}" for line in new]
+        change = f"new kind, {len(new)} lines"
+    else:
+        diff = list(difflib.unified_diff(_pretty(active.body), new, lineterm="",
+                                         fromfile=f"{kind}, active (generation {active.generation})",
+                                         tofile=f"{kind}, generation {generation}"))
+        if diff:
+            lines.append(f"  change against the active {kind} (generation {active.generation}):")
+            lines += [f"    {line}" for line in diff]
+        else:
+            lines.append(f"  no change: the body is the active {kind} body (generation {active.generation})")
+        added = sum(1 for d in diff[2:] if d.startswith("+"))
+        removed = sum(1 for d in diff[2:] if d.startswith("-"))
+        change = f"+{added} -{removed} lines against generation {active.generation}"
+    return [_safe(line) for line in lines], change
+
+
+def _confirm_item(args: argparse.Namespace, verb: str, kind: str, generation: int, store_id: str, change: str,
+                  top: int, out: Any) -> None:
+    """y/N right below a fixed-height summary of the item; refused without a terminal unless ``--yes``."""
+    if args.yes:
+        return
+    if not _is_tty():
+        raise InputRefused(f"config {verb} asks y/N on the operator's terminal and this process has none; run "
+                           f"`levain dispatch config {verb}` in your own terminal")
+    print("\n".join([f"---- you are about to {verb} a configuration item ----", f"  kind        {kind}",
+                     f"  generation  {generation} (the store is at {top})", f"  store       {store_id}",
+                     f"  change      {change} (in full above)"]),
+          file=sys.stderr if args.json else out, flush=True)
+    try:
+        answer = input(f"{verb} {kind} as generation {generation}? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        done = "signed" if verb == "sign" else "accepted"
+        raise InputRefused(f"not confirmed; nothing was {done} and the configuration is still generation {top}")
+
+
+def _config_not_done(store: dctl.ControlStore, top: int) -> str:
+    """What a faulted ``config sign`` / ``config accept`` did NOT do, after its item was handed to the store at
+    generation ``top`` + 1, with the generation read again when the store answers."""
+    try:
+        now = _verified(store)[1]
+    except (*_FAULTS, DispatchError):
+        return ("whether the item was accepted is not known (the store could not be read again): read it with "
+                "`levain dispatch config show`")
+    if now == top:
+        return f"nothing was accepted; generation is still {top}"
+    return (f"the configuration is now generation {now} (was {top}); the store faulted, so whether this item is the "
+            "one accepted is not known: read it with `levain dispatch config show`")
+
+
+def _accept_guarded(store: dctl.ControlStore, item: bytes, signature: str, top: int) -> dctl.ConfigItem:
+    try:
+        return store.accept(item, signature)
+    except _FAULTS as exc:
+        raise _NotDone(exc, _config_not_done(store, top)) from exc
+
+
+def _read_body(source: str) -> Any:
+    from levain.contracts.canon import parse
+
+    raw = _read_input(source, dctl.ITEM_MAX_BYTES, "configuration body")
+    try:
+        return parse(raw)
+    except ValueError as exc:   # ContractError: the leaf-data rules (no floats, no duplicate keys, ...)
+        raise InputRefused(f"the configuration body is not JSON a configuration item can hold: {exc}") from None
+
+
+def _kind_summary(kind: str, item: dctl.ConfigItem, items: dict[str, dctl.ConfigItem]) -> tuple[dict[str, Any], str]:
+    """One active kind as data and as one line of text."""
+    body, gen = item.body, item.generation
+    if kind == "templates":
+        ids = [str(t.get("id")) for t in body if isinstance(t, dict)]
+        return {"generation": gen, "ids": ids}, ", ".join(ids) or "(no templates)"
+    if kind == "verifiers":
+        kinds = {str(v): str(spec.get("kind")) for v, spec in body.items()}
+        return {"generation": gen, "verifiers": kinds}, ", ".join(f"{v} ({k})" for v, k in kinds.items())
+    if kind == "provider_policy":
+        providers = sorted(body.get("providers", {}))
+        return ({"generation": gen, "providers": providers, "never": len(body.get("never", []))},
+                f"providers {', '.join(providers) or '(none)'}; {len(body.get('never', []))} never-patterns")
+    if kind == "routemap":
+        routes = [str(r.get("route")) for r in body.get("routes", []) if isinstance(r, dict)]
+        return {"generation": gen, "routes": routes}, ", ".join(routes) or "(no routes)"
+    # adoption rules: counted, and re-judged against the configuration active now, as their only reader judges them
+    problem = dregistry.body_refusal(kind, body, items)
+    data: dict[str, Any] = {"generation": gen, "count": len(body), "hold": problem is None}
+    if problem is not None:
+        data["why"] = problem
+    return data, f"{len(body)} rule{'s' if len(body) != 1 else ''}" + (
+        "" if problem is None else f" (they NO LONGER HOLD: {problem})")
+
+
+def _run_config(args: argparse.Namespace, out: Any, emit: Callable[[Any, str], None]) -> int:
+    cmd = args.config_cmd
+    d = _config_dir(args)
+    if cmd == "show":
+        path = d / dctl.DB_NAME
+        if not os.path.lexists(path):
+            emit({"configured": False, "store": str(path)},
+                 f"levain dispatch config: nothing is configured (no control store at {path}); "
+                 "`levain dispatch config init` creates it.")
+            return EXIT_OK
+        store = _control(args, d)
+        items, top, head = _verified(store)
+        kinds = {k: _kind_summary(k, items[k], items) for k in dctl.KINDS if k in items}
+        emit({"configured": True, "store": str(path), "store_id": store.store_id(), "trust_root": store.trust_root(),
+              "generation": top, "head": head, "kinds": {k: v[0] for k, v in kinds.items()}},
+             "\n".join(_safe(line) for line in [
+                 f"levain dispatch config: store {store.store_id()}, generation {top}, head {head or '(none)'}",
+                 f"  trust root       {store.trust_root()}",
+                 *[f"  {k:<16} " + (f"(generation {kinds[k][0]['generation']})  {kinds[k][1]}" if k in kinds
+                                    else "(none accepted)") for k in dctl.KINDS]]))
+        return EXIT_OK
+    _refuse_an_agent(f"config {cmd}")
+    if cmd == "init":
+        authority = _authority_source(d, args.data_root)
+        dctl.ControlStore.init(d, args.trust_root, authority=authority)
+        store = dctl.ControlStore(d, authority=authority)
+        sid = store.store_id()
+        emit({"store": str(store.path), "store_id": sid, "trust_root": store.trust_root()},
+             f"levain dispatch config: the control store {store.path} (store id {sid}) is pinned to "
+             f"{store.trust_root()}. Sign its first item with `levain dispatch config sign <kind> <body.json> "
+             "--signing-key <that key>` (verifiers before templates).")
+        return EXIT_OK
+    view_out = sys.stderr if args.json else out
+    if cmd == "sign":
+        body = _read_body(args.body)
+        store = _control(args, d)
+        items, top, head = _verified(store)
+        problem = dregistry.body_refusal(args.kind, body, items)
+        if problem is not None:
+            raise dctl.ConfigRefused(f"{args.kind}: {problem}; nothing was signed")
+        sid = store.store_id()
+        item = dctl.item_bytes(args.kind, top + 1, body, datetime.now(timezone.utc), prev=head, store_id=sid)
+        dctl.parse_item(item)    # the item's own bounds, judged before the touch rather than at accept
+        lines, change = _item_view(args.kind, top + 1, sid, sid, head, body, items.get(args.kind))
+        print("\n".join(lines), file=view_out, flush=True)
+        signer_fp, sign = _signer(args, dctl.CONFIG_NAMESPACE, "config sign")
+        root = store.trust_root()
+        if signer_fp != root:
+            raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only the "
+                               "root's signature is accepted. Nothing was signed")
+        _confirm_item(args, "sign", args.kind, top + 1, sid, change, top, out)
+        try:
+            signature = _sign_bytes(sign, item)
+        except SignerUnavailable as exc:
+            raise _NotDone(exc, f"nothing was signed or accepted; generation is still {top}") from exc
+        accepted = _accept_guarded(store, item, signature, top)
+    else:   # accept
+        raw = _read_input(args.item, dctl.ITEM_MAX_BYTES, "configuration item")
+        try:
+            signature = _read_input(args.signature, dctl.SIGNATURE_MAX, "signature").decode("utf-8")
+        except UnicodeDecodeError:
+            raise InputRefused("the signature file is not UTF-8 text") from None
+        parsed = dctl.parse_item(raw)
+        store = _control(args, d)
+        items, top, _head = _verified(store)
+        sid = store.store_id()
+        # the store judges the generation, the chain link, the store id and the signature; the view shows them
+        lines, change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
+                                   items.get(parsed.kind))
+        print("\n".join(lines), file=view_out, flush=True)
+        _confirm_item(args, "accept", parsed.kind, parsed.generation, sid, change, top, out)
+        accepted = _accept_guarded(store, raw, signature, top)
+    emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest},
+         f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}.")
+    return EXIT_OK
+
+
 def _run(args: argparse.Namespace, out: Any) -> int:
-    store = _store(args)
     cmd = args.dispatch_cmd
 
     def emit(data: Any, text: str) -> None:
         # ASCII-escaped JSON: no C1 control or line separator reaches a terminal raw
         print(json.dumps(data, ensure_ascii=True, indent=2) if args.json else text, file=out, flush=True)
 
+    if cmd == "config":
+        return _run_config(args, out, emit)
+    store = _store(args)
     if cmd == "file":
         submission = _read_contract(args.contract)
         agent, session = planner_session(args.agent, args.session)
-        job, capability, kept = file_job(store, submission, agent=agent, session=session, idem_key=args.idem_key)
+        job, capability, kept = file_job(store, submission, agent=agent, session=session, idem_key=args.idem_key,
+                                         data_root=args.data_root)
         emit({"id": job.id, "digest": job.digest, "state": job.state, "lease_end": job.lease_end,
               "capability": capability, "capability_kept": kept},
              "\n".join([f"levain dispatch: filed job {job.id} ({job.state})",
@@ -547,6 +818,11 @@ def _run(args: argparse.Namespace, out: Any) -> int:
                                             "operator can still cancel it, signed: `levain dispatch cancel --human`") \
                         from None
             if args.capability is None and not args.human:
+                # the job is read before a word on how it would be cancelled: an unknown id is refused as unknown
+                job = seen["job"] = _must_get(store, args.job)
+                if job.state in TERMINAL:
+                    raise TransitionRefused(f"job {job.id} is {job.state}, which is final; only a live job can be "
+                                            "cancelled")
                 print(f"levain dispatch: no capability for job {_safe(args.job)[:40]} in this session's record "
                       f"({agent or 'no agent'}, "
                       f"{'no session' if session == caps.NO_SESSION else _safe(session)[:80]}); cancelling as the "
@@ -606,19 +882,28 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--session", default=None,
                        help="The planner session, when no agent is detected (under a detected agent it must match).")
 
-    def signer(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
-                       help="An enrolled key that signs (its private key file, or the .pub of a key an agent holds).")
+    def data_root(p: argparse.ArgumentParser) -> None:
         p.add_argument("--data-root", dest="data_root", type=Path, default=None,
                        help="The cockpit data root whose authority log verifies the signature (default: the one the "
                             "consent hooks in the dispatch directory name).")
+
+    def yes(p: argparse.ArgumentParser) -> None:
         p.add_argument("--yes", action="store_true",
                        help="Do not ask y/N; the whole view is still printed. Never from an agent's process.")
+
+    def signer(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
+                       help="An enrolled key that signs (its private key file, or the .pub of a key an agent holds).")
+        data_root(p)
+        yes(p)
 
     f = sub.add_parser("file", help="File a task contract (planner); prints the job and its capability once.")
     f.add_argument("contract", help="The contract JSON file, or - for stdin.")
     f.add_argument("--idem-key", dest="idem_key", default=None,
                    help="A replay with the same key and contract returns the same job (and no capability).")
+    f.add_argument("--data-root", dest="data_root", type=Path, default=None,
+                   help="The cockpit data root the dispatch configuration is verified against (default: the one the "
+                        "consent hooks in the dispatch directory name).")
     planner(f)
     sh = sub.add_parser("show", help="One job, resolved as the signer sees it.")
     sh.add_argument("job")
@@ -640,5 +925,28 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rc.add_argument("job")
     rc.add_argument("--capability", default=None, help="The job's capability (default: this session's record).")
     planner(rc)
-    for p in (f, sh, ls, sg, cn, rc):
+    cf = sub.add_parser(
+        "config", help="The dispatch configuration (the operator): init the store, show it, sign or accept an item.",
+        description="Templates, verifiers, the provider policy, the route map and the adoption rules are signed "
+                    "configuration items, one hash chain, verified against the trust root pinned at init. An item "
+                    "is shown (kind, generation, store, prev, and its change against the active body of its kind) "
+                    "before it is signed or accepted.")
+    csub = cf.add_subparsers(dest="config_cmd", required=True)
+    ci = csub.add_parser("init", help="Create the control store and pin the operator's laptop key as its trust root.")
+    ci.add_argument("--trust-root", dest="trust_root", required=True,
+                    help="The fingerprint (SHA256:...) of an enrolled, active laptop key that covers T3, held at a "
+                         "stated presence custody.")
+    data_root(ci)
+    cs = csub.add_parser("show", help="The active configuration: store, generation, head and each kind.")
+    data_root(cs)
+    cg = csub.add_parser("sign", help="Sign a body as the next item of its kind and accept it, after reading it.")
+    cg.add_argument("kind", choices=dctl.KINDS)
+    cg.add_argument("body", help="The item's body as a JSON file, or - for stdin.")
+    signer(cg)
+    ca = csub.add_parser("accept", help="Accept an item signed elsewhere (its canonical bytes and its signature).")
+    ca.add_argument("item", help="The item's canonical bytes, as a file.")
+    ca.add_argument("signature", help="Its SSHSIG signature, as a file.")
+    data_root(ca)
+    yes(ca)
+    for p in (f, sh, ls, sg, cn, rc, ci, cs, cg, ca):
         common(p)

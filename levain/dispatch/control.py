@@ -59,9 +59,9 @@ before the newest fails the walk on read, and an old item cannot be re-signed in
   ``ssh-keygen`` once per configuration kind present (cost, not safety).
 - The R0 CamelCase test rule is casefolded, so a source file whose name ends in ``test`` (``Latest.java``) is refused
   at registration: a visible, fail-safe false positive.
-- The signing tool, when it is built, shows the item before the touch: kind, generation, store id, and its
-  difference from the active configuration.
-Nothing executes on this configuration in this slice. Stdlib only.
+- The signing tool (``levain dispatch config sign``, :mod:`levain.dispatch.cli`) shows the item before the touch:
+  kind, generation, store id, prev, and its difference from the active configuration.
+Nothing executes on this configuration here; ``levain dispatch file`` resolves through it. Stdlib only.
 """
 from __future__ import annotations
 
@@ -462,6 +462,12 @@ class ControlStore:
         """This store's id, drawn at init: every item signed for it carries it."""
         with self._guard(), read_transaction(self._connect) as conn:
             return _meta(conn)["store_id"]
+
+    def trust_root(self) -> str:
+        """The fingerprint pinned at init: the one key whose configuration signature this store accepts. Read
+        unverified, for a signing tool to refuse another key before its touch; :meth:`accept` still judges it."""
+        with self._guard(), read_transaction(self._connect) as conn:
+            return _meta(conn)["trust_root"]
 
     def _now(self) -> datetime:
         now = self._clock()

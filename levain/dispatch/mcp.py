@@ -29,6 +29,7 @@ from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
 from levain.dispatch.cli import file_job, job_view, planner_capability, render
 from levain.dispatch.contract import GitUnavailable
+from levain.dispatch.control import ControlStateUnavailable
 from levain.dispatch.jobs import (
     TERMINAL, CapabilityRefused, JobStore, JobStoreError, SignatureRefused, TransitionRefused,
 )
@@ -78,8 +79,8 @@ TOOLS: list[dict[str, Any]] = [
                      "additionalProperties": False}},
 ]
 _NAMES = {t["name"]: t for t in TOOLS}
-_FAULTS = (GitUnavailable, JobStoreError, caps.CapabilityRecordError, VerifierUnavailable, sqlite3.Error, OSError,
-           ValueError)
+_FAULTS = (GitUnavailable, JobStoreError, ControlStateUnavailable, caps.CapabilityRecordError, VerifierUnavailable,
+           sqlite3.Error, OSError, ValueError)
 _REFUSALS = (ContractRefused, TransitionRefused, SignatureRefused, CapabilityRefused, DispatchError)
 
 
@@ -121,7 +122,7 @@ def _text(text: str, data: Any, *, error: bool = False) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "structuredContent": {"result": data}, "isError": error}
 
 
-def _call(agent: str, directory: Path | None, params: dict[str, Any]) -> dict[str, Any]:
+def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root: Path | None = None) -> dict[str, Any]:
     name = params.get("name")
     if not isinstance(name, str) or name not in _NAMES:
         raise _RpcError(INVALID_PARAMS, f"unknown tool {name!r}")
@@ -131,7 +132,7 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any]) -> dict[st
     try:
         if name == "dispatch_file":
             job, capability, kept = file_job(store, args["contract"], agent=agent, session=session,
-                                             idem_key=args.get("idem_key"))
+                                             idem_key=args.get("idem_key"), data_root=data_root)
             data = {"id": job.id, "digest": job.digest, "state": job.state, "lease_end": job.lease_end,
                     "capability": capability, "capability_kept": kept}
             return _text(f"Filed job {job.id} ({job.state}), digest {job.digest}, lease ends {job.lease_end}. "
@@ -164,9 +165,11 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any]) -> dict[st
         return _text(f"Refused, nothing changed: {exc}", None, error=True)
 
 
-def handle(agent: str, msg: Any, *, directory: Path | None = None) -> dict[str, Any] | None:
+def handle(agent: str, msg: Any, *, directory: Path | None = None,
+           data_root: Path | None = None) -> dict[str, Any] | None:
     """The reply to one decoded message, or ``None`` for a notification (a message with no ``id``). ``directory`` is
-    the dispatch directory (default: :func:`levain.dispatch.jobs.default_dispatch_dir`)."""
+    the dispatch directory (default: :func:`levain.dispatch.jobs.default_dispatch_dir`); ``data_root`` the cockpit
+    its configuration is verified against (:func:`levain.dispatch.cli.resolvers`)."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
         return _error(None, INVALID_REQUEST, "not a JSON-RPC 2.0 request")
     if "id" not in msg:
@@ -187,7 +190,7 @@ def handle(agent: str, msg: Any, *, directory: Path | None = None) -> dict[str, 
         if method == "tools/list":
             return _ok(rid, {"tools": TOOLS})
         if method == "tools/call":
-            return _ok(rid, _call(agent, directory, params))
+            return _ok(rid, _call(agent, directory, params, data_root))
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)
@@ -203,7 +206,8 @@ def _error(rid: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def serve(agent: str, stdin: Any = None, stdout: Any = None, *, directory: Path | None = None) -> None:
+def serve(agent: str, stdin: Any = None, stdout: Any = None, *, directory: Path | None = None,
+          data_root: Path | None = None) -> None:
     """Answer one message per line until stdin ends."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
@@ -215,7 +219,7 @@ def serve(agent: str, stdin: Any = None, stdout: Any = None, *, directory: Path 
         except (ValueError, RecursionError):  # a decoder overflow is a parse error too, never the end of the server
             reply: dict[str, Any] | None = _error(None, PARSE_ERROR, "parse error")
         else:
-            reply = handle(agent, msg, directory=directory)
+            reply = handle(agent, msg, directory=directory, data_root=data_root)
         if reply is not None:
             # ASCII-escaped: a raw U+2028 / U+2029 / U+0085 would split the line for a client that splits on every
             # line break, and one reply would become two broken ones
@@ -228,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agent", required=True, choices=caps.AGENTS)
     parser.add_argument("--dispatch-dir", dest="dispatch_dir", type=Path, default=None,
                         help="The dispatch directory (default: the consent directory).")
+    parser.add_argument("--data-root", dest="data_root", type=Path, default=None,
+                        help="The cockpit data root the dispatch configuration is verified against (default: the one "
+                             "the consent hooks in the dispatch directory name).")
     args = parser.parse_args(argv)
     for stream in (sys.stdin, sys.stdout):
         try:
@@ -235,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
     try:
-        serve(args.agent, directory=args.dispatch_dir)
+        serve(args.agent, directory=args.dispatch_dir, data_root=args.data_root)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     return 0
