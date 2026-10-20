@@ -47,10 +47,15 @@ VENDOR_PREFIX: Mapping[str, PurePosixPath] = {"darwin": PurePosixPath("/usr/loca
 GWPORT_BASE = 47100            # §11 V9: macOS gw port = 47100 + n; Linux: the forwarder's 47100 in the netns (§3.4)
 LINUX_ASK_RULE = "Bash(dangerouslyDisableSandbox:true)"   # §5.3
 MACH_ALLOW = ("com.apple.trustd.agent", "com.apple.system.opendirectoryd.libinfo")   # §8.1 (R-M2, §21)
-#: §8.1 "/dev/null-class devices": the measured list R-M2 ran (runs/macos-RM2/profile.sb).
+#: §8.1 "/dev/null-class devices": the measured list R-M2 ran (runs/macos-RM2/profile.sb), less its
+#: ``^/dev/ttys[0-9]+$`` regex (L2 M3): with it the slot could open ANY pty for write, and a setgid-tty
+#: ``write(1)`` put raw escapes on the operator's terminals past the supervisor relay. The vendor writes its
+#: terminal through the pty fds it inherits (no path open) and ``/dev/tty``; no other tty path is writable.
 DEVICE_LITERALS = ("/dev/null", "/dev/zero", "/dev/tty", "/dev/dtracehelper", "/dev/ptmx")
-DEVICE_REGEX = "^/dev/ttys[0-9]+$"
 SLOT_WRITABLE = ("repo", "config", "xdg", "tmp", "sock")   # §8.1 file-write* and §2.1's slot-owned dirs
+#: DECISION: the verifier driver's one writable dir is its HOME, ``<S>/driver``, which is also its ``TMPDIR``
+#: (render_env); DAC keeps the child out of it (the driver owns it), so the profile allows it whole.
+DRIVER_WRITABLE = ("driver",)
 
 #: §5.3 + §24: the kinds for which an egress session gets its own loopback alias on macOS.
 LOOPBACK_KINDS = frozenset({"interactive", "login"})
@@ -361,14 +366,15 @@ def env_text(env: Mapping[str, str]) -> bytes:
 def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
     """The ``--settings`` layer. Pinned whatever the blob says (§5.3): macOS ``sandbox.enabled:false``; Linux
     ``true`` + ``failIfUnavailable:true`` + ``bwrapPath`` (Levain's copy) + the ask rule; both
-    ``disableBypassPermissionsMode:"disable"`` and ``excludedCommands: []``."""
+    ``disableBypassPermissionsMode:"disable"``, ``excludedCommands: []`` and ``disableAllHooks: false`` (L2 M6:
+    a repo or local layer setting it true would switch Levain's gate hooks off)."""
     check_facts(blob, facts)
     sandbox: dict[str, Any] = {"enabled": facts.host == "linux", "excludedCommands": []}
     permissions: dict[str, Any] = {"disableBypassPermissionsMode": "disable"}
     if facts.host == "linux":
         sandbox.update({"failIfUnavailable": True, "bwrapPath": str(LEVAIN_BWRAP)})
         permissions["ask"] = [LINUX_ASK_RULE]
-    out: dict[str, Any] = {"sandbox": sandbox, "permissions": permissions}
+    out: dict[str, Any] = {"sandbox": sandbox, "permissions": permissions, "disableAllHooks": False}
     if blob.model is not None:
         out["model"] = blob.model
     if blob.hooks:
@@ -498,15 +504,16 @@ def render_profile(blob: RenderBlob, facts: RenderFacts) -> bytes:
     if facts.host != "darwin":
         raise Refused("unsupported-host", "profile.sb is macOS only")
     S = str(facts.S)
+    writable = SLOT_WRITABLE + (DRIVER_WRITABLE if facts.slot.slot_class == "none" else ())
     lines = [
         "(version 1)",
         f";; Levain session profile (CONTRACT §8.1) for {facts.session} on {facts.slot.tag}, kind {facts.kind}.",
         "(allow default)",
         "(deny file-write*)",
         "(allow file-write*",
-        "  " + " ".join(f"(subpath {_q(f'{S}/{d}')})" for d in SLOT_WRITABLE),
+        "  " + " ".join(f"(subpath {_q(f'{S}/{d}')})" for d in writable),
         "  " + " ".join(f"(subpath {_q(vf)})" for vf in facts.var_folders),
-        "  " + " ".join(f"(literal {_q(d)})" for d in DEVICE_LITERALS) + f' (regex #"{DEVICE_REGEX}"))',
+        "  " + " ".join(f"(literal {_q(d)})" for d in DEVICE_LITERALS) + ")",
         "(deny network-outbound)",
         "(deny network-bind)",
         "(deny network-inbound)",
@@ -594,7 +601,7 @@ class Contains:
 def expected_effective_cc(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     """Every pin of :func:`render_cc_settings`, as dotted key -> the value the effective config must hold."""
     exp: dict[str, Any] = {"sandbox.enabled": facts.host == "linux", "sandbox.excludedCommands": [],
-                           "permissions.disableBypassPermissionsMode": "disable"}
+                           "permissions.disableBypassPermissionsMode": "disable", "disableAllHooks": False}
     if facts.host == "linux":
         exp.update({"sandbox.failIfUnavailable": True, "sandbox.bwrapPath": str(LEVAIN_BWRAP),
                     "permissions.ask": Contains((LINUX_ASK_RULE,))})
@@ -647,9 +654,10 @@ def refuse_readback(expected: Mapping[str, Any], observed: Any) -> None:
 def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     """``docs``: repo-relative file name (``.claude/settings.json``, ``.claude/settings.local.json``) -> its parsed
     JSON. Refused by key: every ``sandbox`` key in host_guard's ``_LOOSENING_TRUE`` that is ``true`` and every one
-    in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin). A
-    document that is not an object is refused ``repo-settings-malformed``. Hooks, permissions and every other key
-    launch (plan §2c 3: the repo's settings are its own).
+    in ``_LOOSENING_NONEMPTY`` that is non-empty (the keys whose merge across layers the flag layer cannot pin),
+    and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
+    its meaning to CC is unmeasured). A document that is not an object is refused ``repo-settings-malformed``.
+    Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
     Operator-side: the supervisor runs this on the clone it bundles, before the bundle is made (the slot clones
     exactly that bundle), never the root helper. host_guard is imported here, not at module level, so the root path
@@ -662,6 +670,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
         if not isinstance(doc, Mapping):
             out.append(Refused("repo-settings-malformed", path))
             continue
+        if "disableAllHooks" in doc and doc["disableAllHooks"] is not False:
+            out.append(_refused("loosening", "disableAllHooks", f"{path}: not false"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))

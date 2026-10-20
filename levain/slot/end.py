@@ -2,20 +2,34 @@
 
 ``REVOKED -> FROZEN -> DEAD -> CREDENTIAL_PARKED -> RETAINED``. Ending a session never deletes its
 work (plan §2f): the session tree is renamed, whole, into ``L/retained/<session>/tree/`` after its
-manifest and metadata are durable, then neutralized in place (flags, ACLs and xattrs stripped, owner
-root). Any step that is not PROVEN moves the record to HELD with ``failed_step``; the tree is never
-touched by a failure path, and a retry resumes idempotently.
+manifest and metadata are durable, then neutralized in place (flags, ACLs, xattrs and setuid/setgid
+stripped, owner root). Any step that is not PROVEN moves the record to HELD with ``failed_step``; the
+tree is never touched by a failure path, and a retry resumes idempotently.
 
-Root acts only on alloc facts, its own intent journal and a live check (CONTRACT §7.1): every path
-here comes from :class:`EndFacts`, built from the alloc record, never from the state record. The
-state record's ``state`` / ``failed_step`` (the reaper's read, §7.7 step 3) only choose which CAS
-edges :func:`end_session` sends; every proof (freeze, kill, no process left) and every idempotent act
-runs on every call, so a forged state can make root send a wrong edge (CONTROL refuses it), never
-skip a proof or touch a tree it should not.
+Root acts only on alloc facts, its own intent journal, its own slot state file and a live check
+(CONTRACT §7.1): every path here comes from :class:`EndFacts`, built from the alloc record, never from
+the state record. Before anything is signalled, root's slot state file must show the slot leased to
+THIS session at alloc's ``lease_seq``, else HELD ``failed_step:"slot-not-ours"`` with nothing signalled
+(L2 M4). The state record's ``state`` / ``failed_step`` (the reaper's read, §7.7 step 3) only choose
+which CAS edges :func:`end_session` sends; every proof (freeze, kill, no process left, for EVERY uid the
+session holds) and every idempotent act runs on every call, so a forged state can make root send a
+wrong edge (CONTROL refuses it), never skip a proof or signal another session's processes. The one
+exception destroys nothing: a record already RETAINED makes END return at once, unproven (a forged one
+only leaves that session unended until the next real read).
+
+One END per session at a time: :func:`end_session` and :func:`reconcile_session` hold root's try-lock
+``L/alloc/<session>.lock`` (held = ``end-busy``; the reaper or helper retries). A CAS CONTROL does not
+take is never a step failure (L2 M5): see :func:`send_cas`.
+
+Root reads no bytes the session could not (L2 H2): a file hard-linked to a path outside the tree is
+hashed and copied by a reader dropped to the session's uid, and one that uid cannot read is recorded
+and never copied. Metadata, strip and chown address every entry from its walk dirfd, never by a full
+path (L2 M2).
 
 Every root-only act is an injected seam with a real default: the freeze and kill (2d / 2g build
 them; the defaults here refuse, which lands HELD), ``chown``, the metadata reader and strip, the
-clock, CONTROL's ``cas``. The manifest walk is real code over dirfds with ``O_NOFOLLOW``.
+session-uid reader, root's slot state read, the clock, CONTROL's ``cas``. The manifest walk is real
+code over dirfds with ``O_NOFOLLOW``.
 """
 from __future__ import annotations
 
@@ -23,24 +37,29 @@ import base64
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import os
+import secrets
 import stat
+import struct
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Collection, Iterator, Mapping, Sequence
 
 from levain.contracts import canon
-from levain.slot import Refused, write_all
+from levain.slot import Refused, stage, wall, write_all
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES
 # The §7.3 states END sends; records owns the names (the full set and its legal edges).
-from levain.slot.records import CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED
+from levain.slot.records import (CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED, parse_slot_state,
+                                 read_record)
 from levain.slot.root_intent import (INTENT_PHASES, Cas, Fault, Phase, PhaseFailed, Plan, RootIntent,
                                      atomic_write, begin, fsync_dir, intent_path, read_root_intent,
-                                     reconcile)
+                                     reconcile, sweep_temps, temp_path)
 
 # --- values (CONTRACT §11) -------------------------------------------------------------------------
 
@@ -55,18 +74,24 @@ V17_META_BYTES = 64 << 20
 # (plan §2h 8 asks only that it be known before any mutation). V4's SIGKILL-row tree bytes is the
 # order of magnitude a session's own work is sized at; refused as the manifest budget past it.
 LINK_COPY_BYTES = 2 << 30
+# DECISION: how long END keeps retrying a CAS CONTROL did not take (``locked``, CONTROL down) before it
+# leaves the record for the next pass: V12's order, so one END never outlives a reaper pass by much.
+CAS_RETRY_SECONDS = V12_SECONDS
+CAS_BACKOFF_FIRST = 0.01
+CAS_BACKOFF_MAX = 1.0
 
 MANIFEST_FORMAT = "levain-end-manifest/1"
 META_FORMAT = "levain-retention-meta/1"
 OBJECT_FORMAT = "levain-retained-object/1"
 
 
-#: The vendor credential files (plan §2e 11): (dir under the session tree, file name), parked in
-#: ``L/slots/e<n>/keep/`` under the same name.
-CREDENTIAL_FILES: tuple[tuple[tuple[bytes, ...], bytes], ...] = (
-    ((b"config", b"claude"), b".credentials.json"),
-    ((b"config", b"codex"), b"auth.json"),
-)
+#: The vendor credential files (plan §2e 11): vendor -> (dir under the session tree, file name), parked
+#: in ``L/slots/e<n>/keep/`` under the same name, for a passthrough session of that vendor only.
+CREDENTIALS: Mapping[str, tuple[tuple[bytes, ...], bytes]] = {
+    "claude": ((b"config", b"claude"), b".credentials.json"),
+    "codex": ((b"config", b"codex"), b"auth.json"),
+}
+CREDENTIAL_FILES = tuple(CREDENTIALS.values())
 VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/var/folders/<slot>
 
 #: The refusals that mean "past the manifest budget": HELD ``failed_step:"manifest_budget"``, whose
@@ -74,7 +99,20 @@ VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/v
 BUDGET_REFUSALS = frozenset({"manifest-inode-cap", "manifest-time-cap", "manifest-byte-cap", "meta-byte-cap",
                              "link-copy-cap"})
 
+#: ``L/retained/<s>/linkcopy/<dev>-<ino>``: a foreign inode's bytes as the session uid read them, staged by
+#: the manifest step and linked into the tree by the tree step (L2 H2).
+LINKCOPY = "linkcopy"
+#: (size, digest) of an outside-linked file the session uid cannot read. DECISION: the manifest records it
+#: as ``size:0, digest:""`` (a file's digest is never empty otherwise) and the tree holds an empty 0600
+#: placeholder at its path: the entry is recorded, its bytes never copied, never root's.
+UNREAD = (0, "")
+
 _CHUNK = 1 << 20
+_LINK_TMP = b".levain-link."
+_O_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_O_ENTRY = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+_O_SYMLINK = getattr(os, "O_SYMLINK", 0)       # macOS: open the link itself
+_SETID = stat.S_ISUID | stat.S_ISGID
 
 
 def utc_now() -> str:
@@ -123,7 +161,10 @@ class Caps:
 class EndFacts:
     """Everything END needs about a session, from its alloc record (CONTRACT §7.1) and the store root.
     ``var_folders``: macOS ``/private/var/folders/<slot>`` as the caller derives it from the slot uid
-    (the alloc record does not carry it), ``None`` on Linux."""
+    (the alloc record does not carry it), ``None`` on Linux. ``lease_seq``: the lease root's slot state
+    file must still show (§3.5 Pool). ``child_uid``: a verifier pair's child (§1, §5.6), frozen, killed and
+    proven gone with the slot uid. ``vendor`` + ``auth``: a credential is parked on a passthrough session
+    only. The defaults fail closed: no ``lease_seq`` = ``slot-not-ours``, no ``auth`` = nothing parked."""
 
     session: str
     slot: SlotId
@@ -131,6 +172,15 @@ class EndFacts:
     slot_gid: int
     store: Path
     var_folders: Path | None = None
+    lease_seq: int | None = None
+    child_uid: int | None = None
+    vendor: str | None = None
+    auth: str | None = None
+
+    @property
+    def uids(self) -> tuple[int, ...]:
+        """Every uid the session's processes run as (L2 H3)."""
+        return (self.slot_uid,) if self.child_uid is None else (self.slot_uid, self.child_uid)
 
     @property
     def live(self) -> Path:
@@ -153,8 +203,35 @@ class EndFacts:
         return intent_path(self.alloc_dir, self.session)
 
     @property
+    def cloned_marker(self) -> Path:
+        return cloned_path(self.store, self.session)
+
+    @property
+    def lock(self) -> Path:
+        """DECISION: root's per-session END lock beside the journal (L2 M7); never unlinked."""
+        return self.intent.with_name(f"{self.session}.lock")
+
+    @property
     def keep(self) -> Path:
         return self.slot.slot_dir(self.store) / "keep"
+
+    @property
+    def slot_state(self) -> Path:
+        return self.slot.slot_dir(self.store) / "state"
+
+    @property
+    def parks(self) -> bool:
+        return self.slot.slot_class == "egress" and self.auth == "passthrough" and self.vendor in CREDENTIALS
+
+    @property
+    def credential(self) -> tuple[tuple[bytes, ...], bytes] | None:
+        """The one credential file END parks (the session vendor's, on a passthrough session)."""
+        return CREDENTIALS[self.vendor] if self.parks else None   # type: ignore[index]
+
+    @property
+    def parked_paths(self) -> frozenset[bytes]:
+        c = self.credential
+        return frozenset() if c is None else frozenset({b"/".join(c[0] + (c[1],))})
 
     @property
     def extra(self) -> dict[bytes, Path]:
@@ -167,15 +244,25 @@ def _is_id(x: object) -> bool:
 
 def facts_from_alloc(alloc: Mapping[str, object], *, store: Path, var_folders: Path | None = None) -> EndFacts:
     """The END facts of a parsed ``levain-alloc/1`` record: ``session``, ``slot{class,index}``,
-    ``slot_uid``, ``slot_gid``. Anything else in it is not END's."""
+    ``slot_uid``, ``slot_gid``, ``lease_seq``, ``child_uid`` (none class), ``vendor``, ``auth``. Anything
+    else in it is not END's."""
     try:
         slot = alloc["slot"]
         facts = EndFacts(alloc["session"], SlotId(slot["class"], slot["index"]),  # type: ignore[index]
-                         alloc["slot_uid"], alloc["slot_gid"], Path(store), var_folders)  # type: ignore[arg-type]
+                         alloc["slot_uid"], alloc["slot_gid"], Path(store), var_folders,  # type: ignore[arg-type]
+                         alloc["lease_seq"], alloc.get("child_uid"), alloc["vendor"],  # type: ignore[arg-type]
+                         alloc["auth"])  # type: ignore[arg-type]
     except (KeyError, TypeError) as e:
         raise Refused("alloc-malformed", f"END facts: {e}") from None
     if not _is_id(facts.slot_uid) or not _is_id(facts.slot_gid):
         raise Refused("alloc-malformed", "slot_uid / slot_gid")
+    if not isinstance(facts.lease_seq, int) or isinstance(facts.lease_seq, bool) or facts.lease_seq < 0:
+        raise Refused("alloc-malformed", "lease_seq")
+    if (facts.child_uid is not None) != (facts.slot.slot_class == "none") or \
+            (facts.child_uid is not None and not _is_id(facts.child_uid)):
+        raise Refused("alloc-malformed", "child_uid is a uid, present exactly for the none class")
+    if not isinstance(facts.vendor, str) or not isinstance(facts.auth, str):
+        raise Refused("alloc-malformed", "vendor / auth")
     facts.intent   # validates the session id
     return facts
 
@@ -186,7 +273,8 @@ def facts_from_alloc(alloc: Mapping[str, object], *, store: Path, var_folders: P
 @dataclass(frozen=True)
 class Entry:
     """One tree entry. ``dirfd`` + ``name`` address it without following a link (``dirfd`` is -1 for
-    an ``extra`` root child, addressed by ``abspath``); both are valid only while the walk is at it."""
+    an ``extra`` root child, addressed by ``abspath``); both are valid only while the walk is at it.
+    ``abspath`` is for messages; no metadata call uses it (L2 M2)."""
 
     path: bytes
     st: os.stat_result
@@ -216,7 +304,8 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
     fd and checked against the ``lstat`` that named it). ``extra`` adds root children that live
     elsewhere (macOS ``/var/folders/<slot>``, walked as ``.levain-var-folders`` before it is moved
     there); an absent one is skipped, a present one must be a real directory, and a name the tree
-    already has is ``retain-conflict``."""
+    already has is ``retain-conflict``. An entry on another filesystem than its directory (a mount inside
+    the tree, L2 L12) refuses ``tree-mount``: root never walks, strips or chowns into one."""
     extra = dict(extra or {})
     root_b = os.fsencode(root)
     root_fd = os.open(root_b, _DIR_FLAGS)
@@ -235,10 +324,11 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
             if not stat.S_ISDIR(pst.st_mode):
                 raise Refused("var-folders-not-dir", str(p))
             live_extra[k] = (os.fsencode(p), pst)
-        stack.append([root_fd, b"", root_b, sorted(names + list(live_extra)), 0, live_extra])
+        stack.append([root_fd, b"", root_b, sorted(names + list(live_extra)), 0, live_extra,
+                      os.fstat(root_fd).st_dev])
         while stack:
             frame = stack[-1]
-            fd, prefix, absprefix, names, i, fextra = frame
+            fd, prefix, absprefix, names, i, fextra, dev = frame
             if i == len(names):
                 os.close(fd)
                 stack.pop()
@@ -252,6 +342,8 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
                 child = _open_dir_at(absp, -1, st)
             else:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if st.st_dev != dev:
+                    raise Refused("tree-mount", f"{path!r} is on another filesystem")
                 absp = absprefix + b"/" + name
                 yield Entry(path, st, fd, name, absp)
                 if not stat.S_ISDIR(st.st_mode):
@@ -262,7 +354,7 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None) -> Iterator[Entr
             except BaseException:
                 os.close(child)
                 raise
-            stack.append([child, path + b"/", absp, cnames, 0, {}])
+            stack.append([child, path + b"/", absp, cnames, 0, {}, st.st_dev])
     finally:
         for frame in stack:
             try:
@@ -287,6 +379,27 @@ def entry_type(mode: int) -> str:
     raise Refused("tree-unknown-type", f"mode {mode:o}")
 
 
+def _entry_fd(e: Entry) -> int | None:
+    """An fd on the entry itself, opened from its walk dirfd and never through a link: a directory, file
+    or fifo ``O_NOFOLLOW`` (``O_NONBLOCK``, so a fifo cannot hang it); a macOS symlink ``O_SYMLINK``.
+    ``None`` for an entry with no safe fd form here: a Linux symlink, any socket (open refuses one) and any
+    device (an open as root could act on the device)."""
+    m = e.st.st_mode
+    if stat.S_ISDIR(m):
+        flags = _DIR_FLAGS
+    elif stat.S_ISREG(m) or stat.S_ISFIFO(m):
+        flags = _O_ENTRY
+    elif stat.S_ISLNK(m) and _O_SYMLINK:
+        flags = os.O_RDONLY | _O_SYMLINK | os.O_CLOEXEC
+    else:
+        return None
+    fd = os.open(e.name, flags, dir_fd=e.dirfd) if e.dirfd >= 0 else os.open(e.abspath, flags)
+    if not _same(os.fstat(fd), e.st):
+        os.close(fd)
+        raise Refused("tree-changed", f"{e.path!r} changed under the walk")
+    return fd
+
+
 # --- the manifest (levain-end-manifest/1) ----------------------------------------------------------
 
 
@@ -301,6 +414,10 @@ class _Budget:
     def __init__(self, caps: Caps, clock: Callable[[], float]) -> None:
         self.caps, self.clock, self.t0, self.entries = caps, clock, clock(), 0
 
+    @property
+    def deadline(self) -> float:
+        return self.t0 + self.caps.seconds
+
     def tick(self) -> None:
         if self.clock() - self.t0 > self.caps.seconds:
             raise Refused("manifest-time-cap", f"hashing passed {self.caps.seconds:g} s")
@@ -313,7 +430,7 @@ class _Budget:
 
 
 def _hash_file(e: Entry, budget: _Budget) -> tuple[int, str]:
-    fd = os.open(e.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=e.dirfd)
+    fd = os.open(e.name, _O_ENTRY, dir_fd=e.dirfd)
     try:
         if not _same(os.fstat(fd), e.st):
             raise Refused("tree-changed", f"{e.path!r} changed under the walk")
@@ -330,24 +447,27 @@ def _hash_file(e: Entry, budget: _Budget) -> tuple[int, str]:
     return n, "sha256:" + h.hexdigest()
 
 
-def _credential_paths() -> frozenset[bytes]:
-    return frozenset(b"/".join(d + (n,)) for d, n in CREDENTIAL_FILES)
+#: ``read_foreign(entry, budget) -> (size, digest)``: an outside-linked file's bytes, read as the session.
+ForeignRead = Callable[[Entry, _Budget], "tuple[int, str]"]
 
 
 def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps: Caps = Caps(),
-                  clock: Callable[[], float] = time.monotonic,
-                  links: dict[tuple[int, int], LinkCount] | None = None,
-                  skip_credentials: bool = False) -> Iterator[dict]:
+                  clock: Callable[[], float] = time.monotonic, credentials: Collection[bytes] = (),
+                  skip_credentials: bool = False, foreign: Collection[tuple[int, int]] = (),
+                  read_foreign: ForeignRead | None = None) -> Iterator[dict]:
     """The manifest records of the tree, in walk order: ``{path_b64, type, mode, size, nlink, digest}``
     (``mode`` = the permission bits, ``stat.S_IMODE``; a file's digest is over its bytes, a link's over
     its ``readlink`` target bytes; a dir / fifo / socket / device: size 0, digest ""). The inode and
-    time caps refuse by name mid-walk. ``links`` collects, for every file with ``nlink > 1``, how
-    many of its links the walk saw (the hardlink accounting done before any mutation, plan §2i 4).
-    A credential file still at its vendor path refuses ``credential-not-parked`` (END parks first, so
-    the manifest never holds it, plan §2g 3); ``skip_credentials`` leaves it out instead, for a
-    snapshot of a live tree that still holds one."""
+    time caps refuse by name mid-walk.
+
+    ``credentials``: the tree paths END parks (the session vendor's credential on a passthrough session,
+    plan §2g 3); one still there refuses ``credential-not-parked`` (END parks first, so the manifest never
+    holds it), and ``skip_credentials`` leaves it out instead, for a snapshot of a live tree. ``foreign``:
+    the inodes some of whose links lie outside the tree; root never opens one, ``read_foreign`` (the
+    session-uid reader) hashes it (L2 H2), and :data:`UNREAD` is what it records for one it cannot read."""
     budget = _Budget(caps, clock)
-    creds = _credential_paths()
+    creds = frozenset(credentials)
+    foreign = frozenset(foreign)
     for e in walk(root, extra):
         t = entry_type(e.st.st_mode)
         if e.path in creds and t != "dir":
@@ -357,10 +477,12 @@ def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
         budget.entry()
         size, digest = 0, ""
         if t == "file":
-            size, digest = _hash_file(e, budget)
-            if e.st.st_nlink > 1 and links is not None:
-                lc = links.setdefault((e.st.st_dev, e.st.st_ino), LinkCount(e.st.st_nlink, 0, size))
-                lc.seen += 1
+            if (e.st.st_dev, e.st.st_ino) in foreign:
+                if read_foreign is None:
+                    raise Refused("link-reader-unset", e.path.decode("utf-8", "replace"))
+                size, digest = read_foreign(e, budget)
+            else:
+                size, digest = _hash_file(e, budget)
         elif t == "link":
             target = os.readlink(e.name, dir_fd=e.dirfd)
             size, digest = len(target), digest_bytes(target)
@@ -372,22 +494,39 @@ def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
 
 
 def tree_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps: Caps = Caps(),
-                  clock: Callable[[], float] = time.monotonic, skip_credentials: bool = False) -> list[dict]:
-    """The whole manifest in memory (a pre-freeze snapshot; END streams it to disk)."""
-    return list(iter_manifest(root, extra=extra, caps=caps, clock=clock, skip_credentials=skip_credentials))
+                  clock: Callable[[], float] = time.monotonic, credentials: Collection[bytes] = (),
+                  skip_credentials: bool = False) -> list[dict]:
+    """The whole manifest in memory (a snapshot read as the caller; END streams its own to disk)."""
+    return list(iter_manifest(root, extra=extra, caps=caps, clock=clock, credentials=credentials,
+                              skip_credentials=skip_credentials))
+
+
+def _count_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
+    links: dict[tuple[int, int], LinkCount] = {}
+    for e in walk(root, extra):
+        if stat.S_ISREG(e.st.st_mode) and e.st.st_nlink > 1:
+            lc = links.setdefault((e.st.st_dev, e.st.st_ino), LinkCount(e.st.st_nlink, 0, e.st.st_size))
+            lc.seen += 1
+    return links
+
+
+def foreign_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
+    """The regular files some of whose links lie outside ``root`` (+ ``extra``): ``nlink`` greater than
+    the links the walk sees. Known before any mutation (plan §2i 4)."""
+    return {k: lc for k, lc in _count_links(root, extra).items() if lc.seen < lc.nlink}
 
 
 def outside_link_bytes(links: Mapping[tuple[int, int], LinkCount]) -> int:
-    """Bytes END will copy: every link to an inode some of whose links lie outside the tree."""
-    return sum(lc.size * lc.seen for lc in links.values() if lc.seen < lc.nlink)
+    """Bytes END will copy: one copy per inode some of whose links lie outside the tree, linked into each
+    of its in-tree paths."""
+    return sum(lc.size for lc in links.values() if lc.seen < lc.nlink)
 
 
 def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) -> None:
-    """``records`` as canonical JSONL at ``path``, durable (temp + fsync + rename + fsync(dir)); past
-    ``cap`` bytes refuses ``cap_name`` with the temp removed and ``path`` untouched."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    """``records`` as canonical JSONL at ``path``, durable (a temp unique per writer + fsync + rename +
+    fsync(dir)); past ``cap`` bytes refuses ``cap_name`` with the temp removed and ``path`` untouched."""
+    tmp = temp_path(path)
+    fd = os.open(tmp, _O_NEW, 0o600)
     ok = False
     try:
         with os.fdopen(fd, "wb", buffering=_CHUNK) as fh:
@@ -408,12 +547,129 @@ def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) 
     fsync_dir(path.parent)
 
 
-# --- metadata (levain-retention-meta/1): per-OS readers and strips ---------------------------------
+# --- the session-uid reader (L2 H2) ----------------------------------------------------------------
 
-MetaReader = Callable[[bytes, os.stat_result, Callable[[str], None]], dict]
-Strip = Callable[[bytes, os.stat_result, Callable[[str], None]], None]
+#: ``run_as(uid, gid, fn, wfd, keep)``: run ``fn(wfd)`` as ``uid``/``gid`` with the ``keep`` fds left
+#: open, owning ``wfd`` (closing it when ``fn`` ends). Returns the running reader (stage's ``Reader``).
+SessionRunAs = Callable[[int, int, Callable[[int], None], int, Sequence[int]], "stage.Reader"]
 
-_XATTR_NOFOLLOW = 0x0001
+
+def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: Sequence[int] = ()) -> stage.Reader:
+    """The real ``run_as``, :func:`levain.slot.stage.fork_run_as`'s pattern with a session uid as the target:
+    fork; the child closes every fd but 0-2, ``wfd`` and ``keep``, drops with the one drop
+    (:func:`levain.slot.wall.drop_and_assert`, supplementary groups exactly ``{gid}``), runs ``fn`` and
+    ``_exit``s (70 if the drop or ``fn`` raised, having written nothing more). Only root can run it.
+    DECISION: no RLIMIT_NPROC (the reader never forks)."""
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the child; exercised only as root (VM row)
+        code = 0
+        try:
+            stage._close_fds_except([wfd, *keep])
+            wall.drop_and_assert(uid, gid, (gid,), nproc=None)
+            fn(wfd)
+        except BaseException:   # noqa: BLE001 - the child never returns into the parent's stack
+            code = 70
+        finally:
+            os._exit(code)
+    os.close(wfd)
+    return stage._Forked(pid)
+
+
+def _reader_uid(facts: EndFacts, e: Entry) -> int:
+    """DECISION: the session uid that owns the entry's directory (a verifier's child owns ``<S>/repo``,
+    §3.4), else the slot uid. Either way a session uid, never root (§1.1: its gid is the uid)."""
+    owner = os.fstat(e.dirfd).st_uid
+    return owner if owner in facts.uids else facts.slot_uid
+
+
+def read_as_session(facts: EndFacts, seams: "EndSeams", e: Entry, out_fd: int, cap: int,
+                    budget: _Budget) -> tuple[int, str]:
+    """``e``'s bytes, read by :func:`levain.slot.stage.reader` in a process dropped to a session uid and
+    streamed into ``out_fd``: ``(bytes copied, their digest)``, or :data:`UNREAD` when that uid cannot read
+    it (absent, not regular, open refused). A reader that ends without an answer (its drop not proven,
+    say) is ``link-reader-failed``, never UNREAD, so a broken drop cannot turn readable work into
+    placeholders. DECISION: what the reader read is what is recorded and copied, so a file an outside owner
+    grows or truncates meanwhile keeps the bytes read."""
+    uid = _reader_uid(facts, e)
+    rfd, wfd = os.pipe()
+    proc = None
+    try:
+        proc = seams.run_as(uid, uid, lambda w: stage.reader(e.dirfd, e.name, cap, "link-copy-cap", w), wfd,
+                            (e.dirfd,))
+        wfd = -1   # run_as owns it now
+        pipe = stage._Pipe(rfd, budget.deadline, budget.clock, stage.POLL_SLICE_S)
+        tag = pipe.exactly(1)
+        if tag == b"R":
+            ln = pipe.exactly(1)
+            name = pipe.exactly(ln[0]).decode("ascii", "replace") if ln else ""
+            if name == "link-copy-cap":
+                raise Refused("link-copy-cap", f"{e.path!r} is past {cap} bytes")
+            if name in ("staging-missing", "staging-not-regular", "staging-open-failed"):
+                return UNREAD
+            raise Refused("link-reader-failed", name)
+        head = pipe.exactly(8) if tag == b"S" else b""
+        if len(head) != 8:
+            raise Refused("link-reader-failed", f"{e.path!r}: no answer from the reader")
+        accepted = struct.unpack(">Q", head)[0]
+        if accepted > cap:
+            raise Refused("link-copy-cap", f"{e.path!r}: {accepted} > {cap}")
+        h, n = hashlib.sha256(), 0
+        while n < accepted:
+            chunk = pipe.read(min(_CHUNK, accepted - n))
+            if not chunk:
+                break
+            write_all(out_fd, chunk)
+            h.update(chunk)
+            n += len(chunk)
+            budget.tick()
+        return n, "sha256:" + h.hexdigest()
+    except Refused as err:
+        if proc is not None:
+            proc.kill()
+        if err.name == "staging-raced":   # stage's pipe deadline, which is the manifest budget's
+            raise Refused("manifest-time-cap", f"reading {e.path!r} passed the V2 budget") from None
+        raise
+    except BaseException:
+        if proc is not None:
+            proc.kill()
+        raise
+    finally:
+        os.close(rfd)          # a reader blocked writing gets EPIPE and ends
+        if proc is not None:
+            proc.wait()
+        if wfd >= 0:
+            os.close(wfd)
+
+
+def _staged_name(key: tuple[int, int]) -> bytes:
+    return f"{key[0]}-{key[1]}".encode("ascii")
+
+
+def _clear_linkcopy(facts: EndFacts, seams: "EndSeams") -> None:
+    """Remove a staging dir an earlier attempt left (root's own copies, never work)."""
+    d = facts.retained / LINKCOPY
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(st.st_mode) or not seams.owner_ok(st):
+        raise Refused("bad-root", f"{d} is not a directory with the expected owner")
+    fd = os.open(d, _DIR_FLAGS)
+    try:
+        for n in os.listdir(fd):
+            os.unlink(n, dir_fd=fd)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rmdir(d)
+    fsync_dir(facts.retained)
+
+
+# --- metadata (levain-retention-meta/1): per-OS readers and strips, every call on an fd --------------
+
+MetaReader = Callable[[Entry, Callable[[str], None]], dict]
+Strip = Callable[[Entry, Callable[[str], None]], None]
+
 _ACL_TYPE_EXTENDED = 0x00000100
 _libc = None
 
@@ -422,22 +678,24 @@ def _darwin_libc():
     global _libc
     if _libc is None:
         c = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        c.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-        c.listxattr.restype = ctypes.c_ssize_t
-        c.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
-                               ctypes.c_uint32, ctypes.c_int]
-        c.getxattr.restype = ctypes.c_ssize_t
-        c.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-        c.removexattr.restype = ctypes.c_int
-        c.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        c.acl_get_link_np.restype = ctypes.c_void_p
+        c.flistxattr.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        c.flistxattr.restype = ctypes.c_ssize_t
+        c.fgetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+                                ctypes.c_uint32, ctypes.c_int]
+        c.fgetxattr.restype = ctypes.c_ssize_t
+        c.fremovexattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        c.fremovexattr.restype = ctypes.c_int
+        c.fchflags.argtypes = [ctypes.c_int, ctypes.c_uint]
+        c.fchflags.restype = ctypes.c_int
+        c.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        c.acl_get_fd_np.restype = ctypes.c_void_p
         c.acl_to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
         c.acl_to_text.restype = ctypes.c_void_p
         c.acl_free.argtypes = [ctypes.c_void_p]
         c.acl_init.argtypes = [ctypes.c_int]
         c.acl_init.restype = ctypes.c_void_p
-        c.acl_set_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
-        c.acl_set_link_np.restype = ctypes.c_int
+        c.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        c.acl_set_fd_np.restype = ctypes.c_int
         _libc = c
     return _libc
 
@@ -447,42 +705,42 @@ def _oserr(what: str) -> OSError:
     return OSError(n, f"{what}: {os.strerror(n)}")
 
 
-def _darwin_xattr_names(path: bytes) -> list[bytes]:
+def _darwin_xattr_names(fd: int) -> list[bytes]:
     c = _darwin_libc()
     for _ in range(4):   # the list can grow between the size call and the read
-        n = c.listxattr(path, None, 0, _XATTR_NOFOLLOW)
+        n = c.flistxattr(fd, None, 0, 0)
         if n < 0:
-            raise _oserr("listxattr")
+            raise _oserr("flistxattr")
         if n == 0:
             return []
         buf = ctypes.create_string_buffer(n)
-        m = c.listxattr(path, buf, n, _XATTR_NOFOLLOW)
+        m = c.flistxattr(fd, buf, n, 0)
         if m >= 0:
             return [x for x in buf.raw[:m].split(b"\0") if x]
         if ctypes.get_errno() != errno.ERANGE:
-            raise _oserr("listxattr")
-    raise OSError(errno.ERANGE, "listxattr kept growing")
+            raise _oserr("flistxattr")
+    raise OSError(errno.ERANGE, "flistxattr kept growing")
 
 
-def _darwin_getxattr(path: bytes, name: bytes) -> bytes:
+def _darwin_getxattr(fd: int, name: bytes) -> bytes:
     c = _darwin_libc()
-    n = c.getxattr(path, name, None, 0, 0, _XATTR_NOFOLLOW)
+    n = c.fgetxattr(fd, name, None, 0, 0, 0)
     if n < 0:
-        raise _oserr("getxattr")
+        raise _oserr("fgetxattr")
     buf = ctypes.create_string_buffer(max(n, 1))
-    m = c.getxattr(path, name, buf, n, 0, _XATTR_NOFOLLOW)
+    m = c.fgetxattr(fd, name, buf, n, 0, 0)
     if m < 0:
-        raise _oserr("getxattr")
+        raise _oserr("fgetxattr")
     return buf.raw[:m]
 
 
-def _darwin_acl_text(path: bytes) -> str | None:
+def _darwin_acl_text(fd: int) -> str | None:
     c = _darwin_libc()
-    acl = c.acl_get_link_np(path, _ACL_TYPE_EXTENDED)
+    acl = c.acl_get_fd_np(fd, _ACL_TYPE_EXTENDED)
     if not acl:
         if ctypes.get_errno() in (errno.ENOENT, errno.EOPNOTSUPP, errno.EINVAL, 0):
             return None
-        raise _oserr("acl_get_link_np")
+        raise _oserr("acl_get_fd_np")
     try:
         ln = ctypes.c_ssize_t()
         txt = c.acl_to_text(acl, ctypes.byref(ln))
@@ -512,89 +770,153 @@ def _xattrs_record(names: list[bytes], get: Callable[[bytes], bytes], where: str
     return out
 
 
-def darwin_meta(path: bytes, st: os.stat_result, note: Callable[[str], None]) -> dict:
+def _where(e: Entry) -> str:
+    return e.path.decode("utf-8", "replace")
+
+
+def _open_for(e: Entry, what: str, note: Callable[[str], None]) -> int | None:
+    """:func:`_entry_fd`, with an entry that has no fd form here noted (a bound, L2 M2: such an entry's
+    ACL / xattrs are neither recorded nor stripped; on macOS that is a socket or a device)."""
+    fd = _entry_fd(e)
+    if fd is None:
+        note(f"{what} {_where(e)}: a {entry_type(e.st.st_mode)} has no fd form here; ACL and xattrs left as is")
+    return fd
+
+
+def darwin_meta(e: Entry, note: Callable[[str], None]) -> dict:
     """macOS: the extended ACL (``acl_to_text``), the BSD flags (``uchg`` included), and every xattr
-    (``com.apple.FinderInfo``, ``com.apple.ResourceFork`` included), none following a link. What
-    cannot be read is noted and left out, never a wedge (plan §2i 4)."""
+    (``com.apple.FinderInfo``, ``com.apple.ResourceFork`` included), all on an fd of the entry itself.
+    What cannot be read is noted and left out, never a wedge (plan §2i 4)."""
     rec: dict = {}
-    where = path.decode("utf-8", "replace")
-    try:
-        acl = _darwin_acl_text(path)
-        if acl:
-            rec["acl"] = acl
-    except OSError as e:
-        note(f"meta {where}: ACL unreadable ({e.strerror or e})")
-    flags = getattr(st, "st_flags", 0)
+    where = _where(e)
+    flags = getattr(e.st, "st_flags", 0)
     if flags:
         rec["flags"] = flags
     try:
-        names = _darwin_xattr_names(path)
-    except OSError as e:
-        note(f"meta {where}: xattrs unlistable ({e.strerror or e})")
-        names = []
-    xs = _xattrs_record(names, lambda nm: _darwin_getxattr(path, nm), where, note)
-    if xs:
-        rec["xattrs"] = xs
+        fd = _open_for(e, "meta", note)
+    except OSError as err:
+        note(f"meta {where}: not opened ({err.strerror or err}); ACL and xattrs not recorded")
+        return rec
+    if fd is None:
+        return rec
+    try:
+        try:
+            acl = _darwin_acl_text(fd)
+            if acl:
+                rec["acl"] = acl
+        except OSError as err:
+            note(f"meta {where}: ACL unreadable ({err.strerror or err})")
+        try:
+            names = _darwin_xattr_names(fd)
+        except OSError as err:
+            note(f"meta {where}: xattrs unlistable ({err.strerror or err})")
+            names = []
+        xs = _xattrs_record(names, lambda nm: _darwin_getxattr(fd, nm), where, note)
+        if xs:
+            rec["xattrs"] = xs
+    finally:
+        os.close(fd)
     return rec
 
 
-def linux_meta(path: bytes, st: os.stat_result, note: Callable[[str], None]) -> dict:
-    """Linux: every xattr (POSIX ACLs are the ``system.posix_acl_*`` xattrs), not following a link."""
-    where = path.decode("utf-8", "replace")
+def _proc_path(e: Entry) -> bytes:
+    """Linux: the entry by its walk dirfd (``/proc/self/fd/<dirfd>/<name>``, used not following the last
+    component), for the types with no fd form; short whatever the tree's depth."""
+    return b"/proc/self/fd/%d/" % e.dirfd + e.name
+
+
+def _lx(call: Callable, target: int | bytes, *args):
+    return call(target, *args) if isinstance(target, int) else call(target, *args, follow_symlinks=False)
+
+
+def linux_meta(e: Entry, note: Callable[[str], None]) -> dict:
+    """Linux: every xattr (POSIX ACLs are the ``system.posix_acl_*`` xattrs), on an fd of the entry, or
+    by its walk dirfd's ``/proc`` path for a symlink / socket / device."""
+    where = _where(e)
     try:
-        names = [os.fsencode(n) for n in os.listxattr(path, follow_symlinks=False)]
-    except OSError as e:
-        if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
-            return {}
-        note(f"meta {where}: xattrs unlistable ({e.strerror or e})")
+        fd = _entry_fd(e)
+    except OSError as err:
+        note(f"meta {where}: not opened ({err.strerror or err}); xattrs not recorded")
         return {}
-    xs = _xattrs_record(names, lambda nm: os.getxattr(path, nm, follow_symlinks=False), where, note)
-    return {"xattrs": xs} if xs else {}
+    target: int | bytes = fd if fd is not None else _proc_path(e)
+    try:
+        try:
+            names = [os.fsencode(n) for n in _lx(os.listxattr, target)]
+        except OSError as err:
+            if err.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                note(f"meta {where}: xattrs unlistable ({err.strerror or err})")
+            return {}
+        xs = _xattrs_record(names, lambda nm: _lx(os.getxattr, target, nm), where, note)
+        return {"xattrs": xs} if xs else {}
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
-def darwin_strip(path: bytes, st: os.stat_result, note: Callable[[str], None]) -> None:
-    """Flags first (``uchg`` blocks the rest), then the ACL (an empty one set), then each xattr. A
-    failure is noted and the strip carries on: it is hygiene, not a gate (plan §2i 4)."""
-    where = path.decode("utf-8", "replace")
+def _clear_setid(fd: int, e: Entry) -> None:
+    """L2 M1: setuid / setgid off a file or directory BEFORE root's chown (macOS keeps them on a root
+    chown). Raises when it cannot: a set-id entry is never handed to the chown."""
+    m = e.st.st_mode
+    if (stat.S_ISREG(m) or stat.S_ISDIR(m)) and m & _SETID:
+        os.fchmod(fd, stat.S_IMODE(m) & ~_SETID)
+
+
+def darwin_strip(e: Entry, note: Callable[[str], None]) -> None:
+    """Flags first (``uchg`` blocks the rest), then setuid / setgid (a gate: raises), then the ACL (an
+    empty one set), then each xattr, all on an fd of the entry. A flag, ACL or xattr failure is noted and
+    the strip carries on: it is hygiene, not a gate (plan §2i 4)."""
+    where = _where(e)
     c = _darwin_libc()
-    if getattr(st, "st_flags", 0):
-        try:
-            os.chflags(path, 0, follow_symlinks=False)
-        except OSError as e:
-            note(f"strip {where}: flags not cleared ({e.strerror or e})")
+    fd = _open_for(e, "strip", note)
+    if fd is None:
+        return
     try:
-        if _darwin_acl_text(path):
-            empty = c.acl_init(1)
+        if getattr(e.st, "st_flags", 0) and c.fchflags(fd, 0) != 0:
+            note(f"strip {where}: flags not cleared ({_oserr('fchflags').strerror})")
+        _clear_setid(fd, e)
+        try:
+            if _darwin_acl_text(fd):
+                empty = c.acl_init(1)
+                try:
+                    if c.acl_set_fd_np(fd, empty, _ACL_TYPE_EXTENDED) != 0:
+                        note(f"strip {where}: ACL not cleared ({_oserr('acl_set_fd_np').strerror})")
+                finally:
+                    c.acl_free(empty)
+        except OSError as err:
+            note(f"strip {where}: ACL unreadable ({err.strerror or err})")
+        try:
+            names = _darwin_xattr_names(fd)
+        except OSError as err:
+            note(f"strip {where}: xattrs unlistable ({err.strerror or err})")
+            return
+        for nm in names:
+            if c.fremovexattr(fd, nm, 0) != 0:
+                note(f"strip {where}: xattr {nm!r} not removed ({_oserr('fremovexattr').strerror})")
+    finally:
+        os.close(fd)
+
+
+def linux_strip(e: Entry, note: Callable[[str], None]) -> None:
+    where = _where(e)
+    fd = _entry_fd(e)
+    target: int | bytes = fd if fd is not None else _proc_path(e)
+    try:
+        if fd is not None:
+            _clear_setid(fd, e)
+        try:
+            names = _lx(os.listxattr, target)
+        except OSError as err:
+            if err.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                note(f"strip {where}: xattrs unlistable ({err.strerror or err})")
+            return
+        for nm in names:
             try:
-                if c.acl_set_link_np(path, _ACL_TYPE_EXTENDED, empty) != 0:
-                    note(f"strip {where}: ACL not cleared ({_oserr('acl_set_link_np').strerror})")
-            finally:
-                c.acl_free(empty)
-    except OSError as e:
-        note(f"strip {where}: ACL unreadable ({e.strerror or e})")
-    try:
-        names = _darwin_xattr_names(path)
-    except OSError as e:
-        note(f"strip {where}: xattrs unlistable ({e.strerror or e})")
-        return
-    for nm in names:
-        if c.removexattr(path, nm, _XATTR_NOFOLLOW) != 0:
-            note(f"strip {where}: xattr {nm!r} not removed ({_oserr('removexattr').strerror})")
-
-
-def linux_strip(path: bytes, st: os.stat_result, note: Callable[[str], None]) -> None:
-    where = path.decode("utf-8", "replace")
-    try:
-        names = os.listxattr(path, follow_symlinks=False)
-    except OSError as e:
-        if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
-            note(f"strip {where}: xattrs unlistable ({e.strerror or e})")
-        return
-    for nm in names:
-        try:
-            os.removexattr(path, nm, follow_symlinks=False)
-        except OSError as e:
-            note(f"strip {where}: xattr {nm!r} not removed ({e.strerror or e})")
+                _lx(os.removexattr, target, nm)
+            except OSError as err:
+                note(f"strip {where}: xattr {nm!r} not removed ({err.strerror or err})")
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def default_meta_reader() -> MetaReader:
@@ -606,17 +928,21 @@ def default_strip() -> Strip:
 
 
 def iter_meta(root: Path, *, extra: Mapping[bytes, Path] | None = None, reader: MetaReader,
-              note: Callable[[str], None]) -> Iterator[dict]:
-    """``{path_b64, acl?, flags?, xattrs?}`` for every entry that carries any of the three.
+              note: Callable[[str], None], skip: Collection[tuple[int, int]] = ()) -> Iterator[dict]:
+    """``{path_b64, acl?, flags?, xattrs?}`` for every entry that carries any of the three. ``skip``: the
+    outside-linked inodes, whose metadata is their outside owner's and is never read by root.
     DECISION: an entry with none gets no line, so meta stays within V17's 64 MiB beside a full
     manifest."""
+    skip = frozenset(skip)
     for e in walk(root, extra):
-        rec = reader(e.abspath, e.st, note)
+        if stat.S_ISREG(e.st.st_mode) and (e.st.st_dev, e.st.st_ino) in skip:
+            continue
+        rec = reader(e, note)
         if rec:
             yield {"path_b64": _b64(e.path), **rec}
 
 
-# --- chown + the outside-link copy -----------------------------------------------------------------
+# --- chown + the outside-link copies ---------------------------------------------------------------
 
 Chown = Callable[[int, bytes, int, int], None]
 
@@ -626,43 +952,53 @@ def os_chown(dirfd: int, name: bytes, uid: int, gid: int) -> None:
     os.chown(name, uid, gid, dir_fd=dirfd, follow_symlinks=False)
 
 
-def _count_links(tree: Path) -> dict[tuple[int, int], LinkCount]:
-    links: dict[tuple[int, int], LinkCount] = {}
-    for e in walk(tree):
-        if stat.S_ISREG(e.st.st_mode) and e.st.st_nlink > 1:
-            lc = links.setdefault((e.st.st_dev, e.st.st_ino), LinkCount(e.st.st_nlink, 0, e.st.st_size))
-            lc.seen += 1
-    return links
-
-
-def _copy_over(e: Entry, tmp_dir_fd: int, tmp_name: bytes) -> None:
-    """Replace the link ``e`` by a fresh file holding its bytes (root never chowns a shared inode, plan
-    §2g 2). The copy is made in the retained dir and renamed over the link; setuid/setgid are not
-    carried onto a root-owned copy (DECISION)."""
-    src = os.open(e.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=e.dirfd)
+def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None]) -> None:
+    """Each in-tree link of an outside-linked inode becomes a hard link to that inode's staged copy (the
+    manifest step's: the bytes the session uid read and hashed), so an in-tree link set stays one inode
+    and the outside file is no longer shared (root never chowns a shared inode, plan §2g 2). Redone after a
+    crash: an entry already placed (its inode is a staged copy's) is left, a temp link this step made and
+    did not rename is removed, and the staging dir goes last. A link that cannot be placed (an immutable
+    directory, say) is noted and stays shared: unstripped, unchowned."""
+    sdir = facts.retained / LINKCOPY
     try:
-        if not _same(os.fstat(src), e.st):
-            raise Refused("tree-changed", f"{e.path!r}")
-        try:
-            os.unlink(tmp_name, dir_fd=tmp_dir_fd)
-        except FileNotFoundError:
-            pass
-        dst = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
-                      dir_fd=tmp_dir_fd)
-        try:
-            while True:
-                chunk = os.read(src, _CHUNK)
-                if not chunk:
-                    break
-                write_all(dst, chunk)
-            os.fchmod(dst, stat.S_IMODE(e.st.st_mode) & ~(stat.S_ISUID | stat.S_ISGID))
-            os.fsync(dst)
-        finally:
-            os.close(dst)
+        sfd = os.open(sdir, _DIR_FLAGS)
+    except FileNotFoundError:
+        return
+    try:
+        staged: dict[bytes, os.stat_result] = {}
+        for n in os.listdir(sfd):
+            nb = os.fsencode(n)
+            st = os.stat(nb, dir_fd=sfd, follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode):
+                staged[nb] = st
+        copies = {(st.st_dev, st.st_ino) for st in staged.values()}
+        for e in walk(tree):
+            if not stat.S_ISREG(e.st.st_mode):
+                continue
+            key = (e.st.st_dev, e.st.st_ino)
+            if key in copies:
+                if e.name.startswith(_LINK_TMP):
+                    os.unlink(e.name, dir_fd=e.dirfd)
+                    os.fsync(e.dirfd)
+                continue
+            src = _staged_name(key)
+            if src not in staged:
+                continue
+            tmp = _LINK_TMP + secrets.token_hex(8).encode("ascii")
+            try:
+                os.link(src, tmp, src_dir_fd=sfd, dst_dir_fd=e.dirfd)
+                os.rename(tmp, e.name, src_dir_fd=e.dirfd, dst_dir_fd=e.dirfd)
+                os.fsync(e.dirfd)
+            except OSError as err:
+                note(f"link {e.abspath!r}: not replaced by its copy ({err.strerror or err}); left unstripped, "
+                     f"unchowned")
+        for nb in staged:
+            os.unlink(nb, dir_fd=sfd)
+        os.fsync(sfd)
     finally:
-        os.close(src)
-    os.rename(tmp_name, e.name, src_dir_fd=tmp_dir_fd, dst_dir_fd=e.dirfd)
-    os.fsync(e.dirfd)
+        os.close(sfd)
+    os.rmdir(sdir)
+    fsync_dir(facts.retained)
 
 
 # --- seams -----------------------------------------------------------------------------------------
@@ -673,7 +1009,8 @@ def unbuilt_freeze(uid: int, bound_s: float) -> bool:
     Algorithm (plan §2e 4, built by 2d / 2g): Linux writes ``1`` to the session cgroup's
     ``cgroup.freeze`` and polls ``cgroup.events`` for ``frozen 1``; macOS, in a forked child that drops
     to ``uid`` and asserts real + effective ids == ``uid`` != 0, sends ``kill(-1, SIGSTOP)`` in a loop
-    until a process sweep of ``uid`` shows every process stopped. Past the bound = not proven."""
+    until a process sweep of ``uid`` shows every process stopped. Past the bound = not proven. END calls
+    it once per uid the session holds."""
     raise Refused("seam-unbuilt", "freeze is session 2d / 2g's")
 
 
@@ -689,6 +1026,12 @@ def unbuilt_no_process(uid: int) -> bool:
     raise Refused("seam-unbuilt", "the process sweep is session 2d / 2g's")
 
 
+def read_slot_state(path: Path) -> bytes | None:
+    """Root's own slot state file (§3.5 Pool, root 0644 in a root dir), ``None`` when absent; a link or a
+    non-regular file refuses."""
+    return read_record(path, max_bytes=4096)
+
+
 @dataclass
 class EndSeams:
     cas: Cas
@@ -696,10 +1039,13 @@ class EndSeams:
     kill: Callable[[int, float], bool] = unbuilt_kill
     no_process: Callable[[int], bool] = unbuilt_no_process
     clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
     now: Callable[[], str] = utc_now
     meta_reader: MetaReader = field(default_factory=default_meta_reader)
     strip: Strip = field(default_factory=default_strip)
     chown: Chown = os_chown
+    run_as: SessionRunAs = fork_run_as
+    slot_state: Callable[[Path], "bytes | None"] = read_slot_state
     root_uid: int = 0
     root_gid: int = 0
     fault: Fault = _no_fault
@@ -710,6 +1056,48 @@ class EndSeams:
     @property
     def retry(self) -> Callable[[Callable[[], None]], None]:
         return self.reserve.retry if self.reserve is not None else (lambda fn: fn())
+
+
+# --- CONTROL's CAS (L2 M5) --------------------------------------------------------------------------
+
+
+class CasNotSent(Exception):
+    """A CAS CONTROL did not take: never a step failure and never HELD. The record stays where it is; every
+    proof and act END runs is idempotent, so the next pass redoes them and sends it again."""
+
+    def __init__(self, target: str, cause: BaseException) -> None:
+        self.target, self.cause = target, cause
+        super().__init__(f"CAS {target} not sent: {cause}")
+
+
+def send_cas(seams: EndSeams, target: str, fields: Mapping[str, object]) -> None:
+    """``seams.cas(target, fields)`` under §3.3's client rule: ``locked`` (a try-lock collision) and a
+    CONTROL that is down (``OSError``) are retried with backoff for up to :data:`CAS_RETRY_SECONDS`;
+    ``stale-generation`` is retried once (the seam reads the record's generation on every call). Anything
+    else, or the retries spent, raises :class:`CasNotSent`. A CAS out of HELD (any target but HELD) also
+    clears ``failed_step`` and ``held_attempts`` (L1-F4: CONTROL merges, so an unnamed field survives)."""
+    if target != HELD:
+        fields = {"failed_step": None, "held_attempts": None, **fields}
+    t0 = seams.clock()
+    delay = CAS_BACKOFF_FIRST
+    stale_retried = False
+    while True:
+        try:
+            seams.cas(target, fields)
+            return
+        except Refused as e:
+            if e.name == "stale-generation" and not stale_retried:
+                stale_retried = True
+                continue
+            if e.name != "locked":
+                raise CasNotSent(target, e) from None
+            err: BaseException = e
+        except OSError as e:
+            err = e
+        if seams.clock() - t0 + delay > CAS_RETRY_SECONDS:
+            raise CasNotSent(target, err) from None
+        seams.sleep(delay)
+        delay = min(delay * 2, CAS_BACKOFF_MAX)
 
 
 # --- the retain intent's steps ---------------------------------------------------------------------
@@ -733,20 +1121,54 @@ def _init_step(facts: EndFacts, seams: EndSeams) -> None:
 
 
 def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
-    links: dict[tuple[int, int], LinkCount] = {}
-    _stream_jsonl(facts.retained / "manifest.jsonl",
-                  iter_manifest(facts.live, extra=facts.extra, caps=caps, clock=seams.clock, links=links),
-                  caps.manifest_bytes, "manifest-byte-cap")
-    copy = outside_link_bytes(links)
+    """The manifest of the frozen tree, durable, before any mutation. An outside-linked inode (L2 H2) is
+    read once, by the session-uid reader, into ``L/retained/<s>/linkcopy/<dev>-<ino>`` (the copy keeps its
+    mode less setuid/setgid; an UNREAD one is an empty 0600 placeholder), and that read is what the
+    manifest hashes. The copy cap is checked before anything is read."""
+    foreign = foreign_links(facts.live, facts.extra)
+    copy = outside_link_bytes(foreign)
     if copy > caps.link_copy_bytes:
-        (facts.retained / "manifest.jsonl").unlink()
         raise Refused("link-copy-cap", f"{copy} bytes hard-linked outside the tree > {caps.link_copy_bytes}")
+    _clear_linkcopy(facts, seams)
+    sfd = -1
+    if foreign:
+        os.mkdir(facts.retained / LINKCOPY, 0o700)
+        fsync_dir(facts.retained)
+        sfd = os.open(facts.retained / LINKCOPY, _DIR_FLAGS)
+    staged: dict[tuple[int, int], tuple[int, str]] = {}
+
+    def read_foreign(e: Entry, budget: _Budget) -> tuple[int, str]:
+        key = (e.st.st_dev, e.st.st_ino)
+        if key not in staged:
+            out = os.open(_staged_name(key), _O_NEW, 0o600, dir_fd=sfd)
+            try:
+                got = read_as_session(facts, seams, e, out, caps.link_copy_bytes, budget)
+                os.fchmod(out, 0o600 if got == UNREAD else stat.S_IMODE(e.st.st_mode) & ~_SETID)
+                os.fsync(out)
+            finally:
+                os.close(out)
+            if got == UNREAD:
+                seams.note(f"link {e.abspath!r}: the session uid cannot read it; recorded, not copied")
+            staged[key] = got
+        return staged[key]
+
+    try:
+        _stream_jsonl(facts.retained / "manifest.jsonl",
+                      iter_manifest(facts.live, extra=facts.extra, caps=caps, clock=seams.clock,
+                                    credentials=facts.parked_paths, foreign=foreign, read_foreign=read_foreign),
+                      caps.manifest_bytes, "manifest-byte-cap")
+        if sfd >= 0:
+            os.fsync(sfd)
+    finally:
+        if sfd >= 0:
+            os.close(sfd)
     seams.fault("retain:manifest:written")
 
 
 def _meta_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     _stream_jsonl(facts.retained / "meta.jsonl",
-                  iter_meta(facts.live, extra=facts.extra, reader=seams.meta_reader, note=seams.note),
+                  iter_meta(facts.live, extra=facts.extra, reader=seams.meta_reader, note=seams.note,
+                            skip=foreign_links(facts.live, facts.extra)),
                   caps.meta_bytes, "meta-byte-cap")
 
 
@@ -783,8 +1205,9 @@ def _rename_durable(src: Path, dst: Path) -> None:
 
 def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
     """Rename the session's work into ``tree/`` (and macOS ``/var/folders/<slot>`` into
-    ``tree/.levain-var-folders/``), replace outside-linked files by copies, strip, then chown root.
-    Each sub-step is idempotent; the slot uid is proven dead, so nothing changes under the walks."""
+    ``tree/.levain-var-folders/``), link the staged copies over the outside-linked files, strip (setuid /
+    setgid included), then chown root. Each sub-step is idempotent; every session uid is proven dead, so
+    nothing changes under the walks, and every call is on a walk dirfd or an fd of the entry (L2 M2)."""
     tree = facts.tree
     if os.path.lexists(facts.live):
         if os.path.lexists(tree):
@@ -808,26 +1231,15 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
         _rename_durable(vf, dest)
     seams.fault("retain:tree:var-folders")
 
-    # DECISION: the outside-link copy runs before the strip (§7.4 names rename, strip, fchown), so
-    # the strip never clears flags or xattrs on an inode a path outside the tree still shares.
-    links = _count_links(tree)
-    tmp_fd = os.open(facts.retained, _DIR_FLAGS)
-    try:
-        for e in walk(tree):
-            lc = links.get((e.st.st_dev, e.st.st_ino)) if stat.S_ISREG(e.st.st_mode) else None
-            if lc is not None and lc.seen < lc.nlink:
-                try:
-                    _copy_over(e, tmp_fd, b".linkcopy.tmp")
-                except OSError as err:
-                    seams.note(f"link {e.abspath!r}: not copied ({err.strerror or err}); left unstripped, unchowned")
-    finally:
-        os.close(tmp_fd)
+    # DECISION: the outside-link copies are placed before the strip (§7.4 names rename, strip, fchown),
+    # so the strip never clears flags or xattrs on an inode a path outside the tree still shares.
+    _place_link_copies(facts, tree, seams.note)
     seams.fault("retain:tree:links")
 
-    shared = {k for k, lc in _count_links(tree).items() if lc.seen < lc.nlink}
+    shared = set(foreign_links(tree))
     for e in walk(tree):
         if (e.st.st_dev, e.st.st_ino) not in shared:
-            seams.strip(e.abspath, e.st, seams.note)
+            seams.strip(e, seams.note)
     seams.fault("retain:tree:stripped")
 
     rfd = os.open(facts.retained, _DIR_FLAGS)
@@ -891,35 +1303,45 @@ def _open_subdir(base: Path, parts: tuple[bytes, ...]) -> int | None:
 
 
 def park_move(facts: EndFacts) -> None:
-    """Move each vendor credential file to ``keep/`` by rename, never opening it. Only a non-directory
-    is moved (a directory at that path is ordinary work, retained); absent = already parked or never
-    made. keep/ (root 0700, install's) is made if it is missing (DECISION)."""
-    if facts.slot.slot_class != "egress" or not os.path.isdir(facts.live):
+    """Move the session vendor's credential file to ``keep/`` by rename, never opening it, on a
+    passthrough session only (L1-F1): on any other, a file at a credential path is ordinary work, retained.
+    Only a non-directory is moved; absent = already parked or never made. A ``keep/`` entry already there
+    is never replaced (``keep-occupied``, HELD park), so a planted file cannot overwrite a parked login;
+    ``keep/`` is root-only, so the check and the rename cannot race. keep/ (root 0700, install's) is made
+    if it is missing (DECISION)."""
+    cred = facts.credential
+    if cred is None or not os.path.isdir(facts.live):
+        return
+    parts, name = cred
+    dfd = _open_subdir(facts.live, parts)
+    if dfd is None:
         return
     try:
-        os.mkdir(facts.keep, 0o700)
-    except FileExistsError:
-        pass
-    kfd = os.open(facts.keep, _DIR_FLAGS)
-    try:
-        for parts, name in CREDENTIAL_FILES:
-            dfd = _open_subdir(facts.live, parts)
-            if dfd is None:
-                continue
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(st.st_mode):
+            return
+        try:
+            os.mkdir(facts.keep, 0o700)
+        except FileExistsError:
+            pass
+        kfd = os.open(facts.keep, _DIR_FLAGS)
+        try:
             try:
-                try:
-                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if stat.S_ISDIR(st.st_mode):
-                    continue
-                os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
-                os.fsync(dfd)
-                os.fsync(kfd)
-            finally:
-                os.close(dfd)
+                os.stat(name, dir_fd=kfd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise Refused("keep-occupied", f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+            os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
+            os.fsync(dfd)
+            os.fsync(kfd)
+        finally:
+            os.close(kfd)
     finally:
-        os.close(kfd)
+        os.close(dfd)
 
 
 def park_plan(facts: EndFacts) -> Plan:
@@ -1018,25 +1440,82 @@ class Reserve:
         return cur >= self.size
 
 
+# --- root's facts beside alloc: the clone marker, the slot check, the END lock ---------------------
+
+
+def cloned_path(store: Path, session: str) -> Path:
+    """DECISION: ``L/alloc/<session>.cloned`` (root 0600), beside the alloc record."""
+    return intent_path(Path(store) / "alloc", session).with_name(f"{session}.cloned")
+
+
+def mark_cloned(store: Path, session: str, *, now: Callable[[], str] = utc_now) -> None:
+    """``start``'s root fact that the clone ran (L2 H1, L1-F3; §5.4 3: a failed clone refuses
+    ``clone-failed``), written only after the clone succeeded. It holds the time it was written."""
+    atomic_write(cloned_path(store, session), (now() + "\n").encode("ascii"), 0o600)
+
+
+def repo_cloned(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned) -> bool:
+    """Whether the session ever cloned: root's marker (:func:`mark_cloned`) exists. Never inferred from
+    ``<S>/repo``, which the slot can empty: with the marker, whatever is there is retained, an empty repo
+    included; without it the session never cloned and retains nothing (CONTRACT §7.3)."""
+    try:
+        st = os.lstat(facts.cloned_marker)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or not owner_ok(st):
+        raise Refused("bad-root", f"{facts.cloned_marker} is not a regular file with the expected owner")
+    return True
+
+
+def check_slot_ours(facts: EndFacts, seams: EndSeams) -> None:
+    """L2 M4, before anything is signalled: root's own slot state file (§3.5 Pool) shows this slot
+    ``leased`` to THIS session at alloc's ``lease_seq``. Absent, unreadable, malformed, another session,
+    another lease or not leased = ``slot-not-ours``."""
+    try:
+        data = seams.slot_state(facts.slot_state)
+        st = parse_slot_state(data) if data is not None else None
+    except (Refused, OSError) as e:
+        raise Refused("slot-not-ours", f"{facts.slot_state} unreadable ({e})") from None
+    if st is None:
+        raise Refused("slot-not-ours", f"no {facts.slot_state}")
+    if (st.slot != facts.slot or st.state != "leased" or st.session != facts.session
+            or facts.lease_seq is None or st.lease_seq != facts.lease_seq):
+        raise Refused("slot-not-ours", f"{facts.slot.tag} is {st.state} to {st.session} at lease {st.lease_seq}")
+
+
+@contextmanager
+def end_lock(facts: EndFacts, seams: EndSeams) -> Iterator[None]:
+    """Root's per-session try-lock (L2 M7): one END or reconciliation per session at a time; held =
+    ``end-busy`` (the reaper or helper retries). Under it, a dead writer's temp files of what END writes
+    (the journal's ``L/alloc/.<s>.intent.json.*.tmp``, ``L/retained/<s>/.*.tmp``) are swept: no live writer
+    can own one. ``start``'s clone-marker temp is not END's to sweep."""
+    path = facts.lock
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not seams.owner_ok(st):
+            raise Refused("bad-root", f"{path} is not a regular file with the expected owner")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("end-busy", facts.session) from None
+        sweep_temps(facts.alloc_dir, facts.intent.name, owner_ok=seams.owner_ok)
+        if os.path.isdir(facts.retained) and not os.path.islink(facts.retained):
+            sweep_temps(facts.retained, "", owner_ok=seams.owner_ok)
+        yield
+    finally:
+        os.close(fd)   # closing the only descriptor releases the flock
+
+
 # --- the END driver --------------------------------------------------------------------------------
 
 END_STEPS = ("freeze", "kill", "park", "retain")
 _START = {REVOKED: 0, FROZEN: 1, DEAD: 2, CREDENTIAL_PARKED: 3}
-_RESUME = {"freeze": 0, "kill": 1, "park": 2, "manifest_budget": 3, **{p: 3 for p in INTENT_PHASES["retain"]}}
-
-
-def repo_cloned(facts: EndFacts) -> bool:
-    """Whether the session ever cloned: ``<S>/repo/`` is a real directory with an entry in it. A
-    session that never did retains nothing (CONTRACT §7.3)."""
-    if not os.path.isdir(facts.live):
-        return False
-    fd = _open_subdir(facts.live, (b"repo",))
-    if fd is None:
-        return False
-    try:
-        return bool(os.listdir(fd))
-    finally:
-        os.close(fd)
+_RESUME = {"slot-not-ours": 0, "freeze": 0, "kill": 1, "park": 2, "manifest_budget": 3,
+           **{p: 3 for p in INTENT_PHASES["retain"]}}
 
 
 def _held_name(intent: str, e: PhaseFailed) -> str:
@@ -1053,11 +1532,24 @@ def _plan_for(facts: EndFacts, seams: EndSeams, caps: Caps) -> Callable[[RootInt
     return plan_for
 
 
+def _reconcile(facts: EndFacts, seams: EndSeams, caps: Caps) -> RootIntent | None:
+    return reconcile(facts.intent, _plan_for(facts, seams, caps), cas=lambda t, f: send_cas(seams, t, f),
+                     fault=seams.fault, retry=seams.retry, owner_ok=seams.owner_ok)
+
+
 def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps()) -> RootIntent | None:
     """The reaper's step 2 / helper start for one session: finish its journal, from the journal and
-    the filesystem only. Raises :class:`PhaseFailed` (journal left at the phase) or ``Refused``."""
-    return reconcile(facts.intent, _plan_for(facts, seams, caps), cas=seams.cas, fault=seams.fault,
-                     retry=seams.retry, owner_ok=seams.owner_ok)
+    the filesystem only, under root's per-session lock. It runs no freeze, kill or process proof: a
+    journal exists only once END proved them (the retain and park journals are begun after the kill's
+    proof). Raises :class:`PhaseFailed` (journal left at the phase), ``Refused`` (``end-busy`` included)
+    or :class:`CasNotSent`."""
+    with end_lock(facts, seams):
+        try:
+            return _reconcile(facts, seams, caps)
+        except PhaseFailed as e:
+            if isinstance(e.cause, CasNotSent):
+                raise e.cause from None
+            raise
 
 
 def _prove(ok: Callable[[], bool], what: str, seams: EndSeams, bound: float | None) -> None:
@@ -1069,39 +1561,54 @@ def _prove(ok: Callable[[], bool], what: str, seams: EndSeams, bound: float | No
 
 
 def end_session(facts: EndFacts, seams: EndSeams, *, record_state: str, failed_step: str | None = None,
-                caps: Caps = Caps()) -> str:
+                held_attempts: int | None = None, caps: Caps = Caps()) -> str:
     """Drive one session through END from ``record_state`` (and ``failed_step`` for HELD); returns the
     state it leaves the record in (RETAINED or HELD). Every proof and idempotent act runs every call;
-    the record's state only chooses which CAS edges are sent (see the module docstring)."""
+    the record's state only chooses which CAS edges are sent (see the module docstring). A landing in
+    HELD sends ``held_attempts`` one past the record's (§7.3: the reaper's backoff and doctor read it).
+    Raises ``end-busy`` (another END or reconciliation holds the session) and :class:`CasNotSent`."""
     if record_state == RETAINED:
         return RETAINED
     start = _RESUME.get(failed_step or "") if record_state == HELD else _START.get(record_state)
     if start is None:
         raise Refused("not-ending", f"{record_state} / {failed_step}")
-    uid = facts.slot_uid
-    step = "freeze"
+    attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
+    with end_lock(facts, seams):
+        return _end_locked(facts, seams, start, attempts + 1, caps)
+
+
+def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, caps: Caps) -> str:
+    def cas(target: str, fields: Mapping[str, object]) -> None:
+        send_cas(seams, target, fields)
+
+    step = "slot-not-ours"
     try:
-        _prove(lambda: seams.freeze(uid, V12_SECONDS), "freeze", seams, V12_SECONDS)
+        check_slot_ours(facts, seams)
+        step = "freeze"
+        for uid in facts.uids:
+            _prove(lambda u=uid: seams.freeze(u, V12_SECONDS), "freeze", seams, V12_SECONDS)
         if start <= 0:
-            seams.cas(FROZEN, {})
+            cas(FROZEN, {})
         step = "kill"
-        _prove(lambda: seams.kill(uid, V12_SECONDS), "kill", seams, V12_SECONDS)
-        _prove(lambda: seams.no_process(uid), "kill", seams, None)
+        for uid in facts.uids:
+            _prove(lambda u=uid: seams.kill(u, V12_SECONDS), "kill", seams, V12_SECONDS)
+        for uid in facts.uids:
+            _prove(lambda u=uid: seams.no_process(u), "kill", seams, None)
         if start <= 1:
-            seams.cas(DEAD, {})
+            cas(DEAD, {})
 
         step = "park"
         pending = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
         if pending is not None:
             try:
-                reconcile_session(facts, seams, caps=caps)
+                _reconcile(facts, seams, caps)
             except PhaseFailed as e:
                 step = _held_name(pending.intent, e)
                 raise
             if pending.intent == "retain":
                 return RETAINED
         if pending is None and start <= 2:
-            begin(facts.intent, park_plan(facts), started_at=seams.now(), cas=seams.cas,
+            begin(facts.intent, park_plan(facts), started_at=seams.now(), cas=cas,
                   fault=seams.fault, retry=seams.retry)
         elif start > 2:
             park_move(facts)   # idempotent; no journal and no CAS: the record is already past it
@@ -1110,35 +1617,41 @@ def end_session(facts: EndFacts, seams: EndSeams, *, record_state: str, failed_s
         if os.path.lexists(facts.tree):
             # A tree and no journal = a retain that finished (its CAS precedes the journal delete):
             # the filesystem says RETAINED, so that is the edge sent, never a second retain.
-            seams.cas(RETAINED, dict(retain_plan(facts, seams, caps=caps, started_at=seams.now()).fields()))
+            cas(RETAINED, dict(retain_plan(facts, seams, caps=caps, started_at=seams.now()).fields()))
             return RETAINED
-        if not repo_cloned(facts):
-            seams.cas(RETAINED, {})
+        if not repo_cloned(facts, owner_ok=seams.owner_ok):
+            cas(RETAINED, {})
             return RETAINED
         started = seams.now()
         try:
             begin(facts.intent, retain_plan(facts, seams, caps=caps, started_at=started),
-                  started_at=started, cas=seams.cas, fault=seams.fault, retry=seams.retry)
+                  started_at=started, cas=cas, fault=seams.fault, retry=seams.retry)
         except PhaseFailed as e:
             step = _held_name("retain", e)
             raise
         return RETAINED
+    except CasNotSent:
+        raise
     except PhaseFailed as e:
+        if isinstance(e.cause, CasNotSent):
+            raise e.cause from None
         seams.note(f"END {facts.session}: {step} not proven: {e}")
         held = step
     except Exception as e:   # noqa: BLE001 - an unproven step is HELD, never a crash past the tree
         seams.note(f"END {facts.session}: {step} not proven: {e}")
         held = step
-    seams.cas(HELD, {"failed_step": held})
+    cas(HELD, {"failed_step": held, "held_attempts": attempts})
     return HELD
 
 
-__all__ = ["BUDGET_REFUSALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED", "Caps", "DEAD", "END_STEPS", "EndFacts",
-           "EndSeams", "Entry", "FROZEN", "HELD", "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT",
-           "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES",
-           "V17_META_BYTES", "V1_INODES", "V2_SECONDS", "V5_FLOOR_BYTES", "VAR_FOLDERS_NAME", "darwin_meta",
-           "darwin_strip", "default_meta_reader", "default_strip", "digest_bytes", "end_session", "entry_type",
-           "facts_from_alloc", "iter_manifest", "iter_meta", "keep_shape_ok", "linux_meta", "linux_strip",
-           "object_record", "os_chown", "outside_link_bytes", "park_move", "park_plan", "reconcile_session",
-           "repo_cloned", "retain_plan", "tree_manifest", "unbuilt_freeze", "unbuilt_kill",
-           "unbuilt_no_process", "utc_now", "walk"]
+__all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED", "Caps",
+           "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
+           "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT", "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve",
+           "UNREAD", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES", "V17_META_BYTES", "V1_INODES", "V2_SECONDS",
+           "V5_FLOOR_BYTES", "VAR_FOLDERS_NAME", "check_slot_ours", "cloned_path", "darwin_meta", "darwin_strip",
+           "default_meta_reader", "default_strip", "digest_bytes", "end_lock", "end_session", "entry_type",
+           "facts_from_alloc", "foreign_links", "fork_run_as", "iter_manifest", "iter_meta", "keep_shape_ok",
+           "linux_meta", "linux_strip", "mark_cloned", "object_record", "os_chown", "outside_link_bytes",
+           "park_move", "park_plan", "read_as_session", "read_slot_state", "reconcile_session", "repo_cloned",
+           "retain_plan", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
+           "utc_now", "walk"]

@@ -204,7 +204,7 @@ def _state(**kw) -> R.SessionState:
 
 
 def test_state_round_trip():
-    s = _state(touched=(".claude", "CLAUDE.md"),
+    s = _state(touched=(".config/git", "CLAUDE.md"),
                fields={"manifest": {"digest": "sha256:" + "0" * 64, "entries": 3, "bytes": 10},
                        "identity": {"observed_id": "user@example.com"}, "held_attempts": 2})
     data = R.state_bytes(s)

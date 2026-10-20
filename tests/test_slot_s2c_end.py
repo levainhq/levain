@@ -1,8 +1,10 @@
 """CONTRACT §7.3-7.5 (END: revoke, freeze, kill, park, RETAIN; the reserve), V1 V2 V6 V12 V14 V17.
 
 Real files in pytest tmp dirs and a real git repo; the root-only acts are seams: freeze / kill / the
-process sweep are fakes, CONTROL's CAS is a fake record, and ``chown`` is the real ``fchownat`` to
-THIS test's uid/gid (no root). The metadata reader and strip are the host's real ones."""
+process sweep are fakes, CONTROL's CAS is the REAL ``Control.cas`` (records' edge table, the field merge,
+the "already done" rule) over a temp store, ``chown`` is the real ``fchownat`` to THIS test's uid/gid (no
+root), and the session-uid reader is stage's in-process runner (no drop). The metadata reader and strip
+are the host's real ones."""
 from __future__ import annotations
 
 import errno
@@ -12,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,12 +22,15 @@ import pytest
 
 from levain.contracts import canon
 from levain.slot import Refused
+from levain.slot import control as C
 from levain.slot import end as end_mod
+from levain.slot import records as R
+from levain.slot import stage
 from levain.slot.end import (CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED, VAR_FOLDERS_NAME, Caps,
                              EndFacts, EndSeams, Reserve, end_session, facts_from_alloc, keep_shape_ok,
                              reconcile_session, tree_manifest)
 from levain.slot.ids import SlotId
-from levain.slot.root_intent import INTENT_PHASES, RootIntent, read_root_intent, write_root_intent
+from levain.slot.root_intent import INTENT_PHASES, RootIntent, read_root_intent, temp_path, write_root_intent
 
 SESSION = "s-0123456789abcdef"
 NOW = "2026-10-20T18:00:00Z"
@@ -32,6 +38,8 @@ UID, GID = os.getuid(), os.getgid()
 CRED = b'{"claudeAiOauth":{"accessToken":"sk-ant-oat-TEST"}}'
 DARWIN = sys.platform == "darwin"
 UF_IMMUTABLE = getattr(stat, "UF_IMMUTABLE", 0x2)
+LEASE_SEQ = 5
+OP_UID = UID if UID != 0 else 501
 
 
 class Crash(BaseException):
@@ -39,20 +47,95 @@ class Crash(BaseException):
 
 
 class Control:
-    """CONTROL's record as far as END sees it: CAS to a target; one already at its target is done."""
+    """CONTROL's record as END sees it, through the REAL :meth:`Control.cas`: the edge table, the field
+    merge and the "already done" rule are CONTROL's own. The client side reads the record's generation
+    and state before each CAS, as a client that re-reads would; a CAS already at its target is sent
+    ``from`` a predecessor (a client whose read predates the move), so CONTROL's rule decides it.
+    ``history`` = the CASes that moved a generation, without the null fields. ``refuse``: refusal names
+    raised before the next CASes reach CONTROL (a try-lock collision, a restart)."""
 
-    def __init__(self, state: str = REVOKED) -> None:
-        self.state, self.fields, self.history = state, {}, []
+    def __init__(self, state: str = REVOKED, session: str = SESSION) -> None:
+        self._dir = tempfile.TemporaryDirectory(prefix="lv-end-ctl-")
+        self.session = session
+        self.store = C.StateStore(Path(self._dir.name))
+        self.ctl = C.Control(self.store, OP_UID)
+        with self.store.lock(session):
+            self.store.put(R.SessionState(session=session, generation=0, state=state, claims={}, lease_live=False,
+                                          event_kind="state", updated_at=NOW))
+        self.history: list = []
+        self.refuse: list = []
+        self.sent: list = []
 
     def cas(self, target, fields):
-        if target == self.state and target != HELD:
-            return
-        self.history.append((target, dict(fields)))
-        self.state, self.fields = target, dict(fields)
+        self.sent.append((target, dict(fields)))
+        if self.refuse:
+            raise Refused(self.refuse.pop(0))
+        rec = self.store.get(self.session)
+        frm = rec.state
+        if frm == target and target != HELD:
+            frm = next(a for a, b in sorted(R.EDGES) if b == target)
+        gen = self.ctl.cas(self.session, rec.generation, frm, target, dict(fields))
+        if gen != rec.generation:
+            self.history.append((target, {k: v for k, v in fields.items() if v is not None}))
+
+    @property
+    def rec(self):
+        return self.store.get(self.session)
+
+    @property
+    def state(self):
+        return self.rec.state
+
+    @property
+    def fields(self):
+        return dict(self.rec.fields)
 
     @property
     def failed_step(self):
         return self.fields.get("failed_step") if self.state == HELD else None
+
+
+def slot_state(L: Path, slot: SlotId, session: str = SESSION, lease_seq: int = LEASE_SEQ,
+               state: str = "leased") -> None:
+    """Root's slot state file (§3.5 Pool) for ``slot``: leased to ``session`` at ``lease_seq``."""
+    d = slot.slot_dir(L)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "state").write_bytes(R.slot_state_bytes(R.SlotState(
+        slot, rev=lease_seq * 2, lease_seq=lease_seq, state=state, dispatch_eligible=False, changed_at=NOW,
+        session=session if state == "leased" else None)))
+
+
+def thread_run_as(calls: list | None = None):
+    """stage's in-process runner in the session-uid reader's shape (the drop is the VM's)."""
+    def run_as(uid, gid, fn, wfd, keep=()):
+        if calls is not None:
+            calls.append((uid, gid, tuple(keep)))
+        return stage.thread_run_as(uid, gid, fn, wfd)
+    return run_as
+
+
+def entry_of(path: Path) -> end_mod.Entry:
+    """An Entry for one path, for calling the fd-based metadata helpers in a test."""
+    st = os.lstat(path)
+    return end_mod.Entry(os.fsencode(path.name), st, -1, os.fsencode(path.name), os.fsencode(path))
+
+
+def acl_text(path: Path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        return end_mod._darwin_acl_text(fd)
+    finally:
+        os.close(fd)
+
+
+def xattr_names(path: Path) -> list:
+    if not DARWIN:
+        return [os.fsencode(n) for n in os.listxattr(path)]
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        return end_mod._darwin_xattr_names(fd)
+    finally:
+        os.close(fd)
 
 
 def mine(st):
@@ -89,7 +172,8 @@ def _unflag(root: Path) -> None:
 
 
 class World:
-    def __init__(self, tmp: Path, *, git: bool = True, var_folders: bool = True, uchg: bool = True) -> None:
+    def __init__(self, tmp: Path, *, git: bool = True, var_folders: bool = True, uchg: bool = True,
+                 cloned: bool = True) -> None:
         self.tmp = tmp
         self.L = tmp / "L"
         for d in ("live", "alloc", "retained", "sessions", "slots/e3/keep"):
@@ -97,9 +181,13 @@ class World:
         os.chmod(self.L / "retained", 0o700)
         self.S = self.L / "live" / SESSION
         self.vf = tmp / "var-folders" / "zz" / "slot3" if var_folders else None
-        self.facts = EndFacts(SESSION, SlotId("egress", 3), UID, GID, self.L, self.vf)
+        self.facts = EndFacts(SESSION, SlotId("egress", 3), UID, GID, self.L, self.vf, lease_seq=LEASE_SEQ,
+                              vendor="claude", auth="passthrough")
         self.xattr = False
+        slot_state(self.L, self.facts.slot)
         self._build(git, uchg)
+        if cloned:
+            end_mod.mark_cloned(self.L, SESSION, now=lambda: NOW)
 
     def _build(self, git: bool, uchg: bool) -> None:
         S = self.S
@@ -155,7 +243,7 @@ class World:
             end_mod.os_chown(dirfd, name, uid, gid)
         base = dict(cas=ctl.cas, freeze=lambda uid, b: True, kill=lambda uid, b: True, no_process=lambda uid: True,
                     now=lambda: NOW, chown=chown, root_uid=UID, root_gid=GID, note=self.notes.append,
-                    owner_ok=mine)
+                    owner_ok=mine, run_as=thread_run_as(), sleep=lambda s: None)
         base.update(kw)
         return EndSeams(**base)
 
@@ -169,7 +257,7 @@ class World:
         return snap
 
     def pre_manifest(self):
-        return tree_manifest(self.S, extra=self.extra, skip_credentials=True)
+        return tree_manifest(self.S, extra=self.extra, credentials=self.facts.parked_paths, skip_credentials=True)
 
     def manifest_file(self):
         return [canon.parse(x) for x in (self.facts.retained / "manifest.jsonl").read_bytes().splitlines()]
@@ -270,8 +358,7 @@ def test_meta_captured_before_strip(world):
     if world.xattr:
         assert {"name": "user.levain.test", "value_b64": base64.b64encode(b"kept-in-meta").decode()} in \
             by["repo/README"]["xattrs"]
-        listed = (end_mod._darwin_xattr_names(os.fsencode(world.facts.tree / "repo" / "README")) if DARWIN
-                  else [os.fsencode(n) for n in os.listxattr(world.facts.tree / "repo" / "README")])
+        listed = xattr_names(world.facts.tree / "repo" / "README")
         assert b"user.levain.test" not in listed           # stripped from the retained tree
     if DARWIN:
         assert by["repo/locked.txt"]["flags"] & UF_IMMUTABLE
@@ -286,7 +373,7 @@ def test_uchg_ace_finderinfo_and_unstrippable_xattr_do_not_wedge_end(world, monk
     subprocess.run(["/usr/bin/xattr", "-wx", "com.apple.FinderInfo", "54455854" + "00" * 28, str(f)], check=True)
     os.chflags(f, UF_IMMUTABLE)
     real = end_mod._darwin_libc()
-    monkeypatch.setattr(real, "removexattr", lambda *a: -1)     # every xattr unstrippable
+    monkeypatch.setattr(real, "fremovexattr", lambda *a: -1)    # every xattr unstrippable
     ctl = Control()
     assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == RETAINED
     import base64
@@ -297,7 +384,7 @@ def test_uchg_ace_finderinfo_and_unstrippable_xattr_do_not_wedge_end(world, monk
     assert any(x["name"] == "com.apple.FinderInfo" for x in rec["xattrs"])
     assert any("not removed" in n for n in world.notes)
     assert os.lstat(world.facts.tree / "repo" / "decorated").st_flags == 0
-    assert end_mod._darwin_acl_text(os.fsencode(world.facts.tree / "repo" / "decorated")) is None
+    assert acl_text(world.facts.tree / "repo" / "decorated") is None
 
 
 def test_hardlinks_inside_kept_outside_copied(tmp_path):
@@ -327,7 +414,7 @@ def test_link_copy_cap_refused_before_mutation(tmp_path):
     pre = snapshot(w.S)
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED, caps=Caps(link_copy_bytes=99)) == HELD
-    assert ctl.fields == {"failed_step": "manifest_budget"}
+    assert ctl.failed_step == "manifest_budget"
     pre.pop("config/claude/.credentials.json")
     now = snapshot(w.S)
     assert now == pre and not w.facts.tree.exists()
@@ -368,11 +455,14 @@ def test_crash_mid_manifest_leaves_no_partial(world):
     """The manifest streams to a temp file: a crash before the rename leaves no manifest a later phase
     could trust."""
     ctl = Control()
+    seen: list = []
 
     def fault(p):
         if p == "retain:manifest:written":
             os.unlink(world.facts.retained / "manifest.jsonl")   # as if the rename never happened
-            (world.facts.retained / "manifest.jsonl.tmp").write_bytes(b"partial")
+            partial = temp_path(world.facts.retained / "manifest.jsonl")
+            partial.write_bytes(b"partial")
+            seen.append(partial)
             raise Crash(p)
     with pytest.raises(Crash):
         end_session(world.facts, world.seams(ctl, fault=fault), record_state=REVOKED)
@@ -380,23 +470,32 @@ def test_crash_mid_manifest_leaves_no_partial(world):
     seams = world.seams(ctl)
     reconcile_session(world.facts, seams)
     assert ctl.state == RETAINED and world.manifest_file() == pre_manifest
-    assert not (world.facts.retained / "manifest.jsonl.tmp").exists()
+    assert seen and not seen[0].exists()                  # the dead writer's temp is swept under the lock
 
 
 # --- a forged state record cannot steer root -------------------------------------------------------
 
 
-def _trace(monkeypatch, needle: str, calls=("open", "stat", "lstat", "listdir", "unlink", "rmdir", "rename", "replace")) -> list:
+def _trace(monkeypatch, needle: str, calls=("open", "stat", "lstat", "listdir", "scandir", "unlink", "rmdir",
+                                            "rename", "replace"), builtin_open: bool = True) -> list:
+    """Every call of ``os.<calls>`` (and builtin / ``io`` ``open``, which ``Path.read_bytes`` and ``Path.open``
+    use) naming a path that holds ``needle``."""
+    import builtins
+    import io
     seen: list = []
-    for name in calls:
-        real = getattr(os, name)
 
-        def wrapped(*a, _real=real, **k):
+    def wrap(real):
+        def wrapped(*a, **k):
             for x in a[:2]:
                 if isinstance(x, (str, bytes, os.PathLike)) and needle in os.fsdecode(x):
                     seen.append(x)
-            return _real(*a, **k)
-        monkeypatch.setattr(os, name, wrapped)
+            return real(*a, **k)
+        return wrapped
+    for name in calls:
+        monkeypatch.setattr(os, name, wrap(getattr(os, name)))
+    if builtin_open:
+        monkeypatch.setattr(builtins, "open", wrap(builtins.open))
+        monkeypatch.setattr(io, "open", wrap(io.open))
     return seen
 
 
@@ -451,17 +550,17 @@ def test_end_byte_cap_refused(world):
     pre_live = {k: v for k, v in snapshot(world.S).items() if k != "config/claude/.credentials.json"}
     ctl = Control()
     assert end_session(world.facts, world.seams(ctl), record_state=REVOKED, caps=Caps(manifest_bytes=300)) == HELD
-    assert ctl.fields == {"failed_step": "manifest_budget"}
+    assert ctl.failed_step == "manifest_budget"
     assert any("manifest-byte-cap" in n for n in world.notes)
     _untouched(world, pre_live)
     assert read_root_intent(world.facts.intent, owner_ok=mine).phase == "manifest"
     # meta has its own V17 cap
     ctl2 = Control(HELD)
-    big = lambda path, st, note: {"flags": 1, "xattrs": [{"name": "user.x", "value_b64": "A" * 64}]}  # noqa: E731
+    big = lambda e, note: {"flags": 1, "xattrs": [{"name": "user.x", "value_b64": "A" * 64}]}  # noqa: E731
     assert end_session(world.facts, world.seams(ctl2, meta_reader=big), record_state=HELD,
                        failed_step="manifest_budget", caps=Caps(meta_bytes=500)) == HELD
     assert any("meta-byte-cap" in n for n in world.notes)
-    assert ctl2.fields == {"failed_step": "manifest_budget"} and snapshot(world.S) == pre_live
+    assert ctl2.failed_step == "manifest_budget" and snapshot(world.S) == pre_live
     # force-retire (a): END again with larger caps retains the whole tree
     pre, pre_manifest = world.pre(), world.pre_manifest()
     assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="manifest_budget") == RETAINED
@@ -475,7 +574,7 @@ def test_end_inode_and_time_caps_refused(tmp_path):
     n = len(w.pre_manifest())
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED, caps=Caps(inodes=n - 1)) == HELD
-    assert ctl.fields == {"failed_step": "manifest_budget"} and any("manifest-inode-cap" in x for x in w.notes)
+    assert ctl.failed_step == "manifest_budget" and any("manifest-inode-cap" in x for x in w.notes)
     _untouched(w, pre_live)
     ticks = iter(range(10_000))
     assert end_session(w.facts, w.seams(ctl, clock=lambda: float(next(ticks))), record_state=HELD,
@@ -533,12 +632,12 @@ def test_end_node_modules_class_tree(tmp_path):
     assert len(w2.pre_manifest()) > caps.inodes
     ctl2 = Control()
     assert end_session(w2.facts, w2.seams(ctl2), record_state=REVOKED, caps=caps) == HELD
-    assert ctl2.fields == {"failed_step": "manifest_budget"} and any("manifest-inode-cap" in x for x in w2.notes)
+    assert ctl2.failed_step == "manifest_budget" and any("manifest-inode-cap" in x for x in w2.notes)
     assert w2.S.exists() and not w2.facts.tree.exists()
 
 
-def _no_provenance(path, st, note):
-    rec = end_mod.default_meta_reader()(path, st, note)
+def _no_provenance(e, note):
+    rec = end_mod.default_meta_reader()(e, note)
     xs = [x for x in rec.get("xattrs", []) if x["name"] != "com.apple.provenance"]
     rec = {k: v for k, v in rec.items() if k != "xattrs"}
     return {**rec, "xattrs": xs} if xs else rec
@@ -551,11 +650,11 @@ def test_provenance_on_every_entry_passes_meta_cap(tmp_path):
     force-retire's larger caps. Simulated with a reader that gives every entry one such xattr."""
     w = World(tmp_path, var_folders=False, uchg=False)
     _node_modules_tree(w.S / "repo", packages=80, targets=300)
-    one = lambda path, st, note: {"xattrs": [{"name": "com.apple.provenance", "value_b64": "AQIANGshcIylgIU="}]}  # noqa: E731
+    one = lambda e, note: {"xattrs": [{"name": "com.apple.provenance", "value_b64": "AQIANGshcIylgIU="}]}  # noqa: E731
     caps = Caps().scaled(1 / 1000)
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl, meta_reader=one), record_state=REVOKED, caps=caps) == HELD
-    assert ctl.fields == {"failed_step": "manifest_budget"} and any("meta-byte-cap" in x for x in w.notes)
+    assert ctl.failed_step == "manifest_budget" and any("meta-byte-cap" in x for x in w.notes)
     assert w.S.exists() and not w.facts.tree.exists()
     assert end_session(w.facts, w.seams(ctl, meta_reader=one), record_state=HELD, failed_step="manifest_budget",
                        caps=replace(caps, meta_bytes=caps.meta_bytes * 4)) == RETAINED
@@ -573,7 +672,7 @@ def test_kill_failure_held(world, seam, failed):
     pre_live = snapshot(world.S)
     ctl = Control()
     assert end_session(world.facts, world.seams(ctl, **seam), record_state=REVOKED) == HELD
-    assert ctl.history[-1] == (HELD, {"failed_step": failed})
+    assert ctl.history[-1] == (HELD, {"failed_step": failed, "held_attempts": 1})
     assert snapshot(world.S) == pre_live                  # tree untouched, credential not moved
     assert os.listdir(world.facts.keep) == [] and not world.facts.intent.exists()
     assert not world.facts.retained.exists()
@@ -584,7 +683,7 @@ def test_bound_passed_is_not_proven(world):
     t = itertools.chain([0.0, 11.0], itertools.repeat(11.0))   # the freeze seam returned after 11 s (V12 = 10 s)
     ctl = Control()
     assert end_session(world.facts, world.seams(ctl, clock=lambda: next(t)), record_state=REVOKED) == HELD
-    assert ctl.fields == {"failed_step": "freeze"}
+    assert ctl.failed_step == "freeze"
 
 
 def test_unbuilt_seams_hold(world):
@@ -592,7 +691,7 @@ def test_unbuilt_seams_hold(world):
     seams = world.seams(ctl)
     seams.freeze = end_mod.unbuilt_freeze
     assert end_session(world.facts, seams, record_state=REVOKED) == HELD
-    assert ctl.fields == {"failed_step": "freeze"}
+    assert ctl.failed_step == "freeze"
 
 
 _RETAIN_STEP_FNS = {"init": "_init_step", "manifest": "_manifest_step", "meta": "_meta_step",
@@ -622,7 +721,7 @@ def test_held_retried_each_step(world, monkeypatch, failed):
             return real(*a, **k)
         monkeypatch.setattr(end_mod, name, once)
     assert end_session(world.facts, world.seams(ctl, **kw), record_state=REVOKED) == HELD
-    assert ctl.fields == {"failed_step": failed}
+    assert ctl.failed_step == failed
     edges_before = len(ctl.history)
     assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step=failed) == RETAINED
     sent = [h[0] for h in ctl.history[edges_before:]]
@@ -633,13 +732,14 @@ def test_held_retried_each_step(world, monkeypatch, failed):
 
 
 def test_never_cloned_retains_nothing(tmp_path):
-    w = World(tmp_path, git=False, var_folders=False, uchg=False)
+    w = World(tmp_path, git=False, var_folders=False, uchg=False, cloned=False)
     shutil.rmtree(w.S / "repo")
-    (w.S / "repo").mkdir()                                 # start made it empty; the clone never ran
+    (w.S / "repo").mkdir()                                 # start made it empty; the clone never ran (no marker)
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == RETAINED
     assert [h[0] for h in ctl.history] == [FROZEN, DEAD, CREDENTIAL_PARKED, RETAINED]
-    assert not w.facts.retained.exists() and w.S.exists()   # nothing retained, nothing deleted
+    # nothing retained, nothing deleted (who removes live/<s> of a never-cloned session is SCRUBBED's, 2f)
+    assert not w.facts.retained.exists() and w.S.exists()
     assert (w.facts.keep / ".credentials.json").read_bytes() == CRED   # a login session parks its credential
 
 
@@ -679,10 +779,13 @@ def test_park_never_follows_a_planted_link(tmp_path):
 def test_none_class_parks_nothing(tmp_path):
     w = World(tmp_path, var_folders=False, uchg=False)
     (w.S / "config" / "claude" / ".credentials.json").unlink()
-    facts = EndFacts(SESSION, SlotId("none", 2), UID, GID, w.L)
+    facts = EndFacts(SESSION, SlotId("none", 2), UID, GID, w.L, lease_seq=LEASE_SEQ, child_uid=UID,
+                     vendor="claude", auth="none")
+    slot_state(w.L, facts.slot)
+    end_mod.mark_cloned(w.L, SESSION, now=lambda: NOW)
     ctl = Control()
     assert end_session(facts, w.seams(ctl), record_state=REVOKED) == RETAINED
-    assert not (w.L / "slots" / "v2").exists()
+    assert not (w.L / "slots" / "v2" / "keep").exists()
 
 
 def test_keep_shape_check(tmp_path):
@@ -744,12 +847,18 @@ def test_reserve_releases_on_enospc(tmp_path, world, monkeypatch):
 
 def test_facts_from_alloc(tmp_path):
     alloc = {"session": SESSION, "slot": {"class": "egress", "index": 3}, "slot_uid": 3996, "slot_gid": 3996,
-             "kind": "interactive", "vendor": "claude"}
+             "kind": "interactive", "vendor": "claude", "auth": "passthrough", "lease_seq": 4}
     f = facts_from_alloc(alloc, store=tmp_path)
     assert (f.live, f.tree, f.keep, f.intent) == (
         tmp_path / "live" / SESSION, tmp_path / "retained" / SESSION / "tree", tmp_path / "slots" / "e3" / "keep",
         tmp_path / "alloc" / f"{SESSION}.intent.json")
+    assert (f.lease_seq, f.child_uid, f.vendor, f.auth, f.uids) == (4, None, "claude", "passthrough", (3996,))
+    v = facts_from_alloc({**alloc, "slot": {"class": "none", "index": 1}, "child_uid": 3981, "auth": "none"},
+                         store=tmp_path)
+    assert v.uids == (3996, 3981) and not v.parks
     for bad in ({**alloc, "slot_uid": 0}, {**alloc, "session": "../x"}, {k: v for k, v in alloc.items() if k != "slot"},
-                {**alloc, "slot": {"class": "egress", "index": 99}}):
+                {**alloc, "slot": {"class": "egress", "index": 99}}, {**alloc, "child_uid": 3981},
+                {k: v for k, v in alloc.items() if k != "lease_seq"}, {**alloc, "lease_seq": True},
+                {k: v for k, v in alloc.items() if k != "auth"}):
         with pytest.raises(Refused):
             facts_from_alloc(bad, store=tmp_path)

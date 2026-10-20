@@ -480,7 +480,7 @@ GOLD_PROFILE_EGRESS = """(version 1)
 (allow file-write*
   (subpath "/private/var/levain/live/s-0123456789abcdef/repo") (subpath "/private/var/levain/live/s-0123456789abcdef/config") (subpath "/private/var/levain/live/s-0123456789abcdef/xdg") (subpath "/private/var/levain/live/s-0123456789abcdef/tmp") (subpath "/private/var/levain/live/s-0123456789abcdef/sock")
   (subpath "/private/var/folders/zy/hhq908f97y7g9v4yl18g49l00000lq")
-  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/dtracehelper") (literal "/dev/ptmx") (regex #"^/dev/ttys[0-9]+$"))
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/dtracehelper") (literal "/dev/ptmx"))
 (deny network-outbound)
 (deny network-bind)
 (deny network-inbound)
@@ -504,7 +504,8 @@ GOLD_PROFILE_DISPATCH_QUEUE_LINES = [
 GOLD_SETTINGS_LINUX = {"permissions": {"ask": ["Bash(dangerouslyDisableSandbox:true)"],
                                        "disableBypassPermissionsMode": "disable"},
                        "sandbox": {"bwrapPath": "/usr/libexec/levain/bwrap", "enabled": True, "excludedCommands": [],
-                                   "failIfUnavailable": True}}
+                                   "failIfUnavailable": True},
+                       "disableAllHooks": False}
 
 GOLD_CODEX_DARWIN = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
@@ -546,14 +547,14 @@ def _digest(r) -> str:
 #: Every file (path, owner, mode, bytes) of each (OS x vendor x class) render, pinned. The full text of each was
 #: read once when these were taken; a change here is a change to what a confined session loads.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "669fccfde1c2e305",
-    ("darwin", "claude", "none"): "471a788927912128",
-    ("darwin", "codex", "egress"): "2a9bcf47a9f7b23a",
-    ("darwin", "codex", "none"): "f363bef0bf4a42bf",
-    ("linux", "claude", "egress"): "205228b1f99d4f3d",
-    ("linux", "claude", "none"): "089ba44f9118f42b",
-    ("linux", "codex", "egress"): "dcbb5a74d3a2b047",
-    ("linux", "codex", "none"): "13f6600e2db4b853",
+    ("darwin", "claude", "egress"): "bf42bb6cf0c3e771",
+    ("darwin", "claude", "none"): "426d64fd3fd0cb0a",
+    ("darwin", "codex", "egress"): "d49a946ae050aab9",
+    ("darwin", "codex", "none"): "3655d3d012d8b3c3",
+    ("linux", "claude", "egress"): "d3cf73a3ae08a1ac",
+    ("linux", "claude", "none"): "fad7bf3ef1d223be",
+    ("linux", "codex", "egress"): "cdd9de6f8218df27",
+    ("linux", "codex", "none"): "7d99c71911832dd8",
 }
 
 
