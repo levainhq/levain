@@ -7,6 +7,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -726,3 +727,76 @@ def test_agent_root_regex_under_slash_and_non_ascii(tmp_path) -> None:
     with pytest.raises(conf.ConfinementError):
         conf._agent_root_regex(Path("claude"))
 
+
+
+def _walk_tree(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
+    """An agent root with one subdirectory holding one file, for racing the protected-path walk."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    sub = workspace / ".claude" / "sub"
+    sub.mkdir(parents=True)
+    (sub / "child.json").write_text("{}")
+    return home, workspace, sub
+
+
+def _vanish_once(monkeypatch, name: str, trigger: Path, act) -> None:
+    """Patch ``os.<name>`` so its first call on ``trigger`` runs ``act`` before the real call."""
+    stock = getattr(conf.os, name)
+    fired: list[bool] = []
+
+    def racing(path, *args, **kwargs):
+        if not fired and Path(path) == trigger:
+            fired.append(True)
+            act()
+        return stock(path, *args, **kwargs)
+
+    monkeypatch.setattr(conf.os, name, racing)
+
+
+@pytest.mark.parametrize("name", ["stat", "scandir"])
+def test_walk_skips_a_directory_that_vanishes_after_being_queued(tmp_path, monkeypatch, name) -> None:
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+    _vanish_once(monkeypatch, name, sub, lambda: shutil.rmtree(sub))
+    _, dirs, files, _ = conf._persistence_agent_paths(home, workspace)
+    assert workspace / ".claude" in dirs
+    assert sub not in dirs and sub not in files
+
+
+def test_walk_skips_a_child_that_vanishes_between_scandir_and_lstat(tmp_path, monkeypatch) -> None:
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+    child = sub / "child.json"
+    _vanish_once(monkeypatch, "lstat", child, child.unlink)
+    _, dirs, _, _ = conf._persistence_agent_paths(home, workspace)
+    assert workspace / ".claude" in dirs
+
+
+def test_walk_treats_a_directory_replaced_by_a_file_as_a_file_target(tmp_path, monkeypatch) -> None:
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+
+    def replace() -> None:
+        shutil.rmtree(sub)
+        sub.write_text("now a file")
+
+    _vanish_once(monkeypatch, "scandir", sub, replace)
+    _, _, files, _ = conf._persistence_agent_paths(home, workspace)
+    assert sub in files
+
+
+@pytest.mark.parametrize(("name", "reason"), [
+    ("stat", "unresolvable directory target"),
+    ("scandir", "cannot be walked"),
+    ("lstat", "cannot be inspected"),
+])
+def test_walk_still_refuses_non_enoent_errors(tmp_path, monkeypatch, name, reason) -> None:
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+    trigger = sub / "child.json" if name == "lstat" else sub
+
+    def deny() -> None:
+        raise PermissionError(errno.EACCES, "denied", str(trigger))
+
+    _vanish_once(monkeypatch, name, trigger, deny)
+    with pytest.raises(conf.ConfinementError, match=f"{reason}.*denied"):
+        conf._persistence_agent_paths(home, workspace)
