@@ -143,6 +143,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
+    core.extend(_check_dispatch_adoption_rules())
     for r in core:
         _emit(r)
 
@@ -316,6 +317,38 @@ def _check_consent_limits() -> list[CheckResult]:
                             f"Look at {qdir / limits.DB_NAME}: a full disk, a store of another levain version or a "
                             "corrupt file. The next call is counted once it can be written.", warn=True)]
     return [CheckResult(name, True, detail)]
+
+
+def _check_dispatch_adoption_rules() -> list[CheckResult]:
+    """The dispatch adoption rules (F11 (B)), read the one way a land reads them (re-judged against the active
+    configuration): no row without a dispatch control store; a WARN naming the rule and the way out when they do not
+    hold, the case a rule signed with Levain 0.11.10's free-text criteria meets after an upgrade. Advisory only: a
+    rule that does not hold adopts nothing."""
+    from levain.dispatch import DispatchError
+    from levain.dispatch import control as dctl
+    from levain.dispatch.registry import RESIGN_RULES, active_adoption_rules
+    from levain.install import _consent_queue_dir
+
+    name = "dispatch adoption rules"
+    qdir = _consent_queue_dir()
+    if not (qdir / dctl.DB_NAME).is_file():
+        return []
+    try:
+        from levain.dispatch.cli import _authority_source
+
+        rules = active_adoption_rules(dctl.ControlStore(qdir, authority=_authority_source(qdir, None)))
+    except dctl.ControlStateUnavailable as exc:
+        return [CheckResult(name, True, f"could not be read ({str(exc)[:300]})",
+                            "`levain dispatch config show` says what the control store holds.", warn=True)]
+    except DispatchError as exc:
+        hint = None if RESIGN_RULES in str(exc) else ("Show the active configuration with `levain dispatch config "
+                                                      f"show`; {RESIGN_RULES}.")
+        return [CheckResult(name, True, f"{str(exc)[:600]} (nothing is adopted by rule until they hold)", hint,
+                            warn=True)]
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {str(exc)[:300]})",
+                            "`levain dispatch config show` says what the control store holds.", warn=True)]
+    return [CheckResult(name, True, f"{len(rules)} active rule(s), each with typed criteria")]
 
 
 def _check_seed_content(install: Path) -> list[CheckResult]:

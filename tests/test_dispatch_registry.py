@@ -381,3 +381,61 @@ def test_a_stored_text_criteria_rule_raises_on_read(store, log, keys, monkeypatc
     monkeypatch.setattr(registry, "CRITERION_KEYS", ("onto", "max_files"))
     with pytest.raises(DispatchError, match="no longer hold"):
         active_adoption_rules(store)
+
+
+# --- a rule Levain 0.11.10 accepted (F11 §3 (B), dated correction 2026-10-20) --------------------------------------
+
+def old_rule():
+    # 0.11.10's shape: no repo, criteria as free text
+    return {"template_id": "fix-lint", "template_hash": tmpl()["content_hash"], "verifier_kind": "black-box",
+            "criteria": ["tests pass", "small diff"]}
+
+
+WAY_OUT = r"free text.*adopts nothing.*levain dispatch config sign adoption_rules"
+
+
+def accepted_by_0_11_10(store, log, keys, monkeypatch, gen):
+    # 0.11.10 judged a criterion as any text; this code would refuse the item, so it is accepted under that judge
+    with monkeypatch.context() as m:
+        m.setattr(registry, "_adoption_rules", lambda body, active: None)
+        accept(store, log, keys, "adoption_rules", gen, [old_rule()])
+
+
+def test_a_0_11_10_rule_is_refused_at_accept_with_the_way_out(store, log, keys):
+    base_config(store, log, keys)
+    refused(store, log, keys, "adoption_rules", 4, [old_rule()], WAY_OUT)
+    refused(store, log, keys, "adoption_rules", 4, [rule(criteria=["tests pass"])], WAY_OUT)
+
+
+def test_a_0_11_10_rule_reads_as_a_refusal_naming_it_and_the_way_out(store, log, keys, monkeypatch):
+    base_config(store, log, keys)
+    accepted_by_0_11_10(store, log, keys, monkeypatch, 4)
+    with pytest.raises(DispatchError, match=r"'fix-lint' has criteria as free text.*" + WAY_OUT):
+        active_adoption_rules(store)
+    # the stated way out works: a typed rule signed as the next item replaces it
+    accept(store, log, keys, "adoption_rules", 5, [rule()])
+    assert [r.criteria for r in active_adoption_rules(store)] == [(("onto", ("main",)), ("max_changed_lines", 40))]
+
+
+def test_doctor_says_a_0_11_10_rule_adopts_nothing_and_how_to_replace_it(store, log, keys, monkeypatch):
+    from levain import doctor
+    from levain import install
+    from levain.dispatch import cli as dcli
+
+    base_config(store, log, keys)
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: store.directory)
+    monkeypatch.setattr(dcli, "_authority_source", lambda directory, data_root: store._authority)
+    assert [(r.ok, r.warn) for r in doctor._check_dispatch_adoption_rules()] == [(True, False)]
+    accepted_by_0_11_10(store, log, keys, monkeypatch, 4)
+    (row,) = doctor._check_dispatch_adoption_rules()
+    assert row.ok and row.warn and row.name == "dispatch adoption rules"
+    assert "'fix-lint' has criteria as free text" in row.detail and "levain dispatch config sign adoption_rules" \
+        in row.detail and "nothing is adopted by rule" in row.detail
+
+
+def test_doctor_has_no_adoption_row_without_a_control_store(tmp_path, monkeypatch):
+    from levain import doctor
+    from levain import install
+
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: tmp_path)
+    assert doctor._check_dispatch_adoption_rules() == []

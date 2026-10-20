@@ -83,7 +83,12 @@ __all__ = [
 ]
 
 DB_NAME = "dispatch.db"
-FORMAT = "levain-dispatch-jobs/1"
+FORMAT = "levain-dispatch-jobs/2"
+# the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
+# the old ones (CREATE ... IF NOT EXISTS) and its marker rewritten in the same transaction; no row is rewritten.
+# /2 added the human authorise item and the base_moved edges (F11), so a Levain that knows only /1 refuses the
+# store instead of misreading a job it cannot transition
+_MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
@@ -391,12 +396,20 @@ class JobStore:
                     "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is None):
                 raise JobStoreError("the database holds tables but no dispatch-store format marker")
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
-            if row is not None and row[0] != FORMAT:
+            if row is not None and row[0] != FORMAT and row[0] not in _MIGRATES_FROM:
                 raise JobStoreError(f"store format {row[0]!r} is not {FORMAT!r}")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (FORMAT,))
+            elif row[0] != FORMAT:
+                # meta is written once by trigger; the migration lifts that one trigger for this one UPDATE and puts
+                # it back before COMMIT, so no other connection ever sees meta writable
+                conn.execute("DROP TRIGGER meta_frozen")
+                cur = conn.execute("UPDATE meta SET value = ? WHERE key = 'format' AND value = ?", (FORMAT, row[0]))
+                if cur.rowcount != 1:
+                    raise JobStoreError(f"the store's format marker {row[0]!r} could not be moved to {FORMAT!r}")
+                conn.execute(_append_only("meta", "store metadata is written once")[0])
             if conn.execute("SELECT 1 FROM meta WHERE key = 'store_id'").fetchone() is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('store_id', ?)", (secrets.token_hex(16),))
             conn.execute("COMMIT")

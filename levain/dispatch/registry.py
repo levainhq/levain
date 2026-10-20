@@ -60,8 +60,8 @@ from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
     "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS", "ROUTE_KEYS", "TEMPLATE_FORMAT", "TEMPLATE_KEYS",
-    "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "active_policy", "body_refusal", "execution_bearing",
-    "parse_criteria", "r0_write_refusal", "resolver", "template_content_hash", "template_from_mapping",
+    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "active_policy", "body_refusal",
+    "execution_bearing", "legacy_rule_problem", "parse_criteria", "r0_write_refusal", "resolver", "template_content_hash", "template_from_mapping",
 ]
 
 KINDS = ("adoption_rules", "provider_policy", "routemap", "templates", "verifiers")
@@ -396,10 +396,31 @@ def parse_criteria(criteria: Any, write_paths: frozenset[str]) -> tuple[tuple[st
     return tuple(out)
 
 
+RESIGN_RULES = ("sign a new adoption_rules item naming repo and typed criteria (onto plus at least one bound, such as "
+                "max_files): `levain dispatch config sign adoption_rules <body.json>`")
+
+
+def legacy_rule_problem(rule: Any) -> str | None:
+    """The line for a rule whose criteria hold free text, the only shape Levain 0.11.10 accepted, or ``None``.
+    Such a rule is refused, never migrated: a text criterion cannot become a typed one without inventing what it
+    checks. It adopted nothing in 0.11.10 (no adoption ran) and adopts nothing now."""
+    if not isinstance(rule, dict):
+        return None
+    criteria = rule.get("criteria")
+    if not (isinstance(criteria, list) and any(isinstance(c, str) for c in criteria)):
+        return None
+    tid = rule.get("template_id")
+    return (f"the adoption rule for {str(tid)[:64]!r} has criteria as free text, the shape Levain 0.11.10 accepted; "
+            f"free text is checked by nothing when a job lands, so the rule adopts nothing; {RESIGN_RULES}")
+
+
 def _adoption_rules(body: Any, active: Mapping[str, Any]) -> str | None:
     if not isinstance(body, list) or len(body) > _ENTRIES_MAX:
         return f"an adoption_rules body is a list of at most {_ENTRIES_MAX} rules"
     for rule in body:
+        problem = legacy_rule_problem(rule)
+        if problem is not None:
+            return problem
         if not isinstance(rule, dict) or set(rule) != ADOPTION_RULE_KEYS:
             return f"an adoption rule is exactly {sorted(ADOPTION_RULE_KEYS)}"
         tid = rule["template_id"]

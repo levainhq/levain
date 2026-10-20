@@ -25,8 +25,9 @@ ever runs here. The change set (:func:`change_set`) comes from the plumbing ``di
 alone, under fixed caps (:data:`MAX_ENTRIES`, :data:`MAX_BLOB_BYTES`, :data:`MAX_TOTAL_BYTES`) checked on sizes
 BEFORE any content is read; line counts and the binary test are Levain's own.
 
-The LANDING TIER (F11 §4 step 4) is the consent head's function: it is INJECTED (``landing_tier(repo, paths)``) and
-there is no default. Anything it returns but ``"T2"``/``"T3"``, and any exception from it, refuses the land.
+The LANDING TIER (F11 §4 step 4) is :func:`levain.consent.landing.landing_tier`, which reads consent's own
+classifiers. It is INJECTED (``landing_tier(repo, paths)``) and there is no default, so a caller names it. Anything
+it returns but ``"T2"``/``"T3"``, and any exception from it, refuses the land.
 
 Known edge (F11 §8): until S1 places principals, every actor is the operator's uid, so a planner can merge a staged
 ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Stdlib only.
@@ -869,6 +870,13 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
             job = store.authorise(job.id, cause="human_adoption_rule", evidence=json.dumps(intent, sort_keys=True))
     except SignatureRefused as exc:
         return Landing(outcome="refused", job=job, message=str(exc))
+    except TransitionRefused:
+        # another land authorised (or ended) the job after this one's floor read it: the authorisation written
+        # first is the authority, so finish from ITS intent; any other state is the refusal it was
+        again = store.get(job.id)
+        if again is None or again.state != "authorised":
+            raise
+        job = again
     return _finish(store, job, records)
 
 
