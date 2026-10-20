@@ -49,7 +49,7 @@ def test_drop_is_stored_verbatim_with_a_delivered_receipt(store):
         assert created and drop.words == words
         assert drop.words_sha256 == "sha256:" + hashlib.sha256(words.encode("utf-8")).hexdigest()
         assert store.drop(drop.drop_id).words == words
-        receipts = store.receipts(drop.drop_id)
+        receipts = store.drop_receipts(drop.drop_id)
         assert [r.body["stage"] for r in receipts] == ["delivered"]
         assert receipts[0].kind == "drop_receipt"
 
@@ -71,9 +71,9 @@ def test_one_drop_split_into_two_work_threads(store):
     for t in (a, b):
         assert t.rev == 1 and t.members == (drop.drop_id,) and t.kind == "work" and t.state == "open"
     assert a.members_sha256 == b.members_sha256 and a.thread_id != b.thread_id
-    stages = [r.body["stage"] for r in store.receipts(drop.drop_id)]
+    stages = [r.body["stage"] for r in store.drop_receipts(drop.drop_id)]
     assert stages == ["delivered", "split"]
-    listed = store.receipts(drop.drop_id)[1].body["threads"]
+    listed = store.drop_receipts(drop.drop_id)[1].body["threads"]
     assert {t["thread_id"] for t in listed} == {a.thread_id, b.thread_id}
     with pytest.raises(CoordError, match="already split"):
         store.split(drop.drop_id, [work("again")])
@@ -114,7 +114,7 @@ def test_merge_folds_a_split_that_cut_one_intent_in_two(store):
     assert other.rev == 2 and other.members == () and other.state == "closed"
     last = store.events(b.thread_id)[-1]
     assert last[1:3] == ("state", "closed") and last[4] == "service" and last[3].startswith("merged into")
-    resplit = store.receipts(drop.drop_id)[-1].body
+    resplit = store.drop_receipts(drop.drop_id)[-1].body
     assert resplit["stage"] == "resplit"
     assert {t["thread_id"] for t in resplit["threads"]} == {a.thread_id, c.thread_id}
 
@@ -152,7 +152,7 @@ def test_state_grammar(store):
 def test_detach_never_orphans_a_drop(store):
     solo, _ = store.accept_drop(NOTE, surface="cli")
     (only,) = store.split(solo.drop_id, [work("stepping away")])
-    with pytest.raises(CoordError, match="no other thread"):
+    with pytest.raises(CoordError, match="no other open thread"):
         store.detach(only.thread_id, solo.drop_id)
     assert store.thread(only.thread_id).members == (solo.drop_id,)
     two, _ = store.accept_drop(TWO, surface="cli")
@@ -161,7 +161,7 @@ def test_detach_never_orphans_a_drop(store):
     assert left.members == () and left.state == "closed"
     assert store.events(x.thread_id)[-1][4] == "service"
     assert store.thread(y.thread_id).members == (two.drop_id,)
-    with pytest.raises(CoordError, match="no other thread"):
+    with pytest.raises(CoordError, match="no other open thread"):
         store.detach(y.thread_id, two.drop_id)
 
 
@@ -170,7 +170,7 @@ def test_set_field_guards(store):
     _, hub = store.split(two.drop_id, [work("widget"), work("server")])
     ask, _ = store.accept_drop(ASK, surface="cli")
     (t,) = store.split(ask.drop_id, [Part(kind="ask", title="status", about=hub.thread_id)])
-    with pytest.raises(CoordError, match="never becomes a work thread"):
+    with pytest.raises(CoordError, match="never crosses the work boundary"):
         store.set_field(t.thread_id, "kind", "work")
     with pytest.raises(CoordError, match="one line"):
         store.set_field(t.thread_id, "title", "two\nlines")
@@ -248,3 +248,90 @@ def test_cli_split_and_thread_round_trip(qdir, capsys):
     assert main(["thread", "merge", a["thread_id"], b["thread_id"], "--queue-dir", qdir, "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["rev"] == 2
     assert main(["thread", "add", drop_id, "--attach", f"ask:{a['thread_id']}", "--queue-dir", qdir]) == 1
+
+
+# --- L1 r1's reproduced paths: the ask-never-moves-the-work rule held on every path, not only the attach ----------
+
+def _work_and_ask(store):
+    two, _ = store.accept_drop(TWO, surface="cli")
+    ask, _ = store.accept_drop(ASK, surface="cli")
+    _, w = store.split(two.drop_id, [work("widget"), work("server")])
+    (a,) = store.split(ask.drop_id, [Part(kind="ask", title="status", about=w.thread_id)])
+    return ask, w, a
+
+
+def test_rekind_never_crosses_the_work_boundary(store):
+    ask, w, a = _work_and_ask(store)
+    loose, _ = store.accept_drop(NOTE, surface="cli")
+    (q,) = store.split(loose.drop_id, [Part(kind="ask", title="no about")])
+    for thread_id, kind in ((q.thread_id, "work"), (w.thread_id, "ask"), (w.thread_id, "note")):
+        with pytest.raises(CoordError, match="never crosses the work boundary"):
+            store.set_field(thread_id, "kind", kind)
+    assert store.set_field(q.thread_id, "kind", "note").kind == "note"
+
+
+def test_kind_and_repo_changes_write_a_new_revision(store):
+    _, w, a = _work_and_ask(store)
+    before = store.thread(a.thread_id)
+    after = store.set_field(a.thread_id, "kind", "relay")
+    assert after.rev == before.rev + 1 and after.members == before.members
+    assert store.revisions(a.thread_id)[-1][3] == "rescope"
+    assert store.set_field(w.thread_id, "repo", "/tmp/x").rev == w.rev + 1
+    assert store.set_field(w.thread_id, "title", "renamed").rev == w.rev + 1     # a title is information only
+
+
+def test_merge_never_strands_an_ask_and_merge_then_attach_is_refused(store):
+    ask, w, a = _work_and_ask(store)
+    other, _ = store.accept_drop(COPY, surface="cli")
+    (w2,) = store.split(other.drop_id, [work("copy")])
+    with pytest.raises(CoordError, match="are about"):
+        store.merge(w2.thread_id, w.thread_id)
+    store.merge(w.thread_id, w2.thread_id)          # merging INTO the thread the ask is about is fine
+    with pytest.raises(CoordError, match="never joins it"):
+        store.add(ask.drop_id, Part(kind="work", attach=w.thread_id))
+
+
+def test_about_names_an_open_work_thread(store):
+    ask, w, a = _work_and_ask(store)
+    d, _ = store.accept_drop("one more", surface="cli")
+    with pytest.raises(CoordError, match="open work thread"):
+        store.split(d.drop_id, [Part(kind="note", title="about an ask", about=a.thread_id)])
+
+
+def test_one_drop_that_is_a_fix_and_a_report_request_splits_with_a_sibling_about(store):
+    d, _ = store.accept_drop("fix the build and send me a report when it is green", surface="cli")
+    fix, report = store.split(d.drop_id, [Part(kind="ask", title="report", about="@2"), work("fix the build")])
+    assert fix.kind == "ask" and fix.about == report.thread_id and report.kind == "work"
+    assert fix.members == report.members == (d.drop_id,)
+
+
+def test_split_part_order_never_changes_the_outcome(store):
+    _, w, _ = _work_and_ask(store)
+    for order in (0, 1):
+        d, _ = store.accept_drop(f"also part of that, and how is it going {order}", surface="cli")
+        parts = [Part(kind="work", attach=w.thread_id), Part(kind="ask", title="how", about=w.thread_id)]
+        got = store.split(d.drop_id, parts if order == 0 else parts[::-1])
+        assert sorted(t.kind for t in got) == ["ask", "work"]
+
+
+def test_detach_counts_only_open_threads(store):
+    d, _ = store.accept_drop(TWO, surface="cli")
+    x, y = store.split(d.drop_id, [work("x"), work("y")])
+    store.set_state(y.thread_id, "closed", by="operator")
+    with pytest.raises(CoordError, match="no other open thread"):
+        store.detach(x.thread_id, d.drop_id)
+
+
+def test_cli_words_from_stdin_and_after_double_dash(tmp_path, monkeypatch, capsys):
+    import io
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"words from stdin\n")))
+    assert main(["drop", "--queue-dir", str(q), "--json", "-"]) == 0
+    assert json.loads(capsys.readouterr().out)["words"] == "words from stdin"
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"\xff\xfe bad")))
+    assert main(["drop", "--queue-dir", str(q), "-"]) == 1
+    assert "not UTF-8" in capsys.readouterr().err
+    assert main(["drop", "--queue-dir", str(q), "--json", "--", "-dash first"]) == 0
+    assert json.loads(capsys.readouterr().out)["words"] == "-dash first"

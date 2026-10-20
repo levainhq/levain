@@ -12,12 +12,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from levain.coordinator.store import KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread
+from levain.dispatch.jobs import JobStoreError
+
+# what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
+_REFUSED = (CoordError, JobStoreError, sqlite3.Error)
 
 __all__ = ["add_parsers", "cwd_source"]
 
@@ -84,8 +89,15 @@ def _emit(out: Any, as_json: bool, obj: Any, text: str) -> None:
 
 
 def _read_words(args: argparse.Namespace) -> str:
+    """The words: one argument kept as typed, several joined by one space, or ``-`` alone for stdin (strict UTF-8, one
+    trailing newline dropped, so ``echo words | levain drop -`` stores what ``levain drop words`` does)."""
     if args.words == ["-"]:
-        return sys.stdin.read()
+        raw = sys.stdin.buffer.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise CoordError("stdin is not UTF-8 text") from None
+        return text[:-1] if text.endswith("\n") else text
     return " ".join(args.words)
 
 
@@ -96,7 +108,7 @@ def run_drop(args: argparse.Namespace, out: Any = None) -> int:
         words = _read_words(args)
         source = Source() if args.no_source else cwd_source()
         drop, created = store.accept_drop(words, surface="cli", outbox_id=args.outbox_id, source=source)
-    except CoordError as exc:
+    except _REFUSED as exc:
         print(f"levain drop: {exc}", file=sys.stderr)
         return 1
     state = "delivered" if created else "already delivered (resend, nothing written)"
@@ -126,10 +138,12 @@ def run_split(args: argparse.Namespace, out: Any = None) -> int:
     try:
         parts = [_parse_part(s) for s in args.thread]
         if args.about is not None:
+            if all(p.kind == "work" for p in parts):
+                raise CoordError("--about applies to a new ask, note or relay thread; this split names none")
             parts = [Part(p.kind, p.title, about=None if p.kind == "work" else args.about) for p in parts]
         parts += [_parse_attach(a) for a in args.attach]
         threads = store.split(args.drop_id, parts, by=args.by)
-    except CoordError as exc:
+    except _REFUSED as exc:
         print(f"levain drops split: {exc}", file=sys.stderr)
         return 1
     n = len(threads)
@@ -145,23 +159,27 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     try:
         drop = store.drop(args.drop_id)
         threads = store.threads_of(args.drop_id)
-        receipts = store.receipts(args.drop_id)
-    except CoordError as exc:
+        receipts = store.drop_receipts(args.drop_id)
+    except _REFUSED as exc:
         print(f"levain drops show: {exc}", file=sys.stderr)
         return 1
     obj = {**_drop_row(drop), "threads": [_thread_row(t) for t in threads],
-           "receipts": [{"reply_id": r.reply_id, "at": r.at, **r.body} for r in receipts]}
+           "drop_receipts": [{"reply_id": r.reply_id, "at": r.at, **r.body} for r in receipts]}
     text = (f"{drop.drop_id}  {drop.surface}  received {drop.received_at}, {_where(drop)}\n"
             f"  words (verbatim, data): {json.dumps(drop.words, ensure_ascii=False)}\n"
             + ("\n".join(_thread_line(t) for t in threads) if threads else "  not split yet")
-            + "\n  receipts: " + ", ".join(f"{r.body.get('stage')} {r.at}" for r in receipts))
+            + "\n  drop receipts: " + ", ".join(f"{r.body.get('stage')} {r.at}" for r in receipts))
     _emit(out, args.json, obj, text)
     return 0
 
 
 def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    drops = _store(args).drops(limit=args.limit)
+    try:
+        drops = _store(args).drops(limit=args.limit)
+    except _REFUSED as exc:
+        print(f"levain drops list: {exc}", file=sys.stderr)
+        return 1
     _emit(out, args.json, [_drop_row(d) for d in drops],
           "\n".join(f"{d.drop_id}  {d.received_at}  {json.dumps(d.words[:80], ensure_ascii=False)}" for d in drops)
           or "no drops")
@@ -198,13 +216,15 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
         elif cmd == "detach":
             t = store.detach(args.thread_id, args.drop_id, by=args.by)
         elif cmd == "add":
+            if args.about and args.attach:
+                raise CoordError("--about names what a NEW thread concerns; an attach joins an existing one")
             part = _parse_attach(args.attach) if args.attach else _parse_part(args.thread)
-            if args.about and not args.attach:
+            if args.about:
                 part = Part(part.kind, part.title, about=args.about)
             t = store.add(args.drop_id, part, by=args.by)
         else:   # set
             t = store.set_field(args.thread_id, args.field, args.value, by=args.by, cause=args.cause)
-    except CoordError as exc:
+    except _REFUSED as exc:
         print(f"levain thread {args.thread_cmd}: {exc}", file=sys.stderr)
         return 1
     _emit(out, args.json, _thread_row(t), _thread_line(t))
@@ -219,9 +239,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         p.add_argument("--json", action="store_true", help="Machine-readable output.")
 
     d = subparsers.add_parser(
-        "drop", help="Drop words for the coordinator and go (kept verbatim; never authority).",
+        "drop", help="Drop words for the coordinator and go (kept verbatim; never authority).", allow_abbrev=False,
         description="Store your words as a drop for the coordinator and print its drop receipt. The words are data: "
-                    "they authorise nothing. Read them back with `levain drops`.")
+                    "they authorise nothing. Read them back with `levain drops`. Words that start with '-' go after "
+                    "`--` (levain drop -- -words) or through stdin (levain drop -).")
     d.add_argument("words", nargs="+", help="The words (or - to read them from stdin).")
     d.add_argument("--outbox-id", dest="outbox_id", default=None,
                    help="An idempotency key: a resend with the same key and words writes nothing.")
@@ -239,7 +260,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     sp.add_argument("--attach", action="append", default=[], metavar="KIND:THREAD",
                     help="Put the drop into an existing open thread of that kind. Repeatable.")
     sp.add_argument("--about", default=None, metavar="THREAD",
-                    help="The work thread each new ask/note/relay thread here concerns.")
+                    help="The work thread each new ask/note/relay thread here concerns, or @N for this split's own "
+                         "N-th --thread.")
     sp.add_argument("--by", default="coordinator", choices=("coordinator", "operator"))
     common(sp)
     sp.set_defaults(func=run_split)

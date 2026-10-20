@@ -21,10 +21,16 @@ liveness and the write it authorises share one transaction). The file is opened 
 module adds its tables as ``CREATE TABLE IF NOT EXISTS`` and never writes the format. Every table is append-only
 (triggers refuse UPDATE, DELETE and a replacing INSERT); current state is the latest row.
 
-Who: every row records the actor its writer named (``operator``, ``coordinator``, ``service``). Until S1 places the
-control principal, any process of your uid can write this file, so nothing here is read as authority (C0 §2); the
-store enforces only the shape of the grammar (who may close or reopen a thread, which kinds may join which threads).
-Stdlib only.
+Who: every row records the actor its writer NAMED (``operator``, ``coordinator``, ``service``): a label, never a
+credential. Until S1 places the control principal, any process of your uid can write this file, so nothing here is read
+as authority (C0 §2). A drop's intent (work, ask, ...) is the coordinator's inference, recorded as its thread's kind and
+never verified. What the store holds structurally, on every path that changes a membership (:meth:`CoordStore._revise`):
+a drop that asks about a thread is never added to it; ``about`` names an open work thread; a re-kind never crosses the work
+boundary; a kind or repo change writes a new revision, so anything bound to the old one ends by derivation.
+
+[seat] choices the design does not state (C1, 1020+19): the T7 edges in :data:`_EDGES`; merge, detach and add as the
+regroup operations; merges only between threads of one kind, one ``about`` and compatible repos; a drop is never left
+in no open thread; the size and skew limits below. Stdlib only.
 """
 from __future__ import annotations
 
@@ -58,7 +64,7 @@ KINDS = ("work", "ask", "note", "relay")
 STATES = ("open", "working", "done", "closed")
 ACTORS = ("operator", "coordinator", "service")
 REPLY_KINDS = ("drop_receipt", "sign", "answer", "know")
-_REVISION_CAUSES = ("split", "attach", "resplit")
+_REVISION_CAUSES = ("split", "attach", "resplit", "rescope")
 _EVENT_FIELDS = ("state", "kind", "title", "repo")
 
 WORDS_MAX = 20_000
@@ -214,12 +220,24 @@ class Reply:
 @dataclass(frozen=True)
 class Part:
     """One thread a drop goes into: a NEW thread (``kind`` + ``title``, ``about`` for an ask/note/relay that concerns a
-    work thread) or an EXISTING one (``attach`` = its id, ``kind`` = the intent the drop adds, which must be the
-    thread's own kind)."""
+    work thread; in a split, ``"@N"`` names the split's own N-th part) or an EXISTING one (``attach`` = its id, ``kind``
+    = the intent the drop adds, which must be the thread's own kind)."""
     kind: str | None = None
     title: str | None = None
     about: str | None = None
     attach: str | None = None
+
+
+def _sibling(part: Any) -> bool:
+    return isinstance(part, Part) and isinstance(part.about, str) and part.about.startswith("@")
+
+
+def _sibling_index(part: Part, n: int) -> int:
+    """``about="@N"`` (1-based) names the N-th part of the same split: the work thread an ask in one drop concerns."""
+    raw = part.about[1:]
+    if not raw.isdigit() or not 1 <= int(raw) <= n:
+        raise CoordError(f"about @N names a part of this split, 1 to {n} (got {part.about[:20]!r})")
+    return int(raw) - 1
 
 
 def _one_line(name: str, value: Any, high: int) -> str:
@@ -359,7 +377,22 @@ class CoordStore:
             self._must_drop(conn, drop_id)
             if self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} is already split; regroup it with add, merge or detach")
-            touched = [self._place(conn, drop_id, part, by, now, first=True) for part in parts]
+            touched: list[str] = [""] * len(parts)
+            # the parts about no thread first (new threads, attaches), then those about one: the order a caller
+            # lists parts in never changes what the split is allowed to do
+            for i, part in enumerate(parts):
+                if not isinstance(part, Part) or part.about is None:
+                    touched[i] = self._place(conn, drop_id, part, by, now, first=True)
+            for i, part in enumerate(parts):
+                if isinstance(part, Part) and part.about is not None and not _sibling(part):
+                    touched[i] = self._place(conn, drop_id, part, by, now, first=True)
+            for i, part in enumerate(parts):
+                if _sibling(part):
+                    n = _sibling_index(part, len(parts))
+                    if parts[n].about is not None or parts[n].attach is not None:
+                        raise CoordError(f"about @{n + 1} names a part that is not a new thread of this split")
+                    touched[i] = self._place(conn, drop_id, Part(part.kind, part.title, about=touched[n]), by, now,
+                                             first=True)
             if len(set(touched)) != len(touched):
                 raise CoordError("a split names the same thread twice")
             self._drop_receipt(conn, drop_id, "split", now)
@@ -374,6 +407,8 @@ class CoordStore:
             self._must_drop(conn, drop_id)
             if not self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} has not been split yet; split it first")
+            if _sibling(part):
+                raise CoordError("about @N names a part of the same split; add takes one part")
             thread_id = self._place(conn, drop_id, part, by, now, first=False)
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
@@ -381,7 +416,8 @@ class CoordStore:
     def merge(self, into: str, other: str, *, by: str = "operator") -> Thread:
         """Fold ``other`` into ``into`` (the receipt's one-tap fix for a split that cut one intent in two): ``into``
         gets the union of both memberships as a new revision, ``other`` a new, empty revision and is closed by the
-        service, its cause naming ``into`` and who merged. Both must be open threads of the same kind."""
+        service, its cause naming ``into`` and who merged. Neither may be done or closed; they must share a kind and an
+        ``about``, their repos may not differ, and no thread may be about ``other`` (it would point at a closed one)."""
         by = self._actor(by, ("coordinator", "operator"))
         if into == other:
             raise CoordError("a thread cannot merge into itself")
@@ -392,6 +428,14 @@ class CoordStore:
                     raise CoordError(f"thread {t.thread_id} is {t.state}; reopen it first")
             if a.kind != b.kind:
                 raise CoordError(f"a {b.kind} thread never joins a {a.kind} thread")
+            if a.about != b.about:
+                raise CoordError("threads about different threads never merge")
+            if a.repo and b.repo and a.repo != b.repo:
+                raise CoordError(f"threads on different repos never merge ({a.repo}, {b.repo})")
+            if self._dependents(conn, other):
+                raise CoordError(f"other threads are about {other}; it cannot be merged away")
+            if b.repo and not a.repo:
+                self._event(conn, into, "repo", b.repo, f"merged from {other}", by, now)
             self._revise(conn, into, set(a.members) | set(b.members), "resplit", now)
             self._revise(conn, other, (), "resplit", now)
             self._event(conn, other, "state", "closed", f"merged into {into} by {by}", "service", now)
@@ -401,15 +445,17 @@ class CoordStore:
 
     def detach(self, thread_id: str, drop_id: str, *, by: str = "operator") -> Thread:
         """Take one drop out of a thread (a new revision without it). A thread left with no drops is closed by the
-        service, its cause naming who emptied it. The drop must stay in at least one other thread: a drop is never orphaned."""
+        service, its cause naming who emptied it. The drop must stay in at least one other thread that is not closed: a
+        drop is never orphaned."""
         by = self._actor(by, ("coordinator", "operator"))
         with self._write() as (conn, now):
             self._must_drop(conn, drop_id)
             t = self._must_thread(conn, thread_id)
             if drop_id not in t.members:
                 raise CoordError(f"drop {drop_id} is not in thread {thread_id}")
-            if not [x for x in self._threads_of(conn, drop_id) if x != thread_id]:
-                raise CoordError(f"drop {drop_id} is in no other thread; add it to one before detaching it")
+            if not [x for x in self._threads_of(conn, drop_id)
+                    if x != thread_id and self._thread(conn, x).state != "closed"]:
+                raise CoordError(f"drop {drop_id} is in no other open thread; add it to one before detaching it")
             left = set(t.members) - {drop_id}
             self._revise(conn, thread_id, left, "resplit", now)
             if not left and t.state != "closed":
@@ -432,7 +478,7 @@ class CoordStore:
             if by not in allowed:
                 raise CoordError(f"{by} cannot take a thread from {t.state} to {state} (only {', '.join(sorted(allowed))})")
             if by == "service" and state == "closed" and t.kind == "work":
-                raise CoordError("the service never closes a work thread that still holds drops; you do")
+                raise CoordError("the service never closes a work thread; you do (a regroup that empties one closes it)")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")
             self._event(conn, thread_id, "state", state, cause or state, by, now)
@@ -441,25 +487,32 @@ class CoordStore:
             return self._thread(conn, thread_id)
 
     def set_field(self, thread_id: str, field: str, value: str, *, by: str = "coordinator", cause: str = "") -> Thread:
-        """Re-kind, re-title or re-scope (repo) a thread, recorded as an event. A thread with ``about`` set (an ask,
-        note or relay concerning a work thread) never becomes work."""
+        """Re-kind, re-title or re-scope (repo) a thread, recorded as an event; a done or closed thread is reopened first.
+        A re-kind never crosses the work boundary (work stays work; ask, note and relay move among themselves): an
+        intent that was misread is a new split, never a relabel. A kind or repo change also writes a new revision
+        (cause ``rescope``) with the same members, so anything bound to the old revision ends."""
         if field not in ("kind", "title", "repo"):
             raise CoordError("set_field changes kind, title or repo")
         by = self._actor(by, ("coordinator", "operator"))
         cause = self._cause(cause)
         with self._write() as (conn, now):
             t = self._must_thread(conn, thread_id)
+            if t.state in ("done", "closed"):
+                raise CoordError(f"thread {thread_id} is {t.state}; reopen it first")
             if field == "kind":
                 if value not in KINDS:
                     raise CoordError(f"a thread's kind is one of {', '.join(KINDS)}")
-                if value == "work" and t.about is not None:
-                    raise CoordError(f"thread {thread_id} is about {t.about}; it never becomes a work thread")
+                if (value == "work") != (t.kind == "work"):
+                    raise CoordError(f"a re-kind never crosses the work boundary ({t.kind} -> {value}); split the "
+                                     "drop again instead")
             elif field == "title":
                 value = _one_line("a thread's title", value, _TITLE_MAX)
             elif not isinstance(value, str) or not value.startswith("/") or len(value) > _REPO_MAX \
                     or unshowable.first_hidden(value, allow="", selectors=False) is not None:
                 raise CoordError("a thread's repo is an absolute path, one line")
             self._event(conn, thread_id, field, value, cause or f"{field} set", by, now)
+            if field in ("kind", "repo"):
+                self._revise(conn, thread_id, t.members, "rescope", now)
             return self._thread(conn, thread_id)
 
     # --- reading -------------------------------------------------------------------------------------------------
@@ -468,6 +521,8 @@ class CoordStore:
             return self._must_drop(conn, drop_id)
 
     def drops(self, limit: int = 50) -> list[Drop]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise CoordError("limit is 1 to 1000")
         with read_transaction(self._connect) as conn:
             ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
             return [self._drop(conn, d) for d in ids]
@@ -487,7 +542,7 @@ class CoordStore:
             self._must_drop(conn, drop_id)
             return [self._thread(conn, t) for t in self._threads_of(conn, drop_id)]
 
-    def receipts(self, drop_id: str) -> list[Reply]:
+    def drop_receipts(self, drop_id: str) -> list[Reply]:
         """Every drop receipt of ``drop_id``, oldest first."""
         with read_transaction(self._connect) as conn:
             self._must_drop(conn, drop_id)
@@ -544,6 +599,8 @@ class CoordStore:
                                          (thread_id,)).fetchone()
         rev, members, msha = conn.execute("SELECT rev, members, members_sha256 FROM thread_revisions "
                                           "WHERE thread_id = ? ORDER BY rev DESC LIMIT 1", (thread_id,)).fetchone()
+        if members_sha256(json.loads(members)) != msha:
+            raise CoordError(f"thread {thread_id} revision {rev} does not hash to its members")
         latest: dict[str, str] = {}
         for field, value in conn.execute("SELECT field, value FROM thread_events WHERE thread_id = ? ORDER BY seq",
                                          (thread_id,)):
@@ -579,16 +636,12 @@ class CoordStore:
             t = self._must_thread(conn, part.attach)
             if t.state in ("done", "closed"):
                 raise CoordError(f"thread {t.thread_id} is {t.state}; reopen it first")
-            # the attach declares the intent it adds: an ask or note never joins a work thread (C0 §3.2), so its
-            # drop never moves that thread's revision, and the drop of an ask ABOUT this thread never joins it either
+            # the attach declares the intent it adds (the coordinator's inference): an ask or note never joins a work
+            # thread (C0 §3.2); a drop that asks ABOUT the thread is refused by _revise, on every path
             if part.kind not in KINDS:
                 raise CoordError(f"an attach names the kind of intent it adds, one of {', '.join(KINDS)}")
             if part.kind != t.kind:
                 raise CoordError(f"a {part.kind} part never joins a {t.kind} thread")
-            if t.kind == "work" and conn.execute(
-                    "SELECT 1 FROM threads WHERE about = ? LIMIT 1", (t.thread_id,)).fetchone() is not None \
-                    and any(self._thread(conn, x).about == t.thread_id for x in self._threads_of(conn, drop_id)):
-                raise CoordError(f"drop {drop_id} asks about thread {t.thread_id}; it never joins it")
             if drop_id in t.members:
                 raise CoordError(f"drop {drop_id} is already in thread {t.thread_id}")
             self._revise(conn, t.thread_id, set(t.members) | {drop_id}, "attach", now)
@@ -599,7 +652,10 @@ class CoordStore:
         if part.about is not None:
             if part.kind == "work":
                 raise CoordError("a work thread is about nothing else; only an ask, note or relay carries about")
-            self._must_thread(conn, part.about)
+            target = self._must_thread(conn, part.about)
+            if target.kind != "work" or target.state == "closed":
+                raise CoordError(f"about names an open work thread ({target.thread_id} is {target.kind}, "
+                                 f"{target.state})")
         thread_id = "th-" + secrets.token_hex(16)
         conn.execute("INSERT INTO threads (thread_id, created_at, about) VALUES (?, ?, ?)",
                      (thread_id, now, part.about))
@@ -610,8 +666,30 @@ class CoordStore:
         return thread_id
 
     @staticmethod
-    def _revise(conn: sqlite3.Connection, thread_id: str, members: Iterable[str], cause: str, now: str) -> None:
+    def _dependents(conn: sqlite3.Connection, thread_id: str) -> list[str]:
+        return [r[0] for r in conn.execute("SELECT thread_id FROM threads WHERE about = ? ORDER BY rowid",
+                                           (thread_id,))]
+
+    @classmethod
+    def _current_members(cls, conn: sqlite3.Connection, thread_id: str) -> set[str]:
+        row = conn.execute("SELECT members FROM thread_revisions WHERE thread_id = ? ORDER BY rev DESC LIMIT 1",
+                           (thread_id,)).fetchone()
+        return set() if row is None else set(json.loads(row[0]))
+
+    @classmethod
+    def _revise(cls, conn: sqlite3.Connection, thread_id: str, members: Iterable[str], cause: str,
+                now: str) -> None:
+        """Write ``thread_id``'s next revision. Every membership change goes through here, so this is where the one
+        structural rule is held: a drop that sits in a thread ABOUT this one is never ADDED to it, so an ask never
+        moves the revision of the work it asks about. (One drop that is both a fix and a request for a report may sit
+        in the work thread and in an ask about it: it joined the work as work.)"""
         ordered = sorted(members)
+        added = set(ordered) - cls._current_members(conn, thread_id)
+        for dependent in cls._dependents(conn, thread_id) if added else ():
+            shared = cls._current_members(conn, dependent) & added
+            if shared:
+                raise CoordError(f"drop {min(shared)} asks about thread {thread_id} (in {dependent}); it never "
+                                 "joins it")
         rev = conn.execute("SELECT COALESCE(MAX(rev), 0) + 1 FROM thread_revisions WHERE thread_id = ?",
                            (thread_id,)).fetchone()[0]
         conn.execute("INSERT INTO thread_revisions (thread_id, rev, members, members_sha256, cause, at) "
