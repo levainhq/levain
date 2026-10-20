@@ -1122,7 +1122,12 @@ def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = N
     return RH.EXIT_OK
 
 
-__all__ = ["BUILT_VERBS", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
+
+#: The only name :func:`main` reads from its environment (the caller, :func:`levain.slot.runtime_helper._sudo_uid`).
+INSTALL_ENTRY_ENV = ("SUDO_UID",)
+
+
+__all__ = ["BUILT_VERBS", "INSTALL_ENTRY_ENV", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
@@ -1132,4 +1137,4 @@ __all__ = ["BUILT_VERBS", "Directory", "Gathered", "HostFacts", "InstallPlan", "
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
-    raise SystemExit(main(sys.argv[1:], env=dict(os.environ)))
+    raise SystemExit(main(sys.argv[1:], env=RH.entry_env(os.environ, INSTALL_ENTRY_ENV)))

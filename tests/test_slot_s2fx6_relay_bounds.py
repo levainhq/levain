@@ -26,6 +26,10 @@ FX6_HOOKS = r'''
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
             with open(os.path.join(store, "pid-orphan"), "w") as f:
                 f.write(str(os.getpid()))
+            # Only once the helper's line is written: a pty the orphan filled first (the relay holds the master back
+            # past _OUTPUT_MAX while his terminal is stalled) blocks that write, and the helper never exits.
+            while not os.path.exists(os.path.join(store, "lined")):
+                time.sleep(0.01)
             end = time.monotonic() + 20
             try:
                 while time.monotonic() < end:
@@ -36,6 +40,7 @@ FX6_HOOKS = r'''
         while not os.path.exists(os.path.join(store, "pid-orphan")):
             time.sleep(0.01)
         line({"exit": 0, "ok": True})
+        open(os.path.join(store, "lined"), "w").close()
         sys.exit(0)
     if mode == "modes":'''
 

@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import IO, Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from levain import unshowable
+from levain.launch import child_env
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, layout
 from levain.slot.grammar import SESSION_RE
@@ -368,7 +369,8 @@ def spawn(argv: Sequence[str], *, stdin: Any, stdout: Any, stderr: Any, lease_fd
           ctty: bool = False, env: Optional[Mapping[str, str]] = None) -> "subprocess.Popen[bytes]":
     """Every child gets EXACTLY fds 0, 1, 2 (``close_fds`` with no ``pass_fds``; for ``start`` those three are its pty
     slave) in its own session (``ctty``: the slave becomes its controlling terminal, so sudo's ``use_pty`` sees a
-    terminal). Refused before any fork when a lease fd would be one of the three or could be inherited."""
+    terminal). Refused before any fork when a lease fd would be one of the three or could be inherited. With no
+    ``env`` the child gets :func:`levain.launch.child_env` (the allowlist), never this process's whole environment."""
     for fd in lease_fds:
         if fd in (stdin, stdout, stderr):
             raise Refused("lease-fd-to-child", f"fd {fd}")
@@ -376,7 +378,13 @@ def spawn(argv: Sequence[str], *, stdin: Any, stdout: Any, stderr: Any, lease_fd
             raise Refused("lease-fd-inheritable", f"fd {fd}")
     return subprocess.Popen(list(argv), stdin=stdin, stdout=stdout, stderr=stderr, close_fds=True, pass_fds=(),
                             start_new_session=True, preexec_fn=_take_ctty if ctty else None,
-                            env=None if env is None else dict(env))
+                            env=child_env() if env is None else dict(env))
+
+
+def run_child(argv: Sequence[str], *, env: Mapping[str, str], **kw: Any) -> subprocess.CompletedProcess:
+    """:attr:`Seams.run`'s default: ``subprocess.run`` with ``env`` required, so no child the supervisor runs can
+    inherit this process's whole environment by leaving it out."""
+    return subprocess.run(list(argv), env=dict(env), **kw)
 
 
 # --- the helper's answers (§5 preamble: one canonical JSON line) -----------------------------------------------------
@@ -753,7 +761,7 @@ class Seams:
     store: Optional[Path] = None
     base_map: Optional[Path] = None
     git: str = "git"
-    run: Callable[..., subprocess.CompletedProcess] = subprocess.run
+    run: Callable[..., subprocess.CompletedProcess] = run_child
     spawn: Callable[..., "subprocess.Popen[bytes]"] = spawn
     openpty: Callable[[], Tuple[int, int]] = os.openpty
     stdin: int = 0
@@ -1275,9 +1283,12 @@ class Supervisor:
                 # Once the helper is gone holding the master back holds nothing up but the end of the stream.
                 read_master = exited or len(outbuf) < _OUTPUT_MAX
                 rl = [self._wake_r] + ([master] if read_master else [])
-                if stdin_open and len(pending) < _INPUT_MAX:
+                # Once the helper is gone his input has no reader, and the pty would echo it after `start`'s line
+                # (sudo puts the slave back as it found it, cooked), making the line unreadable: none is read or
+                # forwarded.
+                if stdin_open and len(pending) < _INPUT_MAX and not exited:
                     rl.append(self.s.stdin)
-                wl = ([master] if pending else []) + ([stdout] if outbuf else [])
+                wl = ([master] if pending and not exited else []) + ([stdout] if outbuf else [])
                 try:
                     ready, writable, _ = select.select(rl, wl, [], 0.5)
                 except InterruptedError:
@@ -1296,7 +1307,7 @@ class Supervisor:
                         pass
                     except OSError as e:
                         out_err = e               # his terminal is gone: the relay ends, the loss is counted below
-                if master in writable and pending:
+                if master in writable and pending and not exited:
                     try:
                         del pending[:os.write(master, pending)]
                     except BlockingIOError:

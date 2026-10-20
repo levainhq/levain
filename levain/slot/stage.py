@@ -34,8 +34,9 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
+from levain.launch import allowed_env
 from levain.slot import Refused, wall, write_all
 from levain.slot.render import parse_driver_input
 
@@ -399,10 +400,19 @@ def stage_driver_input(staging: int | str | os.PathLike[str], dest_dir: int | st
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
                  "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES")
+# DECISION: where the caller's own git config lives (not a secret, and no redirection of the repository): carried, so
+# the identity and settings git reads are the caller's, as with git run by hand.
+_GIT_ENV_KEEP = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
 
 
-def _git_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if base is None else base)
+def _git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """git's environment: the allowlist (:func:`levain.launch.allowed_env`) of ``base`` (default this process's),
+    which carries what a local clone and bundle need (``PATH``, ``HOME`` for the caller's config, the locale,
+    ``TMPDIR``), plus :data:`_GIT_ENV_KEEP`, minus any ``GIT_*`` redirection, with the terminal prompt off. Never a
+    copy: whatever git is given sits in its exec-time block, readable by every process of the caller."""
+    src = os.environ if base is None else base
+    env = allowed_env(src)
+    env.update({k: src[k] for k in _GIT_ENV_KEEP if k in src})
     for k in list(env):
         if k in _GIT_ENV_DROP or k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_"):
             del env[k]

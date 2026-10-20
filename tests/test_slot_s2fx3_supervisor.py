@@ -47,6 +47,9 @@ refuse = os.environ.get("FAKE_REFUSE", "")''' % {"session": SESSION}
 
 START_HOOKS = r'''
     mode = os.environ.get("FAKE_START")
+    if mode == "raw":   # sudo's use_pty: the terminal it is given is raw while it runs (no echo of his typing)
+        import tty
+        tty.setraw(0)
     if mode == "modes":
         os.write(1, b"\x1b[?1004h\x1b[?1000;1006h\x1b[?25lM")
         line({"exit": 0, "ok": True})
@@ -476,7 +479,9 @@ def test_malformed_prepare_answer_is_refused_and_left_to_the_lease_close(tmp_pat
 @bounded(60)
 def test_relay_ends_when_the_helper_exits_though_the_operator_keeps_typing(tmp_path: Path,
                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
-    r = rig(tmp_path, monkeypatch)
+    # FAKE_START=raw: with the slave cooked while the fake shuts down, its echo of the typing could land after
+    # `start`'s line (start-result-unreadable, run() == 1); the real slave is raw under sudo until it exits.
+    r = rig(tmp_path, monkeypatch, FAKE_START="raw")
     stop = threading.Event()
 
     def typist() -> None:
@@ -502,7 +507,7 @@ def test_relay_ends_on_the_drained_master_when_no_hangup_comes(tmp_path: Path, m
                                                                ) -> None:
     # With the helper as the pty's session leader, its exit hangs the pty up and the master reads EIO. Without a
     # hangup (no controlling terminal), only "exited, and a read pass found the master empty" ends the relay.
-    r = rig(tmp_path, monkeypatch)
+    r = rig(tmp_path, monkeypatch, FAKE_START="raw")
     real = r.seams.spawn
     r.seams.spawn = lambda argv, **kw: real(argv, **{**kw, "ctty": False})
     stop = threading.Event()

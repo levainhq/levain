@@ -1522,6 +1522,17 @@ VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, objec
 
 # --- main ----------------------------------------------------------------------------------------------------------------
 
+#: The only names :func:`main` reads from its environment (``SUDO_UID`` for the caller, ``TERM`` for render). The
+#: root entry hands main exactly these, never a copy of ``os.environ``: main gives no child its environment, and a name
+#: it is not given cannot reach one later.
+ENTRY_ENV = ("SUDO_UID", "TERM")
+
+
+def entry_env(environ: Mapping[str, str], names: Sequence[str] = ENTRY_ENV) -> Dict[str, str]:
+    """The part of ``environ`` a root entry's :func:`main` reads: ``names``, when set."""
+    return {k: environ[k] for k in names if k in environ}
+
+
 def _sudo_uid(env: Mapping[str, str]) -> int:
     raw = env.get("SUDO_UID")
     if type(raw) is not str or not _SUDO_UID_RE.fullmatch(raw):      # never root, one spelling, ASCII only
@@ -1603,7 +1614,7 @@ def _read_stdin() -> bytes:
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
-           "configured_slots",
+           "configured_slots", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
@@ -1614,4 +1625,4 @@ __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTER
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
     _args = sys.argv[1:]
     _stdin = _read_stdin() if _args[:1] in (["prepare"], ["render"]) else b""
-    raise SystemExit(main(_args, stdin=_stdin, env=dict(os.environ)))
+    raise SystemExit(main(_args, stdin=_stdin, env=entry_env(os.environ)))
