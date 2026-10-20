@@ -148,8 +148,8 @@ def test_show_summarises_every_active_kind(capsys, ddir, root, keys, tmp_path):
 def test_show_counts_the_adoption_rules_and_reads_the_routemap(capsys, ddir, root, keys, tmp_path):
     configure(capsys, ddir, root, keys, tmp_path)
     t = tmpl()
-    rules = [{"template_id": "fix-lint", "template_hash": t["content_hash"], "verifier_kind": "black-box",
-              "criteria": ["contrast-clean", "diff under 40 lines"]}]
+    rules = [{"repo": "/srv/repo", "template_id": "fix-lint", "template_hash": t["content_hash"],
+              "verifier_kind": "black-box", "criteria": [{"onto": ["main"]}, {"max_changed_lines": 40}]}]
     routes = {"routes": [{"route": "openrouter/glm", "provider": "openrouter", "upstream": "https://x.invalid",
                           "credential": "keychain:or", "models": [{"requested": "glm-5", "backend": "z-ai/glm-5"}],
                           "body_policy": {}, "retention_claim": "none"}]}
