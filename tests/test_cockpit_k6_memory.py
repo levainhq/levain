@@ -167,55 +167,63 @@ RENDER = """(async () => { const E = (t) => ({ kind: 'section', ref: 0, id: 'x',
 
 PATTERNS = "\n".join([
     "{today — 2026-10-19}",
-    "- !!! absence_of_signal_rendered_as_health | 40x (2026-10-19) [evidence: 2a273b8b \"a failed cat read as HOLDS\"]",
-    "- !! a name with spaces | 3x (2026-10-18) (cross-session-overlap) — trailing prose here",
+    "- !!! absence_of_signal_rendered_as_health | 40x (2026-10-19) [evidence: 2a273b8b \"a failed cat read as HOLDS\"] — tail prose here",
+    "- ! name with `code` | 2x (2026-10-18) (cross-session-overlap)",
+    "- !! a name with spaces | 3x (2026-10-18) [no-contradicts]",
     "",
     "{carried — not re-exercised today}",
-    "- ! severity_is_reviewer_noise | 4x (2026-10-16) [no-contradicts]",
+    "- ! severity_is_reviewer_noise | 4x (2026-10-16) (carried-forward)",
+    "A stray sentence that is not a pattern line.",
 ])
 DECISIONS = "\n".join([
-    "[decided, 2026-10-18, Phill] **DIOGENES DRIFT SWEEP DISABLED** [episode: 3da3d496] (*\"the premise\"*) with `code span` after",
+    "[decided, 2026-10-18, Phill] **DIOGENES DRIFT SWEEP DISABLED** [episode: 3da3d496] (*\"the premise\"*) · **SECOND** [episode: e2] with `code span` after",
     "  a continuation line that belongs to the same decision",
+    "",
     "[forwarded] **DREAMING BECOMES THE DEFAULT** -> `state/x.md`",
     "[carried] THE BATON (`spore-1322`): every consolidate holds it",
+    "",
+    "[rejected, 10-17] Z was turned down",
+    "Some preface prose that matches nothing.",
 ])
+# the plain markdown render of a body (a heading that is neither Patterns nor Decisions takes the undecorated path) against the same
+# body drawn as Patterns / Decisions: the decorated section keeps every character the markdown showed, minus the chip and date text
+# it moved out in front
+LOSSLESS = RENDER % ("""const norm = (x) => x.replace(/\\s+/g, ' ').trim();
+  const text = (n) => { const c = n.cloneNode(true); for (const x of c.querySelectorAll('.ck-mem-n, .ck-mem-when')) x.remove(); return norm(c.textContent); };
+  const body = (n) => n.querySelector('.section-display');
+  const pP = draw('Patterns', %s), pD = draw('Decisions', %s), plainP = draw('Notes', %s), plainD = draw('Notes', %s);
+  return {
+    pText: text(body(pP)), pPlain: norm(body(plainP).textContent.replace(/\\|\\s*\\d+x\\b/g, '')),
+    pChips: [...pP.querySelectorAll('.ck-mem-n')].map((x) => x.textContent), pGroups: [...pP.querySelectorAll('.ck-mem-group')].map((x) => x.textContent),
+    pNames: [...pP.querySelectorAll('.ck-mem-name')].map((x) => x.textContent), pCode: pP.querySelectorAll('.ck-mem-name code').length,
+    pStray: [...body(pP).querySelectorAll('p.md-p')].filter((x) => /stray/.test(x.textContent)).map((x) => x.outerHTML),
+    pStrayPlain: [...body(plainP).querySelectorAll('p.md-p')].filter((x) => /stray/.test(x.textContent)).map((x) => x.outerHTML),
+    dText: text(body(pD)), dPlain: norm(body(plainD).textContent),
+    dWhen: [...pD.querySelectorAll('.ck-mem-when')].map((x) => x.textContent), dCode: pD.querySelectorAll('code').length,
+    dRejected: [...body(pD).querySelectorAll('p.md-p')].filter((x) => /rejected/.test(x.textContent)).map((x) => [x.outerHTML, x.querySelectorAll('.ck-mem-when').length]),
+    dRejectedPlain: [...body(plainD).querySelectorAll('p.md-p')].filter((x) => /rejected/.test(x.textContent)).map((x) => x.outerHTML),
+    dLead: [...body(pD).querySelectorAll('.ck-mem-li')].length };""" % (json.dumps(PATTERNS), json.dumps(DECISIONS), json.dumps(PATTERNS), json.dumps(DECISIONS)))
 
 
 @needs_browser
-def test_a_patterns_body_and_a_decisions_body_render_losslessly(tmp_path: Path) -> None:
+def test_patterns_and_decisions_are_the_markdown_dressed_in_place_and_lose_nothing(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/{MEMORY}", [
-            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard"},
-            {"eval": RENDER % ("""const p = draw('Patterns', %s); const d = draw('Decisions', %s);
-  const t = (n) => n.textContent.replace(/\\s+/g, ' ');
-  return { pRows: [...p.querySelectorAll('.ck-mem-li')].map((r) => [(r.querySelector('.ck-mem-n') || {}).textContent, (r.querySelector('.ck-mem-name') || {}).textContent, (r.querySelector('.ck-mem-rest') || {}).textContent || '']),
-    pGroups: [...p.querySelectorAll('.ck-mem-group')].map((g) => g.textContent), pText: t(p),
-    dRows: [...d.querySelectorAll('.ck-mem-li')].map((r) => [(r.querySelector('.ck-mem-when') || {}).textContent, (r.querySelector('.ck-mem-text') || {}).textContent]),
-    dCode: d.querySelectorAll('.ck-mem-text code').length, dCites: [...d.querySelectorAll('.ck-mem-cite')].map((c) => c.textContent), dText: t(d) }; """ % (json.dumps(PATTERNS), json.dumps(DECISIONS)))},
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard"}, {"eval": LOSSLESS},
         ])["values"]
     r = out[1]
-    assert [x[:2] for x in r["pRows"]] == [["40x", "absence_of_signal_rendered_as_health"], ["3x", "a name with spaces"], ["4x", "severity_is_reviewer_noise"]], r
-    assert "2a273b8b" in r["pRows"][0][2] and "2026-10-19" in r["pRows"][0][2], r            # the evidence id and the date ride on a muted second line
-    assert "trailing prose here" in r["pRows"][1][2] and "cross-session-overlap" in r["pRows"][1][2], r
-    assert [g.strip() for g in r["pGroups"]] == ["today — 2026-10-19", "carried — not re-exercised today"], r   # stale patterns are labelled as stale
-    assert len(r["dRows"]) == 3, r                                                           # the continuation line joined its decision
-    assert r["dRows"][0][0] == "10-18" and "continuation line that belongs" in r["dRows"][0][1], r
-    assert r["dCode"] >= 3 and r["dCites"] == ["[episode: 3da3d496]"], r                      # code spans keep their rendering; a citation stays, muted
-    assert r["dRows"][1][0] == "forwarded" and r["dRows"][2][0] == "carried", r
-    assert "every consolidate holds it" in r["dText"], r
-
-
-@needs_browser
-def test_a_body_the_parsers_do_not_recognise_falls_back_to_its_markdown_whole(tmp_path: Path) -> None:
-    _root, src, _ids = _install(tmp_path)
-    cases = {"Patterns": PATTERNS + "\nA stray sentence that is not a pattern line.", "Decisions": "Some preface prose.\n" + DECISIONS}
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{MEMORY}", [
-            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard"},
-            {"eval": RENDER % ("""const bodies = %s; return Object.keys(bodies).map((k) => { const p = draw(k, bodies[k]); return [k, !!p.querySelector('.ck-mem-list'), !!p.querySelector('.md-p, .md-ul'), p.textContent.includes(k === 'Patterns' ? 'A stray sentence' : 'Some preface prose')]; }); """ % json.dumps(cases))},
-        ])["values"]
-    assert out[1] == [["Patterns", False, True, True], ["Decisions", False, True, True]], out[1]
+    assert r["pText"] == r["pPlain"], r                                    # every character the markdown showed is still there
+    assert r["dText"] == r["dPlain"], r
+    assert r["pChips"] == ["40x", "2x", "3x", "4x"], r                      # the count moved into a leading chip
+    assert [g.strip() for g in r["pGroups"]] == ["{today — 2026-10-19}", "{carried — not re-exercised today}"], r   # stale patterns are labelled
+    assert r["pNames"][0].strip() == "!!! absence_of_signal_rendered_as_health", r  # the severity mark survives, in the name
+    assert r["pCode"] == 1, r                                              # a code span in a name stays a code span
+    assert r["pStray"] == r["pStrayPlain"] and len(r["pStray"]) == 1, r    # a line that matches nothing is left exactly as rendered
+    assert r["dWhen"] == ["10-18", "forwarded", "carried"], r              # the bracket's date (or its word) leads each decision
+    assert "Phill" in r["dText"], r                                        # who decided stays, as muted text
+    assert r["dCode"] >= 3, r
+    assert len(r["dRejected"]) == 1 and r["dRejected"][0][1] == 0 and r["dRejected"][0][0] == r["dRejectedPlain"][0], r   # [rejected] is not folded into a row
 
 
 @needs_browser
@@ -226,7 +234,7 @@ def test_a_long_crystal_name_keeps_its_count_beside_it(tmp_path: Path) -> None:
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard && document.querySelector('.ck-mem-row')"},
             {"eval": """(() => { const view = { crystal_index: [{ level: 4, name: 'a_stale_record_is_as_dangerous_as_it_is_trusted_and_then_some_more', one_clause: 'short clause' }, { level: 3, name: 'short', one_clause: '' }] };
   const p = window.LevainDashboard.renderPanel({ kind: 'crystals', id: 'crystals', title: 'Crystallized patterns', zone: 'mind' }, view);
-  const host = document.createElement('div'); host.style.width = '230px'; document.querySelector('.ck-zgrid').appendChild(host); host.appendChild(p);
+  const host = document.createElement('div'); host.style.width = '230px'; document.querySelector('.ck-mem-row').parentNode.appendChild(host); host.appendChild(p);
   return [...p.querySelectorAll('.row')].map((r) => { const l = r.querySelector('.lvl').getBoundingClientRect(), n = r.querySelector('.name').getBoundingClientRect(); return [Math.round(l.top), Math.round(n.top), l.right <= n.left + 1, n.right <= r.getBoundingClientRect().right + 1]; }); })()"""},
         ])["values"]
     for lvl_top, name_top, beside, inside in out[1]:
@@ -235,15 +243,60 @@ def test_a_long_crystal_name_keeps_its_count_beside_it(tmp_path: Path) -> None:
 
 @needs_browser
 def test_an_editable_section_with_no_text_keeps_its_edit(tmp_path: Path) -> None:
-    _root, src, _ids = _install(tmp_path)
+    root, src, _ids = _install(tmp_path)
+    # a real neocortex file with an EMPTY State: the section is editable, so it stays on the card as one slim row
+    (root / ".levain" / "memory.continuity.md").write_text(
+        "# Continuity — Sage\n\n## State\n\n## Active Threads\n- t1\n\n## Patterns\n" + PATTERNS + "\n\n## Decisions\n" + DECISIONS + "\n\n## Context\nctx\n\n## Understanding\nthe felt layer\n",
+        encoding="utf-8")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/{MEMORY}", [
-            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard"},
-            {"eval": """(() => { const e = { kind: 'section', ref: 0, id: 'state', title: 'State', heading: 'State', zone: 'mind', edit_class: 'A', source: 'state' };
-  const p = window.LevainDashboard.renderPanel(e, { sections: [{ heading: 'State', body: '' }] });
-  return [p.dataset.ckNoText || null, p.dataset.editable || null, p.dataset.ckSlim || null]; })()"""},
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "document.querySelector('.ck-mem-neo .ck-mem-nest')"},
+            {"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+  const slim = document.querySelector('.ck-mem-neo .ck-mem-slim');
+  if (!slim) return null;
+  const mid = (n) => { const r = n.getBoundingClientRect(); return [Math.round((r.top + r.bottom) / 2), Math.round(r.left), Math.round(r.right)]; };
+  const h = slim.querySelector('.phead h2'), e = slim.querySelector('.empty'), b = slim.querySelector('.edit-btn');
+  return { title: h && h.textContent, empty: e && e.textContent, edit: !!b, h: Math.round(slim.getBoundingClientRect().height),
+    mids: [h, e, b].map((n) => n && mid(n)), pats: document.querySelectorAll('.ck-mem-neo .ck-mem-pats .ck-mem-n').length, decs: document.querySelectorAll('.ck-mem-neo .ck-mem-decs .ck-mem-when').length }; })()"""},
         ])["values"]
-    assert out[1][1:] == ["1", "1"], out[1]       # empty and editable: not omitted from the card, a slim row that keeps its Edit
+    r = out[1]
+    assert r and r["title"].strip().lower() == "state" and r["empty"] == "empty" and r["edit"], r      # State · empty · Edit
+    ys = [m[0] for m in r["mids"]]
+    assert max(ys) - min(ys) <= 12 and r["mids"][0][2] <= r["mids"][2][1] and r["h"] < 70, r          # one row, left to right
+    assert r["pats"] == 4 and r["decs"] == 3, r                      # the real page's Patterns and Decisions carry their chips
+
+
+@needs_browser
+def test_cancelling_a_section_edit_returns_focus_to_its_edit_button(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    (root / ".levain" / "memory.continuity.md").write_text("# Continuity — Sage\n\n## State\nfocus line\n\n## Patterns\n- p1 | 1x\n", encoding="utf-8")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{MEMORY}", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "document.querySelector('.ck-mem-neo .edit-btn')"},
+            {"eval": """(async () => { const b = document.querySelector('.ck-mem-neo .edit-btn'); b.click(); await new Promise(r => setTimeout(r, 200));
+  const ta = document.activeElement === document.querySelector('.ck-mem-neo textarea');
+  document.querySelector('.ck-mem-neo .edit-cancel').click(); await new Promise(r => setTimeout(r, 200));
+  return [ta, document.activeElement === b]; })()"""},
+        ])["values"]
+    assert out[1] == [True, True], out[1]      # the editor took focus, and cancel hands it back to the button that opened it
+
+
+@needs_browser
+def test_a_long_section_never_runs_over_the_one_below_it_on_a_phone(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    many = "\n".join(f"- ! pattern_number_{i}_with_a_long_name_that_wraps_on_a_phone | {i % 4 + 1}x (2026-10-1{i % 9}) [evidence: e{i} \"some quote that runs on\"]" for i in range(16))
+    (root / ".levain" / "memory.continuity.md").write_text(f"# Continuity — Sage\n\n## State\nfocus\n\n## Patterns\n{many}\n\n## Decisions\n{DECISIONS}\n", encoding="utf-8")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{MEMORY}", [
+            PHONE, {"until": "document.querySelector('.ck-mem-neo .ck-mem-nest')"},
+            {"eval": """(async () => { await new Promise(r => setTimeout(r, 500));
+  const ns = [...document.querySelectorAll('.ck-mem-neo .ck-mem-nest')].map((n) => { const r = n.getBoundingClientRect(); return [n.dataset.ckPanel, r.top, r.bottom, n.scrollHeight, r.height]; });
+  return ns; })()"""},
+        ])["values"]
+    ns = out[1]
+    assert any(sh > 560 for _p, _t, _b, sh, _h in ns), ns                                    # the probe is real: one section is taller than the generic card cap
+    for (_p, _t, bottom, sh, h), (_p2, top2, _b2, _s2, _h2) in zip(ns, ns[1:]):
+        assert sh <= h + 1 and bottom <= top2 + 1, ns                                     # no section is cut at a cap and spilled over its neighbour
 
 
 def test_the_wraps_line_and_the_cognition_header_read_the_authoritative_figures(tmp_path: Path) -> None:
@@ -261,7 +314,10 @@ out.dark = memCogBits({ write_path_live: false, wraps: wr(2), graph: { nodes: [1
 out.darkHealth = memCogBits({ health: { write_path_live: false }, wraps: [] });
 out.live = memCogBits({ write_path_live: true, wraps: wr(2) });
 out.capBits = memCogBits({ wraps: wr(50) });
-out.badCrystals = true;
+out.totalBits = memCogBits({ wraps: wr(50), health: { total_wraps: 212 } });
+out.totalFew = memCogBits({ wraps: wr(3), health: { total_wraps: 3 } });
+out.darkEither = memCogBits({ write_path_live: true, health: { write_path_live: false }, wraps: [] });
+out.darkTop = memCogBits({ write_path_live: false, health: { write_path_live: true }, wraps: [] });
 """, tmp_path, fn)
     assert out["capped"].startswith("50+ wraps"), out["capped"]                  # the list is capped at 50: it never claims a total of 50
     assert out["total"].startswith("212 wraps"), out["total"]                    # the authoritative figure wins when the view has it
@@ -270,3 +326,49 @@ out.badCrystals = true;
     assert "write path dark" in out["dark"] and "write path dark" in out["darkHealth"], out
     assert "write path dark" not in out["live"], out
     assert any(b.startswith("50+") for b in out["capBits"]), out["capBits"]
+    assert out["totalBits"][0] == "212 consolidations", out["totalBits"]            # the same total as the wraps line, never the capped list's length
+    assert out["totalFew"][0] == "3 consolidations", out["totalFew"]
+    assert "write path dark" in out["darkEither"] and "write path dark" in out["darkTop"], out   # dark if EITHER place says so
+
+
+@needs_browser
+def test_crystals_survive_a_bad_index_and_show_their_detail_and_break_at_underscores(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{MEMORY}", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "window.LevainDashboard && document.querySelector('.ck-mem-row')"},
+            {"eval": """(() => { const E = { kind: 'crystals', id: 'crystals', title: 'Crystallized patterns', zone: 'mind' };
+  const draw = (idx) => window.LevainDashboard.renderPanel(E, { crystal_index: idx });
+  const bad = [ 'oops', { length: 3 }, 7, true ].map((v) => { const p = draw(v); return [p.textContent.includes('none crystallized yet'), /unavailable|undefined/.test(p.textContent)]; });
+  const p = draw([{ level: 4, name: 'a_stale_record_is_trusted', one_clause: 'short clause', permanence: 'permanent', activation_mode: 'always', tags: ['alpha', 'beta'] }]);
+  const host = document.createElement('div'); document.querySelector('.ck-mem-row').parentNode.appendChild(host); host.appendChild(p);
+  const m = p.querySelector('.ck-crys-meta'), nm = p.querySelector('.name');
+  return { bad, meta: m && m.textContent, metaVisible: !!m && m.getClientRects().length > 0 && getComputedStyle(m).display !== 'none', title: p.querySelector('.row').title,
+    wbr: nm.querySelectorAll('wbr').length, name: nm.textContent }; })()"""},
+        ])["values"]
+    r = out[1]
+    assert r["bad"] == [[True, False]] * 4, r                         # a truthy non-array index is an empty list, not a crash or garbage rows
+    assert r["meta"] == "permanent · always · #alpha #beta" and r["metaVisible"] and not r["title"], r   # detail is on the row, not a tooltip touch cannot reach
+    assert r["name"] == "a_stale_record_is_trusted" and r["wbr"] == 4, r   # a break opportunity after each underscore; the name's text is unchanged
+
+
+@needs_browser
+def test_an_identity_row_keeps_its_degradation_note_visible(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/{MEMORY}", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": "document.querySelector('.ck-mem-ident .ck-mem-ilist')"},
+            {"eval": """(async () => { await new Promise(r => setTimeout(r, 300));
+  const e = { kind: 'config', ref: 0, id: 'config:x', title: 'Probe row', zone: 'identity', banner: [{ tone: 'stale', text: 'stale: read 3 days ago' }] };
+  const p = window.LevainDashboard.renderPanel(e, { config_docs: [{ body: 'one summary line' }] });
+  // what finalizePanel does: everything after the header goes into the body
+  const head = p.querySelector('.phead'), body = document.createElement('div'); body.className = 'pbody';
+  while (head.nextSibling) body.appendChild(head.nextSibling);
+  p.appendChild(body); p.classList.add('ck-mem-nest', 'ck-mem-rowcard');
+  document.querySelector('.ck-mem-ident .ck-mem-ilist').appendChild(p);
+  const n = p.querySelector('.ext-note'), s = p.querySelector('.md-p');
+  const rp = p.getBoundingClientRect(), rn = n.getBoundingClientRect();
+  return { shown: n.getClientRects().length > 0, inside: rn.top >= rp.top && rn.bottom <= rp.bottom + 1, below: s ? rn.top >= s.getBoundingClientRect().bottom - 1 : null, text: n.textContent }; })()"""},
+        ])["values"]
+    r = out[1]
+    assert r["shown"] and r["inside"] and r["text"] == "stale: read 3 days ago", r      # a stale / partial / held-back row never reads as a healthy one

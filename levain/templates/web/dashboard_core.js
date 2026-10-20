@@ -957,9 +957,11 @@
   // the identity cards themselves, restyled into rows (title | one-line summary | the card's own Edit), the editor opening in place.
   // Nothing is hidden and nothing is pressed for the reader: each panel the kernel drew keeps doing its own work.
   const MEM_WRAP_CAP = 50;   // the longest history list the page is sent
+  // the authoritative wrap count when the view has one; the list is capped, so its length is only ever a floor
+  const memWrapTotal = (view) => (view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null);
   function memWrapsLine(view) {
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
-    const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
+    const total = memWrapTotal(view);
     // the newest stamp, wherever it sits in the list
     let last = null;
     for (const w of ws) {
@@ -979,13 +981,14 @@
   // the Cognition header's figures, the same on both of its tabs. The write path speaks only when it is dark.
   function memCogBits(view) {
     const g = view.graph, gn = g && Array.isArray(g.nodes) ? g.nodes.length : 0, ge = g && Array.isArray(g.edges) ? g.edges.length : 0;
-    const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
+    const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
+    const ws = total !== null ? total : listed;
     const bits = [];
-    if (ws) bits.push((ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
+    if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
     if (gn) bits.push(gn + " nodes");
     if (ge) bits.push(ge + " edges");
-    const live = view.health && "write_path_live" in view.health ? view.health.write_path_live : view.write_path_live;
-    if (live === false) bits.push("write path dark");
+    // dark if either place the view can say so says so
+    if (view.write_path_live === false || (view.health && view.health.write_path_live === false)) bits.push("write path dark");
     return bits;
   }
   function memCard(cls, title, meta, modes) {
@@ -1335,7 +1338,7 @@
   const tierErr = (view, key) => view.errors && view.errors[key];
 
   function renderCrystals(entry, view) {
-    const list = view.crystal_index || [];
+    const list = Array.isArray(view.crystal_index) ? view.crystal_index : [];
     const p = panel(entry);
     const err = tierErr(view, "crystal_index");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
@@ -1345,14 +1348,17 @@
       const row = el("div", "row");
       row.appendChild(el("span", "lvl", `${c.level}x`));
       const txt = el("span", "ck-crys-t");
-      txt.appendChild(el("span", "name", c.name));
+      // a name breaks after each underscore, so a long snake_case name wraps at a word and never mid-word
+      const nm = el("span", "name");
+      String(c.name == null ? "" : c.name).split("_").forEach((part, i) => { if (i) nm.appendChild(document.createTextNode("_")), nm.appendChild(document.createElement("wbr")); nm.appendChild(document.createTextNode(part)); });
+      txt.appendChild(nm);
       if (c.one_clause) txt.appendChild(el("span", "clause", c.one_clause));
-      row.appendChild(txt);
-      // fuller crystal detail (permanence / activation mode / tags) rides the row's tooltip: the card reads as name and clause
+      // permanence / activation mode / tags are a muted line under the clause: touch has no hover, so a tooltip is not a place to keep them
       const meta = [c.permanence, c.activation_mode].filter(Boolean).join(" · ");
       const tags = Array.isArray(c.tags) && c.tags.length ? "#" + c.tags.slice(0, 6).join(" #") : "";
-      const tip = [meta, tags].filter(Boolean).join(" · ");
-      if (tip) row.title = tip;
+      const detail = [meta, tags].filter(Boolean).join(" · ");
+      if (detail) txt.appendChild(el("span", "ck-crys-meta", detail));
+      row.appendChild(txt);
       grid.appendChild(row);
     }
     p.appendChild(grid);
@@ -2274,81 +2280,88 @@
   }
   // [MD-EXTRACT-END]
 
-  // The Patterns and Decisions sections are lists on the Memory tab, read off the section's own markdown. A list drops nothing: every
-  // line of the body is a row, a group label or part of a row (its second line, its continuation), or the whole section stays the
-  // markdown it is. Patterns: `- !!! name | 4x (date) [evidence: ...] prose` under optional `{group}` headers. Decisions:
-  // `[decided, 2026-10-18, who] **TITLE** ...` (also `[forwarded ...]`, `[carried ...]`), a line without a bracket continuing the row above.
-  function memPatternRows(body) {
-    const rows = [];
-    let seen = 0;
-    for (const line of String(body || "").split("\n")) {
-      if (!line.trim()) continue;
-      const g = /^\s*\{([^}]*)\}\s*$/.exec(line);
-      if (g) { rows.push({ group: g[1].trim() }); continue; }
-      const m = /^\s*[-*]\s*(?:[!~]+\s+)?([^|]+?)\s*\|\s*(\d+)x\b(.*)$/.exec(line);
-      if (!m) return null;
-      rows.push({ n: m[2], name: m[1], rest: m[3].trim() });
-      seen++;
+  // The Patterns and Decisions sections are decorated on the Memory tab, never re-parsed: the section is drawn by its own markdown
+  // renderer (sectionDisplay, the same path every other section takes), then the rendered DOM is dressed in place. So whatever the
+  // markdown shows is still there (names with code spans, severity marks, bracket metadata, tails, lines that do not match), and an
+  // item the decoration does not recognise is left exactly as rendered.
+  // Patterns: in each list item the `| NNx` token (a direct text child, outside any code span) moves into a leading count chip; what
+  // came before it is the name, what follows is muted after it. A `{group}` line is a group label.
+  const MEM_COUNT = /\|\s*(\d+)x\b/;
+  function memDecoratePatterns(root) {
+    for (const p of root.querySelectorAll("p.md-p")) {
+      if (/^\s*\{[^}]*\}\s*$/.test(p.textContent)) p.classList.add("ck-mem-group");
     }
-    return seen ? rows : null;
-  }
-  function memDecisionRows(body) {
-    const rows = [];
-    for (const line of String(body || "").split("\n")) {
-      if (!line.trim()) continue;
-      const m = /^\s*\[(decided|forwarded|carried)\b([^\]]*)\]\s*(.*)$/.exec(line);
-      if (m) {
-        const d = /,\s*(?:\d{4}-)?(\d\d-\d\d)/.exec(m[2]);
-        rows.push({ when: m[1] === "decided" && d ? d[1] : m[1], text: m[3].trim() });
-      } else if (rows.length) rows[rows.length - 1].text += " " + line.trim();
-      else return null;
-    }
-    return rows.length ? rows : null;
-  }
-  // text through the same inline markdown a section uses (code spans and links keep their rendering); a citation stays, muted
-  function memInline(parent, text) {
-    for (const part of String(text).split(/(\[(?:episode|evidence):[^\]]*\])/)) {
-      if (!part) continue;
-      if (/^\[(?:episode|evidence):/.test(part)) parent.appendChild(el("span", "ck-mem-cite", part));
-      else mdInline(part, parent, 0);
+    for (const li of root.querySelectorAll("li.md-li")) {
+      let at = null, m = null;
+      for (const n of li.childNodes) {
+        if (n.nodeType !== 3) continue;
+        m = MEM_COUNT.exec(n.nodeValue);
+        if (m) { at = n; break; }
+      }
+      if (!at) continue;
+      const kids = Array.from(li.childNodes);
+      const name = el("span", "ck-mem-name"), rest = el("span", "ck-mem-rest");
+      const text = at.nodeValue, before = text.slice(0, m.index), after = text.slice(m.index + m[0].length);
+      let seen = false;
+      for (const n of kids) {
+        if (n === at) { seen = true; if (before) name.appendChild(document.createTextNode(before)); if (after) rest.appendChild(document.createTextNode(after)); }
+        else (seen ? rest : name).appendChild(n);
+      }
+      const t = el("span", "ck-mem-t");
+      t.append(name, rest);
+      li.replaceChildren(el("span", "ck-mem-n", m[1] + "x"), t);
+      li.classList.add("ck-mem-li");
     }
   }
-  function memList(cls, rows, cell) {
-    const d = el("div", "section section-display ck-mem-list " + cls);
-    for (const r of rows) {
-      if (r.group) { d.appendChild(el("div", "ck-mem-group", r.group)); continue; }
-      const row = el("div", "ck-mem-li");
-      cell(row, r);
-      d.appendChild(row);
+  // Decisions: an item (or paragraph) that begins with a `[decided|forwarded|carried ...]` bracket takes the bracket's date into a
+  // leading date column; the whole bracket (who, qualifier) stays visible as muted text. A later line of the same paragraph that
+  // opens with such a bracket gets its date inline. Anything else (a `[rejected ...]` line, prose) is left as rendered.
+  const MEM_BRACKET = /^(\s*)(\[(decided|forwarded|carried)\b([^\]]*)\])/;
+  function memWhen(m) {
+    const d = /,\s*(?:\d{4}-)?(\d\d-\d\d)/.exec(m[4]);
+    return m[3] === "decided" && d ? d[1] : m[3];
+  }
+  function memDecorateDecisions(root) {
+    for (const host of root.querySelectorAll("p.md-p, li.md-li")) {
+      // a paragraph's source lines are split at its <br>s into one block per line, so each decision line is its own row; a line that
+      // opens with no bracket (a continuation) stays a block of its own under the row above, its words untouched
+      const kids = Array.from(host.childNodes);
+      const lines = [[]];
+      for (const n of kids) { if (n.nodeName === "BR" && host.nodeName === "P") lines.push([]); else lines[lines.length - 1].push(n); }
+      const hits = lines.map((ln) => { const n = ln[0]; return n && n.nodeType === 3 ? MEM_BRACKET.exec(n.nodeValue) : null; });
+      if (!hits.some(Boolean)) continue;
+      host.replaceChildren();
+      lines.forEach((ln, i) => {
+        const m = hits[i];
+        const row = el("span", m ? "ck-mem-li" : "ck-mem-cont");
+        if (m) {
+          const first = ln[0];
+          first.nodeValue = first.nodeValue.slice(m[0].length);
+          const t = el("span", "ck-mem-text");
+          t.appendChild(el("span", "ck-mem-cite", m[1] + m[2]));
+          for (const n of ln) t.appendChild(n);
+          row.append(el("span", "ck-mem-when", memWhen(m)), t);
+        } else for (const n of ln) row.appendChild(n);
+        host.appendChild(row);
+      });
+      host.classList.add("ck-mem-dec");
     }
-    return d;
   }
 
   function renderSection(entry, sec) {
     const p = panel(entry);
     if (!sec) { p.appendChild(el("p", "empty", "—")); return p; }
     const head = String(sec.heading || entry.heading || entry.title || "").trim().toLowerCase();
-    const pats = head === "patterns" ? memPatternRows(sec.body) : null;
-    const decs = head === "decisions" ? memDecisionRows(sec.body) : null;
-    if (pats) p.appendChild(memList("ck-mem-pats", pats, (row, r) => {
-      row.appendChild(el("span", "ck-mem-n", r.n + "x"));
-      const t = el("span", "ck-mem-t");
-      t.appendChild(el("span", "ck-mem-name", r.name));
-      if (r.rest) { const rest = el("span", "ck-mem-rest"); memInline(rest, r.rest); t.appendChild(rest); }
-      row.appendChild(t);
-    }));
-    else if (decs) p.appendChild(memList("ck-mem-decs", decs, (row, r) => {
-      row.appendChild(el("span", "ck-mem-when", r.when));
-      const t = el("span", "ck-mem-text");
-      memInline(t, r.text);
-      row.appendChild(t);
-    }));
-    else p.appendChild(sectionDisplay(sec.body));  // markdown-rendered (edit shows raw)
+    const disp = sectionDisplay(sec.body);   // markdown-rendered (edit shows raw)
+    // Patterns and Decisions are dressed in place on the Memory tab; a body the decoration finds nothing in stays the markdown it is
+    if (head === "patterns") { memDecoratePatterns(disp); disp.classList.add("ck-mem-pats"); }
+    else if (head === "decisions") { memDecorateDecisions(disp); disp.classList.add("ck-mem-decs"); }
+    p.appendChild(disp);
     // a section with no text is left out of the Memory tab's neocortex card (a bare heading says nothing), unless it can be edited:
     // then it is a slim row that keeps its Edit
     const bare = !String(sec.body || "").trim();
     if (bare) p.dataset.ckNoText = "1";
-    if (bare && isEditablePanel(entry)) { p.dataset.ckSlim = "1"; p.appendChild(el("p", "empty", "empty")); }
+    if (bare && isEditablePanel(entry)) { p.dataset.ckSlim = "1"; p.classList.add("ck-mem-slim"); p.appendChild(el("p", "empty", "empty")); }
     if (isEditablePanel(entry)) {
       // State (Class-A neocortex section) is editable in Slice 2b via the SAME
       // affordance config panels use — mark + stash; finalizePanels appends the bar.
@@ -2433,6 +2446,8 @@
       if (p.hasAttribute("data-clamp")) body.classList.add("clamped");
       row.style.display = "";
       body.dataset.editing = "";
+      const again = row.querySelector(".edit-btn");   // the way back in is where focus returns, not the page
+      if (again) again.focus();
     };
     cancel.addEventListener("click", restore);
     // Escape cancels the edit (not the whole modal): stopPropagation keeps it from
