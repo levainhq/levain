@@ -53,7 +53,7 @@ __all__ = [
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
     "consent_grant", "consent_grant_tool_problem", "consent_tool_shape_problem", "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
-    "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
+    "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
 
 FORMAT = "levain-authority/1"
@@ -575,6 +575,9 @@ _SSHSIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
 _SSHSIG_END = "-----END SSH SIGNATURE-----"
 _SK_USER_PRESENT = 0x01
 _WEBAUTHN_SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
+# a key type :func:`sshsig_public_key` will name: it is written into an allowed-signers line, so a space, a newline
+# or a quote in it would add options or a second line (``no-touch-required``) to what ssh-keygen trusts
+_KEY_TYPE_RE = re.compile(r"[A-Za-z0-9@._-]+")
 
 
 class _Wire:
@@ -601,6 +604,47 @@ class _Wire:
             raise ValueError("trailing bytes")
 
 
+def _sshsig_fields(armored: str) -> tuple[bytes, bytes]:
+    """The ``publickey`` and ``signature`` strings of an armored SSHSIG v1 blob (the layout
+    :func:`_sshsig_type_and_flags` describes); namespace, reserved and hash_algorithm are skipped, for
+    ssh-keygen to judge. Raises ValueError on anything malformed."""
+    text = armored.strip()
+    if not text.startswith(_SSHSIG_BEGIN) or not text.endswith(_SSHSIG_END):
+        raise ValueError("not an armored SSH signature")
+    blob = base64.b64decode("".join(text[len(_SSHSIG_BEGIN):-len(_SSHSIG_END)].split()), validate=True)
+    outer = _Wire(blob)
+    if outer.take(6) != b"SSHSIG" or outer.u32() != 1:
+        raise ValueError("not an SSHSIG v1 blob")
+    public_key = outer.string()
+    for _ in range(3):              # namespace, reserved, hash_algorithm
+        outer.string()
+    signature = outer.string()
+    outer.end()
+    return public_key, signature
+
+
+def sshsig_public_key(armored: Any) -> tuple[str, str, str]:
+    """What an armored SSHSIG CLAIMS about its signer: the public key embedded in it as ``<type> <base64>``, that
+    key's fingerprint in the ``SHA256:...`` form ssh-keygen prints, and the signature's algorithm. Nothing here
+    verifies the signature: the key is only the one the blob names, for :func:`verify_link_sig` to verify against
+    (it is never authority on its own). Raises ValueError on anything malformed, longer than any signature
+    levain verifies, or naming a key type outside ``[A-Za-z0-9@._-]+``."""
+    if not isinstance(armored, str) or len(armored) > _MAX_SIGNATURE:
+        raise ValueError("not a signature levain reads")
+    try:
+        key_blob, sig_blob = _sshsig_fields(armored)
+        key_type = _Wire(key_blob).string().decode("ascii")
+        sig_type = _Wire(sig_blob).string().decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"not an SSH signature ({type(exc).__name__})") from None
+    if not key_type or not sig_type:
+        raise ValueError("the signature names no key type or no algorithm")
+    if not _KEY_TYPE_RE.fullmatch(key_type):
+        raise ValueError("the signature's key type is not one ssh-keygen names")
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii").rstrip("=")
+    return f"{key_type} {base64.b64encode(key_blob).decode('ascii')}", fingerprint, sig_type
+
+
 def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     """The signature algorithm inside an armored SSHSIG, and its FIDO flags byte (None for a non-sk
     algorithm). Raises ValueError on anything malformed.
@@ -612,17 +656,8 @@ def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     presence. A WebAuthn signature (``webauthn-sk-ecdsa-sha2-nistp256@openssh.com``, the same section: a
     passkey's assertion, Q6b) carries string origin, string clientData, string extensions after the
     counter. Every other algorithm is string sig-type, string signature."""
-    text = armored.strip()
-    if not text.startswith(_SSHSIG_BEGIN) or not text.endswith(_SSHSIG_END):
-        raise ValueError("not an armored SSH signature")
-    blob = base64.b64decode("".join(text[len(_SSHSIG_BEGIN):-len(_SSHSIG_END)].split()), validate=True)
-    outer = _Wire(blob)
-    if outer.take(6) != b"SSHSIG" or outer.u32() != 1:
-        raise ValueError("not an SSHSIG v1 blob")
-    for _ in range(4):              # publickey, namespace, reserved, hash_algorithm: ssh-keygen judges them
-        outer.string()
-    inner = _Wire(outer.string())
-    outer.end()
+    _public_key_blob, sig_blob = _sshsig_fields(armored)
+    inner = _Wire(sig_blob)
     sig_type = inner.string().decode("ascii")
     inner.string()
     webauthn = sig_type == _WEBAUTHN_SIG_TYPE
