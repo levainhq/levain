@@ -3112,7 +3112,7 @@
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
     const box = el("div", "tray-dump");
     const ta = el("textarea", "tray-dump-ta");
-    ta.placeholder = placeholder; ta.rows = 2;
+    ta.placeholder = placeholder; ta.title = "⌘/Ctrl+Enter sends"; ta.rows = 2;
     box.appendChild(ta);
     const controls = el("div", "tray-dump-controls");
     let sel = null;
@@ -3154,7 +3154,7 @@
   // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
   function buildTrayDump(entity) {
     return buildCaptureBox(
-      `dump anything — a to-do, a thought, a thread to pick up… ${entity} sorts it (⌘/Ctrl+Enter)`,
+      `Drop anything. ${entity} sorts it.`,
       "drop", "nothing to drop", true,
       (text, type) => {
         const req = { kind: "spore_seed", text };
@@ -3167,7 +3167,7 @@
   // cognition-excluded + resolve-exempt. No type (reference never resolves).
   function buildKeepNote() {
     return buildCaptureBox(
-      "add a note — a command, a pointer, durable reference to keep handy (⌘/Ctrl+Enter)",
+      "Add a note or a command",
       "keep", "nothing to keep", false,
       (text) => ({ kind: "spore_seed", text, disposition: "note" }));
   }

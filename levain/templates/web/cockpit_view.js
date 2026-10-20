@@ -133,7 +133,8 @@
       if (held && f.reason === HELD_REASON) continue;
       out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
     }
-    if (head.note) out.push({ tone: "dim", text: head.note });
+    // an optional source never seen says so once, in the panel's empty sentence: its "not configured: ..." note adds nothing over no rows
+    if (head.note && !(/^not configured: /.test(head.note) && !(panel.rows || []).length)) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
     for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", alert: true, text: "! " + a.message });
     return out.length ? out : null;

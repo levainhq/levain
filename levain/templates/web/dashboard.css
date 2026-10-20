@@ -2015,12 +2015,10 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { 
 body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
 
-/* Board work lists: the repo chip sits in the meta line (the mock), the Tray's filter and order bar give way to the rows, and its held-back line closes the list */
+/* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
 body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }
-body.ke [data-ck-panel="tray"] .ep-search { display: none; }
 body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
 body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
-body.ke [data-ck-panel="now"] .ep-search { display: none; }
 /* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
 body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
 .grp-col { display: contents; }
