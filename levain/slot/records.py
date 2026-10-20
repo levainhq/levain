@@ -28,6 +28,7 @@ from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused, write_all
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
+from levain.slot.render import DISCOVERY
 from levain.slot.runtime_grammar import (AUTHS, HOOKS, KINDS, MAX_ROUTES, VENDORS, VerifierStep,
                                          _MODEL_RE, _ROUTE_ID_RE, _handle, _keys, _verifier_steps)
 
@@ -86,13 +87,15 @@ _TS_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", r
 _BOOT_ID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", re.ASCII)
 #: §7.6: the stable account id root takes from the identity call.
 OBSERVED_ID_RE = re.compile(r"[A-Za-z0-9._@:+-]{1,128}", re.ASCII)
-#: DECISION: the contract names END steps ("kill", "manifest_budget") but gives no pattern.
-_STEP_RE = re.compile(r"[a-z0-9_]{1,64}", re.ASCII)
+#: DECISION: the contract names END steps ("kill", "manifest_budget", "slot-not-ours") but gives no pattern.
+_STEP_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.ASCII)
 #: DECISION: a refusal or reason name held in a record (``artifact_failed:"<refusal name>"``, a brake
 #: reason, an identity result): the contract gives none, so a bounded token that is never a path.
 _REASON_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,127}", re.ASCII)
-#: DECISION: ``touched`` holds §5.5 discovery names (file names, never paths); the cap is ours.
-_TOUCHED_NAME_RE = re.compile(r"[^\x00-\x1f\x7f/]{1,255}")
+#: ``touched`` holds §5.5 discovery names ("A name created mid-session = touched at END"), from render's ONE
+#: list, nested names (``.config/git``) included. DECISION: a name, not root-qualified (``CLAUDE.md`` is one
+#: name under three roots); the cap is ours.
+TOUCHED_NAMES = frozenset(n for names in DISCOVERY.values() for n in names)
 MAX_TOUCHED = 256
 _ANY_RE = re.compile(r"[^\x00-\x1f\x7f]{1,512}")
 
@@ -125,13 +128,17 @@ def _obj(value: object, where: str) -> dict:
     return value
 
 
-def _str_list(value: object, where: str, pattern: re.Pattern[str], cap: int, *,
+def _str_list(value: object, where: str, pattern: re.Pattern[str] | frozenset[str], cap: int, *,
               unique: bool = True) -> tuple[str, ...]:
+    """A list of strings, each matching ``pattern`` (or a member of it, when it is a set)."""
     if type(value) is not list:
         raise Refused("wrong-type", f"{where} is an array")
     if len(value) > cap:
         raise Refused("too-many", f"{where}: {len(value)} > {cap}")
-    out = tuple(_match(x, f"{where}[]", pattern) for x in value)
+    if isinstance(pattern, frozenset):
+        out = tuple(_enum(x, f"{where}[]", pattern) for x in value)
+    else:
+        out = tuple(_match(x, f"{where}[]", pattern) for x in value)
     if unique and len(set(out)) != len(out):
         raise Refused("duplicate-value", where)
     return out
@@ -531,7 +538,7 @@ FIELD_CHECKS: Mapping[str, Callable[[object], object]] = {
     "failed_step": lambda v: _match(v, "failed_step", _STEP_RE),
     "held_attempts": lambda v: _uint(v, "held_attempts"),
     "brake_reason": lambda v: _match(v, "brake_reason", _REASON_RE),
-    "touched": lambda v: list(_str_list(v, "touched", _TOUCHED_NAME_RE, MAX_TOUCHED)),
+    "touched": lambda v: list(_str_list(v, "touched", TOUCHED_NAMES, MAX_TOUCHED)),
     "manifest": _manifest,
     "artifact_digest": lambda v: _match(v, "artifact_digest", _DIGEST_RE),
     "artifact_failed": lambda v: _match(v, "artifact_failed", _REASON_RE),
@@ -622,6 +629,57 @@ def parse_state(data: bytes) -> SessionState:
     return check_state(_parse_canonical(data, "state"))
 
 
+# --- §3.5 Pool: root's slot state file ---------------------------------------------------------------------
+
+SLOT_STATE_FORMAT = "levain-slot-state/1"
+SLOT_STATES = ("leased", "scrubbed", "reusable", "retired")
+#: §3.5 ``{class, index, rev, lease_seq, state, session?, dispatch_eligible, changed_at}``. DECISION: with a
+#: ``format`` key, as every other record here carries one though its section's field list omits it.
+SLOT_STATE_KEYS = frozenset({"format", "class", "index", "rev", "lease_seq", "state", "session",
+                             "dispatch_eligible", "changed_at"})
+
+
+@dataclass(frozen=True)
+class SlotState:
+    """``L/slots/{e,v}<n>/state`` (§3.5 Pool), root's slot truth. DECISION: ``session`` is present exactly
+    when ``state`` is ``leased``."""
+
+    slot: SlotId
+    rev: int
+    lease_seq: int
+    state: str
+    dispatch_eligible: bool
+    changed_at: str
+    session: str | None = None
+
+
+def slot_state_bytes(s: SlotState) -> bytes:
+    rec: dict[str, object] = {"format": SLOT_STATE_FORMAT, "class": s.slot.slot_class, "index": s.slot.index,
+                              "rev": s.rev, "lease_seq": s.lease_seq, "state": s.state,
+                              "dispatch_eligible": s.dispatch_eligible, "changed_at": s.changed_at}
+    if s.session is not None:
+        rec["session"] = s.session
+    data = canon.canonical_bytes(rec)
+    parse_slot_state(data)
+    return data
+
+
+def parse_slot_state(data: bytes) -> SlotState:
+    """Strict parse of a ``levain-slot-state/1`` file."""
+    obj = _parse_canonical(data, "slot state")
+    _keys(obj, SLOT_STATE_KEYS, SLOT_STATE_KEYS - {"session"}, "slot state")
+    if obj["format"] != SLOT_STATE_FORMAT:
+        raise Refused("bad-format", "slot state")
+    slot = _slot({"class": obj["class"], "index": obj["index"]}, "slot state")
+    state = _enum(obj["state"], "slot state.state", SLOT_STATES)
+    session = check_session(obj["session"], "slot state.session") if "session" in obj else None
+    if (session is not None) != (state == "leased"):
+        raise Refused("bad-value", "slot state.session is present exactly when leased")
+    return SlotState(slot, _uint(obj["rev"], "slot state.rev"), _uint(obj["lease_seq"], "slot state.lease_seq"),
+                     state, _bool(obj["dispatch_eligible"], "slot state.dispatch_eligible"),
+                     check_timestamp(obj["changed_at"], "slot state.changed_at"), session)
+
+
 # --- the durable write -----------------------------------------------------------------------------------
 
 def write_durably(path: Path, data: bytes, *, mode: int = 0o600,
@@ -630,7 +688,10 @@ def write_durably(path: Path, data: bytes, *, mode: int = 0o600,
     survives a crash once this returns: a fresh temp file in the same directory (``O_EXCL``, never
     following a link), written whole, fsynced, renamed over ``path``, the directory fsynced. The caller
     holds whatever lock makes it the only writer of ``path`` (CONTROL: the session lock; root: the slot
-    lock). A failure raises ``OSError`` with ``path`` untouched and the temp file removed.
+    lock), which is why the temp name is fixed: a dead writer's temp is unlinked by the next write. A failure
+    before the rename raises ``OSError`` with ``path`` untouched and the temp file removed; a failure of the
+    directory fsync after it raises with the new bytes already at ``path``, not yet durable (a retry of the
+    same write converges).
 
     ``fsync`` is the seam a test uses to fail the write at the durability step."""
     path = Path(path)
@@ -686,8 +747,9 @@ __all__ = [
     "BRAKED", "CAS_FIELDS", "CREDENTIAL_PARKED", "DEAD", "EDGES", "END_FROM_STATES", "END_INTO_STATES",
     "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FROZEN", "Front", "HELD", "LIVE_STATES",
     "MINT_CLAIM_KEYS", "OBSERVED_ID_RE", "PURGED", "RENDERED", "RENDERING", "RETAINED", "REVOKED",
-    "REVOKED_SET_STATES", "STATES", "STATE_FORMAT", "SessionState", "TRASH", "alloc_bytes", "alloc_record",
+    "REVOKED_SET_STATES", "SLOT_STATES", "SLOT_STATE_FORMAT", "STATES", "STATE_FORMAT", "SessionState", "SlotState",
+    "TOUCHED_NAMES", "TRASH", "alloc_bytes", "alloc_record",
     "cgroup_path", "check_alloc", "check_exclusive", "check_session", "check_state", "check_timestamp",
     "epoch_of", "has_mint_claims", "parse_alloc", "parse_attach_claims", "parse_claims", "parse_mint_claims",
-    "parse_state", "read_record", "slot_obj", "state_bytes", "state_record", "timestamp", "write_durably",
+    "parse_slot_state", "parse_state", "read_record", "slot_obj", "slot_state_bytes", "state_bytes", "state_record", "timestamp", "write_durably",
 ]

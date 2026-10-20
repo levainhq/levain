@@ -372,11 +372,15 @@ class Control:
 
     def lease_eof(self, lease: Lease) -> threading.Thread | None:
         """The lease connection read EOF. The lease is dead at once (every lease-bound verb answers
-        ``lease-dead`` from here on); the session it bound, if any, is revoked on a thread that retries the
-        session lock until it is taken. Returns that thread (tests join it)."""
+        ``lease-dead`` from here on) and the session's in-memory handles are dropped at once, BEFORE any durable
+        write (L1: a full disk that keeps the revoke retrying must not keep a token resolvable); the session it
+        bound, if any, is then revoked on a thread that retries the session lock until it is taken. Returns that
+        thread (tests join it)."""
         with self._mu:
             lease.live = False
             session = lease.session
+            if session is not None:
+                self._handles.pop(session, None)
         if session is None or self._stopping.is_set():
             return None
         return self._spawn_revoke(session)
@@ -521,7 +525,8 @@ class Control:
         """§7.2 CAS. Static checks first (no lock): states named, the edge in :data:`records.EDGES` (or
         ``from == to``: a field-only CAS), every field CAS-writable and valid. Then, under the try-lock: a
         CAS whose ``to`` is already the record's state, with every field already holding its value, counts
-        as done (§7.4) and answers the current generation; else the generation must be the record's
+        as done (§7.4) and answers the current generation, unless ``to`` is a live state and the lease is gone
+        (``lease-dead``, §3.3, checked in the shortcut too); else the generation must be the record's
         (``stale-generation``), ``from`` its state, and a move into a live state needs the lease live.
         ``null`` as a field value removes the field (DECISION)."""
         session = R.check_session(session)
@@ -549,13 +554,16 @@ class Control:
             rec = self.store.get(session)
             if rec is None:
                 raise Refused("no-session")
+            live_to = to in R.LIVE_STATES and to != R.ALLOCATED
             if frm != to and rec.state == to and all(_current(rec, k) == v for k, v in checked.items()):
+                if live_to and not self._lease_live(session):
+                    raise Refused("lease-dead")
                 return rec.generation                                  # §7.4: already done
             if generation != rec.generation:
                 raise Refused("stale-generation")
             if rec.state != frm:
                 raise Refused("from-mismatch")
-            if to in R.LIVE_STATES and to != R.ALLOCATED and not self._lease_live(session):
+            if live_to and not self._lease_live(session):
                 raise Refused("lease-dead")
             merged = {k: v for k, v in rec.fields.items() if k not in checked}
             merged.update({k: v for k, v in checked.items() if v is not None and k != "touched"})

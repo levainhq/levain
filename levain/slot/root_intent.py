@@ -18,6 +18,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import secrets
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,17 +76,50 @@ def fsync_dir(path: Path) -> None:
         os.close(dfd)
 
 
+def temp_path(path: Path) -> Path:
+    """A temp name beside ``path`` that is unique per writer (``.<name>.<16 hex>.tmp``): two writers of the
+    same path never unlink or rename each other's temp file (L2 M7). A dead writer's temp is swept by
+    :func:`sweep_temps` under the lock that makes its caller the only writer."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+
+
+def is_temp_of(name: str, base: str) -> bool:
+    """Whether ``name`` is a :func:`temp_path` name of a path whose name starts with ``base``."""
+    return name.startswith(f".{base}") and name.endswith(".tmp") and len(name) >= len(base) + 22
+
+
+def sweep_temps(directory: Path, base: str, *,
+                owner_ok: Callable[[os.stat_result], bool] = _root_owned) -> list[str]:
+    """Unlink the regular files in ``directory`` that are :func:`temp_path` names of paths starting with
+    ``base`` and owned as expected (a dead writer's leftovers). The caller holds the lock that makes it the
+    only writer, so no live writer's temp is among them. Returns the names removed."""
+    gone = []
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return gone
+    for name in names:
+        if not is_temp_of(name, base):
+            continue
+        p = Path(directory) / name
+        st = os.lstat(p)
+        if stat.S_ISREG(st.st_mode) and owner_ok(st):
+            os.unlink(p)
+            gone.append(name)
+    if gone:
+        fsync_dir(Path(directory))
+    return gone
+
+
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     """``data`` at ``path`` so a reader sees the old file or the whole new one: a fresh temp file
-    beside it written whole and fsynced, renamed over the path, the directory fsynced. Raises
-    ``OSError`` (ENOSPC included, which the reserve's retry acts on); the temp file never survives
-    a failed write, and the path is untouched by one."""
+    beside it (:func:`temp_path`, unique per writer) written whole and fsynced, renamed over the path,
+    the directory fsynced. Raises ``OSError`` (ENOSPC included, which the reserve's retry acts on). A
+    failure before the rename removes the temp file and leaves the path untouched; a failure of the
+    directory fsync after it leaves the new file in place, not yet durable (a retry rewrites it)."""
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        os.unlink(tmp)          # a temp file a dead run left
-    except FileNotFoundError:
-        pass
+    tmp = temp_path(path)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     try:
         os.fchmod(fd, mode)
@@ -96,7 +130,11 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
         tmp.unlink(missing_ok=True)
         raise
     os.close(fd)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     fsync_dir(path.parent)
 
 
@@ -307,5 +345,5 @@ def reconcile(path: Path, plan_for: Callable[[RootIntent], Plan], *, cas: Cas, f
 __all__ = ["BUILT_INTENTS", "Cas", "INTENT_PHASES", "MAX_INTENT_BYTES", "Phase", "PhaseFailed", "Plan",
            "ROOT_INTENT_FORMAT", "RootIntent", "TARGET_STATE", "TIMESTAMP_RE", "atomic_write", "begin",
            "delete_root_intent", "fsync_dir", "intent_bytes", "intent_path", "parse_root_intent",
-           "pending_sessions", "read_root_intent", "reconcile", "run_from", "unlink_durable",
-           "write_root_intent"]
+           "is_temp_of", "pending_sessions", "read_root_intent", "reconcile", "run_from", "sweep_temps",
+           "temp_path", "unlink_durable", "write_root_intent"]
