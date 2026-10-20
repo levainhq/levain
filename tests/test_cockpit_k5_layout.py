@@ -27,10 +27,10 @@ RELOAD = "window.__old = 1; location.reload(); 1"
 FRESH = "!window.__old && " + READY["until"]
 
 
-def _run(tmp_path: Path, steps: list, width: int = 1440) -> list:
+def _run(tmp_path: Path, steps: list, width: int = 1440, frag: str = BOARD) -> list:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        return _drive(tmp_path, f"{url}/{BOARD}", [{"emulate": {"w": width, "h": 900, "dpr": 1}}, READY, SETTLE] + steps)["values"][2:]
+        return _drive(tmp_path, f"{url}/{frag}", [{"emulate": {"w": width, "h": 900, "dpr": 1}}, READY, SETTLE] + steps)["values"][2:]
 
 
 def _seed(value: str) -> list:
@@ -316,3 +316,73 @@ def test_a_zone_id_is_never_interpolated_into_a_selector(tmp_path: Path) -> None
         SETTLE, {"eval": "window.__errs"},
     ])
     assert out[-1] == [], out[-1]
+
+
+# every enabled, shown move control must move something on screen: clicked one by one from the state the page is in
+EVERY_MOVE = ("(async () => { const seq = () => " + SEQ + "; const res = [];"
+              f" const labels = {SHOWN_MOVES}.map(b => b.getAttribute('aria-label'));"
+              " for (const l of labels) {"
+              f"   const b = {SHOWN_MOVES}.find(x => x.getAttribute('aria-label') === l); if (!b) continue;"
+              "   const before = seq(); b.click(); await new Promise(r => setTimeout(r, 400));"
+              "   res.push([l, before !== seq()]); }"
+              f" return [res, {SHOWN_MOVES}.length]; }})()")
+
+
+@needs_browser
+def test_a_tabbed_card_folds_as_a_whole_by_its_card_key(tmp_path: Path) -> None:
+    """P1: fold is stored by CARD key and every panel of the card is folded, whichever tab shows."""
+    out = _run(tmp_path, [
+        {"eval": f"{PANEL % 'keep'}.dataset.ckCard = 'now'; 1"},                      # keep joins now's card: a two-panel card
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
+        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
+        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
+    ])
+    assert out[3] == [True, True, {"v": 1, "zones": {}, "collapsed": ["now"]}], out[3]
+    assert out[4] == "false", out[4]
+    assert out[7][:2] == [False, False] and out[7][2]["collapsed"] == [], out[7]
+
+
+@needs_browser
+def test_a_stored_panel_id_that_is_not_a_card_key_folds_nothing(tmp_path: Path) -> None:
+    out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {}, collapsed: ['no-such-card']})")
+               + [{"eval": "document.querySelectorAll('.ck-zgrid .panel.ck-collapsed').length"}])
+    assert out[-1] == 0, out[-1]
+
+
+@needs_browser
+def test_a_key_switch_and_an_initial_build_load_leave_no_no_op_move_enabled(tmp_path: Path) -> None:
+    """P2: the controls refresh from applyMode, not only from a click."""
+    key2 = "document.dispatchEvent(new KeyboardEvent('keydown', {key: '%s', bubbles: true})); new Promise(r => setTimeout(r, 400)).then(() => 1)"
+    out = _run(tmp_path, [{"eval": key2 % "1"}, {"eval": EVERY_MOVE}, {"eval": key2 % "3"}, {"eval": EVERY_MOVE}])
+    for r in (out[1], out[3]):
+        assert all(ch for _l, ch in r[0]), r
+    build = _run(tmp_path / "b", [{"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"}, {"eval": EVERY_MOVE}], frag="#write_token=T&build")
+    assert build[1][0] == [] or all(ch for _l, ch in build[1][0]), build
+
+
+@needs_browser
+def test_every_enabled_move_in_every_tab_moves_something(tmp_path: Path) -> None:
+    """P4: the N1 test without its break: every enabled control, tab by tab."""
+    steps: list = []
+    for m in ("morning", "board", "build"):
+        steps += [{"eval": f"({TAB})('{m}')"}, {"eval": EVERY_MOVE}]
+    out = _run(tmp_path, steps)
+    for i in (1, 3, 5):
+        assert all(ch for _l, ch in out[i][0]), out[i]
+    assert out[3][0], out[3]                                                  # the Board has moves to test
+
+
+@needs_browser
+def test_a_store_that_refuses_removal_leaves_an_empty_layout_not_the_old_one(tmp_path: Path) -> None:
+    """P3: Reset with a read-only store: the page draws the default; the stored copy the page cannot remove is not read back."""
+    out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['tray']})") + [
+        {"eval": "Storage.prototype.setItem = () => { throw new Error('quota'); }; Storage.prototype.removeItem = () => { throw new Error('ro'); }; 1"},
+        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": "document.querySelector('[data-layout-reset]').click(); new Promise(r => setTimeout(r, 600)).then(() => 1)"},
+        {"eval": STACKS},
+        {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('[data-layout-reset]').length]"},
+    ])
+    assert out[-2]["left"] == ["tray", "now"], out[-2]
+    assert out[-1] == [False, 0], out[-1]

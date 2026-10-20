@@ -360,6 +360,7 @@ out.n = w.dataset.n;
 def test_a_panel_that_stops_being_dashed_loses_its_open_state_and_action(tmp_path: Path) -> None:
     fn = _cut("  function dashAction(p) {", "  // Tabs of one card:") + "\n" + _cut("  function emptyProvider(p) {", "  function dashAction(p) {")
     out = _node(r"""
+globalThis.layoutControls = () => {};   // dashPass ends by drawing the K5 layout controls; this cut is the dashed-line pass alone
 const cls = new Set(["ck-dash", "ck-dash-open"]); let act = { removed: false, remove() { this.removed = true; } };
 const p = { dataset: { ckPanel: "x", ckExternal: "1" }, classList: { toggle: (c, on) => { on ? cls.add(c) : cls.delete(c); }, remove: (c) => cls.delete(c), add: (c) => cls.add(c) },
   querySelectorAll: () => [{ dataset: { keepKey: "m1" }, textContent: "a real row" }], querySelector: (sel) => (/ck-dash-act/.test(sel) ? act : null) };

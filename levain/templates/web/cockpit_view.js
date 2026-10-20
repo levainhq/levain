@@ -1730,7 +1730,7 @@
     if (html && html.dataset && t) html.dataset.theme = t;
   })();
   // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
-  // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<panel id>",...]}; a card's key is its first panel id.
+  // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
   // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
   const LAYOUT_KEY = "levain_cockpit_layout_v1";
   const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
@@ -1758,7 +1758,12 @@
     memLayout = copyLayout(l);
     try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
   }
-  function resetLayout() { memLayout = null; memStale = false; try { root.localStorage.removeItem(LAYOUT_KEY); } catch (_) { /* nothing was kept */ } }
+  // A store that refuses the removal still holds the old copy: the page then keeps an EMPTY layout in memory (the stored one is never read
+  // back) and drops it only after a removal that worked.
+  function resetLayout() {
+    try { root.localStorage.removeItem(LAYOUT_KEY); memLayout = null; memStale = false; }
+    catch (_) { memLayout = { zones: Object.create(null), collapsed: [] }; memStale = true; }
+  }
   // the stored names first, in their stored order; every key the page has and the store does not name follows in the order it came
   function layoutOrder(zoneId, keys) {
     const stored = readLayout().zones[zoneId] || [];
@@ -1803,6 +1808,8 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
+    // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
+    if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
   // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
   // tab list (page chrome) is on every tab.

@@ -1002,8 +1002,9 @@
     if (!K || !at || hasUnsavedEdit()) return;
     const { p, grid, key } = at, now = !p.classList.contains("ck-collapsed");
     if (now && ckNodesOf(grid, key).some((n) => n.querySelector(CK_EDIT_OPEN))) return;   // never fold a card whose edit row is open
-    K.setLayoutCollapsed(p.dataset.ckPanel, now);
-    layoutControls(grid, p);
+    K.setLayoutCollapsed(key, now);
+    const ctx = ckCtx(grid);
+    for (const n of ckPanels(grid)) layoutControls(grid, n, ctx);
     ckSyncResets();
   }
   function ckButton(cls, glyph, label, onclick) {
@@ -1027,7 +1028,7 @@
     ctx = ctx || ckCtx(grid);
     const key = p.dataset.ckCard, id = p.dataset.ckPanel;
     const name = (head.querySelector("h2") || {}).textContent || id;
-    const folded = ctx.folded.has(id);
+    const folded = ctx.folded.has(key);   // folded by CARD key: every panel of a tabbed card folds together
     p.classList.toggle("ck-collapsed", folded);
     if (!box) {
       box = el("span", "ck-lay");
@@ -1065,6 +1066,8 @@
   document.addEventListener("click", ckScheduleRefresh);
   document.addEventListener("input", ckScheduleRefresh);
   window.addEventListener("hashchange", ckScheduleRefresh);
+  document.addEventListener("ck-layout-refresh", ckScheduleRefresh);   // a tab change (cockpit_view applyMode)
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") ckScheduleRefresh(); });   // Esc closes an editor
   function stackColumns(grid) {
     const kids = Array.from(grid.children);
     const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
@@ -4709,7 +4712,10 @@
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
     try { return render(view, opts); }
-    finally { if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y); }
+    finally {
+      if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y);
+      ckScheduleRefresh();   // what the draw left on screen (the tab, the jobs) decides which moves are live
+    }
   }
 
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
