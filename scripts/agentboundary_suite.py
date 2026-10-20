@@ -21,11 +21,16 @@ This file is OUTSIDE the wheel and levain never depends on agentboundary; it imp
     deny             -> a signed deny
     escalate         -> ``mark_undecided``
 
-then exports the queue with ``levain.consent.agentboundary`` and takes that request's receipt. Emulation of the
+then, when the action executed (a decision of allow: an allow rule or an approved require-approval), files the
+authority ledger's ``post`` row for that exact call as the PostToolUse hook does (R11: execution comes from the ledger
+row, never from permission), and exports the queue with ``levain.consent.agentboundary`` and takes that request's receipt. Emulation of the
 scenario's world, NOT Levain's own values (each is a post-export override, listed in RESULTS.md):
 
     O1 receipt_id      <- setup.seed_receipt_id (when given)
     O2 clocks          <- setup.now into issued_at and execution.completed_at (when given)
+    O5 scratch clock   <- the scratch world's clock (authority log, queue, ledger) is pinned 3 days in the past; the
+                          queue is exported at the REAL clock (a future export clock is refused), so a lapsed hold is
+                          older than the exporter's 24 h SETTLE and the export does not stop at it
     O3 approval time   <- the matched setup.approvals entry's approved_at, into approval.approved_at (an approval block
                           Levain wrote only; the reference records the approval as given, its time included)
     then receipt_hash is recomputed (Levain's own ``receipt_hash``) and ``action.inject`` is applied by the reference
@@ -62,10 +67,13 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import CockpitDB
 from levain.consent import ANSWER_NAMESPACE, ConsentQueue, answer_message, answer_payload, authority_source
 from levain.consent import agentboundary as ab
+from levain.consent.ledger import Ledger
 from levain.consent.queue import UNDECIDED_GRACE
 from levain.consent.receipt_log import head as receipts_head
 
 __all__ = ["LevainImplementation"]
+
+SCRATCH_PAST = timedelta(days=3)
 
 
 class _Key:
@@ -94,9 +102,10 @@ class _Clock:
 class _Log:
     """A real signed authority log in a real cockpit journal; ``source`` is what a queue replays from."""
 
-    def __init__(self, directory: Path, keys: dict[str, _Key]) -> None:
+    def __init__(self, directory: Path, keys: dict[str, _Key], clock) -> None:
         self.path = directory / "cockpit.db"
         self.keys = keys
+        self.clock = clock
         with CockpitDB(directory).read():
             pass
         self.source = authority_source(self.path, anchor=None, cache=ReplayCache())
@@ -107,7 +116,7 @@ class _Log:
         conn = sqlite3.connect(self.path, isolation_level=None)
         try:
             auth.sign_and_append(conn, op, signer_fp=signer.fp, sign=lambda m: signer.sign(m, auth.NAMESPACE),
-                                 clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=None)
+                                 clock=self.clock, cache=ReplayCache(), anchor=None)
         finally:
             conn.close()
 
@@ -193,12 +202,15 @@ class LevainImplementation(Implementation):
         akey = self._approver_key(approver_id) if approver_id else None
         keys = dict(self._keys)
         (home / "auth").mkdir()
-        log = _Log(home / "auth", keys)
+        # O5: the scratch world's clock is pinned SCRATCH_PAST in the past (the authority log, the queue and the
+        # ledger all read it), so a lapsed hold (expired / withdrawn) is older than the exporter's 24 h SETTLE when
+        # the queue is exported at the real clock; a future export clock is refused (R11), so the world goes back
+        clock = _Clock(datetime.now(timezone.utc) - SCRATCH_PAST)
+        log = _Log(home / "auth", keys, clock)
         log.link({"op": "enrol", "fingerprint": keys["laptop"].fp, "public_key": keys["laptop"].public_key,
                   "class": "laptop-presence", "custody": "passphrase"})
         if akey is not None and akey.fp != keys["laptop"].fp:
             log.enrol(akey)
-        clock = _Clock(datetime.now(timezone.utc))
         by_grant = rule == "allow" and not self.fallback_signed_allow
         if by_grant:
             try:
@@ -263,7 +275,14 @@ class LevainImplementation(Implementation):
             decision, note = "deny", "unknown rule: signed deny"
         self.trace[f"{self._n:03d}"] = note
 
-        exported = ab.export(queue.directory, levain_version=self.levain_version)
+        if decision == "allow":
+            # the action EXECUTED (an allow, or an approved require-approval): file the ledger's post row for this exact
+            # call as the PostToolUse hook does (ledger.hook_record, phase post); R11 takes execution from it
+            Ledger(queue.directory).record_call(agent=agent, agent_session_id="suite", tool_name=tool,
+                                                tool_input=arguments, cwd=cwd, phase="post", received_at=clock.now)
+            note += " + post row"
+            self.trace[f"{self._n:03d}"] = note
+        exported = ab.export(queue.directory)
         assert len(exported.receipts) == 1, f"expected one terminal receipt, got {len(exported.receipts)}"
         receipt = copy.deepcopy(exported.receipts[0])
 
@@ -371,7 +390,7 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace) 
     ne = sum(_kind(r) == "N/E" for r in strict)
     out = [f"# Levain through the AgentBoundary conformance suite ({n} scenarios)", "",
            f"Generated by `scripts/agentboundary_suite.py` on {_now()}; agentboundary {agentboundary.__version__}.", "",
-           f"- **STRICT: {cnt(strict)} / {n} pass** ({ne} of the failures are NOT EXPRESSIBLE: a consent-mcp grant "
+           f"- **STRICT: {cnt(strict)} / {n} pass** (27 / 54 before R11) ({ne} of the failures are NOT EXPRESSIBLE: a consent-mcp grant "
            f"cannot declare what the scenario's arguments are, reported with Levain's own refusal, not forced). An `allow` is "
            f"answered by a consent-mcp standing grant on the MCP tool the capability names. Levain keeps its own actor, "
            f"agent, capability, target, policy name/version and approver id; only receipt_id, clocks and the approval "
@@ -398,6 +417,14 @@ def _write_results(path: Path, strict, fallback, bound, strict_trace, fb_trace) 
            "scenario asks. Without it the injected path would be in no provenance map and the score would mismatch "
            "(a shim artefact, since the reference emits no provenance). BOUND also marks every scenario-supplied "
            "optional path `synthesized` and recomputes the score.",
+           "- O5 the scratch world's clock (authority log, queue, ledger) is pinned 3 days in the past and the queue is "
+           "exported at the real clock (a future export clock is refused, R11). Without it a lapsed hold (expired, "
+           "withdrawn) is younger than the exporter's 24 h SETTLE and the export stops there. The ledger `post` row "
+           "(below) is stamped by that clock.",
+           "- R11 evidence: when the action executed (allow, or an approved require-approval) the shim files the "
+           "ledger's `post` row for that exact call (same agent, session, tool, input digest) as the PostToolUse hook "
+           "does (`Ledger.record_call(phase=\"post\")`); the exporter takes `execution.status = success` from it. "
+           "Failure scenarios are not driven (no scenario has an executed action that failed).",
            "- After O1-O3 `receipt_hash` is recomputed (Levain's `receipt_hash`), then `action.inject` is applied by "
            "the reference runtime's own `_apply_inject` (imported, private).",
            "- Emulated as `ReferenceImplementation` does: first matching policy by capability, else implicit deny; in "
@@ -488,7 +515,7 @@ DIAGNOSES: dict[str, str] = {
     '42-refusal-approval-missing': 'EXPORTER MAPPING / queue-state choice. Per the brief a missing approval makes the hold lapse, which Levain records as `expired` (refusal `expired` / `approval-window-elapsed`); the scenario wants verdict `require-approval` / `approval-missing`. A request the hook marks `undecided` would carry verdict `require-approval` (reason `undecided`, still not `approval-missing`); not run here. Plus naming (policy downgrade).',
     '43-refusal-approval-expired': 'REAL SEMANTIC MISMATCH. verdict `expired` and reason `approval-window-elapsed` match. Levain never records the stale approval: an approval too old is never answered, so there is no approval block to carry as evidence. Plus naming (policy downgrade).',
     '44-refusal-unauthorized-approver': "REAL SEMANTIC MISMATCH. The shim really attempted the unenrolled key's signed answer and Levain really refused it (AnswerRefused); a refused answer writes no receipt, so the request lapses as `expired` with no approval evidence. The scenario wants `deny` / `approver-not-authorized` with the approval recorded. A candidate Levain feature (a receipt for a refused answer), a scope call for Phill. Plus naming (policy downgrade).", '47-refusal-contradicts-policy': 'NOT EXPRESSIBLE in STRICT (needs `policy.decision = allow`). Even in FALLBACK the fault cannot be planted: with policy.decision `require-approval`, every refusal verdict is consistent (`_REFUSAL_CONSISTENT_DECISIONS`), so LEVEL_2_REFUSAL_DECISION_MISMATCH cannot fire. Root cause is the same as the N/E set: no no-human allow.',
-    '01-merge-allow': "NAMING (answered by a consent-mcp grant on `mcp__<server>__<tool>`). `policy.decision = allow` holds; only `policy.name` (`levain.consent.T2` vs the scenario's) differs. FALLBACK/BOUND answer by a signed allow, whose decision is `require-approval`, so they fail on that instead (informational).", '20-numeric-arguments-validate': "NOT EXPRESSIBLE: a float argument has no consent-mcp field kind (str, int, bool, strs, path, paths).", '34-empty-arguments-validate': "NOT EXPRESSIBLE: a consent-mcp grant must declare 1 to 32 fields, so a no-argument MCP tool cannot be granted.", '39-nested-arguments-canonical': "NOT EXPRESSIBLE: an object argument has no consent-mcp field kind.", '28-honest-completeness-passes': "NAMING in STRICT (LEVEL_4_POLICY_DOWNGRADE only; the grant-allow receipt has no approval block, so the completeness score now matches). FALLBACK ARTIFACT otherwise: its signed allow adds an approval block the injected provenance map does not list.", '49-envelope-payload-tampered': "SUITE ASSUMPTION. The runner's `replace_in_payload` finds `pull/14` (the scenario's `target.resource_id`) in the emitted receipt and raises if it is absent. Levain's `resource_id` is the request's cwd, so STRICT/FALLBACK crash in the suite's grading (`GradingError`). BOUND restores the target and passes. The suite assumes an implementation echoes `action.target`.", '19-actor-human-validates': "FALLBACK: naming (policy downgrade) and `actor.type` `agent` where the scenario's action is a human actor. Levain's hook actors are always agents (a semantic gap, by design).", '36-dev-environment-validates': "FALLBACK: `actor.type` agent vs the scenario's human actor (naming).", '35-staging-environment-validates': "FALLBACK: `target.environment` is Levain's fixed `dev` (synthesized), the scenario's is `staging` (naming)."}
+    '46-refusal-claims-execution': "EXPORTER CHANGE (R11, was PASS at R10). A human deny now exports with NO approval block (a denial is not an approval); the scenario injects execution.status = success, and a v0.2-alpha receipt claiming success must carry an approval, so the schema rejects it before LEVEL_2_REFUSAL_EXECUTED can fire. Not a shim artefact.", '01-merge-allow': "NAMING (answered by a consent-mcp grant on `mcp__<server>__<tool>`). `policy.decision = allow` holds; only `policy.name` (`levain.consent.T2` vs the scenario's) differs. FALLBACK/BOUND answer by a signed allow, whose decision is `require-approval`, so they fail on that instead (informational).", '20-numeric-arguments-validate': "NOT EXPRESSIBLE: a float argument has no consent-mcp field kind (str, int, bool, strs, path, paths).", '34-empty-arguments-validate': "NOT EXPRESSIBLE: a consent-mcp grant must declare 1 to 32 fields, so a no-argument MCP tool cannot be granted.", '39-nested-arguments-canonical': "NOT EXPRESSIBLE: an object argument has no consent-mcp field kind.", '28-honest-completeness-passes': "NAMING in STRICT (LEVEL_4_POLICY_DOWNGRADE only; the grant-allow receipt has no approval block, so the completeness score now matches). FALLBACK ARTIFACT otherwise: its signed allow adds an approval block the injected provenance map does not list.", '49-envelope-payload-tampered': "SUITE ASSUMPTION. The runner's `replace_in_payload` finds `pull/14` (the scenario's `target.resource_id`) in the emitted receipt and raises if it is absent. Levain's `resource_id` is the request's cwd, so STRICT/FALLBACK crash in the suite's grading (`GradingError`). BOUND restores the target and passes. The suite assumes an implementation echoes `action.target`.", '19-actor-human-validates': "FALLBACK: naming (policy downgrade) and `actor.type` `agent` where the scenario's action is a human actor. Levain's hook actors are always agents (a semantic gap, by design).", '36-dev-environment-validates': "FALLBACK: `actor.type` agent vs the scenario's human actor (naming).", '35-staging-environment-validates': "FALLBACK: `target.environment` is Levain's fixed `dev` (synthesized), the scenario's is `staging` (naming)."}
 
 
 def main(argv: list[str] | None = None) -> int:
