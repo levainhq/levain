@@ -396,6 +396,9 @@ def test_sudoers_text(host):
         assert verb not in disp
     for verb in ("prepare", "render", "start", "resume", "teardown", "status"):
         assert f"{h}/runtime-helper {verb}" in disp
+    # F15: one spec per verb, each `<verb> *` (which matches the bare verb too); no separate bare `status`
+    specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
+    assert specs == [f"{h}/runtime-helper {v} *" for v in ("prepare", "render", "start", "resume", "teardown", "status")]
     it = install_sudoers_text(host, OP)
     assert "NOPASSWD" not in it
     for bad in ("ALL", "a b", "x,ALL", "#0", "root", "Defaults", "defaults", "DEFAULTS", "User_Alias",
@@ -415,7 +418,8 @@ def test_sudoers_text(host):
 @pytest.mark.parametrize("host", HOSTS)
 def test_install_rule_tagged_passwd(host):
     """§23 / §5.2: the install rule carries the PASSWD tag and its Defaults pin authenticate +
-    timestamp_timeout=0, so a later NOPASSWD drop-in or `!authenticate` cannot make it passwordless."""
+    timestamp_timeout=0. A LATER root-written NOPASSWD rule for the path would still win (sudo applies
+    the last match), so the text claims only what it holds."""
     h = "/usr/local/libexec/levain" if host == "darwin" else "/usr/libexec/levain"
     lines = install_sudoers_text(host, OP).splitlines()
     rules = [ln for ln in lines if not ln.startswith("#")]

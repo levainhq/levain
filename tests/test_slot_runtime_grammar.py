@@ -114,8 +114,9 @@ def test_slot_pattern_and_bound(tok, name):
 
 def test_slot_bound_is_per_class_and_follows_an_index_set():
     assert argv(["prepare", "egress", "interactive", "claude", "brokered", "7"]).slot == 7
-    assert refused_argv(["prepare", "none", "interactive", "claude", "none", "2"]) == "slot-not-configured"
-    assert argv(["prepare", "none", "interactive", "claude", "none", "1"]).slot == 1
+    assert refused_argv(["prepare", "none", "verifier", "claude", "none", "2"], caller=DISPATCH) == \
+        "slot-not-configured"
+    assert argv(["prepare", "none", "verifier", "claude", "none", "1"], caller=DISPATCH).slot == 1
     # a replenished slot takes a new index (§1.1): the configured set is not a prefix
     conf = {"egress": frozenset({0, 1, 9}), "none": 0}
     assert argv(["prepare", "egress", "interactive", "claude", "brokered", "9"], conf=conf).slot == 9
@@ -156,7 +157,12 @@ def test_class_kind_auth_rows():
     assert refused_argv(["prepare", "egress", "verifier", "claude", "none"], caller=DISPATCH) == \
         "class-kind-mismatch"
     for auth in ("brokered", "passthrough"):
-        assert refused_argv(["prepare", "none", "interactive", "claude", auth]) == "class-auth-mismatch"
+        assert refused_argv(["prepare", "none", "verifier", "claude", auth], caller=DISPATCH) == "class-auth-mismatch"
+    # F11, the other direction: none class is verifier ONLY, so no other kind is handed a verifier pair
+    assert refused_argv(["prepare", "none", "interactive", "codex", "none"]) == "class-kind-mismatch"
+    for kind in ("dispatch", "planner"):
+        assert refused_argv(["prepare", "none", kind, "codex", "none"], caller=DISPATCH) == "class-kind-mismatch"
+    assert refused_argv(["prepare", "none", "login", "claude", "none"]) == "class-kind-mismatch"
     assert argv(["prepare", "none", "verifier", "codex", "none"], caller=DISPATCH).kind == "verifier"
     assert argv(["prepare", "egress", "interactive", "claude", "none"]).auth == "none"
 

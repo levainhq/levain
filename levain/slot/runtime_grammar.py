@@ -216,9 +216,10 @@ def _parse_prepare(rest: Sequence[str], caller: str, configured_slots: SlotConfi
     auth = _enum(rest[3], "auth", AUTHS)
     if kind not in KINDS_FOR_CALLER[caller]:
         raise Refused("kind-not-allowed-for-caller", f"{caller} may not prepare kind {kind}")
-    # §5.6: kind verifier is a none-class session.
-    if kind == "verifier" and slot_class != "none":
-        raise Refused("class-kind-mismatch", "kind verifier is none class")
+    # §5.6: kind verifier is a none-class session, and ONLY it is: every other kind runs in an egress slot.
+    # Both directions, so no non-verifier session is handed a verifier pair.
+    if (kind == "verifier") != (slot_class == "none"):
+        raise Refused("class-kind-mismatch", f"kind {kind} is not {slot_class} class")
     # §5.3 routes "none class: empty" and §5.1 render (5b) "a none-class render has no front": a none-class
     # session holds no brokered and no passthrough route, so its auth is none.
     if slot_class == "none" and auth != "none":
@@ -433,9 +434,11 @@ def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None
         raise Refused("unknown-verb", repr(verb)[:64])
     if not isinstance(raw_bytes, (bytes, bytearray, memoryview)):
         raise Refused("wrong-type", "stdin is bytes")
-    if len(raw_bytes) > STDIN_MAX:                 # §5 preamble: the cap, before any decode or parse
-        raise Refused("stdin-too-large", f"{len(raw_bytes)} > {STDIN_MAX}")
+    # The cap counts BYTES, so it is taken after the conversion: a memoryview's len() counts its items,
+    # which for a wider format is fewer than its bytes. §5 preamble: still before any decode or parse.
     raw = bytes(raw_bytes)
+    if len(raw) > STDIN_MAX:
+        raise Refused("stdin-too-large", f"{len(raw)} > {STDIN_MAX}")
     if verb not in STDIN_VERBS:
         if raw:
             raise Refused("unexpected-stdin", verb)

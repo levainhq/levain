@@ -98,40 +98,95 @@ def anchor_text(slots: Iterable[SlotId], ids: Mapping[str, int]) -> str:
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
-def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
-    """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
-    file. No file = nothing to release. A token pf no longer knows (a reboot dropped every reference)
-    is not an error: the reference is gone either way."""
+#: What pfctl prints when the reference a token names is already gone. "pf not enabled" is pfctl's text
+#: for pf holding no reference at all, the state a reboot leaves when nothing else enabled pf; that -X
+#: prints it there is reasoned, not run. A token pf forgot while something else keeps pf enabled prints
+#: some other text and so is KEPT: a release that may not have happened is never recorded as done.
+PF_TOKEN_GONE = ("pf not enabled",)
+
+
+def _token_gone(r: "subprocess.CompletedProcess[str]") -> bool:
+    text = f"{r.stderr or ''}\n{r.stdout or ''}".lower()
+    return any(t in text for t in PF_TOKEN_GONE)
+
+
+def _read_token(token_path: Path) -> tuple[str | None, str]:
+    """(the stored token, or None; a note). A file that holds no token names nothing pf could release,
+    so it is removed rather than left to wedge every later undo."""
     try:
         token = token_path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
-        return True, ""
-    if not re.fullmatch(r"[0-9]{1,20}", token):
-        return False, f"{token_path} does not hold a pf token"
-    r = run([PFCTL, "-X", token], capture_output=True, text=True)
+        return None, ""
+    except UnicodeDecodeError:
+        token = ""
+    if re.fullmatch(r"[0-9]{1,20}", token):
+        return token, ""
     token_path.unlink(missing_ok=True)
-    return True, "" if r.returncode == 0 else f"pf no longer held token {token} ({(r.stderr or '').strip()})"
+    return None, f"{token_path} held no pf token; removed it (nothing to release)"
+
+
+def _release(token: str, run: Run) -> tuple[bool, str]:
+    r = run([PFCTL, "-X", token], capture_output=True, text=True)
+    if r.returncode == 0:
+        return True, ""
+    if _token_gone(r):
+        return True, f"pf no longer held token {token} ({(r.stderr or '').strip()})"
+    return False, f"pfctl -X {token} failed, token kept: {(r.stderr or r.stdout or '').strip()}"
+
+
+def _write_token(token_path: Path, token: str) -> None:
+    """Root 0600, replaced in one rename after the bytes are on disk, so a crash leaves the old token
+    or the new one, never a torn file."""
+    tmp = token_path.with_name(f".{token_path.name}.tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, f"{token}\n".encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, token_path)
+    dfd = os.open(token_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def release_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
+    """Release the reference whose token :func:`take_enable_reference` stored, then remove the token
+    file. No file, or a file holding no token, = nothing to release. The file goes only once pf
+    confirms the reference is gone (released now, or already dropped); any other failure keeps it."""
+    token, note = _read_token(token_path)
+    if token is None:
+        return True, note
+    ok, why = _release(token, run)
+    if ok:
+        token_path.unlink(missing_ok=True)
+    return ok, why
 
 
 def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run) -> tuple[bool, str]:
-    """``pfctl -E`` and store its token, readable by root alone (§23). A token an earlier run stored is released first, so
-    a re-run holds one reference, not two."""
-    ok, why = release_enable_reference(token_path, run)
-    if not ok:
-        return ok, why
+    """``pfctl -E`` and store its token, readable by root alone (§23). The new reference is taken BEFORE
+    an earlier run's is released, so pf never sits with no Levain reference between the two. If the old
+    one cannot be released, the new one is given back and the old token stays recorded: a re-run holds
+    one reference, never two, and never one with no record."""
+    old, note = _read_token(token_path)
     r = run([PFCTL, "-E"], capture_output=True, text=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "pfctl -E failed").strip()
     m = _TOKEN_RE.search(f"{r.stdout}\n{r.stderr}")
     if m is None:
         return False, "pfctl -E printed no token"
-    fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, f"{m.group(1)}\n".encode("ascii"))
-    finally:
-        os.close(fd)
-    return True, ""
+    new = m.group(1)
+    if old is not None:
+        ok, why = _release(old, run)
+        if not ok:
+            back, back_why = _release(new, run)
+            return False, why + ("" if back else f"; and the new reference {new} could not be given back: {back_why}")
+    _write_token(token_path, new)
+    return True, note
 
 
 # --- steps ---------------------------------------------------------------------------------------------------
@@ -200,6 +255,6 @@ def unload_steps() -> list[Step]:
     ]
 
 
-__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_TOKEN", "alias_absent", "alias_present",
+__all__ = ["ANCHOR", "ANCHOR_FILE", "GWPORT_BASE", "IFCONFIG", "PFCTL", "PF_TOKEN", "PF_TOKEN_GONE", "alias_absent", "alias_present",
            "alias_steps", "alias_undo_steps", "anchor_rules", "anchor_text", "gwport", "load_steps",
            "release_enable_reference", "take_enable_reference", "unload_steps"]

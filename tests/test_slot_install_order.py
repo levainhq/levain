@@ -227,7 +227,10 @@ def test_undo_leaves_no_shared_gid_on_store(host):
     root_grp = "wheel" if host == "darwin" else "root"
     chgrp = {Path(s.argv[-1]): i for i, s in enumerate(undo.steps) if s.argv and s.argv[0].endswith("chgrp")}
     assert set(chgrp) == named
-    assert all(undo.steps[i].argv[1] == root_grp for i in chgrp.values())
+    # the whole subtree, never following a link (F4): BSD and GNU chgrp both take -R -h -P
+    assert all(undo.steps[i].argv[1:5] == ("-R", "-h", "-P", root_grp) for i in chgrp.values())
+    last_kill = max(i for i, s in enumerate(undo.steps) if "stop every process" in s.why)
+    assert last_kill < min(chgrp.values())
     assert all(undo.steps[i].skip_if[-3:] == ("!", "-e", str(p)) for p, i in chgrp.items())
     first_delete = next(i for i, s in enumerate(undo.steps) if "delete the shared group" in s.why)
     assert max(chgrp.values()) < first_delete
@@ -313,7 +316,7 @@ def test_root_tree_checks_fail_closed():
     assert root_tree._no_links(Path("/t"), **_fake_tree(fifo))[0] is False
     for bad in (_st(stat.S_IFREG, uid=501), _st(stat.S_IFREG, 0o664), _st(stat.S_IFREG, 0o646)):
         assert root_tree._no_foreign_entries(Path("/t"), **_fake_tree({**plain, "/t/levain/b.py": bad}))[0] is False
-    # ancestors: every existing one root's alone; a link is judged by its target
+    # ancestors: every existing one root's alone; a link is judged by where it resolves (F12)
     anc = {"/usr": _st(stat.S_IFDIR, 0o755), "/usr/local": _st(stat.S_IFDIR, 0o755),
            "/usr/local/lib": _st(stat.S_IFDIR, 0o755), "/": _st(stat.S_IFDIR, 0o755)}
 
@@ -324,15 +327,42 @@ def test_root_tree_checks_fail_closed():
             return table[p]
         return lstat
 
+    same = lambda p: p
     target = Path("/usr/local/lib/levain-root")
-    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(anc), stat_=lstat_of(anc)) == (True, "")
+    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(anc), realpath=same) == (True, "")
     brew = {**anc, "/usr/local/lib": _st(stat.S_IFDIR, 0o755, uid=501)}
-    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(brew), stat_=lstat_of(brew))[0] is False
+    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(brew), realpath=same)[0] is False
     wide = {**anc, "/usr/local": _st(stat.S_IFDIR, 0o775)}
-    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(wide), stat_=lstat_of(wide))[0] is False
-    linked = {**anc, "/usr/local": _st(stat.S_IFLNK, 0o755)}
-    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(linked),
-                                           stat_=lambda p: _st(stat.S_IFDIR, 0o755, uid=501))[0] is False
+    assert root_tree._root_owned_ancestors(target, lstat=lstat_of(wide), realpath=same)[0] is False
+
+
+def test_root_tree_ancestry_follows_links_to_their_real_parents():
+    """F12: a root-owned link above the tree, pointing into a dir an operator owns, is judged by the
+    resolved path's ancestry, and a destination that is itself a link is refused."""
+    D, L = stat.S_IFDIR, stat.S_IFLNK
+    table = {"/": _st(D, 0o755), "/usr": _st(D, 0o755), "/usr/local": _st(D, 0o755),
+             "/usr/local/lib": _st(L, 0o755),                         # root's link ...
+             "/Users": _st(D, 0o755), "/Users/alice": _st(D, 0o755, uid=501),
+             "/Users/alice/lib": _st(D, 0o755)}                     # ... to a root dir under alice's
+
+    def lstat(p):
+        if p not in table:
+            raise FileNotFoundError(2, "absent", p)
+        return table[p]
+
+    def realpath(p):
+        return p.replace("/usr/local/lib", "/Users/alice/lib", 1)
+
+    target = Path("/usr/local/lib/levain-root")
+    ok, why = root_tree._root_owned_ancestors(target, lstat=lstat, realpath=realpath)
+    assert ok is False and "/Users/alice" in why
+    # the same link into a tree root owns all the way up passes
+    table["/Users/alice"] = _st(D, 0o755)
+    assert root_tree._root_owned_ancestors(target, lstat=lstat, realpath=realpath) == (True, "")
+    # the destination itself a link: refused, wherever it points
+    table["/usr/local/lib/levain-root"] = _st(L, 0o777)
+    ok, why = root_tree._root_owned_ancestors(target, lstat=lstat, realpath=realpath)
+    assert ok is False and "symlink" in why
 
 
 @pytest.mark.parametrize("host", HOSTS)

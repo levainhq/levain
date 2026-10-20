@@ -7,9 +7,9 @@ be root's, reaches ``sys.path``) with the import tree as the ONE path added to t
 standard library. One text (:func:`entry_text`) serves both helpers and the service units (§23).
 
 The helper entries hand off to ``levain.slot.install_helper`` / ``levain.slot.runtime_helper`` run as
-``__main__``; the service entry to :mod:`levain.slot.service_boot`. Neither helper module has a
-``__main__`` entry yet and the runtime helper module does not exist yet: :data:`PENDING` says so in
-the plan output.
+``__main__``; the service entry to :mod:`levain.slot.service_boot`. The install helper's ``__main__``
+refuses with a non-zero exit until its apply layer exists, and the runtime helper module does not
+exist yet: :data:`PENDING` says so in the plan output.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ ENTRY_MODULES = {"install-helper": "levain.slot.install_helper", "runtime-helper
                  "service-entry": "levain.slot.service_boot"}
 HELPER_MODULES = {k: v for k, v in ENTRY_MODULES.items() if k != "service-entry"}
 
-PENDING = ("levain.slot.install_helper has no __main__ entry yet",
+PENDING = ("levain.slot.install_helper's __main__ refuses (exit 2): its apply layer is not built yet",
            "levain.slot.runtime_helper does not exist yet")
 
 
@@ -96,18 +96,36 @@ def _no_foreign_entries(tree: Path, *, lstat: Callable[[str], os.stat_result] = 
 
 
 def _root_owned_ancestors(path: Path, *, lstat: Callable[[str], os.stat_result] = os.lstat,
-                          stat_: Callable[[str], os.stat_result] = os.stat) -> tuple[bool, str]:
-    """Every existing ancestor of ``path`` is root's and writable by root alone: otherwise its owner
-    could swap the tree root imports from (an Intel Homebrew install, for one, owns /usr/local/lib)."""
-    for anc in path.parents:
+                          realpath: Callable[[str], str] = os.path.realpath) -> tuple[bool, str]:
+    """The directory root's code goes in can be changed by root alone: otherwise its owner could swap
+    the tree root imports from (an Intel Homebrew install, for one, owns /usr/local/lib).
+
+    The deepest part of ``path`` that exists is resolved through every link, and it and every one of
+    the RESOLVED path's ancestors must be root's and writable by root alone, so a link anywhere above
+    is judged by where it really leads. ``path`` itself must not be a link: setup would follow it and
+    install root's code wherever it points."""
+    try:
+        if stat.S_ISLNK(lstat(str(path)).st_mode):
+            return False, f"{path} is a symlink; refusing to install root's code through it"
+    except FileNotFoundError:
+        pass
+    deepest = path
+    while True:
         try:
-            st = lstat(str(anc))
+            lstat(str(deepest))
+            break
         except FileNotFoundError:
-            continue
+            if deepest.parent == deepest:
+                return False, f"no part of {path} exists"
+            deepest = deepest.parent
+    real = Path(realpath(str(deepest)))
+    for d in (real, *real.parents):
+        st = lstat(str(d))
         if stat.S_ISLNK(st.st_mode):
-            st = stat_(str(anc))
+            return False, f"{d} became a symlink while it was checked; refusing"
         if st.st_uid != 0 or st.st_mode & 0o022:
-            return False, f"{anc} is not root's alone; refusing to install root's code below it"
+            shown = d if real == deepest else f"{d} (where {deepest} leads)"
+            return False, f"{shown} is not root's alone; refusing to install root's code below it"
     return True, ""
 
 
@@ -134,7 +152,7 @@ def tree_steps(host: HostOS, source: Path) -> list[Step]:
     steps: list[Step] = []
     for d in (tree, helpers, vendor):
         steps += [
-            Step(f"check every directory above {d} is root's alone", call=lambda p=d: _root_owned_ancestors(p)),
+            Step(f"check every directory above {d} is root's alone (links resolved), and {d} is no link", call=lambda p=d: _root_owned_ancestors(p)),
             Step(f"create {d}", (t["mkdir"], "-p", "-m", "755", str(d))),
             Step(f"own {d} as root", (t["chown"], owner, str(d))),
             Step(f"set {d} to 0755", (t["chmod"], "0755", str(d))),

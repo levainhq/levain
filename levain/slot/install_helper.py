@@ -145,11 +145,25 @@ def plan_tools(steps: Sequence[Step]) -> tuple[str, ...]:
     return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}))
 
 
+def extra_tools(host: HostOS) -> tuple[str, ...]:
+    """The host programs a plan runs that no step's argv names first: the system bwrap (Linux) is only
+    the copy's SOURCE argument, and pkill, pgrep and dseditgroup run inside step callbacks. A fixed
+    list per host, checked with every plan's own tools, so a missing one refuses before step 1 instead
+    of failing part-way. (``/usr/bin/python3`` is covered by the ``xcode-select`` check.)"""
+    if host == "darwin":
+        return ("/usr/sbin/dseditgroup", "/usr/bin/pkill", "/usr/bin/pgrep")
+    if host == "linux":
+        return (bwrap.system_bwrap(), _abs("pkill"), _abs("pgrep"))
+    raise Refused("unsupported-host", repr(host))
+
+
 def check_tools(facts: HostFacts, steps: Sequence[Step], *, python: bool = False) -> None:
-    """CONTRACT §23: every tool a step names is an absolute path that is present, refused by name
-    before step 1 (a bare name is a tool the plan could not resolve on this host). ``python``: the
-    plan installs root-run Python, so on macOS ``xcode-select -p`` must succeed too."""
-    missing = [t for t in plan_tools(steps) if not t.startswith("/") or not facts.tool_present(t)]
+    """CONTRACT §23: every tool a step names, and every one of :func:`extra_tools`, is an absolute path
+    that is present, refused by name before step 1 (a bare name is a tool the plan could not resolve on
+    this host). ``python``: the plan installs root-run Python, so on macOS ``xcode-select -p`` must
+    succeed too."""
+    wanted = sorted(set(plan_tools(steps)) | set(extra_tools(facts.host)))
+    missing = [t for t in wanted if not t.startswith("/") or not facts.tool_present(t)]
     if missing:
         raise Refused("tool-missing", ", ".join(missing))
     if python and facts.host == "darwin" and not facts.xcode_ready():
@@ -409,6 +423,18 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
     return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(rows), (), facts.retired)
 
 
-__all__ = ["HostFacts", "InstallPlan", "OPERATOR_FORMAT", "check_account_ids", "check_tools", "operator_record",
+#: The entry's exit while the apply layer is unbuilt: a caller that trusts the exit code must never read
+#: an install that did nothing as one that worked.
+EXIT_NOT_BUILT = 2
+
+__all__ = ["EXIT_NOT_BUILT", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "check_account_ids", "check_tools",
+           "extra_tools", "operator_record",
            "operator_record_text", "parse_operator_record", "plan_replenish", "plan_setup", "plan_tools",
            "plan_undo", "preflight"]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.stderr.write("levain install helper: apply layer not built (S1 session 2)\n")
+    raise SystemExit(EXIT_NOT_BUILT)

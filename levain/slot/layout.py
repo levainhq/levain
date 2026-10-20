@@ -301,9 +301,13 @@ def shared_group_rows(host: HostOS, operator: str) -> list[Row]:
 
 def ungroup_steps(host: HostOS, operator: str) -> list[Step]:
     """Before the shared groups are deleted: each dir that names one goes to the host's gid-0 group,
-    so no deleted gid stays on a dir for a later group to inherit. A dir already gone is skipped."""
+    with everything below it, so no deleted gid stays on a dir or a file for a later group to inherit.
+    The walk never follows a link (``-P``) and a link's own group is the one changed (``-h``), so it never
+    leaves the tree. Run after every slot process is stopped, so nothing new lands mid-walk. A dir
+    already gone is skipped."""
     chgrp = "/usr/bin/chgrp" if host == "darwin" else _abs("chgrp")
     test = _tools(host)["test"]
-    return [Step(f"give {r.path} back to {ROOT_GROUP[host]} (its group {r.group} is about to be deleted)",
-                 (chgrp, ROOT_GROUP[host], str(r.path)), skip_if=(test, "!", "-e", str(r.path)))
+    return [Step(f"give {r.path} and everything below it back to {ROOT_GROUP[host]} "
+                 f"(its group {r.group} is about to be deleted)",
+                 (chgrp, "-R", "-h", "-P", ROOT_GROUP[host], str(r.path)), skip_if=(test, "!", "-e", str(r.path)))
             for r in shared_group_rows(host, operator)]

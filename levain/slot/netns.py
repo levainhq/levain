@@ -18,16 +18,24 @@ def _ip() -> str:
     return _abs("ip")
 
 
+def _netns_listed(name: str, *, want: bool) -> tuple[str, ...]:
+    # ``ip netns list`` is read on its own first: a pipe would report only grep's status, so a failing
+    # ``ip`` would read as "not listed". Its failure exits 2, which is neither answer, so the step it
+    # guards is not skipped and runs, failing loudly rather than hiding a namespace.
+    neg = "" if want else "! "
+    script = (f'out=$({_ip()} netns list) || exit 2; '
+              f'{neg}printf "%s\\n" "$out" | {_abs("cut")} -d" " -f1 | {_abs("grep")} -qxF -- "$1"')
+    return ("/bin/sh", "-c", script, "sh", name)
+
+
 def netns_present(name: str) -> tuple[str, ...]:
     """A ``skip_if`` that exits 0 when ``ip netns list`` names ``name`` (its lines read ``<name>`` or
     ``<name> (id: <k>)``)."""
-    return ("/bin/sh", "-c", f'{_ip()} netns list | {_abs("cut")} -d" " -f1 | {_abs("grep")} -qxF -- "$1"',
-            "sh", name)
+    return _netns_listed(name, want=True)
 
 
 def netns_absent(name: str) -> tuple[str, ...]:
-    return ("/bin/sh", "-c", f'! {{ {_ip()} netns list | {_abs("cut")} -d" " -f1 | {_abs("grep")} -qxF -- "$1"; }}',
-            "sh", name)
+    return _netns_listed(name, want=False)
 
 
 def netns_steps(slots: Iterable[SlotId]) -> list[Step]:

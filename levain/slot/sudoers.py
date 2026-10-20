@@ -25,7 +25,8 @@ DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "status")
 def runtime_sudoers_text(host: HostOS, operator: str) -> str:
     op = check_operator_name(operator)
     h = str(runtime_helper_path(host))
-    dispatch_cmds = ", ".join(f"{h} {v} *" for v in DISPATCH_VERBS) + f", {h} status"
+    # `<verb> *` also matches the verb with no argument at all (`status` alone), so no bare spec is needed.
+    dispatch_cmds = ", ".join(f"{h} {v} *" for v in DISPATCH_VERBS)
     return (
         "# Written by the Levain install helper (CONTRACT §5.1); removed by its undo verb.\n"
         f"Defaults!{h} use_pty\n"
@@ -39,8 +40,8 @@ def install_sudoers_text(host: HostOS, operator: str) -> str:
     h = str(install_helper_path(host))
     return (
         "# Written by the Levain install helper (CONTRACT §5.2, §23); removed by its undo verb.\n"
-        # §23: the tag and the Defaults both pin the password, so a later NOPASSWD drop-in or a
-        # `!authenticate` default elsewhere cannot make this rule passwordless.
+        # §23: the password is asked unless a LATER sudoers rule for this path says NOPASSWD (root-written,
+        # so trusted): with several matching rules sudo applies the last one.
         f"Defaults!{h} authenticate, timestamp_timeout=0\n"
         f"{op} ALL=(root) PASSWD: {h}\n"
     )

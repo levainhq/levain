@@ -149,11 +149,13 @@ def revive_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
             steps += [Step(f"revive {a.name} at its recorded id {a.uid}: {s.why}", s.argv)
                       for s in account_steps(host, [a])]
         elif host == "linux":
+            # The live label goes on LAST: an account carrying it is one setup keeps as finished (§23), so a
+            # revive interrupted before it still reads as a tombstone and is revived again, expiry included.
             steps += [
-                Step(f"revive {a.name} at its recorded id {a.uid}: relabel, no login shell, no home, locked",
-                     (_abs("usermod"), "--comment", SLOT_MARKER, "--shell", _nologin(), "--home", NO_HOME[host],
-                      "--lock", a.name)),
                 Step(f"revive {a.name}: lift the tombstone's expiry", (_abs("chage"), "--expiredate", "-1", a.name)),
+                Step(f"revive {a.name} at its recorded id {a.uid}: no login shell, no home, locked, relabelled (last)",
+                     (_abs("usermod"), "--shell", _nologin(), "--home", NO_HOME[host], "--lock",
+                      "--comment", SLOT_MARKER, a.name)),
             ]
         else:
             raise Refused("unsupported-host", repr(host))
@@ -193,7 +195,8 @@ def membership_pairs(accounts: Iterable[Account], operator: str | None) -> list[
 
 def tombstone_steps(host: HostOS, name: str) -> list[Step]:
     """Retire an account in place: its id stays reserved, it can never log in, it is in no group but
-    its own (CONTRACT §1.1 'never reissued')."""
+    its own (CONTRACT §1.1 'never reissued'). The retired label is the LAST act: until it is on, the
+    account still reads as live, so an undo interrupted part-way tombstones it again from the start."""
     if not is_levain_account(name):
         raise Refused("not-levain-name", repr(name))
     if host == "darwin":
@@ -205,14 +208,14 @@ def tombstone_steps(host: HostOS, name: str) -> list[Step]:
                  (*_DSCL, "-create", u, "AuthenticationAuthority", ";DisabledUser;")),
             Step(f"tombstone {name}: hidden", (*_DSCL, "-create", u, "IsHidden", "1")),
             Step(f"tombstone {name}: no home", (*_DSCL, "-create", u, "NFSHomeDirectory", NO_HOME[host])),
-            Step(f"tombstone {name}: labelled", (*_DSCL, "-create", u, "RealName", SLOT_RETIRED_MARKER[host])),
             Step(f"take {name} out of every group", call=lambda n=name: _darwin_leave_groups(n)),
+            Step(f"tombstone {name}: labelled (last)", (*_DSCL, "-create", u, "RealName", SLOT_RETIRED_MARKER[host])),
         ]
     return [
         Step(f"tombstone {name}: locked, no login shell, no home, no other groups",
-             (_abs("usermod"), "--lock", "--shell", _nologin(), "--home", NO_HOME[host],
-              "--comment", SLOT_RETIRED_MARKER[host], "--groups", "", name)),
+             (_abs("usermod"), "--lock", "--shell", _nologin(), "--home", NO_HOME[host], "--groups", "", name)),
         Step(f"tombstone {name}: expired", (_abs("chage"), "--expiredate", "0", name)),
+        Step(f"tombstone {name}: labelled (last)", (_abs("usermod"), "--comment", SLOT_RETIRED_MARKER[host], name)),
     ]
 
 

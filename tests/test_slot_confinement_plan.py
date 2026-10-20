@@ -201,7 +201,9 @@ def test_service_units_golden():
         s = by[name]
         assert (s.user, s.after, s.restart) == (uid, after, restart), name
         job = plistlib.loads(units.launchd_plist_text(s).encode())
-        assert job["Label"] == label and job["UserName"] == uid and job["KeepAlive"] is (restart == "always")
+        assert job["Label"] == label and job["UserName"] == uid
+        # a one-shot is retried while it exits non-zero (F5), never left failed after one boot attempt
+        assert job["KeepAlive"] == (True if restart == "always" else {"SuccessfulExit": False})
         assert job["ProgramArguments"] == ["/usr/bin/python3", "-IS", "/usr/local/libexec/levain/service-entry", name]
         if unit is None:
             assert "linux" not in s.hosts
@@ -651,7 +653,10 @@ def test_pf_token_released_on_undo(tmp_path):
     assert fake.calls[-1] == ("/sbin/pfctl", "-X", "1002")
     assert pf.release_enable_reference(tok, fake) == (True, "")          # nothing left: a no-op
     tok.write_text("1; rm -rf /\n")
-    assert pf.release_enable_reference(tok, fake)[0] is False             # never passes a non-token to pfctl
+    n = len(fake.calls)
+    ok, why = pf.release_enable_reference(tok, fake)                      # nothing pf could release: removed
+    assert ok and "held no pf token" in why and not tok.exists()
+    assert len(fake.calls) == n                                           # never passes a non-token to pfctl
     # the plan steps call exactly these
     undo = _undo("darwin", {"_levain_s0": 3999})
     rel = [s for s in undo.steps if s.call and "release pf's enable reference" in s.why]

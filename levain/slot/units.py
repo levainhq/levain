@@ -116,7 +116,9 @@ def launchd_plist_text(svc: Service) -> str:
         "GroupName": _group("darwin", svc),
         "InitGroups": True,     # the account's §1.2 supplementary groups
         "RunAtLoad": True,
-        "KeepAlive": svc.restart == "always",
+        # "always": restarted whenever it exits. "one-shot": restarted only while it exits non-zero, so a
+        # boot load that failed once is retried until it succeeds instead of leaving its work undone.
+        "KeepAlive": True if svc.restart == "always" else {"SuccessfulExit": False},
     }
     return plistlib.dumps(job, sort_keys=True).decode("utf-8")
 
@@ -171,18 +173,62 @@ def _launchd_job_absent(label: str, run: Callable[..., object] | None = None) ->
     return (not loaded, f"{label} is still loaded" if loaded else "")
 
 
-def install_steps(host: HostOS, services: Iterable[Service]) -> list[Step]:
-    """Write each of ``services``' units, then start each in :func:`start_order`."""
-    chosen = [s for s in services_for(host) if s.name in {x.name for x in services}]
+def _read_or_none(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+class _PlistChanges:
+    """Whether each LaunchDaemon's plist on disk differed from the one setup is about to write, recorded
+    BEFORE the write (after it the two always agree). launchd keeps running the definition it loaded, so
+    a job that is loaded AND changed is booted out and bootstrapped again; an unchanged loaded job is
+    left running."""
+
+    def __init__(self, run: Callable[..., object] | None = None,
+                 read: Callable[[Path], bytes | None] = _read_or_none) -> None:
+        self.changed: dict[str, bool] = {}
+        self._run, self._read = run, read
+
+    def record(self, label: str, path: Path, text: str) -> tuple[bool, str]:
+        self.changed[label] = self._read(path) != text.encode("utf-8")
+        return True, ""
+
+    def reload_if_changed(self, label: str) -> tuple[bool, str]:
+        """Boot out a loaded job whose plist changed, so the bootstrap step after this loads the new one."""
+        import subprocess
+
+        if label not in self.changed:
+            return False, f"{label}: no record of whether its plist changed (the record step did not run)"
+        absent, _ = _launchd_job_absent(label, self._run)
+        if absent or not self.changed[label]:
+            return True, ""
+        (self._run or subprocess.run)(["/bin/launchctl", "bootout", f"system/{label}"], capture_output=True)
+        return _launchd_job_absent(label, self._run)
+
+
+def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..., object] | None = None,
+                  read: Callable[[Path], bytes | None] = _read_or_none) -> list[Step]:
+    """Write each of ``services``' units, then start each in :func:`start_order`. macOS: a job already
+    loaded is restarted only when its plist changed (``run``/``read``: launchctl and the plist read)."""
+    names = {x.name for x in services}
+    chosen = [s for s in services_for(host) if s.name in names]
     steps: list[Step] = []
     if host == "darwin":
+        changes = _PlistChanges(run, read)
         for s in chosen:
-            steps.append(Step(f"write the LaunchDaemon {launchd_label(s)} ({s.title}, as {s.user})",
-                              write=(launchd_path(s), launchd_plist_text(s), 0o644),
-                              validate=("/usr/bin/plutil", "-lint")))
+            label, path, text = launchd_label(s), launchd_path(s), launchd_plist_text(s)
+            steps.append(Step(f"note whether {path} on disk differs from the one about to be written",
+                              call=lambda lb=label, p=path, t=text: changes.record(lb, p, t)))
+            steps.append(Step(f"write the LaunchDaemon {label} ({s.title}, as {s.user})",
+                              write=(path, text, 0o644), validate=("/usr/bin/plutil", "-lint")))
         for s in chosen:
-            steps.append(Step(f"start {launchd_label(s)}", ("/bin/launchctl", "bootstrap", "system", str(launchd_path(s))),
-                              skip_if=("/bin/launchctl", "print", f"system/{launchd_label(s)}")))
+            label = launchd_label(s)
+            steps.append(Step(f"boot out {label} if it is loaded and its plist changed",
+                              call=lambda lb=label: changes.reload_if_changed(lb)))
+            steps.append(Step(f"start {label}", ("/bin/launchctl", "bootstrap", "system", str(launchd_path(s))),
+                              skip_if=("/bin/launchctl", "print", f"system/{label}")))
         return steps
     if not chosen:
         return steps
