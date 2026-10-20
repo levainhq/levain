@@ -15,8 +15,10 @@ An iPhone's Home Screen app keeps its own storage, apart from Safari's, and the 
 The SHORT code is the path that always works: eight characters the operator types once into the installed app. It is
 short enough to type, so it lives ten minutes, only the newest one is redeemable, and wrong guesses lock every short
 redeem out for a while; with those three, a guesser gets a handful of tries at a 40-bit secret per code. Minting a code
-clears the lock: a mint takes the run token or the laptop, which a guesser holding no credential lacks, so a peer
-sending wrong codes can never keep the operator from pairing with a fresh code.
+clears the lock: a mint takes the run token or the laptop, which a guesser holding no credential lacks, so wrong
+codes alone cannot keep a fresh short code from redeeming. They can still keep the phone server's own per-minute cap
+on failed redeems full (it counts the lock's refusals and a mint does not reset it), which refuses short and long
+redeems alike for as long as the peer keeps sending: an availability edge only, nothing is guessed through it.
 
 Every function takes an open ``sqlite3.Connection`` on the push store (``levain.webpush.store``), whose schema holds
 ``devices(id, label, token_hash, created, last_seen, revoked_at)``,
