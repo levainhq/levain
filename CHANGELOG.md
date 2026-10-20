@@ -12,10 +12,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
   were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
   `detach`, `add` and `state` fix a split or close a thread.
+- **Dispatch keeps one record per verified run.** When a verifier finishes a run, Levain checks its report against what
+  that run was set up to check and keeps one record of the result. Landing a job reads only these records. A verifier that
+  could not run at all (it timed out, or its report was missing or damaged) fails the job with its own cause,
+  `verifier_refused`, so it never reads as the verifier saying no.
+  - **The dispatch job store moves to format 3** the first time this version opens it. Your jobs are kept. After that,
+    Levain 0.11.12 refuses to open the store, so do not downgrade.
 
 ### Known edges
 - The coordinator session that reads drops and splits them comes later; until then a thread is named with
   `levain drops split`. The phone drop sheet comes later too.
+- The verifier sessions that write these records come with the slot work; until then no run produces one.
 
 ## [0.11.12] — 2026-10-20
 
