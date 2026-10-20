@@ -212,7 +212,7 @@ def test_a_passkey_key_never_signs_an_authority_link(world) -> None:
     # L3 r2 HIGH: a display-phone key's rank covers a renew or a tighten; a passkey's custody still refuses every link
     conn = sqlite3.connect(world["root"] / "cockpit.db", isolation_level=None)
     try:
-        with pytest.raises(auth.AuthorityError, match="consent answers only"):
+        with pytest.raises(auth.AuthorityError, match="never an authority link"):
             auth.sign_and_append(conn, {"op": "raise", "verb": "spore_touch", "tier": "T3"},
                                  signer_fp=world["passkey_fp"], sign=lambda m: "not a signature",
                                  clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(),

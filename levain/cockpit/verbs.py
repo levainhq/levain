@@ -104,6 +104,7 @@ class VerbSpec:
       param (the floor the "needs intent" rule compares against); defaults to ``floor``.
     - ``escalates(row, provenance, today)``: typed predicates a renderer evaluates on its compose
       fields to show the tier a param will raise to (``RowAction.escalates``).
+    - ``device_ok``: whether a ``device`` credential (a phone passkey, K8) may fire it; always signed.
     - ``fire(scope, params, target, confirm)``: the C1 write. ``target`` carries the row read at the
       source (``row``), the surface's ``source`` label, and for a value write a ``check`` to re-run
       under the source's lock. Kernel verbs build their legacy request here, supplying the CAS key
@@ -127,6 +128,10 @@ class VerbSpec:
     legacy_kind: str | None = None           # the ``/edit`` kind this verb aliases
     applies_to: Callable[[dict[str, Any]], bool] | None = None   # rows a row verb offers itself on
     options: Callable[[dict[str, Any]], dict[str, list[Any]]] | None = None   # a row action's allowed values per param
+    # K8: a ``device`` credential (a phone passkey) may fire this verb, always as a signed broker pending. Off for
+    # every verb unless named here: ``dispatch`` refuses a device credential on any other (a kernel allowlist, never
+    # the phone's UI)
+    device_ok: bool = False
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
     # §3.4, §4.1): it may raise a tier, never lower one
@@ -158,7 +163,9 @@ def gesture_for(tier: Tier, credential_class: str, install_class: str) -> str:
     if credential_class not in ("token", "device"):
         return "refused"
     if tier == "C1":
-        return "direct"
+        # a device credential is a fingerprint the client names: its C1 is a pending the passkey signs, applied
+        # once the signature verifies, never a write on the bearer token alone (K8, B5 condition 1)
+        return "sign" if credential_class == "device" else "direct"
     if tier == "T2":
         if credential_class == "token" and install_class == "reported":
             return "direct-reported"
@@ -373,31 +380,32 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              applies_to=_SPORE_ROW),
     VerbSpec("spore_descend", "resolve", "resolves the item (it leaves the open set; recoverable in anneal)",
              "row", fields=("spore_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
-             reversible=False, fire=_spore_fire("spore_descend"), legacy_kind="spore_descend",
+             reversible=False, fire=_spore_fire("spore_descend"), legacy_kind="spore_descend", device_ok=True,
              applies_to=_SPORE_ROW, options=_resolve_kinds("descend")),
     VerbSpec("spore_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
              row_tier=_const("C1"),
              escalates=lambda row, prov, today: _date_escalates(row, prov, today, "surface_at"),
-             fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", applies_to=_SPORE_ROW),
+             fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", device_ok=True, applies_to=_SPORE_ROW),
     VerbSpec("spore_update", "edit", "changes the item's text, domain, tier or type", "row",
              # design §4.2 also allowlists next; here a date moves only through spore_surface_at. domain
              # is always T2 (_update_tier), so it lands through the broker's effect and never reaches the
              # legacy write, which refuses it rather than drop it
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
-             fire=_spore_fire("spore_update"), legacy_kind="spore_update", applies_to=_SPORE_ROW),
+             fire=_spore_fire("spore_update"), legacy_kind="spore_update", device_ok=True, applies_to=_SPORE_ROW),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, Keep, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
-             fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition",
+             fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,
              applies_to=_SPORE_ROW),
     VerbSpec("spore_ascend", "promote", "resolves the loop into what it became, with a reference", "row",
              fields=("spore_kind", "ref"), floor="T2", tier_fn=_const("T2"), confirm_required=True,
-             reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend",
+             reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend", device_ok=True,
              applies_to=_SPORE_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("spore_seed", "capture", "adds a new item that agents will read", "create",
              fields=("text", "type", "disposition"), floor="T2", tier_fn=_const("T2"),
-             fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed"),
+             fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed",
+             device_ok=True),
     VerbSpec("episode_tombstone", "tombstone", "deletes an episode (memory's graduation evidence)", "row",
              floor="T2", tier_fn=_const("T2"), confirm_required=True, reversible=False,
              fire=_unbuilt_fire("episode_tombstone fires through the broker (K2b)"),
@@ -426,6 +434,13 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
 )
 
 LEGACY_KINDS: dict[str, str] = {v.legacy_kind: v.name for v in KERNEL_VERBS if v.legacy_kind}
+
+# K8: the kernel verbs a device credential (a phone passkey) may fire, each as a signed broker pending; the broker
+# adds ``pending_cancel`` (a device cancels only through a signed pending). Not here, by B5's review: section_edit
+# (the dream's single-writer surface), episode_tombstone (irreversible), undo, question_answer (the phone answers on
+# its consent path), operator_state (until Phill asks), spore_touch (no broker effect), every T3 verb, and any panel
+# verb registered later (``device_ok`` defaults off)
+DEVICE_VERBS: frozenset[str] = frozenset(v.name for v in KERNEL_VERBS if v.device_ok)
 
 # The legacy ``/edit`` keys that are not params: the target, the CAS keys the kernel now supplies
 # itself, and the confirm flag. Everything else in a legacy body is a param and meets the allowlist.
@@ -735,6 +750,9 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     if scope is None:
         raise _refuse("read_only", 422, "this source is read-only; nothing editable")
     today = auth.now.astimezone().date()   # the snapshot's instant: a second clock read could cross midnight
+    device = credential.get("class") == "device"
+    if device and route != "cockpit":
+        raise _refuse("laptop_only", 403, f"a device credential writes on /cockpit/verb only, never on /{route}")
 
     if route == "edit":
         return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today, broker, auth)
@@ -766,6 +784,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     verb = registry.get(name) if isinstance(name, str) else None
     if verb is None:
         raise _refuse("unknown_verb", 404, f"no such verb: {name!r}")
+    if device and not verb.device_ok:
+        raise _refuse("laptop_only", 403, f"{verb.name!r} is not a device verb: it is fired on the laptop")
     panel_id = req.get("panel_id")
     if not isinstance(panel_id, str) or verb not in offered(registry, cockpit, panel_id, fresh=True):
         raise _refuse("not_offered", 404, f"panel {panel_id!r} does not offer {verb.name!r}")
@@ -808,8 +828,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     gesture = gesture_for(tier, credential["class"], install_class)
     # before the key check: a fire previewed at T2 carries a key, so a T2->C1 move must answer as one
     _check_moved(req, tier, gesture)
-    # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb
-    if "idempotency_key" in req and not verb.idempotent and tier == "C1":
+    # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb, and so does a device's C1
+    if "idempotency_key" in req and not verb.idempotent and tier == "C1" and not device:
         raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
     if req.get("dry_run") is True:
         return {"ok": True, "dry_run": True, "verb": verb.name, "tier": tier, "rendered_tier": floor,
@@ -817,7 +837,11 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     if TIERS.index(tier) > TIERS.index(floor) and intent is None:
         raise _refuse("needs_intent", 409, f"these params raise {verb.name!r} from {floor} to {tier}; "
                       "send 'intent' to proceed")
-    if tier != "C1":
+    if device and gesture == "refused":
+        raise _refuse("laptop_only", 403, f"{verb.name!r} is {tier} here: a device never signs a {tier}; "
+                                          "it needs the laptop")
+    if tier != "C1" or device:
+        # a device's C1 too: a pending its passkey signs, applied once the signature verifies (K8)
         _require_confirm(verb, req)
         return _to_broker(verb, tier, credential, install_class, broker, params=params, row=row,
                           panel_id=panel_id, intent=intent, idempotency_key=req.get("idempotency_key"),
@@ -894,8 +918,8 @@ def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope"
 def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str,
                       broker: "Broker | None" = None) -> None:
     """§4.3: T2 and T3 never fire from the POST handler; with no write-enabled broker they are
-    refused, naming why."""
-    if tier == "C1":
+    refused, naming why. A device's C1 is a signed pending too (K8), so it is refused the same way."""
+    if tier == "C1" and credential.get("class") != "device":
         return
     gesture = gesture_for(tier, credential["class"], install_class)
     if broker is None:

@@ -485,6 +485,53 @@
     call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
   }
 
+  // K8: a cockpit write signed by this phone's passkey. issue(fp) files the write as a pending under that passkey (the
+  // phone app's POST /cockpit/verb, or a cancel) and resolves to the server's answer; the challenge then comes from the
+  // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
+  // review(pending, sign), when given, shows that same record and calls sign() from its own Sign tap (a fresh gesture
+  // for the passkey prompt); the broker verifies the signature over its own copy and decides. done(answer) gets every
+  // outcome. This page decides nothing: what it shows is the server's words.
+  function signPending(issue, fp, rawId, say, review, done) {
+    if (busy) return;
+    busy++;
+    const finish = (a) => { if (done) done(a); };
+    const failed = (e) => ({ ok: false, status: 0, body: { message: (e && e.name) || "error" } });
+    say("filing the write to sign…");
+    Promise.resolve(issue(fp)).then((p) => {
+      if (!p || !p.ok) { finish(p || failed()); return say(p ? why(p) : "the write was not filed", "bad"); }
+      if (p.body.state !== "WAITING") { finish(p); return say("the write is " + p.body.state, "bad"); }
+      const base = "/cockpit/pending/" + encodeURIComponent(p.body.pending_id);
+      return call("GET", base).then((c) => {
+        if (!c.ok) { finish(c); return say(why(c), "bad"); }
+        const sign = () => {
+          busy++;
+          say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
+          const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
+          return navigator.credentials.get({ publicKey: pk }).then((cred) => call("POST", base + "/signature", {
+            fingerprint: fp, authenticator_data: b64u(cred.response.authenticatorData),
+            client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) }).then((a) => {
+            finish(a);
+            // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
+            if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it applied", "bad");
+            if (!a.ok) return say("not applied: " + why(a), "bad");
+            say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + " · signed by " + fp, a.body.state === "COMMITTED" ? "ok" : "bad");
+          }), (e) => {
+            if (rawId && e && e.name === "NotAllowedError") forget(fp);
+            finish(failed(e));
+            say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was applied", "bad");
+          }).finally(() => { busy--; });
+        };
+        return review ? review(c.body, sign) : sign();
+      });
+    }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
+      .finally(() => { busy--; });
+  }
+  // the ONE hook the phone app signs through (Q4 ruling b): the consent ceremony's own start (the passkey picker), with
+  // signPending as its continuation. No second copy of the ceremony lives in phone_app.js.
+  window.levainSign = (signers, say, actions, issue, review, done) =>
+    start(null, null, signers, say, actions, false, (fp, rawId) => signPending(issue, fp, rawId, say, review, done));
+
   $("refresh").addEventListener("click", load);
   $("enrol-btn").addEventListener("click", enrol);
   load();

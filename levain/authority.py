@@ -1226,9 +1226,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
             if signer.custody == PASSKEY:
-                # a passkey signs consent answers only (its own namespace, the consent queue's check); a link it
-                # signed is refused whatever its class's rank would allow
-                raise AuthorityError(f"a {PASSKEY} key signs consent answers only, never an authority link")
+                # a passkey signs consent answers (the consent queue's namespaces and check) and, since K8, a
+                # cockpit pending of T2 at most in the phone namespace (the broker's check); a link it signed is
+                # refused whatever its class's rank would allow (display-phone's rank covers renew/tighten links)
+                raise AuthorityError(f"a {PASSKEY} key signs consent answers and phone cockpit pendings only, "
+                                     "never an authority link")
             need = _apply_op(rec, seq, state, keys, ssh_keygen)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)

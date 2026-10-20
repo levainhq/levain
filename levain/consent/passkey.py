@@ -219,8 +219,9 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     Touch ID or the device passcode, as the authenticator reports it), and come from a page whose origin is exactly
     the key's own ``https://<host>`` (:func:`_client_origin`, which ``page_origin`` pins on ``localhost``). Among
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
-    namespaces (it runs this check for all three), and the authority replay and the broker refuse it for anything
-    else. The phone port's sign requests (:mod:`levain.consent.sign`) also run this check, for a caller outside
+    namespaces (it runs this check for all three); the cockpit broker accepts one only over a phone pending in
+    ``levain-cockpit-phone``, T2 at most, and runs this check before ssh-keygen (K8); the authority replay refuses
+    it on every link. The phone port's sign requests (:mod:`levain.consent.sign`) also run this check, for a caller outside
     levain, in namespaces levain never verifies."""
     try:
         _key_blob, application = _key_parts(public_key)

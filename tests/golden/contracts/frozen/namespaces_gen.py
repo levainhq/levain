@@ -20,6 +20,7 @@ DOC = {
         {"namespace": "levain-authority-reset", "status": "shipped", "owner": "levain/authority.py"},
         {"namespace": "levain-confirm", "status": "shipped", "owner": "levain/autonomic/confirm.py"},
         {"namespace": "levain-cockpit", "status": "shipped", "owner": "levain/autonomic/confirm.py"},
+        {"namespace": "levain-cockpit-phone", "status": "shipped", "owner": "levain/autonomic/confirm.py"},
         {"namespace": "levain-team-entry", "status": "reserved", "owner": "S1 F9 / F12"},
         {"namespace": "levain-manifest", "status": "reserved", "owner": "fleet design §11o item 1"},
         {"namespace": "levain-consent", "status": "reserved", "owner": "fleet design §11o item 1"},

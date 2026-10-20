@@ -22,6 +22,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-authority-reset": ("shipped", "levain/authority.py", "moving an authority anchor to a new head"),
     "levain-confirm": ("shipped", "levain/autonomic/confirm.py", "a confirm-gate challenge"),
     "levain-cockpit": ("shipped", "levain/autonomic/confirm.py", "a cockpit action signed by its operator"),
+    "levain-cockpit-phone": ("shipped", "levain/autonomic/confirm.py",
+                             "a cockpit pending signed by the operator's phone passkey (K8); a passkey's signer "
+                             "line names only this namespace"),
     TEAM_ENTRY_NAMESPACE: ("reserved", "S1 F9 / F12",
                            "a device's signature over a team-log line (origin, file, chain hash)"),
     "levain-manifest": ("reserved", "fleet design §11o item 1", "a fleet manifest change"),
