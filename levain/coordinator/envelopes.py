@@ -606,6 +606,16 @@ class EnvelopeStore(CoordStore):
         GAUGE"*), so a successor's smaller budget does not narrow a running job here; its meter is C6's."""
         return NOT_IN_FORCE
 
+    def end_of(self, envelope_id: str, thread_id: str | None) -> tuple[str, str, str] | None:
+        """The row that ended ``envelope_id`` for ``thread_id`` (a kill, envelope-wide or for that thread, or its thread
+        going done or closed) as ``(kind, by, at)``, the first one written; None while none has."""
+        with read_transaction(self._connect) as conn:
+            row = conn.execute(
+                "SELECT kind, by, at FROM envelope_attenuations WHERE envelope_id = ? AND kind IN ('kill', "
+                "'thread_done') AND (thread_id IS NULL OR thread_id IS ?) ORDER BY gseq LIMIT 1",
+                (envelope_id, thread_id)).fetchone()
+        return None if row is None else (row[0], row[1], row[2])
+
     def head(self, thread_id: str) -> Envelope | None:
         """The thread's current envelope (the one a new echo for it supersedes), or None."""
         with read_transaction(self._connect) as conn:

@@ -211,7 +211,7 @@ def test_kill_twice_written_then_not(run, repo, tmp_path, monkeypatch):
     first = run("envelope", "kill", eid).out
     assert "already ended" in first and "(a row was written)" not in first
     out = run("envelope", "show", eid, "--data-root", run.root).out
-    assert out.splitlines()[0] == "ENDED (killed by you)" and "it had allowed:" in out
+    assert out.splitlines()[0].startswith("ENDED (killed by you at ") and "it had allowed:" in out
     assert f"authority today: {NOT_IN_FORCE}" in out
     run("envelope", "kill", "ev-" + "0" * 32, rc=1)
 
@@ -411,7 +411,7 @@ def test_m8_a_done_thread_ends_its_envelope(run, repo, tmp_path, monkeypatch):
     run("thread", "state", thread, "working", "--by", "coordinator")
     run("thread", "state", thread, "done", "--by", "coordinator")
     shown = run("envelope", "show", got["body"]["envelope_id"], "--data-root", run.root).out
-    assert shown.splitlines()[0] == "ENDED (its thread is done)"
+    assert shown.splitlines()[0].startswith("ENDED (its thread is done, at ")
 
 
 def test_m9_a_supersede_marks_each_effect_and_says_wider(run, repo, tmp_path, monkeypatch):

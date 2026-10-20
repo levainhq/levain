@@ -316,7 +316,7 @@ def _wider(old: dict[str, Any], new: dict[str, Any]) -> bool:
 
 
 def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds: bool = True,
-              old: dict[str, Any] | None = None, now: datetime | None = None) -> list[str]:
+              old: dict[str, Any] | None = None, now: datetime | None = None, ended: bool = False) -> list[str]:
     """An envelope body as the lines a human signs: where, each effect, the budget, the stop. One function for the
     echo, the sign view, the drop view and show, so what is signed is what was read."""
     now = now or _tick()
@@ -329,9 +329,14 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
     L += _effects(body, old)
     b = body["budget"]
     L.append("  budget (the budget is a gauge: crossing it stops new steps, it is not a hard stop):")
-    L += [f"    tool calls: {b['tool_calls']} allowed", f"    tokens: {b['tokens']} allowed",
-          f"    dollars: {_money(b['dollars_cents'])} allowed", f"    hours: {b['hours']} allowed"]
-    L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {_stops(body['stop_at'], now)}")
+    def _allowed(v: Any, shown: str) -> str:
+        return f"{shown} allowed" if v else "0 allowed (none named: new steps stop at once)"
+    L += [f"    tool calls: {_allowed(b['tool_calls'], str(b['tool_calls']))}",
+          f"    tokens: {_allowed(b['tokens'], str(b['tokens']))}",
+          f"    dollars: {_allowed(b['dollars_cents'], _money(b['dollars_cents']))}",
+          f"    hours: {_allowed(b['hours'], str(b['hours']))}"]
+    stop = (f"was to stop {_clock(parse_stamp(body['stop_at']))}" if ended else _stops(body['stop_at'], now))
+    L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {stop}")
     if body["supersedes"] is not None:
         L.append(f"  supersedes {body['supersedes']['envelope_id']}")
     if binds:
@@ -675,11 +680,14 @@ def run_envelope_show(args: argparse.Namespace, out: Any) -> int:
     return _show(args, out, store, stored, threads)
 
 
-def _ended(store: EnvelopeStore, thread_id: str, eff: dict[str, Any]) -> str | None:
-    """Why the envelope is over for this thread (an end writes the stop to its issue time), or None."""
-    if eff["stop_at"] != eff["issued_at"]:
+def _ended(store: EnvelopeStore, envelope_id: str, thread_id: str) -> str | None:
+    """Why the envelope is over for this thread, read from the row that ended it, or None."""
+    end = store.end_of(envelope_id, thread_id)
+    if end is None:
         return None
-    return "its thread is done" if store.thread(thread_id).state in ("done", "closed") else "killed by you"
+    kind, _by, at = end
+    when = _clock(parse_stamp(at))
+    return f"its thread is done, at {when}" if kind == "thread_done" else f"killed by you at {when}"
 
 
 def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, threads: list[str]) -> int:
@@ -689,7 +697,7 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
     except _faults() as exc:
         unchecked = f"not checked ({str(exc)[:160]})"
     effs = {t: store.effective(stored.envelope_id, t) for t in threads}
-    ends = {t: _ended(store, t, effs[t]) for t in threads}
+    ends = {t: _ended(store, stored.envelope_id, t) for t in threads}
     head = [f"envelope {stored.envelope_id}  digest {stored.digest}  signed by {stored.signer_fp} "
             f"({stored.signer_class}), accepted {stored.accepted_at}"]
     if threads and all(ends.values()):
@@ -706,7 +714,7 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
         if ends[t]:
             text.append(f"thread {t}: ENDED ({ends[t]})" if not all(ends.values()) else f"thread {t}:")
             text.append("  it had allowed:")
-            text += _describe(stored.body, store, binds=False)
+            text += _describe(stored.body, store, binds=False, ended=True)
         else:
             text.append(f"thread {t} (as narrowed):")
             text += _describe(eff, store, binds=False)
