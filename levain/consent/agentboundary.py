@@ -552,10 +552,13 @@ def _check_rules(rules: Any) -> None:
 
 
 def _rules_digest(rules: Any) -> str:
-    """The sha256 of the validated rules themselves (compact JSON, file order), the names part of a renamed
-    ``receipt_id``: derived from what renames the receipt, never from the ``sha256`` a caller hands over."""
+    """The sha256 of the validated rules themselves, the names part of a renamed ``receipt_id``: derived from what
+    renames the receipt, never from the ``sha256`` a caller hands over. Compact ASCII JSON; rules in file order (the
+    order is meaning), each rule's ``when`` and ``set`` sorted by field (their order is not), so re-keying a file
+    keeps its ids."""
     import hashlib
-    return hashlib.sha256(json.dumps(rules, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    canon = [[sorted(when), sorted(sets)] for when, sets in rules]
+    return hashlib.sha256(json.dumps(canon, separators=(",", ":")).encode("ascii")).hexdigest()
 
 
 def load_names(data: bytes) -> Names:

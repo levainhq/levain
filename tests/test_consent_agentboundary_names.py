@@ -118,6 +118,10 @@ def test_a_names_file_is_part_of_the_receipt_identity(world):
             == [{k: v for k, v in r.items() if k not in strip} for r in plain.receipts])
 
 
+# sha256 of [[[["policy.name","levain.consent.T2"]],[["policy.name","acme.x"]]]] (compact ASCII JSON), hashed outside Python
+PINNED = "de2652f653097953deb42a667e36e20300559e58f1a12ea3a4e7b5a7850c7188"
+
+
 def test_the_receipt_id_comes_from_the_rules_never_from_a_handed_sha256(world):
     """Two Names with different rules but one handed sha256 (L3 r2 codex HIGH): disjoint ids, because the id's
     names part is computed from the rules; the same rules from byte-different files give the same receipts."""
@@ -132,6 +136,23 @@ def test_the_receipt_id_comes_from_the_rules_never_from_a_handed_sha256(world):
                                       indent=4).encode())
     assert spaced.sha256 != one.sha256
     assert ab.export(queue.directory, now=now, names=spaced).receipts == a.receipts
+    # key order inside `when` / `set` is not meaning: a re-keyed file keeps its ids; rule order is
+    rekeyed = [{"set": r["set"], "when": dict(reversed(list(r["when"].items())))}
+               for r in _policy_rules("levain.consent.T2", "acme.repo.merges", "7")]
+    assert ab._rules_digest(_names(rekeyed)[1].rules) == ab._rules_digest(one.rules)
+    # the id formula is a format: a serialisation change moves every renamed receipt_id, so it is pinned
+    assert ab._rules_digest(((( ("policy.name", "levain.consent.T2"),), (("policy.name", "acme.x"),)),)) == PINNED
+
+
+def test_a_forged_names_with_a_lone_surrogate_raises_export_error_or_digests(world):
+    """A hand-built Names carrying a lone surrogate in `when` never escapes export as a UnicodeEncodeError."""
+    queue, now, _ = world
+    forged = ab.Names(rules=(((("policy.name", "levain.consent.\ud800"),), (("policy.name", "acme.x"),)),),
+                      sha256="0" * 64)
+    try:
+        ab.export(queue.directory, now=now, names=forged)
+    except ab.ExportError:
+        pass
 
 
 @pytest.mark.parametrize("field", ["policy.decision", "execution.status", "actor.type", "approval.approved_at",
