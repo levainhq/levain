@@ -897,3 +897,361 @@ def test_the_authorise_table_is_append_only(store, repo):
                 conn.execute(sql)
     finally:
         conn.close()
+
+
+# --- W2-a: the verifier writer and the run records -----------------------------------------------------------------
+
+VERIFIED_AT = utc_stamp(NOW + timedelta(minutes=5))
+
+
+def base_tree(repo) -> str:
+    from tests.test_dispatch_contract import git
+    return git(repo[0], "rev-parse", f"{repo[1]}^{{tree}}")
+
+
+def model(run=0) -> dict:
+    return {"requested": "glm-5", "answered": "glm-5", "backend_identity": f"backend-{run}"}
+
+
+def verify(store, repo, job, run=0, *, verdicts=("pass", "pass"), entry=None, raw=None, ev=None, **kw):
+    """One verifier session's end for ``run`` of ``job``, its envelope built from the fixture unless given."""
+    from tests import test_dispatch_verifier_report as tvr
+
+    r = tvr.vrun(job.id, run, entry)
+    if raw is None:
+        raw, digest = tvr.envelope(r, tvr.body(verdicts))
+        ev = ev or tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
+    return store.record_verification(r, envelope=raw, event=ev or tvr.event(r, at=VERIFIED_AT), repo=str(repo[0]),
+                                     tree=kw.pop("tree", base_tree(repo)), model=kw.pop("model", model(run)), **kw)
+
+
+def staged_refs(repo, job) -> list[str]:
+    from tests.test_dispatch_contract import git
+    out = git(repo[0], "for-each-ref", "--format=%(refname)", f"refs/heads/levain/dispatch/{job.id}/")
+    return out.splitlines()
+
+
+def test_every_run_passing_verifies_the_job_and_the_records_read_back(store, repo):
+    from levain.dispatch.adopt import artifact_digest, artifact_problem, staged_ref
+    from tests.test_dispatch_contract import git
+
+    job, _ = at_state(store, repo, "verifying")
+    after_one = verify(store, repo, job, 0)
+    assert after_one.state == "verifying" and after_one.history == job.history       # a record, no transition
+    done = verify(store, repo, job, 1)
+    assert done.state == "verified" and done.history[-1].cause == "verifier_pass"
+    recs = store.run_records(job.id)
+    assert [r.run for r in recs] == [0, 1]
+    for r in recs:
+        assert r.verifier == {"id": "pytest-bb", "hash": "sha256:" + "b" * 64, "kind": "black-box", "result": "pass"}
+        assert r.verified_at == VERIFIED_AT and r.model == model(r.run)
+        assert artifact_problem(str(repo[0]), done, r) is None
+        assert git(repo[0], "rev-parse", staged_ref(job.id, r.run)) == r.staged_commit
+    conn = sqlite3.connect(store.path)
+    try:
+        rows = conn.execute("SELECT run, digest, envelope_digest FROM run_records WHERE job_id = ? ORDER BY run",
+                            (job.id,)).fetchall()
+    finally:
+        conn.close()
+    assert [d for _r, d, _e in rows] == [artifact_digest(r) for r in recs]
+    assert all(e.startswith("sha256:") for _r, _d, e in rows)
+
+
+def test_a_fail_writes_its_record_and_fails_the_job_naming_the_step(store, repo):
+    job, _ = at_state(store, repo, "verifying")
+    out = verify(store, repo, job, 0, verdicts=("pass", "fail"))
+    assert out.state == "failed" and out.history[-1].cause == "verifier_fail"
+    assert out.history[-1].evidence == '{"note": "step 1 fail", "run": 0, "step": 1}'
+    assert [(r.run, r.verifier["result"]) for r in store.run_records(job.id)] == [(0, "fail")]
+
+
+def test_a_failed_job_leaves_no_staged_ref_even_for_a_run_that_passed_first(store, repo):
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    assert len(staged_refs(repo, job)) == 1
+    out = verify(store, repo, job, 1, verdicts=("fail", "pass"))
+    assert out.state == "failed" and staged_refs(repo, job) == []
+    assert [r.run for r in store.run_records(job.id)] == [0, 1]
+
+
+def test_a_refused_event_fails_the_job_with_its_name_and_no_record(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    out = store.record_verification(r, envelope=None, event=tvr.event(r, at=VERIFIED_AT,
+                                                                      verifier_report_refused="driver-timeout"),
+                                    repo=str(repo[0]), tree=base_tree(repo), model=model())
+    assert (out.state, out.history[-1].cause, out.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                             "driver-timeout")
+    assert store.run_records(job.id) == [] and staged_refs(repo, job) == []
+
+
+def test_a_digest_mismatch_is_infrastructure_never_the_verifiers_fail(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r)
+    out = verify(store, repo, job, 0, raw=raw + b" ", ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest))
+    assert (out.state, out.history[-1].cause, out.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                             "report-digest-mismatch")
+    assert store.run_records(job.id) == [] and staged_refs(repo, job) == []
+
+
+def test_an_envelope_named_but_not_read_is_report_missing(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    out = store.record_verification(r, envelope=None, event=tvr.event(r, at=VERIFIED_AT,
+                                                                      verifier_report_digest="sha256:" + "1" * 64),
+                                    repo=str(repo[0]), tree=base_tree(repo), model=model())
+    assert out.history[-1].evidence == "report-missing"
+
+
+def test_a_minted_verifier_that_is_not_the_templates_is_refused_before_staging(store, repo):
+    from levain.dispatch.jobs import NOT_THE_TEMPLATES
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    out = verify(store, repo, job, 0, entry={**tvr.ENTRY, "verifier_artifact_digest": "sha256:" + "f" * 64})
+    assert (out.state, out.history[-1].cause, out.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                             NOT_THE_TEMPLATES)
+    assert staged_refs(repo, job) == [] and store.run_records(job.id) == []
+
+
+@pytest.mark.parametrize("field, value", [("declared_kind", "in-process"), ("verifier_id", "other-bb")])
+def test_each_identity_field_of_the_entry_is_checked(tmp_path, clock, repo, field, value):
+    from levain.dispatch.jobs import NOT_THE_TEMPLATES
+    from tests import test_dispatch_verifier_report as tvr
+
+    store = new_store(tmp_path, clock)
+    job, _ = at_state(store, repo, "verifying")
+    out = verify(store, repo, job, 0, entry={**tvr.ENTRY, field: value})
+    assert out.history[-1].evidence == NOT_THE_TEMPLATES
+
+
+def test_a_run_is_recorded_once(store, repo):
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    before = store.get(job.id).history
+    with pytest.raises(TransitionRefused, match="already recorded"):
+        verify(store, repo, job, 0)
+    assert store.get(job.id).history == before and len(store.run_records(job.id)) == 1
+
+
+def test_the_run_records_table_is_append_only(store, repo):
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        for sql in ("UPDATE run_records SET digest = 'x'", "DELETE FROM run_records",
+                    f"INSERT OR REPLACE INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a')",
+                    f"INSERT INTO run_records VALUES ('{job.id}', 0, 'r', 'd', 'e', 'a')"):
+            with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("state", ["running", "verified", "failed"])
+def test_only_a_verifying_job_records_its_verifier(tmp_path, clock, repo, state):
+    store = new_store(tmp_path, clock)
+    job, _ = at_state(store, repo, state)
+    with pytest.raises(TransitionRefused, match="only a verifying job"):
+        verify(store, repo, job, 0)
+    assert staged_refs(repo, job) == []
+
+
+def test_an_event_that_is_not_this_sessions_is_refused_and_writes_nothing(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r)
+    good = tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
+    for ev, match in (({**good, "session": "v-other"}, "another session"),
+                      ({**good, "ticket": "t-other"}, "another ticket"),
+                      ({**good, "kind": "artifact"}, "state event"),
+                      ({**good, "verifier_report_refused": "driver-timeout"}, "exactly one"),
+                      ({k: v for k, v in good.items() if k != "verifier_report_digest"}, "exactly one"),
+                      ({**good, "verifier_report_digest": "sha1:x"}, "sha256"),
+                      ({**{k: v for k, v in good.items() if k != "verifier_report_digest"},
+                        "verifier_report_refused": "a\nb"}, "one line")):
+        with pytest.raises(DispatchError, match=match):
+            store.record_verification(r, envelope=raw, event=ev, repo=str(repo[0]), tree=base_tree(repo),
+                                      model=model())
+    assert store.get(job.id).history == job.history
+
+
+def test_a_run_outside_the_template_another_repo_or_a_bad_record_writes_nothing(store, repo, tmp_path):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    with pytest.raises(DispatchError, match="not one of the template's runs"):
+        verify(store, repo, job, 2)
+    other = make_repo(tmp_path / "other")
+    with pytest.raises(DispatchError, match="another repository"):
+        r = tvr.vrun(job.id)
+        store.record_verification(r, envelope=None, event=tvr.event(r, at=VERIFIED_AT,
+                                                                    verifier_report_refused="driver-timeout"),
+                                  repo=str(other[0]), tree=base_tree(repo), model=model())
+    with pytest.raises(DispatchError, match="model is exactly"):
+        verify(store, repo, job, 0, model={"requested": "glm-5"})
+    with pytest.raises(DispatchError, match="tree is a full object id"):
+        verify(store, repo, job, 0, tree="HEAD")
+    assert store.get(job.id).history == job.history and staged_refs(repo, job) == []
+
+
+def test_a_crash_between_staging_and_the_record_does_not_wedge_the_retry(store, repo):
+    from levain.dispatch.adopt import stage_commit
+
+    job, _ = at_state(store, repo, "verifying")
+    staged = stage_commit(str(repo[0]), job_id=job.id, run=0, contract_digest=job.digest, base=repo[1],
+                          tree=base_tree(repo), verified_at=VERIFIED_AT)
+    verify(store, repo, job, 0)
+    assert store.run_records(job.id)[0].staged_commit == staged
+
+
+@pytest.mark.parametrize("damage", ["record", "digest"])
+def test_a_record_that_no_longer_matches_its_digest_is_never_skipped(store, repo, damage):
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute("DROP TRIGGER run_records_frozen")
+        if damage == "record":
+            conn.execute("UPDATE run_records SET record = replace(record, 'backend-0', 'backend-9')")
+        else:
+            conn.execute(f"UPDATE run_records SET digest = 'sha256:{'0' * 64}'")
+    finally:
+        conn.close()
+    with pytest.raises(JobStoreError, match="does not match its digest"):
+        store.run_records(job.id)
+
+
+def test_run_records_of_an_unknown_job_is_refused(store):
+    with pytest.raises(TransitionRefused, match="no dispatch job"):
+        store.run_records("dj-" + "0" * 32)
+
+
+def test_a_second_writer_recording_the_same_run_first_is_refused_inside_the_transaction(store, repo, monkeypatch):
+    from levain.dispatch import adopt
+
+    job, _ = at_state(store, repo, "verifying")
+    real = adopt.artifact_problem
+    raced = []
+
+    def racing(repo_path, j, record):
+        # another writer records this run between this call's pre-read and its write transaction
+        if not raced:
+            raced.append(True)
+            monkeypatch.setattr(adopt, "artifact_problem", real)
+            verify(JobStore(store.directory, clock=store._clock), repo, job, 0)
+        return real(repo_path, j, record)
+
+    monkeypatch.setattr(adopt, "artifact_problem", racing)
+    with pytest.raises(TransitionRefused, match="already recorded"):
+        verify(store, repo, job, 0)
+    assert raced and len(store.run_records(job.id)) == 1 and store.get(job.id).state == "verifying"
+
+
+# --- L3 r1 -----------------------------------------------------------------------------------------------------------
+
+def test_a_minted_entry_of_only_the_template_fields_fails_as_verifier_refused(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    entry = {k: tvr.ENTRY[k] for k in ("verifier_id", "verifier_artifact_digest", "declared_kind")}
+    out = verify(store, repo, job, 0, entry=entry)
+    assert (out.state, out.history[-1].cause, out.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                             "verifier-entry")
+    assert staged_refs(repo, job) == [] and store.run_records(job.id) == []
+
+
+@pytest.mark.parametrize("state", ["ACTIVE", "REVOKED", None])
+def test_an_event_in_a_state_that_is_not_terminal_is_refused_and_writes_nothing(store, repo, state):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r)
+    ev = tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
+    if state is None:
+        del ev["state"]
+    else:
+        ev["state"] = state
+    with pytest.raises(DispatchError, match="RETAINED or HELD"):
+        verify(store, repo, job, 0, raw=raw, ev=ev)
+    assert store.get(job.id).history == job.history and staged_refs(repo, job) == []
+
+
+def test_a_held_session_is_a_terminal_event(store, repo):
+    from tests import test_dispatch_verifier_report as tvr
+
+    job, _ = at_state(store, repo, "verifying")
+    r = tvr.vrun(job.id, 0)
+    raw, digest = tvr.envelope(r)
+    out = verify(store, repo, job, 0, raw=raw, ev=tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest,
+                                                            state="HELD"))
+    assert out.state == "verifying" and len(store.run_records(job.id)) == 1
+
+
+def test_a_refused_result_for_a_run_recorded_meanwhile_is_refused_never_fails_the_job(store, repo, monkeypatch):
+    from levain.dispatch import jobs as jobs_mod
+    from levain.dispatch.verifier_report import ReportRefused
+
+    job, _ = at_state(store, repo, "verifying")
+    real = jobs_mod.check_envelope
+    raced = []
+
+    def racing(raw, *, expected, event_digest):
+        # another writer records this run with a pass between this call's pre-read and its write transaction
+        if not raced:
+            raced.append(True)
+            monkeypatch.setattr(jobs_mod, "check_envelope", real)
+            verify(JobStore(store.directory, clock=store._clock), repo, job, 0)
+        raise ReportRefused("report-missing")
+
+    monkeypatch.setattr(jobs_mod, "check_envelope", racing)
+    with pytest.raises(TransitionRefused, match="already recorded"):
+        verify(store, repo, job, 0)
+    assert raced and store.get(job.id).state == "verifying" and len(store.run_records(job.id)) == 1
+
+
+def test_a_staging_writer_that_finds_the_job_failed_deletes_its_staged_refs(store, repo, monkeypatch):
+    from levain.dispatch import adopt
+
+    job, _ = at_state(store, repo, "verifying")
+    real = adopt.artifact_problem
+
+    def racing(repo_path, j, record):
+        # the job fails by another cause after this writer staged its run's commit
+        monkeypatch.setattr(adopt, "artifact_problem", real)
+        JobStore(store.directory, clock=store._clock)._transition(job.id, "failed", "budget_cap")
+        return real(repo_path, j, record)
+
+    monkeypatch.setattr(adopt, "artifact_problem", racing)
+    with pytest.raises(TransitionRefused, match="only a verifying job"):
+        verify(store, repo, job, 0)
+    assert store.get(job.id).state == "failed" and staged_refs(repo, job) == []
+
+
+@pytest.mark.parametrize("text", ["not json", '{"run": 0}', '{"verifier": []}', "[]",
+                                  # a row that only says pass is not a record (L3 r2 G2): the pass count reads rows
+                                  # with run_records' own check
+                                  '{"verifier":{"result":"pass"}}'])
+def test_an_unreadable_stored_record_in_the_pass_count_is_a_damaged_store(tmp_path, clock, repo, text):
+    store = new_store(tmp_path, clock)
+    job, _ = at_state(store, repo, "verifying")
+    verify(store, repo, job, 0)
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute("DROP TRIGGER run_records_frozen")
+        conn.execute("UPDATE run_records SET record = ?", (text,))
+    finally:
+        conn.close()
+    with pytest.raises(JobStoreError, match="damaged"):
+        verify(store, repo, job, 1)
+    assert store.get(job.id).state == "verifying"

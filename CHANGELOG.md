@@ -18,12 +18,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain envelope sign` shows it again in full, asks y/N, and signs it. `levain drop --envelope SPEC "words"` signs one
   as you send the drop. You can narrow or kill an envelope at any time without signing (`levain envelope kill`,
   `levain envelope narrow`); only a wider one needs a new signature.
+- **Dispatch keeps one record per verified run.** When a verifier finishes a run, Levain checks its report against what
+  that run was set up to check and keeps one record of the result. Landing a job reads only these records. A verifier that
+  could not run at all (it timed out, or its report was missing or damaged) fails the job with its own cause,
+  `verifier_refused`, so it never reads as the verifier saying no.
+  - **The dispatch job store moves to format 3** the first time this version opens it. Your jobs are kept. After that,
+    Levain 0.11.12 refuses to open the store, so do not downgrade.
 
 ### Known edges
 - The coordinator session that reads drops and splits them comes later; until then a thread is named with
   `levain drops split`. The phone drop sheet comes later too.
 - Nothing acts on an envelope yet: until Levain's separate-user setup is in place, every step that needs your say
   still asks you each time, and `levain envelope show` says so. Signing from the phone comes later.
+- The verifier sessions that write these records come with the slot work; until then no run produces one.
 
 ## [0.11.12] — 2026-10-20
 

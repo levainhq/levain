@@ -62,6 +62,7 @@ from levain.dispatch.sign import FIELD_MAX, SIGNATURE_MAX
 __all__ = [
     "AUTHORISE_FORMAT", "AUTHORISE_KEYS", "DISPATCH_AUTHORISE_NAMESPACE", "MAX_BLOB_BYTES", "MAX_ENTRIES",
     "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Floor", "GitFault", "Landing", "artifact_digest",
+    "artifact_problem",
     "authorise_message", "authorise_payload", "authorise_refusal", "branch_problem", "change_set",
     "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref",
 ]
@@ -597,7 +598,10 @@ def _tier(landing_tier: Callable[[str, tuple[str, ...]], str], repo: str, paths:
     return tier if isinstance(tier, str) and tier in TIERS else None
 
 
-def _artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None:
+def artifact_problem(repo: str, job: Job, record: ArtifactRecord) -> str | None:
+    """Why ``record`` is not a run of ``job`` whose staged commit this repository holds as recorded (its own
+    fields, the job, contract, base and template verifier it names, a commit whose one parent is the base and whose
+    tree is the recorded tree); ``None`` when it is. Raises :class:`GitFault` when git cannot run."""
     problem = record.problem()
     if problem is not None:
         return problem
@@ -729,7 +733,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
         if not candidates:
             return _refuse("no verified run to land")
     for r in candidates:
-        problem = _artifact_problem(repo, job, r)
+        problem = artifact_problem(repo, job, r)
         if problem is not None:
             return _refuse(problem)
     record = candidates[0]
@@ -1021,13 +1025,53 @@ def stage_commit(repo: str, *, job_id: str, run: int, contract_digest: str, base
                  verified_at: str) -> str:
     """Make the deterministic staged commit of one run (parent ``base``, ``tree``, author and committer
     ``levain dispatch`` dated ``verified_at``, a message naming the job, the run, the contract digest and the tree)
-    and point :func:`staged_ref` at it (created, never moved); returns its sha. The same inputs make the same sha."""
+    and point :func:`staged_ref` at it (created, never moved); returns its sha. The same inputs make the same sha, so
+    a call whose ref already points at exactly that sha returns it (a crash between the ref and the record it was made
+    for must not wedge the retry); a ref that points anywhere else, or is symbolic, is a :class:`DispatchError`, and a
+    create that fails with no ref after it is a :class:`GitFault` carrying git's words."""
     when = f"{int(parse_stamp(verified_at).timestamp())} +0000"
     env = {"GIT_AUTHOR_NAME": _STAGE_NAME, "GIT_AUTHOR_EMAIL": _STAGE_EMAIL, "GIT_AUTHOR_DATE": when,
            "GIT_COMMITTER_NAME": _STAGE_NAME, "GIT_COMMITTER_EMAIL": _STAGE_EMAIL, "GIT_COMMITTER_DATE": when}
     message = (f"levain dispatch {job_id} run {run}\n\ncontract {contract_digest}\ntree {tree}\n").encode("utf-8")
     sha = _git_ok(repo, "commit-tree", "--no-gpg-sign", tree, "-p", base, feed=message,
                   extra_env=env).decode("ascii").strip()
-    zero = "0" * len(sha)
-    _git_ok(repo, "update-ref", "--no-deref", staged_ref(job_id, run), sha, zero)
+    ref = staged_ref(job_id, run)
+    held = _staged_held(repo, ref)
+    if held is None:
+        cp = _git(repo, "update-ref", "--no-deref", ref, sha, "0" * len(sha))
+        if cp.returncode == 0:
+            return sha
+        # another writer created it between the read and the create: judge what it holds; no ref at all means the
+        # create failed for its own reason, which git's words say
+        held = _staged_held(repo, ref)
+        if held is None:
+            detail = cp.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise GitFault(f"git update-ref could not create {ref}: "
+                           f"{detail[-1][:200] if detail else cp.returncode}")
+    if held != sha:
+        raise DispatchError(f"{ref} already points at {held[:64]}, not this run's staged commit {sha}; a staged "
+                            "ref is never moved, and the staged commit is dated by the event, so a retry carries the "
+                            "event that staged it")
     return sha
+
+
+def _staged_held(repo: str, ref: str) -> str | None:
+    """The object the staged ``ref`` names, or ``None`` when it does not exist; a symbolic ref is refused, never
+    followed (its target can move, and the staged ref would move with it)."""
+    cp = _git(repo, "symbolic-ref", "-q", ref)
+    if cp.returncode == 0:
+        raise DispatchError(f"{ref} is a symbolic ref; a staged ref is a direct ref, never followed")
+    if cp.returncode != 1:
+        raise GitFault(f"git symbolic-ref failed in {repo} (exit {cp.returncode})")
+    return _read_ref(repo, ref)
+
+
+def _read_ref(repo: str, ref: str) -> str | None:
+    """The object ``ref`` names, or ``None`` when it does not exist (rev-parse --quiet exit 1); any other failure
+    raises."""
+    cp = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
+    if cp.returncode == 1:
+        return None
+    if cp.returncode != 0:
+        raise GitFault(f"git rev-parse failed in {repo} (exit {cp.returncode})")
+    return cp.stdout.decode("ascii").strip()
