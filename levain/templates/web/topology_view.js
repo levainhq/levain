@@ -113,7 +113,7 @@
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
                                                    tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
                                                    counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;
-    return JSON.stringify([l, sane, Array.from(shownAll)]);
+    return JSON.stringify([l, sane, Array.from(shownAll), replaySig()]);       // T is in it: two instants repaint even when the value reads alike
   }
   // one OS-level observer at a time: the card calls this before it replaces its children
   function release() {
@@ -541,9 +541,36 @@
     }
     return out;
   }
-  // a conflict is drawn between the first node on the file and each other one, the file's name on a chip on the first arc
-  function conflictArcs(v, L) {
+  // The boxes the graph draws text and nodes in, in graph coordinates: one place computes them, the drawing and the conflict chip's placement
+  // both read them (two pieces of code never restate a label's size). `hub` and each group's label, each node's face, each node's ring.
+  const box = (x, y, w, h) => ({ x, y, w, h });
+  function graphBoxes(v, L, measure) {
+    const nodes = arr(v.nodes), running = nodes.filter((n) => n.state === "running").length, h = L.hub;
+    const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " \u00b7 " + running + " running";
+    const hw = Math.max(measure(hsub, "l2"), 70);
+    const out = { hubText: hsub, hub: box(h.x - hw / 2 - 7, h.y - h.r - 42, hw + 14, 40), hubBody: box(h.x - h.r - 8, h.y - h.r - 8, 2 * (h.r + 8), 2 * (h.r + 8)), groups: {}, faces: {}, rings: [] };
+    for (const k of Object.keys(L.gpos)) {
+      const gp = L.gpos[k], mem = nodes.filter((n) => L.gkey(n) === k), run = mem.filter((n) => n.state === "running").length;
+      const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " \u00b7 " + run + " running";
+      const lw = Math.max(measure(gp.label, "group"), measure(sub, "l2")), ly = gp.y + gp.r + 18;
+      out.groups[k] = { sub, ly, rect: box(gp.x - lw / 2 - 7, ly - 14, lw + 14, 36) };
+    }
+    for (const n of nodes) {
+      const P = L.pos[n.id], f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting";
+      const tx = P.x + dir * (wait ? 26 : 17), bw = P.tw + 8, bh = f.tag ? 66 : 50, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
+      out.faces[n.id] = box(bx, P.y - (f.tag ? 30 : 13), bw, bh);
+      out.rings.push(box(P.x - 17, P.y - 17, 34, 34));
+    }
+    return out;
+  }
+  const overlap = (a, b, pad) => Math.max(0, Math.min(a.x + a.w + pad, b.x + b.w) - Math.max(a.x - pad, b.x)) * Math.max(0, Math.min(a.y + a.h + pad, b.y + b.h) - Math.max(a.y - pad, b.y));
+  // a conflict is drawn between the first node on the file and each other one, the file's name on a chip on the first arc. The chip sits on
+  // the arc where it covers no label, face or node: the middle first, then along the arc each way; with none free, where it covers least.
+  const CHIP_AT = [0.5, 0.4, 0.6, 0.3, 0.7, 0.22, 0.78, 0.15, 0.85];
+  function conflictArcs(v, L, measure, boxes) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
+    const bx = boxes || graphBoxes(v, L, measure);
+    const obstacles = [bx.hub, bx.hubBody, ...Object.values(bx.groups).map((g) => g.rect), ...Object.values(bx.faces), ...bx.rings];
     for (const c of arr(v.conflicts)) {
       if (!isObj(c) || typeof c.path !== "string") continue;
       const ids = arr(c.nodes).filter((id) => L.pos[id] && byId.has(id));
@@ -553,7 +580,20 @@
         const gp = L.gpos[L.gkey(byId.get(ids[0]))] || L.hub;
         const sg = ((-dy / ln) * (mx - gp.x) + (dx / ln) * (my - gp.y)) >= 0 ? -1 : 1;
         const cx = mx + (-dy / ln) * 62 * sg, cy = my + (dx / ln) * 62 * sg;
-        out.push({ path: c.path, A, B, cx, cy, chip: k === 1, lx: 0.25 * A.x + 0.5 * cx + 0.25 * B.x, ly: 0.25 * A.y + 0.5 * cy + 0.25 * B.y, ids: [ids[0], ids[k]] });
+        const at = (t) => ({ x: (1 - t) * (1 - t) * A.x + 2 * t * (1 - t) * cx + t * t * B.x, y: (1 - t) * (1 - t) * A.y + 2 * t * (1 - t) * cy + t * t * B.y });
+        let lp = at(0.5);
+        if (k === 1) {
+          const w = measure(c.path, "chip") + 16;
+          let best = null;
+          for (const t of CHIP_AT) {
+            const p = at(t), r = box(p.x - w / 2, p.y - 10, w, 20);
+            const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0);
+            if (best === null || cost < best.cost) best = { cost, p };
+            if (cost === 0) break;
+          }
+          lp = best.p;
+        }
+        out.push({ path: c.path, A, B, cx, cy, chip: k === 1, lx: lp.x, ly: lp.y, ids: [ids[0], ids[k]] });
       }
     }
     return out;
@@ -563,7 +603,7 @@
   function drawGraph(v, L, edges, measure, opts) {
     const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
     const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
-    const lost = lostMap(v);
+    const lost = lostMap(v), bxs = graphBoxes(v, L, measure);
     for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
     const eg = sv("g", null, "tv-edges");
     for (const ed of edges) {
@@ -573,7 +613,7 @@
     }
     svg.appendChild(eg);
     // file conflicts: the file on the arc
-    for (const a of conflictArcs(v, L)) {
+    for (const a of conflictArcs(v, L, measure, bxs)) {
       const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
       g.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y) }, "tv-confline"));
       if (a.chip) {
@@ -590,9 +630,8 @@
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r + 8 }, "tv-hubhalo"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r }, "tv-hubbody"));
     hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: 9 }, "tv-hubcore" + (running ? " run" : "")));
-    const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " · " + running + " running";
-    const hw = Math.max(measure(hsub, "l2"), 70);
-    hg.appendChild(sv("rect", { x: num(h.x - hw / 2 - 7), y: num(h.y - h.r - 42), width: num(hw + 14), height: 40, rx: 7 }, "tv-lblbg"));
+    const hsub = bxs.hubText, hr = bxs.hub;
+    hg.appendChild(sv("rect", { x: num(hr.x), y: num(hr.y), width: num(hr.w), height: hr.h, rx: 7 }, "tv-lblbg"));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26), "text-anchor": "middle" }, "tv-hubname", hubLabel));
     hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
     svg.appendChild(hg);
@@ -603,9 +642,8 @@
       const gg = sv("g", { "data-group": k }, "tv-ggroup" + (wait ? " waiting" : ""));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: gp.r }, "tv-gbody"));
       gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: 4 }, "tv-gcore" + (run ? " run" : "")));
-      const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " · " + run + " running";
-      const lw = Math.max(measure(gp.label, "group"), measure(sub, "l2")), ly = gp.y + gp.r + 18;
-      gg.appendChild(sv("rect", { x: num(gp.x - lw / 2 - 7), y: num(ly - 14), width: num(lw + 14), height: 36, rx: 7 }, "tv-lblbg"));
+      const sub = bxs.groups[k].sub, ly = bxs.groups[k].ly, gr = bxs.groups[k].rect;
+      gg.appendChild(sv("rect", { x: num(gr.x), y: num(gr.y), width: num(gr.w), height: gr.h, rx: 7 }, "tv-lblbg"));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly), "text-anchor": "middle" }, "tv-gname", gp.label));
       gg.appendChild(sv("text", { x: num(gp.x), y: num(ly + 15), "text-anchor": "middle" }, "tv-gsub", sub));
       svg.appendChild(gg);
@@ -625,8 +663,8 @@
       else g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: wait ? 5.5 : n.state === "idle" ? 3.2 : 4.4 }, "tv-core"));
       // the face sits outward of the node
       const tx = P.x + dir * (wait ? 26 : 17), anchor = dir === 1 ? "start" : "end", top = P.y - 22;
-      const bw = P.tw + 8, bh = f.tag ? 66 : 50, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
-      g.appendChild(sv("rect", { x: num(bx), y: num(P.y - (f.tag ? 30 : 13)), width: num(bw), height: bh, rx: 6 }, "tv-facebg"));
+      const fr = bxs.faces[n.id];
+      g.appendChild(sv("rect", { x: num(fr.x), y: num(fr.y), width: num(fr.w), height: fr.h, rx: 6 }, "tv-facebg"));
       if (f.tag) {
         const tw = measure(f.tag, "tag") + 14, px = dir === 1 ? tx - 3 : tx - tw + 3;
         if (wait) g.appendChild(sv("rect", { x: num(px), y: num(top - 8), width: num(tw), height: 16, rx: 8 }, "tv-tagpill"));
@@ -899,25 +937,206 @@
     return p;
   }
 
+  // ---- Replay (K10 S8b): the page half of the topology's past read (`GET /cockpit/panel/topology.json?at=T`) ----
+  // The strip is drawn only when the caller hands `opts.replay` (the panel head said `replay: true`). T is minute-aligned and bounded by the
+  // LIVE read's as_of (the server's clock, never the browser's): [as_of - 14 h, as_of]. A scrub fetches on RELEASE (a keyboard step after a
+  // quiet 250 ms), with at most one past read in flight (a newer one aborts the older), and never with an empty T. While T is set the topology's
+  // live refetch is paused (`paused()`, read by cockpit_view.refetchPanel) and the badge says so; Live (or Esc) drops T and resumes it.
+  // What the past read could not rebuild (`unreadable`) is drawn as unknown. The histogram is the activity panel's events bucketed by `at`.
+  const WINDOW_MS = 14 * 3600e3, STEP_MS = 5 * 60e3, MIN_MS = 60e3, KEY_MS = 250, LO_MARGIN_MS = 2 * MIN_MS, HIST_STALE_MS = 60e3;
+  const UNKNOWN_WORDS = { spores: "open loops", lost_if_closed: "what closing would lose", context: "model and tokens", session_logs: "rate and state from the session logs",
+                          conflicts: "file conflicts", decisions: "decisions", questions: "questions" };
+  const R = { at: null, value: null, err: "", busy: false, anchor: null, ctl: null, timer: null, pend: null, refocus: false, opts: null, cur: null, hist: null, histAt: 0, histBusy: false, escBound: false };
+  const minuteOf = (ms) => Math.floor(ms / MIN_MS) * MIN_MS;
+  const isoMin = (ms) => new Date(minuteOf(ms)).toISOString().replace(/\.\d{3}Z$/, "Z");
+  function paused() { return R.at !== null; }
+  function replaying() { return R.at !== null; }
+  function replayValue() { return R.at !== null ? R.value : null; }
+  const replaySig = () => [R.at, R.err, R.busy];
+  function abortFlight() { if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
+  function leaveReplay(silent) {
+    abortFlight();
+    const was = R.at !== null || R.err !== "";
+    R.at = null; R.value = null; R.anchor = null; R.busy = false; R.err = "";
+    if (!was) return;
+    const rp = R.opts && R.opts.replay;
+    if (rp && typeof rp.resume === "function") { try { const p = rp.resume(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* the next poll reads */ } }
+    if (!silent && R.opts && R.opts.repaint) R.opts.repaint();       // silent: the caller is already repainting
+  }
+  // one past read: T goes out once, the answer is kept only if no newer scrub superseded it
+  function replayTo(T, anchor) {
+    const o = R.opts, rp = o && o.replay;
+    if (!rp || typeof rp.readJson !== "function" || !isNum(T)) return;
+    abortFlight();
+    const prev = { at: R.at, value: R.value, anchor: R.anchor };
+    R.err = ""; R.at = T; R.busy = true; if (R.anchor === null) R.anchor = anchor;
+    const ctl = typeof root.AbortController === "function" ? new root.AbortController() : null;
+    R.ctl = ctl;
+    if (o.repaint) o.repaint();
+    const fail = (msg) => {
+      if (R.ctl !== ctl) return;
+      R.ctl = null; R.busy = false;
+      R.err = "replay refused: " + msg;
+      if (prev.at !== null) { R.at = prev.at; R.value = prev.value; R.anchor = prev.anchor; }
+      else { R.at = null; R.value = null; R.anchor = null; if (typeof rp.resume === "function") { try { const p = rp.resume(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* next poll */ } } }
+      if (o.repaint) o.repaint();
+    };
+    let p;
+    try { p = rp.readJson("/cockpit/panel/topology.json?profile=full&at=" + encodeURIComponent(isoMin(T)), ctl ? ctl.signal : undefined); } catch (e) { fail(e && e.message ? e.message : String(e)); return; }
+    p.then((pl) => {
+      if (R.ctl !== ctl) return;                                          // superseded: it changes nothing
+      const val = isObj(pl) ? pl.value : null;
+      if (!isObj(val) || !Array.isArray(val.nodes) || !Array.isArray(val.tasks) || !Array.isArray(val.groups) || !isObj(val.hub)) { fail("the past read was not a topology"); return; }
+      R.ctl = null; R.busy = false; R.value = val;
+      if (o.repaint) o.repaint();
+    }, (e) => { if (e && e.name === "AbortError") return; fail(e && e.message ? e.message : String(e)); });
+  }
+  // activity per bucket, from the activity panel's events (the sky's own source); fetched once and again when stale, never while replaying
+  function ensureHist() {
+    const rp = R.opts && R.opts.replay;
+    if (!rp || typeof rp.readJson !== "function" || R.histBusy) return;
+    if (R.hist !== null && (R.at !== null || Date.now() - R.histAt < HIST_STALE_MS)) return;
+    R.histBusy = true;
+    rp.readJson("/cockpit/panel/activity.json?profile=full").then((pl) => {
+      const val = isObj(pl) ? pl.value : null;
+      R.hist = isObj(val) && Array.isArray(val.events) ? { events: val.events.filter(isObj).map((e) => Date.parse(e.at)).filter(isNum), unreadable: arr(val.unreadable).filter((x) => typeof x === "string") }
+                                                        : { fail: "no activity source" };
+    }, () => { R.hist = { fail: "activity not read" }; }).then(() => { R.histBusy = false; R.histAt = Date.now(); paintBars(R.cur); });
+  }
+  function paintBars(cur) {
+    if (!cur || !cur.bars.isConnected) return;
+    const h = R.hist, n = cur.bars.children.length;
+    cur.note.textContent = "";
+    cur.bars.classList.toggle("unk", !h || !!h.fail || h.unreadable.length > 0);
+    if (!h) return;
+    if (h.fail) { cur.note.textContent = h.fail; return; }
+    if (h.unreadable.length) cur.note.textContent = "activity not read: " + h.unreadable.join(", ");
+    const counts = new Array(n).fill(0), lo = cur.hi - WINDOW_MS;
+    for (const t of h.events) { if (t >= lo && t <= cur.hi) counts[Math.min(n - 1, Math.floor((t - lo) / WINDOW_MS * n))]++; }
+    const top = Math.max(1, ...counts);
+    counts.forEach((c, i) => { cur.bars.children[i].style.height = (c ? 3 + 24 * c / top : 2) + "px"; cur.bars.children[i].classList.toggle("on", c > 0); });
+  }
+  function bindEsc() {
+    if (R.escBound || !root.document || !root.document.addEventListener) return;
+    R.escBound = true;
+    root.document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape" || R.at === null || ev.defaultPrevented) return;
+      const t = ev.target && ev.target.tagName;
+      if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") return;
+      leaveReplay(false);
+    });
+  }
+  function replayStrip(v) {
+    const hi = minuteOf(R.anchor !== null ? R.anchor : Date.parse(v.as_of));
+    if (!isNum(hi)) return null;
+    const lo0 = hi - WINDOW_MS, lo = lo0 + LO_MARGIN_MS;
+    const strip = el("div", "tv-replay");
+    const cap = el("div", "tv-rcap");
+    cap.append(el("b", null, "Replay"), el("span", null, "last 14 h, from the ledger"));
+    const track = el("div", "tv-rtrack");
+    track.tabIndex = 0;
+    track.setAttribute("role", "slider");
+    track.setAttribute("aria-label", "Replay time, last 14 hours");
+    track.setAttribute("aria-valuemin", String(lo0)); track.setAttribute("aria-valuemax", String(hi));
+    const bars = el("div", "tv-rbars");
+    for (let i = 0; i < 168; i++) bars.appendChild(el("i"));
+    track.appendChild(bars);
+    for (let ms = Math.ceil(lo0 / 7200e3) * 7200e3; ms <= hi; ms += 7200e3) {
+      // two-hour marks on the local clock, as the mock labels them
+      const d = new Date(ms);
+      if (d.getMinutes() !== 0) continue;
+      if (d.getHours() % 2 !== 0) continue;
+      const h = el("span", "tv-rhr", String(d.getHours()).padStart(2, "0") + ":00");
+      h.style.left = ((ms - lo0) / WINDOW_MS * 100) + "%";
+      track.appendChild(h);
+    }
+    const head = el("div", "tv-rhead" + (R.at === null ? " live" : ""));
+    const tlabel = el("span", "tv-rtime");
+    head.appendChild(tlabel);
+    const place = (ms) => { head.style.left = ((ms - lo0) / WINDOW_MS * 100) + "%"; tlabel.textContent = clock(new Date(ms).toISOString()); head.classList.toggle("live", ms >= hi); };
+    place(R.pend !== null ? R.pend : R.at !== null ? R.at : hi);
+    track.appendChild(head);
+    const pill = el("button", "tv-live");
+    pill.type = "button";
+    pill.setAttribute("aria-pressed", R.at === null ? "true" : "false");
+    pill.append(el("i", "tv-livedot"), "Live");
+    pill.addEventListener("click", () => { if (R.at !== null || R.err) leaveReplay(false); });
+    // T from a pointer, minute-aligned and inside the window; the right edge is live
+    const tAt = (clientX) => { const r = track.getBoundingClientRect(); const k = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width))); return minuteOf(lo0 + k * WINDOW_MS); };
+    const commit = (T) => { if (T >= hi) { leaveReplay(false); return; } replayTo(Math.max(lo, T), hi); };
+    let down = false;
+    track.addEventListener("pointerdown", (ev) => { down = true; track.classList.add("drag"); try { track.setPointerCapture(ev.pointerId); } catch (_) { /* no capture */ } place(tAt(ev.clientX)); });
+    track.addEventListener("pointermove", (ev) => { if (down) place(tAt(ev.clientX)); });
+    track.addEventListener("pointerup", (ev) => { if (!down) return; down = false; track.classList.remove("drag"); commit(tAt(ev.clientX)); });
+    track.addEventListener("pointercancel", () => { down = false; track.classList.remove("drag"); place(R.at !== null ? R.at : hi); });
+    track.addEventListener("keydown", (ev) => {
+      const dir = ev.key === "ArrowLeft" || ev.key === "ArrowDown" ? -1 : ev.key === "ArrowRight" || ev.key === "ArrowUp" ? 1 : 0;
+      if (ev.key === "Escape") { ev.preventDefault(); leaveReplay(false); return; }
+      if (!dir && ev.key !== "Home" && ev.key !== "End") return;
+      ev.preventDefault();
+      const base = R.pend !== null ? R.pend : R.at !== null ? R.at : hi;
+      const T = ev.key === "Home" ? lo : ev.key === "End" ? hi : Math.max(lo, Math.min(hi, base + dir * STEP_MS));
+      R.pend = T; R.refocus = true; place(T);
+      if (R.timer) root.clearTimeout(R.timer);
+      R.timer = root.setTimeout(() => { R.timer = null; const t = R.pend; R.pend = null; if (t !== null) commit(t); }, KEY_MS);
+    });
+    const note = el("span", "tv-rnote");
+    strip.append(cap, track, pill, note);
+    if (R.busy) cap.lastChild.textContent = "reading the past…";
+    if (R.err) { const e = el("p", "tv-rerr", R.err); e.setAttribute("role", "status"); strip.appendChild(e); }
+    R.cur = { bars, note, hi };
+    if (R.refocus) { R.refocus = false; root.setTimeout(() => { if (track.isConnected) track.focus({ preventScroll: true }); }, 0); }
+    paintBars(R.cur);
+    return strip;
+  }
+  // what the past read could not rebuild: said in words, never drawn as none
+  function unknownLines(v) {
+    const names = arr(v.unreadable).filter((x) => typeof x === "string" && x);
+    if (v.replay !== true || !names.length) return [];
+    return names.map((nm) => el("p", "tv-unk", (UNKNOWN_WORDS[nm] || nm) + ": not kept for the past"));
+  }
+
   // ---- the body ----
-  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to}
+  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to,
+  // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o = opts || {};
+    R.opts = o;
     const which = lens();
     const w = el("div", "tv");
     w.dataset.lens = which;
+    if (o.replay && R.at !== null) w.classList.add("tv-replaying");
     const bar = el("div", "tv-bar");
     bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { keep(LENS_KEY, id); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
-    w.appendChild(which === "agents" ? agentsLens(v, o) : workLens(v, o));
+    const body = el("div", "tv-lensbody");
+    body.appendChild(which === "agents" ? agentsLens(v, o) : workLens(v, o));
+    // the paused line, said plainly where the graph is (the mock: top of the Agents stage, foot of the Work stage)
+    if (o.replay && R.at !== null) {
+      const b = el("div", "tv-rbadge", "replay " + clock(new Date(R.at).toISOString()) + " — live paused");
+      b.setAttribute("role", "status");
+      const back = el("button", "tv-rback", "Back to live");
+      back.type = "button";
+      back.addEventListener("click", () => leaveReplay(false));
+      const wrapB = el("div", "tv-rbadgewrap");
+      wrapB.append(b, back);
+      body.appendChild(wrapB);
+    }
+    w.appendChild(body);
     w.appendChild(which === "agents" ? legendAgents() : legend());
+    for (const u of unknownLines(v)) w.appendChild(u);
     const q = quietLine(v);
     if (q) w.appendChild(q);
+    if (o.replay) {
+      bindEsc();
+      const s = replayStrip(v);
+      if (s) { w.appendChild(s); ensureHist(); }
+    }
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault };
+  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, leaveReplay };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -391,7 +391,7 @@
       const tasks = Array.isArray(v.tasks) ? v.tasks : [];
       const waiting = isNum(v.waiting) ? v.waiting : tasks.filter((t) => isObj(t) && t.state === "waiting").length;
       out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
-      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; }   // typed: the page keeps a live state for it (Build's Sessions card reads it)
+      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (Build's Sessions card reads it)
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -1836,6 +1836,8 @@
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
     if (!liveOf(pid).length) return false;
+    // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
+    if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
     const gen = (refetchGen.get(pid) || 0) + 1;
     refetchGen.set(pid, gen);
     const epoch = boardEpoch;
@@ -2232,8 +2234,12 @@
     const ep = TV && !ts ? document.querySelector('[data-ck-panel="topology"][data-ck-external]') : null;
     const epErr = ep ? ep.querySelector(".err") : null;
     const tfault = !TV ? "" : ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
-    const tv = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    const tvLive = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    // a scrubbed past is drawn in place of the live value (the read behind it may hold no work: an empty past is still the past)
+    const tv = tvLive && TV.replaying && TV.replaying() ? (TV.replayValue() || tvLive) : tvLive;
     const topo = !!(tv || tfault) && TV.mode(root.innerWidth) === "topology";
+    if (TV && TV.replaying && TV.replaying() && !topo) TV.leaveReplay(true);       // no topology on screen: no replay, and the live read is not left paused
+    const canReplay = !!(topo && ts && ts.data && ts.data.replay === true && root.LevainCockpitTransport);
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
     const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", topo, tfault,
                                 tv ? TV.signature(tv, TV.lens()) : (ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
@@ -2276,7 +2282,9 @@
     let tbody = null, tfail = false;
     if (TV) TV.release();           // the old body's resize observer goes with it, even when the list replaces the topology
     if (topo && !tfault) {
-      try { tbody = TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard }); } catch (e) { tfail = true; }
+      // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
+      const replay = canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
+      try { tbody = TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard, replay }); } catch (e) { tfail = true; }
     }
     if (topo && tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
     else if (tbody) card.appendChild(tbody);

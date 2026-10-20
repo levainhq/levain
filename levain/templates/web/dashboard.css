@@ -2077,6 +2077,36 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 :root[data-theme="light"] .tv-particles { color: var(--label); }
 @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .tv-particles { color: var(--label); } }
 .tv-hint { position: absolute; z-index: 2; top: var(--sp-4); right: var(--sp-5); color: var(--meta); font-size: var(--fs-micro); pointer-events: none; }
+/* Replay (K10 S8b): the strip under both lenses, the paused line, the unknown lines. No animation anywhere in it. */
+.tv-lensbody { position: relative; min-width: 0; }
+.tv-replaying .tv-hint { display: none; }
+.tv-rbadgewrap { display: flex; justify-content: center; align-items: center; gap: var(--sp-4); margin-top: var(--sp-4); padding: var(--sp-2) var(--sp-3) var(--sp-2) var(--sp-4); width: fit-content; margin-inline: auto; border: 1px solid var(--hair-2); background: var(--card-2); border-radius: var(--r-md); }
+.tv-lensbody:has(.tv-agents) .tv-rbadgewrap { position: absolute; z-index: 3; top: var(--sp-4); left: 50%; transform: translateX(-50%); margin: 0; }
+.tv-rbadge { font: var(--fw-semibold) var(--fs-meta)/1 var(--mono); color: var(--text); }
+.tv-rback, .tv-live { font: inherit; font-size: var(--fs-meta); color: var(--label); background: transparent; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 3px var(--sp-3); cursor: pointer; }
+.tv-rback:hover, .tv-live:hover { color: var(--text); }
+.tv-replay { display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; align-items: center; gap: var(--sp-5); margin-top: var(--sp-5); }
+.tv-rcap { display: flex; flex-direction: column; gap: 3px; }
+.tv-rcap b { font-size: var(--fs-body); font-weight: var(--fw-bold, 700); color: var(--text); }
+.tv-rcap span { color: var(--meta); font-size: var(--fs-micro); }
+.tv-rtrack { position: relative; height: 44px; cursor: ew-resize; touch-action: none; user-select: none; outline-offset: 2px; }
+.tv-rbars { position: absolute; left: 0; right: 0; top: 0; height: 30px; display: flex; align-items: flex-end; gap: 1px; }
+.tv-rbars i { flex: 1 1 0; min-width: 0; height: 2px; border-radius: 1px; background: var(--hair); }
+.tv-rbars i.on { background: var(--hair-2); }
+.tv-rbars.unk i { background-image: repeating-linear-gradient(135deg, var(--hair-2) 0 2px, transparent 2px 4px); background-color: transparent; }
+.tv-rhr { position: absolute; top: 32px; transform: translateX(-50%); font: 500 10px var(--mono); color: var(--meta); }
+.tv-rhead { position: absolute; top: 0; bottom: 14px; width: 2px; background: var(--text); border-radius: 2px; transform: translateX(-1px); pointer-events: none; }
+.tv-rhead::before { content: ""; position: absolute; left: -5px; top: -3px; width: 12px; height: 12px; border-radius: 99px; background: var(--text); border: 2px solid var(--base); }
+.tv-rhead.live, .tv-rhead.live::before { background: var(--ok); }
+.tv-rtime { display: none; position: absolute; left: 50%; top: -22px; transform: translateX(-50%); font: 600 10px var(--mono); color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: 1px 5px; white-space: nowrap; }
+.tv-rtrack.drag .tv-rtime { display: block; }
+.tv-live[aria-pressed="true"] { color: var(--ok); border-color: color-mix(in oklch, var(--ok) 45%, var(--base)); }
+.tv-livedot { display: inline-block; width: 7px; height: 7px; border-radius: 99px; background: var(--ok); margin-right: var(--sp-2); }
+.tv-live[aria-pressed="false"] .tv-livedot { background: var(--meta); }
+.tv-rnote { grid-column: 2; color: var(--meta); font-size: var(--fs-micro); }
+.tv-rnote:empty { display: none; }
+.tv-rerr { grid-column: 1 / -1; margin: 0; color: var(--bad); font-size: var(--fs-meta); }
+.tv-unk { margin: var(--sp-3) 0 0; color: var(--meta); font-size: var(--fs-meta); font-style: italic; }
 .tv-gring { fill: none; stroke: var(--hair); stroke-width: 1; stroke-dasharray: 1 5; stroke-linecap: round; opacity: .9; }
 .tv-edge { fill: none; stroke: var(--hair-2); stroke-width: 1.1; opacity: .55; }
 .tv-edge.hub { stroke-width: 1.4; }
