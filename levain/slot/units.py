@@ -255,7 +255,7 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
     for s in chosen:
         name, text = systemd_name(s), systemd_unit_text(s)
         path = systemd_path(name)
-        steps.append(Step(f"stop {name} if it is active and {path} is about to change",
+        steps.append(Step(f"stop {name} unless {path} already matches",
                           call=lambda n=name, p=path, t=text: _stop_unit_if_changed(systemctl, n, p, t, run, read)))
         steps.append(Step(f"write the systemd unit {name} ({s.title}, as {s.user})", write=(path, text, 0o644)))
     steps.append(Step("tell systemd about the units", (systemctl, "daemon-reload")))
