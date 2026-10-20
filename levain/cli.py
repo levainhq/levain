@@ -1667,6 +1667,11 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
     export_p.add_argument("--out", type=Path, default=None, metavar="FILE",
                           help="Write the JSON here instead of stdout (whole or not at all where the filesystem has hard "
                                "links); refuses to overwrite a file.")
+    export_p.add_argument("--names", type=Path, default=None, metavar="FILE",
+                          help="A names file (JSON, format levain-agentboundary-names/1) that maps Levain's names "
+                               "(policy, approver key, agent, tool, target) to your organisation's. Names only: a "
+                               "file that sets a decision, a status, an actor type or a time is refused and nothing "
+                               "is exported. The hash covers the renamed receipt.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
@@ -1724,11 +1729,16 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
     import sqlite3
     import tempfile
 
-    from levain.consent.agentboundary import ExportError, export
+    from levain.consent.agentboundary import ExportError, export, load_names
 
     try:
+        names = None
+        if args.names is not None:
+            if args.export_format != "agentboundary":
+                raise ExportError(f"--names applies to --format agentboundary only, not {args.export_format}")
+            names = load_names(args.names.expanduser().read_bytes())
         qdir = _consent_queue_dir(args)
-        result = export(qdir)
+        result = export(qdir, names=names)
         # UTF-8 bytes whatever the locale or PYTHONIOENCODING says: the file and stdout carry the same JSON
         data = (json.dumps(result.receipts, ensure_ascii=False) + "\n").encode("utf-8")
         if args.out is not None:
@@ -1781,7 +1791,9 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
     states = ", ".join(f"{k} {v}" for k, v in rep.by_state.items()) or "none"
     print(_term_safe(f"levain consent receipts export: {rep.receipts} receipt(s) ({states}); "
                      f"{rep.pending_skipped} pending skipped, {rep.held_unsettled} held back unsettled"
-                     + ("" if rep.ledger_found else "; no authority ledger found")), file=sys.stderr)
+                     + ("" if rep.ledger_found else "; no authority ledger found")
+                     + ("" if rep.names_sha256 is None
+                        else f"; names file sha256 {rep.names_sha256} renamed {rep.names_renamed}")), file=sys.stderr)
     return 0
 
 

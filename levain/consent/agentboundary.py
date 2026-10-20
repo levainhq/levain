@@ -88,6 +88,14 @@ Fail closed: a value this module would emit that the spec rejects (a digest that
 a timestamp that does not parse, an empty required string, a score that is not a number) raises
 :class:`ExportError`, never an invalid receipt. A column is parsed only where it is used.
 
+The names bridge (``names=``, :func:`load_names`). Levain names its own things (``levain.consent.<tier>``,
+``ssh-key:<fp>``, ``claude-code.<tool>``, the working directory); an operator's verifier knows its organisation's
+names. A names file (``{"format": "levain-agentboundary-names/1", "rules": [{"when": {...}, "set": {...}}]}``) maps
+one onto the other inside the export: ``when`` tests Levain's own values (every key equal), ``set`` writes names, the
+first matching rule wins per field. It may write NAMES only, never FACTS (the allowlist at :data:`_NAME_FIELDS`); a
+file that tries is refused whole when loaded. The rename lands before provenance, score and hash, each renamed path is
+``inferred``, and ``execution.result_ref`` still names Levain's own leaf.
+
 Known edges (each stated, none built against):
   - a kept refused answer is covered by no signed head (``refused_answers`` is outside the Q11 log): a raw writer of
     ``queue.db`` can add or drop one, so the approval block of a refusal is evidence that an attempt was made and
@@ -134,7 +142,8 @@ from typing import Any, NamedTuple
 from levain.cockpit.consent import ConsentError, parse_stamp, record_sha256
 from levain.cockpit.consent import encode as jcs_encode
 
-__all__ = ["AB_VERSION", "Export", "ExportError", "Report", "SETTLE", "export", "policy_identity", "receipt_hash"]
+__all__ = ["AB_VERSION", "Export", "ExportError", "NAMES_FORMAT", "Names", "Report", "SETTLE", "export", "load_names",
+           "policy_identity", "receipt_hash"]
 
 AB_VERSION = "agentboundary/v0.2-alpha"
 # fixed, so a re-export reproduces every receipt_id; it is uuid5(NAMESPACE_URL, _NS_NAME), written out so an edit to
@@ -245,7 +254,8 @@ class Report:
     enough to settle with no ledger evidence, exported ``blocked``. ``ledger_found``: whether the authority ledger
     was there to read. ``held_unsettled``: terminal rows not exported because the first unsettled row and all after
     it were held back. ``refused_not_authorized`` / ``refused_window_elapsed``: expired rows exported with a kept
-    refused answer as their approval evidence, for each reason."""
+    refused answer as their approval evidence, for each reason. ``names_sha256``: the sha256 of the names file's
+    bytes when one was applied, else ``None``; ``names_renamed``: receipts in which it changed at least one name."""
     receipts: int
     by_state: Mapping[str, int]
     pending_skipped: int
@@ -261,6 +271,8 @@ class Report:
     held_unsettled: int
     refused_not_authorized: int
     refused_window_elapsed: int
+    names_sha256: str | None = None
+    names_renamed: int = 0
 
 
 @dataclass(frozen=True)
@@ -338,6 +350,132 @@ def policy_identity(tier: str) -> tuple[str, str]:
     """The ``(policy.name, policy.version)`` a receipt of a request in ``tier`` names: the queue never recorded which
     code decided, so the version is ``"unknown"``."""
     return f"levain.consent.{tier}", _UNKNOWN
+
+
+# --- the names bridge: an operator's names file maps Levain's names onto the operator's ----------------------------
+NAMES_FORMAT = "levain-agentboundary-names/1"
+# ⛔ The invariant: a names file may write only what something is CALLED, never what happened or what kind of thing
+# acted. Each v0.2-alpha schema field, classified:
+#   NAME (settable): actor.id, actor.display_name; agent.framework, agent.framework_version, agent.model,
+#     agent.model_version (the operator's labels for the agent it runs; Levain writes "unknown" for framework_version
+#     and model, and no model_version);
+#     tool.name, tool.version, tool.capability; target.system, target.environment (an environment's NAME, one of the
+#     schema's enum), target.resource_id; policy.name, policy.version; approval.approver.id,
+#     approval.approver.display_name.
+#   FACT (never settable): version, receipt_id, issued_at, actor.type (what kind of actor acted), arguments_hash,
+#     policy.decision, approval.approver.role (an authority claim: Levain names a key an operator only when the
+#     authority log held it), approval.approved_at, approval.context (the pointer to Levain's evidence), execution.*
+#     (status, completed_at, error_code, result_ref: what happened and where its leaf is), refusal.*, prior_receipt.*,
+#     provenance, completeness_score, receipt_hash.
+# A name is written only where its parent block exists: a names file never creates an approval block.
+_NAME_FIELDS: dict[str, frozenset[str] | None] = {
+    "actor.id": None, "actor.display_name": None, "agent.framework": None, "agent.framework_version": None,
+    "agent.model": None, "agent.model_version": None, "tool.name": None, "tool.version": None,
+    "tool.capability": None, "target.system": None, "target.environment": frozenset({"prod", "staging", "dev"}),
+    "target.resource_id": None, "policy.name": None, "policy.version": None, "approval.approver.id": None,
+    "approval.approver.display_name": None}
+# what a rule's `when` may test: a field of the receipt as Levain maps it, before the rename; provenance, the score,
+# the hash and prior_receipt are computed after the rename, so a test of them could never match and is refused
+_WHEN_FIELDS = frozenset(("version",) + _REQUIRED_PATHS + tuple(
+    p for p in _CONDITIONAL_PATHS if not p.startswith("prior_receipt.")))
+
+
+@dataclass(frozen=True)
+class Names:
+    """A loaded, validated names file (:func:`load_names`): ``rules`` as ``(when, set)`` pairs in file order, every
+    string NFC, and ``sha256`` the hex digest of the file's bytes."""
+    rules: tuple[tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]], ...]
+    sha256: str
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ExportError(f"names file: the key {k!r} appears twice in one object")
+        out[k] = v
+    return out
+
+
+def _name_string(value: Any, where: str) -> str:
+    if type(value) is not str or not value:
+        raise ExportError(f"names file: {where} must be a non-empty string, not {value!r}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ExportError(f"names file: {where} holds a lone surrogate") from None
+    return unicodedata.normalize("NFC", value)
+
+
+def load_names(data: bytes) -> Names:
+    """Parse and validate a names file's bytes. Raises :class:`ExportError`, naming the field, for a file that is not
+    well-formed UTF-8 JSON (a key repeated in one object included), has another ``format``, holds a key the format
+    does not define, tests a field in ``when`` that is not one of the receipt's, or SETS a field that is not a name
+    (the allowlist above: ``policy.decision``, ``execution.status``, ``actor.type`` or any time is refused)."""
+    import hashlib
+    try:
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ExportError(f"names file: not well-formed UTF-8 JSON: {exc}") from None
+    if not isinstance(doc, dict):
+        raise ExportError("names file: the top level must be an object")
+    if doc.get("format") != NAMES_FORMAT:
+        raise ExportError(f"names file: format {doc.get('format')!r} is not {NAMES_FORMAT!r}")
+    if set(doc) != {"format", "rules"}:
+        raise ExportError(f"names file: unknown or missing top-level keys {sorted(set(doc) ^ {'format', 'rules'})}")
+    if not isinstance(doc["rules"], list):
+        raise ExportError("names file: rules must be a list")
+    rules = []
+    for i, rule in enumerate(doc["rules"]):
+        if not isinstance(rule, dict) or set(rule) != {"when", "set"}:
+            raise ExportError(f"names file: rule {i} must be an object with exactly `when` and `set`")
+        when, sets = rule["when"], rule["set"]
+        if not isinstance(when, dict) or not isinstance(sets, dict) or not sets:
+            raise ExportError(f"names file: rule {i}: `when` must be an object and `set` a non-empty object")
+        for field in when:
+            if field not in _WHEN_FIELDS:
+                raise ExportError(f"names file: rule {i}: `when` tests {field!r}, not a field of Levain's receipt")
+        for field in sets:
+            if field not in _NAME_FIELDS:
+                raise ExportError(f"names file: rule {i}: `set` writes {field!r}, which is not a name a names file "
+                                  f"may set (only {', '.join(_NAME_FIELDS)})")
+        w = tuple((f, _name_string(v, f"rule {i} when {f}")) for f, v in when.items())
+        s = tuple((f, _name_string(v, f"rule {i} set {f}")) for f, v in sets.items())
+        for f, v in s:
+            allowed = _NAME_FIELDS[f]
+            if allowed is not None and v not in allowed:
+                raise ExportError(f"names file: rule {i}: set {f} must be one of {sorted(allowed)}, not {v!r}")
+        rules.append((w, s))
+    return Names(rules=tuple(rules), sha256=hashlib.sha256(data).hexdigest())
+
+
+def _get(receipt: Mapping[str, Any], dotted: str) -> Any:
+    cursor: Any = receipt
+    for part in dotted.split("."):
+        if not isinstance(cursor, Mapping) or part not in cursor:
+            return None
+        cursor = cursor[part]
+    return cursor
+
+
+def _rename(receipt: dict[str, Any], names: Names) -> list[str]:
+    """Apply ``names`` to ``receipt`` in place; the paths whose value changed. Every rule's ``when`` is tested against
+    the receipt as it was before any rename, and for each field the first matching rule that sets it wins."""
+    before = json.loads(json.dumps(receipt))
+    decided: dict[str, str] = {}
+    for when, sets in names.rules:
+        if all(_get(before, f) == v for f, v in when):
+            for f, v in sets:
+                decided.setdefault(f, v)
+    changed = []
+    for f, v in decided.items():
+        parent, _, leaf = f.rpartition(".")
+        block = _get(receipt, parent)
+        if not isinstance(block, dict) or block.get(leaf) == v:
+            continue                                      # never create a block; an equal value is not a rename
+        block[leaf] = v
+        changed.append(f)
+    return changed
 
 
 def _open_ro(path: Path, what: str) -> sqlite3.Connection:
@@ -691,13 +829,18 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
     return receipt, prov
 
 
-def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
+def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names | None = None) -> Export:
     """The AgentBoundary receipts of the consent queue in ``queue_dir``, one per terminal receipt row in ``seq``
     order, chained by ``prior_receipt``, up to the first unsettled row (the settle rule in the module docstring).
     ``now`` is the export's clock (an aware datetime; default the current UTC time) and must not be ahead of the real
     clock by more than a few seconds, or the export is refused; the same queue and ``now`` yield the same receipts,
-    and any later ``now`` yields them as a prefix. Raises :class:`ExportError` when the store is not a readable
-    current-format queue or a row cannot be made into a receipt."""
+    and any later ``now`` yields them as a prefix. ``names`` (:func:`load_names`) renames each receipt's names to the
+    operator's before its provenance, score and hash are computed, so the hash and the chain cover the renamed
+    receipt; a renamed path's provenance is ``inferred`` (the operator declared it, Levain did not observe it).
+    Raises :class:`ExportError` when the store is not a readable current-format queue or a row cannot be made into a
+    receipt."""
+    if names is not None and not isinstance(names, Names):
+        raise ExportError("names must be a Names from load_names")
     real = _utcnow()
     if now is None:
         now = real
@@ -713,7 +856,7 @@ def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
                 "execution_unrecorded": 0, "refused_not_authorized": 0, "refused_window_elapsed": 0}
     by_state: dict[str, int] = {}
     receipts: list[dict[str, Any]] = []
-    pending = normalised = held = 0
+    pending = normalised = held = renamed = 0
     prior: dict[str, str] | None = None
     stopped = False
     for row in rows:
@@ -750,6 +893,11 @@ def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
         if clean != receipt:
             normalised += 1
             receipt = clean
+        if names is not None:
+            changed = _rename(receipt, names)
+            if changed:
+                renamed += 1
+                prov.update({p: "inferred" for p in changed})
         if prior is not None:
             receipt["prior_receipt"] = dict(prior)
             prov.update({"prior_receipt.receipt_id": "inferred", "prior_receipt.receipt_hash": "inferred"})
@@ -762,4 +910,6 @@ def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
     return Export(receipts=receipts,
                   report=Report(receipts=len(receipts), by_state=dict(sorted(by_state.items())),
                                 pending_skipped=pending, nfc_normalised=normalised, held_unsettled=held,
-                                ledger_found=ledger.found, **counters))
+                                ledger_found=ledger.found,
+                                names_sha256=None if names is None else names.sha256, names_renamed=renamed,
+                                **counters))
