@@ -49,7 +49,7 @@ def _blob(**kw) -> bytes:
 
 
 def _slot_state(slot: SlotId, state: str = "reusable", *, rev: int = 0, seq: int = 0, session=None) -> bytes:
-    return H.slot_state_bytes(H.SlotState(slot, rev, seq, state, True, "2026-10-20T00:00:00Z", session))
+    return R.slot_state_bytes(R.SlotState(slot, rev, seq, state, True, "2026-10-20T00:00:00Z", session))
 
 
 class Fronts:
@@ -204,8 +204,8 @@ class World:
     def alloc(self, session: str) -> R.Alloc:
         return R.parse_alloc((self.L / "alloc" / f"{session}.json").read_bytes())
 
-    def slot_state(self, slot: SlotId) -> H.SlotState:
-        return H.parse_slot_state((slot.slot_dir(self.L) / "state").read_bytes(), slot)
+    def slot_state(self, slot: SlotId) -> R.SlotState:
+        return H.parse_slot_state_of((slot.slot_dir(self.L) / "state").read_bytes(), slot)
 
     def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True) -> None:
         d = slot.slot_dir(self.L)
@@ -262,8 +262,6 @@ def test_configured_slots_read_from_store(world):
 
 def test_unbuilt_verbs_answer_by_name(world):
     s = _prepared(world)
-    for verb in ("start", "teardown"):
-        assert world.main([verb, s])[1]["refused"] == f"verb-unbuilt:{verb}"
     assert world.main(["confirm-identity", s, "yes"])[1]["refused"] == "verb-unbuilt:confirm-identity"
 
 
@@ -349,8 +347,18 @@ def test_login_then_session_same_slot(world):
 
 def test_named_slot_taken_when_reusable(world):
     assert world.prepare("egress", "interactive", "claude", "brokered", "2")["slot"]["index"] == 2
-    # §5.1 "the named slot if REUSABLE, else ..." falls through to the rest of the order.
-    assert world.prepare("egress", "interactive", "claude", "brokered", "2")["slot"]["index"] == 0
+
+
+def test_named_slot_not_reusable_refused_never_replaced(world):
+    """Lane F3 a (head ruling on §5.1 "the named slot if REUSABLE"): naming a slot asks for THAT slot's
+    credential, so a named slot that is leased is refused by its tag, never swapped for another slot."""
+    assert world.prepare("egress", "interactive", "claude", "brokered", "2")["slot"]["index"] == 2
+    line = world.prepare("egress", "interactive", "claude", "brokered", "2")
+    assert line["refused"] == "slot-not-reusable:e2"
+    assert world.slot_state(SlotId("egress", 0)).state == "reusable"          # nothing else was leased
+    assert world.slot_state(SlotId("egress", 1)).state == "reusable"
+    os.unlink(SlotId("egress", 1).slot_dir(world.L) / "state")               # absent = not reusable, by name too
+    assert world.prepare("egress", "interactive", "claude", "brokered", "1")["refused"] == "slot-not-reusable:e1"
 
 
 def test_no_free_slot(tmp_path):
@@ -447,7 +455,7 @@ def test_concurrent_prepares_keep_operator_slot(tmp_path):
 def test_pick_slot_rules():
     def v(i, state="reusable", creds=(), baseline=None):
         slot = SlotId("egress", i)
-        return H.SlotView(H.SlotState(slot, 0, 0, state, True, "2026-10-20T00:00:00Z",
+        return H.SlotView(R.SlotState(slot, 0, 0, state, True, "2026-10-20T00:00:00Z",
                                       "s-0000000000000001" if state == "leased" else None),
                           slot, frozenset(creds), baseline)
 
@@ -545,16 +553,19 @@ def test_render_order_observed(world):
     spec = world.fronts.procs[pid]["spec"]
     assert (spec["target"], spec["uid"], spec["keep_fds"], spec["extra_env"], spec["profile"]) == \
         ("front", 898, [H.GO_FD], {H.GO_FD_ENV: str(H.GO_FD)}, None)
-    assert spec["argv"][-1] == H.FRONT_MODULE
+    # Lane F3 b: the stub runs with root's FIXED args (its argparse needs --unix/--port + --log).
+    assert spec["argv"][-7:] == [H.FRONT_MODULE, "--unix", "/run/levain/gw/slot0/gw.sock", "--slot", "0",
+                                 "--log", "/dev/null"]
     assert world.fronts.alive() == [pid]                                # left running, detached
 
 
 def test_render_front_program_is_a_parameter(world):
     s = _prepared(world)
     world.seams.front_module = "levain.gateway.front"
+    world.seams.front_args = lambda host, slot: ("--config-fd", "5")
     assert world.main(["render", s], _blob())[1]["ok"]
     (p,) = world.fronts.procs.values()
-    assert p["spec"]["argv"][-1] == "levain.gateway.front"
+    assert p["spec"]["argv"][-3:] == ["levain.gateway.front", "--config-fd", "5"]
 
 
 def test_staging_emptied_at_render(world):
