@@ -68,12 +68,19 @@ def _uint(token: str, field: str, lo: int, hi: int) -> int:
     return value
 
 
+def is_sudoers_alias(name: str) -> bool:
+    """True for a name sudoers reads as a keyword or an alias rather than a user: ``ALL``, or any
+    all-uppercase name (an alias name is uppercase). A rule naming one would be a grant for whatever
+    the keyword or alias stands for. The one home of this rule; hands imports it."""
+    return bool(_SUDOERS_ALIAS_RE.fullmatch(name))
+
+
 def check_operator_name(name: str) -> str:
     """The operator name: the imported sudoers-safe ``OPERATOR_RE``, never a Levain account name, never
     root (DECISION: the narrowest reading of 'one operator uid'), and never a name sudoers reads as a
     keyword or an alias (``ALL``, or any all-uppercase name), which would widen the rule."""
     if (not OPERATOR_RE.fullmatch(name) or name.startswith("_levain") or name == "root"
-            or _SUDOERS_ALIAS_RE.fullmatch(name)):
+            or is_sudoers_alias(name)):
         raise Refused("bad-operator", repr(name))
     return name
 

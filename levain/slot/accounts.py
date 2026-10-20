@@ -131,6 +131,32 @@ def account_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
     return steps
 
 
+def revive_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
+    """Bring a singleton tombstone back at its recorded id (CONTRACT §20): relabel it Levain's live
+    marker, keep it with no login shell, no home and its password locked, and lift the expiry the
+    tombstone set. Its own primary group was never removed. Supplementary groups are re-added by
+    :func:`membership_steps`, as for a fresh account."""
+    steps: list[Step] = []
+    for a in accounts:
+        if a.name not in SINGLETONS:
+            raise Refused("not-levain-name", f"{a.name!r} is not a singleton; slot tombstones are never revived")
+        if host == "darwin":
+            # Every dscl -create sets the attribute whether or not the record exists: the same steps as a
+            # fresh account, at the recorded id, relabel the tombstone and leave nothing of it behind.
+            steps += [Step(f"revive {a.name} at its recorded id {a.uid}: {s.why}", s.argv)
+                      for s in account_steps(host, [a])]
+        elif host == "linux":
+            steps += [
+                Step(f"revive {a.name} at its recorded id {a.uid}: relabel, no login shell, no home, locked",
+                     (_abs("usermod"), "--comment", SLOT_MARKER, "--shell", _nologin(), "--home", NO_HOME[host],
+                      "--lock", a.name)),
+                Step(f"revive {a.name}: lift the tombstone's expiry", (_abs("chage"), "--expiredate", "-1", a.name)),
+            ]
+        else:
+            raise Refused("unsupported-host", repr(host))
+    return steps
+
+
 def shared_group_steps(host: HostOS, groups: Sequence[Group]) -> list[Step]:
     steps: list[Step] = []
     for g in groups:
@@ -196,5 +222,5 @@ def delete_group_steps(host: HostOS, names: Iterable[str]) -> list[Step]:
 
 __all__ = ["Account", "Group", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
            "accounts_of", "account_steps", "delete_group_steps", "group_members", "membership_pairs",
-           "membership_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
+           "membership_steps", "revive_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
            "tombstone_steps"]

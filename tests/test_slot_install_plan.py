@@ -293,26 +293,72 @@ def test_slot_socket_group_inherited(host):
     assert not [p for p in by_path if p.parent in (R / "gw", R / "qb", R / "planner") and p.name not in ("slot0", "slot1")]
 
 
+#: CONTRACT §2.1, every DIRECTORY row not per-session, typed out (§20: install makes each one whoever
+#: "Written by" names). "R" = root : the host's gid-0 group; "OP" = the operator.
+STORE_DIRS = {
+    "": ("R", "R", 0o755), "live": ("R", "R", 0o711), "alloc": ("R", "R", 0o700),
+    "sessions": ("_levain_control", "_levain_control", 0o700),
+    "slots": ("R", "R", 0o755), "retained": ("R", "R", 0o700), "trash": ("R", "R", 0o700),
+    "staging": ("R", "R", 0o711), "export": ("R", "R", 0o755),
+    "export/operator": ("_levain_export", "levain-export", 0o2750),
+    "export/dispatch": ("_levain_export", "levain-dispatch-export", 0o2750),
+    "queue/requests": ("_levain_qbroker", "levain-queue", 0o750),
+    "queue/answers": ("OP", "levain-queue", 0o770),
+    "policy": ("R", "R", 0o755), "lineage": ("_levain_control", "levain-lineage", 0o750),
+    "keys": ("_levain_keys", "_levain_keys", 0o700), "routes": ("R", "R", 0o755),
+    "routes/dispatch": ("_levain_control", "_levain_keys", 0o750),
+    "routes/verifiers": ("_levain_control", "_levain_control", 0o700),
+    "slots/e0": ("R", "R", 0o755), "slots/v0": ("R", "R", 0o755), "slots/e0/keep": ("R", "R", 0o700),
+}
+
+
 @pytest.mark.parametrize("host", HOSTS)
 def test_store_layout(host):
     plan = plan_setup(_setup(1, 1), _facts(host))
     L = STORE[host]
     root_grp = "wheel" if host == "darwin" else "root"
-    rows = {r.path: (r.owner, r.group, r.mode) for r in plan.rows}
-    assert rows[L] == ("root", root_grp, 0o755)
-    assert rows[L / "live"] == ("root", root_grp, 0o711)
-    assert rows[L / "alloc"] == ("root", root_grp, 0o700)
-    assert rows[L / "staging"] == ("root", root_grp, 0o711)
-    assert rows[L / "export" / "operator"] == ("_levain_export", "levain-export", 0o2750)
-    assert rows[L / "export" / "dispatch"] == ("_levain_export", "levain-dispatch-export", 0o2750)
-    assert rows[L / "policy"] == ("root", root_grp, 0o755)
-    assert rows[L / "reserve"] == ("root", root_grp, 0o600)
-    assert rows[RUN[host] / "control"] == ("_levain_control", "levain-control", 0o750)
+    rows = {r.path: (r.owner, r.group, r.mode, r.kind) for r in plan.rows}
+    sub = {"R": "root", "OP": OP}
+    for rel, (owner, group, mode) in STORE_DIRS.items():
+        want = (sub.get(owner, owner), root_grp if group == "R" else sub.get(group, group), mode, "dir")
+        assert rows[L / rel if rel else L] == want, rel
+        p = str(L / rel if rel else L)
+        mk = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("mkdir")]
+        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")]
+        assert mk and chmod and mk[0] < chmod[0] and plan.steps[chmod[0]].argv[1] == f"{mode:04o}", rel
+    # a verifier slot has no keep/ (§2.1: L/slots/e<n>/keep only)
+    assert L / "slots/v0/keep" not in rows
+    # the parent of a child row exists before the child
+    order = [s.argv[-1] for s in plan.steps if s.argv and s.argv[0].endswith("mkdir")]
+    for rel in STORE_DIRS:
+        if "/" in rel:
+            assert order.index(str(L / rel.rsplit("/", 1)[0])) < order.index(str(L / rel)), rel
+    assert rows[L / "reserve"] == ("root", root_grp, 0o600, "file")
+    assert rows[RUN[host] / "control"] == ("_levain_control", "levain-control", 0o750, "dir")
     assert L == (Path("/private/var/levain") if host == "darwin" else Path("/var/levain"))
-    # every path the plan touches is under the store, the run dir, or a fixed system path
+    # L/routes/base.json: §4.3's base map, no routes, canonical, root 0644, never over an existing map
+    base = [s for s in plan.steps if s.write and s.write[0] == L / "routes" / "base.json"]
+    assert len(base) == 1 and base[0].write[1:] == ('{"format":"levain-routes-base/1","routes":[]}', 0o644)
+    assert base[0].skip_if[-2:] == ("-e", str(L / "routes" / "base.json"))
+    # every file the plan writes is under the store or a fixed system path
+    fixed = ("/etc/sudoers.d/", "/usr/local/libexec/levain/", "/usr/libexec/levain/", "/Library/LaunchDaemons/",
+             "/etc/systemd/system/", "/etc/pf.anchors/", "/etc/apparmor.d/")
     for s in plan.steps:
         if s.write:
-            assert str(s.write[0]).startswith((str(L), "/etc/sudoers.d/")), s.write[0]
+            assert str(s.write[0]).startswith((str(L) + "/", *fixed)), s.write[0]
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_keys_dir_traversable_by_both_peers(host):
+    """§2.2 (c7.2): R/keys/ is _levain_keys:_levain_keys 0711. Its two sockets' peers (every
+    _levain_gw<n> via levain-gwfronts; _levain_control) are both OTHER to the dir: they traverse, none lists."""
+    plan = plan_setup(_setup(2, 1), _facts(host))
+    row = next(r for r in plan.rows if r.path == RUN[host] / "keys")
+    assert (row.owner, row.group, row.mode) == ("_levain_keys", "_levain_keys", 0o711)
+    groups = {a.name: set(a.groups) | {a.name} for a in plan.accounts}
+    for peer in ("_levain_gw0", "_levain_gw1", "_levain_control"):
+        assert peer != row.owner and row.group not in groups[peer]
+        assert row.mode & 0o001 and not row.mode & 0o004      # other: x, not r
 
 
 # --- §5.1 / §5.2 sudoers --------------------------------------------------------------------------------

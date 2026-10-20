@@ -596,7 +596,19 @@ def sshd_dropin_path(hands_user: str) -> Path:
     return _SSHD_DROPIN_DIR / f"levain-{hands_user}.conf"
 
 
+def _operator_name_refused(operator: str) -> bool:
+    """True when ``operator`` could change meaning in a sudoers rule: outside :data:`OPERATOR_RE`
+    (matched whole, so a trailing newline is refused too), or a name sudoers reads as a keyword or an
+    alias (``ALL``, any all-uppercase name), which would make the rule a grant for every user the
+    keyword or alias covers. The alias rule has one home, :func:`levain.slot.grammar.is_sudoers_alias`."""
+    from levain.slot.grammar import is_sudoers_alias   # levain.slot imports this module
+
+    return not OPERATOR_RE.fullmatch(operator) or is_sudoers_alias(operator)
+
+
 def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -> str:
+    if _operator_name_refused(operator):
+        raise HandsSetupError(f"refusing the account name {operator!r}: it could change meaning in a sudoers rule")
     return (
         f"# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
         f"# {operator} may run commands as the Levain hands user {hands_user}, and nothing else.\n"
@@ -677,7 +689,7 @@ def plan_setup(
     """The setup, as data. ``sshd_dropins`` says whether sshd reads ``sshd_config.d``;
     ``deny_lists`` are the cron/at deny files that exist (only an existing list is extended: where
     neither list exists, cron's default is site-specific and a new deny file could widen it)."""
-    if not OPERATOR_RE.match(operator):
+    if _operator_name_refused(operator):
         raise HandsSetupError(f"refusing the account name {operator!r}: it could change meaning in a sudoers rule")
     ed = Path(entity_dir).expanduser().resolve()
     hands = hands_user_name(ed)
@@ -1269,7 +1281,7 @@ def invoking_operator() -> str:
             "run setup-isolation through sudo from your own account (SUDO_USER names the account "
             "that will be allowed to start the hands user)."
         )
-    if not OPERATOR_RE.match(operator):
+    if _operator_name_refused(operator):
         raise HandsSetupError(f"refusing the account name {operator!r}: it could change meaning in a sudoers rule")
     pwd.getpwnam(operator)  # KeyError → the caller reports it
     return operator

@@ -180,16 +180,26 @@ def _take(pool: range, n: int, blocked: set[int], what: str) -> list[int]:
 
 def allocate(host: HostOS, *, egress: Iterable[SlotId], verifier: Iterable[SlotId],
              used: Iterable[int], retired: Iterable[int],
-             singletons: bool = False, shared: bool = False) -> Allocation:
+             singletons: bool = False, shared: bool = False,
+             revive: Mapping[str, int] | None = None) -> Allocation:
     """Ids for the given slots (and, for ``setup``, the singletons and shared groups), highest free
-    first, skipping every id in use (as a uid or a gid) and every retired id."""
+    first, skipping every id in use (as a uid or a gid) and every retired id. ``revive``: singletons
+    that come back at their recorded id (§20); they take no fresh id."""
     egress, verifier = tuple(egress), tuple(verifier)
-    blocked = set(used) | set(retired)
+    revive = dict(revive or {})
+    blocked = set(used) | set(retired) | set(revive.values())
     r = RANGES[host]
+    for name, uid in revive.items():
+        if name not in SINGLETONS or uid not in r.singletons:
+            raise Refused("account-exists", f"{name} at {uid} is not a singleton tombstone in range")
+    if len(set(revive.values())) != len(revive):
+        raise Refused("tombstone-id-conflict", "two tombstones record one id")
     names = [n for s in egress + verifier for n in s.accounts]
     ids = dict(zip(names, _take(r.slots, len(names), blocked, "slot accounts")))
     if singletons:
-        ids.update(zip(SINGLETONS, _take(r.singletons, len(SINGLETONS), blocked, "singletons")))
+        fresh = [n for n in SINGLETONS if n not in revive]
+        got = dict(zip(fresh, _take(r.singletons, len(fresh), blocked, "singletons")))
+        ids.update((n, revive[n] if n in revive else got[n]) for n in SINGLETONS)
     gids: dict[str, int] = {}
     if shared:
         gids = dict(zip(SHARED_GROUPS, _take(r.shared, len(SHARED_GROUPS), blocked, "shared groups")))

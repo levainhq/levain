@@ -52,33 +52,53 @@ def _root(host: HostOS, path: Path, mode: int, kind: Literal["dir", "file"] = "d
     return Row(path, "root", ROOT_GROUP[host], mode, kind)
 
 
-def base_store_rows(host: HostOS) -> list[Row]:
-    """The store rows ``install`` writes that do not depend on the slots (CONTRACT §2.1)."""
+def base_store_rows(host: HostOS, operator: str) -> list[Row]:
+    """Every store DIRECTORY row of CONTRACT §2.1 that does not depend on a slot or a session, with the
+    owner, group and mode its row gives, whoever the row's "Written by" names (§20): the named writer
+    writes the files inside. Plus ``L/slots/pool.lock``, the one file ``install`` writes here.
+
+    Per-session rows (``<S>``, ``L/retained/<session>``, ``L/trash/<session>``, ``L/staging/<session>``,
+    ``L/export/*/<session>``) are made by the verb that makes the session, not here. ``operator``
+    owns ``L/queue/answers/`` (§2.1)."""
     L = STORE[host]
     return [
         _root(host, L, 0o755),
         _root(host, L / "live", 0o711),
         _root(host, L / "alloc", 0o700),
+        Row(L / "sessions", "_levain_control", "_levain_control", 0o700),
         _root(host, L / "slots", 0o755),
         _root(host, L / "slots" / "pool.lock", 0o600, "file"),
+        _root(host, L / "retained", 0o700),
+        _root(host, L / "trash", 0o700),
         _root(host, L / "staging", 0o711),
         _root(host, L / "export", 0o755),
         Row(L / "export" / "operator", "_levain_export", "levain-export", 0o2750),
         Row(L / "export" / "dispatch", "_levain_export", "levain-dispatch-export", 0o2750),
+        # §2.1 gives no row for L/queue/ itself; root 0755 so the members of its two children reach them.
+        _root(host, L / "queue", 0o755),
+        Row(L / "queue" / "requests", "_levain_qbroker", "levain-queue", 0o750),
+        Row(L / "queue" / "answers", operator, "levain-queue", 0o770),
         _root(host, L / "policy", 0o755),
+        Row(L / "lineage", "_levain_control", "levain-lineage", 0o750),
         Row(L / "keys", "_levain_keys", "_levain_keys", 0o700),
         _root(host, L / "routes", 0o755),
+        Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o750),
+        Row(L / "routes" / "verifiers", "_levain_control", "_levain_control", 0o700),
     ]
 
 
 def policy_rows(host: HostOS) -> list[Row]:
     """What ``setup`` needs before it writes the operator record: the store root and policy dir."""
-    return [r for r in base_store_rows(host) if r.path in (STORE[host], STORE[host] / "policy")]
+    L = STORE[host]
+    return [_root(host, L, 0o755), _root(host, L / "policy", 0o755)]
 
 
 def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:
-    """``L/slots/{e,v}<n>/`` and its lock (CONTRACT §2.1)."""
-    return [_root(host, slot.slot_dir(STORE[host]), 0o755), _root(host, slot.lock_path(STORE[host]), 0o600, "file")]
+    """``L/slots/{e,v}<n>/``, its lock, and (egress class) its ``keep/`` dir (CONTRACT §2.1)."""
+    rows = [_root(host, slot.slot_dir(STORE[host]), 0o755), _root(host, slot.lock_path(STORE[host]), 0o600, "file")]
+    if slot.slot_class == "egress":
+        rows.append(_root(host, slot.slot_dir(STORE[host]) / "keep", 0o700))
+    return rows
 
 
 def base_run_rows(host: HostOS) -> list[Row]:
@@ -89,7 +109,8 @@ def base_run_rows(host: HostOS) -> list[Row]:
         _root(host, R / "gw", 0o755),
         _root(host, R / "qb", 0o755),
         _root(host, R / "planner", 0o755),
-        Row(R / "keys", "_levain_keys", "levain-gwfronts", 0o750),
+        # §2.2 (c7.2): every uid traverses, none lists; each socket's own mode, group and peer check gate it.
+        Row(R / "keys", "_levain_keys", "_levain_keys", 0o711),
         Row(R / "control", "_levain_control", "levain-control", 0o750),
         Row(R / "reaper", "root", "levain-wake", 0o750),
     ]
@@ -138,6 +159,26 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
             Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)),
         ]
     return steps
+
+
+BASE_ROUTES_FORMAT = "levain-routes-base/1"   # CONTRACT §4.3
+
+
+def base_routes_path(host: HostOS) -> Path:
+    return STORE[host] / "routes" / "base.json"
+
+
+def base_routes_steps(host: HostOS) -> list[Step]:
+    """``L/routes/base.json`` (CONTRACT §2.1, §4.3): the S1 base map with no routes, canonical JSON,
+    root 0644. Routes are added by the install verbs that own them. Written only when absent, so a
+    later ``setup`` over a store that kept its map does not empty it."""
+    from levain.contracts import canon
+
+    p = base_routes_path(host)
+    t = _tools(host)
+    return [Step(f"write the empty base route map {p}",
+                 write=(p, canon.canonical({"format": BASE_ROUTES_FORMAT, "routes": []}), 0o644),
+                 skip_if=(t["test"], "-e", str(p)))]
 
 
 def reserve_row(host: HostOS) -> Row:
