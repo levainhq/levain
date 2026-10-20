@@ -35,6 +35,7 @@ MAX_DAYS = 9999                              # DECISION: the contract sets no ca
 MAX_INODES = 999_999_999                     # DECISION: the contract sets no cap
 MAX_SECONDS = 999_999                        # DECISION: the contract sets no cap
 MAX_ROOT_LEN = 1024                          # DECISION: the smaller PATH_MAX of the two hosts
+MAX_ROOTS = 16                               # CONTRACT §23 (the --root record)
 
 #: Defaults the CLI front fills in; the helper's grammar itself requires the flags (CONTRACT §1).
 DEFAULT_SLOTS = 8
@@ -42,6 +43,11 @@ DEFAULT_VERIFIER_SLOTS = 2
 
 _UINT_RE = re.compile(r"0|[1-9][0-9]*")
 _SUDOERS_ALIAS_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+#: CONTRACT §23: sudoers reserved words, matched case-insensitively (``Defaults``, any ``*_Alias``).
+_SUDOERS_RESERVED_RE = re.compile(r"defaults|.*_alias", re.IGNORECASE)
+#: CONTRACT §23: a ``--root`` is absolute, with no control character and no quote, so the record that
+#: carries it and every message that prints it read it as one path.
+_ROOT_RE = re.compile(r"/[^\x00-\x1f\x7f\"']*")
 
 
 @dataclass(frozen=True)
@@ -70,15 +76,16 @@ def _uint(token: str, field: str, lo: int, hi: int) -> int:
 
 def is_sudoers_alias(name: str) -> bool:
     """True for a name sudoers reads as a keyword or an alias rather than a user: ``ALL``, or any
-    all-uppercase name (an alias name is uppercase). A rule naming one would be a grant for whatever
-    the keyword or alias stands for. The one home of this rule; hands imports it."""
-    return bool(_SUDOERS_ALIAS_RE.fullmatch(name))
+    all-uppercase name (an alias name is uppercase), or a reserved word (``Defaults``, ``*_Alias``,
+    any case; CONTRACT §23). A rule naming one would be a grant for whatever the keyword or alias
+    stands for, or would not parse as a user rule at all. The one home of this rule; hands imports it."""
+    return bool(_SUDOERS_ALIAS_RE.fullmatch(name) or _SUDOERS_RESERVED_RE.fullmatch(name))
 
 
 def check_operator_name(name: str) -> str:
     """The operator name: the imported sudoers-safe ``OPERATOR_RE``, never a Levain account name, never
     root (DECISION: the narrowest reading of 'one operator uid'), and never a name sudoers reads as a
-    keyword or an alias (``ALL``, or any all-uppercase name), which would widen the rule."""
+    keyword, an alias or a reserved word (:func:`is_sudoers_alias`), which would widen the rule."""
     if (not OPERATOR_RE.fullmatch(name) or name.startswith("_levain") or name == "root"
             or is_sudoers_alias(name)):
         raise Refused("bad-operator", repr(name))
@@ -86,7 +93,7 @@ def check_operator_name(name: str) -> str:
 
 
 def _root_syntax(path: str) -> str:
-    if (not path.startswith("/") or len(path) > MAX_ROOT_LEN
+    if (not _ROOT_RE.fullmatch(path) or len(path) > MAX_ROOT_LEN
             or any(part in (".", "..") for part in path.split("/"))):
         raise Refused("bad-root", repr(path))
     return path
@@ -105,6 +112,8 @@ def _parse_setup(rest: Sequence[str]) -> InstallCommand:
         value = rest[i + 1]
         if flag == "--root":
             root = _root_syntax(value)
+            if len(roots) >= MAX_ROOTS:
+                raise Refused("out-of-range", f"at most {MAX_ROOTS} --root")
             if root in roots:
                 raise Refused("duplicate-root", repr(root))
             roots.append(root)
@@ -190,15 +199,18 @@ def check_roots(roots: Sequence[str], operator_uid: int, *,
                 realpath: Callable[[str], str] = os.path.realpath,
                 lstat: Callable[[str], os.stat_result] = os.lstat) -> tuple[str, ...]:
     """CONTRACT §5 preamble: each ``--root`` resolved with ``realpath`` must be an existing directory
-    owned by the operator. Returns the resolved paths, in argv order."""
+    owned by the operator, and the resolved path passes the same pattern as the argv token. At most
+    :data:`MAX_ROOTS`. Returns the resolved paths, in argv order."""
+    if len(roots) > MAX_ROOTS:
+        raise Refused("out-of-range", f"at most {MAX_ROOTS} --root")
     out: list[str] = []
     for root in roots:
         resolved = realpath(_root_syntax(root))
-        if not resolved.startswith("/") or resolved == "/":
+        if not _ROOT_RE.fullmatch(resolved) or resolved == "/":
             raise Refused("bad-root", f"{root!r} resolves to {resolved!r}")
         try:
             st = lstat(resolved)
-        except FileNotFoundError:
+        except OSError:   # absent, a non-directory on the way (NotADirectoryError), unreadable
             raise Refused("root-missing", repr(resolved)) from None
         if not _stat.S_ISDIR(st.st_mode):
             raise Refused("root-not-directory", repr(resolved))

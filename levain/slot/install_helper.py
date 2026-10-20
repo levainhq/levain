@@ -1,15 +1,23 @@
-"""The install helper's plans (CONTRACT §5.2): ``plan_setup``, ``plan_undo``, ``plan_replenish``.
+"""The install helper's plans (CONTRACT §5.2, §23): ``plan_setup``, ``plan_undo``, ``plan_replenish``.
 
 Each takes the parsed command (:mod:`levain.slot.grammar`) and the host's facts as data, and returns
 an :class:`InstallPlan` whose ``steps`` are :class:`~levain.firing.hands.Step` s. Nothing here acts on
-the OS; every refusal (live lease, second operator, capacity, index space) is raised while planning.
+the OS; every refusal (live lease, second operator, capacity, index space, a missing tool) is raised
+while planning, before step 1.
+
+Re-runs (§23): setup writes the operator record LAST, so ``already-set-up`` means a complete install,
+and a setup that failed part-way re-runs: every step is idempotent (a ``skip_if`` where the act is
+not), and what the interrupted run made is kept at the ids it holds (:attr:`HostFacts.levain_live`).
+Undo removes the runtime rule first and the install rule last, before the record, so a failed undo
+re-runs through the install helper.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs, _kill_all
@@ -19,13 +27,27 @@ from levain.slot.accounts import (Account, Group, account_steps, accounts_of, de
                                   shared_groups_of, tombstone_steps)
 from levain.slot.grammar import LEASE_EXEMPT, InstallCommand, check_roots
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
-                             SlotClass, SlotId, allocate, check_capacity, choose_indices, is_levain_account,
-                             retired_ids_text, spent_indices)
+                             SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
+                             is_levain_account, retired_ids_text, spent_indices)
 from levain.slot.layout import (Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                policy_rows, reserve_row, reserve_steps, row_steps, slot_rows)
-from levain.slot.sudoers import remove_sudoers_steps, sudoers_steps
+                                policy_rows, reserve_row, reserve_steps, roots_steps, row_steps,
+                                single_filesystem_steps, slot_rows, tmpfiles_steps, tmpfiles_undo_steps,
+                                ungroup_steps)
+from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_steps
 
 OPERATOR_FORMAT = "levain-operator/1"
+
+
+def _tool_present(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _xcode_ready() -> bool:
+    """macOS: ``/usr/bin/python3`` is a shim that runs only once the developer tools are installed."""
+    try:
+        return subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -43,6 +65,13 @@ class HostFacts:
     retired: frozenset[int] = frozenset()             # the retired-ids file
     #: Accounts whose label is Levain's retired marker (``accounts.SLOT_RETIRED_MARKER``), name -> uid.
     levain_tombstones: Mapping[str, int] = field(default_factory=dict)
+    #: Accounts and shared groups whose label is Levain's live marker (``accounts.SLOT_MARKER``),
+    #: name -> id: what an interrupted setup made (§23).
+    levain_live: Mapping[str, int] = field(default_factory=dict)
+    #: Whether a host tool (an absolute path) is present and executable (§23 preflight).
+    tool_present: Callable[[str], bool] = _tool_present
+    #: macOS: ``xcode-select -p`` succeeds (§23 preflight).
+    xcode_ready: Callable[[], bool] = _xcode_ready
 
 
 @dataclass(frozen=True)
@@ -57,7 +86,9 @@ class InstallPlan:
     roots: tuple[str, ...] = ()
     retired_after: frozenset[int] = field(default_factory=frozenset)
     revived: tuple[str, ...] = ()        # singletons brought back at their recorded id (§20)
+    kept: tuple[str, ...] = ()           # names an interrupted setup made, kept at their ids (§23)
     pending: tuple[str, ...] = ()        # programs the plan points at that are not built yet
+    services: tuple[str, ...] = ()       # the §1.3 services whose units this plan installs
 
 
 # --- the operator record ---------------------------------------------------------------------------
@@ -109,26 +140,79 @@ def preflight(cmd: InstallCommand, facts: HostFacts) -> None:
         raise Refused("operator-mismatch", f"configured for {rec.get('name')!r}")
 
 
+def plan_tools(steps: Sequence[Step]) -> tuple[str, ...]:
+    """Every host program a step runs: its argv's, its ``skip_if``'s and its validator's."""
+    return tuple(sorted({x[0] for s in steps for x in (s.argv, s.skip_if, s.validate) if x}))
+
+
+def check_tools(facts: HostFacts, steps: Sequence[Step], *, python: bool = False) -> None:
+    """CONTRACT §23: every tool a step names is an absolute path that is present, refused by name
+    before step 1 (a bare name is a tool the plan could not resolve on this host). ``python``: the
+    plan installs root-run Python, so on macOS ``xcode-select -p`` must succeed too."""
+    missing = [t for t in plan_tools(steps) if not t.startswith("/") or not facts.tool_present(t)]
+    if missing:
+        raise Refused("tool-missing", ", ".join(missing))
+    if python and facts.host == "darwin" and not facts.xcode_ready():
+        raise Refused("tool-missing", f"{root_tree.ROOT_PYTHON['darwin']} (xcode-select -p fails: no developer tools)")
+
+
 # --- setup -----------------------------------------------------------------------------------------
 
 
-def _singletons_to_revive(facts: HostFacts) -> dict[str, int]:
-    """CONTRACT §20: a singleton name present on the host is revived only when it carries Levain's
-    retired marker AND its recorded id sits in the singleton range; any other present singleton or
-    shared-group name is ``account-exists``."""
-    singles = RANGES[facts.host].singletons
+@dataclass(frozen=True)
+class _Reuse:
+    revive: dict[str, int]              # singleton tombstones, at their recorded id (§20)
+    keep: dict[str, int]                # accounts an interrupted setup made (§23)
+    keep_shared: dict[str, int]         # shared groups an interrupted setup made (§23)
+    kept_slots: tuple[SlotId, ...]      # the slots whose accounts those are
+
+
+def _reuse(facts: HostFacts, slots: int, verifier_slots: int) -> _Reuse:
+    """CONTRACT §20 + §23: what setup brings back or keeps, and what it refuses as ``account-exists``.
+
+    A singleton carrying Levain's live marker at an id in its range is kept (an interrupted setup made
+    it); one carrying the retired marker at such an id is revived; any other present singleton or
+    shared-group name is refused. Slot accounts carrying the live marker are kept with their slot."""
+    r = RANGES[facts.host]
+    live = facts.levain_live
     revive: dict[str, int] = {}
+    keep: dict[str, int] = {}
+    keep_shared: dict[str, int] = {}
     taken: list[str] = []
     for name in SINGLETONS:
-        uid = facts.levain_tombstones.get(name)
-        if uid is not None and uid in singles:
-            revive[name] = uid
-        elif uid is not None or name in facts.existing_names:
+        cur, tomb = live.get(name), facts.levain_tombstones.get(name)
+        if cur is not None and in_own_range(facts.host, name, cur):
+            keep[name] = cur
+        elif cur is not None:
             taken.append(name)
-    taken += [g for g in SHARED_GROUPS if g in facts.existing_names]
+        elif tomb is not None and tomb in r.singletons:
+            revive[name] = tomb
+        elif tomb is not None or name in facts.existing_names:
+            taken.append(name)
+    for g in SHARED_GROUPS:
+        cur = live.get(g)
+        if cur is not None and isinstance(cur, int) and cur in r.shared:
+            keep_shared[g] = cur
+        elif cur is not None or g in facts.existing_names:
+            taken.append(g)
+    kept: set[SlotId] = set()
+    for name, uid in sorted(live.items()):
+        m = SLOT_NAME_RE.fullmatch(name)
+        if m is None or not is_levain_account(name):
+            continue
+        if not in_own_range(facts.host, name, uid):
+            taken.append(name)
+            continue
+        keep[name] = uid
+        kept.add(SlotId("egress" if m.group(1) in ("s", "gw") else "none", int(m.group(2))))
     if taken:
         raise Refused("account-exists", ", ".join(taken))
-    return revive
+    for cls, want in (("egress", slots), ("none", verifier_slots)):
+        have = sum(1 for s in kept if s.slot_class == cls)
+        if have > want:
+            raise Refused("account-exists", f"an interrupted setup made {have} {cls} slots; re-run it with "
+                                            f"at least that many")
+    return _Reuse(revive, keep, keep_shared, tuple(sorted(kept)))
 
 
 def _levain_package() -> Path:
@@ -141,55 +225,72 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
                realpath: Callable[[str], str] = os.path.realpath,
                lstat: Callable[[str], os.stat_result] = os.lstat,
                read_sysctl: Callable[[str], str] | None = None,
-               source: Path | None = None) -> InstallPlan:
+               source: Path | None = None,
+               program_exists: Callable[[Path], bool] = Path.is_file) -> InstallPlan:
     """``read_sysctl``: reads a ``/proc/sys`` path (Linux, the AppArmor userns check); ``source``: the
-    ``levain`` package copied into the root import tree (default: the one running)."""
+    ``levain`` package copied into the root import tree (default: the one running);
+    ``program_exists``: whether a service's program file is in ``source`` (§23)."""
     if cmd.verb != "setup" or cmd.slots is None or cmd.verifier_slots is None or cmd.operator is None:
         raise Refused("wrong-verb", cmd.verb)
     preflight(cmd, facts)
     host = facts.host
     assert facts.operator_uid is not None
     roots = check_roots(cmd.roots, facts.operator_uid, realpath=realpath, lstat=lstat)
-    revive = _singletons_to_revive(facts)
+    reuse = _reuse(facts, cmd.slots, cmd.verifier_slots)
     check_capacity(host, cmd.slots, cmd.verifier_slots, facts.retired)
-    # Slot, front and verifier-pair tombstones are never revived: their indices are spent (§20).
-    egress = choose_indices("egress", cmd.slots, spent_indices("egress", facts.existing_names))
-    verifier = choose_indices("none", cmd.verifier_slots, spent_indices("none", facts.existing_names))
-    alloc = allocate(host, egress=egress, verifier=verifier, used=facts.used_ids, retired=facts.retired,
-                     singletons=True, shared=True, revive=revive)
+    # Slot, front and verifier-pair tombstones are never revived: their indices are spent (§20). Slots
+    # an interrupted setup made come first, at their own indices (§23).
+    chosen: dict[SlotClass, tuple[SlotId, ...]] = {}
+    for cls, want in (("egress", cmd.slots), ("none", cmd.verifier_slots)):
+        mine = tuple(s for s in reuse.kept_slots if s.slot_class == cls)
+        spent = spent_indices(cls, facts.existing_names) | {s.index for s in mine}
+        chosen[cls] = mine + choose_indices(cls, want - len(mine), spent)
+    alloc = allocate(host, egress=chosen["egress"], verifier=chosen["none"], used=facts.used_ids,
+                     retired=facts.retired, singletons=True, shared=True, revive=reuse.revive,
+                     keep=reuse.keep, keep_shared=reuse.keep_shared)
     accounts = accounts_of(alloc)
-    fresh = tuple(a for a in accounts if a.name not in revive)
-    revived = tuple(a for a in accounts if a.name in revive)
+    fresh = tuple(a for a in accounts if a.name not in reuse.revive)
+    revived = tuple(a for a in accounts if a.name in reuse.revive)
     groups = shared_groups_of(alloc, cmd.operator)
     early = policy_rows(host)
     rows = ([r for r in base_store_rows(host, cmd.operator) if r not in early] + base_run_rows(host)
             + slot_rows(host, alloc.slots))
+    package = source or _levain_package()
+    services, skipped = units.built_services(host, package, exists=program_exists)
     if host == "linux":
         restricted = (bwrap.userns_restricted() if read_sysctl is None
                       else bwrap.userns_restricted(read_sysctl))
         confinement = [*bwrap.bwrap_steps(apparmor_userns_restricted=restricted), *netns.netns_steps(alloc.slots)]
+        boot_dirs = tmpfiles_steps(host, alloc.slots)
     else:
-        confinement = pf.load_steps(alloc.slots)
+        confinement = pf.load_steps(alloc.slots, alloc.ids)
+        boot_dirs = []
     steps: list[Step] = [
         *row_steps(host, early),
-        # One operator per machine, claimed before anything else is made (CONTRACT header).
-        Step(f"record {cmd.operator} as this machine's one operator",
-             write=(operator_record_path(host), operator_record_text(cmd.operator, facts.operator_uid), 0o644)),
         *shared_group_steps(host, groups),
         *account_steps(host, fresh),
         *revive_steps(host, revived),
         *membership_steps(host, membership_pairs(accounts, cmd.operator)),
         *row_steps(host, rows),
+        *boot_dirs,
         *reserve_steps(host),
+        *single_filesystem_steps(host, alloc.slots),
         *base_routes_steps(host),
-        *root_tree.tree_steps(host, source or _levain_package()),
+        *roots_steps(host, roots),
+        *root_tree.tree_steps(host, package),
         *confinement,
-        *units.install_steps(host),
+        *units.install_steps(host, services),
         *sudoers_steps(host, cmd.operator),
+        # LAST (§23): only a complete install is `already-set-up`; until this, setup re-runs.
+        Step(f"record {cmd.operator} as this machine's one operator (last)",
+             write=(operator_record_path(host), operator_record_text(cmd.operator, facts.operator_uid), 0o644)),
     ]
+    check_tools(facts, steps, python=True)
+    kept = tuple(sorted(reuse.keep)) + tuple(sorted(reuse.keep_shared))
     return InstallPlan("setup", host, tuple(steps), alloc, accounts, groups,
                        tuple(early + rows + [reserve_row(host)]), roots, facts.retired,
-                       revived=tuple(a.name for a in revived), pending=root_tree.PENDING + units.PENDING)
+                       revived=tuple(a.name for a in revived), kept=kept,
+                       pending=root_tree.PENDING + skipped, services=tuple(s.name for s in services))
 
 
 # --- undo ------------------------------------------------------------------------------------------
@@ -205,27 +306,39 @@ def slots_of(names: Iterable[str]) -> tuple[SlotId, ...]:
     return tuple(sorted(out))
 
 
+def check_account_ids(host: HostOS, accounts: Mapping[str, int]) -> None:
+    """CONTRACT §23: every name a Levain account name, every uid in §1.1's range for its class, so no
+    caller-supplied id can aim a kill or a retire at an account that is not one of ours."""
+    for name, uid in accounts.items():
+        if not is_levain_account(name):
+            raise Refused("not-levain-name", repr(name))
+        if not in_own_range(host, name, uid):
+            raise Refused("bad-token", f"{name}: uid {uid!r} is not in its §1.1 range")
+
+
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
               shared_groups: Iterable[str]) -> InstallPlan:
     """``accounts``: every live Levain account the directory service holds, name -> uid (== gid);
-    ``shared_groups``: the shared groups present. Order: sudoers first (no new helper calls), every
-    service stopped and its unit removed, ids retired, processes stopped, accounts tombstoned, shared
-    groups deleted, slot confinement removed (Linux netns + the slots' bwrap; macOS the pf anchor),
-    operator record LAST. The store and the root import tree stay."""
+    ``shared_groups``: the shared groups present. Order (§23): the runtime sudoers rule first (no new
+    runtime-helper calls), every service stopped and its unit removed, ids retired, processes stopped,
+    accounts tombstoned, every dir naming a shared group given back to root's group, the shared groups
+    deleted, slot confinement removed (Linux netns + the slots' bwrap + tmpfiles.d; macOS the pf
+    rules and pf's enable reference), the install sudoers rule, the operator record LAST. Every step
+    is safe to re-run. The store and the root import tree stay."""
     if cmd.verb != "undo":
         raise Refused("wrong-verb", cmd.verb)
     preflight(cmd, facts)
     host = facts.host
-    for name in accounts:
-        if not is_levain_account(name):
-            raise Refused("not-levain-name", repr(name))
+    check_account_ids(host, accounts)
+    rec = facts.operator_record
+    assert rec is not None and isinstance(rec.get("name"), str)
     groups = [g for g in shared_groups if g in SHARED_GROUPS]
     retired_after = frozenset(facts.retired) | frozenset(accounts.values())
     path = RETIRED_IDS_PATH[host]
     mkdir = "/bin/mkdir" if host == "darwin" else _abs("mkdir")
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     steps: list[Step] = [
-        *remove_sudoers_steps(host),
+        *remove_runtime_sudoers_steps(host),
         # Every service stops before anything is removed; their unit files go with them.
         *units.uninstall_steps(host),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
@@ -235,13 +348,16 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         steps.append(Step(f"stop every process of {name}, and check they are gone", call=lambda u=uid: _kill_all(u)))
     for name in sorted(accounts):
         steps += tombstone_steps(host, name)
+    steps += ungroup_steps(host, str(rec["name"]))
     steps += delete_group_steps(host, groups)
     # Slot confinement goes only after every slot process is stopped and its account tombstoned.
     if host == "linux":
-        steps += netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps()
+        steps += netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
     else:
         steps += pf.unload_steps()
+    steps += remove_install_sudoers_steps(host)
     steps.append(Step("remove the operator record (last)", (rm, "-f", str(operator_record_path(host)))))
+    check_tools(facts, steps)
     return InstallPlan("undo", host, tuple(steps), retired_after=retired_after)
 
 
@@ -249,15 +365,19 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
 
 
 def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifier_slots: int,
-                   live: Mapping[SlotClass, Iterable[int]]) -> InstallPlan:
+                   live: Mapping[SlotClass, Iterable[int]],
+                   accounts: Mapping[str, int] | None = None) -> InstallPlan:
     """Bring each class back to its configured count with NEW indices (a retired index is never
-    reissued). ``live``: the indices of each class still in service."""
+    reissued). ``live``: the indices of each class still in service; ``accounts``: their accounts,
+    name -> uid (macOS: the pf rules name every slot in service by uid, §23)."""
     if cmd.verb != "replenish":
         raise Refused("wrong-verb", cmd.verb)
     preflight(cmd, facts)
     host = facts.host
     rec = facts.operator_record
     assert rec is not None
+    accounts = dict(accounts or {})
+    check_account_ids(host, accounts)
     check_capacity(host, slots, verifier_slots, facts.retired)
     new: dict[SlotClass, tuple[SlotId, ...]] = {}
     for cls, want in (("egress", slots), ("none", verifier_slots)):
@@ -265,19 +385,27 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
         new[cls] = choose_indices(cls, max(0, want - len(have)),
                                   spent_indices(cls, facts.existing_names) | have)
     alloc = allocate(host, egress=new["egress"], verifier=new["none"], used=facts.used_ids, retired=facts.retired)
-    accounts = accounts_of(alloc)
+    made = accounts_of(alloc)
     rows = slot_rows(host, alloc.slots)
     in_service = tuple(SlotId(cls, i) for cls in ("egress", "none") for i in live.get(cls, ()))  # type: ignore[arg-type]
+    if host == "linux":
+        # Every slot in service keeps its boot-time run dirs; the slots' bwrap re-copied if the system's changed.
+        confinement = [*netns.netns_steps(alloc.slots), *tmpfiles_steps(host, in_service + alloc.slots),
+                       *bwrap.copy_steps()]
+    else:
+        # The rules re-rendered for every slot in service, the new ones with it, so no slot runs
+        # without its pf rules.
+        confinement = pf.load_steps(in_service + alloc.slots, {**accounts, **alloc.ids})
     steps = [
-        *account_steps(host, accounts),
-        *membership_steps(host, membership_pairs(accounts, None)),
+        *account_steps(host, made),
+        *membership_steps(host, membership_pairs(made, None)),
         *row_steps(host, rows),
-        # The new slots' confinement: their namespaces (Linux); the anchor re-rendered for every slot
-        # in service, the new ones with it, so no slot runs without its pf rules (macOS).
-        *(netns.netns_steps(alloc.slots) if host == "linux" else pf.load_steps(in_service + alloc.slots)),
+        *confinement,
     ]
-    return InstallPlan("replenish", host, tuple(steps), alloc, accounts, (), tuple(rows), (), facts.retired)
+    check_tools(facts, steps)
+    return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(rows), (), facts.retired)
 
 
-__all__ = ["HostFacts", "InstallPlan", "OPERATOR_FORMAT", "operator_record", "operator_record_text",
-           "parse_operator_record", "plan_replenish", "plan_setup", "plan_undo", "preflight"]
+__all__ = ["HostFacts", "InstallPlan", "OPERATOR_FORMAT", "check_account_ids", "check_tools", "operator_record",
+           "operator_record_text", "parse_operator_record", "plan_replenish", "plan_setup", "plan_tools",
+           "plan_undo", "preflight"]

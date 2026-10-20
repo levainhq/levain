@@ -599,8 +599,8 @@ def sshd_dropin_path(hands_user: str) -> Path:
 def _operator_name_refused(operator: str) -> bool:
     """True when ``operator`` could change meaning in a sudoers rule: outside :data:`OPERATOR_RE`
     (matched whole, so a trailing newline is refused too), or a name sudoers reads as a keyword or an
-    alias (``ALL``, any all-uppercase name), which would make the rule a grant for every user the
-    keyword or alias covers. The alias rule has one home, :func:`levain.slot.grammar.is_sudoers_alias`."""
+    alias or a reserved word (``ALL``, any all-uppercase name, ``Defaults``, ``*_Alias``), which would
+    make the rule a grant for every user the keyword or alias covers, or not a user rule at all. The alias rule has one home, :func:`levain.slot.grammar.is_sudoers_alias`."""
     from levain.slot.grammar import is_sudoers_alias   # levain.slot imports this module
 
     return not OPERATOR_RE.fullmatch(operator) or is_sudoers_alias(operator)

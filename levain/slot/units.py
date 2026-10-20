@@ -1,30 +1,35 @@
-"""The S1 services (CONTRACT §1.3): LaunchDaemon plists (macOS) and systemd units (Linux), and the
+"""The S1 services (CONTRACT §1.3, §23): LaunchDaemon plists (macOS) and systemd units (Linux), and the
 Steps that install, start, stop and remove them.
 
-Each runs the root interpreter isolated (:data:`levain.slot.root_tree.PY_FLAGS`) on its program in
-the root-owned import tree, ``<import tree>/levain/slot/services/<name>.py``, as its own uid. The
-program bodies are not built yet (:data:`PENDING` names them in the plan output).
+Each runs the root interpreter isolated (:data:`levain.slot.root_tree.PY_FLAGS`) on the shared
+service entry script (:func:`levain.slot.layout.service_entry_path`), the same bootstrap the helpers
+use (§23): the root-owned import tree is the one path added, then
+:mod:`levain.slot.service_boot` checks the service's run dir and runs its program,
+``levain/slot/services/<name>.py``, as its own uid. Setup installs a unit only when that program
+exists in the package it copies (§23); the plan names every skipped one in ``pending``.
 
 Start order: systemd orders by ``After=`` (with ``Wants=``, so a dependency is pulled in but its
 restart does not restart the dependant). launchd has no ordering key, so on macOS the order is the
-order setup bootstraps the jobs in; at boot launchd starts them together and each restarts until its
-dependency answers (``KeepAlive``).
+order setup bootstraps the jobs in; at boot launchd starts them together, and each non-root service
+exits until its run dir is there (§22), restarting under ``KeepAlive``.
+
+The reaper is ONE long-running root service; its pass interval and its wake socket are inside its
+program, so no unit here carries a timer or a start interval (§23).
 """
 from __future__ import annotations
 
 import plistlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Iterable, Literal
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
-from levain.slot.layout import IMPORT_TREE, ROOT_GROUP
+from levain.slot.layout import ROOT_GROUP, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
 
 LAUNCHD_DIR = Path("/Library/LaunchDaemons")
 SYSTEMD_DIR = Path("/etc/systemd/system")
-REAPER_TIMER_SECONDS = 60   # §1.3
 
 
 @dataclass(frozen=True)
@@ -47,8 +52,6 @@ SERVICES: tuple[Service, ...] = (
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",)),
 )
 
-PENDING = tuple(f"levain/slot/services/{s.name}.py (the {s.title} program) does not exist yet" for s in SERVICES)
-
 
 def services_for(host: HostOS) -> tuple[Service, ...]:
     if host not in ("darwin", "linux"):
@@ -56,16 +59,38 @@ def services_for(host: HostOS) -> tuple[Service, ...]:
     return tuple(s for s in SERVICES if host in s.hosts)
 
 
-def _by_name(name: str) -> Service:
-    return next(s for s in SERVICES if s.name == name)
+def by_name(name: str) -> Service:
+    for s in SERVICES:
+        if s.name == name:
+            return s
+    raise Refused("bad-token", f"service: {name!r}")
 
 
-def program_path(host: HostOS, svc: Service) -> Path:
-    return IMPORT_TREE[host] / "levain" / "slot" / "services" / f"{svc.name}.py"
+def program_relpath(svc: Service) -> str:
+    return f"levain/slot/services/{svc.name}.py"
+
+
+def program_source(package: Path, svc: Service) -> Path:
+    """The program inside the ``levain`` package directory ``package`` (the one setup copies)."""
+    return package / "slot" / "services" / f"{svc.name}.py"
+
+
+def built_services(host: HostOS, package: Path, *,
+                   exists: Callable[[Path], bool] = Path.is_file) -> tuple[tuple[Service, ...], tuple[str, ...]]:
+    """(the services whose program exists in ``package``, a ``pending`` line for each that does not)."""
+    have: list[Service] = []
+    skipped: list[str] = []
+    for s in services_for(host):
+        if exists(program_source(package, s)):
+            have.append(s)
+        else:
+            unit = launchd_label(s) if host == "darwin" else systemd_name(s)
+            skipped.append(f"{program_relpath(s)} (the {s.title} program) does not exist yet: {unit} not installed")
+    return tuple(have), tuple(skipped)
 
 
 def argv(host: HostOS, svc: Service) -> tuple[str, ...]:
-    return (ROOT_PYTHON[host], PY_FLAGS, str(program_path(host, svc)))
+    return (ROOT_PYTHON[host], PY_FLAGS, str(service_entry_path(host)), svc.name)
 
 
 def _group(host: HostOS, svc: Service) -> str:
@@ -107,13 +132,10 @@ def systemd_path(name: str) -> Path:
     return SYSTEMD_DIR / name
 
 
-REAPER_TIMER = "levain-reaper.timer"
-
-
 def systemd_unit_text(svc: Service) -> str:
     if "linux" not in svc.hosts:
         raise Refused("unsupported-host", f"{svc.name} is macOS only")
-    deps = " ".join(systemd_name(_by_name(a)) for a in svc.after)
+    deps = " ".join(systemd_name(by_name(a)) for a in svc.after)
     unit = [f"Description=Levain {svc.title} (CONTRACT §1.3)"]
     if deps:
         unit += [f"After={deps}", f"Wants={deps}"]
@@ -122,71 +144,61 @@ def systemd_unit_text(svc: Service) -> str:
         "# Written by the Levain install helper; removed by its undo verb.",
         "[Unit]", *unit, "",
         "[Service]", "Type=simple", f"User={svc.user}", f"Group={_group('linux', svc)}",
-        f"ExecStart={' '.join(argv('linux', svc))}", "Restart=always", "RestartSec=1", "",
+        f"ExecStart={' '.join(argv('linux', svc))}",
+        # A service that keeps failing backs off step by step instead of restarting at a fixed short interval.
+        "Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30", "",
         "[Install]", "WantedBy=multi-user.target", "",
     ]
     return "\n".join(lines)
 
 
-def reaper_timer_text() -> str:
-    return "\n".join([
-        "# Written by the Levain install helper; removed by its undo verb.",
-        "[Unit]", "Description=Levain reaper wake (CONTRACT §1.3)", "",
-        "[Timer]", f"OnBootSec={REAPER_TIMER_SECONDS}", f"OnUnitActiveSec={REAPER_TIMER_SECONDS}",
-        f"Unit={systemd_name(_by_name('reaper'))}", "",
-        "[Install]", "WantedBy=timers.target", "",
-    ])
-
-
 # --- steps -------------------------------------------------------------------------------------------
 
 
-def start_order(host: HostOS) -> tuple[str, ...]:
+def start_order(host: HostOS, services: Iterable[Service] | None = None) -> tuple[str, ...]:
     """The unit names setup starts, in order (macOS labels / Linux unit names)."""
-    out: list[str] = []
-    for s in services_for(host):
-        if host == "darwin":
-            out.append(launchd_label(s))
-        else:
-            out.append(systemd_name(s))
-            if s.name == "reaper":
-                out.append(REAPER_TIMER)
-    return tuple(out)
+    chosen = services_for(host) if services is None else tuple(services)
+    names = {s.name for s in chosen}
+    ordered = [s for s in services_for(host) if s.name in names]
+    return tuple(launchd_label(s) if host == "darwin" else systemd_name(s) for s in ordered)
 
 
-def _launchd_job_absent(label: str) -> tuple[bool, str]:
+def _launchd_job_absent(label: str, run: Callable[..., object] | None = None) -> tuple[bool, str]:
     import subprocess
 
-    r = subprocess.run(["/bin/launchctl", "print", f"system/{label}"], capture_output=True)
-    return (r.returncode != 0, f"{label} is still loaded" if r.returncode == 0 else "")
+    r = (run or subprocess.run)(["/bin/launchctl", "print", f"system/{label}"], capture_output=True)
+    loaded = getattr(r, "returncode", 1) == 0
+    return (not loaded, f"{label} is still loaded" if loaded else "")
 
 
-def install_steps(host: HostOS) -> list[Step]:
-    """Write every unit, then start each in :func:`start_order`."""
+def install_steps(host: HostOS, services: Iterable[Service]) -> list[Step]:
+    """Write each of ``services``' units, then start each in :func:`start_order`."""
+    chosen = [s for s in services_for(host) if s.name in {x.name for x in services}]
     steps: list[Step] = []
     if host == "darwin":
-        for s in services_for(host):
+        for s in chosen:
             steps.append(Step(f"write the LaunchDaemon {launchd_label(s)} ({s.title}, as {s.user})",
                               write=(launchd_path(s), launchd_plist_text(s), 0o644),
                               validate=("/usr/bin/plutil", "-lint")))
-        for s in services_for(host):
+        for s in chosen:
             steps.append(Step(f"start {launchd_label(s)}", ("/bin/launchctl", "bootstrap", "system", str(launchd_path(s))),
                               skip_if=("/bin/launchctl", "print", f"system/{launchd_label(s)}")))
         return steps
+    if not chosen:
+        return steps
     systemctl = _abs("systemctl")
-    for s in services_for(host):
+    for s in chosen:
         steps.append(Step(f"write the systemd unit {systemd_name(s)} ({s.title}, as {s.user})",
                           write=(systemd_path(systemd_name(s)), systemd_unit_text(s), 0o644)))
-    steps.append(Step(f"write the systemd timer {REAPER_TIMER}",
-                      write=(systemd_path(REAPER_TIMER), reaper_timer_text(), 0o644)))
     steps.append(Step("tell systemd about the units", (systemctl, "daemon-reload")))
-    for name in start_order(host):
+    for name in start_order(host, chosen):
         steps.append(Step(f"enable and start {name}", (systemctl, "enable", "--now", name)))
     return steps
 
 
 def uninstall_steps(host: HostOS) -> list[Step]:
-    """Stop every service in reverse start order, then remove the unit files."""
+    """Stop every service in reverse start order, then remove the unit files. Every service, installed
+    or not: each step is a no-op for one that is absent, so a failed undo re-runs."""
     steps: list[Step] = []
     if host == "darwin":
         for s in reversed(services_for(host)):
@@ -206,6 +218,6 @@ def uninstall_steps(host: HostOS) -> list[Step]:
     return steps
 
 
-__all__ = ["PENDING", "REAPER_TIMER", "SERVICES", "Service", "argv", "install_steps", "launchd_label",
-           "launchd_plist_text", "program_path", "reaper_timer_text", "services_for", "start_order",
+__all__ = ["SERVICES", "Service", "argv", "built_services", "by_name", "install_steps", "launchd_label",
+           "launchd_plist_text", "program_relpath", "program_source", "services_for", "start_order",
            "systemd_name", "systemd_unit_text", "uninstall_steps"]

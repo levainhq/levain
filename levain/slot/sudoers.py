@@ -38,9 +38,11 @@ def install_sudoers_text(host: HostOS, operator: str) -> str:
     op = check_operator_name(operator)
     h = str(install_helper_path(host))
     return (
-        "# Written by the Levain install helper (CONTRACT §5.2); removed by its undo verb.\n"
-        f"Defaults!{h} timestamp_timeout=0\n"
-        f"{op} ALL=(root) {h}\n"
+        "# Written by the Levain install helper (CONTRACT §5.2, §23); removed by its undo verb.\n"
+        # §23: the tag and the Defaults both pin the password, so a later NOPASSWD drop-in or a
+        # `!authenticate` default elsewhere cannot make this rule passwordless.
+        f"Defaults!{h} authenticate, timestamp_timeout=0\n"
+        f"{op} ALL=(root) PASSWD: {h}\n"
     )
 
 
@@ -57,9 +59,19 @@ def sudoers_steps(host: HostOS, operator: str) -> list[Step]:
     ]
 
 
-def remove_sudoers_steps(host: HostOS) -> list[Step]:
-    rm = "/bin/rm" if host == "darwin" else _abs("rm")
-    return [Step(f"remove {p} (no new helper calls)", (rm, "-f", str(p))) for p in (RUNTIME_SUDOERS, INSTALL_SUDOERS)]
+def _rm(host: HostOS) -> str:
+    return "/bin/rm" if host == "darwin" else _abs("rm")
+
+
+def remove_runtime_sudoers_steps(host: HostOS) -> list[Step]:
+    """Undo's FIRST step (CONTRACT §23): no new runtime-helper calls."""
+    return [Step(f"remove {RUNTIME_SUDOERS} (no new runtime-helper calls)", (_rm(host), "-f", str(RUNTIME_SUDOERS)))]
+
+
+def remove_install_sudoers_steps(host: HostOS) -> list[Step]:
+    """Undo's last removal before the operator record (CONTRACT §23): until it goes, a failed undo
+    re-runs through the install helper."""
+    return [Step(f"remove {INSTALL_SUDOERS} (the install helper's rule, last)", (_rm(host), "-f", str(INSTALL_SUDOERS)))]
 
 
 def sudoers_paths() -> tuple[Path, Path]:

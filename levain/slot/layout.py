@@ -7,9 +7,10 @@ set last and no chown can clear it.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Mapping
+from typing import Callable, Iterable, Literal, Mapping
 
 from levain.firing.hands import HostOS, Step, _abs
 from levain.slot import Refused
@@ -33,6 +34,11 @@ def runtime_helper_path(host: HostOS) -> Path:
 
 def install_helper_path(host: HostOS) -> Path:
     return HELPER_DIR[host] / "install-helper"
+
+
+def service_entry_path(host: HostOS) -> Path:
+    """The one bootstrap entry every service unit runs (CONTRACT §23), beside the helpers' entries."""
+    return HELPER_DIR[host] / "service-entry"
 
 
 def operator_record_path(host: HostOS) -> Path:
@@ -153,7 +159,8 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
         if r.kind == "dir":
             steps.append(Step(f"create {p}", (t["mkdir"], p), skip_if=(t["test"], "-d", p)))
         else:
-            steps.append(Step(f"create {p}", write=(r.path, "", r.mode)))
+            # Created only when absent: a lock file is never replaced under a process holding it.
+            steps.append(Step(f"create {p}", write=(r.path, "", r.mode), skip_if=(t["test"], "-e", p)))
         steps += [
             Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)),
             Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)),
@@ -188,9 +195,115 @@ def reserve_row(host: HostOS) -> Row:
 def reserve_steps(host: HostOS) -> list[Step]:
     """``L/reserve``: written zeros, never fallocate (CONTRACT §7.5)."""
     t, r = _tools(host), reserve_row(host)
+    size = ("/usr/bin/stat", "-f", "%z") if host == "darwin" else (_abs("stat"), "-c", "%s")
+    at_size = ("/bin/sh", "-c", f'[ "$({" ".join(size)} -- "$1")" = {RESERVE_BYTES} ]', "sh", str(r.path))
     return [
+        # Skipped when the reserve already exists at its size (a re-run, CONTRACT §23).
         Step(f"write {r.path} as zeros", (t["dd"], "if=/dev/zero", f"of={r.path}", f"bs={_MIB}",
-                                         f"count={RESERVE_BYTES // _MIB}")),
+                                         f"count={RESERVE_BYTES // _MIB}"), skip_if=at_size),
         Step(f"own {r.path} as root", (t["chown"], f"{r.owner}:{r.group}", str(r.path))),
         Step(f"set {r.path} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", str(r.path))),
     ]
+
+
+# --- the --root record (CONTRACT §23, a §2.1 row) ------------------------------------------------------
+
+ROOTS_FORMAT = "levain-roots/1"
+
+
+def roots_path(host: HostOS) -> Path:
+    return STORE[host] / "policy" / "roots"
+
+
+def roots_record_text(roots: Iterable[str]) -> str:
+    from levain.contracts import canon
+
+    return canon.canonical({"format": ROOTS_FORMAT, "roots": list(roots)})
+
+
+def roots_steps(host: HostOS, roots: Iterable[str]) -> list[Step]:
+    """``L/policy/roots``: the resolved ``--root`` paths setup was given, root 0644."""
+    return [Step(f"record the --root paths in {roots_path(host)}",
+                 write=(roots_path(host), roots_record_text(roots), 0o644))]
+
+
+# --- one filesystem (CONTRACT §2.1) -----------------------------------------------------------------------
+
+
+def single_filesystem_paths(host: HostOS, slots: Iterable[SlotId]) -> list[Path]:
+    """The store dirs that move entries between each other by rename (CONTRACT §2.1 heading): live,
+    alloc, retained, trash, staging, export (both children), and every egress slot's keep/."""
+    L = STORE[host]
+    out = [L / d for d in ("live", "alloc", "retained", "trash", "staging", "export", "export/operator",
+                           "export/dispatch")]
+    out += [s.slot_dir(L) / "keep" for s in sorted(set(slots)) if s.slot_class == "egress"]
+    return out
+
+
+def same_filesystem(paths: Iterable[Path], *, stat: Callable[[str], os.stat_result] = os.stat) -> tuple[bool, str]:
+    """Every path's ``st_dev`` equal (a rename between two of them never crosses filesystems)."""
+    devs: dict[int, list[str]] = {}
+    for p in paths:
+        try:
+            devs.setdefault(stat(str(p)).st_dev, []).append(str(p))
+        except OSError as e:
+            return False, f"{p}: {e.strerror or e}"
+    if len(devs) > 1:
+        return False, "the store spans filesystems: " + "; ".join(", ".join(v) for v in devs.values())
+    return True, ""
+
+
+def single_filesystem_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
+    paths = single_filesystem_paths(host, slots)
+    return [Step(f"check the store is one filesystem ({len(paths)} dirs, st_dev equal)",
+                 call=lambda: same_filesystem(paths))]
+
+
+# --- Linux: R/ at boot (CONTRACT §22) -----------------------------------------------------------------------
+
+TMPFILES_CONF = Path("/etc/tmpfiles.d/levain.conf")
+
+
+def tmpfiles_text(host: HostOS, slots: Iterable[SlotId]) -> str:
+    """One ``d`` line per §2.2 dir (the base rows, then each slot's), parents first, with the row's
+    owner, group and mode (setgid kept); systemd applies it before any unit starts."""
+    rows = base_run_rows(host) + [r for s in sorted(set(slots)) for r in slot_run_rows(host, s)]
+    lines = ["# Written by the Levain install helper (CONTRACT §22); removed by its undo verb."]
+    lines += [f"d {r.path} {r.mode:04o} {r.owner} {r.group} -" for r in rows]
+    return "\n".join(lines) + "\n"
+
+
+def tmpfiles_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
+    """Write ``/etc/tmpfiles.d/levain.conf`` for ``slots`` (every slot in service) and apply it now.
+    Setup and replenish run the same list. Linux only."""
+    if host != "linux":
+        raise Refused("unsupported-host", f"{host}: tmpfiles.d is Linux's")
+    return [
+        Step(f"write {TMPFILES_CONF} (the run dirs systemd recreates at boot)",
+             write=(TMPFILES_CONF, tmpfiles_text(host, slots), 0o644)),
+        Step(f"apply {TMPFILES_CONF.name}", (_abs("systemd-tmpfiles"), "--create", TMPFILES_CONF.name)),
+    ]
+
+
+def tmpfiles_undo_steps() -> list[Step]:
+    return [Step(f"remove {TMPFILES_CONF}", (_abs("rm"), "-f", str(TMPFILES_CONF)))]
+
+
+# --- undo: no shared gid left on a dir (CONTRACT §23) --------------------------------------------------------
+
+
+def shared_group_rows(host: HostOS, operator: str) -> list[Row]:
+    """Every store and run dir whose row names a shared group (§1.2)."""
+    from levain.slot.ids import SHARED_GROUPS
+
+    return [r for r in base_store_rows(host, operator) + base_run_rows(host) if r.group in SHARED_GROUPS]
+
+
+def ungroup_steps(host: HostOS, operator: str) -> list[Step]:
+    """Before the shared groups are deleted: each dir that names one goes to the host's gid-0 group,
+    so no deleted gid stays on a dir for a later group to inherit. A dir already gone is skipped."""
+    chgrp = "/usr/bin/chgrp" if host == "darwin" else _abs("chgrp")
+    test = _tools(host)["test"]
+    return [Step(f"give {r.path} back to {ROOT_GROUP[host]} (its group {r.group} is about to be deleted)",
+                 (chgrp, ROOT_GROUP[host], str(r.path)), skip_if=(test, "!", "-e", str(r.path)))
+            for r in shared_group_rows(host, operator)]

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
-from levain.firing.hands import HostOS, Step, _abs, _darwin_leave_groups, _nologin
+from levain.firing.hands import HostOS, Step, _abs, _absent, _darwin_leave_groups, _nologin
 from levain.slot import Refused
 from levain.slot.ids import SINGLETONS, SLOT_NAME_RE, Allocation, is_levain_account
 
@@ -118,12 +118,15 @@ def account_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
             ]
         elif host == "linux":
             steps += [
+                # Skipped when present: a setup interrupted after this step re-runs (CONTRACT §23); the
+                # planner kept such an account at the id it already holds.
                 Step(f"create {a.name}'s own primary group",
-                     (_abs("groupadd"), "--system", "--gid", str(a.gid), a.name)),
+                     (_abs("groupadd"), "--system", "--gid", str(a.gid), a.name),
+                     skip_if=(_abs("getent"), "group", a.name)),
                 Step(f"create the account {a.name} (system range, no home, no login shell)",
                      (_abs("useradd"), "--system", "--uid", str(a.uid), "--gid", str(a.gid),
                       "--no-create-home", "--home-dir", NO_HOME[host], "--shell", _nologin(),
-                      "--comment", SLOT_MARKER, a.name)),
+                      "--comment", SLOT_MARKER, a.name), skip_if=(_abs("getent"), "passwd", a.name)),
                 Step(f"lock {a.name}'s password", (_abs("usermod"), "--lock", a.name)),
             ]
         else:
@@ -164,7 +167,8 @@ def shared_group_steps(host: HostOS, groups: Sequence[Group]) -> list[Step]:
             steps += _darwin_group(g.name, g.gid, "shared")
         else:
             steps.append(Step(f"create the shared group {g.name}",
-                              (_abs("groupadd"), "--system", "--gid", str(g.gid), g.name)))
+                              (_abs("groupadd"), "--system", "--gid", str(g.gid), g.name),
+                              skip_if=(_abs("getent"), "group", g.name)))
     return steps
 
 
@@ -216,7 +220,8 @@ def delete_group_steps(host: HostOS, names: Iterable[str]) -> list[Step]:
     steps = []
     for g in names:
         argv = (*_DSCL, "-delete", f"/Groups/{g}") if host == "darwin" else (_abs("groupdel"), g)
-        steps.append(Step(f"delete the shared group {g}", argv))
+        # Skipped when already gone, so a failed undo re-runs (CONTRACT §23).
+        steps.append(Step(f"delete the shared group {g}", argv, skip_if=_absent("group", host, g)))
     return steps
 
 

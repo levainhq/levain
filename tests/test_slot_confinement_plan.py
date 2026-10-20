@@ -1,22 +1,37 @@
-"""S1 session 1b-i plan layer (CONTRACT c7.2 §1.1-1.3, §2.1, §8.3, §9.1, §20): services, the pf anchor,
-Linux namespaces, the slots' bwrap, the root import tree, singleton revival. Every row is a plan or text
-assertion; nothing touches the OS (the one file write is to a pytest tmp file, for the pf.conf hook)."""
+"""S1 session 1b plan layer (CONTRACT c7.5 §1.1-1.3, §2.1, §8.3, §9.1, §20, §22, §23): services and their
+shared bootstrap, the pf rules, Linux namespaces, the slots' bwrap, the root import tree, singleton
+revival. Every row is a plan or text assertion; nothing touches the OS (file writes go to pytest tmp
+dirs; the executed entry runs a stub program from a tmp tree)."""
 from __future__ import annotations
 
+import os
 import plistlib
+import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from levain.firing.hands import _ensure_line
-from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+import levain
+from levain.firing import hands
+from levain.slot import Refused, bwrap, netns, pf, root_tree, service_boot, units
 from levain.slot.accounts import SLOT_MARKER
 from levain.slot.grammar import parse_install_argv
 from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
-from levain.slot.layout import IMPORT_TREE, install_helper_path, runtime_helper_path
+from levain.slot.layout import IMPORT_TREE, RUN, install_helper_path, runtime_helper_path, service_entry_path
 
 HOSTS = ("linux", "darwin")
+
+
+@pytest.fixture(autouse=True)
+def _tools_resolve(monkeypatch):
+    """A plan for the OTHER host names tools this test host lacks; the §23 preflight refuses a bare
+    name, so here every tool resolves (to its real path when present)."""
+    real = hands.shutil.which
+    monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
 OP, OP_UID = "alice", 501
 
 
@@ -25,7 +40,9 @@ def _setup(n=8, m=2):
 
 
 def _facts(host, **kw):
-    base = dict(caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID)
+    # every host tool present: the plan, not this test host, decides what it names (§23 preflight)
+    base = dict(caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID, tool_present=lambda p: True,
+                xcode_ready=lambda: True)
     base.update(kw)
     return HostFacts(host, **base)
 
@@ -35,7 +52,8 @@ def _set_up(host, **kw):
 
 
 def _plan(host, n=8, m=2, restricted="0", **kw):
-    return plan_setup(_setup(n, m), _facts(host, **kw), read_sysctl=lambda p: restricted)
+    return plan_setup(_setup(n, m), _facts(host, **kw), read_sysctl=lambda p: restricted,
+                      program_exists=lambda p: True)
 
 
 def _refusal(fn, *a, **kw) -> str:
@@ -130,7 +148,8 @@ GOLDEN_CONTROL_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 	<array>
 		<string>/usr/bin/python3</string>
 		<string>-IS</string>
-		<string>/usr/local/lib/levain-root/levain/slot/services/control.py</string>
+		<string>/usr/local/libexec/levain/service-entry</string>
+		<string>control</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -151,25 +170,14 @@ StartLimitIntervalSec=0
 Type=simple
 User=_levain_dispatch
 Group=_levain_dispatch
-ExecStart=/usr/bin/python3 -IS /usr/lib/levain-root/levain/slot/services/dispatch.py
+ExecStart=/usr/bin/python3 -IS /usr/libexec/levain/service-entry dispatch
 Restart=always
 RestartSec=1
+RestartSteps=5
+RestartMaxDelaySec=30
 
 [Install]
 WantedBy=multi-user.target
-"""
-
-GOLDEN_REAPER_TIMER = """# Written by the Levain install helper; removed by its undo verb.
-[Unit]
-Description=Levain reaper wake (CONTRACT §1.3)
-
-[Timer]
-OnBootSec=60
-OnUnitActiveSec=60
-Unit=levain-reaper.service
-
-[Install]
-WantedBy=timers.target
 """
 
 #: §1.3 typed out: name -> (uid, starts after, restart, macOS label, Linux unit)
@@ -188,14 +196,12 @@ def test_service_units_golden():
     assert set(by) == set(TABLE_1_3)
     assert units.launchd_plist_text(by["control"]) == GOLDEN_CONTROL_PLIST
     assert units.systemd_unit_text(by["dispatch"]) == GOLDEN_DISPATCH_UNIT
-    assert units.reaper_timer_text() == GOLDEN_REAPER_TIMER
     for name, (uid, after, restart, label, unit) in TABLE_1_3.items():
         s = by[name]
         assert (s.user, s.after, s.restart) == (uid, after, restart), name
         job = plistlib.loads(units.launchd_plist_text(s).encode())
         assert job["Label"] == label and job["UserName"] == uid and job["KeepAlive"] is (restart == "always")
-        assert job["ProgramArguments"] == ["/usr/bin/python3", "-IS",
-                                           f"/usr/local/lib/levain-root/levain/slot/services/{name}.py"]
+        assert job["ProgramArguments"] == ["/usr/bin/python3", "-IS", "/usr/local/libexec/levain/service-entry", name]
         if unit is None:
             assert "linux" not in s.hosts
             assert _refusal(units.systemd_unit_text, s) == "unsupported-host"
@@ -203,12 +209,49 @@ def test_service_units_golden():
         text = units.systemd_unit_text(s)
         assert units.systemd_name(s) == unit
         assert f"User={uid}\n" in text and "Restart=always\n" in text
-        assert f"ExecStart=/usr/bin/python3 -IS /usr/lib/levain-root/levain/slot/services/{name}.py\n" in text
+        assert f"ExecStart=/usr/bin/python3 -IS /usr/libexec/levain/service-entry {name}\n" in text
+        # §23 item 8: a failing service backs off instead of looping at 1 Hz
+        assert "RestartSteps=5\n" in text and "RestartMaxDelaySec=30\n" in text
         deps = " ".join(TABLE_1_3[a][4] for a in after)
         assert (f"After={deps}\n" in text) if after else ("After=" not in text)
-    # the program bodies are named as not built, in the plan output
-    plan = _plan("linux")
-    assert all(any(f"services/{n}.py" in p and "does not exist yet" in p for p in plan.pending) for n in TABLE_1_3)
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_reaper_unit_has_no_timer(host):
+    """§23: the reaper is ONE long-running root service; its interval lives in its program."""
+    reaper = units.by_name("reaper")
+    assert reaper.restart == "always"
+    plan = _plan(host)
+    written = [s.write for s in plan.steps if s.write]
+    assert not [w for w in written if str(w[0]).endswith(".timer")]
+    for path, text, _ in written:
+        if str(path).startswith(("/Library/LaunchDaemons/", "/etc/systemd/system/")):
+            assert "StartInterval" not in text and "OnUnitActiveSec" not in text and "[Timer]" not in text, path
+    assert not [n for n in units.start_order(host) if n.endswith(".timer")]
+    assert not [s for s in _undo(host, {}).steps if s.argv and any(a.endswith(".timer") for a in s.argv)]
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_units_install_only_with_their_program(host, tmp_path):
+    """§23: setup installs a unit only when its program is in the package it copies; the plan names
+    every skipped one."""
+    pkg = tmp_path / "levain"
+    (pkg / "slot" / "services").mkdir(parents=True)
+    (pkg / "slot" / "services" / "control.py").write_text("")
+    plan = plan_setup(_setup(), _facts(host), read_sysctl=lambda p: "0", source=pkg)
+    assert plan.services == ("control",)
+    written = [str(s.write[0]) for s in plan.steps if s.write]
+    unit_dir = "/Library/LaunchDaemons/" if host == "darwin" else "/etc/systemd/system/"
+    assert [w for w in written if w.startswith(unit_dir)] == [
+        "/Library/LaunchDaemons/com.levain.control.plist" if host == "darwin"
+        else "/etc/systemd/system/levain-control.service"]
+    skipped = [p for p in plan.pending if "not installed" in p]
+    assert len(skipped) == len(units.services_for(host)) - 1
+    assert all("services/control.py" not in p for p in skipped)
+    # nothing built: no unit, no start step at all
+    bare = plan_setup(_setup(), _facts(host), read_sysctl=lambda p: "0", source=tmp_path / "x" / "levain")
+    assert bare.services == () and not [s for s in bare.steps if s.write and str(s.write[0]).startswith(unit_dir)]
+    assert not [s for s in bare.steps if s.argv and ("bootstrap" in s.argv or "--now" in s.argv)]
 
 
 @pytest.mark.parametrize("host", HOSTS)
@@ -220,8 +263,7 @@ def test_services_start_order(host):
         writes = [i for i, s in enumerate(plan.steps) if s.write and str(s.write[0]).startswith("/Library/LaunchDaemons/")]
     else:
         starts = [s.argv[-1] for s in plan.steps if s.argv[1:3] == ("enable", "--now")]
-        names = [n.removeprefix("levain-").removesuffix(".service") for n in starts if n.endswith(".service")]
-        assert starts[starts.index("levain-reaper.service") + 1] == "levain-reaper.timer"
+        names = [n.removeprefix("levain-").removesuffix(".service") for n in starts]
         writes = [i for i, s in enumerate(plan.steps) if s.write and str(s.write[0]).startswith("/etc/systemd/system/")]
     want = [n for n in TABLE_1_3 if host == "darwin" or TABLE_1_3[n][4]]
     assert sorted(names) == sorted(want)
@@ -232,12 +274,12 @@ def test_services_start_order(host):
                        if s.argv and ("bootstrap" in s.argv or "--now" in s.argv))
     assert max(writes) < first_start                       # every unit written before any starts
     # services start after the accounts, the import tree and the confinement they run under
-    tree_write = next(i for i, s in enumerate(plan.steps) if s.write and s.write[0] == install_helper_path(host))
+    tree_write = next(i for i, s in enumerate(plan.steps) if s.write and s.write[0] == service_entry_path(host))
     assert tree_write < first_start
-    # undo: every service stopped right after sudoers, reverse order, before anything is removed
+    # undo: every service stopped right after the runtime sudoers rule, reverse order, before anything is removed
     undo = _undo(host, dict(plan.allocation.ids))
     stops = [i for i, s in enumerate(undo.steps) if s.argv and ("bootout" in s.argv or "disable" in s.argv)]
-    assert stops and min(stops) == 2
+    assert stops and min(stops) == 1
     first_removal = next(i for i, s in enumerate(undo.steps) if s.write or "tombstone" in s.why or
                          (s.argv and s.argv[0].endswith("rm") and "sudoers" not in s.argv[-1]))
     assert max(stops) < first_removal
@@ -246,74 +288,232 @@ def test_services_start_order(host):
                        else list(reversed(units.start_order(host))))
 
 
-# --- §8.3 pf anchor -----------------------------------------------------------------------------------
+# --- the shared service bootstrap (§22, §23) ------------------------------------------------------------
+
+
+def _st(mode, uid=0, gid=0, kind=stat.S_IFDIR):
+    return os.stat_result((kind | mode, 0, 0, 0, uid, gid, 0, 0, 0, 0))
+
+
+_UIDS = {"_levain_control": 3799, "_levain_keys": 3798, "_levain_qbroker": 3797, "_levain_dispatch": 3796}
+_GIDS = {**_UIDS, "levain-control": 3788}
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_service_exits_without_run_dir(host):
+    """§22: a non-root service exits non-zero when its R/ dir is absent or not root-made with the §2.2
+    owner, group and mode; KeepAlive / Restart brings it back once the reaper made it."""
+    R = str(RUN[host])
+    good = {R: _st(0o755), f"{R}/control": _st(0o750, 3799, 3788)}
+
+    def lstat_from(table):
+        def lstat(p):
+            if p not in table:
+                raise FileNotFoundError(2, "No such file or directory", p)
+            return table[p]
+        return lstat
+
+    def check(table):
+        return service_boot.check_run_dir(host, "control", lstat=lstat_from(table), uid_of=_UIDS.__getitem__,
+                                          gid_of=_GIDS.__getitem__)
+
+    assert check(good) == (True, "")                                               # positive control
+    assert not check({R: good[R]})[0]                                               # dir absent
+    assert not check({})[0]                                                         # R/ absent
+    assert not check({**good, R: _st(0o755, uid=501)})[0]                          # R/ not root's
+    assert not check({**good, R: _st(0o775)})[0]                                   # R/ writable by a group
+    assert not check({**good, f"{R}/control": _st(0o750, 3799, 3788, stat.S_IFLNK)})[0]   # a link
+    assert not check({**good, f"{R}/control": _st(0o755, 3799, 3788)})[0]          # wrong mode
+    assert not check({**good, f"{R}/control": _st(0o750, 501, 3788)})[0]           # wrong owner
+    assert not check({**good, f"{R}/control": _st(0o750, 3799, 20)})[0]            # wrong group
+    # the run dir each non-root service checks is its §2.2 row
+    assert {n: service_boot.run_dir_row(host, n).path.name for n in service_boot.RUN_DIR_OF} == {
+        "control": "control", "keys": "keys", "qbroker": "qb", "dispatch": "planner"}
+    assert set(service_boot.RUN_DIR_OF) == {s.name for s in units.SERVICES if s.user != "root"}
+    # main exits non-zero (and never runs the program) when the check fails; root services skip it
+    ran = []
+    assert service_boot.main(["control"], host=host, check=lambda h, n: (False, "absent")) == service_boot.EXIT_NO_RUN_DIR
+    assert service_boot.main(["nope"], host=host, check=lambda h, n: ran.append(n) or (True, "")) == service_boot.EXIT_USAGE
+    assert service_boot.main([], host=host) == service_boot.EXIT_USAGE
+    assert ran == []
+
+
+def _tree(tmp_path, host, program: str):
+    tree = tmp_path / "tree"
+    shutil.copytree(Path(levain.__file__).parent, tree / "levain", ignore=shutil.ignore_patterns("__pycache__"))
+    (tree / "levain" / "slot" / "services" / "reaper.py").write_text(program)
+    entry = tmp_path / "service-entry"
+    entry.write_text(root_tree.entry_text(host, "service-entry", tree=tree))
+    return tree, entry
+
+
+def test_service_entry_imports_levain(tmp_path):
+    """§23: a unit runs its program through the shared bootstrap entry with -IS; the entry puts the
+    import tree on sys.path, so the program imports levain FROM THE TREE (and no site-packages)."""
+    host = service_boot.host_os()
+    program = ("import sys, levain, levain.slot.layout\n"
+               "print(levain.__file__)\n"
+               "print(any('site-packages' in p for p in sys.path))\n")
+    tree, entry = _tree(tmp_path, host, program)
+    r = subprocess.run([sys.executable, "-IS", str(entry), "reaper"], capture_output=True, text=True, cwd=tmp_path,
+                       env={"PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr
+    imported, site = r.stdout.split("\n")[:2]
+    assert Path(imported).resolve() == (tree / "levain" / "__init__.py").resolve()
+    assert site == "False"
+    # a name not in §1.3 is refused before any program runs
+    r = subprocess.run([sys.executable, "-IS", str(entry), "evil"], capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode == service_boot.EXIT_USAGE and r.stdout == ""
+
+
+@pytest.mark.skipif(RUN[service_boot.host_os()].exists(), reason="this host has a Levain run dir")
+def test_service_entry_exits_without_run_dir(tmp_path):
+    """§22, executed: control's entry exits EX_TEMPFAIL on a host with no R/ and never runs its program."""
+    host = service_boot.host_os()
+    tree, entry = _tree(tmp_path, host, "")
+    (tree / "levain" / "slot" / "services" / "control.py").write_text("print('ran')\n")
+    r = subprocess.run([sys.executable, "-IS", str(entry), "control"], capture_output=True, text=True, cwd=tmp_path)
+    assert r.returncode == service_boot.EXIT_NO_RUN_DIR and "ran" not in r.stdout
+
+
+# --- §8.3 / §23 pf rules -------------------------------------------------------------------------------
 
 
 GOLDEN_ANCHOR = """# Levain session slots (CONTRACT §8.3). Written by the install helper; removed by its undo verb.
-pass out quick proto tcp from any to 127.0.0.1 port 47100 user _levain_s0
-block out quick proto {tcp udp} user _levain_s0
-pass out quick proto tcp from any to 127.0.0.1 port 47101 user _levain_s1
-block out quick proto {tcp udp} user _levain_s1
-block out quick proto {tcp udp} user _levain_v0
-block out quick proto {tcp udp} user _levain_c0
+pass out quick proto tcp from any to 127.0.0.1 port 47100 user 3999
+block out quick proto {tcp udp} user 3999
+pass out quick proto tcp from any to 127.0.0.1 port 47101 user 3997
+block out quick proto {tcp udp} user 3997
+block out quick proto {tcp udp} user 3995
+block out quick proto {tcp udp} user 3994
 """
+
+_PF_IDS = {"_levain_s0": 3999, "_levain_gw0": 3998, "_levain_s1": 3997, "_levain_gw1": 3996,
+           "_levain_v0": 3995, "_levain_c0": 3994}
 
 
 def test_pf_anchor_golden():
     slots = [SlotId("none", 0), SlotId("egress", 1), SlotId("egress", 0)]
-    assert pf.anchor_text(slots) == GOLDEN_ANCHOR
-    # every egress pass names its OWN port and its own user; nothing passes a verifier account
-    rules = pf.anchor_rules([SlotId("egress", n) for n in range(32)] + [SlotId("none", n) for n in range(16)])
+    assert pf.anchor_text(slots, _PF_IDS) == GOLDEN_ANCHOR
+    # every egress pass names its OWN port and its own uid; nothing passes a verifier account
+    every = [SlotId("egress", n) for n in range(32)] + [SlotId("none", n) for n in range(16)]
+    ids = {}
+    for i, name in enumerate(x for s in every for x in s.accounts):
+        ids[name] = 3999 - i
+    rules = pf.anchor_rules(every, ids)
     for n in range(32):
-        i = rules.index(f"pass out quick proto tcp from any to 127.0.0.1 port {47100 + n} user _levain_s{n}")
-        assert rules[i + 1] == f"block out quick proto {{tcp udp}} user _levain_s{n}"
-    assert not [r for r in rules if r.startswith("pass") and ("_levain_v" in r or "_levain_c" in r)]
+        uid = ids[f"_levain_s{n}"]
+        i = rules.index(f"pass out quick proto tcp from any to 127.0.0.1 port {47100 + n} user {uid}")
+        assert rules[i + 1] == f"block out quick proto {{tcp udp}} user {uid}"
+    verifier_uids = {str(ids[x]) for s in every if s.slot_class == "none" for x in s.accounts}
+    assert not [r for r in rules if r.startswith("pass") and r.rsplit(" ", 1)[1] in verifier_uids]
     assert len(rules) == 2 * 32 + 2 * 16
+    assert not [r for r in rules if "_levain" in r]                      # §23: numeric uids only
     assert _refusal(pf.gwport, SlotId("none", 0)) == "bad-token"
+    # a uid outside §1.1's slot range (or none at all) is refused, never rendered
+    assert _refusal(pf.anchor_rules, [SlotId("egress", 0)], {"_levain_s0": 0}) == "bad-token"
+    assert _refusal(pf.anchor_rules, [SlotId("egress", 0)], {}) == "bad-token"
 
 
 def test_pf_anchor_plan_and_undo():
     plan = _plan("darwin", 2, 1)
     w = [s for s in plan.steps if s.write and s.write[0] == pf.ANCHOR_FILE]
-    assert len(w) == 1 and w[0].write[1] == pf.anchor_text(plan.allocation.slots)
-    assert w[0].validate == ("/sbin/pfctl", "-n", "-a", "levain", "-f")
+    assert len(w) == 1 and w[0].write[1] == pf.anchor_text(plan.allocation.slots, plan.allocation.ids)
+    assert w[0].validate == ("/sbin/pfctl", "-n", "-a", "com.apple/levain", "-f")
     argvs = [s.argv for s in plan.steps if s.argv]
-    assert ("/sbin/pfctl", "-a", "levain", "-f", "/etc/pf.anchors/levain") in argvs
-    assert argvs.index(("/sbin/pfctl", "-n", "-f", "/etc/pf.conf")) < argvs.index(("/sbin/pfctl", "-f", "/etc/pf.conf"))
-    hooks = [s for s in plan.steps if s.call and "/etc/pf.conf" in s.why]
-    assert len(hooks) == 2
-    # the anchor loads after every slot account exists (pf resolves user names at load)
+    load = argvs.index(("/sbin/pfctl", "-a", "com.apple/levain", "-f", "/etc/pf.anchors/levain"))
+    enable = next(i for i, s in enumerate(plan.steps) if s.call and "enable reference" in s.why)
+    assert plan.steps.index(w[0]) < plan.steps.index(next(s for s in plan.steps if s.argv == argvs[load])) < enable
+    # the rules load after every slot account exists
     last_acct = max(i for i, s in enumerate(plan.steps) if s.argv[:4] == ("/usr/bin/dscl", ".", "-create", "/Users/_levain_c0"))
     assert last_acct < plan.steps.index(w[0])
     assert not [s for s in _plan("linux").steps if "pf" in s.why.split()]
     undo = _undo("darwin", dict(plan.allocation.ids))
     uargv = [s.argv for s in undo.steps if s.argv]
-    flush = uargv.index(("/sbin/pfctl", "-a", "levain", "-F", "all"))
+    flush = uargv.index(("/sbin/pfctl", "-a", "com.apple/levain", "-F", "all"))
     assert ("/bin/rm", "-f", "/etc/pf.anchors/levain") in uargv[flush:]
+    assert ("/bin/rm", "-f", str(pf.PF_TOKEN)) in uargv[flush:]
     last_tomb = max(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
     assert last_tomb < undo.steps.index(next(s for s in undo.steps if s.argv == uargv[flush]))
-    # replenish re-renders the anchor for every slot in service plus the new one
+    # replenish re-renders the rules for every slot in service plus the new one, by uid
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up("darwin", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
-                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)})
+                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
     rw = next(s for s in rep.steps if s.write and s.write[0] == pf.ANCHOR_FILE)
     assert rw.write[1] == pf.anchor_text([SlotId("egress", 0), SlotId("egress", 1), SlotId("egress", 2),
-                                          SlotId("none", 0)])
+                                          SlotId("none", 0)], {**ids, **rep.allocation.ids})
+    # without the in-service slots' uids it refuses rather than render a slot with no rules
+    assert _refusal(plan_replenish, parse_install_argv(["replenish"]),
+                    _set_up("darwin", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
+                    slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}) == "bad-token"
 
 
-def test_pf_conf_hook_idempotent(tmp_path):
-    conf = tmp_path / "pf.conf"
-    conf.write_text('scrub-anchor "com.apple/*"\nanchor "com.apple/*"\nload anchor "com.apple" from "/etc/pf.anchors/com.apple"\n')
-    original = conf.read_text()
-    for _ in range(2):
-        for line in pf.PF_CONF_HOOK:
-            _ensure_line(conf, line, present=True)
-    once = conf.read_text()
-    assert once == original + "".join(f"{ln}\n" for ln in pf.PF_CONF_HOOK)
-    for line in reversed(pf.PF_CONF_HOOK):
-        _ensure_line(conf, line, present=False)
-    assert conf.read_text() == original
+def _every_plan(host):
+    plan = _plan(host, 2, 1)
+    ids = dict(plan.allocation.ids)
+    rep = plan_replenish(parse_install_argv(["replenish"]),
+                         _set_up(host, used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
+                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
+    return [plan, _undo(host, ids), rep]
+
+
+def test_pf_never_touches_pf_conf():
+    """§23: Levain never edits /etc/pf.conf and never reloads the main ruleset (`pfctl -f
+    /etc/pf.conf` flushes every service's dynamic anchors); its rules go only to com.apple/levain."""
+    for p in _every_plan("darwin"):
+        for s in p.steps:
+            blob = " ".join([s.why, *s.argv, *s.skip_if, *s.validate, str(s.write[0]) if s.write else ""])
+            assert "/etc/pf.conf" not in blob, s.why
+            if s.argv[:1] == ("/sbin/pfctl",) and "-f" in s.argv:
+                assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
+            if s.argv[:1] == ("/sbin/pfctl",) and "-F" in s.argv:
+                assert s.argv[1:3] == ("-a", "com.apple/levain"), s.argv
+    assert pf.ANCHOR == "com.apple/levain"
+    assert not hasattr(pf, "PF_CONF_HOOK")
+
+
+class _Pf:
+    """A fake pfctl: -E hands out tokens, -X releases one it handed out."""
+
+    def __init__(self):
+        self.calls, self.live, self.next = [], set(), 1000
+
+    def __call__(self, argv, **kw):
+        self.calls.append(tuple(argv))
+        if argv[1] == "-E":
+            self.next += 1
+            self.live.add(str(self.next))
+            return subprocess.CompletedProcess(argv, 0, "", f"pf enabled\nToken : {self.next}\n")
+        if argv[1] == "-X":
+            ok = argv[2] in self.live
+            self.live.discard(argv[2])
+            return subprocess.CompletedProcess(argv, 0 if ok else 1, "", "" if ok else "token not found")
+        raise AssertionError(argv)
+
+
+def test_pf_token_released_on_undo(tmp_path):
+    """§23: setup takes pf's enable reference with -E and keeps its token root 0600; undo releases
+    exactly that token with -X and removes the file; a re-run never holds two references."""
+    tok = tmp_path / "pf.token"
+    fake = _Pf()
+    assert pf.take_enable_reference(tok, fake) == (True, "")
+    assert tok.read_text() == "1001\n" and stat.S_IMODE(tok.stat().st_mode) == 0o600
+    assert pf.take_enable_reference(tok, fake) == (True, "")             # a re-run of setup
+    assert fake.live == {"1002"} and ("/sbin/pfctl", "-X", "1001") in fake.calls
+    ok, _ = pf.release_enable_reference(tok, fake)
+    assert ok and fake.live == set() and not tok.exists()
+    assert fake.calls[-1] == ("/sbin/pfctl", "-X", "1002")
+    assert pf.release_enable_reference(tok, fake) == (True, "")          # nothing left: a no-op
+    tok.write_text("1; rm -rf /\n")
+    assert pf.release_enable_reference(tok, fake)[0] is False             # never passes a non-token to pfctl
+    # the plan steps call exactly these
+    undo = _undo("darwin", {"_levain_s0": 3999})
+    rel = [s for s in undo.steps if s.call and "release pf's enable reference" in s.why]
+    flush = next(i for i, s in enumerate(undo.steps) if s.argv[-2:] == ("-F", "all"))
+    assert len(rel) == 1 and undo.steps.index(rel[0]) > flush
+    setup = _plan("darwin")
+    assert len([s for s in setup.steps if s.call and "take pf's enable reference" in s.why]) == 1
 
 
 # --- §9.1 Linux namespaces ---------------------------------------------------------------------------
@@ -326,10 +526,12 @@ def test_netns_setup_boot_pass_and_undo():
     assert names == ["levain-e0", "levain-e1", "levain-v0"]
     for s in want:
         if s.argv[1:3] == ("netns", "add"):
-            assert s.skip_if[-2:] == ("-e", f"/run/netns/{s.argv[-1]}")
+            # present = `ip netns list` names it (not a path test)
+            assert s.skip_if[0] == "/bin/sh" and "netns list" in s.skip_if[2] and s.skip_if[-1] == s.argv[-1]
+            assert "test" not in s.skip_if[2]
     assert [s.argv[2:] for s in want if s.argv[1] == "-n"] == [(n, "link", "set", "lo", "up") for n in names]
     # setup runs exactly the boot pass's list
-    got = [s.argv for s in plan.steps if s.argv and s.argv[0].endswith("ip")]
+    got = [s.argv for s in plan.steps if s.argv and s.argv[0].endswith("/ip")]
     assert got == [s.argv for s in want]
     assert not [s for s in _plan("darwin").steps if s.argv and s.argv[0].endswith("/ip")]
     undo = _undo("linux", dict(plan.allocation.ids))
@@ -338,6 +540,25 @@ def test_netns_setup_boot_pass_and_undo():
     last_kill = max(i for i, s in enumerate(undo.steps) if "stop every process" in s.why)
     first_del = next(i for i, s in enumerate(undo.steps) if s.argv[1:3] == ("netns", "delete"))
     assert last_kill < first_del
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="no /bin/sh")
+def test_netns_probe_reads_ip_netns_list(tmp_path):
+    """The skip_if, run against a fake `ip` printing both line shapes: present only on an exact name."""
+    ip = tmp_path / "ip"
+    ip.write_text("#!/bin/sh\nprintf 'levain-e10 (id: 3)\\nlevain-v0\\n'\n")
+    ip.chmod(0o755)
+    real = hands.shutil.which
+
+    def which(n, path=None):
+        return str(ip) if n == "ip" else real(n, path=path) or real(n)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hands.shutil, "which", which)
+        for name, present in (("levain-e10", True), ("levain-v0", True), ("levain-e1", False), ("levain", False)):
+            assert subprocess.run(netns.netns_present(name)).returncode == (0 if present else 1), name
+            assert subprocess.run(netns.netns_absent(name)).returncode == (1 if present else 0), name
+
 
 
 # --- §1.2 the slots' bwrap ---------------------------------------------------------------------------

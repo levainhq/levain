@@ -19,6 +19,14 @@ from levain.slot.layout import RUN, STORE, operator_record_path
 from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, install_sudoers_text, runtime_sudoers_text)
 
 HOSTS = ("linux", "darwin")
+
+
+@pytest.fixture(autouse=True)
+def _tools_resolve(monkeypatch):
+    """A plan for the OTHER host names tools this test host lacks; the §23 preflight refuses a bare
+    name, so here every tool resolves (to its real path when present)."""
+    real = hands.shutil.which
+    monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
 OP, OP_UID = "alice", 501
 
 
@@ -27,7 +35,9 @@ def _setup(n=8, m=2, operator=OP):
 
 
 def _facts(host, **kw):
-    base = dict(caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID)
+    # every host tool present: the plan, not this test host, decides what it names (§23 preflight)
+    base = dict(caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID, tool_present=lambda p: True,
+                xcode_ready=lambda: True)
     base.update(kw)
     return HostFacts(host, **base)
 
@@ -124,7 +134,9 @@ def test_retired_id_never_reissued(host, tmp_path):
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up(host, retired=retired | gone, used_ids=frozenset(accounts.values()),
                                  existing_names=frozenset(accounts)),
-                         slots=8, verifier_slots=2, live={"egress": range(1, 8), "none": range(2)})
+                         slots=8, verifier_slots=2, live={"egress": range(1, 8), "none": range(2)},
+                         accounts={k: v for k, v in accounts.items() if k not in ("_levain_s0", "_levain_gw0")
+                                   and k not in SINGLETONS})
     assert [s.tag for s in rep.allocation.slots] == ["e8"]
     assert not set(rep.allocation.ids.values()) & (retired | gone | set(accounts.values()))
 
@@ -150,25 +162,31 @@ def test_second_operator_refused_by_name(host):
     assert _refusal(plan_setup, _setup(), _facts(host, operator_uid=None)) == "no-such-operator"
 
 
-def test_operator_record_written_first_and_removed_last():
-    plan = plan_setup(_setup(), _facts("darwin"))
-    writes = [i for i, s in enumerate(plan.steps) if s.write and s.write[0] == operator_record_path("darwin")]
-    assert len(writes) == 1
-    assert not any(s.argv and s.argv[:3] == ("/usr/bin/dscl", ".", "-create") for s in plan.steps[:writes[0]])
+@pytest.mark.parametrize("host", HOSTS)
+def test_operator_record_written_last_and_removed_last(host):
+    """§23: the record is setup's LAST step (``already-set-up`` = a complete install) and undo's last
+    removal; undo takes the runtime rule out first and the install rule out just before the record."""
+    plan = plan_setup(_setup(), _facts(host))
+    writes = [i for i, s in enumerate(plan.steps) if s.write and s.write[0] == operator_record_path(host)]
+    assert writes == [len(plan.steps) - 1]
     path, text, mode = plan.steps[writes[0]].write
     assert mode == 0o644 and parse_operator_record(text.encode()) == operator_record(OP, OP_UID)
     assert text == operator_record_text(OP, OP_UID)
     for bad in (b'{"name":"alice","uid":501}', b'{"format":"levain-operator/1","name":"alice","uid":0}',
                 b'{"format":"levain-operator/1","name":"alice","uid":5.0}', b"not json"):
         assert _refusal(parse_operator_record, bad) == "operator-record-malformed"
-    undo = plan_undo(parse_install_argv(["undo"]), _set_up("darwin"), accounts={"_levain_s0": 3999},
+    uid = RANGES[host].slots[0]
+    undo = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts={"_levain_s0": uid},
                      shared_groups=SHARED_GROUPS)
-    assert undo.steps[-1].argv == ("/bin/rm", "-f", str(operator_record_path("darwin")))
-    assert {s.argv[-1] for s in undo.steps[:2]} == {str(RUNTIME_SUDOERS), str(INSTALL_SUDOERS)}
+    assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
+    assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
+    assert undo.steps[-2].argv[-1] == str(INSTALL_SUDOERS)
+    assert [s.argv[-1] for s in undo.steps if s.argv and "sudoers" in s.argv[-1]] == [str(RUNTIME_SUDOERS),
+                                                                                       str(INSTALL_SUDOERS)]
     retire = next(i for i, s in enumerate(undo.steps) if s.write)
     first_tomb = next(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
     first_kill = next(i for i, s in enumerate(undo.steps) if s.call and "stop every process" in s.why)
-    assert 2 <= retire < first_kill < first_tomb
+    assert 1 <= retire < first_kill < first_tomb
 
 
 # --- §1.2 groups ---------------------------------------------------------------------------------------
@@ -342,7 +360,7 @@ def test_store_layout(host):
     assert base[0].skip_if[-2:] == ("-e", str(L / "routes" / "base.json"))
     # every file the plan writes is under the store or a fixed system path
     fixed = ("/etc/sudoers.d/", "/usr/local/libexec/levain/", "/usr/libexec/levain/", "/Library/LaunchDaemons/",
-             "/etc/systemd/system/", "/etc/pf.anchors/", "/etc/apparmor.d/")
+             "/etc/systemd/system/", "/etc/pf.anchors/", "/etc/apparmor.d/", "/etc/tmpfiles.d/")
     for s in plan.steps:
         if s.write:
             assert str(s.write[0]).startswith((str(L) + "/", *fixed)), s.write[0]
@@ -379,15 +397,30 @@ def test_sudoers_text(host):
     for verb in ("prepare", "render", "start", "resume", "teardown", "status"):
         assert f"{h}/runtime-helper {verb}" in disp
     it = install_sudoers_text(host, OP)
-    assert f"Defaults!{h}/install-helper timestamp_timeout=0\n" in it
-    assert f"\n{OP} ALL=(root) {h}/install-helper\n" in it and "NOPASSWD" not in it
-    for bad in ("ALL", "a b", "x,ALL", "#0", "root"):
+    assert "NOPASSWD" not in it
+    for bad in ("ALL", "a b", "x,ALL", "#0", "root", "Defaults", "defaults", "DEFAULTS", "User_Alias",
+                "cmnd_alias", "Host_ALIAS", "runas_alias", "x_alias"):
         assert _refusal(runtime_sudoers_text, host, bad) == "bad-operator"
         assert _refusal(install_sudoers_text, host, bad) == "bad-operator"
+    assert _refusal(parse_install_argv, ["setup", "--slots", "1", "--verifier-slots", "1", "--operator",
+                                         "Defaults"]) == "bad-operator"
+    for ok in ("alice", "default", "alias", "bob_aliases"):
+        assert install_sudoers_text(host, ok)                 # positive control: the reserved words only
     plan = plan_setup(_setup(), _facts(host))
-    last = plan.steps[-2:]
+    last = plan.steps[-3:-1]
     assert [s.write[0] for s in last] == [RUNTIME_SUDOERS, INSTALL_SUDOERS]
     assert all(s.write[2] == 0o440 and s.validate[-1] == "-cf" for s in last)
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_install_rule_tagged_passwd(host):
+    """§23 / §5.2: the install rule carries the PASSWD tag and its Defaults pin authenticate +
+    timestamp_timeout=0, so a later NOPASSWD drop-in or `!authenticate` cannot make it passwordless."""
+    h = "/usr/local/libexec/levain" if host == "darwin" else "/usr/libexec/levain"
+    lines = install_sudoers_text(host, OP).splitlines()
+    rules = [ln for ln in lines if not ln.startswith("#")]
+    assert rules == [f"Defaults!{h}/install-helper authenticate, timestamp_timeout=0",
+                     f"{OP} ALL=(root) PASSWD: {h}/install-helper"]
 
 
 def test_setup_refuses_existing_singleton_or_shared_group():
