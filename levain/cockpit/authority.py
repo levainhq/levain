@@ -150,6 +150,9 @@ class RequestAuthority:
     # no log was asked: this server's broker is not ACTIVE, so it holds no journal it may read (K2b-3b
     # §8d row 1). Unless ``log_empty`` too, its policy is UNKNOWN_POLICY: the log it cannot read may hold a raise
     no_log: bool = False
+    # the log was not refused: the signature verifier (ssh-keygen) could not run during its replay, a machine
+    # fault a caller may report apart from a refusal
+    verifier_unavailable: bool = False
     # journal reads one request shares (K2b-3b §0.6: Recent edits' broker side), so a write's probes
     # through ``_scan_read_one`` read the journal once, never once per probe
     _memo: dict[str, tuple[bool, Any]] = field(default_factory=dict, compare=False, repr=False)
@@ -227,6 +230,7 @@ class RequestAuthority:
         snap: AuthoritySnapshot | None = None
         error: str | None = None
         empty = False
+        verifier_down = False
         try:
             # the anchor is read BEFORE the replay's first SELECT pins the read snapshot: an append
             # committing in between can then only put the log ahead of the anchor, never behind it
@@ -241,6 +245,9 @@ class RequestAuthority:
                 error = f"authority not initialised: run {INIT_HINT}"
             if snap is not None and anchor is not None:
                 auth.check_anchor(snap, pinned)
+        except auth.VerifierUnavailable as exc:
+            snap, empty, verifier_down = None, False, True
+            error = f"the authority log could not be verified: {exc}"
         except auth.AuthorityError as exc:
             snap, empty = None, False
             error = f"the authority log is refused: {exc}"
@@ -249,7 +256,7 @@ class RequestAuthority:
             if marker is not None:
                 error = f"authority not initialised ({marker}): run {INIT_HINT}"
         labels = NO_LABELS if labeller is None else labeller.snapshot(conn, snap)
-        return cls(now, labels, snap, error, source, empty)
+        return cls(now, labels, snap, error, source, empty, verifier_unavailable=verifier_down)
 
 
 # The outer boundary's authority for the reads it makes through ``Cockpit.read_one`` /

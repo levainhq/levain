@@ -29,10 +29,10 @@ Known edges (one line each, not built against):
   answer is recorded and listed, never delivered.
 - the hook claims the answer before Claude Code or Codex reads its output: a hook killed in between (its timeout
   after a long hold) loses that answer's text, as a ruling's.
-- a resume is never started while any running process's command line names the session id
-  (:func:`levain.consent.delivery.session_named_running`): an unrelated one that names it (``tail -f`` of its
-  transcript) keeps the answer waiting for the session's next hook. That check reads every process's command line
-  and keeps nothing but the yes or no.
+- a resume is never started while any running process's command line resumes the session id
+  (:func:`levain.consent.delivery.session_named_running`: ``--resume <id>``, ``codex exec resume <id>``); one that
+  only mentions it (``tail -f`` of its transcript) does not count. That check reads every process's command line and
+  keeps nothing but the yes or no.
 - the resume record is read from a transcript's first 1 MiB and a Codex rollout's first line up to 1 MiB: past that
   no start directory is recorded and the answer waits for the next hook; so does a Codex session whose prompt or an
   option value is exactly ``exec``, ``app-server`` or ``mcp-server`` (read as that subcommand).

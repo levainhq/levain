@@ -289,7 +289,7 @@ def test_l3r2_a_process_naming_the_session_blocks_a_resume(tmp_path, monkeypatch
     monkeypatch.setattr(dv, "codex_sandbox_args", lambda meta, thread: ["-s", "read-only"])
     got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
                    named=lambda s: True)
-    assert got[0] == "hook" and "a process naming this session may be running" in got[1]
+    assert got[0] == "hook" and "a process resuming this session may be running" in got[1]
     got = dv.route("codex", SESSION, meta, noun="answer", running=lambda pid, started=None: False,
                    named=lambda s: None)
     assert got[0] == "hook"                                   # cannot tell: no resume
@@ -297,7 +297,11 @@ def test_l3r2_a_process_naming_the_session_blocks_a_resume(tmp_path, monkeypatch
                    named=lambda s: False)
     assert got[0] == "resumed"
     assert dv.session_named_running("not-a-uuid") is None
-    assert dv.session_named_running(SESSION) is False         # no process here names the test's session
+    # a False is only true of the list it read (a dev seat's own claude -c reads None): read a list with one
+    # unrelated process
+    monkeypatch.setattr(dv.subprocess, "run", lambda argv, *a, **k: dv.subprocess.CompletedProcess(
+        argv, 0, "1 /bin/zsh -l\n", ""))
+    assert dv.session_named_running(SESSION) is False
 
 
 def test_l3r2_an_answer_without_meta_borrows_the_sessions_newest(tmp_path, monkeypatch):
