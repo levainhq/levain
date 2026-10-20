@@ -112,7 +112,7 @@ def test_echo_sign_yes_accepted_and_live(run, repo, tmp_path, monkeypatch):
     # the exact retry is `accept` with the sig file; a second `sign` makes a new signature, which the store refuses
     sigfile = tmp_path / "body.json.sig.json"
     assert run.json("envelope", "accept", str(f), str(sigfile), "--data-root", run.root)["created"] is False
-    assert "already stored with a different" in run(*run.signed("envelope", "sign", str(f), "--yes"), rc=1).err
+    assert "is already accepted; there is nothing to sign" in run(*run.signed("envelope", "sign", str(f), "--yes"), rc=1).err
 
 
 def test_sign_without_yes_on_a_non_tty_refuses(run, repo, tmp_path, monkeypatch):

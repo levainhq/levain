@@ -591,6 +591,17 @@ class EnvelopeStore(CoordStore):
         GAUGE"*), so a successor's smaller budget does not narrow a running job here; its meter is C6's."""
         return NOT_IN_FORCE
 
+    def store_id(self) -> str:
+        """This dispatch store's random id, which every envelope body and signature names."""
+        with read_transaction(self._connect) as conn:
+            return self._jobs._store_id(conn)
+
+    def threads_of_envelope(self, envelope_id: str) -> list[str]:
+        """The threads ``envelope_id`` is bound to, in bind order."""
+        with read_transaction(self._connect) as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT thread_id FROM envelope_binds WHERE envelope_id = ? ORDER BY gseq", (envelope_id,)).fetchall()]
+
     def envelopes_of(self, thread_id: str) -> list[Envelope]:
         with read_transaction(self._connect) as conn:
             return [self._envelope(conn, r[0]) for r in conn.execute(

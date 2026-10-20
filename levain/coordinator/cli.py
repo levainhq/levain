@@ -217,15 +217,7 @@ def _parse_land(spec: str) -> dict[str, Any]:
 
 
 def _store_id(store: EnvelopeStore) -> str:
-    store.drops(limit=1)          # opening the store creates the file and its id
-    conn = sqlite3.connect(store.path)
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        raise CoordError("the dispatch store has no store_id")
-    return row[0]
+    return store.store_id()
 
 
 def _money(cents: int) -> str:
@@ -375,9 +367,8 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
 
 
 def _bound_threads(store: EnvelopeStore, envelope_id: str) -> list[str]:
-    """The threads ``envelope_id`` is bound to (the store reads envelope-by-thread; this is the other way round)."""
-    return [t.thread_id for t in store.threads(include_closed=True)
-            if any(e.envelope_id == envelope_id for e in store.envelopes_of(t.thread_id))]
+    """The threads ``envelope_id`` is bound to."""
+    return store.threads_of_envelope(envelope_id)
 
 
 def _accepted(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, created: bool,
@@ -399,6 +390,14 @@ def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
 
     store = _store(args)
     text, body = _body_from_file(args.file)
+    try:
+        stored = store.envelope(body["envelope_id"])
+    except CoordError:
+        stored = None
+    if stored is not None:
+        # a second signature would be a new signed_at, which the store refuses as another record for this id
+        raise CoordError(f"envelope {stored.envelope_id} is already accepted; there is nothing to sign "
+                         f"(levain envelope show {stored.envelope_id})")
     print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
     if not args.yes and not dcli._is_tty():
         raise CoordError("signing asks y/N on your terminal and this process has none; run it in your own terminal, "
