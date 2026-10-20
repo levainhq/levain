@@ -1094,7 +1094,7 @@ class TestSession2Gaps:
             "now": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
-            "activity": "C", "memory_glance": "C", "doctor": "C",
+            "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",
             "notifications": None}      # the Team zone's one card: this install root has no team ledger
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
         assert sections and all(c in ("A", "B", "C") for c in sections.values())

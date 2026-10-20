@@ -1252,7 +1252,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
 
 
 # the Levain-native panels a downstream may leave out (K1_DESIGN §3): only these; the kernel's core panels are not a menu
-OPTIONAL_NATIVE = frozenset({"activity", "memory_glance", "doctor"})
+OPTIONAL_NATIVE = frozenset({"activity", "memory_glance", "doctor", "topology"})
 
 
 def build_default_cockpit(
@@ -1369,6 +1369,32 @@ def build_default_cockpit(
         ck.register(ProviderSpec("doctor", "status-dots", "Levain health", "gauge",
                                  doctor_reader(source.install_root), region="widgets", rank=45, timeout_s=20.0,
                                  edit_class=CLASS_C))
+    if "topology" not in exclude:
+        # F12a: the live topology (Build tab): sessions, the work they are on, what closing one would lose
+        from levain.cockpit.topology import topology_reader
+
+        def open_loops(ctx: ReadContext) -> list[Any]:
+            if not source.anneal.spores_json.exists():
+                return []
+            v = _view(source, ctx)
+            if "open_spores" in v.errors or "store" in v.errors:
+                raise RuntimeError("the spore store did not read")
+            return list(v.open_spores)
+
+        def hub_label(ctx: ReadContext) -> str:
+            try:
+                return _view(source, ctx).entity_name or "Levain"
+            except Exception:  # noqa: BLE001 - the hub's name is a label, never the panel's fault
+                return "Levain"
+
+        ck.register(ProviderSpec(
+            "topology", "topology", "Topology", "gauge",
+            topology_reader(install_root=source.install_root, consent=lambda: ck.consent_reader,
+                            questions=lambda: ck.question_store, hub_label=hub_label, spores=open_loops,
+                            dispatch_dir=lambda: getattr(ck.consent_reader, "directory", None)),
+            region="operate", rank=80, size="tall", optional=True,
+            timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C,
+            empty="No agent session in the last day and no open task."))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
                              size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(

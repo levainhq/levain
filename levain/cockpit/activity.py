@@ -17,6 +17,14 @@ program-naming key overridden on the command line (``NEUTRALISE``). The scan is 
 repos, an ``ACTIVITY_GIT_DEADLINE_S`` deadline, the repositories past it named) and cached for
 ``ACTIVITY_CACHE_S``, so a polling page never re-runs it per request.
 
+The topology's "Lost if closed" read (``git_worktree_state``) is the same path on one working tree (``find_worktree``
+keeps the worktree's own git directory and its top), with one more boundary: a status read compares file contents,
+which runs a filter driver's ``clean`` program, and the driver's name is the agent's to choose in an attribute, so no
+``-c`` override can name it, and a check of the config before the read loses a race against a swap of it. So
+``git status`` never reads the repository's config: it runs on a private git directory the cockpit makes for each
+read and removes after (its own config, ``HEAD`` detached at the commit the repository's ``HEAD`` names, a copy of
+the index, the repository's objects). The same environment, overrides and process group, and no submodule entered.
+
 Known edge: a session record whose ``cwd`` is forged to name the operator's own repository shows that repository's
 commit times (never its contents) to whoever can see the page, the operator and cockpit-token holders; the
 confined agent does not see the page.
@@ -28,8 +36,10 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -41,7 +51,7 @@ from levain.cockpit.results import Fault, Read, Result
 
 __all__ = ["ACTIVITY_CACHE_S", "ACTIVITY_EVENTS_MAX", "ACTIVITY_GIT_DEADLINE_S", "ACTIVITY_REPOS_MAX",
            "ACTIVITY_WINDOW_H", "GitRefused", "LEGEND", "NEUTRALISE", "activity_reader", "find_repo_gitdir",
-           "git_commits", "repo_label", "repo_refusal"]
+           "find_worktree", "git_commits", "git_worktree_state", "repo_label", "repo_refusal"]
 
 ACTIVITY_WINDOW_H = 14
 ACTIVITY_REPOS_MAX = 12
@@ -54,6 +64,11 @@ ACTIVITY_EVENTS_MAX = 2000          # events served, the newest kept
 LABEL_MAX = 80
 GITFILE_MAX = 4096                  # a gitfile or commondir larger than this is not one git wrote
 PACK_ENTRIES_MAX = 10000            # objects/pack entries scanned for a .promisor before the repository is refused
+STATUS_NAMES_MAX = 8                # dirty files named per worktree (the rest are counted)
+INDEX_MAX = 256 * 1024 * 1024       # an index (with its shared index files) larger than this is not copied
+SHARED_INDEX_MAX = 4                # nor a worktree git directory holding more sharedindex.* files than this
+EXCLUDE_MAX = 1024 * 1024           # nor an info/exclude larger than this
+UNPUSHED_MAX = 1000                 # commits counted past the remote branches, git's own --max-count
 
 #: Every program-naming key git could read from the repository's own config (or a file it includes), set on the
 #: command line, whose scope wins: ``levain.firing.ws_git._NEUTRALISE`` plus ``log.showSignature`` and
@@ -185,32 +200,38 @@ def _one_line(p: Path, limit: int = GITFILE_MAX) -> str | None:
     return None if not text or any(c in text for c in "\r\n\0") else text
 
 
-def _linked_common(gitfile: Path) -> tuple[Path | None, str | None]:
-    """The common git directory a linked worktree's ``.git`` gitfile names, or why it is not read. Accepted only
-    as git itself writes it: one line ``gitdir: <absolute path>`` naming ``<common>/worktrees/<name>``, every
-    one of those a real (unlinked) directory owned by this uid, whose ``commondir`` file leads back to
-    ``<common>``, which names no other repository through a ``commondir`` of its own."""
+def _linked(gitfile: Path) -> tuple[Path | None, Path | None, str | None]:
+    """The common git directory a linked worktree's ``.git`` gitfile names and that worktree's own git directory
+    (``<common>/worktrees/<name>``), or why it is not read. Accepted only as git itself writes it: one line
+    ``gitdir: <absolute path>`` naming ``<common>/worktrees/<name>``, every one of those a real (unlinked)
+    directory owned by this uid, whose ``commondir`` file leads back to ``<common>``, which names no other
+    repository through a ``commondir`` of its own."""
     line = _one_line(gitfile)
     if line is None or not line.startswith("gitdir: "):
-        return None, "its .git file is not one gitdir line you own, not read"
+        return None, None, "its .git file is not one gitdir line you own, not read"
     target = line[len("gitdir: "):]
     if not os.path.isabs(target) or os.path.normpath(target) != target:
-        return None, "its .git file names no absolute worktree path, not read"
+        return None, None, "its .git file names no absolute worktree path, not read"
     wt = Path(target)
     if wt.parent.name != "worktrees" or not wt.name:
-        return None, "its .git file names no <repository>/worktrees/<name>, not read"
+        return None, None, "its .git file names no <repository>/worktrees/<name>, not read"
     common = wt.parent.parent
     if os.path.realpath(wt) != str(wt):
-        return None, "its .git file names a path through a link, not read"
+        return None, None, "its .git file names a path through a link, not read"
     if not all(_owned_dir(d) for d in (wt, wt.parent, common)):
-        return None, "its .git file names a worktree that is not a directory you own, not read"
+        return None, None, "its .git file names a worktree that is not a directory you own, not read"
     back = _one_line(wt / "commondir")
     if back is None or os.path.realpath(os.path.join(wt, back)) != str(common):
-        return None, "its worktree's commondir does not lead back to its repository, not read"
+        return None, None, "its worktree's commondir does not lead back to its repository, not read"
     if os.path.lexists(common / "commondir"):
         # git run on <common> would follow this one too, into a store the refusal never looked at
-        return None, "its repository names another repository (commondir), not read"
-    return common, None
+        return None, None, "its repository names another repository (commondir), not read"
+    return common, wt, None
+
+
+def _linked_common(gitfile: Path) -> tuple[Path | None, str | None]:
+    common, _wt, why = _linked(gitfile)
+    return common, why
 
 
 def repo_label(common: Path) -> str:
@@ -228,8 +249,17 @@ def find_repo_gitdir(cwd: str, home: str | None = None) -> tuple[Path | None, st
     repository, or ``(None, why)`` for one that is not read. The walk checks ``cwd`` itself and its parents
     below the user's home (home and ``/`` are where it stops, unread unless ``cwd`` is one of them). The first
     ``.git`` found decides: a plain directory owned by this uid (and naming no other repository through a
-    ``commondir``), or a linked worktree's gitfile as ``_linked_common`` accepts it, whose shared repository is
+    ``commondir``), or a linked worktree's gitfile as ``_linked`` accepts it, whose shared repository is
     the one read. A link is never followed."""
+    found, why = find_worktree(cwd, home)
+    return (found[0] if found is not None else None), why
+
+
+def find_worktree(cwd: str, home: str | None = None) -> tuple[tuple[Path, Path, Path] | None, str | None]:
+    """``find_repo_gitdir``'s walk, keeping what a worktree read needs: ``((common, gitdir, top), None)``, where
+    ``common`` is the repository's common git directory, ``gitdir`` the worktree's own (``common`` itself for the
+    main working tree, ``<common>/worktrees/<name>`` for a linked one) and ``top`` the directory holding the
+    ``.git`` the walk found; ``(None, None)`` for no repository, ``(None, why)`` for one that is not read."""
     if not os.path.isabs(cwd):
         return None, "not an absolute path"
     try:
@@ -251,26 +281,40 @@ def find_repo_gitdir(cwd: str, home: str | None = None) -> tuple[Path | None, st
                 if stat.S_ISLNK(st.st_mode):
                     return None, "its .git is a link, not read"
                 if stat.S_ISREG(st.st_mode):
-                    return _linked_common(cand)
+                    common, wt, why = _linked(cand)
+                    return ((common, wt, cur) if common is not None and wt is not None else None), why
                 if not stat.S_ISDIR(st.st_mode):
                     return None, "its .git is not a directory, not read"
                 if st.st_uid != os.getuid():
                     return None, "not owned by you, not read"
                 if os.path.lexists(cand / "commondir"):
                     return None, "its .git names another repository (commondir), not read"
-                return cand, None
+                return (cand, cand, cur), None
         first = False
         if cur == stop or cur == cur.parent:
             return None, None
         cur = cur.parent
 
 
-def _run(argv: list[str], timeout: float) -> tuple[int, str]:
+def _budget(timeout: float) -> Callable[[], float]:
+    """The time left of ``timeout`` from now, asked before each git call (``subprocess.TimeoutExpired`` once none
+    is): the calls of one read share one budget, never a full timeout each."""
+    deadline = time.monotonic() + timeout
+
+    def left() -> float:
+        t = deadline - time.monotonic()
+        if t <= 0:
+            raise subprocess.TimeoutExpired("git", timeout)
+        return t
+    return left
+
+
+def _run(argv: list[str], timeout: float, extra_env: dict[str, str] | None = None) -> tuple[int, str]:
     """git in its own process group, killed whole at the timeout. Something git started that left the group and
     still holds the output pipe would keep a plain ``communicate`` waiting forever, holding the scan's cache lock:
     after the kill the read waits one more second, then closes its ends of the pipes and moves on."""
     p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, cwd="/",
-                         env=_git_env(), text=True, start_new_session=True)
+                         env={**_git_env(), **(extra_env or {})}, text=True, start_new_session=True)
     try:
         stdout, _err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -301,7 +345,9 @@ def repo_refusal(gitdir: Path, timeout: float = ACTIVITY_GIT_CALL_S) -> str | No
     includes another file (``include.path``, ``includeIf.<cond>.path``): read here with ``git config --file``,
     outside the repository, a ``gitdir:`` or ``onbranch:`` condition is false that the real ``--git-dir`` run
     finds true, so an include is refused unread rather than evaluated in the wrong context. The config is read
-    with ``git config --file --no-includes``, which runs nothing. The message names the reason, never the path."""
+    with ``git config --file --no-includes``, which runs nothing; its two reads share ``timeout``. The message names
+    the reason, never the path."""
+    left = _budget(timeout)
     if os.path.lexists(gitdir / "commondir"):
         return "it names another repository (commondir), not read"
     objs = gitdir / "objects"
@@ -333,21 +379,29 @@ def repo_refusal(gitdir: Path, timeout: float = ACTIVITY_GIT_CALL_S) -> str | No
     except OSError:
         return "its pack directory is unreadable, not read"
     for name in ("config", "config.worktree"):
-        f = gitdir / name
-        if not os.path.lexists(f):
-            continue
-        code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--no-includes", "-z",
-                          "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor|include\.path|"
-                          r"includeif\..*\.path)$"], timeout)
-        if code not in (0, 1):
-            return f"its {name} does not parse (git config exited {code}), not read"
-        keys = [item.partition("\n")[0].lower() for item in out.split("\0") if item]
-        if any(k == "include.path" or (k.startswith("includeif.") and k.endswith(".path")) for k in keys):
-            return f"its {name} includes another config file, not read"
-        for key in keys:
-            if key == "extensions.partialclone" or (key.startswith("remote.") and key.endswith(".promisor")):
-                shown = "extensions.partialclone" if key.startswith("extensions.") else "remote.<name>.promisor"
-                return f"a partial clone ({shown} in {name}), not read"
+        why = _config_refusal(gitdir / name, name, left)
+        if why is not None:
+            return why
+    return None
+
+
+def _config_refusal(f: Path, name: str, left: Callable[[], float]) -> str | None:
+    """``repo_refusal``'s check of one config file (absent is fine), with ``git config --file --no-includes``,
+    which runs nothing."""
+    if not os.path.lexists(f):
+        return None
+    code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--no-includes", "-z",
+                      "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor|include\.path|includeif\..*\.path)$"],
+                     left())
+    if code not in (0, 1):
+        return f"its {name} does not parse (git config exited {code}), not read"
+    keys = [item.partition("\n")[0].lower() for item in out.split("\0") if item]
+    if any(k == "include.path" or (k.startswith("includeif.") and k.endswith(".path")) for k in keys):
+        return f"its {name} includes another config file, not read"
+    for key in keys:
+        if key == "extensions.partialclone" or (key.startswith("remote.") and key.endswith(".promisor")):
+            shown = "extensions.partialclone" if key.startswith("extensions.") else "remote.<name>.promisor"
+            return f"a partial clone ({shown} in {name}), not read"
     return None
 
 
@@ -357,18 +411,15 @@ def git_commits(gitdir: Path, since: datetime, timeout: float) -> list[int]:
     this git directory (``--git-dir``, cwd ``/``) under ``_git_env`` (no lazy fetch: a promisor remote's
     upload-pack never runs), with no pager and every program-naming key overridden (``NEUTRALISE``). Raises
     ``subprocess.TimeoutExpired``, ``OSError`` or ``RuntimeError`` (git refused)."""
-    deadline = time.monotonic() + timeout
-    why = repo_refusal(gitdir, timeout)
+    left = _budget(timeout)
+    why = repo_refusal(gitdir, left())
     if why is not None:
         raise GitRefused(why)
-    left = deadline - time.monotonic()
-    if left <= 0:
-        raise subprocess.TimeoutExpired("git", timeout)
     # refs/stash is left out on purpose (``--all`` would walk it): branches, remotes and tags are the work
     argv = [_real_git(), "--no-pager", *NEUTRALISE, f"--git-dir={gitdir}", "log", "--branches", "--remotes", "--tags",
             "--no-show-signature", "--no-ext-diff", "--no-textconv", f"--since=@{int(since.timestamp())}",
             f"--max-count={ACTIVITY_COMMITS_MAX}", "--format=%H%x1f%ct"]
-    code, stdout = _run(argv, left)
+    code, stdout = _run(argv, left())
     if code != 0:
         raise RuntimeError(f"git exited {code}")
     out: list[int] = []
@@ -377,6 +428,196 @@ def git_commits(gitdir: Path, since: datetime, timeout: float) -> list[int]:
         if sep and ct.strip().isdigit():
             out.append(int(ct.strip()))
     return out
+
+
+#: Added for a status read, after ``NEUTRALISE``: no submodule is entered (git would run there on a config no
+#: refusal read) and no summary of one is drawn.
+STATUS_NEUTRALISE = ("-c", "status.submoduleSummary=false", "-c", "diff.ignoreSubmodules=all")
+
+
+def _short(text: str) -> str:
+    """Repository-controlled text as one display-safe line of at most 48 characters (the topology's label rule). The
+    cut falls before a ``⟨U+…⟩`` marker it would split, never inside one."""
+    s = visible(" ".join(text.split()))
+    if len(s) <= 48:
+        return s
+    cut = s[:47]
+    i = cut.rfind("⟨")
+    return (cut[:i] if i != -1 and "⟩" not in cut[i:] else cut) + "…"
+
+
+def _status_name(path: str) -> str:
+    """A changed path's basename (an untracked directory's own name), as ``_short``."""
+    return _short(os.path.basename(path.rstrip("/")) or path)
+
+
+_BOOL = frozenset({"true", "false", "yes", "no", "on", "off", "1", "0"})
+
+#: What the private git directory's config takes from the repository's: keys that change what a status read
+#: counts, never what it runs, each copied only with a value of the listed shape (lower-cased).
+MIRRORED = {"core.filemode": _BOOL, "core.ignorecase": _BOOL, "core.precomposeunicode": _BOOL,
+            "core.symlinks": _BOOL, "core.trustctime": _BOOL, "core.checkstat": frozenset({"default", "minimal"}),
+            "core.autocrlf": _BOOL | {"input"}, "core.eol": frozenset({"lf", "crlf", "native"}),
+            "extensions.objectformat": frozenset({"sha1", "sha256"})}
+
+
+def _copy_owned(src: Path, dst: Path, limit: int) -> int:
+    """Copy a regular file owned by this uid, opened without following a link, of at most ``limit`` bytes, into
+    ``dst`` (created 0600): the bytes copied, -1 when ``src`` is absent; ``GitRefused`` when it is not such a file
+    or is larger."""
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return -1
+    except OSError:
+        raise GitRefused(f"its {src.name} is not a file you own, not read") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise GitRefused(f"its {src.name} is not a file you own, not read")
+        if st.st_size > limit:
+            raise GitRefused(f"its {src.name} is larger than the copy allows, not read")
+        out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            n = 0
+            while chunk := os.read(fd, 1 << 20):
+                n += len(chunk)
+                if n > limit:
+                    raise GitRefused(f"its {src.name} is larger than the copy allows, not read")
+                os.write(out, chunk)
+        finally:
+            os.close(out)
+    finally:
+        os.close(fd)
+    return n
+
+
+def _copy_index(gitdir: Path, private: Path) -> None:
+    """The worktree's index into the private git directory, with any ``sharedindex.<oid>`` files beside it (a split
+    index names one, which git looks for in the git directory it runs on), all within ``INDEX_MAX`` bytes."""
+    shared = []
+    with os.scandir(gitdir) as it:
+        for n, e in enumerate(it):
+            if n >= PACK_ENTRIES_MAX:
+                raise GitRefused(f"its git directory holds more than {PACK_ENTRIES_MAX} entries, not read")
+            oid = e.name[len("sharedindex."):]
+            if e.name.startswith("sharedindex.") and len(oid) in (40, 64) and all(c in "0123456789abcdef" for c in oid):
+                shared.append(e.name)
+    if len(shared) > SHARED_INDEX_MAX:
+        raise GitRefused(f"its git directory holds more than {SHARED_INDEX_MAX} shared index files, not read")
+    room = INDEX_MAX
+    for name in ("index", *shared):
+        room -= max(0, _copy_owned(gitdir / name, private / name, room))
+
+
+def _mirrored(f: Path, left: Callable[[], float], extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """The ``MIRRORED`` keys (and ``extra``) one config file sets, read with ``git config --file --no-includes``,
+    which runs nothing: lower-cased, the last one winning as in git, a value of any other shape left out (an
+    ``extra`` key is returned unchecked, for the caller to read as it means). Absent is empty."""
+    got: dict[str, str] = {}
+    if not os.path.lexists(f):
+        return got
+    keys = (*MIRRORED, *extra)
+    pattern = "^(" + "|".join(k.replace(".", r"\.") for k in keys) + ")$"
+    code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--no-includes", "-z",
+                      "--get-regexp", pattern], left())
+    if code not in (0, 1):
+        raise GitRefused(f"its {f.name} does not parse (git config exited {code}), not read")
+    for item in out.split("\0"):
+        key, _sep, val = item.partition("\n")
+        key, val = key.lower(), val.strip().lower()
+        if key in extra or (key in MIRRORED and val in MIRRORED[key]):
+            got[key] = val
+    return got
+
+
+def _private_config(common: Path, gitdir: Path, left: Callable[[], float]) -> str:
+    """The private git directory's config: ``MIRRORED`` keys read from the repository's ``config`` and then, when
+    that config sets ``extensions.worktreeConfig``, from this worktree's ``config.worktree`` (``<gitdir>``'s; the
+    main worktree's is in the common git dir), which wins, as in git. Only ``core.*`` keys come from
+    ``config.worktree``: the object format is the repository's. Nothing that names a program, a filter, an include
+    or another repository crosses from either file."""
+    got = _mirrored(common / "config", left, ("extensions.worktreeconfig",))
+    on = got.pop("extensions.worktreeconfig", "false") in ("true", "yes", "on", "1", "")    # a bare key is true
+    if on:
+        got.update((k, v) for k, v in _mirrored(gitdir / "config.worktree", left).items() if k.startswith("core."))
+    fmt = got.pop("extensions.objectformat", "sha1")
+    lines = ["[core]", f"\trepositoryformatversion = {1 if fmt != 'sha1' else 0}", "\tbare = false",
+             "\tuntrackedCache = false", "\tlogAllRefUpdates = false",
+             *(f"\t{k.split('.', 1)[1]} = {v}" for k, v in got.items()), "[gc]", "\tauto = 0"]
+    if fmt != "sha1":
+        lines += ["[extensions]", f"\tobjectformat = {fmt}"]
+    return "\n".join(lines) + "\n"
+
+
+def git_worktree_state(common: Path, gitdir: Path, top: Path, timeout: float) -> dict[str, Any]:
+    """What closing a session in this working tree would leave unsaved: ``{dirty, dirty_names, branch, unpushed}``:
+    the count of changed and untracked files (submodules ignored), the first ``STATUS_NAMES_MAX`` basenames, the
+    checked-out branch (None when detached or unborn) and the count of commits on ``HEAD`` that no remote branch
+    holds (at most ``UNPUSHED_MAX``). Every git call shares ``timeout``.
+
+    ``repo_refusal`` first (``GitRefused``). Then the commit read's path on the repository, which runs no working
+    tree comparison: its ``HEAD`` (``symbolic-ref``, ``rev-parse``) and, after the status, the unpushed count
+    (``rev-list``), each on exactly this worktree's git directory (``--git-dir``, cwd ``/``) under ``_git_env``
+    with every program-naming key overridden (``NEUTRALISE``). The status itself runs on a private git directory
+    (``tempfile.mkdtemp``, 0700, removed after, whatever happens): the config ``_private_config`` writes, ``HEAD``
+    detached at that commit, a copy of the worktree's index (``_copy_index``) and of ``info/exclude``, the
+    repository's objects by ``GIT_OBJECT_DIRECTORY``, and ``--work-tree`` the real top; plus no optional locks
+    (``--no-optional-locks``, besides ``_git_env``'s ``GIT_OPTIONAL_LOCKS=0``) and no submodule entered
+    (``STATUS_NEUTRALISE``). So no config, ``info/attributes`` or hook the agent writes is
+    read by the git that compares contents, and an attribute naming a driver names one nobody defined (the
+    operator's own global config aside, which is trusted). Raises ``subprocess.TimeoutExpired``, ``OSError`` or
+    ``RuntimeError`` (git refused or exited non-zero: the caller shows the counts as unknown, never as 0)."""
+    left = _budget(timeout)
+    why = repo_refusal(common, left())
+    if why is not None:
+        raise GitRefused(why)
+    real = [_real_git(), "--no-pager", *NEUTRALISE, f"--git-dir={gitdir}"]
+    config = _private_config(common, gitdir, left)
+    code, out = _run([*real, "symbolic-ref", "-q", "HEAD"], left())
+    if code not in (0, 1):
+        raise RuntimeError(f"git symbolic-ref exited {code}")
+    ref = out.strip() if code == 0 else None
+    code, out = _run([*real, "rev-parse", "-q", "--verify", "HEAD^{commit}"], left())
+    oid = out.strip() if code == 0 else None
+    if code not in (0, 1) or (oid is None and ref is None) or (
+            oid is not None and (len(oid) not in (40, 64) or any(c not in "0123456789abcdef" for c in oid))):
+        raise RuntimeError(f"git rev-parse exited {code}")
+    private = Path(tempfile.mkdtemp(prefix="levain-status-"))
+    try:
+        (private / "config").write_text(config)
+        (private / "HEAD").write_text(f"{oid}\n" if oid else "ref: refs/heads/unborn\n")
+        (private / "refs").mkdir()
+        (private / "info").mkdir()
+        _copy_index(gitdir, private)
+        _copy_owned(common / "info" / "exclude", private / "info" / "exclude", EXCLUDE_MAX)
+        code, out = _run([_real_git(), "--no-pager", *NEUTRALISE, *STATUS_NEUTRALISE, f"--git-dir={private}",
+                          f"--work-tree={top}", "--no-optional-locks", "status", "--porcelain=v2", "-z",
+                          "--no-renames", "--ignore-submodules=all", "--untracked-files=normal"], left(),
+                         {"GIT_OBJECT_DIRECTORY": str(common / "objects")})
+    finally:
+        shutil.rmtree(private, ignore_errors=True)
+    if code != 0:
+        raise RuntimeError(f"git status exited {code}")
+    dirty, names = 0, []
+    for item in out.split("\0"):
+        if item[:2] in ("1 ", "2 ", "u ", "? "):
+            # porcelain v2: the path is the last field (8 before it on an ordinary change, 10 on an unmerged one)
+            parts = item.split(" ", {"1": 8, "2": 9, "u": 10, "?": 1}[item[0]])
+            dirty += 1
+            if len(names) < STATUS_NAMES_MAX and len(parts) > 1:
+                names.append(_status_name(parts[-1]))
+    unpushed = 0
+    if oid is not None:
+        code, out = _run([*real, "rev-list", "--count", f"--max-count={UNPUSHED_MAX}", oid, "--not", "--remotes"],
+                         left())
+        if code != 0 or not out.strip().isdigit():
+            raise RuntimeError(f"git rev-list exited {code}")
+        unpushed = int(out.strip())
+    branch = None
+    if oid is not None and ref is not None and ref.startswith("refs/heads/"):
+        branch = _short(ref[len("refs/heads/"):])
+    return {"dirty": dirty, "dirty_names": names, "branch": branch, "unpushed": unpushed}
 
 
 def _scan(repos: list[tuple[Path, str]], since: datetime, clock: Callable[[], float] = time.monotonic,

@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -302,10 +303,21 @@ def _await_events(resp, timeout: float = 15.0, settle: float = 1.0) -> list[tupl
         got = _events_for(resp, 0.25)
     return got + _events_for(resp, settle) if got else got
 
+def _pin_minute(ck, second: int = 5) -> None:
+    """The cockpit's clock, still advancing in real time but held inside ONE wall-clock minute. The topology panel
+    stamps ``as_of`` to the minute (so an idle install is quiet for 59 s and announces the minute turning), and a
+    test that straddled a minute boundary read that as a change nobody made."""
+    t0 = time.monotonic()
+    base = datetime.now(timezone.utc).replace(second=second, microsecond=0)
+    ck._clock = lambda: base + timedelta(seconds=min(time.monotonic() - t0, 50.0))
+
+
 def _cockpit(src: SubstrateSource, rows: list[RowIn]):
-    """A cockpit with one ON-DEMAND panel ``od`` whose rows the test edits; ``reads`` counts provider calls."""
+    """A cockpit with one ON-DEMAND panel ``od`` whose rows the test edits; ``reads`` counts provider calls. Its
+    clock is pinned inside one minute (``_pin_minute``)."""
     state = {"rows": rows, "reads": 0}
     ck = build_default_cockpit(src)
+    _pin_minute(ck)
 
     def read(ctx):
         state["reads"] += 1
@@ -348,6 +360,25 @@ class TestHttp:
                 assert got[0][2]["etag"]
             finally:
                 c.close()
+
+    def test_the_topology_etag_moves_when_the_minute_turns_and_not_before(self, tmp_path: Path) -> None:
+        # S1: the flake was a real boundary crossing, not a feedback loop. The panel stamps as_of to the minute, so
+        # an idle install announces ONE topology change per minute (F12a ruling 4, as the activity panel does).
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        now = [datetime(2026, 10, 19, 15, 0, 59, 900000, tzinfo=timezone.utc)]
+        ck._clock = lambda: now[0]
+
+        def etags() -> dict[str, str]:
+            return {k: v["etag"] for k, v in ck.manifest({"class": "none", "device_class": None})["panels"].items()}
+
+        before = etags()
+        assert etags() == before                                   # the same instant: stable
+        now[0] += timedelta(milliseconds=300)                      # 15:01:00.2: the minute turned
+        after = etags()
+        assert {k for k in before if before[k] != after[k]} == {"topology"}
+        now[0] += timedelta(seconds=30)                            # inside the new minute: quiet again
+        assert etags() == after
 
     def test_a_client_get_of_a_panel_produces_no_event(self, tmp_path: Path) -> None:
         # the feedback-loop regression: a read advances the engine's freshness, which must not be a change signal
