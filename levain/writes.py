@@ -1126,7 +1126,7 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     would fail a set that has already landed). With ``defer_episode`` (``apply_edit``'s path, which holds
     the process-wide write lock) the result carries ``episode: pending`` and a private ``_deliver``
     that ``apply_edit`` calls after the lock is released, so a slow store or a blocking sink never
-    freezes the other edits and a sink may call back into ``apply_edit"""
+    freezes the other edits and a sink may call back into ``apply_edit``."""
     ctx = scope.context_json
     if ctx is None:
         raise EditError(
