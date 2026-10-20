@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **`levain drop`: leave a message for your coordinator and go.** Your words are kept exactly as you typed them and
+  authorise nothing. Each drop gets a drop receipt: one when it arrives, and one naming the threads it became (one
+  intent per thread: work, ask, note or relay). Typed inside a git checkout, a drop records the repo and branch you
+  were on. `levain drops list|show` reads them back; `levain thread list|show` shows the threads, and `merge`,
+  `detach`, `add` and `state` fix a split or close a thread.
+
+### Known edges
+- The coordinator session that reads drops and splits them comes later; until then a thread is named with
+  `levain drops split`. The phone drop sheet comes later too.
+
 ## [0.11.12] — 2026-10-20
 
 ### Added
