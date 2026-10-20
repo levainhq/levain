@@ -24,17 +24,19 @@ import signal
 import socket
 import subprocess
 import sys
+import stat as stat_mod
 import threading
-from pathlib import Path
+import types
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from levain.contracts import canon
-from levain.slot import forwarder, wall
+from levain.slot import Refused, forwarder, wall
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
 from levain.slot import start as SS
-from levain.slot.ids import RANGES
+from levain.slot.ids import RANGES, SlotId
 from levain.slot.root_tree import VENDOR_PREFIX
 from tests.test_slot_s2d_forwarder import sockdir  # noqa: F401,F811 - the short /tmp socket dir fixture
 from tests.test_slot_s2f2_runtime_helper import OP_UID
@@ -664,3 +666,112 @@ def test_xdg_dirs_listed_under_home(env):
     finally:
         ctx.store.close()
     assert "xdg/config/other" in home and "xdg/data/claude" in home
+
+
+# --- F3 (VM run s2-linux): make_cgroup makes the missing ancestors, trusts only root's ------------------------------
+
+class CgFS:
+    """A fake cgroupfs below ``/sys/fs/cgroup``: path -> (uid, mode); a mkdir is root's, 0755."""
+
+    def __init__(self, **extra):
+        self.nodes = {"/sys/fs/cgroup": (0, stat_mod.S_IFDIR | 0o555)}
+        self.nodes.update(extra)
+        self.made: list = []
+
+    def lstat(self, p):
+        if p not in self.nodes:
+            raise FileNotFoundError(errno.ENOENT, p)
+        uid, mode = self.nodes[p]
+        return types.SimpleNamespace(st_uid=uid, st_mode=mode)
+
+    def mkdir(self, p, mode):
+        if p in self.nodes:
+            raise FileExistsError(errno.EEXIST, p)
+        if p.rsplit("/", 1)[0] not in self.nodes:
+            raise FileNotFoundError(errno.ENOENT, p)       # what the bare os.mkdir hit in the VM
+        self.nodes[p] = (0, stat_mod.S_IFDIR | mode)
+        self.made.append((p, mode))
+
+
+CG = "/sys/fs/cgroup/levain.slice/e0.scope/" + SESSION
+
+
+def test_make_cgroup_makes_every_missing_ancestor_root_0755():
+    fs = CgFS()
+    H.make_cgroup(CG, mkdir=fs.mkdir, lstat=fs.lstat)
+    assert fs.made == [("/sys/fs/cgroup/levain.slice", 0o755), ("/sys/fs/cgroup/levain.slice/e0.scope", 0o755),
+                       (CG, 0o755)]
+    H.make_cgroup(CG, mkdir=fs.mkdir, lstat=fs.lstat)               # a second start's: used as it is
+    assert len(fs.made) == 3
+
+
+@pytest.mark.parametrize("node", [
+    ("/sys/fs/cgroup/levain.slice", (1000, stat_mod.S_IFDIR | 0o755)),            # not root's
+    ("/sys/fs/cgroup/levain.slice", (0, stat_mod.S_IFDIR | 0o775)),               # group-writable
+    ("/sys/fs/cgroup/levain.slice/e0.scope", (0, stat_mod.S_IFDIR | 0o757)),      # other-writable
+    ("/sys/fs/cgroup/levain.slice/e0.scope", (0, stat_mod.S_IFLNK | 0o777)),      # a link
+    (CG, (899, stat_mod.S_IFDIR | 0o755)),                                        # the leaf itself
+])
+def test_make_cgroup_refuses_an_untrusted_ancestor(node):
+    path, st = node
+    parents = {"/sys/fs/cgroup/levain.slice": (0, stat_mod.S_IFDIR | 0o755),
+               "/sys/fs/cgroup/levain.slice/e0.scope": (0, stat_mod.S_IFDIR | 0o755)}
+    fs = CgFS(**{p: v for p, v in parents.items() if len(p) < len(path)})
+    fs.nodes[path] = st
+    with pytest.raises(Refused) as e:
+        H.make_cgroup(CG, mkdir=fs.mkdir, lstat=fs.lstat)
+    assert e.value.name == "cgroup-untrusted"
+    assert all(len(p) <= len(path) for p, _ in fs.made)             # nothing made below the refused one
+
+
+@pytest.mark.parametrize("bad", ["/sys/fs/cgroup/other/x", "/sys/fs/cgroup/levain.slice/../x",
+                                 "/sys/fs/cgroup/levain.slice//x", "/sys/fs/cgroup/levain.slice"])
+def test_make_cgroup_refuses_a_path_off_the_slice(bad):
+    fs = CgFS()
+    with pytest.raises(Refused) as e:
+        H.make_cgroup(bad, mkdir=fs.mkdir, lstat=fs.lstat)
+    assert e.value.name == "cgroup-untrusted" and fs.made == []
+
+
+def test_make_cgroup_without_the_cgroupfs_refused():
+    fs = CgFS()
+    del fs.nodes["/sys/fs/cgroup"]
+    with pytest.raises(Refused) as e:
+        H.make_cgroup(CG, mkdir=fs.mkdir, lstat=fs.lstat)
+    assert e.value.name == "cgroup-untrusted" and fs.made == []
+
+
+# --- F4 (VM run s2-linux): the view's ancestor dirs, with §2.1 / §2.2's modes ---------------------------------------
+
+def _dirs(args):
+    out, i = [], 0
+    while i < len(args):
+        if args[i] == "--perms" and args[i + 2] == "--dir":
+            out.append((args[i + 3], int(args[i + 1], 8)))
+            i += 4
+        else:
+            i += 1
+    return out
+
+
+@pytest.mark.parametrize("slot,kw", [(E0, dict(kind="interactive", queue_grant=False)),
+                                     (SlotId("egress", 1), dict(kind="planner", queue_grant=True)),
+                                     (SlotId("none", 0), dict(kind="verifier", queue_grant=False))])
+def test_view_ancestors_precede_their_binds_with_layouts_modes(slot, kw):
+    from levain.slot.layout import base_run_rows, base_store_rows
+
+    links = {"/bin": "usr/bin", "/sbin": "usr/sbin", "/lib": "usr/lib", "/lib64": None}
+    args = list(wall.linux_view_args(slot, SESSION, host_links=links, **kw))
+    dirs = _dirs(args)
+    first_bind = args.index("--bind")
+    assert all(args.index(p) < first_bind for p, _ in dirs)
+    binds = [args[i + 1] for i, x in enumerate(args) if x == "--bind"]
+    made = [p for p, _ in dirs]
+    for b in binds:
+        anc = [str(a) for a in reversed(PurePosixPath(b).parents) if str(a) != "/"]
+        assert all(a in made for a in anc) and [m for m in made if m in anc] == anc    # parents first
+    rows = {str(r.path): r.mode for r in base_store_rows("linux", "-") + base_run_rows("linux") if r.kind == "dir"}
+    for p, mode in dirs:
+        assert mode == rows.get(p, 0o755), p                         # §2.1 / §2.2's row, where it has one
+    assert ("/var/levain", 0o755) in dirs and ("/var/levain/live", 0o711) in dirs
+    assert len(made) == len(set(made))

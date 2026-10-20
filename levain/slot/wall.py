@@ -454,7 +454,8 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
     them) · ``/bin /sbin /lib /lib64`` as the host's links into ``/usr`` · a fresh ``/proc`` (a new PID
     namespace) · ``/dev`` bound with a fresh ``/dev/shm`` · tmpfs ``/tmp /var/tmp /run`` · rw ``<S>`` · the
     slot's socket dirs: ``R/gw/slot<n>/`` (egress), ``R/qb/slot<n>/`` (queue grant), ``R/planner/slot<n>/``
-    (planner kind). No ``/sys``. Per-session IPC, PID and UTS namespaces (§9.1, plan §2e 7); bwrap always
+    (planner kind), each bind's ancestors made first with their §2.1 / §2.2 modes
+    (:func:`view_ancestor_dirs`). No ``/sys``. Per-session IPC, PID and UTS namespaces (§9.1, plan §2e 7); bwrap always
     makes the mount namespace. The network namespace is joined by ``nsenter``, never unshared here.
     [not run: R-L1 built this view with hand mounts + ``pivot_root``; bwrap run AS ROOT building it (``/dev``
     recursion, no ``--cap-*`` so the slot's own nested bwrap keeps a full bounding set) is a 2g row.]
@@ -496,16 +497,48 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
             raise Refused("view-path-off-list", f"{name} -> {target!r} is not a link into /usr (§9.2)")
         args += ["--symlink", target, name]
     args += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
-             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
-             "--bind", str(S), str(S)]
+             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run"]
+    binds = [str(S)]
     if slot.slot_class == "egress":
         R = PurePosixPath(str(RUN["linux"]))
         grants = ["gw"] + (["qb"] if queue_grant else []) + (["planner"] if kind == "planner" else [])
-        for g in grants:
-            d = str(R / g / f"slot{slot.index}")
-            args += ["--bind", d, d]
+        binds += [str(R / g / f"slot{slot.index}") for g in grants]
+    args += view_ancestor_dirs(binds)
+    for d in binds:
+        args += ["--bind", d, d]
     args += ["--chdir", "/"]
     return tuple(args)
+
+
+#: DECISION: an ancestor §2.1 / §2.2 gives no row (``/var``, ``/run``) is the host's ordinary 0755.
+_HOST_DIR_MODE = 0o755
+
+
+def view_ancestor_modes() -> dict:
+    """The modes the view's ancestor dirs take: layout's rows for the store and run dirs (§2.1, §2.2), the one
+    source ``install`` makes the host's dirs from."""
+    from levain.slot.layout import base_run_rows, base_store_rows
+
+    rows = base_store_rows("linux", "-") + base_run_rows("linux")
+    return {str(r.path): r.mode for r in rows if r.kind == "dir"}
+
+
+def view_ancestor_dirs(binds: Iterable[str]) -> Tuple[str, ...]:
+    """``--perms <mode> --dir <path>`` for every ancestor of each bind destination, parents first, each once.
+    Without them bwrap makes a destination's missing parents ``root:root 0700`` and the slot cannot reach its
+    own ``<S>`` (VM run s2-linux F4: ``/var/levain``, ``/var/levain/live``, ``/run/levain``, ``/run/levain/gw``).
+    A ``--dir`` on a dir an earlier op already made (``/var`` by ``--tmpfs /var/tmp``, the ``/run`` tmpfs) leaves
+    it as it is."""
+    modes = view_ancestor_modes()
+    out: list = []
+    seen: set = set()
+    for d in binds:
+        for a in reversed(PurePosixPath(d).parents):
+            if str(a) == "/" or str(a) in seen:
+                continue
+            seen.add(str(a))
+            out += ["--perms", f"{modes.get(str(a), _HOST_DIR_MODE):04o}", "--dir", str(a)]
+    return tuple(out)
 
 
 @dataclass(frozen=True)

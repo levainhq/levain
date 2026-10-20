@@ -296,13 +296,34 @@ def wait_child(pid: int) -> int:
     return os.WEXITSTATUS(status)
 
 
-def make_cgroup(path: str) -> None:
+def make_cgroup(path: str, *, mkdir: Callable[[str, int], None] = os.mkdir,
+                lstat: Callable[[str], os.stat_result] = os.lstat) -> None:
     """Linux: the session's cgroup (§7.3), made by ``start`` before the first process joins it (wall's
-    :func:`exec_launch` proves the join). DECISION: one that exists (a start that died after making it) is used."""
-    try:
-        os.mkdir(path, 0o755)
-    except FileExistsError:
-        pass
+    :func:`exec_launch` proves the join). Every missing directory from ``levain.slice`` down to the session leaf is
+    made root 0755 (setup makes none of them: VM run s2-linux F3); every one on the way, the cgroupfs root
+    included, must then be a root-owned directory, not a link, writable by no group or other, else
+    ``cgroup-untrusted`` and no process joins it. DECISION: one that exists (a start that died after making it) is
+    used. [known edge: a systemd-delegated ``levain.slice`` (systemd owning these names under its root) is a later
+    refinement; here root's own mkdir makes them.]"""
+    root = wall.CGROUP_ROOT.rsplit("/", 1)[0]          # the cgroupfs mount, never made here
+    parts = path[len(root) + 1:].split("/")
+    if not path.startswith(wall.CGROUP_ROOT + "/") or any(p in ("", ".", "..") for p in parts):
+        raise Refused("cgroup-untrusted", f"{path!r} is not below {wall.CGROUP_ROOT}")
+    cur = root
+    for i, part in enumerate([""] + parts):
+        cur = cur if i == 0 else f"{cur}/{part}"
+        try:
+            st = lstat(cur)
+        except FileNotFoundError:
+            if i == 0:
+                raise Refused("cgroup-untrusted", f"{cur} is not mounted") from None
+            try:
+                mkdir(cur, 0o755)
+            except FileExistsError:
+                pass                                     # made between the lstat and the mkdir: checked below
+            st = lstat(cur)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Refused("cgroup-untrusted", f"{cur}: uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):o}")
 
 
 def stub_front_args(host: str, slot: SlotId) -> Tuple[str, ...]:
