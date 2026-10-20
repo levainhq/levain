@@ -139,3 +139,26 @@ def test_out_naming_a_user_that_does_not_exist_is_a_clean_error(queue_dir, capsy
     rc = cli.main(_ARGS + [str(queue_dir), "--out", "~levain_user_that_does_not_exist_1019/r.json"])
     out, err = capsys.readouterr()
     assert rc == 1 and out == "" and err.startswith("levain consent receipts export:")
+
+
+def test_a_failed_write_on_the_no_hard_link_path_leaves_no_partial_file(queue_dir, tmp_path, monkeypatch, capsys):
+    import errno
+    import os
+
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    real_fsync = os.fsync
+    calls = []
+
+    def fsync_fails_on_the_second(fd):           # the temp file's fsync passes, the fallback's fails
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError(errno.EIO, "I/O error")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "link", no_links)
+    monkeypatch.setattr(os, "fsync", fsync_fails_on_the_second)
+    target = tmp_path / "r.json"
+    assert cli.main(_ARGS + [str(queue_dir), "--out", str(target)]) == 1
+    assert not target.exists() and list(tmp_path.iterdir()) == [p for p in tmp_path.iterdir() if p.is_dir()]

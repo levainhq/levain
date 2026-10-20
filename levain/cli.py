@@ -1638,7 +1638,8 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
     export_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
                           help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
     export_p.add_argument("--out", type=Path, default=None, metavar="FILE",
-                          help="Write the JSON here (atomically) instead of stdout; refuses to overwrite a file.")
+                          help="Write the JSON here instead of stdout (whole or not at all where the filesystem has hard "
+                               "links); refuses to overwrite a file.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
@@ -1724,10 +1725,14 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
                     # a filesystem with no hard links (exFAT, some network mounts): an exclusive create, still never
                     # over an existing file, at the cost of a partial file if the write itself fails
                     efd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(efd, "wb") as fh:
-                        fh.write(data)
-                        fh.flush()
-                        os.fsync(fh.fileno())
+                    try:
+                        with os.fdopen(efd, "wb") as fh:
+                            fh.write(data)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                    except BaseException:
+                        os.unlink(out)                  # ours (O_EXCL made it): never leave a partial file behind
+                        raise
             finally:
                 try:
                     os.unlink(tmp_name)
