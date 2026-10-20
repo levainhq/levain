@@ -140,6 +140,8 @@ _WEIGHTS = {"observed": 2, "inferred": 1, "synthesized": 0}
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 # the hook events that close a tool call, and the execution status each says
 _TOOL_STATUS = {"PostToolUse": "success", "PostToolUseFailure": "failure"}
+# the outcomes the queue's dialog_outcomes CHECK allows
+_OUTCOMES = frozenset({"ran", "ran_unasked", "did_not_run"})
 _LEDGER_STATUS = {"post": "success", "post_failure": "failure"}
 
 # the spec's provenance paths: always present, then present only when the leaf is
@@ -429,8 +431,10 @@ def _counted_outcome(row: _Row) -> tuple[str, str, str] | None:
         return None
     if _stamp(row.closed, "dialog outcome time", row.seq) - _stamp(row.created, "stamp", row.seq) >= SETTLE:
         return None
-    if type(row.outcome) is not str:
-        return None
+    if row.outcome not in _OUTCOMES:
+        # the queue's CHECK allows only these; anything else is a raw writer's, and mapping it would turn damaged
+        # data into a receipt of an action that ran
+        raise ExportError(f"receipt {row.seq}: its dialog outcome {row.outcome!r} is not one the queue writes")
     if row.outcome != "did_not_run" and _TOOL_STATUS.get(row.oevent) is None:
         raise ExportError(f"receipt {row.seq}: its dialog outcome was closed by {row.oevent!r}, not a tool event")
     return row.outcome, row.closed, row.oevent

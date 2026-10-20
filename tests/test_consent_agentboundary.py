@@ -813,6 +813,19 @@ def test_a_dialog_outcome_time_is_parsed_only_where_it_is_used(tmp_path):
     assert ab.export(queue.directory, now=later(queue)).receipts == clean.receipts
 
 
+def test_an_outcome_the_queue_never_writes_is_an_export_error_not_a_success(tmp_path):
+    queue, ids = build_scratch(tmp_path)
+    conn = sqlite3.connect(queue.path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA ignore_check_constraints = ON")         # a raw writer, past the queue's CHECK
+        conn.execute("INSERT INTO dialog_outcomes (request_id, outcome, closed_at, event) "
+                     "SELECT id, 'bogus', decided_at, 'PostToolUse' FROM requests WHERE id = ?", (ids["withdrawn"],))
+    finally:
+        conn.close()
+    with pytest.raises(ab.ExportError, match="not one the queue writes"):
+        ab.export(queue.directory, now=later(queue))
+
+
 @pytest.mark.parametrize("score", ["0.5", True, [1], float("nan"), float("inf")])
 def test_a_score_that_is_not_a_number_is_an_export_error(score):
     with pytest.raises(ab.ExportError, match="not a number"):
