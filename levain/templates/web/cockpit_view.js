@@ -112,12 +112,12 @@
   }
 
   const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
-  function sporeOf(pid, row, groupTitles, hidden) {
+  function sporeOf(pid, row, groupTitles, hidden, today) {
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
       id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
-      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true,
+      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
@@ -195,22 +195,24 @@
 
   // Now's rows in date order with the heading each sits under. Overdue and undated (waiting on you) rows lead as TODAY / OVERDUE,
   // each later day within a week is "TUE 10-20", anything further is LATER.
-  function nowByDate(rows, nowMs) {
-    const d0 = new Date(nowMs);
+  // `today` is the server's calendar day ("YYYY-MM-DD", the panel's own `today`); the browser's clock and zone decide nothing here
+  function nowByDate(rows, today) {
     const day = (y, m, d) => Date.UTC(y, m, d);
-    const today = day(d0.getFullYear(), d0.getMonth(), d0.getDate());
+    const tm = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(today || ""));
+    const d0 = new Date();
+    const today0 = tm ? day(+tm[1], +tm[2] - 1, +tm[3]) : day(d0.getFullYear(), d0.getMonth(), d0.getDate());   // an old server sends none: the page's own day
     const iso = (r) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String((r.facets || {}).due || "")); return m ? day(+m[1], +m[2] - 1, +m[3]) : null; };
     const keyed = rows.map((r, i) => ({ r: r, i: i, t: iso(r) }));
-    const rank = (k) => (k.t === null ? today : k.t);     // undated: due now
+    const rank = (k) => (k.t === null ? today0 : k.t);     // undated: due now
     keyed.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
     const label = new Map();
     const names = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
     for (const k of keyed) {
       const t = rank(k);
       let text;
-      if (t < today) text = "OVERDUE";
-      else if (t === today) text = "TODAY";
-      else if (t - today <= 7 * 86400000) { const d = new Date(t); text = names[d.getUTCDay()] + " " + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0"); }
+      if (t < today0) text = "OVERDUE";
+      else if (t === today0) text = "TODAY";
+      else if (t - today0 <= 7 * 86400000) { const d = new Date(t); text = names[d.getUTCDay()] + " " + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0"); }
       else text = "LATER";
       label.set(k.r.id, text);
     }
@@ -241,7 +243,7 @@
       if (compose) out.compose = compose;
       // Now reads as a dated list, as the mock draws it: what is late and what is due today first, then each day of the next seven by
       // date ("TUE 10-20"), one line per item. A row with no date is due now (a decision waiting on you).
-      const nowRows = head.id === "now" ? nowByDate(panel.rows || [], nowMs || Date.now()) : null;
+      const nowRows = head.id === "now" ? nowByDate(panel.rows || [], panel.today) : null;
       const srcRows = nowRows ? nowRows.rows : (panel.rows || []);
       if (nowRows) out.note = "next 7 days";
       out.lines = srcRows.map((r) => {
@@ -687,9 +689,9 @@
       if ((rowsAct || pActions.length || (nat === "keep" && traySeeds)) && (nat === "tray" || nat === "loops" || nat === "keep" || nat === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
-        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
         if (heldRows.length) {
-          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
+          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
           const hf = (head.filtered || []).find((f) => f && f.reason === HELD_REASON);
           view.tray_held_line = { count: hf && isNum(hf.count) ? hf.count : heldRows.length, reason: HELD_REASON };
         }
@@ -1155,13 +1157,19 @@
       // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
       // English word at its head is capitalised (an identifier or a path is left as written).
       const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
+      // a tile whose glance face draws it (Decisions names the top item, Sessions says live and quiet) is drawn by that face alone: the
+      // generic first line + count would be a second, lesser answer ahead of it, and a strip tile shows only its first sub line
+      const glance = el("div");
+      glanceFace(d, n, glance);
+      const glanced = glance.childNodes.length > 0;
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
+      else if (glanced) { /* the glance lines below are the answer */ }
       else if (n && Array.isArray(d.lines) && d.lines.length && d.lines[0] && typeof d.lines[0].text === "string" && !s.ctx.alerted) {
         // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
         host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
       }
       else if (d.note) host.appendChild(el("div", "sub", d.note));
-      glanceFace(d, n, host);
+      while (glance.firstChild) host.appendChild(glance.firstChild);
       return;
     }
     if (d.kind === "status-dots" && d.pid === "doctor" && (d.metrics || []).some((m) => m.status === "ok" || m.status === "warn" || m.status === "bad")) {
@@ -1976,7 +1984,11 @@
       if (known) hit = [known[0]];
       else {
         // the pieces of the row are joined by a space: a badge ("handoff") and the text that follows it are not one word
-        let text = Array.from(row.children).filter((c) => c !== had).map((c) => c.textContent).join(" ");
+        // and without the tag it already wears, wherever it sits (a direct child of the row, or inside the clause): its own words
+        // are not evidence of the repo, and a tag glued to the clause's first word would hide a match
+        const bare = row.cloneNode(true);
+        for (const t of bare.querySelectorAll(".rp-tag:not(.k7-repo)")) t.remove();
+        let text = Array.from(bare.children).map((c) => c.textContent).join(" ");
         hit = matchers.find(([, re]) => re.test(text));
       }
       const key = hit && sky && typeof sky.hueKey === "function" ? sky.hueKey(hit[0]) : "";

@@ -106,12 +106,16 @@ def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
     return None
 
 
+def _handoff_expired(s: Any, today: date) -> bool:
+    """An undated handoff nobody has touched for more than ``HANDOFF_FRESH_DAYS``: the Tray lists it under "Also pending" and
+    Where to begin leaves it out. The one rule both read (a row's ``handoff_expired`` facet is this)."""
+    seen = parse_date(s.seen)
+    return bool(s.disposition == "handoff" and not parse_date(s.next) and seen and (today - seen).days > HANDOFF_FRESH_DAYS)
+
+
 def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
     due = parse_date(s.next)
-    seen = parse_date(s.seen)
-    expired = bool(
-        s.disposition == "handoff" and not due and seen and (today - seen).days > HANDOFF_FRESH_DAYS
-    )
+    expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
         "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
@@ -192,7 +196,7 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 continue                                    # held until its surface date
             if d and d < today:
                 late.append((d, s))
-            elif d == today or (not d and s.disposition == "handoff"):
+            elif d == today or (not d and s.disposition == "handoff" and not _handoff_expired(s, today)):
                 due.append(s)
         late.sort(key=lambda t: t[0])
         first = [s for _d, s in late] + due
@@ -1091,7 +1095,7 @@ def _tool_label(text: str) -> str:
     """The token-free panel's words for a tool event (the hook logs ``Name: argument``): the tool name alone, plus the
     BASENAME of the path for a file tool. The argument of any other tool (a shell command, an MCP call's payload) is never
     shown, and a path is never shown whole: this panel is served without a token."""
-    name, sep, arg = " ".join(text.split()).partition(": ")
+    name, sep, arg = " ".join(text.split("\n", 1)[0].split()).partition(": ")   # a multi-path patch logs one path a line: the first shows
     name = _tool_name(name.strip())
     if sep and name in _FILE_TOOLS:
         base = re.split(r"[/\\]", arg.strip().rstrip("/\\"))[-1]

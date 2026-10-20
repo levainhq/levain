@@ -417,19 +417,27 @@
     const heldLine = body.querySelector(":scope > .held-line, .held-line");
     const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
     const items = Array.prototype.filter.call(body.querySelectorAll(".row, .grp-head"), (n) => !n.parentElement.closest(".row"));
-    let hidden = 0, cut = false;
-    for (const n of items) {
-      const r = n.getBoundingClientRect();
-      if (!cut && r.bottom - top > limit) cut = true;
-      if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (n.classList.contains("row")) hidden++; }
-    }
-    // a heading left with no row under it goes too
-    for (let i = 0; i < items.length; i++) {
-      if (!items[i].classList.contains("grp-head") || items[i].dataset.folded) continue;
-      const next = items.slice(i + 1).find((n) => !n.dataset.folded && n.classList.contains("row"));
-      const nextHead = items.slice(i + 1).findIndex((n) => n.classList.contains("grp-head") && !n.dataset.folded);
-      const nextRow = next ? items.indexOf(next) : -1;
-      if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { items[i].style.display = "none"; items[i].dataset.folded = "1"; }
+    // where bands sit side by side (Morning's Tray: Overdue | Today) each column has its own fold, since a column that overflows says
+    // nothing about the one beside it; a band laid in the same flow (`display: contents`) shares the one
+    const colOf = (n) => { const c = n.closest(".grp-col"); return c && body.contains(c) && window.getComputedStyle(c).display !== "contents" ? c : null; };
+    const buckets = new Map();
+    for (const n of items) { const k = colOf(n); if (!buckets.has(k)) buckets.set(k, []); buckets.get(k).push(n); }
+    let hidden = 0;
+    for (const list of buckets.values()) {
+      let cut = false;
+      for (const n of list) {
+        const r = n.getBoundingClientRect();
+        if (!cut && r.bottom - top > limit) cut = true;
+        if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (n.classList.contains("row")) hidden++; }
+      }
+      // a heading left with no row under it goes too
+      for (let i = 0; i < list.length; i++) {
+        if (!list[i].classList.contains("grp-head") || list[i].dataset.folded) continue;
+        const next = list.slice(i + 1).find((n) => !n.dataset.folded && n.classList.contains("row"));
+        const nextHead = list.slice(i + 1).findIndex((n) => n.classList.contains("grp-head") && !n.dataset.folded);
+        const nextRow = next ? list.indexOf(next) : -1;
+        if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { list[i].style.display = "none"; list[i].dataset.folded = "1"; }
+      }
     }
     if (!hidden) return false;
     const more = el("button", "more-foot", hidden + " more");
@@ -1836,7 +1844,7 @@
       row.appendChild(sf);
     } else if (s.next) {
       // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
-      const late = daysLate(s.next);
+      const late = daysLate(s.next, s.today);
       if (late > 0) {
         row.dataset.band = "overdue";
         const od = tagEl("muted", "overdue " + late + " d");
@@ -2771,12 +2779,15 @@
     return m[1] < today;
   }
 
-  // whole days a due stamp is before today (negative: still ahead; 0: today); NaN when it is no date
-  function daysLate(due) {
+  // whole days a due stamp is before today (negative: still ahead; 0: today); NaN when it is no date. `today` is the server's
+  // calendar day ("YYYY-MM-DD", carried on the row): the browser's own zone and clock are used only when the server sent none
+  function daysLate(due, today) {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(due));
     if (!m) return NaN;
+    const tm = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(today || ""));
     const now = new Date();
-    return Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
+    const t0 = tm ? Date.UTC(+tm[1], +tm[2] - 1, +tm[3]) : Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    return Math.round((t0 - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
   }
   const shortDate = (due) => String(due).slice(5, 10);
 

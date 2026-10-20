@@ -1554,6 +1554,7 @@ class Cockpit:
             "actionable_count": None if snap.status == "error" else count,
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
+            "today": today.isoformat(),   # the server's calendar day: the page counts "overdue" / "today" against this, never its own clock
             "refresh_every_s": spec.refresh_every_s,
             "etag": etag,
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
@@ -2772,9 +2773,13 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             text(f"value.conflicts[{i}].path", c.get("path"), label=True, blank=False)
             if "/" in c["path"] or "\\" in c["path"]:
                 raise _bad(spec, f"value.conflicts[{i}].path", "must be a basename (no path on the wire)")
-            pair = c.get("nodes")
-            if not (isinstance(pair, list) and len(pair) == 2 and all(x in node_ids for x in pair) and pair[0] != pair[1]):
-                raise _bad(spec, f"value.conflicts[{i}].nodes", "must be two distinct node ids")
+            ids = c.get("nodes")
+            if not (isinstance(ids, list) and len(ids) >= 2 and all(isinstance(x, str) and x in node_ids for x in ids)
+                    and len(set(ids)) == len(ids)):
+                raise _bad(spec, f"value.conflicts[{i}].nodes", "must be two or more distinct node ids")
+        total = v.get("conflicts_total")
+        if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < len(v["conflicts"])):
+            raise _bad(spec, "value.conflicts_total", "must be an integer no smaller than the conflicts listed (the count before the cap), or null")
     counts = v.get("counts")
     if not isinstance(counts, dict):
         raise _bad(spec, "value.counts", "must be an object {tokens_today}")
@@ -2796,6 +2801,9 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         # an open loop's age and heat, both optional (a provider with no such thing omits them): present means ISO / a tier name, or null
         if t.get("opened") is not None and not _is_iso(t["opened"]):
             raise _bad(spec, f"{w}.opened", "must be an ISO-8601 timestamp or null (when the task was opened)")
+        age = t.get("age_days")
+        if age is not None and (isinstance(age, bool) or not isinstance(age, int) or age < 0):
+            raise _bad(spec, f"{w}.age_days", "must be a non-negative integer or null (calendar days open, in the provider's day)")
         if t.get("heat") is not None and t["heat"] not in TOPOLOGY_TASK_HEATS:
             raise _bad(spec, f"{w}.heat", f"must be one of {list(TOPOLOGY_TASK_HEATS)} or null, got {t.get('heat')!r}")
         outs = t.get("outcomes")

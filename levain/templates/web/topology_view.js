@@ -86,13 +86,9 @@
   // does the value hold anything to draw? Sessions or any task, an open loop included (it is a task with an age, as the flow cockpit
   // shows it). An install with neither keeps the card's empty line (with the quiet line beside it when a source could not be read).
   function hasWork(v) { return isObj(v) && (arr(v.nodes).length > 0 || arr(v.tasks).length > 0); }
-  // "open N d": calendar days from the day it was opened to the provider's own clock, in this browser's day (the Open loops panel's count)
-  function openDays(t, asOf) {
-    const a = Date.parse(t.opened), b = Date.parse(asOf);
-    if (isNaN(a) || isNaN(b)) return null;
-    const day = (ms) => { const d = new Date(ms); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); };
-    return Math.max(0, Math.round((day(b) - day(a)) / 86400000));
-  }
+  // "open N d": the whole calendar days the provider counted, in its own day (the Open loops panel's count). The page never
+  // recomputes a calendar day from a timestamp: its zone and clock are not the server's. No count is unknown, drawn as "open".
+  function openDays(t) { return Number.isInteger(t.age_days) && t.age_days >= 0 ? t.age_days : null; }
 
   // what the quiet line says: what the provider could not read, never hidden
   function quietLine(v) {
@@ -103,11 +99,14 @@
     return parts.length ? el("p", "tv-quiet", parts.join(" · ")) : null;
   }
 
-  // the value's content, for the card's repaint signature: only what is drawn. The clock (as_of, a node's last_event) is not in it, and
-  // a rate and a token count enter as the display rounds them, so a poll that moved nothing the operator can see repaints nothing
+  // the value's content, for the card's repaint signature: exactly what is drawn, each number as the display writes it (a rate at
+  // its one decimal, tokens as K / M, an open loop's age as the provider's day count). The clock (as_of, a node's last_event) and the
+  // `opened` stamp are not in it, so a poll that moved nothing the operator can see repaints nothing and a visible change always does
   function signature(v, l) {
-    const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, rate: isNum(n.rate) ? Math.round(n.rate) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
+    const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, rate: isNum(n.rate) ? n.rate.toFixed(1) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
+    const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined }) : t);
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
+                                                   tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
                                                    counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;
     return JSON.stringify([l, sane, Array.from(shownAll)]);
   }
@@ -197,7 +196,7 @@
     let c;
     if (conflicts === null) { c = el("span", "tv-stat dim", "conflicts not tracked"); }
     else if (!conflicts.length) { c = el("span", "tv-stat"); c.append(el("b", null, "0"), " conflicts"); }
-    else { c = el("span", "tv-stat warn"); c.append(el("b", null, conflicts.length), conflicts.length === 1 ? " file conflict" : " file conflicts"); }
+    else { const n = conflictCount(v); c = el("span", "tv-stat warn"); c.append(el("b", null, n), n === 1 ? " file conflict" : " file conflicts"); }
     c.dataset.k = "conflicts";
     row.appendChild(c);
     const tk = v.counts && isNum(v.counts.tokens_today) ? fmtTokens(v.counts.tokens_today) : null;
@@ -227,14 +226,22 @@
     for (const k of ["conflicts", "tokens"]) row.appendChild(rest.querySelector('[data-k="' + k + '"]'));
     return row;
   }
+  // the files in conflict: the provider's own count of them, which exceeds the list when the list was cut (never fewer than the list)
+  function conflictCount(v) {
+    const list = arr(v.conflicts);
+    return Number.isInteger(v.conflicts_total) && v.conflicts_total >= list.length ? v.conflicts_total : list.length;
+  }
   function conflictList(v) {
     const list = arr(v.conflicts);
     if (!list.length) return null;
+    const total = conflictCount(v);
     const label = new Map();
     for (const n of arr(v.nodes)) label.set(n.id, n.label);
     const d = el("details", "tv-conf");
-    d.appendChild(el("summary", null, list.length === 1 ? "1 file two live sessions are both writing" : list.length + " files two live sessions are both writing"));
-    for (const c of list) d.appendChild(el("div", "tv-conf-row", c.path + " — " + arr(c.nodes).map((id) => label.get(id) || id).join(" and ")));
+    d.appendChild(el("summary", null, (total === 1 ? "1 file" : total + " files") + " live sessions are both writing" + (total > list.length ? " (showing " + list.length + ")" : "")));
+    // one file, every session on it: "a and b", "a, b and c"
+    const names = (c) => { const w = arr(c.nodes).map((id) => label.get(id) || id); return w.length > 2 ? w.slice(0, -1).join(", ") + " and " + w[w.length - 1] : w.join(" and "); };
+    for (const c of list) d.appendChild(el("div", "tv-conf-row", c.path + " — " + names(c)));
     return d;
   }
 
@@ -248,7 +255,7 @@
     if (risk) c.appendChild(risk);
     return c;
   }
-  function taskCard(t, byId, lost, opts, asOf) {
+  function taskCard(t, byId, lost, opts) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));
     c.dataset.task = t.id;
     c.dataset.kind = t.kind;
@@ -259,7 +266,7 @@
     else { const ti = el("b", "tv-task-t", t.label); ti.title = t.label; head.appendChild(ti); }
     if (t.state === "open") {
       // an open loop is quiet: its age and its heat, never a tag that looks like a state change
-      const days = openDays(t, asOf);
+      const days = openDays(t);
       if (t.heat) { const h = el("i", "tv-heat " + t.heat); h.title = t.heat; h.setAttribute("role", "img"); h.setAttribute("aria-label", "heat: " + t.heat); head.appendChild(h); }
       head.appendChild(el("span", "tv-age", days === null ? "open" : "open " + days + " d"));
     } else if (t.kind !== "unattached" || t.state !== "running") head.appendChild(tag(t.state, t.state === "waiting" ? "waiting on you" : t.state));
@@ -361,7 +368,7 @@
       const folds = t.kind !== "unattached" && t.state !== "waiting" && t.state !== "failed";
       const idx = folds ? (seen.set(t.state, (seen.get(t.state) || 0) + 1), seen.get(t.state)) : 0;
       const hide = folds && idx > GROUP_CAP && !shownAll.has(t.state);
-      const c = taskCard(t, byId, lost, opts, v.as_of);
+      const c = taskCard(t, byId, lost, opts);
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;

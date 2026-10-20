@@ -43,16 +43,20 @@ def test_the_provider_value_accepts_open_with_its_age_and_heat_and_refuses_a_bad
     assert _panel(_with({"opened": None, "heat": None}))["status"] == "ok"
     p = _panel(_with({"heat": "scorching"}))
     assert p["status"] == "error" and "value.tasks[" in p["error"] and "heat" in p["error"], p
+    assert _panel(_with({"age_days": 3}))["status"] == "ok" and _panel(_with({"age_days": None}))["status"] == "ok"
+    for bad in (-1, 2.5, "3", True):
+        p = _panel(_with({"age_days": bad}))
+        assert p["status"] == "error" and "age_days" in p["error"], (bad, p)
     p = _panel(_with({"opened": "last tuesday"}))
     assert p["status"] == "error" and "opened" in p["error"], p
 
 
 def _loops(v: dict) -> dict:
     v["nodes"], v["groups"], v["lost_if_closed"], v["conflicts"] = [], [], [], None
-    t = lambda i, label, heat, opened: {"id": i, "kind": "spore", "label": label, "state": "open", "waits_on": [], "card": None,  # noqa: E731
-                                        "outcomes": [], "cost": {"usd": None, "tokens": None, "source": None}, "workers": [], "heat": heat, "opened": opened}
-    v["tasks"] = [t("spore:a", "parked one", "parked", "2026-10-10T12:00:00+00:00"), t("spore:b", "no heat", None, None),
-                  t("spore:c", "hot one", "hot", "2026-10-18T12:00:00+00:00"), t("spore:d", "warm one", "warm", "2026-10-19T12:00:00+00:00")]
+    t = lambda i, label, heat, opened, age=None: {"id": i, "kind": "spore", "label": label, "state": "open", "waits_on": [], "card": None,  # noqa: E731
+                                        "outcomes": [], "cost": {"usd": None, "tokens": None, "source": None}, "workers": [], "heat": heat, "opened": opened, "age_days": age}
+    v["tasks"] = [t("spore:a", "parked one", "parked", "2026-10-10T12:00:00+00:00", 10), t("spore:b", "no heat", None, None),
+                  t("spore:c", "hot one", "hot", "2026-10-18T12:00:00+00:00", 2), t("spore:d", "warm one", "warm", "2026-10-19T12:00:00+00:00", 1)]
     v["as_of"] = "2026-10-20T12:00:00+00:00"
     return v
 

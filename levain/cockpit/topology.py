@@ -19,8 +19,9 @@ dir the cockpit owns, which takes only allow-listed, shape-checked settings from
 each working tree past it named, and cached for ``LOST_CACHE_S``.
 
 File conflicts come from the session log: the PostToolUse hook logs ``Name: file_path`` for an Edit/Write, and two
-live nodes with the same whole path inside the live window are a conflict (basename only on the wire; ``null`` when
-live nodes exist and none has a log).
+live nodes with the same whole path inside the live window are a conflict: one record per path naming every node on it
+(basename only on the wire; ``null`` when live nodes exist and none has a log), with ``conflicts_total`` the count before
+the list's cap. An ``apply_patch`` logs every file it touches, one a line.
 
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
 log holds it only inside text this token-free panel must not carry), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
@@ -186,6 +187,7 @@ def _log_signal(install_root: Path, stem: str, now: datetime) -> tuple[datetime 
 #: the tools whose logged argument is the file they write (the PostToolUse hook logs ``Name: file_path``)
 _WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"})
 CONFLICTS_MAX = 20
+_MORE_PATHS = re.compile(r"\(\+\d+ more\)")   # the hook's count of the patch paths it did not list
 
 
 def _edit_paths(install_root: Path, stem: str, cwd: str, now: datetime, window_s: float) -> set[str] | None:
@@ -208,14 +210,20 @@ def _edit_paths(install_root: Path, stem: str, cwd: str, now: datetime, window_s
         if at is None or not 0 <= (now - at).total_seconds() <= window_s:
             continue
         name, sep, arg = ev["text"].partition(": ")
-        arg = arg.strip()
-        if not sep or name not in _WRITE_TOOLS or not arg or "\n" in arg:
+        if not sep or name not in _WRITE_TOOLS:
             continue
-        if not os.path.isabs(arg):
-            if not os.path.isabs(cwd):
+        # an apply_patch logs every file it touches, one per line (the hook's bounded list, then "(+N more)"); any other
+        # tool's argument is one path, and a multi-line one is no path
+        args = arg.split("\n") if name == "apply_patch" else [arg]
+        for one in args:
+            one = one.strip()
+            if not one or "\n" in one or _MORE_PATHS.fullmatch(one):
                 continue
-            arg = os.path.join(cwd, arg)
-        out.add(os.path.normpath(arg))
+            if not os.path.isabs(one):
+                if not os.path.isabs(cwd):
+                    continue
+                one = os.path.join(cwd, one)
+            out.add(os.path.normpath(one))
     return out
 
 
@@ -234,11 +242,13 @@ def _node_state(waiting: bool, age_s: float, last_kind: str | None) -> str:
 
 
 def _conflicts(install_root: Path, live: list[tuple[str, str]], stems: dict[str, str], now: datetime,
-               window_s: float) -> list[dict[str, Any]] | None:
-    """Two live nodes whose hooks logged an Edit/Write on the same path within ``window_s`` (the live window): a
-    pair per path, basename only on the wire. None when live nodes exist and none has a readable log (nothing was
-    observed, so "no conflicts" would be absence rendered as health); a list (maybe empty) once any log was read."""
-    seen: dict[str, list[str]] = {}
+               window_s: float) -> tuple[list[dict[str, Any]] | None, int | None]:
+    """Live nodes whose hooks logged an Edit/Write on the same path within ``window_s`` (the live window): ONE record
+    per path, naming every node on it (two or more), basename only on the wire, and the number of conflicting paths
+    found, which exceeds the list when ``CONFLICTS_MAX`` cut it. ``(None, None)`` when live nodes exist and none has a
+    readable log (nothing was observed, so "no conflicts" would be absence rendered as health); a list (maybe empty)
+    and its total once any log was read."""
+    seen: dict[str, set[str]] = {}
     read_any = False
     for nid, cwd in live:
         paths = _edit_paths(install_root, stems[nid], cwd, now, window_s)
@@ -246,16 +256,12 @@ def _conflicts(install_root: Path, live: list[tuple[str, str]], stems: dict[str,
             continue
         read_any = True
         for path in paths:
-            seen.setdefault(path, []).append(nid)
+            seen.setdefault(path, set()).add(nid)
     if live and not read_any:
-        return None
-    out: list[dict[str, Any]] = []
-    for path in sorted(seen):
-        ids = sorted(seen[path])
-        for i, a in enumerate(ids):
-            for b in ids[i + 1:]:
-                out.append({"path": _wire(os.path.basename(path), base=True), "nodes": [a, b]})
-    return out[:CONFLICTS_MAX]
+        return None, None
+    out = [{"path": _wire(os.path.basename(path), base=True), "nodes": sorted(seen[path])}
+           for path in sorted(seen) if len(seen[path]) >= 2]
+    return out[:CONFLICTS_MAX], len(out)
 
 
 # --- lost if closed: the git read ------------------------------------------------------------------------------
@@ -424,6 +430,17 @@ def _opened(created: Any, now: datetime) -> str | None:
     return _iso(datetime(d.year, d.month, d.day, tzinfo=now.astimezone().tzinfo))
 
 
+def _age_days(created: Any, now: datetime) -> int | None:
+    """Whole calendar days from the day a spore was opened to the provider's own day (the install's local day, the one the
+    Open loops panel counts in): the number the page draws, so no browser clock or zone decides it. None when the store has no
+    usable date."""
+    t = act._parse(created) if isinstance(created, str) else None
+    opened = t.astimezone().date() if t is not None else parse_date(created)
+    if opened is None:
+        return None
+    return max(0, (now.astimezone().date() - opened).days)
+
+
 def _spore_tasks(spores: list[Any], now: datetime | None = None) -> list[dict[str, Any]]:
     """The first ``SPORES_MAX`` open loops as tasks. The spore store links no loop to a session or a record, so a
     loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today). A loop nobody is on is
@@ -437,6 +454,7 @@ def _spore_tasks(spores: list[Any], now: datetime | None = None) -> list[dict[st
         tasks.append({"id": f"spore:{_wire(s.id)}", "kind": "spore", "label": _wire(s.text),
                       "state": "running" if workers else "open", "waits_on": [], "card": None, "outcomes": [],
                       "cost": dict(NO_COST), "workers": workers, "opened": _opened(getattr(s, "created", None), now),
+                      "age_days": _age_days(getattr(s, "created", None), now),
                       "heat": tier if tier in HEATS else None})
     return tasks
 
@@ -638,12 +656,13 @@ def topology_reader(*, install_root: Path | None,
                          "branches": [_wire(st["branch"])] if st and st["unpushed"] and st["branch"] else [],
                          "uncaptured_episodes": None, "running_children": None})
 
-        conflicts = _conflicts(install_root, live, live_stems, now, SESSION_ACTIVE_S)
+        conflicts, conflicts_total = _conflicts(install_root, live, live_stems, now, SESSION_ACTIVE_S)
 
         errors = list(dict.fromkeys(errors))
         return Read(value={
             "hub": {"id": HUB_ID, "label": _wire(hub_label(ctx) or "Levain")},
             "groups": list(groups.values()), "nodes": nodes, "conflicts": conflicts,
+            "conflicts_total": conflicts_total,
             "counts": {"tokens_today": None},
             # the minute, not the instant: a value stamped per read would change on every poll of an idle install
             "as_of": _iso(now.replace(second=0, microsecond=0)),
