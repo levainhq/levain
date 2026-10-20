@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Sequence
 
+from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
@@ -1016,7 +1017,7 @@ def _cwd_hint(cwd: str) -> str:
     """Where a session works, WITHOUT the whole path: this panel is token-free, and its tile has never carried the full
     cwd. ``~/repo`` for a direct child of the home directory, ``~/…/repo`` deeper under it, ``/…/repo`` elsewhere."""
     home = os.path.expanduser("~").rstrip("/\\")
-    name = "".join(c for c in (os.path.basename(cwd.rstrip("/\\")) or "/") if c.isprintable())[:64]
+    name = unshowable.mark((os.path.basename(cwd.rstrip("/\\")) or "/"), "", allow="", selectors=False)[:64]
     if name == "/":
         return "/"
     if home and cwd.rstrip("/\\") == home:
@@ -1045,7 +1046,7 @@ def _tool_label(text: str) -> str:
     name = _tool_name(name.strip())
     if sep and name in _FILE_TOOLS:
         base = re.split(r"[/\\]", arg.strip().rstrip("/\\"))[-1]
-        base = "".join(c for c in base if c.isprintable())[:SESSION_TOOL_MAX]
+        base = unshowable.mark(base, "", allow="", selectors=False)[:SESSION_TOOL_MAX]
         if base:
             return f"{name} {base}"
     return name
@@ -1120,13 +1121,13 @@ def _limit_lines() -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
             line: dict[str, Any] = {"counting": ent.get("counting") is True}
             if worst is not None:
                 m, st = worst
-                label = "".join(c for c in m["label"] if c.isprintable())[:LIMIT_LABEL_MAX]
+                label = unshowable.mark(m["label"], "", allow="", selectors=False)[:LIMIT_LABEL_MAX]
                 figure = _limit_figure(m.get("value")) + (f"/{_limit_figure(m['limit'])}" if m.get("limit") is not None else "")
                 line["metric"] = f"{label} {figure}"
                 line["status"] = st
             halted = ent.get("halted")
             if isinstance(halted, dict):
-                line["halted"] = "".join(c for c in str(halted.get("kind") or "limit") if c.isprintable())[:40]
+                line["halted"] = unshowable.mark(str(halted.get("kind") or "limit"), "", allow="", selectors=False)[:40]
             out[(ent["agent"], ent["session"])] = line
         return "ok", out
     except Exception:  # noqa: BLE001 - a limits panel that cannot be read is said on the rows, never a dark sessions panel
@@ -1201,7 +1202,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
-            work = "".join(c for c in work if c.isprintable())[:64]
+            work = unshowable.mark(work, "", allow="", selectors=False)[:64]
             key = (rec["agent"], rec["session_id"])
             view: dict[str, Any] = {"cwd": _cwd_hint(rec["cwd"]), "first_seen": rec["first_seen"], "last_seen": rec["last_seen"],
                                     "context": ctx_text}

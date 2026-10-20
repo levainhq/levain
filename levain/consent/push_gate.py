@@ -73,12 +73,12 @@ import signal
 import subprocess
 import sys
 import time
-import unicodedata
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from levain import unshowable
 from levain.consent import push
 from levain.consent.adapters import claude_code, codex
 from levain.consent.listing import filed_input
@@ -104,9 +104,6 @@ AGENT_LINE = ("To push a branch, run `levain push --remote <url> --branch <name>
               "600000): it asks the operator and pushes only on a signed yes. Do not run `git push` yourself.")
 
 _CONTROL = re.compile("[\x00-\x1f\x7f]")
-# characters the operator cannot read on a display: controls, format characters (bidi overrides such as U+202E,
-# zero-width joiners) and line / paragraph separators
-_UNSHOWABLE = frozenset({"Cc", "Cf", "Zl", "Zp"})
 # the agent's adapter: its own settings file and its hold. The ping, the U-IRR text and the hold ceiling used
 # here are the Claude Code adapter's, for either agent
 _ADAPTERS = {"claude_code": claude_code, "codex": codex}
@@ -137,10 +134,10 @@ def _agent_and_session(agent: str | None, session: str | None) -> tuple[str, str
 
 def _showable(name: str, text: str) -> None:
     """Refuse a field the operator would read with a character he cannot see (``ValueError``)."""
-    for ch in text:
-        if unicodedata.category(ch) in _UNSHOWABLE:
-            raise ValueError(f"the {name} carries an invisible or direction-changing character (U+{ord(ch):04X}); "
-                             "the operator could not read what he is asked to allow")
+    found = unshowable.first_hidden(text, allow="", selectors=False)
+    if found is not None:
+        raise ValueError(f"the {name} carries an invisible or direction-changing character (U+{ord(found[1]):04X}); "
+                         "the operator could not read what he is asked to allow")
 
 
 def _branch_tip(real: str, branch: str) -> str:

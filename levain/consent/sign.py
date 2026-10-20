@@ -81,6 +81,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
+
 __all__ = ["LIST_MAX", "MESSAGE_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "SignRefused", "SignRequest",
            "Signer", "namespace_problem", "read_request", "sign_dir", "state_of"]
 
@@ -96,10 +98,6 @@ _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9.-]{2,63}")
 _KEYS = frozenset({"format", "id", "namespace", "message", "title", "requester", "expires_at"})
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
-# characters that can render differently from their bytes: controls (newline and tab aside), format characters (the
-# bidi controls, zero-width joiners and spaces), line and paragraph separators, a lone surrogate (no UTF-8 form),
-# private-use and unassigned code points (tofu or blank); every space but U+0020 is refused beside these
-_UNSHOWABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 
 
 class SignRefused(Exception):
@@ -125,13 +123,12 @@ def namespace_problem(namespace: object) -> str | None:
 
 
 def _text_problem(text: str, what: str) -> str | None:
-    for ch in text:
-        if ch in "\n\t ":
-            continue
-        category = unicodedata.category(ch)
-        if category in _UNSHOWABLE or category == "Zs":
-            return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
-                    "from what is signed")
+    # characters that can render differently from their bytes (levain.unshowable); newline and tab are text
+    found = unshowable.first_hidden(text, allow="\n\t")
+    if found is not None:
+        ch = found[1]
+        return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
+                "from what is signed")
     return None
 
 

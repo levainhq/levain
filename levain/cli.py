@@ -1667,6 +1667,18 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
     export_p.add_argument("--out", type=Path, default=None, metavar="FILE",
                           help="Write the JSON here instead of stdout (whole or not at all where the filesystem has hard "
                                "links); refuses to overwrite a file.")
+    export_p.add_argument("--names", type=Path, default=None, metavar="FILE",
+                          help="A names file (JSON, format levain-agentboundary-names/1, at most 1 MiB) that maps "
+                               "Levain's names (actor, approver key, policy, capability, resource) to your "
+                               "organisation's aliases. Facts are never written: a file that sets a decision, a "
+                               "status, an actor type, a time, or what the run was (the agent's framework or model, "
+                               "the tool's name, the environment, any version but the policy's) is refused and "
+                               "nothing is exported. An authority name (approver, policy, capability, resource) maps "
+                               "only one to one from Levain's own exact value, by a rule that selects on that field "
+                               "alone, never from or to a call Levain did not decide; each renamed field is marked "
+                               "synthesized: your export vouches for that mapping. The hash covers the renamed "
+                               "receipt, and each receipt_id includes a digest of the file's rules, so one queue "
+                               "exported with two different names files is two distinct sets of receipts.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
@@ -1724,11 +1736,22 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
     import sqlite3
     import tempfile
 
-    from levain.consent.agentboundary import ExportError, export
+    from levain.consent.agentboundary import NAMES_MAX_BYTES, ExportError, export, load_names
 
     try:
+        names = None
+        if args.names is not None:
+            if args.export_format != "agentboundary":
+                raise ExportError(f"--names applies to --format agentboundary only, not {args.export_format}")
+            # O_NONBLOCK so opening a FIFO does not wait for a writer; a regular file only (a FIFO, a device or a
+            # directory is refused before any read), then one byte past the cap so load_names refuses an oversize one
+            fd = os.open(args.names.expanduser(), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    raise ExportError(f"--names {args.names}: not a regular file")
+                names = load_names(fh.read(NAMES_MAX_BYTES + 1))
         qdir = _consent_queue_dir(args)
-        result = export(qdir)
+        result = export(qdir, names=names)
         # UTF-8 bytes whatever the locale or PYTHONIOENCODING says: the file and stdout carry the same JSON
         data = (json.dumps(result.receipts, ensure_ascii=False) + "\n").encode("utf-8")
         if args.out is not None:
@@ -1781,7 +1804,9 @@ def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
     states = ", ".join(f"{k} {v}" for k, v in rep.by_state.items()) or "none"
     print(_term_safe(f"levain consent receipts export: {rep.receipts} receipt(s) ({states}); "
                      f"{rep.pending_skipped} pending skipped, {rep.held_unsettled} held back unsettled"
-                     + ("" if rep.ledger_found else "; no authority ledger found")), file=sys.stderr)
+                     + ("" if rep.ledger_found else "; no authority ledger found")
+                     + ("" if rep.names_sha256 is None
+                        else f"; names file sha256 {rep.names_sha256} renamed {rep.names_renamed}")), file=sys.stderr)
     return 0
 
 
@@ -2565,17 +2590,17 @@ def _reading_queue(qdir: Path) -> object:
     return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
 
 
-# What the terminal must never receive raw from an agent-sourced string: every C0/C1 control and DEL (Cc), every
-# format control, the bidi controls among them (Cf), a lone surrogate (Cs), and the line and paragraph separators
-# (Zl, Zp). Each is printed as its escape, \uXXXX (\UXXXXXXXX past the BMP).
-_TERM_UNSAFE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
-
-
+# What the terminal must never receive raw from an agent-sourced string: every character levain.unshowable calls
+# unshowable (controls, newline and tab included, format and bidi controls, separators, invisible spaces, fillers,
+# variation-selector runs). Each is printed as its escape, \uXXXX (\UXXXXXXXX past the BMP).
 def _term_safe(text: object) -> str:
-    import unicodedata
+    from levain import unshowable
 
-    return "".join((f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
-                   if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
+    return unshowable.mark(str(text), _escape, allow="")
+
+
+def _escape(cp: int) -> str:
+    return f"\\u{cp:04x}" if cp <= 0xFFFF else f"\\U{cp:08x}"
 
 
 def __getattr__(name: str) -> object:

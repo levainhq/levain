@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from levain import unshowable
 from levain.cockpit.display_safe import visible
 from levain.cockpit.results import Fault, Read, Result
 
@@ -115,7 +116,7 @@ def _label(text: Any) -> str:
 def _base(path: str) -> str:
     """A working directory's basename, printable, at most 64 characters (the sessions panel's form)."""
     name = os.path.basename(path.rstrip("/\\")) or "/"
-    return "".join(c for c in name if c.isprintable())[:64]
+    return unshowable.mark(name, "", allow="", selectors=False)[:64]
 
 
 # --- the git read --------------------------------------------------------------------------------------------

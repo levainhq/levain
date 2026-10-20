@@ -59,7 +59,6 @@ import os
 import re
 import secrets
 import sqlite3
-import unicodedata
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -67,6 +66,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.authority import AuthorityError, VerifierUnavailable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
@@ -319,7 +319,7 @@ def _replay(authority: AuthoritySource) -> Any:
 def _label(name: str, value: Any, high: int) -> str:
     if not isinstance(value, str) or not value or len(value) > high:
         raise DispatchError(f"{name} must be 1 to {high} characters")
-    if any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in value):
+    if unshowable.first_hidden(value, allow="", selectors=False) is not None:
         raise DispatchError(f"{name} must be one line of plain text")
     return value
 

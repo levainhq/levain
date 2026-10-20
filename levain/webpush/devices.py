@@ -35,6 +35,8 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from levain import unshowable
+
 __all__ = ["PAIRING_TTL", "OPEN_PAIRINGS_KEPT", "LABEL_MAX", "SHORT_PAIRING_TTL", "SHORT_MAX_FAILURES",
            "SHORT_LOCK_WINDOW", "SHORT_ALPHABET", "LOCKED", "mint_pairing", "redeem", "mint_short_pairing",
            "normalize_short", "display_short", "redeem_short", "verify", "revoke", "list_devices"]
@@ -83,7 +85,7 @@ def _parse(s: Any) -> datetime | None:
 
 
 def _label(label: Any) -> str:
-    text = "".join(c for c in str(label or "") if c.isprintable()).strip()
+    text = unshowable.mark(str(label or ""), "", allow="").strip()
     return text[:LABEL_MAX] or "phone"
 
 

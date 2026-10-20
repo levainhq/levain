@@ -40,7 +40,7 @@ import json
 import os
 import re
 import sqlite3
-import unicodedata
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
@@ -68,9 +69,11 @@ _LABEL_MAX = 200
 _BLOCKS_MAX = 300
 _TEXT_MAX = 4000
 _N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
-# how long the hook's reads and its claim wait on a lock another writer holds: past it the answers wait for the
-# session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is not this)
+# how long the hook's read and its claim together wait on a lock another writer holds, by the wall clock: past it
+# the answers wait for the session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is
+# not this). One deadline, not SQLite's busy_timeout per step: that counts the sleeps it asked for, not time passed
 HOOK_BUSY_MS = 2000
+_RETRY_SECONDS = 0.025
 
 
 class QuestionStoreError(RuntimeError):
@@ -199,17 +202,19 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
     return now
 
 
-def _has_control(text: str) -> bool:
-    # control and format characters, and the line and paragraph separators (U+2028, U+2029), which a model or a
-    # renderer can read as a line break: a one-line field carries none of them
-    return any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in text)
+def _has_control(text: str, selectors: bool = True) -> bool:
+    # any unshowable character (levain.unshowable): control and format characters, the line and paragraph
+    # separators a model or a renderer can read as a line break, invisible spaces and fillers. selectors=False for an
+    # id or a path (no presentation selector at all); the default is the rule for text a person reads
+    return unshowable.first_hidden(text, allow="", selectors=selectors) is not None
 
 
 def _line(name: str, value: Any, low: int, high: int) -> str:
     if not isinstance(value, str):
         raise ConsentError(f"{name} must be a string")
-    if _has_control(value):
-        raise ConsentError(f"{name} must be one line of plain text: no control characters")
+    hidden = unshowable.describe(value)
+    if hidden is not None:
+        raise ConsentError(f"{name} must be one line of plain text that shows as itself: it holds {hidden}")
     value = value.strip()
     if not low <= len(value) <= high:
         raise ConsentError(f"{name} must be {low} to {high} characters")
@@ -319,9 +324,39 @@ class QuestionStore:
             raise
 
     @contextmanager
-    def _write(self, busy_ms: int | None = None) -> Iterator[sqlite3.Connection]:
-        with write_transaction(lambda: self._connect(busy_ms)) as conn:
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        with write_transaction(self._connect) as conn:
             yield conn
+
+    @contextmanager
+    def _write_by(self, deadline: float) -> Iterator[sqlite3.Connection]:
+        """As :meth:`_write`, but the write lock is waited for until ``deadline`` (``time.monotonic()``) by the wall
+        clock: SQLite is told not to wait at all, and ``BEGIN IMMEDIATE`` is retried here. Past the deadline the
+        lock's own ``OperationalError`` is raised."""
+        # Only ever called after _peek found a set-up store: _connect's own setup would BEGIN IMMEDIATE at busy 0,
+        # outside the retry loop below.
+        assert self._ready
+        conn = self._connect(busy_ms=0)
+        try:
+            while True:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) and "busy" not in str(exc):
+                        raise
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise
+                    time.sleep(min(_RETRY_SECONDS, left))
+            try:
+                yield conn
+            except BaseException:
+                _rollback(conn)
+                raise
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
 
     @contextmanager
     def _peek(self) -> Iterator[sqlite3.Connection | None]:
@@ -385,9 +420,9 @@ class QuestionStore:
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
-                or _has_control(agent_session_id)):
-            raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters with no control characters")
-        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd):
+                or _has_control(agent_session_id, selectors=False)):
+            raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters that show as themselves")
+        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd, selectors=False):
             raise ConsentError("cwd must be an absolute path")
         what = _line("what", what, 1, _WHAT_MAX)
         opts = _options_of(options)
@@ -414,7 +449,8 @@ class QuestionStore:
                 raise ConsentError("a link must name one of the question's option keys")
             if link.kind != "push":
                 raise ConsentError(f"a link's kind must be push: {link.kind!r}")
-            if not all(isinstance(v, str) and v and not _has_control(v) for v in (link.request_id, link.queue_id)):
+            if not all(isinstance(v, str) and v and not _has_control(v, selectors=False)
+                       for v in (link.request_id, link.queue_id)):
                 raise ConsentError("a link names its request and queue by id")
         qid = "q-" + os.urandom(12).hex()
         stamp = utc_stamp(_now_utc(self._clock))
@@ -502,11 +538,12 @@ class QuestionStore:
         key = (agent, agent_session_id)
         where = (" WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
                  + _DELIVERABLE + " ORDER BY a.rowid")
+        deadline = time.monotonic() + HOOK_BUSY_MS / 1000      # the read and the claim share it
         with self._peek() as conn:                            # read-only: no write lock when nothing is due
             if conn is None or not conn.execute(_select(conn) + where, key).fetchall():
                 return []
         out: list[Question] = []
-        with self._write(busy_ms=HOOK_BUSY_MS) as conn:
+        with self._write_by(deadline) as conn:
             stamp = utc_stamp(_now_utc(self._clock))
             for row in conn.execute(_select(conn) + where, key).fetchall():   # re-read under the lock
                 q = self._question_of(row)

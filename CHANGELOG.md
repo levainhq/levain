@@ -7,6 +7,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Export with your organisation's names.** `levain consent receipts export --format agentboundary --names FILE` maps
+  Levain's own names (the actor, the approver's key, the policy, the capability, the working directory) to the aliases
+  your verifier expects, before each receipt is hashed and chained. It renames; it never changes what happened. A file
+  that sets a decision, a status, an actor type, a time, or what the run was (the agent's framework or model, the tool's
+  name, the environment, any version but the policy's) is refused and nothing is exported. An authority name maps one to
+  one, a permission-dialog approval is never relabelled, and every renamed field is marked `synthesized`. The names file
+  is part of each receipt's id, so a renamed export never reuses an unrenamed receipt's id. Against the AgentBoundary
+  v0.2-alpha conformance scenarios, Levain's receipts pass 26 of 54 as Levain writes them and 41 of 54 with a names file.
+
+## [0.11.10] — 2026-10-20
+
+### Added
 - **Context meter in the Sessions view.** Each Claude Code and Codex session shows how much context it holds now ("context
   142K"; Codex "context 80K of 258K"), and says when it passes 200K (a fixed warn line, not the model's window). Read from
   the session's own transcript; a display, it decides nothing.
@@ -60,7 +72,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Pairing a phone by typed code.** On an iPhone the Home Screen app keeps its own storage, so a link opened in Safari does not
   reach it. Tap "Install on this phone" in Safari and the page shows an 8-character code (good for 10 minutes, one use, only the
   newest works); type it into the "Pairing code" box in the installed app. `levain ping pair` prints a fresh code from the
-  laptop. Five wrong tries in 10 minutes lock every short-code pairing until a new code is made.
+  laptop. Five wrong tries in 10 minutes lock every short-code pairing for up to 10 minutes, or until a new code is made.
 - **The phone app's state line and board.** From the phone you can set your state line (the same one the cockpit, `levain
   state` and the TUI set; agents see it on their next prompt), and work your Tray: resolve and snooze an item. Open loops and
   Keep are there to read. The phone does only what the cockpit's own tiers allow without a signature; anything more says
@@ -68,6 +80,51 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The notification record.** Every ping Levain sent, where it went (each phone, and whether your `notify_argv` command
   started), whether you opened it, and what came of it (answered, expired, ruled late, still waiting), read from the queue
   when you look. On the phone, in the cockpit and with `levain ping record`.
+- **Export the consent receipts for an AgentBoundary verifier.** `levain consent receipts export --format agentboundary
+  [--out FILE]` writes the queue's receipts as AgentBoundary v0.2-alpha receipts: a JSON array in UTF-8, one receipt per
+  request state, chained, each field marked observed, inferred or synthesized. A request less than 24 hours old is held
+  back until it settles, so a receipt never changes after it was exported. `--out` never overwrites a file.
+- **A refused answer is kept as evidence.** When an answer verifies under the key it names but is refused (the key is
+  not enrolled, revoked, compromised, of a class that does not cover the request, or the answer came after the hold
+  ended), the queue now keeps it, a few per request, instead of only refusing it. An exported receipt for that request
+  carries it as the evidence of the refusal, never as an approval. A key that is not enrolled, or one revoked as
+  compromised, is never named the operator.
+- **`levain dispatch`: a planner hands work to cheaper models, and you sign it first.** A planning agent (Claude Code or
+  Codex) writes a task contract. The contract names a template you set up, the files the work may read and write, a
+  budget and an expiry. Filing it creates a job and does nothing else. Before anything runs, you read the job on your
+  own laptop and sign its digest with your enrolled key.
+  - `levain dispatch file <contract.json>`: the planner files a contract. It gets the job id back, plus a capability
+    (shown once) that lets that planner session recommend or cancel its own job later. Filing gives the planner no
+    authority.
+  - `levain dispatch show <job>` / `list`: the job as you will sign it. You see the goal in full, the read and write
+    lists, the template, the models, the verifier, the budget, the expiry and every state change with its cause.
+  - `levain dispatch sign <job>`: you sign the job's digest after reading the whole view and answering y/N on your
+    terminal. An agent's process is refused.
+  - `levain dispatch cancel <job>`: the planner can cancel its own job until you authorise a result. You can cancel any
+    live job with a signature.
+  - `levain dispatch recommend <job>`: the planner marks a verified result it likes. This is advisory only.
+  - On your phone: the Levain page shows each filed job as a card (the goal in full, the files, the template, where the
+    read files are sent, the budget and the digest), and you can sign it or cancel it with your passkey (Face ID). A
+    passkey that is not enrolled for dispatch signing is never offered.
+  - An MCP server (`levain_dispatch`), registered in the workspace `.mcp.json` by `levain init` / `levain update`, gives
+    a Claude Code planner the same file, show, list, recommend and cancel tools. It has no sign tool. Claude Code asks
+    you before each call (a headless run is refused). `levain doctor` reports whether it is registered.
+- **`levain dispatch config`: you decide what may run.** Templates, verifiers, the provider policy (which provider may
+  read which paths), the route map and the adoption rules are signed configuration. Each change is one item, signed by
+  one pinned laptop key, in one hash chain.
+  - `levain dispatch config init --trust-root <fingerprint>`: create the store and pin your laptop key. Only an
+    enrolled, active laptop key held with presence can be pinned. A phone key or a passkey cannot.
+  - `levain dispatch config sign <kind> <body.json> --signing-key <key>`: turn a body file into the next item. A body
+    the rules refuse is refused before your key is touched. You see the kind, the generation, the store, the previous
+    head and a diff against what is active now, then answer y/N.
+  - `levain dispatch config accept <item> <signature>`: accept an item signed on another machine.
+  - `levain dispatch config show`: what is configured now.
+
+  A contract can only be filed against a template you signed. With nothing configured, every filing is refused.
+- **`levain init` offers one default grant per agent.** When your authority log is set up and a laptop-presence key is
+  enrolled, init shows one standing grant (Claude Code: workspace edits and WebFetch; Codex: apply_patch; 14 days) and
+  asks [y/N], default No. A yes runs the `levain consent grant create` line it printed, with your key's usual passphrase
+  or Touch ID. With no terminal, it prints that line and signs nothing; `--default-grants no` skips it.
 
 ### Changed
 - **Claude Code sessions started in a subfolder are gated too.** Claude Code reads a project's `.claude/settings.json`
@@ -93,6 +150,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `.husky/`, or one outside the repository, counts), and your `~/.gitconfig` and `~/.config/git/config`. Known edges: a
   shell command that writes agent config is not caught here (that belongs to the session sandbox); and a Codex hook that
   runs past Codex's timeout lets the call through, as Codex has no setting to block on a hook failure.
+- `levain consent pending`, the undecided list and the cockpit card now say what a publish or a budget request is about:
+  the package, version and index for `levain publish`; the agent, session, limit and counts for an extend. They used to
+  read "none named: the working directory".
 
 ### Fixed
 - **An OpenHands entity's turn runs once.** Saving a finished turn to memory used to run the conversation again, unchecked:
@@ -103,6 +163,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   limit ("on macOS bash still receives your `$SSH_AUTH_SOCK`") no longer holds. bash's `$SSH_AUTH_SOCK` names levain's
   session agent, which holds only keys you add with `levain ssh-add`, and a connect to any other unix socket by its path is
   refused unless you granted it.
+- When several agents of one session crossed a budget limit at once, one of them could be refused with "the operator is
+  being asked" even after the operator had already extended the limit, or file a second request for the same crossing.
+  All of them now wait on the one request and go on together when it is extended, and none goes on once the operator has
+  chosen End. A session stopped by End now says "The operator chose End." on every stop.
+- **A confined agent can no longer write your git configuration.** The files your global git config makes git read (its
+  includes and `core.attributesFile` among them) are now write-protected, so nothing inside the sandbox can plant a
+  filter or credential-helper setting that later runs as you. If Levain finds no root-owned `git`, it says so once and
+  protects only the default locations.
+- **Starting a confined agent no longer fails at random when another Claude Code or Codex session deletes a folder under
+  `~/.claude` or `~/.codex` at the same moment.**
 
 ### Known edges
 - The hint is a pattern reader, not a shell parser: a command written to dodge the patterns gets no hint, and the full command
@@ -197,6 +267,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   does not answer at that moment, the page may misreport once; the stale entry is retired by the next ping.
 - On an install whose cockpit is governed, the phone takes no writes until the cockpit has run once on the laptop (it keeps
   the authority log the phone checks); reads work from the start.
+- Kept refused answers are not covered by the signed receipts head: something that can write the queue's database can
+  add or remove one.
+- When several refused answers arrived for one request, the export carries the latest.
+- A receipt that carries a refused answer ends at the time Levain refused that answer.
+- A budget Extend does not resume a session started with `--setting-sources` or `--max-turns`: resume it by hand.
+- Nothing executes yet. Jobs can be filed, read, signed and cancelled. The runner, the verifier run and adoption come in
+  later slices.
+- The configuration store is a file your own user account can write. A forged or edited item fails verification on read.
+  A process running as you could still delete the newest items and roll the configuration back to an older signed state.
+  The planned fix binds each signed contract to the configuration head it resolved under.
+- There is no trust-root rotation yet. If the pinned key is revoked or lost, every read refuses, and recovery means a
+  new store.
+- The agent check on `sign`, `cancel`, `config init/sign/accept` checks intent. It is not a security boundary. Until the
+  control principal is placed (S1), what protects a laptop signature is how the key is held (a touch, a passphrase, a
+  key no agent can read).
+- Codex does not get the `levain_dispatch` MCP server yet. A Codex planner files through the `levain dispatch` command.
+- A template's provider and route are not cross-checked against the provider policy or the route map.
+- A read path built from look-alike characters shows as the path it imitates in the signer's view.
+- Whether you can set up a template from this CLI without reading code is yours to judge on the first real template.
 
 ## [0.11.9] — 2026-10-19
 

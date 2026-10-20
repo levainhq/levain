@@ -60,6 +60,7 @@ from levain.cockpit.registry import (
     parse_date,
     validate_facets,
 )
+from levain import unshowable
 from levain.cockpit.display_safe import visible
 from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
@@ -1465,6 +1466,11 @@ class Cockpit:
             "title": title,
             "truncated": truncated,
             "body": row.body,
+            # the one judge of the page's hidden-text lock (levain.unshowable, over the provider's raw title and
+            # body, newline and tab kept as text): the page offers a row's inline text edit only when this is False,
+            # and a compact profile that drops the body keeps it
+            "text_hidden": any(isinstance(t, str) and unshowable.first_hidden(t, allow="\n\t") is not None
+                               for t in (row.title, row.body)),
             "facets": dict(f),
             "emphasis": "accent" if isinstance(overdue, int) and overdue > 0 else row.emphasis,
             "band": band,

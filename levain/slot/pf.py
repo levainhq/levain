@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from levain.firing.hands import Step
+from levain.launch import child_env
 from levain.slot import Refused, write_all
 from levain.slot.ids import SlotId, in_own_range, loopback_alias
 
@@ -130,7 +131,7 @@ def _read_token(token_path: Path) -> tuple[bool, str | None, str]:
 
 
 def _release(token: str, run: Run) -> tuple[bool, str]:
-    r = run([PFCTL, "-X", token], capture_output=True, text=True)
+    r = run([PFCTL, "-X", token], capture_output=True, text=True, env=child_env())
     if r.returncode == 0:
         return True, ""
     if _token_gone(r):
@@ -188,7 +189,7 @@ def take_enable_reference(token_path: Path = PF_TOKEN, run: Run = subprocess.run
     readable, old, note = _read_token(token_path)
     if not readable:
         return False, note
-    r = run([PFCTL, "-E"], capture_output=True, text=True)
+    r = run([PFCTL, "-E"], capture_output=True, text=True, env=child_env())
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "pfctl -E failed").strip()
     m = _TOKEN_RE.search(f"{r.stdout}\n{r.stderr}")

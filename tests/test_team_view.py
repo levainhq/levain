@@ -442,3 +442,10 @@ def test_a_held_entry_appears_once_with_both_reasons_and_paths_are_deduped():
     assert [(g["path"], len(g["entries"])) for g in m["in_force"]] == [("x/**", 1)]
     assert m["in_force"][0]["entries"][0]["paths"] == ["x/**"]
     assert m["in_force_count"] == 1
+
+
+def test_a_peer_written_owner_with_a_hidden_character_is_shown_with_a_marker():
+    # entry_v1 (frozen) accepts `client:acme​` via isprintable(); the view must not render it as `client:acme`
+    from levain.team import view as V
+    assert V._e("client:acme​") == "client:acme⟨U+200B⟩"
+    assert V._e("<b>é") == "&lt;b&gt;é"
