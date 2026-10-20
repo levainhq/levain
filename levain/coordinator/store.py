@@ -494,7 +494,8 @@ class CoordStore:
             if allowed is None:
                 raise CoordError(f"a thread cannot go from {t.state} to {state}")
             if by not in allowed:
-                raise CoordError(f"{by} cannot take a thread from {t.state} to {state} (only {', '.join(sorted(allowed))})")
+                raise CoordError(f"{by} cannot take a thread from {t.state} to {state} "
+                                f"(only {', '.join(sorted(allowed - {'service'}))})")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")
             if state == "open" and t.about is not None and self._thread(conn, t.about).state == "closed":

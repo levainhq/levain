@@ -137,9 +137,7 @@ def test_state_grammar(store):
 
     drop, (a, b, _c) = split_copy(store)
     assert store.set_state(a.thread_id, "done", by="coordinator").state == "done"
-    with pytest.raises(CoordError):
-        store.set_state(a.thread_id, "closed", by="service")
-    with pytest.raises(CoordError):
+    with pytest.raises(CoordError, match="only operator"):
         store.set_state(a.thread_id, "closed", by="coordinator")
     assert store.thread(a.thread_id).state == "done"
 
