@@ -241,7 +241,6 @@ GIT_STATE_DIRS = frozenset({"objects", "refs", "logs"})
 GIT_STATE_FILES = frozenset({"head", "index", "packed-refs", "orig_head", "fetch_head", "commit_editmsg"})
 # Asking git where hooks run (L3 r3 G1): from a fixed binary, never one the session's PATH finds; within one gate
 # call's budget, at most GIT_QUERIES repositories asked and GIT_BUDGET_SECONDS spent, past which a target is tagged.
-GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
 GIT_QUERIES = 4
 GIT_BUDGET_SECONDS = 3.0
 
@@ -324,16 +323,7 @@ def global_git_configs(home: Path) -> tuple[Path, ...]:
     return tuple(out)
 
 
-_GIT_BINARY: list[str | None] = []   # resolved once per process: [path] or [None]
 GIT_TAGGED = "tagged"                # a repository answer that tags every target asked of it (fail closed)
-
-
-def git_binary() -> str | None:
-    """The git the gate asks: the first existing executable of :data:`GIT_CANDIDATES`, resolved once. Never found
-    through ``PATH`` (L3 r3 G1: a session's PATH can name a workspace ``bin/`` holding a planted ``git``)."""
-    if not _GIT_BINARY:
-        _GIT_BINARY.append(next((g for g in GIT_CANDIDATES if os.path.isfile(g) and os.access(g, os.X_OK)), None))
-    return _GIT_BINARY[0]
 
 
 def _git_envs() -> list[dict[str, str]]:
@@ -359,10 +349,12 @@ def _ask_git(directory: str, state: dict[str, Any]) -> frozenset[Path] | str:
     hooks directories as a set, recorded under the repository's top-level. Exit 128 saying "not a git repository"
     is no repository (an empty set, recorded for ``directory``'s ancestors up to its mount point, which git's own
     search covered). Any other failure, a timeout, more than two lines, the budget spent (:data:`GIT_QUERIES`,
-    :data:`GIT_BUDGET_SECONDS`): :data:`GIT_TAGGED`. No git at :data:`GIT_CANDIDATES`: an empty set, no query
+    :data:`GIT_BUDGET_SECONDS`): :data:`GIT_TAGGED`. No git at ``host_guard.GIT_CANDIDATES``: an empty set, no query
     spent (no git, no hooks run). An older git (< 2.31) echoes the unknown ``--path-format`` and prints a relative
     answer relative to ``directory`` (measured on 2.50 without the option), which is how it is joined.
     ``rev-parse`` runs no hooks."""
+    from levain.host_guard import git_binary  # imported here, not at module load, to keep this module light
+
     git = git_binary()
     if git is None:
         return frozenset()

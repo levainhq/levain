@@ -395,14 +395,38 @@
       return token() ? api("POST", "/webpush/subscribe", body, token()).then(kept) : r;
     });
   }
+  // A subscription is bound to the key it was made under. One made for another Levain install (a reinstall, a rotated key)
+  // is accepted by this laptop and refused by the push service on every ping, while the page reads "on": so the page
+  // drops it and says so. A browser that does not expose the key, or a laptop that does not answer, counts as a match.
+  function keyMismatch(s) {
+    const had = s.options && s.options.applicationServerKey;
+    if (!had) return Promise.resolve(false);
+    return api("GET", "/webpush/key").then((k) => {
+      if (!k.ok || !k.body.key) return false;
+      const a = new Uint8Array(had), b = b64uToBytes(k.body.key);
+      return a.length !== b.length || a.some((v, i) => v !== b[i]);
+    }).catch(() => false);
+  }
   function resync() {
     if (!token() && !deviceToken()) return;
-    currentSub().then((s) => s ? sendSub(s).then((r) => {
-      if (r.ok) return;
-      // a 4xx is the laptop refusing to hold it, so the browser drops it too; a 503 or no answer keeps the phone's pings
-      if (r.status >= 400 && r.status < 500) return s.unsubscribe().catch(() => {}).then(refreshSub);
-      pingNote = "could not confirm with the laptop: " + why(r); pingNoteKind = "bad"; renderPings();
-    }) : null);
+    currentSub().then((s) => !s ? null : keyMismatch(s).then((stale) => {
+      if (stale) {
+        const endpoint = s.endpoint;
+        return s.unsubscribe().catch(() => {}).then(() => api("POST", "/webpush/unsubscribe", { endpoint: endpoint })).catch(() => {}).then(refreshSub).then(() => {
+          // the browser's own state decides what the note may claim
+          pingNote = subState === "off"
+            ? "this phone's pings were made for a different Levain install, so they were switched off: turn pings on again"
+            : "this phone's pings were made for a different Levain install and could not be switched off here: tap Turn off, then turn on";
+          pingNoteKind = "bad"; renderPings();
+        });
+      }
+      return sendSub(s).then((r) => {
+        if (r.ok) return;
+        // a 4xx is the laptop refusing to hold it, so the browser drops it too; a 503 or no answer keeps the phone's pings
+        if (r.status >= 400 && r.status < 500) return s.unsubscribe().catch(() => {}).then(refreshSub);
+        pingNote = "could not confirm with the laptop: " + why(r); pingNoteKind = "bad"; renderPings();
+      });
+    }));
   }
   function turnOff() {
     currentSub().then((s) => {
@@ -566,7 +590,7 @@
         pairNote = "This browser will not keep the pairing, and the code is spent. Get a new code and try again in a " +
                    "browser that keeps site data.";
       } else if (r.status === 403) {
-        pairNote = "That code did not match, or it expired. Get a new one: in Safari open the link from the laptop, tap Install on this phone.";
+        pairNote = "That code did not match, or it expired (only the newest code works). Get a new one: run levain ping pair on the laptop, or in Safari tap Install on this phone.";
       } else if (r.status === 429) {
         const secs = Number(r.body.retry_after) > 0 ? Number(r.body.retry_after) : 60;
         pairNote = "Too many wrong codes. Try again in " + Math.max(1, Math.ceil(secs / 60)) + " min, then get a new code.";

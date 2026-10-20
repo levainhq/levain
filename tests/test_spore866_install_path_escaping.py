@@ -30,6 +30,11 @@ from levain.packs import compose_roster
 from levain.verify import _python_from_hooks_config
 from tests.test_install import _templates_root
 
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
+
 # apply_init's subprocess.run is stubbed below, and that stub is the module-global function.
 _run = subprocess.run
 
@@ -73,10 +78,11 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         hooks_config = codex_home / "hooks.json"
     else:
         server = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["anneal_memory"]
-        settings = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        # levain's hooks live in settings.local.json, the install path written into every command
+        settings = json.loads((install / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
         commands = [h["command"] for ev in settings["hooks"].values() for m in ev for h in m["hooks"]]
-        script_dir = None
-        hooks_config = install / ".claude" / "settings.json"
+        script_dir = f"{install}/activation/hooks/"
+        hooks_config = install / ".claude" / "settings.local.json"
     assert server["command"] == python
     hooks_py = sorted((install / "activation" / "hooks").glob("*.py"))
     assert hooks_py
@@ -100,7 +106,9 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         ).stdout.splitlines()
         assert argv[0] == python
         if script_dir is not None:
-            assert argv[-1].startswith(script_dir) and argv[-1].endswith(".py")
+            # the script is the last .py argument (the auto-memory mirror carries a `hook` argument after it)
+            script = [a for a in argv[1:] if a.endswith(".py")][-1]
+            assert script.startswith(script_dir) and os.path.isfile(script)
         # doctor's and verify's reader agrees (they substitute the harness's own variable too)
         tokens = [t.replace("${CLAUDE_PROJECT_DIR}", "/proj") for t in shlex.split(cmd)]
         assert tokens == argv

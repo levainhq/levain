@@ -718,6 +718,90 @@ def cc_project_settings_files(cwd: str | os.PathLike[str], home: str | os.PathLi
     return ([at_root] if at_root == beside else [at_root, beside]), shared
 
 
+# The line init and doctor print for a workspace whose hooks stay in settings.json (cc_levain_hooks_file). It names
+# no cause: the same branch covers a nested workspace, a linked worktree, no git, the home directory, a root not
+# owned by this user and Windows.
+CC_HOOKS_ROOT_ONLY = ("Claude Code reads levain's hooks only when it starts at the workspace folder itself (a session "
+                      "started in a subfolder is not covered)")
+
+
+# The git levain asks (L3 r3 G1): a fixed binary, never one PATH finds (a session's PATH can name a workspace bin/
+# holding a planted git).
+GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+_GIT_BINARY: list[str | None] = []   # resolved once per process: [path] or [None]
+
+
+def git_binary() -> str | None:
+    """The first existing executable of :data:`GIT_CANDIDATES`, resolved once per process; None when there is none
+    (each caller then does what it does when git fails)."""
+    if not _GIT_BINARY:
+        _GIT_BINARY.append(next((g for g in GIT_CANDIDATES if os.path.isfile(g) and os.access(g, os.X_OK)), None))
+    return _GIT_BINARY[0]
+
+
+def git_env() -> dict[str, str]:
+    """The environment for asking git about a workspace: levain's child environment (:func:`levain.launch.child_env`,
+    never the whole of this process's) without any ``GIT_*`` variable, so a caller's GIT_DIR / GIT_WORK_TREE /
+    GIT_INDEX_FILE (a git hook, an alias) cannot make git answer about another repository."""
+    from levain.launch import child_env
+
+    return {k: v for k, v in child_env().items() if not k.startswith("GIT_")}
+
+
+def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
+    """The ONE answer to where levain wires its Claude Code hooks for the workspace ``install``: its
+    ``.claude/settings.local.json`` when Claude Code reads that file for a session started anywhere in the workspace,
+    else its ``.claude/settings.json``. Claude Code reads settings.local.json at the git repository root, resolved
+    through worktrees to the main checkout, and settings.json from the start folder only; so the local file covers a
+    subfolder start only when the workspace IS the toplevel of a main checkout. Asked of git: ``rev-parse
+    --show-toplevel`` is the workspace and ``--git-common-dir`` is the workspace's own ``.git`` (not a linked
+    worktree, a submodule or a separate git dir), and :func:`cc_project_settings_files` agrees (not the home
+    directory, owned by this user, not Windows). Anything else, git missing or failing included, gets settings.json,
+    which loads for a session started at the workspace folder in every layout (:data:`CC_HOOKS_ROOT_ONLY`).
+    install, update, doctor, the consent canary and verify-hooks all ask this; none derives it again."""
+    ws = Path(os.path.abspath(install))
+    shared = ws / ".claude" / "settings.json"
+    local = ws / ".claude" / "settings.local.json"
+    env = git_env()
+
+    git = git_binary()
+
+    def ask(*args: str) -> str | None:
+        if git is None:
+            return None
+        try:
+            r = subprocess.run([git, "-C", str(ws), "rev-parse", *args], capture_output=True, text=True,
+                               timeout=10, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        out = r.stdout.strip()
+        return out if r.returncode == 0 and out else None
+
+    top = ask("--show-toplevel")
+    common = ask("--git-common-dir") if top is not None else None
+    real = os.path.realpath(ws)
+    if (top is None or common is None or os.path.realpath(top) != real
+            or os.path.realpath(os.path.join(ws, common)) != os.path.join(real, ".git")):
+        return shared
+    # asked for a session started BELOW the workspace: for one started at it the file beside settings.json is this
+    # same file, so the home / ownership / Windows conditions would never show (L2 r2)
+    return local if cc_project_settings_files(ws / "levain-subfolder-probe")[0][0] == local else shared
+
+
+def cc_settings_aliased(install: str | os.PathLike[str]) -> bool:
+    """Whether the workspace's ``.claude/settings.local.json`` and ``.claude/settings.json`` are one file (a symlink
+    either way, or a hard link): then levain neither splits its hooks out of it nor migrates them between the two
+    (removing them from one would remove them from both)."""
+    d = Path(os.path.abspath(install)) / ".claude"
+    a, b = d / "settings.json", d / "settings.local.json"
+    if (os.path.islink(a) or os.path.islink(b)) and os.path.realpath(a) == os.path.realpath(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _settings_files(ent: Path) -> list[tuple[str, Path]]:
     """(component name, path) of every project settings file Claude Code loads for this install."""
     out = [(".claude/settings.json hooks", ent / ".claude" / "settings.json"),
