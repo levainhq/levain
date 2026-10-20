@@ -818,7 +818,14 @@ def _hold(agent: str, queue: Any, qdir: Path, root: str, kind: str, v: Verdict, 
     held = queue.get(request_id)
     if held is not None and held[1] == "pending":
         queue.await_decision(request_id, hold + 5.0, poll=0.25)
-    return _resolve(agent, queue, qdir, root, kind, request_id, sleep=sleep, now=now)
+    out = _resolve(agent, queue, qdir, root, kind, request_id, sleep=sleep, now=now)
+    if out.go:      # an Extend releases every open halt, so a halt open now is a NEWER End: the root's stop wins
+        with write_transaction(lambda: _connect(qdir)) as conn:
+            _ensure(conn)
+            halt = _open_halt(conn, agent, root)
+        if halt is not None:
+            return Outcome(False, stop_text(halt["kind"], halt["gap"]), stop=True)
+    return out
 
 
 def _resolve(agent: str, queue: Any, qdir: Path, root: str, kind: str, request_id: str, *, sleep: Any,

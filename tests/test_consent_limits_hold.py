@@ -335,3 +335,17 @@ def test_a_halt_landing_after_the_count_stops_the_late_crossing_too(tmp_path, ke
     t.join()
     out = _hold(q, v, "s1#agent:a1")
     assert not out.go and out.stop and "operator chose End" in out.text and _requests(q) == 1
+
+
+def test_an_extend_does_not_carry_a_late_crossing_past_a_newer_end(tmp_path, keys, authority, monkeypatch):
+    q = _q(tmp_path, authority)                         # L3 r1 (codex HIGH, complement MED): the root's halt wins
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    v = _crossed(q, 10, "s1#agent:a1")                 # call 3, counted at the limit of 2
+    t = _answer_when_filed(q, keys["phone"], "allow")
+    assert _check(q, 11, session="s1#agent:a0").go     # call 4: Extend to 4
+    t.join()
+    t = _answer_when_filed(q, keys["phone"], "deny")
+    assert not _check(q, 12, session="s1#agent:a0").go  # call 5: End, the root halts
+    t.join()
+    out = _hold(q, v, "s1#agent:a1")                   # a1's settled Extend is older than the End
+    assert not out.go and out.stop and "STOPPED by a budget" in out.text
