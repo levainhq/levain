@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.12] — 2026-10-20
+
 ### Added
 - **Adoption rules now say exactly what they check.** An adoption rule names the repository it lands in and a short
   list of typed checks: which branches it may land on, plus at least one limit (changed lines, bytes, files, or the
