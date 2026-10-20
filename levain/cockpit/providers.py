@@ -207,10 +207,39 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if loops:
             lines.append({"label": "loop", "text": clip(loops[0].text)})
         if not lines:
-            return Read(value={"headline": "Nothing set for today yet",
+            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the Tray and Open loops",
                                "lines": [{"label": "set", "text": "Drop a thought in the Tray, or say what you are on with `levain state \"...\"`."}]})
-        return Read(value={"headline": "", "lines": lines})
+        value: dict[str, Any] = {"headline": "", "lines": lines, "title": "Where to begin",
+                                 "source": "from the Tray and Open loops"}
+        if loops:
+            # the open loops, hottest first, for the card's Threads column: the page groups them by the repo each one names (the
+            # same reading the row tags use), because only the page knows the sky's repos. Capped: the column shows few.
+            value["threads"] = [{"text": clip(s.text), "domain": s.domain or "", "tier": s.tier} for s in loops[:THREADS_MAX_LOOPS]]
+        overnight = _overnight(v)
+        if overnight:
+            value["overnight"] = overnight
+        return Read(value=value)
     return read
+
+
+THREADS_MAX_LOOPS = 40
+
+
+def _overnight(v: Any) -> dict[str, Any] | None:
+    """Episodes recorded since the last wrap, from Levain's own stores (the last wrap's time and the substrate's episodes-since-wrap
+    count), or None when either is unknown: an absent figure is never drawn as 0."""
+    errors = getattr(v, "errors", None) or {}
+    if "wraps" in errors or "health" in errors:
+        return None
+    wraps = getattr(v, "wraps", None)
+    health = getattr(v, "health", None)
+    since = getattr(health, "episodes_since_wrap", None)
+    at = getattr(wraps[0], "wrapped_at", None) if wraps else None
+    if not at or isinstance(since, bool) or not isinstance(since, int) or since < 0:
+        return None
+    if not _utc_at(at):         # a wrap time that does not parse (or has no zone) is unknown time, not a reason to fault the card
+        return None
+    return {"episodes": since, "since": _utc_at(at)}
 
 
 TOP_MAX_BEGIN = 110

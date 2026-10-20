@@ -5,8 +5,9 @@
        value  {events: [{kind, at, repo, agent, outcome, end?, label?}], legend}   (the `ambient` kind's contract)
        opts   windowHours (14)   topRows (5)   pinnedRows ([])   single (a repo name, or auto)
               ambient (true)     now (() => ms; a replay supplies its own clock)
-              size ('compact' | 'large' | 'strip'; default and 'compact' are today's size, 'large' is the Build tab's,
-                    'strip' is the phone's: merged lanes, no gutter, no tooltip, no summary)
+              size ('compact' | 'large' | 'strip'; default and 'compact' are today's size, 'large' is the tall chart,
+                    'strip' is the phone's and the Build tab's: merged lanes, no gutter, no tooltip, no summary)
+              head (true: a strip carries its own header row, "Activity  N commits · ...  last 14 h", as the Build tab draws it)
      LevainSky.legendNode() -> a DOM key for the Levain marks (the host may place it, as the hero does with its own).
 
    A feed is Levain-shaped when it carries a session or question, a decision with an outcome of allowed / denied / waiting
@@ -279,8 +280,10 @@
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
     // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
-    if (strip) bar.style.display = 'none';   // the phone's strip is a glance: no summary line, no toggle (inline: .sky-bar's display would beat `hidden`)
-    if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
+    var head = strip && !!o.head;   // the Build tab's strip: a one-row header, no toggle
+    if (strip && !head) bar.style.display = 'none';   // the phone's strip is a glance: no summary line, no toggle (inline: .sky-bar's display would beat `hidden`)
+    if (head) { bar.classList.add('sky-head'); bar.append(summary); }
+    else if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
     var cv = el('canvas', { class: 'sky-canvas', role: 'img' });
@@ -375,7 +378,15 @@
       var c = model.counts, lev = model.lev;
       var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + (lev ? c.sessions + ' sessions, ' + c.decisions + ' decisions, ' + c.memory + ' memory writes, ' + c.questions + ' questions, ' + c.waiting + ' waiting on you'
         : c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes');
-      if (!strip) {   // the strip has no summary bar, so none is built
+      if (head) {
+        var parts = lev ? [[c.commit, 'commits'], [c.sessions, 'sessions'], [c.decisions, 'decisions'], [c.memory, 'memory writes'], [c.questions, 'questions']]
+          : [[c.commit, 'commits'], [c.review, 'reviews'], [c.memory, 'memory writes']];
+        var hb = document.createElement('b'); hb.className = 'sky-head-title'; hb.textContent = 'Activity';
+        var hc = document.createElement('span'); hc.className = 'sky-head-counts';
+        hc.textContent = parts.map(function (x) { return x[0] + ' ' + x[1]; }).join(' · ');
+        var hw2 = document.createElement('span'); hw2.className = 'sky-head-win'; hw2.textContent = 'last ' + opts.windowHours + ' h';
+        summary.replaceChildren(hb, hc, hw2);
+      } else if (!strip) {   // the phone's strip has no summary bar, so none is built
         var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
         var txt = function (x) { return document.createTextNode(x); };
         if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));

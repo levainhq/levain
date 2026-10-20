@@ -2365,6 +2365,17 @@ def _v_brief(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"value.lines[{i}].text", "must be a string")
             if ln.get("label") is not None and not _is_str(ln["label"]):
                 raise _bad(spec, f"value.lines[{i}].label", "must be a string")
+    for k in ("title", "source"):
+        if v.get(k) is not None and not _is_str(v[k]):
+            raise _bad(spec, f"value.{k}", "must be a string")
+    if v.get("threads") is not None:
+        for i, t in enumerate(_need_list(spec, v, "threads")):
+            if not (isinstance(t, dict) and _is_str(t.get("text"))):
+                raise _bad(spec, f"value.threads[{i}].text", "must be a string")
+    ov = v.get("overnight")
+    if ov is not None and not (isinstance(ov, dict) and isinstance(ov.get("episodes"), int) and not isinstance(ov.get("episodes"), bool)
+                               and _is_iso(ov.get("since"))):
+        raise _bad(spec, "value.overnight", "must be {episodes: int, since: ISO-8601}")
     return v
 
 

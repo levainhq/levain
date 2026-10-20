@@ -359,7 +359,8 @@
       const lines = labelled(v.lines, "lines");
       const head1 = typeof v.headline === "string" && v.headline ? v.headline : "";
       if (typeof v.markdown === "string" && v.markdown) out.markdown = v.markdown;   // the card's own head carries the title: a bold copy of it above the text read as a second title
-      else { out.typed = true; out.brief = { headline: head1, lines: lines }; }
+      else { out.typed = true; out.brief = { headline: head1, lines: lines, title: typeof v.title === "string" ? v.title : "", source: typeof v.source === "string" ? v.source : "",
+        threads: Array.isArray(v.threads) ? v.threads : null, overnight: isObj(v.overnight) ? v.overnight : null }; }
     } else if (kind === "reading") {
       need(isNum(v.value) || (typeof v.value === "string" && v.value), "reading value");
       need(v.sub === undefined || (Array.isArray(v.sub) && v.sub.every((s) => isObj(s) && typeof s.label === "string")), "reading sub");
@@ -1326,7 +1327,88 @@
   // In the brief region a label that repeats is a list, not a paragraph: its lines sit in a side column, clamped, and
   // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
   const BRIEF_SIDE_LINES = 6;
+  // Where to begin, as the mock draws it: a head (title, what it reads from), the lead in large type with what comes after it,
+  // the overnight line, and a Threads column: the open loops grouped by the repo each one names (the row tags' own reading), a
+  // loop naming none under its domain, else "other". Loudest first: most loops, then the hottest tier.
+  const THREADS_SHOWN = 5;
+  const TIER_RANK = { hot: 0, warm: 1, cold: 2, parked: 3 };
+  function groupThreads(threads) {
+    const sky = root.LevainSky;
+    const matchers = matchersOf(sky);
+    const groups = new Map();
+    for (const t of threads) {
+      if (!isObj(t) || typeof t.text !== "string") continue;
+      const text = visible(t.text);
+      const dom = typeof t.domain === "string" ? visible(t.domain).trim() : "";
+      // the repo a row's tag shows: its domain when that is a repo the sky knows (Build's Open loops chip), else the repo its words name
+      const hit = (dom && matchers.find(([n]) => n.toLowerCase() === dom.toLowerCase())) || matchers.find(([, re]) => re.test(text));
+      const key = hit ? "r:" + hit[0] : "d:" + (dom || "other");
+      let g = groups.get(key);
+      if (!g) { g = { repo: hit ? hit[0] : "", label: hit ? "" : (dom || "other"), top: text, n: 0, rank: 9, order: groups.size }; groups.set(key, g); }
+      g.n++;
+      const r = t.tier in TIER_RANK ? TIER_RANK[t.tier] : 9;
+      if (r < g.rank) { g.rank = r; g.top = text; }   // the group is named by its hottest loop
+    }
+    return Array.from(groups.values()).sort((a, b) => b.n - a.n || a.rank - b.rank || a.order - b.order);
+  }
+  function paintBriefCard(host, b) {
+    const head = el("div", "brief-head");
+    head.appendChild(el("h3", "", b.title));
+    head.appendChild(el("span", "sp"));
+    if (b.source) head.appendChild(el("span", "stamp", b.source));
+    host.appendChild(head);
+    const body = el("div", "brief-cols");
+    const lead = el("div", "brief-lead");
+    const lines = b.lines || [];
+    if (b.headline) {
+      // nothing set: one line, what is missing and the way to fill it
+      lead.appendChild(el("p", "lead-first", [b.headline, ...lines.map((l) => l.text)].join(". ").replace(/\.\.$/, ".")));
+    } else {
+      if (lines[0]) lead.appendChild(el("p", "lead-first", lines[0].text));
+      if (lines[1]) { const p = el("p", "lead-then"); p.appendChild(el("span", "k", lines[1].label || "then")); p.appendChild(document.createTextNode(" " + lines[1].text)); lead.appendChild(p); }
+      if (lines.length > 2) {
+        const more = el("div", "lead-more");
+        for (const l of lines.slice(2)) { const p = el("p", "lead-item"); p.appendChild(el("span", "k", l.label || "")); p.appendChild(document.createTextNode(" " + l.text)); more.appendChild(p); }
+        lead.appendChild(more);
+      }
+    }
+    const ov = b.overnight;
+    if (isObj(ov) && Number.isInteger(ov.episodes) && typeof ov.since === "string") {
+      const at = new Date(ov.since);
+      if (!Number.isNaN(at.getTime())) {
+        const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+        const row = el("div", "brief-overnight");
+        row.appendChild(el("span", "k", "Overnight"));
+        row.appendChild(el("span", "mono", ov.episodes + (ov.episodes === 1 ? " episode" : " episodes") + " since the last wrap, " + when));
+        lead.appendChild(row);
+      }
+    }
+    body.appendChild(lead);
+    const groups = Array.isArray(b.threads) ? groupThreads(b.threads) : [];
+    if (groups.length) {
+      const col = el("div", "brief-threads");
+      col.appendChild(el("div", "k", "Threads"));
+      for (const g of groups.slice(0, THREADS_SHOWN)) {
+        const row = el("div", "thread");
+        row.appendChild(el("span", "t", g.repo ? g.top : g.label));
+        row.appendChild(el("span", "pill", g.n + (g.n === 1 ? " loop" : " loops")));
+        if (g.repo) {
+          const sky = root.LevainSky;
+          const tag = el("span", "rp-tag", g.repo);
+          const key = sky && typeof sky.hueKey === "function" ? sky.hueKey(g.repo) : "";
+          if (key) tag.dataset.repo = key;
+          row.appendChild(tag);
+        }
+        col.appendChild(row);
+      }
+      if (groups.length > THREADS_SHOWN) col.appendChild(el("p", "xnote", "+" + (groups.length - THREADS_SHOWN) + " more"));
+      body.appendChild(col);
+    }
+    body.classList.toggle("has-threads", groups.length > 0);
+    host.appendChild(body);
+  }
   function paintBrief(host, b, region) {
+    if (region && b.title && b.source) { host.classList.add("brief-card"); paintBriefCard(host, b); return; }
     if (b.headline) host.appendChild(el("div", "q", b.headline));
     const count = new Map();
     for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
@@ -1401,8 +1483,8 @@
     const S = root.LevainSky;
     try { return !!(S && typeof S.isLevainFeed === "function" && S.isLevainFeed({ events: sky.events, dialect: sky.dialect })); } catch (_) { return false; }
   }
-  // the Build tab draws the sky large, the others compact
-  function skySize() { return document.body && document.body.dataset && document.body.dataset.mode === "build" ? "large" : "compact"; }
+  // the Build tab draws the sky as the compact strip the mock shows (merged lanes, its own header row), the others the full chart
+  function skySize() { return document.body && document.body.dataset && document.body.dataset.mode === "build" ? "strip" : "compact"; }
   function skyNow(s) {
     const k = s.skyParts;
     return !!k && k.size === skySize();
@@ -1459,7 +1541,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize() }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false, size: skySize(), head: true }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
