@@ -7271,7 +7271,6 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr, runtime_roots)
     # The persistence files ride the same loop: outside $HOME's frozen top level (a relocated git
     # config, a file git includes) nothing else stops bash writing one.
-    persistence_files = set(policy.persistence_write_files)
     for f in _dedup_paths([*policy.deny_write_files, *policy.own_memory_files,
                            *policy.persistence_write_files]):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
