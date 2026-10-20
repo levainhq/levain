@@ -90,7 +90,11 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Optional[Callable[[Any], 
 def register(subparsers: Any) -> None:
     """``levain session …``: every word after ``session`` reaches :func:`main` as it was typed (no option of the
     top-level parser applies inside it)."""
-    p = subparsers.add_parser("session", help="Run Claude Code or Codex in a confined slot on a clone of a repo.",
+    # Hidden (Phill 10-20, np-cd6de24a "(a)"): not listed in `levain --help` until it is runnable for a user (no
+    # public install path for the root helpers exists, and the V13 re-probe is unbuilt); it still parses, for the
+    # VM runs. No `help=`: argparse lists only subcommands added with one (`help=SUPPRESS` prints "==SUPPRESS==" on
+    # some Pythons), and the `<command>` metavar keeps the name out of the usage line.
+    p = subparsers.add_parser("session",
                               add_help=False, prefix_chars="\x01")
     p.add_argument("words", nargs=argparse.REMAINDER)
     p.set_defaults(func=lambda a: main(a.words))
