@@ -130,12 +130,19 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 
 def patch_targets(patch: Any) -> list[str] | None:
     """The file paths a Codex ``apply_patch`` names in its headers (``*** Add File:``, ``Update File:``,
-    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, or has a line starting
-    ``***`` (indented or not) that is neither a header nor a patch marker: what it names cannot be told."""
+    ``Delete File:``, ``Move to:``), or ``None`` when ``patch`` is not a string, names no file, has a line starting
+    ``***`` (indented or not) that is neither a header nor a patch marker, or has a line holding ``***`` and a
+    whitespace character other than a space or a tab: what it names cannot be told. Lines are read as Codex reads them,
+    split on ``\n`` alone with one trailing ``\r`` dropped, so only a line holding ``***`` can be a header to either;
+    on such a line every other whitespace character is one Python and Codex's parser trim differently (a path could be
+    written that the header here does not name), so the patch names nothing."""
     if not isinstance(patch, str):
         return None
     found: list[str] = []
-    for line in patch.splitlines():
+    for raw in patch.split("\n"):
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if "***" in line and any(c.isspace() and c not in " \t" for c in line):
+            return None
         m = _PATCH_HEADER.fullmatch(line)
         if m:
             found.append(m.group(1))
