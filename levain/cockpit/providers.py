@@ -1258,6 +1258,19 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
 OPTIONAL_NATIVE = frozenset({"activity", "memory_glance", "doctor", "topology"})
 
 
+def _dispatch_dir(consent_reader: Any) -> Any:
+    """Where the topology reads the dispatch store: the consent reader's own directory, and for the default reader
+    (``directory`` present and None = "the default queue", as ``read_listing`` resolves it) the queue's default
+    directory. A reader without the attribute names no directory, so none is read."""
+    if not hasattr(consent_reader, "directory"):
+        return None
+    if consent_reader.directory is not None:
+        return consent_reader.directory
+    from levain.consent.queue import default_queue_dir
+
+    return default_queue_dir()
+
+
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
     episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
@@ -1394,7 +1407,7 @@ def build_default_cockpit(
             "topology", "topology", "Topology", "gauge",
             topology_reader(install_root=source.install_root, consent=lambda: ck.consent_reader,
                             questions=lambda: ck.question_store, hub_label=hub_label, spores=open_loops,
-                            dispatch_dir=lambda: getattr(ck.consent_reader, "directory", None)),
+                            dispatch_dir=lambda: _dispatch_dir(ck.consent_reader)),
             region="operate", rank=80, size="tall", optional=True,
             timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C,
             empty="No agent session in the last day and no open task."))
