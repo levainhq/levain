@@ -78,6 +78,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   shell command that writes agent config is not caught here (that belongs to the session sandbox); and a Codex hook that
   runs past Codex's timeout lets the call through, as Codex has no setting to block on a hook failure.
 
+### Fixed
+- **An OpenHands entity's turn runs once.** Saving a finished turn to memory used to run the conversation again, unchecked:
+  a turn stopped by `--max-iterations` (or any run the runtime ends in its error or stuck state) started over with a fresh
+  budget, and an action held at the gate during that second run was reported as one that ran. The turn now runs once; one
+  that ends in error or stuck is reported as failed (exit 3 from `levain run --task`) and nothing from it is saved.
+- **On macOS, bash now gets its own session ssh agent, not yours.** This landed in 0.11.7 without a line here: the 0.11.4
+  limit ("on macOS bash still receives your `$SSH_AUTH_SOCK`") no longer holds. bash's `$SSH_AUTH_SOCK` names levain's
+  session agent, which holds only keys you add with `levain ssh-add`, and a connect to any other unix socket by its path is
+  refused unless you granted it.
+
 ### Known edges
 - The hint is a pattern reader, not a shell parser: a command written to dodge the patterns gets no hint, and the full command
   is always shown above it.

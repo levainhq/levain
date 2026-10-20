@@ -118,12 +118,12 @@ def test_two_entities_in_one_process_each_resolve_their_own_store(tmp_path, home
             assert cond._firing._resolve_episodic_path().parent == store          # recall
             assert Path(cond._presence.entity_dir).resolve() == ent.resolve()     # re-anchor
             seen = {}
-            real = capmod.vagus_run
-            capmod.vagus_run = lambda conv, firing=None, **kw: seen.update(f=firing)
+            real = capmod.capture_completed_turn
+            capmod.capture_completed_turn = lambda conv, firing, **kw: seen.update(f=firing)
             try:
                 s.binding.capture_turn(object())
             finally:
-                capmod.vagus_run = real
+                capmod.capture_completed_turn = real
             assert seen["f"]._resolve_episodic_path().parent == store              # capture
     finally:
         a.close()
