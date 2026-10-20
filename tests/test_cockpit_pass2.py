@@ -65,10 +65,17 @@ def test_an_empty_card_with_no_compose_box_is_a_full_width_bar_after_its_zones_c
       const bars = [...document.querySelectorAll('.ck-zgrid .panel.ck-fold')].filter(p => getComputedStyle(p).display !== 'none'); if (!bars.length) return null;
       return bars.map(b => { const g = b.parentElement, gw = g.getBoundingClientRect().width, bt = b.getBoundingClientRect().top;
         const cards = [...g.querySelectorAll('.panel')].filter(p => p !== b && !p.classList.contains('ck-fold') && getComputedStyle(p).display !== 'none');
-        return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump')]; }); })()"""}])
+        const placed = g.dataset.ckZone === 'operate' && ['jobs', 'jobs-none', 'edits', 'loops'].includes(b.dataset.ckPanel);
+        return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump'),
+                placed, b.getBoundingClientRect().height]; }); })()"""}])
     assert vals[3], vals
-    for share, after_cards, has_box in vals[3]:
-        assert share > 0.95 and after_cards and not has_box, vals
+    for share, after_cards, has_box, placed, height in vals[3]:
+        if placed:
+            # K4s ruling 10-19 (k-reviews/K7_FOLD_RULING.md): on Build, Results / edits / loops keep their designed slots (K7 grid),
+            # so an empty one stays a one-line bar IN its column and the layout does not move as data arrives
+            assert share < 0.6 and height < 90 and not has_box, vals
+        else:
+            assert share > 0.95 and after_cards and not has_box, vals
 
 
 def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_names_it() -> None:
