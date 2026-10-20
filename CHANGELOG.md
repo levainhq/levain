@@ -6,6 +6,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Adoption rules now say exactly what they check.** An adoption rule names the repository it lands in and a short
+  list of typed checks: which branches it may land on, plus at least one limit (changed lines, bytes, files, or the
+  paths it may touch; optionally no new files, or a maximum age). Free-text criteria are refused.
+  - **Upgrading from 0.11.10:** a rule you signed with free-text criteria no longer applies. It never landed anything
+    (0.11.10 ran no adoption), and it lands nothing now. `levain dispatch config show` and `levain doctor` name the
+    rule and the fix: sign a new `adoption_rules` item with `repo` and typed criteria
+    (`levain dispatch config sign adoption_rules <body.json>`).
+  - **The dispatch job store moves to format 2** the first time this version opens it. Your jobs are kept. After that,
+    Levain 0.11.10 refuses to open the store, so do not downgrade.
+  - `levain doctor` has a new row, "dispatch adoption rules".
+
+### Known edges
+- Adoption itself has no command yet (the `authorise` and `land` verbs and the phone card come in F11-s2).
+
 ## [0.11.11] — 2026-10-20
 
 ### Added
