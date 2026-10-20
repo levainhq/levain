@@ -289,6 +289,15 @@ def tmpfiles_undo_steps() -> list[Step]:
     return [Step(f"remove {TMPFILES_CONF}", (_abs("rm"), "-f", str(TMPFILES_CONF)))]
 
 
+def run_dir_undo_steps(host: HostOS) -> list[Step]:
+    """Linux: remove ``R`` (§2.2). It is tmpfs, so with the tmpfiles conf gone it would not come back at boot, but
+    until then its dirs name tombstoned owners (the 1d VM run). ``--one-file-system``: a mount found below it
+    fails the step instead of being walked into. Run after every slot process is stopped."""
+    if host != "linux":
+        raise Refused("unsupported-host", f"{host}: only Linux's R is removed by undo")
+    return [Step(f"remove {RUN[host]} (the run dirs)", (_abs("rm"), "-rf", "--one-file-system", "--", str(RUN[host])))]
+
+
 # --- undo: no shared gid left on a dir (CONTRACT §23) --------------------------------------------------------
 
 

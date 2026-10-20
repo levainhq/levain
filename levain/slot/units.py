@@ -284,6 +284,10 @@ def uninstall_steps(host: HostOS) -> list[Step]:
                           skip_if=(test, "!", "-e", str(systemd_path(name)))))
     steps += [Step(f"remove {systemd_path(n)}", (rm, "-f", str(systemd_path(n)))) for n in start_order(host)]
     steps.append(Step("tell systemd", (systemctl, "daemon-reload")))
+    # A unit whose last run failed keeps a `failed` row after its file is gone (the 1d VM run); clearing it
+    # is best-effort: a unit systemd holds no record of answers non-zero, and nothing later depends on it.
+    steps += [Step(f"clear systemd's failed record of {n}", (systemctl, "reset-failed", n), allow_fail=True)
+              for n in start_order(host)]
     return steps
 
 

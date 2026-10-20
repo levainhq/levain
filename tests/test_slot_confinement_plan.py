@@ -784,4 +784,14 @@ def test_helper_imports_root_tree_only(host):
     assert any(f"above {tree} is root's alone" in w for w in checks)
     assert _refusal(root_tree.helper_entry_text, host, "other-helper") == "bad-token"
     assert _refusal(root_tree.tree_steps, host, Path("/tmp/notlevain")) == "bad-root"
-    assert any("runtime_helper does not exist yet" in p for p in plan.pending)
+    # The pending lines are derived from the helpers (S1 2e): the runtime helper exists, so nothing says it does
+    # not; each helper's line names exactly its verbs with no handler.
+    assert not any("does not exist" in p or "apply layer is not built" in p for p in plan.pending)
+    from levain.slot import install_helper, runtime_helper
+    from levain.slot.grammar import VERBS as INSTALL_VERBS
+    from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
+    lines = {p.split(" answers ")[0]: p.split(": ", 1)[1].split(", ") for p in plan.pending if " answers verb-unbuilt" in p}
+    assert lines.get("levain.slot.install_helper") == [v for v in INSTALL_VERBS if v not in install_helper.BUILT_VERBS]
+    assert lines.get("levain.slot.runtime_helper", []) == [v for v in RUNTIME_VERBS
+                                                           if v not in runtime_helper.VERB_HANDLERS]
+    assert "setup" not in lines["levain.slot.install_helper"] and "prepare" not in lines["levain.slot.runtime_helper"]

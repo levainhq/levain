@@ -14,25 +14,33 @@ re-runs through the install helper.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO
 
 from levain.contracts import canon
-from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs, _kill_all
+from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
-from levain.slot.intent import Intent, intent_remove_step, intent_write_step
-from levain.slot.accounts import (Account, Group, account_steps, accounts_of, delete_group_steps,
-                                  membership_pairs, membership_steps, revive_steps, shared_group_steps,
-                                  shared_groups_of, tombstone_steps)
-from levain.slot.grammar import LEASE_EXEMPT, InstallCommand, check_roots
+from levain.slot import records as R
+from levain.slot import runtime_helper as RH
+from levain.slot.intent import INTENT_PATH, Intent, install_lock, intent_remove_step, intent_write_step, read_intent
+from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
+                                  delete_group_steps, membership_pairs, membership_steps, revive_steps,
+                                  shared_group_steps, shared_groups_of, tombstone_steps)
+from levain.slot.grammar import LEASE_EXEMPT, SESSION_RE, VERBS, InstallCommand, check_roots, parse_install_argv
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
-                             is_levain_account, retired_ids_text, spent_indices)
-from levain.slot.layout import (Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                policy_rows, reserve_row, reserve_steps, roots_steps, row_steps,
+                             is_levain_account, read_retired_ids, retired_ids_text, spent_indices)
+from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
+from levain.slot.runtime_grammar import ok_line, refusal_line
+from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
+                                policy_rows, reserve_row, reserve_steps, roots_steps, row_steps, run_dir_undo_steps,
                                 single_filesystem_steps, slot_rows, tmpfiles_steps, tmpfiles_undo_steps,
                                 ungroup_steps)
 from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_steps
@@ -180,6 +188,103 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
         raise Refused("tool-missing", ", ".join(missing))
     if python and facts.host == "darwin" and not facts.xcode_ready():
         raise Refused("tool-missing", f"{root_tree.ROOT_PYTHON['darwin']} (xcode-select -p fails: no developer tools)")
+
+
+#: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
+BUILT_VERBS = ("setup", "undo", "replenish")
+
+
+def helper_pending() -> tuple[str, ...]:
+    """A plan's ``pending`` line for each helper with verbs it does not apply yet, derived from the helpers
+    themselves (this module's :data:`BUILT_VERBS`, the runtime helper's registered handlers), so it never goes
+    stale as lanes land."""
+    install = [v for v in VERBS if v not in BUILT_VERBS]
+    runtime = [v for v in RUNTIME_VERBS if v not in RH.VERB_HANDLERS]
+    out = []
+    if install:
+        out.append(f"levain.slot.install_helper answers verb-unbuilt for: {', '.join(install)}")
+    if runtime:
+        out.append(f"levain.slot.runtime_helper answers verb-unbuilt for: {', '.join(runtime)}")
+    return tuple(out)
+
+
+# --- the slot state files (CONTRACT §3.5 Pool, §2.1) -----------------------------------------------
+
+
+@contextmanager
+def pool_lock(store: Path, *, missing_ok: bool = False, waits: RH.Seams | None = None) -> Iterator[None]:
+    """``L/slots/pool.lock`` held for the body: every writer of a slot state file holds it (§3.5). Install takes
+    no slot lock, so the lock order has nothing more to say here. Waited for as the runtime helper waits
+    (:func:`runtime_helper.wait_flock`; ``waits`` carries the clock and the bound), refused ``pool-locked`` past
+    it. ``missing_ok``: with no lock file (a store emptied by hand) there is no writer to exclude and the body runs
+    unlocked; undo only, since setup and replenish made the file in an earlier step."""
+    path = Path(store) / "slots" / "pool.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+        yield
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused("bad-root", f"{path} is not a regular file")
+        RH.wait_flock(fd, waits or RH.Seams(), "pool-locked")
+        yield
+    finally:
+        os.close(fd)   # closing the only descriptor releases the flock
+
+
+def _operator_held(slot_dir: Path) -> bool:
+    """§3.5 ``dispatch_eligible`` is false for a slot whose ``keep/`` holds a vendor credential or that has a
+    ``baseline``; both are looked at by name only (§2.1: keep files are moved, never opened)."""
+    return (any(os.path.lexists(slot_dir / "keep" / n) for n in RH.CREDENTIAL_NAME.values())
+            or os.path.lexists(slot_dir / "baseline"))
+
+
+def write_initial_slot_state(store: Path, slot: SlotId, *, clock: Callable[[], float] = time.time,
+                             waits: RH.Seams | None = None) -> tuple[bool, str]:
+    """A slot an install makes starts ``reusable`` with ``rev`` 0 and ``lease_seq`` 0 (DECISION: §3.5 fixes only
+    that both count up from here and are never reset), root 0644 (§2.1), written whole and durably under the pool
+    lock in the runtime helper's own encoding (:func:`runtime_helper.slot_state_bytes`, the one definition).
+
+    Written only when absent: a re-run must never put a slot back to ``rev`` 0 over a newer state. A present
+    file is parsed instead, and one that does not parse fails the step."""
+    path = slot.slot_dir(Path(store)) / "state"
+    with pool_lock(store, waits=waits):
+        raw = R.read_record(path)
+        if raw is not None:
+            have = RH.parse_slot_state(raw, slot)
+            return True, f"{slot.tag} already has its state ({have.state}, rev {have.rev})"
+        state = RH.SlotState(slot, rev=0, lease_seq=0, state="reusable",
+                             dispatch_eligible=not _operator_held(slot.slot_dir(Path(store))),
+                             changed_at=R.timestamp(clock()))
+        R.write_durably(path, RH.slot_state_bytes(state), mode=0o644)
+    return True, ""
+
+
+def remove_slot_state(store: Path, slot: SlotId, *, waits: RH.Seams | None = None) -> tuple[bool, str]:
+    """Undo: the slot's state file goes, under the pool lock, so no ``prepare`` reads the slot as reusable."""
+    path = slot.slot_dir(Path(store)) / "state"
+    with pool_lock(store, missing_ok=True, waits=waits):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return True, "already gone"
+    return True, ""
+
+
+def slot_state_steps(host: HostOS, slots: Iterable[SlotId], *, store: Path | None = None) -> list[Step]:
+    L = Path(store) if store is not None else STORE[host]
+    return [Step(f"mark {s.tag} reusable in {s.slot_dir(L) / 'state'} (levain-slot-state/1, under the pool lock)",
+                 call=lambda s=s: write_initial_slot_state(L, s))
+            for s in sorted(set(slots))]
+
+
+def slot_state_undo_steps(host: HostOS, slots: Iterable[SlotId], *, store: Path | None = None) -> list[Step]:
+    L = Path(store) if store is not None else STORE[host]
+    return [Step(f"remove {s.slot_dir(L) / 'state'} (under the pool lock)", call=lambda s=s: remove_slot_state(L, s))
+            for s in sorted(set(slots))]
 
 
 # --- setup -----------------------------------------------------------------------------------------
@@ -369,6 +474,9 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *root_tree.tree_steps(host, package),
         *confinement,
         *units.install_steps(host, services),
+        # Each slot's §3.5 Pool state once everything the slot needs is in place, before the rule that lets
+        # prepare run (prepare picks only from these).
+        *slot_state_steps(host, alloc.slots),
         *sudoers_steps(host, cmd.operator),
         # LAST (§23): only a complete install is `already-set-up`; until this, setup re-runs.
         Step(f"record {cmd.operator} as this machine's one operator (last)",
@@ -382,7 +490,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
     return InstallPlan("setup", host, tuple(steps), alloc, accounts, groups,
                        tuple(early + rows + [reserve_row(host)]), roots, facts.retired,
                        revived=tuple(a.name for a in revived), kept=kept,
-                       pending=root_tree.PENDING + skipped, services=tuple(s.name for s in services),
+                       pending=helper_pending() + skipped, services=tuple(s.name for s in services),
                        intent=intent)
 
 
@@ -472,6 +580,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *remove_runtime_sudoers_steps(host),
         # Every service stops before anything is removed; their unit files go with them.
         *units.uninstall_steps(host),
+        # With the services stopped nothing rewrites them: no slot reads as reusable from here on.
+        *slot_state_undo_steps(host, slots_of(accounts)),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
     ]
@@ -483,7 +593,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     steps += delete_group_steps(host, groups)
     # Slot confinement goes only after every slot process is stopped and its account tombstoned.
     if host == "linux":
-        steps += netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
+        steps += (netns.netns_undo_steps(slots_of(accounts)) + bwrap.bwrap_undo_steps() + tmpfiles_undo_steps()
+                  + run_dir_undo_steps(host))
     else:
         # The slots' lo0 aliases go before the rules guarding them are flushed (§24).
         steps += pf.alias_undo_steps(slots_of(accounts)) + pf.unload_steps()
@@ -559,6 +670,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
         *membership_steps(host, membership_pairs(made, None)),
         *row_steps(host, rows),
         *confinement,
+        # Only now may prepare take them: a new slot is reusable once its confinement is loaded (§3.5 Pool).
+        *slot_state_steps(host, alloc.slots),
         intent_remove_step(host),   # LAST, after the confinement steps
     ]
     check_tools(facts, steps, verb="replenish")
@@ -566,18 +679,311 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
                        intent=intent)
 
 
-#: The entry's exit while the apply layer is unbuilt: a caller that trusts the exit code must never read
-#: an install that did nothing as one that worked.
-EXIT_NOT_BUILT = 2
-
-__all__ = ["EXIT_NOT_BUILT", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "check_account_ids", "check_tools",
-           "extra_tools", "operator_record",
-           "operator_record_text", "parse_operator_record", "plan_replenish", "plan_setup", "plan_tools",
-           "plan_undo", "preflight"]
+# --- the apply layer: ``__main__`` (CONTRACT §5 preamble, §5.2, §25) --------------------------------------
 
 
-if __name__ == "__main__":
-    import sys
+@dataclass(frozen=True)
+class Directory:
+    """The host's directory service, read once under the install lock: name -> id, and each name's label (macOS
+    ``RealName``; Linux a user's GECOS field, a group has none)."""
 
-    sys.stderr.write("levain install helper: apply layer not built (S1 session 2)\n")
-    raise SystemExit(EXIT_NOT_BUILT)
+    users: Mapping[str, int]
+    groups: Mapping[str, int]
+    user_labels: Mapping[str, str] = field(default_factory=dict)
+    group_labels: Mapping[str, str] = field(default_factory=dict)
+
+
+def _lines(run: Callable[..., object], argv: Sequence[str]) -> list[str]:
+    r = run(list(argv), capture_output=True, text=True, cwd="/", env=child_env())
+    if r.returncode != 0:
+        raise Refused("host-read-failed", f"{' '.join(argv)}: {(r.stderr or '').strip()[:200]}")
+    return r.stdout.splitlines()
+
+
+def _id(token: str, line: str) -> int:
+    try:
+        return int(token)
+    except ValueError:
+        raise Refused("host-read-failed", f"no id in {line[:120]!r}") from None
+
+
+def read_directory(host: HostOS, *, run: Callable[..., object] = subprocess.run) -> Directory:
+    """Every user and group with its id and label. A read that fails, or a line that does not parse, refuses
+    ``host-read-failed``: an id the planner never saw is an id it could hand out again."""
+    users: dict[str, int] = {}
+    groups: dict[str, int] = {}
+    ulab: dict[str, str] = {}
+    glab: dict[str, str] = {}
+    if host == "darwin":
+        dscl = "/usr/bin/dscl"
+        for kind, key, into in (("/Users", "UniqueID", users), ("/Groups", "PrimaryGroupID", groups)):
+            for ln in _lines(run, (dscl, ".", "-list", kind, key)):
+                p = ln.split()
+                if not p:
+                    continue
+                if len(p) != 2:
+                    raise Refused("host-read-failed", f"dscl {kind} {key}: {ln[:120]!r}")
+                into[p[0]] = _id(p[1], ln)
+        for kind, into in (("/Users", ulab), ("/Groups", glab)):
+            for ln in _lines(run, (dscl, ".", "-list", kind, "RealName")):
+                p = ln.split(None, 1)
+                if p:
+                    into[p[0]] = " ".join(p[1].split()) if len(p) > 1 else ""
+    elif host == "linux":
+        getent = _abs("getent")
+        for ln in _lines(run, (getent, "passwd")):
+            if not ln:
+                continue
+            p = ln.split(":")
+            if len(p) != 7:
+                raise Refused("host-read-failed", f"getent passwd: {ln[:120]!r}")
+            users[p[0]] = _id(p[2], ln)
+            ulab[p[0]] = p[4]
+        for ln in _lines(run, (getent, "group")):
+            if not ln:
+                continue
+            p = ln.split(":")
+            if len(p) != 4:
+                raise Refused("host-read-failed", f"getent group: {ln[:120]!r}")
+            groups[p[0]] = _id(p[2], ln)
+    else:
+        raise Refused("unsupported-host", repr(host))
+    if users.get("root") != 0:
+        raise Refused("host-read-failed", "the directory service lists no root at uid 0")
+    return Directory(users, groups, ulab, glab)
+
+
+def count_live_leases(sessions: Path) -> int:
+    """Root's read of §3.1: the state records CONTROL marks ``lease_live``. DECISION: a record that does not parse
+    counts as live, so an install verb refuses rather than act beside a session it cannot read."""
+    try:
+        names = os.listdir(sessions)
+    except FileNotFoundError:
+        return 0
+    live = 0
+    for name in sorted(names):
+        if not name.endswith(".json") or not SESSION_RE.fullmatch(name[:-len(".json")]):
+            continue
+        try:
+            raw = R.read_record(Path(sessions) / name)
+            if raw is not None and R.parse_state(raw).lease_live:
+                live += 1
+        except (Refused, OSError):
+            live += 1
+    return live
+
+
+def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:
+    """The configured slots (the runtime helper's own reading of ``L/slots/``) whose state file is not
+    ``retired``. DECISION: a slot with no state file is in service (one an install made before state files)."""
+    out: dict[str, tuple[int, ...]] = {}
+    for cls, indices in RH.configured_slots(store).items():
+        keep = []
+        for i in sorted(indices):
+            view = RH.read_view(store, SlotId(cls, i))   # type: ignore[arg-type]
+            if view.state is None or view.state.state != "retired":
+                keep.append(i)
+        out[cls] = tuple(keep)
+    return out
+
+
+@dataclass(frozen=True)
+class Gathered:
+    """What :func:`gather_facts` read under the install lock: the facts every plan takes, plus each verb's own
+    inputs (undo: every live Levain account and the shared groups present; replenish: the slots in service, by
+    class, and their accounts)."""
+
+    facts: HostFacts
+    accounts: Mapping[str, int] = field(default_factory=dict)
+    shared_groups: tuple[str, ...] = ()
+    live: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+
+
+def _operator_of(store: RH.Store) -> Mapping[str, object] | None:
+    """``L/policy/operator`` parsed, or None when it (or ``L/policy/``) is absent: not set up."""
+    try:
+        raw = store.read(("policy",), "operator")
+    except Refused as e:
+        if e.name != "store-missing":
+            raise
+        return None
+    return parse_operator_record(raw) if raw is not None else None
+
+
+def _user_name(uid: int) -> str | None:
+    import pwd
+
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
+
+
+def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
+                 run: Callable[..., object] = subprocess.run, store_seams: RH.Seams | None = None,
+                 state_dir: Path | None = None,
+                 user_name: Callable[[int], str | None] = _user_name) -> Gathered:
+    """CONTRACT §25: everything a plan reads, read while the caller holds the install lock. ``store_seams``: the
+    runtime helper's store access (``L`` and the trust check on its dirs); ``state_dir``: the dir holding the
+    retired ids and the journal (default beside :data:`~levain.slot.ids.RETIRED_IDS_PATH`).
+
+    Accounts and groups are Levain's by label (§23) or, with a journal, by name AND journaled id (§25: a Linux
+    group carries no label)."""
+    d = read_directory(host, run=run)
+    rs = store_seams or RH.Seams(host=host)
+    L = rs.L
+    retired_path = Path(state_dir) / RETIRED_IDS_PATH[host].name if state_dir else RETIRED_IDS_PATH[host]
+    intent_path = Path(state_dir) / INTENT_PATH[host].name if state_dir else INTENT_PATH[host]
+    orec, in_service = None, None
+    if os.path.lexists(L):
+        # Read as the runtime helper reads the store: one dirfd, every component O_NOFOLLOW, root's dirs only.
+        store = RH.Store(rs)
+        try:
+            orec = _operator_of(store)
+            if cmd.verb == "replenish" and orec is not None:
+                in_service = slots_in_service(store)
+        finally:
+            store.close()
+    journal = read_intent(host, path=intent_path)
+    live: dict[str, int] = {}
+    tombs: dict[str, int] = {}
+    accounts: dict[str, int] = {}
+    for name, uid in d.users.items():
+        if not name.startswith("_levain_"):
+            continue
+        label = d.user_labels.get(name, "")
+        if label == SLOT_MARKER:
+            live[name] = accounts[name] = uid
+        elif label == SLOT_RETIRED_MARKER[host]:
+            tombs[name] = uid
+    shared = tuple(sorted(g for g in d.groups if g in SHARED_GROUPS))
+    if host == "darwin":
+        live.update((g, d.groups[g]) for g in shared if d.group_labels.get(g) == SLOT_MARKER)
+    host_ids: dict[str, int] = {}
+    if journal is not None:
+        host_ids.update((n, d.users[n]) for n in journal.accounts if n in d.users)
+        host_ids.update((g, d.groups[g]) for g in journal.groups if g in d.groups)
+    facts = HostFacts(
+        host=host, caller_uid=caller_uid, caller_name=user_name(caller_uid),
+        operator_uid=d.users.get(cmd.operator) if cmd.operator else None, operator_record=orec,
+        live_leases=count_live_leases(L / "sessions"),
+        used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
+        existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
+        levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids)
+    if cmd.verb == "undo":
+        return Gathered(facts, accounts, shared)
+    if in_service is not None:
+        wanted = {n for cls, idx in in_service.items() for i in idx for n in SlotId(cls, i).accounts}  # type: ignore[arg-type]
+        return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service)
+    return Gathered(facts)
+
+
+def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
+    """The verb's plan from what was gathered. ``setup_kw`` reaches :func:`plan_setup` (tests: its host seams).
+
+    DECISION (replenish): no store record holds the configured counts, so they are the slots in service; a
+    replenish without a journal then chooses no new index, and only a journaled one makes slots (§25 resume)."""
+    if cmd.verb == "setup":
+        return plan_setup(cmd, g.facts, **setup_kw)
+    if cmd.verb == "undo":
+        return plan_undo(cmd, g.facts, accounts=g.accounts, shared_groups=g.shared_groups)
+    if cmd.verb == "replenish":
+        return plan_replenish(cmd, g.facts, slots=len(g.live.get("egress", ())),
+                              verifier_slots=len(g.live.get("none", ())), live=g.live, accounts=g.accounts)
+    raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
+
+
+def apply_steps(plan: InstallPlan, err: TextIO) -> str | None:
+    """Run the plan's steps in order with :func:`levain.firing.hands.run_plan` (it reads only ``steps``), progress
+    on ``err``. None when every step ran or was skipped; else the failing step's line and why."""
+    seen = {"step": "", "why": ""}
+
+    def emit(text: str) -> None:
+        err.write(text + "\n")
+        if text.startswith("["):
+            seen["step"] = text.split("\n", 1)[0]
+        elif text.lstrip().startswith("FAILED:"):
+            seen["why"] = text.strip()
+
+    if run_plan(plan, dry_run=False, emit=emit) == 0:   # type: ignore[arg-type]
+        return None
+    return f"{seen['step']} {seen['why']}".strip()
+
+
+def _host() -> HostOS:
+    try:
+        return host_os()
+    except HandsSetupError as e:
+        raise Refused("unsupported-host", str(e)) from None
+
+
+@dataclass
+class Seams:
+    """Every act :func:`main` takes that a unit test cannot take as a non-root user, with its real default."""
+
+    euid: Callable[[], int] = os.geteuid
+    host: Callable[[], HostOS] = _host
+    lock: Callable[[HostOS], ContextManager[object]] = install_lock
+    gather: Callable[[InstallCommand, HostOS, int], Gathered] = gather_facts
+    plan: Callable[[InstallCommand, Gathered], InstallPlan] = plan_for
+    apply: Callable[[InstallPlan, TextIO], Optional[str]] = apply_steps
+
+
+def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
+    """The verb's ok fields, or :class:`Refused`. The order is §25's: the install lock is taken BEFORE the host's
+    facts are gathered, and held through the plan, its first step (the journal), every act, the record and the
+    journal's removal, so no second run plans against this one's half. Nothing before the lock reads the host."""
+    if seams.euid() != 0:
+        raise Refused("not-root", "the install helper runs as root")
+    cmd = parse_install_argv(argv)
+    if cmd.verb not in BUILT_VERBS:
+        raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
+    caller_uid = RH._sudo_uid(env)
+    host = seams.host()
+    with seams.lock(host):
+        gathered = seams.gather(cmd, host, caller_uid)
+        plan = seams.plan(cmd, gathered)
+        for line in plan.pending:
+            err.write(f"levain install-helper: pending: {line}\n")
+        failed = seams.apply(plan, err)
+        if failed is not None:
+            raise Refused("step-failed", failed)
+    fields: dict[str, object] = {"verb": plan.verb, "steps": len(plan.steps)}
+    if plan.allocation is not None:
+        fields["slots"] = [s.tag for s in plan.allocation.slots]
+    return fields
+
+
+def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = None,
+         out: TextIO | None = None, err: TextIO | None = None) -> int:
+    """Exactly one canonical JSON line on ``out`` (``ok`` or ``refused`` by name); progress and every refusal's
+    detail on ``err``. Exits as the runtime helper does: 0 ok, 1 refused, 70 internal."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    try:
+        line = ok_line(run(argv, env=env, seams=seams or Seams(), err=err))
+    except Refused as e:
+        err.write(f"levain install-helper: refused {e.name}: {e.detail!r}\n")
+        out.write(refusal_line(e))
+        out.flush()
+        return RH.EXIT_REFUSED
+    except Exception as e:   # noqa: BLE001 - one line on stdout, whatever went wrong
+        err.write(f"levain install-helper: internal error: {type(e).__name__}: {e}\n")
+        out.write(refusal_line(Refused("internal")))
+        out.flush()
+        return RH.EXIT_INTERNAL
+    out.write(line)
+    out.flush()
+    return RH.EXIT_OK
+
+
+__all__ = ["BUILT_VERBS", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
+           "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "extra_tools", "gather_facts",
+           "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
+           "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight",
+           "read_directory", "remove_slot_state", "run", "slot_state_steps", "slot_state_undo_steps",
+           "slots_in_service", "write_initial_slot_state"]
+
+
+if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
+    raise SystemExit(main(sys.argv[1:], env=dict(os.environ)))
