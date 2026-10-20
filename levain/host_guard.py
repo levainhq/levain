@@ -740,9 +740,12 @@ def git_binary() -> str | None:
 
 
 def git_env() -> dict[str, str]:
-    """The environment for asking git about a workspace: this process's without any ``GIT_*`` variable, so a caller's
-    GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE (a git hook, an alias) cannot make git answer about another repository."""
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    """The environment for asking git about a workspace: levain's child environment (:func:`levain.launch.child_env`,
+    never the whole of this process's) without any ``GIT_*`` variable, so a caller's GIT_DIR / GIT_WORK_TREE /
+    GIT_INDEX_FILE (a git hook, an alias) cannot make git answer about another repository."""
+    from levain.launch import child_env
+
+    return {k: v for k, v in child_env().items() if not k.startswith("GIT_")}
 
 
 def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
