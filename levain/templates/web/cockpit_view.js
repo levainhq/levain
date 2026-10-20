@@ -2045,23 +2045,19 @@
     h.append(el("h3", null, title), el("span", null, gloss));
     return h;
   }
-  // A waiting task or node links to the Needs-you row it waits on. The page opens a consent or question row inside the
-  // Decisions focus view, so that is opened (its tile is the one door); the row is then marked and scrolled to by the card id
-  // the row carries (data-card). With no Decisions tile on the page, the Board tab is shown instead: the same rows live there.
+  // A waiting task or node links to the Needs-you item it waits on: the strip's card with that id is scrolled to and lit (on Build, the bar's
+  // chip is). An item with no card (decided, no longer waiting) opens the Decisions focus view, where its row is marked and scrolled to by
+  // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
   function openNeedsYouCard(card) {
-    const tile = document.querySelector('.ck-card.w[data-ck-panel="decisions"]');
+    const N = root.LevainNeeds;
+    if (N && N.go(card)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
     const mark = (tries) => {
       const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
       if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
       if (tries > 0) root.setTimeout(() => mark(tries - 1), 150);
     };
-    if (tile) {
-      const wasOpen = tile.classList.contains("w-open");
-      tile.classList.add("w-open");     // the tile opens only while it hides rows: a task linking to one asks for the focus view regardless
-      tile.click();
-      if (!wasOpen) tile.classList.remove("w-open");
-      mark(12);
-    } else applyMode("board", true);
+    if (N && N.history()) mark(12);
+    else applyMode("board", true);
   }
   function paintBuildSessions() {
     const sec = k7Host();

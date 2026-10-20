@@ -149,8 +149,8 @@ def test_a_click_on_a_waiting_record_opens_the_card_it_waits_on(tmp_path, monkey
     out = _run(tmp_path, src, [
         {"until": TV + " && " + TV + ".querySelector('.tv-rec.tv-open')"},
         {"eval": TV + ".querySelector('.tv-rec.tv-open').click(); 1"},
-        {"until": "document.querySelector('.modal-overlay [data-card^=\"consent:\"].tv-lit')"},
-        {"eval": "JSON.stringify([!!document.querySelector('.modal-overlay'), document.querySelector('[data-card^=\"consent:\"].tv-lit').className])"}])
+        {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},      # K10 S3: the strip's card (Build: its chip) is lit, no modal
+        {"eval": "JSON.stringify([!document.querySelector('.modal-overlay'), document.querySelector('#ck-needs .needs-lit').className])"}])
     assert "timeout" not in json.dumps(out[-2]), out
     assert json.loads(out[-1])[0] is True, out
 

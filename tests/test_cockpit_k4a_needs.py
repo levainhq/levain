@@ -90,13 +90,15 @@ def test_a_question_card_keeps_its_rec_and_its_cli_line_sits_behind_details(tmp_
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
             {"eval": "(() => { const q = document.querySelector('#ck-needs .needs-question'); return JSON.stringify({"
-                     " recText: q.innerText.toLowerCase().includes('recommends hold'), recBtn: [...q.querySelectorAll('.question-option')].map(b => [b.textContent, b.classList.contains('question-rec')]),"
+                     " recText: /REC\\s+hold\\./.test(q.innerText), title: (q.querySelector('.needs-q-title')||{}).textContent, recBtn: [...q.querySelectorAll('.question-option')].map(b => [b.textContent, b.classList.contains('question-rec')]),"
                      " words: !!q.querySelector('.question-words')}); })()"},
             {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); const d = c.querySelector('details.needs-details'); const code = c.querySelector('.consent-code');"
                      " return JSON.stringify({isDetails: !!d, openBefore: d.open, shownBefore: code.checkVisibility()}); })()"},
             {"eval": "(() => { const c = document.querySelector('#ck-needs .needs-consent'); c.querySelector('details.needs-details summary').click();"
                      " const code = c.querySelector('.consent-code'); return JSON.stringify({openAfter: c.querySelector('details').open, shownAfter: code.checkVisibility(), cmd: code.textContent}); })()"}])["values"]
     q, before, after = (json.loads(v) for v in out[-3:])
+    assert q["title"] == "Ship the sweep fix tonight or hold it?", q
+    assert not any("recommended" in b[0] for b in q["recBtn"]), q          # the fill and the REC line say it
     assert q["recText"] and q["words"] and ["hold", True] == [q["recBtn"][1][0].split(" ")[0], q["recBtn"][1][1]] and q["recBtn"][0][1] is False, q
     assert before == {"isDetails": True, "openBefore": False, "shownBefore": False}, before
     assert after["openAfter"] and after["shownAfter"] and after["cmd"].startswith("levain consent answer "), after
@@ -123,3 +125,34 @@ def test_the_sessions_tile_says_live_and_quiet_and_names_the_busiest(tmp_path: P
             {"eval": f"{SESS_TILE}.innerText.replace(/\\s+/g, ' ')"}])["values"][-1]
     text = out.lower()
     assert "live" in text and "quiet" in text and "busiest" in text, out
+
+
+@needs_browser
+def test_time_left_reads_in_whole_units_never_minutes_and_seconds(tmp_path: Path, monkeypatch) -> None:
+    _waiting(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        got = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+            {"eval": "JSON.stringify({cards: [...document.querySelectorAll('#ck-needs .needs-left')].map(n => n.textContent),"
+                     " tile: " + TILE + ".innerText.replace(/\\s+/g, ' ')})"}])["values"][-1]
+    got = json.loads(got)
+    assert got["cards"][0].endswith(" m left") and not any(__import__("re").search(r"\d+m\d+s", c) for c in got["cards"]), got
+    assert not __import__("re").search(r"\d+m\d+s", got["tile"]), got
+
+
+@needs_browser
+def test_a_record_click_lights_its_card_and_build_draws_one_bar(tmp_path: Path, monkeypatch) -> None:
+    _waiting(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
+            {"eval": "(() => { const id = document.querySelector('#ck-needs .needs-consent').dataset.needsId; const ok = window.LevainNeeds.go(id);"
+                     " return JSON.stringify({id, ok, lit: document.querySelectorAll('.needs-lit').length, none: window.LevainNeeds.go('consent:nope')}); })()"},
+            {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('.needs-lit').length), 2000))"},
+            {"eval": "(() => { window.LevainCockpitKinds.applyMode('build', true); return new Promise(r => setTimeout(() => { const n = document.getElementById('ck-needs');"
+                     " r(JSON.stringify({bar: getComputedStyle(n.querySelector('.needs-bar')).display, grid: getComputedStyle(n.querySelector('.needs-grid')).display,"
+                     " chips: n.querySelectorAll('.needs-chip-btn').length, btn: /Open on Board/.test(n.innerText)})); }, 300)); })()"}])["values"]
+    a, gone, bar = json.loads(out[-3]), out[-2], json.loads(out[-1])
+    assert a["ok"] is True and a["lit"] == 1 and a["none"] is False, a
+    assert gone == 0, gone                                              # the light ends by itself: no class left behind
+    assert bar["bar"] != "none" and bar["grid"] == "none" and bar["chips"] == 3 and bar["btn"], bar

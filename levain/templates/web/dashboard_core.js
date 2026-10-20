@@ -3671,14 +3671,15 @@
   function consentLeft(expiresAt) {
     const ms = Date.parse(expiresAt) - Date.now();
     if (!Number.isFinite(ms) || ms <= 0) return "expired";
-    const t = Math.floor(ms / 1000);
-    return (t >= 60 ? Math.floor(t / 60) + "m" + String(t % 60).padStart(2, "0") + "s" : t + "s") + " left";
+    // "11 h 31 m left", "52 m left", "40 s left": whole units the eye reads at a glance, one formatter for every place a clock shows
+    const t = Math.floor(ms / 1000), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
+    return (h ? h + " h " + String(m).padStart(2, "0") + " m" : m ? m + " m" : t + " s") + " left";
   }
   let consentTicker = null;
   function tickConsent() {
     const nodes = document.querySelectorAll("[data-consent-expires]");
     if (!nodes.length && consentTicker) { window.clearInterval(consentTicker); consentTicker = null; return; }
-    for (const n of nodes) n.textContent = consentLeft(n.dataset.consentExpires);
+    for (const n of nodes) n.textContent = (n.dataset.consentPrefix || "") + consentLeft(n.dataset.consentExpires);
   }
   function copyText(text, codeEl, btn) {
     const done = (msg) => { btn.textContent = msg; setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500); };
@@ -3929,7 +3930,9 @@
     line.append(code, btn);
     return line;
   }
-  function drawQuestionBody(q, slot, b) {
+  // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
+  // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
+  function drawQuestionBody(q, slot, b, card) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
@@ -3939,12 +3942,24 @@
       slot.replaceChildren(...parts);
       return;
     }
-    const parts = [el("pre", "consent-display", sv(b.what))];
     const options = Array.isArray(b.options) ? b.options : [];
-    const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
-    facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
-    parts.push(facts);
+    const parts = [];
+    if (card) {
+      parts.push(el("div", "needs-q-title", sv(b.what)));
+      if (sv(b.blocks)) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + sv(b.blocks)));
+      const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
+      if (sv(b.rec)) {
+        const rl = el("div", "needs-rec");
+        rl.append(el("span", "needs-rec-tag", "REC"), document.createTextNode(" " + sv(b.rec) + (recOpt && sv(recOpt.label) ? ". " + sv(recOpt.label) : "")));
+        parts.push(rl);
+      }
+    } else {
+      parts.push(el("pre", "consent-display", sv(b.what)));
+      const facts = el("div", "consent-facts");
+      facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
+      facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
+      parts.push(facts);
+    }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
     if (a) {
       const opt = options.find((o) => o && o.key === a.value);
@@ -3976,7 +3991,7 @@
     };
     for (const o of options) {
       const key = sv(o && o.key);
-      const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (key === sv(b.rec) ? " (recommended)" : ""));
+      const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (!card && key === sv(b.rec) ? " (recommended)" : ""));
       if (key === sv(b.rec)) btn.classList.add("question-rec");
       btn.type = "button";
       btn.title = "answer with option " + key;
@@ -3987,12 +4002,19 @@
     const words = el("textarea", "question-words");
     words.rows = 2;
     words.maxLength = 4000;
-    words.placeholder = "or answer in your own words";
+    words.placeholder = card ? "or your own words" : "or answer in your own words";
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
     sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
     controls.push(words, sendWords);
+    if (card) {
+      const bottom = el("div", "needs-actions needs-qa");
+      bottom.append(wrap, words, sendWords, msg);
+      slot.replaceChildren(...parts);
+      card.appendChild(bottom);
+      return;
+    }
     parts.push(wrap, words, sendWords, msg);
     slot.replaceChildren(...parts);
   }
@@ -4067,9 +4089,12 @@
     card.appendChild(head);
   }
   // an answer-on-your-phone note, and the CLI route behind "details" (the digests, the note and the two commands)
-  function needsDetails(parts) {
+  function needsDetails(parts, note) {
     const d = el("details", "needs-details");
-    d.appendChild(el("summary", null, "details"));
+    const sum = el("summary", null);
+    sum.appendChild(el("span", "needs-details-toggle", "details"));
+    if (note) sum.appendChild(el("span", "needs-phone ext-meta", note));
+    d.appendChild(sum);
     d.append(...parts);
     return d;
   }
@@ -4078,8 +4103,7 @@
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("pre", "consent-display", sv(b.display))];
     const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "in " + sv(b.cwd)));
-    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
+    facts.appendChild(el("span", "ext-meta", "in " + sv(b.cwd) + " \u00b7 targets " + sv(b.targets)));
     parts.push(facts);
     const hintBox = consentHintBox(b);
     if (hintBox) parts.push(hintBox);
@@ -4092,7 +4116,7 @@
       const btn = el("button", "needs-btn", label);
       btn.type = "button";
       btn.dataset.label = label;
-      btn.title = "copy the " + label.toLowerCase() + " command; this page signs nothing";
+      btn.title = "copy the " + label.toLowerCase() + " command for a terminal; this page signs nothing, sign on your phone with Face ID";
       const code = el("code", "consent-code", cmd);
       btn.addEventListener("click", () => copyText(cmd, code, btn));
       acts.appendChild(btn);
@@ -4100,17 +4124,18 @@
       line.appendChild(code);
       cmds.push(line);
     }
-    if (acts.childElementCount) parts.push(acts);
-    parts.push(el("div", "needs-phone ext-meta", "answer on your phone to sign it with Face ID, or copy a command for a terminal"));
     const more = [...consentDigestLines(b)];
     if (sv(b.note)) more.push(el("div", "consent-note ext-meta", sv(b.note)));
     more.push(...cmds);
-    parts.push(needsDetails(more));
     slot.replaceChildren(...parts);
+    // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
+    if (acts.childElementCount) card.appendChild(acts);
+    card.appendChild(needsDetails(more, "signs on your phone"));
   }
   function consentCard(c) {
     const card = el("div", "needs-card needs-consent");
     card.dataset.needsCard = "consent";
+    if (c.id) card.dataset.needsId = "consent:" + c.id;
     needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
       const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
       left.dataset.consentExpires = c.expiresAt;
@@ -4127,11 +4152,12 @@
   function questionCard(q) {
     const card = el("div", "needs-card needs-question");
     card.dataset.needsCard = "question";
+    if (q.id) card.dataset.needsId = String(q.id);
     needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
-      drawQuestionBody(q, slot, b);
+      drawQuestionBody(q, slot, b, card);
       if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")]));
     });
     return card;
@@ -4154,29 +4180,114 @@
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Needs you"));
     head.appendChild(el("span", "needs-count", String(items.length)));
-    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign on your phone, or answer a question here."));
+    // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
+    // pushes), so the gloss claims no ping: it says where the answer is signed
+    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
     const hist = el("button", "needs-history", "all decisions");
     hist.type = "button";
     hist.title = "decided requests, outcomes and standing-rule proposals";
-    hist.addEventListener("click", () => {
-      const entry = currentView && Array.isArray(currentView.layout) ? currentView.layout.find((e) => e.id === "decisions") : null;
-      if (entry) openModal(findEntry(currentView, entryKey(entry)) || entry, hist, true);
-    });
+    hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
     const grid = el("div", "needs-grid");
     for (const it of items) grid.appendChild(it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
-    host.replaceChildren(head, grid);
+    host.replaceChildren(head, needsBar(items), grid);
     host.hidden = false;
+  }
+  // the Decisions focus view (decided requests, outcomes, proposals); false when this page has no Decisions panel
+  function openDecisionsHistory(opener) {
+    const entry = currentView && Array.isArray(currentView.layout) ? currentView.layout.find((e) => e.id === "decisions") : null;
+    if (!entry) return false;
+    openModal(findEntry(currentView, entryKey(entry)) || entry, opener || null, true);
+    return true;
+  }
+  // The one orange bar Build and Memory draw in place of the cards (CSS shows it only there): dot, "Needs you", the count, one chip
+  // per waiting item (its tool and first words, or the question's), the soonest clock, and "Open on Board". A chip goes to Board
+  // too, with its card lit. A consent chip says its tool at once and adds the command's first words when the body arrives.
+  const NEEDS_CHIPS = 6, NEEDS_CHIP_WORDS = 26;
+  function needsFirstWords(display, tool) {
+    let t = String(display || "").replace(/^\s+/, "");
+    if (tool && t.startsWith(tool)) t = t.slice(tool.length).replace(/^\s+/, "");
+    const m = /"(?:command|file_path|path|url|pattern|prompt)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(t);
+    t = (m ? m[1] : t.replace(/^[{\["]+/, "")).replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+    return t.length > NEEDS_CHIP_WORDS ? t.slice(0, NEEDS_CHIP_WORDS - 1).trimEnd() + "\u2026" : t;
+  }
+  function needsBar(items) {
+    const bar = el("div", "needs-bar");
+    bar.appendChild(el("span", "needs-dot"));
+    bar.appendChild(el("b", "needs-bar-title", "Needs you"));
+    bar.appendChild(el("span", "needs-count", String(items.length)));
+    const chips = el("div", "needs-chips");
+    for (const it of items.slice(0, NEEDS_CHIPS)) {
+      const chip = el("button", "needs-chip-btn", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
+      chip.type = "button";
+      const id = it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : "");
+      if (id) chip.dataset.needsId = id;
+      chip.title = "open on the Board";
+      chip.addEventListener("click", () => needsToBoard(id));
+      chips.appendChild(chip);
+      if (it.kind === "consent" && it.c.id) {
+        consentBody(it.c, chip).then((b) => {
+          const w = b && !b.error ? needsFirstWords(b.display, it.c.tool) : "";
+          if (w) chip.textContent = (it.c.tool || "request") + " " + w;
+        });
+      } else if (it.kind === "question") {
+        questionBody(it.q, chip).then((b) => {
+          const w = b && !b.error && typeof b.what === "string" ? needsFirstWords(b.what, "") : "";
+          if (w) chip.textContent = w;
+        });
+      }
+    }
+    if (items.length > NEEDS_CHIPS) chips.appendChild(el("span", "needs-more ext-meta", "+" + (items.length - NEEDS_CHIPS) + " more"));
+    bar.appendChild(chips);
+    const first = items.find((it) => it.kind === "consent" && Number.isFinite(Date.parse(it.c.expiresAt)));
+    if (first) {
+      const soon = el("span", "needs-soonest ext-meta", "soonest " + consentLeft(first.c.expiresAt));
+      soon.dataset.consentExpires = first.c.expiresAt;
+      soon.dataset.consentPrefix = "soonest ";
+      bar.appendChild(soon);
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+    }
+    const open = el("button", "needs-history needs-open", "Open on Board");
+    open.type = "button";
+    open.addEventListener("click", () => needsToBoard(""));
+    bar.appendChild(open);
+    return bar;
+  }
+  // switch to Board, then focus the card the id names (the first card with no id)
+  function needsToBoard(id) {
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.applyMode === "function") K.applyMode("board", true);
+    window.setTimeout(() => { if (!(id && needsGo(id))) needsFocus(); }, 0);
   }
   // the focus the Decisions tile hands the operator in place of a modal: the first card, scrolled to
   function needsFocus() {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden) return false;
     const first = host.querySelector(".needs-card");
-    if (!first) return false;
+    if (!first || !first.offsetParent) return false;   // on Build and Memory the cards are not drawn: the bar is
     first.tabIndex = -1;
     if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
     first.focus({ preventScroll: true });
+    return true;
+  }
+
+  // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
+  // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
+  // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
+  function needsGo(id) {
+    const host = document.getElementById("ck-needs");
+    if (!host || host.hidden || !id) return false;
+    for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
+    const cards = host.querySelector(".needs-card") && host.querySelector(".needs-card").offsetParent;
+    const sel = cards ? ".needs-card" : ".needs-chip-btn";
+    const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
+    if (!node) return false;
+    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
+    void node.offsetWidth;   // restart the animation if the same node is lit twice
+    node.classList.add("needs-lit");
+    const off = () => node.classList.remove("needs-lit");
+    node.addEventListener("animationend", off, { once: true });
+    window.setTimeout(off, 3000);   // a page that plays no animation (reduced motion) still ends the light
     return true;
   }
 
@@ -4892,6 +5003,6 @@
     }
   }
 
-  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary };
+  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
