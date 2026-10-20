@@ -101,7 +101,7 @@ def test_the_phone_port_seam_gates_each_route_by_credential(install):
     import threading
 
     _inst, qdir = install
-    httpd = make_phone_server(qdir, "localhost", port=0, token="run-token-for-test")
+    httpd = make_phone_server(qdir, "localhost", port=0, token="run-token-for-test", dispatch_dir=qdir)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://localhost:{httpd.server_address[1]}"
 

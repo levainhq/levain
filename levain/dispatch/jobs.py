@@ -3,8 +3,8 @@
 A planner files a contract SUBMISSION (:meth:`JobStore.file`); the store resolves it itself, through
 :func:`levain.dispatch.contract.resolve_contract` with the template resolver and the provider policy it is handed,
 so no caller can file a contract object it built by hand. The planner gets back the job and, once, a JOB
-CAPABILITY: a random token only the filing session holds, of which the store keeps the SHA-256 alone. The operator signs the
-contract's digest (:meth:`JobStore.sign`); from there the job is queued for a slot, run, verified, perhaps
+CAPABILITY: a random token only the filing session holds, of which the store keeps the SHA-256 alone. The operator
+signs the contract's digest (:meth:`JobStore.sign`); from there the job is queued for a slot, run, verified, perhaps
 RECOMMENDED by the planner (:meth:`JobStore.recommend`, advisory: it confers no authority), authorised by a human
 signature or a human-signed adoption rule, and adopted. It fails on what the service itself observes (a lapsed
 lease, a budget cap, a floor refusal, a failed verifier) and is cancelled by the filing planner (its capability) at
@@ -27,16 +27,28 @@ same path, or one an ancestor of the other (``src/sub`` and ``src/sub/deep.py`` 
 or runaway planner cannot hold a file past its lease.
 
 By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human
-signed for that result, and only a human releases it (adoption, or the human cancel, whose public method is slice
-b's). The lease protects against a planner that abandons a job, and an authorised job is no longer the planner's.
+signed for that result, and only a human releases it (adoption, or the human cancel, :meth:`JobStore.cancel_by_human`,
+whose signed item is kept append-only beside the contract signature). The lease protects against a planner that
+abandons a job, and an authorised job is no longer the planner's. A human cancel signed before the job's latest
+human-signed transition (the contract signature, a later authorisation) is refused: a stale cancel never kills a job
+the operator signed for after it.
 
-The store is ``<directory>/dispatch.db``, the consent directory by default (:func:`default_dispatch_dir`), in a directory that is the
-operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse UPDATE, DELETE and an
-INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature and the store's own
-metadata are rows written once, and a job's state is its latest transition. Every connection the store opens turns
-foreign keys on. At creation the store draws a random ``store_id``, which every contract signature binds, so a
-signature made for a job in one store is refused by another. Known edge: until S1 places the control principal (design §8), the store is an operator-uid file,
-so any process of that uid can write it; no executor exists in this slice, so no run rests on it. Stdlib only.
+The store is ``<directory>/dispatch.db``, the consent directory by default (:func:`default_dispatch_dir`), in a
+directory that is the operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse
+UPDATE, DELETE and an INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature, its
+one human cancel, the agent that filed it and the store's own metadata are rows written once, and a job's state is its
+latest transition. Every connection the store opens turns foreign keys on. At creation the store draws a random
+``store_id``, which every contract signature binds, so a signature made for a job in one store is refused by another.
+
+Signature checks tell a refusal from a fault by class: a signature or cancel that is not the operator's is a
+:class:`SignatureRefused`; an authority log that cannot be read (a database or file error) or a verifier that cannot
+run (:class:`levain.authority.VerifierUnavailable`) is raised as itself, and nothing is written. An authority log
+that is readable but refused (not initialised, its anchor refuses it) is a :class:`SignatureRefused`.
+
+Known edge: until S1 places the control principal (design §8), the store is an operator-uid file, so any process of
+that uid can write it; no executor exists in this slice, so no run rests on it. The filing agent is the name the
+filing door was given (a flag or the agent's own environment), kept for the signer to read, never proven. Stdlib
+only.
 """
 from __future__ import annotations
 
@@ -55,7 +67,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.authority import AuthorityError
+from levain.authority import AuthorityError, VerifierUnavailable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
@@ -76,6 +88,9 @@ FORMAT = "levain-dispatch-jobs/1"
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
 _SIGN_SKEW = timedelta(minutes=2)
+# the causes a human signed for: a cancel signed before the latest of these is stale
+_HUMAN_SIGNED = frozenset({"signature", "human_authorises", "human_adoption_rule"})
+_AGENT_MAX = 64
 _ACCESS_BY_OTHERS = 0o077
 _SESSION_MAX = 256
 _IDEM_MAX = 128
@@ -158,6 +173,8 @@ class Job:
     history: tuple[Transition, ...]
     signer_fp: str | None
     store_id: str
+    # the agent the filing door named (``claude_code`` / ``codex``), or None when it named none; never proven
+    filer_agent: str | None = None
 
     @property
     def state(self) -> str:
@@ -210,6 +227,21 @@ _SCHEMA = (
     *_append_only("transitions", "transitions are append-only"),
     *_append_only("signatures", "a signature is written once"),
     *_append_only("meta", "store metadata is written once"),
+    # the human cancel's signed item, kept beside the contract signature and never in its table: a job has at most
+    # one of each, and a cancel is not a signature over the contract
+    "CREATE TABLE IF NOT EXISTS cancel_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, "
+    "signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
+    *_append_only("cancel_signatures", "a cancel is written once"),
+    # the agent that filed a job, as the filing door named it: beside the jobs table, never a column of it, so a store
+    # made before it gains the table and keeps its rows; a job filed with no agent named has no row
+    "CREATE TABLE IF NOT EXISTS job_filers (job_id TEXT PRIMARY KEY REFERENCES jobs(id), agent TEXT NOT NULL)",
+    *_append_only("job_filers", "a job filer is written once"),
+    "CREATE TRIGGER IF NOT EXISTS job_filers_no_replace BEFORE INSERT ON job_filers "
+    "WHEN EXISTS (SELECT 1 FROM job_filers WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a job filer is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures "
+    "WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END",
     # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row that reuses ANY key the
     # table has (its primary key, every UNIQUE, an explicit rowid). jobs: id, (filer_session, idem_key) when the
     # idem_key is not null (a null idem_key never collides under UNIQUE), rowid.
@@ -271,6 +303,17 @@ def _capability_sha(capability: Any) -> str:
         return hashlib.sha256(capability.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         return ""
+
+
+def _replay(authority: AuthoritySource) -> Any:
+    """A fresh authority snapshot. A log the replay refuses is the caller's :class:`SignatureRefused`; a verifier that
+    cannot run, and a database or file that cannot be read, propagate as the machine faults they are."""
+    try:
+        return authority()
+    except VerifierUnavailable:
+        raise                   # an AuthorityError subclass, so it must leave before the refusal clause
+    except AuthorityError as exc:
+        raise SignatureRefused(f"the authority log is refused: {str(exc)[:200]}") from None
 
 
 def _label(name: str, value: Any, high: int) -> str:
@@ -385,9 +428,11 @@ class JobStore:
         history = tuple(Transition(*r) for r in conn.execute(
             "SELECT seq, to_state, cause, at, evidence FROM transitions WHERE job_id = ? ORDER BY seq", (job_id,)))
         signer = conn.execute("SELECT signer_fp FROM signatures WHERE job_id = ?", (job_id,)).fetchone()
+        filer = conn.execute("SELECT agent FROM job_filers WHERE job_id = ?", (job_id,)).fetchone()
         return Job(id=row[0], digest=row[1], contract_text=row[2], filed_at=row[3], filer_session=row[4],
                    idem_key=row[5], repo=row[6], expires_at=row[7], unsigned_until=row[8], history=history,
-                   signer_fp=None if signer is None else signer[0], store_id=cls._store_id(conn))
+                   signer_fp=None if signer is None else signer[0], store_id=cls._store_id(conn),
+                   filer_agent=None if filer is None else filer[0])
 
     def _must_load(self, conn: sqlite3.Connection, job_id: Any) -> Job:
         job = self._load(conn, job_id) if isinstance(job_id, str) and _JOB_ID.fullmatch(job_id) else None
@@ -443,11 +488,13 @@ class JobStore:
         return None if row is None else (row[0], row[1], row[2])
 
     def file(self, submission: Any, *, resolve_template: Callable[[str], ResolvedTemplate | None],
-             policy: ProviderPolicy, filer_session: str, idem_key: str | None = None) -> tuple[Job, str | None]:
+             policy: ProviderPolicy, filer_session: str, idem_key: str | None = None,
+             filer_agent: str | None = None) -> tuple[Job, str | None]:
         """Resolve the planner's contract ``submission`` (:func:`levain.dispatch.contract.resolve_contract`, with
         ``resolve_template`` and ``policy``, at the store's clock) and file it for the planner session
-        ``filer_session``; returns the job and its capability. Every refusal resolution makes is raised here, and
-        nothing is filed.
+        ``filer_session``; returns the job and its capability. ``filer_agent`` is the agent the filing door named,
+        kept for the signer to read (it proves nothing). Every refusal resolution makes is raised here, and nothing
+        is filed.
 
         A repeat with the same ``(filer_session, idem_key)`` and the same digest returns the SAME job and no
         capability: it was returned once, to that session, and the store keeps only its hash, so a replayed call
@@ -456,6 +503,8 @@ class JobStore:
         whatever state it is now). The same key with another digest is refused. Filing is refused while another live
         job in the same repo writes the same path or an ancestor or descendant of one, compared without case."""
         filer_session = _label("filer_session", filer_session, _SESSION_MAX)
+        if filer_agent is not None:
+            filer_agent = _label("filer_agent", filer_agent, _AGENT_MAX)
         if idem_key is not None:
             idem_key = _label("idem_key", idem_key, _IDEM_MAX)
         now = _now_utc(self._clock)
@@ -516,6 +565,8 @@ class JobStore:
             conn.execute("INSERT INTO transitions (job_id, seq, to_state, cause, at, evidence) "
                          "VALUES (?, 1, 'filed', 'filed', ?, ?)",
                          (job_id, stamp, json.dumps({"filer_session": filer_session}, sort_keys=True)))
+            if filer_agent is not None:
+                conn.execute("INSERT INTO job_filers (job_id, agent) VALUES (?, ?)", (job_id, filer_agent))
             job = self._load(conn, job_id)
         assert job is not None
         return job, capability
@@ -525,20 +576,17 @@ class JobStore:
         transaction; raises :class:`SignatureRefused` saying why when it does not verify. ``authority`` is the
         trusted source (:func:`levain.consent.queue.authority_source`), replayed afresh INSIDE the write
         transaction, just before the check, so a key revoked while the call waited for the lock is seen as revoked;
-        never a snapshot a caller captured earlier. An authority log that cannot be read (its refusal, a database
-        error, an unreadable file, a malformed value) is a :class:`SignatureRefused`, as the consent queue turns the
-        same failures into no decision."""
+        never a snapshot a caller captured earlier. An authority log the replay refuses (not initialised, its anchor
+        refuses it) is a :class:`SignatureRefused`; one that cannot be read (a database or file error, a malformed
+        value) and a verifier that cannot run (:class:`levain.authority.VerifierUnavailable`) are raised as
+        themselves, machine faults, and nothing is written."""
         if type(authority) is not AuthoritySource:
             raise SignatureRefused("authority must be the AuthoritySource authority_source() returns")
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state != _FILED:
                 raise SignatureRefused(f"job {job.id} is {job.state}; only a filed job can be signed")
-            try:
-                snapshot = authority()
-            except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
-                raise SignatureRefused(f"the authority log could not be read: {type(exc).__name__}: "
-                                       f"{str(exc)[:200]}") from None
+            snapshot = _replay(authority)
             problem = dsign.refusal(payload, signature, snapshot, job, ssh_keygen=self._ssh_keygen)
             if problem is None and payload["signed_at"] > utc_stamp(parse_stamp(stamp) + _SIGN_SKEW):
                 problem = "the signature is dated in the future"
@@ -575,6 +623,45 @@ class JobStore:
         """The filing planner cancels its job (its capability), at any state before authorised: cancelling only
         removes authority, so the planner may always do it before a human has authorised."""
         return self._planner(job_id, capability, "cancelled", "planner_cancel")
+
+    def cancel_by_human(self, job_id: str, payload: Any, signature: Any, authority: AuthoritySource) -> Job:
+        """The operator's signed cancel (:func:`levain.dispatch.sign.cancel_payload`) of a job in any non-terminal
+        state, authorised included: store the signed item and move the job to ``cancelled`` (cause
+        ``human_cancel``) in one write transaction. ``authority`` is replayed afresh inside that transaction, as
+        :meth:`sign` replays it. A terminal job is a :class:`TransitionRefused`; a cancel that is not the operator's,
+        or one signed before the job's latest human-signed transition (a stale cancel), is a
+        :class:`SignatureRefused` saying why; an authority log that cannot be read and a verifier that cannot run
+        are raised as themselves, as :meth:`sign` raises them. Cancelled is terminal, so an authorised job cancelled
+        here stops holding its write files."""
+        if type(authority) is not AuthoritySource:
+            raise SignatureRefused("authority must be the AuthoritySource authority_source() returns")
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state in TERMINAL:
+                raise TransitionRefused(f"job {job.id} is {job.state}, which is final; only a live job can be "
+                                        "cancelled")
+            snapshot = _replay(authority)
+            problem = dsign.cancel_refusal(payload, signature, snapshot, job, ssh_keygen=self._ssh_keygen)
+            if problem is None and payload["signed_at"] > utc_stamp(parse_stamp(stamp) + _SIGN_SKEW):
+                problem = "the cancel is dated in the future"
+            if problem is None:
+                last = max((h for h in job.history if h.cause in _HUMAN_SIGNED), key=lambda h: h.seq, default=None)
+                if last is not None and payload["signed_at"] < last.at:
+                    problem = (f"the cancel was signed at {payload['signed_at']}, before the job's {last.cause} at "
+                               f"{last.at}: a stale cancel never undoes what the operator signed after it; sign a "
+                               "new cancel")
+            if problem is not None:
+                raise SignatureRefused(problem)
+            conn.execute("INSERT INTO cancel_signatures (job_id, payload, signature, signer_fp, at) "
+                         "VALUES (?, ?, ?, ?, ?)",
+                         (job.id, dsign.sign_message(payload).decode("utf-8"), signature, payload["signer_fp"],
+                          stamp))
+            self._apply(conn, job.id, "cancelled", "human_cancel", stamp,
+                        json.dumps({"signer_fp": payload["signer_fp"], "reason": payload["reason"]},
+                                   sort_keys=True))
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
 
     def get(self, job_id: str) -> Job | None:
         """The job ``job_id`` after a sweep, or ``None``."""
