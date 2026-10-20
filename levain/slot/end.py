@@ -26,9 +26,10 @@ hashed and copied by a reader dropped to the session's uid, and one that uid can
 and never copied. Metadata, strip and chown address every entry from its walk dirfd, never by a full
 path (L2 M2).
 
-Every root-only act is an injected seam with a real default: the freeze and kill (2d / 2g build
-them; the defaults here refuse, which lands HELD), ``chown``, the metadata reader and strip, the
-session-uid reader, root's slot state read, the clock, CONTROL's ``cas``. The manifest walk is real
+Every root-only act is an injected seam with a real default: the freeze, kill and process proof
+(the defaults here refuse, which lands HELD; the real ones are :func:`levain.slot.proc.end_seams`'s),
+``chown``, the metadata reader and strip, the session-uid reader, root's slot state read, the clock,
+CONTROL's ``cas``. The manifest walk is real
 code over dirfds with ``O_NOFOLLOW``.
 """
 from __future__ import annotations
@@ -1005,25 +1006,23 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
 
 
 def unbuilt_freeze(uid: int, bound_s: float) -> bool:
-    """Freeze every process of ``uid`` within ``bound_s`` (V12) and return whether that is PROVEN.
-    Algorithm (plan §2e 4, built by 2d / 2g): Linux writes ``1`` to the session cgroup's
-    ``cgroup.freeze`` and polls ``cgroup.events`` for ``frozen 1``; macOS, in a forked child that drops
-    to ``uid`` and asserts real + effective ids == ``uid`` != 0, sends ``kill(-1, SIGSTOP)`` in a loop
-    until a process sweep of ``uid`` shows every process stopped. Past the bound = not proven. END calls
-    it once per uid the session holds."""
-    raise Refused("seam-unbuilt", "freeze is session 2d / 2g's")
+    """Freeze every process of ``uid`` within ``bound_s`` (V12); ``True`` only when that is PROVEN, and
+    past the bound is not proven. END calls it once per uid the session holds. This default refuses, which
+    lands HELD; the real seam is :func:`levain.slot.proc.end_seams` ``(host, cgroup)``'s, and how it
+    proves the freeze is proc's to say."""
+    raise Refused("seam-unbuilt", "freeze: pass levain.slot.proc.end_seams(host, cgroup)")
 
 
 def unbuilt_kill(uid: int, bound_s: float) -> bool:
-    """SIGKILL every process of ``uid`` within ``bound_s`` (V12): Linux ``cgroup.kill``; macOS the same
-    forked child as the freeze, ``kill(-1, SIGKILL)`` until the sweep is empty (plan §2e 4)."""
-    raise Refused("seam-unbuilt", "kill is session 2d / 2g's")
+    """SIGKILL every process of ``uid`` within ``bound_s`` (V12); ``True`` only when that is PROVEN. This
+    default refuses (HELD); the real seam is :func:`levain.slot.proc.end_seams`'s."""
+    raise Refused("seam-unbuilt", "kill: pass levain.slot.proc.end_seams(host, cgroup)")
 
 
 def unbuilt_no_process(uid: int) -> bool:
-    """The proof END rests on: no process of ``uid`` exists (Linux: the session cgroup's
-    ``cgroup.procs`` empty AND no ``/proc/<pid>`` with that uid; macOS: a ``proc_listallpids`` sweep)."""
-    raise Refused("seam-unbuilt", "the process sweep is session 2d / 2g's")
+    """The proof END rests on: ``True`` only when no process of ``uid`` exists. This default refuses
+    (HELD); the real seam is :func:`levain.slot.proc.end_seams`'s."""
+    raise Refused("seam-unbuilt", "no_process: pass levain.slot.proc.end_seams(host, cgroup)")
 
 
 def read_slot_state(path: Path) -> bytes | None:
