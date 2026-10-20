@@ -55,7 +55,8 @@ from levain.dispatch.jobs import JobStore
 
 __all__ = [
     "ACTORS", "KINDS", "REPLY_KINDS", "SCHEMA", "SOURCE_HOW", "STATES", "SURFACES", "CoordError", "CoordStore",
-    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "members_sha256",
+    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "check_words", "members_sha256",
+    "words_sha256",
 ]
 
 SURFACES = ("cli", "phone", "cockpit")
@@ -166,8 +167,12 @@ def members_sha256(members: Iterable[str]) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(sorted(members))).hexdigest()
 
 
-def _words_sha256(words: str) -> str:
+def words_sha256(words: str) -> str:
+    """``sha256:<hex>`` of a drop's exact words, as stored and as an envelope body names them."""
     return "sha256:" + hashlib.sha256(words.encode("utf-8")).hexdigest()
+
+
+_words_sha256 = words_sha256
 
 
 @dataclass(frozen=True)
@@ -247,6 +252,11 @@ def _one_line(name: str, value: Any, high: int) -> str:
     if unshowable.first_hidden(value, allow="", selectors=False) is not None:
         raise CoordError(f"{name} must be one line of plain text")
     return value
+
+
+def check_words(words: Any) -> str:
+    """The words, if a drop can hold them; raises CoordError saying why not (checked before anything is signed)."""
+    return _check_words(words)
 
 
 def _check_words(words: Any) -> str:

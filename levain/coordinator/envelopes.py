@@ -131,9 +131,15 @@ class EnvelopeStore(CoordStore):
         self._ssh_keygen = ssh_keygen
 
     # --- acceptance ----------------------------------------------------------------------------------------------
-    def _checked(self, body_text: Any, payload: Any, signature: Any,
-                 authority: AuthoritySnapshot) -> tuple[dict[str, Any], str]:
-        """The body parsed and its signature verified (no store read): ``(body, signer_class)``."""
+    def check_body(self, body_text: Any) -> dict[str, Any]:
+        """The body parsed and held to every check that reads the disk (each where repo a git work tree's top by its
+        real path, each land's branch by F11's branch_problem), with no signature: what echo runs before writing a
+        file and sign runs before asking, so a body the store can only refuse is never signed. Raises CoordError."""
+        body = self._parsed(body_text)
+        self._disk_checks(body)
+        return body
+
+    def _parsed(self, body_text: Any) -> dict[str, Any]:
         try:
             body = env.parse_body(body_text)
         except env.EnvelopeError as exc:
@@ -141,9 +147,9 @@ class EnvelopeStore(CoordStore):
         except (TypeError, ValueError, KeyError) as exc:
             # a shape parse_body did not name is still a refusal, never a lost drop
             raise CoordError(f"an envelope body this reader cannot read: {type(exc).__name__}") from None
-        refused = env.refusal(payload, signature, authority, body, ssh_keygen=self._ssh_keygen)
-        if refused is not None:
-            raise CoordError(refused)
+        return body
+
+    def _disk_checks(self, body: Mapping[str, Any]) -> None:
         for w in body["where"]:
             if _git_toplevel(w["repo"]) != w["repo"]:
                 raise CoordError(f"where repo {w['repo'][:120]} is not a git work tree's top, by its real path")
@@ -155,6 +161,15 @@ class EnvelopeStore(CoordStore):
                                  f"{str(exc)[:160]}") from None
             if problem is not None:
                 raise CoordError(f"a land onto {land['onto'][:80]}: {problem}")
+
+    def _checked(self, body_text: Any, payload: Any, signature: Any,
+                 authority: AuthoritySnapshot) -> tuple[dict[str, Any], str]:
+        """The body parsed, its signature verified and its disk checks run: ``(body, signer_class)``."""
+        body = self._parsed(body_text)
+        refused = env.refusal(payload, signature, authority, body, ssh_keygen=self._ssh_keygen)
+        if refused is not None:
+            raise CoordError(refused)
+        self._disk_checks(body)
         return body, authority.key(payload["signer_fp"]).key_class
 
     @staticmethod
@@ -590,6 +605,11 @@ class EnvelopeStore(CoordStore):
         :meth:`ceiling_criteria`. The budget is a gauge, never part of the ceiling (T6, *"the thread budget is a
         GAUGE"*), so a successor's smaller budget does not narrow a running job here; its meter is C6's."""
         return NOT_IN_FORCE
+
+    def head(self, thread_id: str) -> Envelope | None:
+        """The thread's current envelope (the one a new echo for it supersedes), or None."""
+        with read_transaction(self._connect) as conn:
+            return self._head(conn, thread_id)
 
     def store_id(self) -> str:
         """This dispatch store's random id, which every envelope body and signature names."""
