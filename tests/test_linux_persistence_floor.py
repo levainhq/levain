@@ -348,30 +348,49 @@ def test_an_existing_git_config_global_outside_home_is_bound_read_only(
     assert argv.index(str(C._host_spelling(cfg))) < _first_mask(argv)
 
 
-def test_an_absent_derived_git_file_nobody_here_can_create_gets_no_mask(
+def _derived_includes(home: Path, monkeypatch, *paths: Path) -> None:
+    listing = "".join(f"file:{home / '.gitconfig'}\0include.path\n{p}\0" for p in paths)
+    monkeypatch.setattr(C, "_run_git_config",
+                        lambda args, environ: listing if "--get-regexp" in args else None)
+
+
+def test_an_absent_derived_git_file_under_a_dir_this_user_owns_keeps_its_mask(
         home: Path, tmp_path: Path, monkeypatch) -> None:
-    # L3 r2 (complement MED): a mask over an absent path under a directory this user cannot write
-    # needs a mountpoint bwrap cannot make, so the agent never started; nothing can be planted there.
+    # L3 r3 (codex HIGH): a directory this user owns but cannot write today is one a same-uid
+    # confined process can chmod back and plant the include in, so it keeps the mask.
     ent, ws = _entity(home)
     ro = tmp_path / "ro"
     ro.mkdir()
-    unreachable = ro / "sub" / "inc.cfg"
+    under_own = ro / "sub" / "inc.cfg"
     writable = tmp_path / "rw" / "inc.cfg"
     writable.parent.mkdir()
     existing = tmp_path / "rw" / "present.cfg"
     existing.write_text("[x]\n")
-    listing = "".join(f"file:{home / '.gitconfig'}\0include.path\n{p}\0"
-                      for p in (unreachable, writable, existing))
-    monkeypatch.setattr(C, "_run_git_config",
-                        lambda args, environ: listing if "--get-regexp" in args else None)
+    _derived_includes(home, monkeypatch, under_own, writable, existing)
     ro.chmod(0o555)
     try:
         policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
-        assert unreachable in policy.persistence_write_files
+        assert under_own in policy.persistence_write_files
         argv, _ = C._bwrap_plan(policy)
     finally:
         ro.chmod(0o755)
-    for spelling in {str(unreachable), os.path.realpath(unreachable)}:
-        assert not any(spelling in a for a in argv), spelling
+    assert str(C._host_spelling(under_own)) in _masks(argv)
     assert str(C._host_spelling(writable)) in _masks(argv)
     assert str(C._host_spelling(existing)) in _ro_binds(argv)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root owns and can write /")
+def test_an_absent_derived_git_file_nobody_here_can_create_gets_no_mask(
+        home: Path, monkeypatch) -> None:
+    # L3 r2 (complement MED): a mask over an absent path under a directory another user owns and
+    # this one cannot write needs a mountpoint bwrap cannot make, so the agent never started;
+    # nothing can be planted there.
+    ent, ws = _entity(home)
+    unreachable = Path("/levain-test-absent-root") / "sub" / "inc.cfg"
+    assert not os.path.lexists(unreachable.parent.parent)
+    _derived_includes(home, monkeypatch, unreachable)
+    policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
+    assert unreachable in policy.persistence_write_files
+    argv, _ = C._bwrap_plan(policy)
+    for spelling in {str(unreachable), os.path.realpath(unreachable)}:
+        assert not any(spelling in a for a in argv), spelling

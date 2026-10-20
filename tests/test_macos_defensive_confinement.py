@@ -294,23 +294,33 @@ def test_a_git_that_cannot_run_or_hangs_warns(tmp_path, monkeypatch, caplog) -> 
     assert len(_git_warnings(caplog)) == 1
 
 
-def test_nothing_found_absent_config_or_missing_git_stay_silent(tmp_path, monkeypatch, caplog) -> None:
+def test_nothing_found_or_absent_config_stay_silent(tmp_path, monkeypatch, caplog) -> None:
     # MEASURED on git 2.50.1: a --get / --get-regexp that matches nothing exits 1, and a --list with
     # no global config file at all exits 128; both are every-build normal and lose nothing.
-    from levain.consent import push
     environ = _git_that(tmp_path, monkeypatch, "exit 1")
     with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
         assert _REAL_RUN_GIT_CONFIG(["--get", "core.attributesFile"], environ) is None
         (tmp_path / "home" / ".gitconfig").unlink()
         _script(tmp_path / "root-owned" / "git", "exit 128")
         assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
-
-        def refuse():
-            raise push.PushRefused("no root-owned git")
-
-        monkeypatch.setattr(push, "git_bin", refuse)
-        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
     assert _git_warnings(caplog) == []
+
+
+def test_no_root_owned_git_warns_once_that_nothing_was_added(tmp_path, monkeypatch, caplog) -> None:
+    # L3 r3 (complement LOW-MED): with no git levain will run, the derived files are never added;
+    # that fail-open is said once, in git_bin's own words, not on every call.
+    from levain.consent import push
+
+    def refuse():
+        raise push.PushRefused("no root-owned git at /usr/bin/git")
+
+    monkeypatch.setattr(push, "git_bin", refuse)
+    monkeypatch.setattr(conf, "_git_bin_refusal_warned", False, raising=False)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], {"HOME": str(tmp_path / "home")}) is None
+        assert _REAL_RUN_GIT_CONFIG(["--get", "core.attributesFile"], {}) is None
+    [msg] = _git_warnings(caplog)
+    assert "no root-owned git at /usr/bin/git" in msg and "not added" in msg
 
 
 def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) -> None:

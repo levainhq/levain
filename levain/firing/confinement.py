@@ -476,6 +476,9 @@ def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
     return list(_dedup_paths(dirs)), list(_dedup_paths(files))
 
 
+_git_bin_refusal_warned = False
+
+
 def _run_git_config(args: list[str], environ) -> str | None:
     """``git config --global <args>`` run with the operator's git environment (``HOME``,
     ``XDG_CONFIG_HOME``, ``GIT_CONFIG_GLOBAL`` from ``environ``), outside any repository; its stdout,
@@ -486,9 +489,15 @@ def _run_git_config(args: list[str], environ) -> str | None:
     from levain.consent.push import PushRefused, git_bin
     from levain.launch import child_env
 
+    global _git_bin_refusal_warned
     try:
         exe = git_bin()
-    except PushRefused:
+    except PushRefused as exc:
+        # Fail-open, like a failing git, so it is said; once, since every build asks again.
+        if not _git_bin_refusal_warned:
+            _git_bin_refusal_warned = True
+            _log.warning("%s; the files the operator's global git config makes git read were not "
+                         "added to the write-protected startup files", exc)
         return None
     genv = child_env()
     for var in ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
@@ -6477,6 +6486,22 @@ def _creatable_by_me(p: Path) -> bool:
     return a.is_dir() and os.access(a, os.W_OK)
 
 
+def _unplantable_by_me(p: Path) -> bool:
+    """Whether nothing running as this user could ever create ``p``: its nearest existing ancestor is
+    a real directory (not a link) that another user owns and this one cannot write into. Stricter
+    than ``not _creatable_by_me``: a directory this user owns but cannot write today is one it can
+    chmod, so it does not count. Anything this cannot read counts as plantable (fail-closed)."""
+    a = p.parent
+    while not os.path.lexists(a) and a != a.parent:
+        a = a.parent
+    try:
+        st = os.lstat(a)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid != os.geteuid()
+            and not os.access(a, os.W_OK | os.X_OK))
+
+
 # Every gpg-agent option that names a program the agent executes, with the gpgconf component that is
 # its default when the option is absent: ONE table read by both :func:`_gpg_program_spellings` (the
 # options in gpg-agent.conf) and :func:`_gpg_components` (the defaults). The set is gpg-agent's own
@@ -7275,9 +7300,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             # (``gpg.conf -> /nonexistent/gpg.conf``): nothing to plant, so no mask, and no pin that
             # would have to create ``/nonexistent`` (RUN in CI's bwrap job 2026-10-13: bash refused).
             continue
-        if f in persistence_files and not os.path.lexists(f) and not _creatable_by_me(f):
-            # The same for a startup file git names under a directory this user cannot create in (an
-            # include under /etc): nothing can be planted, and its mountpoint is one bwrap cannot make.
+        if f in persistence_files and not os.path.lexists(f) and _unplantable_by_me(f):
+            # The same for a startup file git names under a directory another user owns and this one
+            # cannot create in (an include under /etc): nothing can be planted, and its mountpoint is
+            # one bwrap cannot make. A directory this user owns keeps the mask: it can be chmodded back.
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
