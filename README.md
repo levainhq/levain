@@ -367,7 +367,7 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 
 **`levain tui`** is the terminal-native peer of `serve`: read and steer without a browser or a port. `--read-only` drops to a pure inspection view.
 
-**`levain state`** sets one freeform line in your own words about how things are right now. Every session reads it at start and again when it changes, and the cockpit shows it verbatim with its age. It is never parsed or scored, and it expires after 12 hours.
+**`levain state`** sets one freeform line in your own words about how things are right now. Every session reads it at start and again when it changes, and the cockpit shows it verbatim with its age. It is never parsed or scored. The line expires after 12 hours, but each one you set is also saved once, word for word, as a `felt,state` memory episode that stays until you tombstone it in the cockpit.
 
 ```
 levain state "wiped, keep it light"   # set it
