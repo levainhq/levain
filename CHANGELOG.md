@@ -54,6 +54,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 
 ### Changed
+- **Claude Code sessions started in a subfolder are gated too.** Claude Code reads a project's `.claude/settings.json`
+  only from the folder a session starts in, so a session started in a subfolder of a levain workspace ran none of
+  levain's hooks: no consent queue, no gate, no memory hooks. When the workspace is its own git repository's root,
+  levain now keeps its hooks in `.claude/settings.local.json` (which Claude Code also reads from the repository root),
+  every command naming its script by absolute path, and keeps that file out of git. `levain update` moves an existing
+  install over (your own entries in the local file stay, and a malformed local file stops the update with nothing
+  written), and `levain doctor` says where the hooks are, warns about a levain hook left in the wrong file, and warns
+  when Claude Code is too old to read the local file from the repository root.
 - **Agent config and hooks are refused when nothing can approve the edit.** Until now, with no enrolled key that could
   approve an edit of agent config or hooks, Claude Code and Codex in acceptEdits, bypass, auto or dontAsk mode (Codex
   with approvals off) could make the edit with no question. Now levain refuses it with a plain denial: the agent is told
@@ -131,6 +139,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - `levain publish` is a path the agent is told to take, not a wall: a `twine upload` or `npm publish` the agent runs
   itself is not gated until Levain's hands run as another user.
 - `levain publish` runs the twine and npm found on your PATH (Homebrew, `~/.local/bin`), which are writable by your user.
+- Only a workspace that is its own git repository's root gets the subfolder fix. A workspace nested inside a larger repository, a
+  linked worktree, a submodule, or a folder that is not under git keeps its hooks in `.claude/settings.json`, and a
+  session started in a subfolder there still runs none of them: start it at the workspace root.
+- A workspace set up before `git init` first takes the `settings.json` layout; run `git init`, then `levain update`, and
+  it moves to the local layout.
+- A write to `.claude/settings.local.json` is not locked against a running Claude Code saving a permission at the same
+  instant; an approval saved in that window can be lost.
+- A tool call through the gate from a subfolder was checked by replaying the hooks and by SessionStart in a real
+  Claude Code run, not by an authenticated tool call.
 
 ## [0.11.9] — 2026-10-19
 
