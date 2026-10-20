@@ -138,3 +138,34 @@ def test_unswept_expired_pending_do_not_crowd_live_ones_out_of_the_cap(tmp_path,
     got = read_listing(q.directory, now=T0 + timedelta(minutes=10))
     assert [e.request.id for e in got.pending] == [live.id] and got.overflow is False
     assert {e.request.id for e in got.recent} == {r.id for r in stale} and {e.state for e in got.recent} == {"expired"}
+
+
+def _filed(tmp_path, tool, call):
+    q = _queue(tmp_path, lambda: T0)
+    return q.file(agent="claude_code", agent_session_id="s", tool_name=tool, tool_input=call, cwd="/w",
+                  hold=timedelta(minutes=5), event_id="e1")
+
+
+def test_a_publish_row_names_the_package_version_and_target(tmp_path):
+    r = _filed(tmp_path, "levain_publish", {"index": "pypi", "target": "https://upload.pypi.org/legacy/",
+                                             "package": "levain", "version": "1.0.0", "files": [{"name": "a.whl"}]})
+    assert consent_targets(r) == "publish levain 1.0.0 to pypi (https://upload.pypi.org/legacy/)"
+
+
+def test_a_limit_row_names_the_agent_session_kind_count_and_extension(tmp_path):
+    r = _filed(tmp_path, "levain_limit", {"agent": "codex", "session": "sess-1", "limit": "turns", "now": "50",
+                                          "extend_to": "100", "count": "51"})
+    assert consent_targets(r) == "codex session sess-1 limit turns count 51 extend_to 100"
+    (tmp_path / "x").mkdir()
+    e = _filed(tmp_path / "x", "levain_limit",
+               {"agent": "codex", "session": "s2", "limit": "turns", "now": "50", "extend_to": "100",
+                "purpose": "extend"})
+    assert consent_targets(e) == "codex session s2 limit turns count (absent) extend_to 100"
+
+
+def test_a_publish_or_limit_row_with_missing_or_odd_fields_shows_absent(tmp_path):
+    r = _filed(tmp_path, "levain_publish", {"index": "npm", "package": ["x"], "files": []})
+    assert consent_targets(r) == "publish (absent) (absent) to npm ((absent))"
+    (tmp_path / "y").mkdir()
+    s = _filed(tmp_path / "y", "levain_limit", {"agent": "codex"})
+    assert consent_targets(s) == "codex session (absent) limit (absent) count (absent) extend_to (absent)"
