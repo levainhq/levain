@@ -56,6 +56,10 @@ EXIT_INTERNAL = 70     # DECISION: an unexpected error (stdout still carries one
 
 LOCK_WAIT_S = 10.0     # §11 V23: render's ``locked`` retry window; DECISION: also the pool / slot flock wait
 LOCK_SLICE_S = 0.02    # DECISION: the flock retry's first backoff (doubling to 0.5 s)
+#: DECISION: fresh session ids ``prepare`` draws before it gives up on a collision (each is 64 random bits).
+SESSION_ID_TRIES = 8
+#: ATTACH refusals that do not say CONTROL created nothing: the answer was lost, or CONTROL failed mid-write.
+_ATTACH_AMBIGUOUS = frozenset({"control-down", "internal-error", "record-unsettled"})
 
 #: The front's GO pipe read end sits on this fd in the front (§5.1 render (4)): above 0-2 and wall's SPEC_FD.
 GO_FD = 4
@@ -453,6 +457,33 @@ def replace_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable
     fsync(dirfd)
 
 
+def create_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable[[int], None]) -> None:
+    """:func:`replace_at` that never replaces: the temp is LINKED to ``name`` (``linkat`` fails on an existing name,
+    atomically), so an existing record raises ``FileExistsError`` and is left as it was; a reader never sees a
+    partial file. The temp name is ``name.new`` (DECISION: never :func:`replace_at`'s, so neither sweeps the
+    other's)."""
+    tmp = name + ".new"
+    try:
+        os.unlink(tmp, dir_fd=dirfd)        # a temp a dead writer left
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, _O_NEW, mode, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, mode)
+        write_all(fd, data)
+        fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp, dir_fd=dirfd)
+        raise
+    os.close(fd)
+    try:
+        os.link(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    finally:
+        os.unlink(tmp, dir_fd=dirfd)
+    fsync(dirfd)
+
+
 @dataclass(frozen=True)
 class DirRow:
     """One §2.1 row a verb makes: ``rel`` below ``<S>`` (``""`` = ``<S>`` itself), owner, group, mode."""
@@ -527,6 +558,11 @@ class Store:
     def replace(self, parts: Sequence[str], name: str, data: bytes, *, mode: int) -> None:
         with self.dir(*parts) as fd:
             replace_at(fd, name, data, mode=mode, fsync=self.seams.fsync)
+
+    def create(self, parts: Sequence[str], name: str, data: bytes, *, mode: int) -> None:
+        """A FRESH record (:func:`create_at`): an existing ``name`` raises ``FileExistsError``."""
+        with self.dir(*parts) as fd:
+            create_at(fd, name, data, mode=mode, fsync=self.seams.fsync)
 
     def mkdir(self, parent: int, name: str, row_uid: int, row_gid: int, mode: int, rel: str) -> None:
         """A fresh directory ``name`` under ``parent`` with its §2.1 owner and mode (chown first, mode last)."""
@@ -759,6 +795,8 @@ class Leased:
     slot: SlotId
     state: R.SlotState
     lock_fd: int
+    #: the state file as it was before this lease (what a clean ``prepare`` failure puts back).
+    prior: Optional[R.SlotState] = None
 
     def release(self) -> None:
         if self.lock_fd >= 0:
@@ -803,7 +841,43 @@ def lease_slot(store: Store, *, slot_class: str, kind: str, vendor: str, auth: s
                 raise
         finally:
             os.close(pool)                 # the pool lock is released here; the slot lock stays held
-    return Leased(slot, new, lock)
+    return Leased(slot, new, lock, old)
+
+
+def revert_lease(store: Store, leased: Leased) -> bool:
+    """Put back a lease a CLEAN ``prepare`` failure leaves behind (nothing ran in the slot, CONTROL holds no record,
+    the alloc is gone): the prior state at ``rev + 1``, ``lease_seq`` kept (it is never reset, §3.5). Only if the state
+    file is still EXACTLY the lease this ``prepare`` wrote; anything else is left as it is. §3.5 LOCK ORDER: the
+    slot lock is held here, so the pool lock is only TRIED; on failure the slot lock is released, the pool lock taken,
+    and the slot lock TRIED again (a holder now = someone else's: leave it). Returns whether it wrote. A slot this
+    leaves leased has no alloc: the reaper's orphan revert (§3.5) is its recovery."""
+    seams = store.seams
+    prior = leased.prior
+    if prior is None:
+        return False
+    with store.dir("slots") as slots_fd:
+        pool = _open_lock(slots_fd, "pool.lock", "slots/pool.lock")
+        try:
+            if not try_flock(pool):
+                leased.release()
+                wait_flock(pool, seams, "pool-locked")
+            if leased.lock_fd < 0:
+                with store.dir("slots", leased.slot.tag) as sfd:
+                    lock = _open_lock(sfd, "lock", f"slots/{leased.slot.tag}/lock")
+                if not try_flock(lock):
+                    os.close(lock)
+                    return False
+                leased.lock_fd = lock
+            seams.at("revert-locked")
+            data = store.read(("slots", leased.slot.tag), "state")
+            if data is None or parse_slot_state_of(data, leased.slot) != leased.state:
+                return False
+            back = replace(leased.state, rev=leased.state.rev + 1, state=prior.state, session=prior.session,
+                           changed_at=R.timestamp(seams.clock()))
+            store.replace(("slots", leased.slot.tag), "state", R.slot_state_bytes(back), mode=0o644)
+            return True
+        finally:
+            os.close(pool)
 
 
 # --- the caller context -------------------------------------------------------------------------------------------------
@@ -860,7 +934,59 @@ def read_alloc(ctx: Ctx, session: str) -> R.Alloc:
 
 
 def write_alloc(ctx: Ctx, a: R.Alloc) -> None:
+    """An alloc update (render's policy and front facts): replaces the record ``prepare`` created."""
     ctx.store.replace(("alloc",), f"{a.session}.json", R.alloc_bytes(a), mode=0o600)
+
+
+def create_alloc(ctx: Ctx, a: R.Alloc) -> None:
+    """``prepare``'s alloc: created FRESH, never over an existing session's record (``session-exists``)."""
+    try:
+        ctx.store.create(("alloc",), f"{a.session}.json", R.alloc_bytes(a), mode=0o600)
+    except FileExistsError:
+        raise Refused("session-exists", a.session) from None
+
+
+def session_lock_name(session: str) -> str:
+    """Root's per-session lock below ``L/alloc/``: the SAME file END takes (``end.EndFacts.lock``), so a render or
+    resume and an END of one session never overlap."""
+    return f"{session}.lock"
+
+
+@contextmanager
+def session_lock(ctx: Ctx, session: str) -> Iterator[None]:
+    """Root's per-session TRY-lock (CONTRACT §5.1 render is one transaction per session): held = ``session-busy``.
+    The lock file is never removed (as END's)."""
+    name = session_lock_name(session)
+    with ctx.store.dir("alloc") as afd:
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
+                         dir_fd=afd)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO):
+                raise Refused("bad-root", f"alloc/{name} is a link or not a file") from None
+            raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st):
+            raise Refused("bad-root", f"alloc/{name}")
+        if not try_flock(fd):
+            raise Refused("session-busy", session)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _session_taken(store: Store, session: str) -> bool:
+    """Whether any record or tree of ``session`` already exists (a fresh id is checked before any slot is leased;
+    :func:`create_alloc` is what holds against a race)."""
+    for rel in (("alloc", f"{session}.json"), ("alloc", f"{session}.intent.json"), ("sessions", f"{session}.json"),
+                ("live", session), ("staging", session), ("retained", session)):
+        try:
+            os.lstat(store.path.joinpath(*rel))
+            return True
+        except FileNotFoundError:
+            continue
+    return False
 
 
 # --- prepare (§5.1) -----------------------------------------------------------------------------------------------------
@@ -911,11 +1037,17 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     seams.at("floor")
     if seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:        # §5.1: refuses below V5
         raise Refused("below-floor", "free space under V5")
-    session = seams.new_session()
-    if not SESSION_RE.fullmatch(session):
-        raise Refused("internal", "session id")
+    for _ in range(SESSION_ID_TRIES):
+        session = seams.new_session()
+        if not SESSION_RE.fullmatch(session):
+            raise Refused("internal", "session id")
+        if not _session_taken(ctx.store, session):
+            break
+    else:
+        raise Refused("internal", "no fresh session id")
     leased = lease_slot(ctx.store, slot_class=req.slot_class, kind=req.kind, vendor=req.vendor, auth=req.auth,
                         named=req.slot, ticketed=False, session=session)
+    created = attach_sent = False
     try:
         slot = leased.slot
         ids = slot_ids(ctx, slot)
@@ -929,15 +1061,26 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
             child_uid=ids[second] if slot.slot_class == "none" else None,
             netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None)
         seams.at("alloc")
-        write_alloc(ctx, alloc)
+        create_alloc(ctx, alloc)
+        created = True
         claims = {"operator_uid": alloc.operator_uid, "supervisor_uid": alloc.supervisor_uid,
                   "slot": R.slot_obj(slot), "class": slot.slot_class, "kind": alloc.kind, "vendor": alloc.vendor,
                   "auth": alloc.auth, "lease_seq": alloc.lease_seq, "slot_rev": alloc.slot_rev}
         seams.at("attach")
-        ans = ctx.call("ATTACH", lease_nonce=blob.lease_nonce, sudo_uid=ctx.sudo_uid, session=session,
-                       claims=claims)
+        attach_sent = True
+        try:
+            ans = ctx.call("ATTACH", lease_nonce=blob.lease_nonce, sudo_uid=ctx.sudo_uid, session=session,
+                           claims=claims)
+        except Refused as e:
+            if e.name not in _ATTACH_AMBIGUOUS:
+                attach_sent = False                  # CONTROL refused it: it created nothing
+            raise
         if ans.get("generation") != 0:
             raise Refused("attach-answer-malformed", repr(ans.get("generation"))[:32])
+    except BaseException:
+        if not attach_sent:
+            _undo_prepare(ctx, leased, session if created else None)
+        raise
     finally:
         leased.release()           # §3.5: only after ATTACH answers or prepare gives up
     if seams.wake_reaper is not None:
@@ -952,6 +1095,21 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
     if slot.slot_class == "egress":
         out["gwport"] = RD.gwport_for(seams.host, slot)
     return out
+
+
+def _undo_prepare(ctx: Ctx, leased: Leased, created: Optional[str]) -> None:
+    """A CLEAN prepare failure (CONTROL holds no record): the alloc it created removed, then the slot lease put back
+    (:func:`revert_lease`), in that order, so a crash between them leaves the reaper's alloc-less orphan, never an
+    alloc naming a reusable slot. Best effort: the refusal that got here is the answer, and a step that fails leaves
+    the rest to the reaper (an alloc it cannot remove keeps the slot leased)."""
+    try:
+        if created is not None:
+            with ctx.store.dir("alloc") as afd:
+                os.unlink(f"{created}.json", dir_fd=afd)
+                ctx.seams.fsync(afd)
+        revert_lease(ctx.store, leased)
+    except (OSError, Refused):
+        pass
 
 
 # --- render (§5.1, in its ORDER (1)-(6)) ----------------------------------------------------------------------------
@@ -1181,18 +1339,22 @@ def kill_front(run: RenderRun) -> None:
 
 
 def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]:
+    """§5.1 render, the whole of it under root's per-session lock (``session-busy``): a second render of the session
+    can neither pass step (1) beside this one nor write its alloc. The alloc is read again under the lock."""
     assert req.session is not None
-    a = read_alloc(ctx, req.session)
-    if a.policy is not None:
-        raise Refused("not-allocated", req.session)
-    run = RenderRun(ctx, a, blob)
-    try:
-        for name, step in RENDER_STEPS:
-            ctx.seams.at(name)
-            step(run)
-    except BaseException:
-        kill_front(run)
-        raise
+    read_alloc(ctx, req.session)             # no-session before any lock file is made
+    with session_lock(ctx, req.session):
+        a = read_alloc(ctx, req.session)
+        if a.policy is not None:
+            raise Refused("not-allocated", req.session)
+        run = RenderRun(ctx, a, blob)
+        try:
+            for name, step in RENDER_STEPS:
+                ctx.seams.at(name)
+                step(run)
+        except BaseException:
+            kill_front(run)
+            raise
     return {}
 
 
@@ -1211,11 +1373,12 @@ def resume(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """BRAKED -> ACTIVE, only above V5. DECISION: the CAS clears ``brake_reason``."""
     assert req.session is not None
     read_alloc(ctx, req.session)
-    if ctx.seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:
-        raise Refused("below-floor", "free space under V5")
-    gen = state_generation(ctx, req.session)
-    ctx.call("CAS", session=req.session, generation=gen, **{"from": R.BRAKED, "to": R.ACTIVE},
-             fields={"brake_reason": None})
+    with session_lock(ctx, req.session):
+        if ctx.seams.free_bytes(ctx.store.fd) < V5_FLOOR_BYTES:
+            raise Refused("below-floor", "free space under V5")
+        gen = state_generation(ctx, req.session)
+        ctx.call("CAS", session=req.session, generation=gen, **{"from": R.BRAKED, "to": R.ACTIVE},
+                 fields={"brake_reason": None})
     return {}
 
 
@@ -1340,10 +1503,11 @@ def _read_stdin() -> bytes:
 
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
-           "RenderRun", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "kill_front",
-           "lease_slot", "main", "make_cgroup", "parse_slot_state_of", "pick_slot", "prepare", "proc_identity",
-           "read_view", "render", "render_layer_rows", "resume", "run", "session_dir_rows", "spawn_front",
-           "spawn_target", "status", "stub_front_args", "wait_child"]
+           "RenderRun", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "create_alloc",
+           "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "parse_slot_state_of", "pick_slot",
+           "prepare", "proc_identity", "read_view", "render", "render_layer_rows", "resume", "revert_lease", "run",
+           "session_dir_rows", "session_lock", "session_lock_name", "spawn_front", "spawn_target", "status",
+           "stub_front_args", "wait_child"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)

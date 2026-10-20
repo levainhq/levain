@@ -174,10 +174,10 @@ def test_already_done_into_live_state_answers_lease_dead(tmp_path):
     ctl = C.Control(store, OP_UID)
     _seed(store, S1, "ACTIVE")
     with pytest.raises(Refused) as e:
-        ctl.cas(S1, 4, "RENDERED", "ACTIVE", {})
+        ctl.cas(S1, 3, "RENDERED", "ACTIVE", {})              # the retry of the CAS that made generation 4
     assert e.value.name == "lease-dead"
     _seed(store, S1, "REVOKED")
-    assert ctl.cas(S1, 0, "ACTIVE", "REVOKED", {}) == 4      # a non-live target's shortcut still answers
+    assert ctl.cas(S1, 3, "ACTIVE", "REVOKED", {}) == 4      # a non-live target's shortcut still answers
 
 
 def test_timestamps_refuse_leap_seconds():

@@ -71,10 +71,12 @@ class Control:
         if self.refuse:
             raise Refused(self.refuse.pop(0))
         rec = self.store.get(self.session)
-        frm = rec.state
-        if frm == target and target != HELD:
-            frm = next(a for a, b in sorted(R.EDGES) if b == target)
-        gen = self.ctl.cas(self.session, rec.generation, frm, target, dict(fields))
+        frm, gen0 = rec.state, rec.generation
+        if frm == target and target != HELD and rec.generation > 0:
+            # a read from before the move: its predecessor state AND the generation before it (S2 L3 r1 c1: the
+            # "already done" rule is a lost-ack retry's, one generation behind)
+            frm, gen0 = next(a for a, b in sorted(R.EDGES) if b == target), rec.generation - 1
+        gen = self.ctl.cas(self.session, gen0, frm, target, dict(fields))
         if gen != rec.generation:
             self.history.append((target, {k: v for k, v in fields.items() if v is not None}))
 
