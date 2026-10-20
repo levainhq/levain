@@ -350,8 +350,8 @@ def test_a_locked_route_opens_only_for_a_run_token_mint(tmp_path: Path):
 def test_the_page_offers_the_typed_code_in_the_installed_app():
     js = _JS.read_text(encoding="utf-8")
     for words in ("This app is not paired yet: type the pairing code from the laptop or from Safari.",
-                  "That code did not match, or it expired. Get a new one: in Safari open the link from the laptop, tap "
-                  "Install on this phone.",
+                  "That code did not match, or it expired (only the newest code works). Get a new one: run levain ping "
+                  "pair on the laptop, or in Safari tap Install on this phone.",
                   "Too many wrong codes. Try again in ", " min, then get a new code.",
                   "Type this code in the box the app shows.", "New code", "Pairing code"):
         assert words in js, words
@@ -391,3 +391,14 @@ def test_the_box_takes_a_pasted_code_with_invisible_characters_in_front_of_it():
     js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "phone_app.js").read_text()
     box = js[js.index('id: "pair-code"'):][:200]
     assert 'maxlength: "64"' in box and 'maxlength: "12"' not in box
+
+
+def test_the_page_drops_a_subscription_made_under_another_installs_key():
+    # the page's resync compares the browser subscription's key to the laptop's before handing it over; the run that
+    # proves it on a real browser is in levain-memory 1019-app (a stale-key subscription reads "off")
+    js = _JS.read_text(encoding="utf-8")
+    for words in ("function keyMismatch(s)", "s.options.applicationServerKey", 'api("GET", "/webpush/key")',
+                  "a.length !== b.length || a.some((v, i) => v !== b[i])",
+                  "were made for a different Levain install, so they were switched off"):
+        assert words in js, words
+    assert "keyMismatch(s).then((stale) =>" in js
