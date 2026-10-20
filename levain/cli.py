@@ -572,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_publish_parser(subparsers)
     _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
+    _add_dispatch_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1179,7 +1180,8 @@ def main(argv: list[str] | None = None) -> int:
             "apply under review, and record the composed set. After a levain "
             "upgrade it also refreshes the activation tree and adapter files "
             "(hooks, posture.md, recency_directives.md, CLAUDE.md / AGENTS.md, "
-            ".claude/settings.json, .mcp.json, codex hooks): a file you edited is "
+            ".claude/settings.json, levain's hooks in .claude/settings.local.json or .claude/settings.json "
+            "(per workspace, see `levain doctor`), .mcp.json, codex hooks): a file you edited is "
             "kept, and where the new release changed it too, its new version is "
             "staged under .levain/pending/ and listed once. The fix for "
             "version-drift — a new anneal feature landing as a CONFLICT with stale "
@@ -2401,6 +2403,13 @@ def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
 def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
     """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
     from levain.consent.band import add_parsers
+
+    add_parsers(subparsers)
+
+
+def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain dispatch``: the dispatch job's planner and operator door (``levain.dispatch.cli``)."""
+    from levain.dispatch.cli import add_parsers
 
     add_parsers(subparsers)
 

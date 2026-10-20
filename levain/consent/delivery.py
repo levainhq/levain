@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -265,21 +266,25 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     ``timeout`` :data:`GATE_TIMEOUT`, no other field), and no settings file the resume loads may set
     ``disableAllHooks``. A lookalike entry (another matcher, a non-blocking one) gates less than every call, so the
     reason names the field that differs."""
-    import shlex
-
     from levain.consent.adapters.claude_code import GATE_EVENT, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN
     from levain.install import CONSENT_HOOK_SCRIPTS
 
+    from levain.host_guard import cc_project_settings_files
+
     user = Path(config_dir) if config_dir else Path.home() / ".claude"
+    # the project files Claude Code loads for a session in cwd: settings.local.json at the git root and beside
+    # settings.json, and settings.json from cwd itself (levain wires the gate in one of them, per workspace:
+    # host_guard.cc_levain_hooks_file)
+    local, shared = cc_project_settings_files(cwd)
     project = Path(cwd) / ".claude"
-    files = {f: _settings(f) for f in (project / "settings.json", project / "settings.local.json",
-                                        user / "settings.json")}
+    hook_files = [*local, shared, user / "settings.json"]
+    files = {f: _settings(f) for f in dict.fromkeys([*hook_files, project / "settings.local.json"])}
     off = [str(f) for f, doc in files.items() if doc.get("disableAllHooks") is True]
     if off:
         return f"{off[0]} turns every hook off"
     want = {"type": "command", "onFailure": "block", "timeout": GATE_TIMEOUT}
     lookalike = None
-    for f in (project / "settings.json", user / "settings.json"):
+    for f in dict.fromkeys(hook_files):
         hooks = files[f].get("hooks")
         groups = hooks.get(GATE_EVENT) if isinstance(hooks, dict) else None
         for group in groups if isinstance(groups, list) else ():
@@ -522,11 +527,14 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     (``meta``) and the session's state read now, with no side effect: ``(route, reason, argv, cwd)``, the route
     ``hook``, ``stop_resume``, ``resumed`` (``argv`` without its prompt, in ``cwd``) or ``none`` (see the module
     docstring). ``noun`` names the text in the reason (a ruling, a question's answer). Shared by :func:`plan` and the
-    question band's delivery. ``named`` (default :func:`session_named_running`) is the last guard before a resume: a
+    question band's delivery. ``named`` (default :func:`session_named_running`, given the directory recorded in
+    ``meta``, so a ``claude -c`` elsewhere does not hold it) is the last guard before a resume: a
     recorded process that has ended does not mean the SESSION has (an earlier resume, or the operator's own
-    ``codex resume``, runs under a new process), so any running process whose command line names the session id
+    ``codex resume``, runs under a new process), so any running process whose command line resumes the session id
     leaves the text to its next hook."""
-    named = named if named is not None else session_named_running
+    if named is None:
+        def named(sid: str) -> bool | None:
+            return session_named_running(sid, meta.get("cwd"))
     target = base_session(session)
     lands = f"the {noun} lands at its next step"
     if agent == _CLAUDE:
@@ -559,9 +567,14 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     if running(pid, started) is not False:
         return "hook", f"its process {pid} (started {started or 'at a time not recorded'}) may still run; {lands}", \
             (), None
-    if named(target) is not False:
-        return "hook", f"a process naming this session may be running (an earlier resume, or one by hand); {lands}", \
+    resuming = named(target)
+    if resuming is True:
+        return "hook", f"a process resuming this session may be running (an earlier resume, or one by hand); {lands}", \
             (), None
+    if resuming is not False:
+        return "hook", ("a resume without a session id is running (codex resume --last or by name, claude -c, "
+                        "--continue or a --resume picker), or the process list could not be read, so this session "
+                        f"may be the one it resumed; {lands}"), (), None
     why = resume_refusal(agent, target, meta)
     if why is not None:
         return "hook", f"the session has ended but is not resumed: {why}; resume it by hand and {lands}", (), None
@@ -571,19 +584,245 @@ def route(agent: str, session: str, meta: Mapping[str, Any], *, noun: str = "rul
     return "resumed", f"the session has ended: resumed with the {noun} as its prompt", tuple(argv), meta["cwd"]
 
 
-def session_named_running(session: str) -> bool | None:
-    """Whether a running process's command line names ``session`` (a resume of it: ``--resume=<id>``, ``codex exec
-    resume <id>``), ``None`` when the process list cannot be read (read as maybe: no resume)."""
-    if not session_ok(session):
+# the options of `codex resume` / `codex exec resume` that take a separate value [measured: codex-cli 0.162.1
+# --help]; any other option is read as a switch, so the first word after the options is the session selector
+_CODEX_VALUED = frozenset({
+    "-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env", "-i", "--image", "-m",
+    "--model", "--local-provider", "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a",
+    "--ask-for-approval", "--thread-source", "--cyber-access-program", "--output-schema", "-o",
+    "--output-last-message",
+})
+
+# :func:`_resumes` for a `claude -c` / `--continue`: it resumes the latest session of its OWN directory, so which
+# session it holds is told by its cwd (:func:`_continues_in`)
+_CONTINUE = "continue"
+
+
+def _agent_cli(exe: str) -> str | None:
+    """``claude`` or ``codex`` when the executable path ``exe`` is that CLI, else ``None``. Claude Code's native
+    install runs as ``.../claude/versions/<version>`` (its basename is the version, not ``claude``), and its npm
+    install as ``node .../claude-code/cli.js``."""
+    path = Path(exe)
+    if path.name in ("claude", "codex"):
+        return path.name
+    if path.parent.name == "versions" and path.parent.parent.name == "claude":
+        return "claude"
+    if path.name == "cli.js" and "claude-code" in path.parts:
+        return "claude"
+    return None
+
+
+def _cli_word(token: str) -> str | None:
+    """``claude`` or ``codex`` when the argv word ``token`` may be that CLI's executable: :func:`_agent_cli`, or a
+    path containing ``claude-code/`` or ``.local/share/claude/versions/``. It is a test on the word alone, with no
+    list of wrappers or of their options, so ``env -u K claude``, ``nohup claude``, ``caffeinate -i claude`` and
+    ``node --require x <dir>/claude-code/cli.js`` all name the CLI, and so does the word ``claude`` in another tool's
+    arguments (``grep claude -c file``): the reading fails closed. No marker or name holds a space, so a path ``ps``
+    split at a space still ends in a word this reads."""
+    name = _agent_cli(token)
+    if name:
+        return name
+    if "claude-code/" in token or ".local/share/claude/versions/" in token:
+        return "claude"
+    return None
+
+
+def _claude_selector(value: str) -> str | None:
+    """The session id a Claude Code ``--resume`` value names: the UUID itself, or the stem of a transcript path
+    (``--resume <dir>/<uuid>.jsonl``); ``None`` for a name, a search term or nothing."""
+    if _UUID.fullmatch(value):
+        return value
+    stem = os.path.basename(value)
+    if stem.endswith(".jsonl") and _UUID.fullmatch(stem[:-6]):
+        return stem[:-6]
+    return None
+
+
+def _codex_selector(after: list[str]) -> tuple[str | None, bool]:
+    """``(selector, last)`` for the words after Codex's ``resume``: the first positional word once its options and
+    their values (:data:`_CODEX_VALUED`) are passed, and whether ``--last`` was among those options. A UUID later in
+    the prompt is never the selector."""
+    last, i = False, 0
+    while i < len(after):
+        tok = after[i]
+        if tok == "--":
+            return (after[i + 1] if i + 1 < len(after) else None), last
+        if not tok.startswith("-") or tok == "-":
+            return tok, last
+        last = last or tok == "--last"
+        i += 2 if (tok in _CODEX_VALUED and "=" not in tok) else 1
+    return None, last
+
+
+def _names_resume(tokens: list[str], want: str) -> bool:
+    """Whether the lower-cased argv ``tokens`` carry ``want`` as the value of a resume option, ANYWHERE and in ANY
+    program: ``--resume <id>``, ``--resume=<id>``, ``-r <id>``, ``-r<id>`` (the value may be a transcript path,
+    :func:`_claude_selector`), or a ``resume`` word whose session selector (:func:`_codex_selector`) is the id."""
+    for i, tok in enumerate(tokens):
+        if tok in (f"--resume={want}", f"-r{want}"):
+            return True
+        if tok in ("--resume", "-r") and i + 1 < len(tokens) and _claude_selector(tokens[i + 1]) == want:
+            return True
+        if tok.startswith("--resume=") and _claude_selector(tok.split("=", 1)[1]) == want:
+            return True
+        if tok == "resume" and _codex_selector(tokens[i + 1:])[0] == want:
+            return True
+        # ps does not quote: a transcript path with a space splits, and its last piece still ends with the file name
+        if tok.endswith(f"/{want}.jsonl") and any(t in ("--resume", "-r") for t in tokens[:i]):
+            return True
+    return False
+
+
+def _cli_resumes(prog: str, rest: list[str], want: str) -> bool | str | None:
+    """:func:`_resumes` for the lower-cased words ``rest`` after a word naming the CLI ``prog`` (:func:`_cli_word`):
+    the forms that need the program, the strong ones (:func:`_names_resume`) already read."""
+    if prog == "codex":
+        lead = _options(rest, words=("exec",))
+        if "resume" not in lead:
+            return False
+        selector, last = _codex_selector(rest[lead.index("resume") + 1:])
+        return None if last or selector is None or not _UUID.fullmatch(selector) else False
+    for i, tok in enumerate(rest):
+        if tok in (f"--session-id={want}", f"-r={want}"):
+            return True
+        if tok == "--session-id" and i + 1 < len(rest) and _claude_selector(rest[i + 1]) == want:
+            return True
+    opts = _options(rest)
+    continues = False
+    for i, tok in enumerate(opts):
+        if tok in ("-c", "--continue"):
+            continues = True
+        elif tok in ("--resume", "-r"):
+            if not (i + 1 < len(opts) and _claude_selector(opts[i + 1])):
+                return None
+        elif tok.startswith(("--resume=", "-r")) and not _claude_selector(
+                tok.split("=", 1)[1] if "=" in tok else tok[2:]):
+            return None
+    return _CONTINUE if continues else False
+
+
+def _resumes(tokens: list[str], session: str) -> bool | str | None:
+    """Whether the argv ``tokens`` run ``session``, read so that a process it cannot place HOLDS delivery rather than
+    lets a second copy start (this is the backstop behind ``claude agents --json``; a held delivery rides the
+    session's next step). Ids compare case-insensitively and only as a whole token.
+
+    ``True`` for the strong forms in any process, with no program check (:func:`_names_resume`): the id as the value
+    of ``--resume`` / ``-r`` (also a transcript path), or as a ``resume`` word's session selector (``codex resume``,
+    ``codex exec resume``). Every other form counts only after a word that may be the CLI (:func:`_cli_word`), read
+    from each such word on: ``True`` for a Claude Code ``--session-id <id>``, ``--session-id=<id>`` or ``-r=<id>``;
+    ``None`` for a resume that names no session id and so may be resuming this one (a Claude ``--resume`` / ``-r``
+    with no id or a name, a Codex ``resume`` with ``--last``, no selector or a name); :data:`_CONTINUE` for a Claude
+    ``-c`` / ``--continue``. ``False`` otherwise. The id-less forms are read only in the leading option run after that
+    word (:func:`_options`), so a ``-c`` or ``resume`` inside a prompt does not count."""
+    want = session.lower()
+    low = [t.lower() for t in tokens]
+    if _names_resume(low, want):
+        return True
+    found: list[bool | str | None] = []
+    for at, tok in enumerate(tokens):
+        prog = _cli_word(tok)
+        if prog:
+            found.append(_cli_resumes(prog, low[at + 1:], want))
+    if any(got is True for got in found):
+        return True
+    if any(got is None for got in found):
+        return None
+    return _CONTINUE if _CONTINUE in found else False
+
+
+def _options(tokens: list[str], words: tuple[str, ...] = ()) -> list[str]:
+    """The leading run of ``tokens`` that can still be options (or the subcommand ``words``): it ends before the first
+    word that neither starts with ``-`` nor follows a token that does (an option's value), so a prompt's words
+    (``please resume``, a ``-c`` inside an unquoted prompt) are not read as flags. The last word kept may be a
+    subcommand (``resume``)."""
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        if not (tok.startswith("-") or tok in words or tok == "resume"
+                or (i and tokens[i - 1].startswith("-") and "=" not in tokens[i - 1])):
+            break
+        out.append(tok)
+        if tok == "resume":
+            break
+    return out
+
+
+#: how long :func:`session_named_running` may spend reading the process list and the cwds it needs, in seconds
+NAMED_BUDGET = 5.0
+
+
+def _continues_in(pid: str, cwd: Any, deadline: float) -> bool | None:
+    """Whether the ``claude -c`` process ``pid`` runs in ``cwd`` (the same directory, :func:`os.path.samefile`, so a
+    case or symlink difference on macOS still matches; resolved-path equality when either cannot be stat'ed), read
+    with ``lsof``; ``None`` when ``cwd`` is not a path or the process's cwd cannot be read before ``deadline``."""
+    left = deadline - time.monotonic()
+    if not isinstance(cwd, str) or not cwd or left <= 0:
         return None
     try:
-        got = subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True, timeout=5,
-                             stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+        got = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fn", "-p", pid], capture_output=True, text=True,
+                             timeout=left, stdin=subprocess.DEVNULL,
+                             env={"PATH": "/usr/sbin:/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    path = next((ln[1:] for ln in got.stdout.splitlines() if ln.startswith("n")), None)
+    if not path:
+        return None
+    try:
+        return os.path.samefile(path, cwd)
+    except (OSError, ValueError):
+        return os.path.realpath(path) == os.path.realpath(cwd)
+
+
+def session_named_running(session: str, cwd: Any = None) -> bool | None:
+    """Whether a running process resumes ``session`` (:func:`_resumes`, read from ``ps``'s command lines), ``None``
+    when the process list cannot be read or a resume that names no session id may be resuming it (``codex resume
+    --last``, a ``--resume`` picker: which session it holds is not in its command line), so the caller starts no
+    resume. This argv reading is the BACKSTOP behind Claude Code's ``claude agents --json`` listing, and it fails
+    CLOSED: a process it cannot place holds delivery (which rides the session's next step) rather than reads ``False``
+    (which starts a second copy of a live session). So the id as a resume option's value (``--resume <id>``, ``-r<id>``,
+    a ``resume <id>``) counts in ANY process, with no check of which program it is; the weaker forms count after any
+    word that may be the CLI (:func:`_cli_word`), with no list of wrappers. A ``claude -c`` / ``--continue`` can only
+    be resuming a session started in its own directory: it counts (``None``) only when its cwd is ``cwd``, the
+    directory ``session`` was started in, or when either cannot be read. A process that only mentions the id outside
+    a resume option (``levain consent rule --session <id>``, its shell, ``tail -f`` of the transcript) does not count,
+    and this process never does. An ancestor that IS a resume of the session counts: the session is then running (a
+    hook of it delivering)."""
+    if not session_ok(session):
+        return None
+    deadline = time.monotonic() + NAMED_BUDGET
+    try:
+        got = subprocess.run(["ps", "-axww", "-o", "pid=,args="], capture_output=True, text=True,
+                             timeout=NAMED_BUDGET, stdin=subprocess.DEVNULL,
+                             env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return None
     if got.returncode != 0:
         return None
-    return any(session in line for line in got.stdout.splitlines())
+    me = str(os.getpid())
+    idless = False
+    continuing: list[str] = []
+    for line in got.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid == me:
+            continue
+        # ps does not quote: a prompt's apostrophe can unbalance shlex, and a quote pair can swallow tokens, so both
+        # readings are tried
+        try:
+            quoted = shlex.split(args)
+        except ValueError:
+            quoted = []
+        readings = (_resumes(quoted, session), _resumes(args.split(), session))
+        if True in readings:
+            return True
+        if None in readings:
+            idless = True
+        elif _CONTINUE in readings:
+            continuing.append(pid)
+    if idless:
+        return None
+    # the cwds are read after the whole list, so a match on the id is never delayed by lsof
+    if any(_continues_in(pid, cwd, deadline) is not False for pid in continuing):
+        return None
+    return False
 
 
 def _launch(argv: list[str], cwd: str, env: Mapping[str, str], log: Path) -> str | None:
