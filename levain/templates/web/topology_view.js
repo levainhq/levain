@@ -1015,8 +1015,8 @@
                                                         : { fail: "no activity source" };
     }, () => { R.hist = { fail: "activity not read" }; }).then(() => { R.histBusy = false; R.histAt = Date.now(); paintBars(R.cur); });
   }
-  function paintBars(cur) {
-    if (!cur || !cur.bars.isConnected) return;
+  function paintBars(cur, fresh) {
+    if (!cur || (!fresh && !cur.bars.isConnected)) return;
     const h = R.hist, n = cur.bars.children.length;
     cur.note.textContent = "";
     cur.bars.classList.toggle("unk", !h || !!h.fail || h.unreadable.length > 0);
@@ -1098,7 +1098,7 @@
     if (R.err) { const e = el("p", "tv-rerr", R.err); e.setAttribute("role", "status"); strip.appendChild(e); }
     R.cur = { bars, note, hi };
     if (R.refocus) { R.refocus = false; root.setTimeout(() => { if (track.isConnected) track.focus({ preventScroll: true }); }, 0); }
-    paintBars(R.cur);
+    paintBars(R.cur, true);
     return strip;
   }
   // what the past read could not rebuild: said in words, never drawn as none
@@ -1138,8 +1138,9 @@
     }
     w.appendChild(body);
     w.appendChild(which === "agents" ? legendAgents() : legend());
-    for (const u of unknownLines(v)) w.appendChild(u);
-    const q = quietLine(v);
+    const unk = unknownLines(v);
+    for (const u of unk) w.appendChild(u);
+    const q = unk.length ? null : quietLine(v);        // the unknown lines already say what the past could not rebuild
     if (q) w.appendChild(q);
     if (o.replay) {
       bindEsc();
