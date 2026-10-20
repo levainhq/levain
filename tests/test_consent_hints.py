@@ -159,7 +159,7 @@ def test_no_decision_path_imports_the_hints() -> None:
     assert got[0] == CUT_HINT and any("pipes into a shell" in h for h in got) and not any("nc" in h for h in got), got
     # agent-controlled invisible characters are shown, not rendered
     assert visible("a‮b​c\x07\nd\te ") == "a⟨U+202E⟩b⟨U+200B⟩c⟨U+0007⟩\nd\te⟨U+2028⟩"
-    for cp in (0x2028, 0x2029, 0x3164, 0x2800, 0x115F, 0x1160, 0xFFA0, 0x034F, 0x180B, 0x180C, 0x180D):   # _BLANKS, each shown
+    for cp in (0x2028, 0x2029, 0x3164, 0x2800, 0x115F, 0x1160, 0xFFA0, 0x034F, 0x180B, 0x180C, 0x180D):   # blank-looking characters (levain.unshowable), each shown
         assert visible(f"a{chr(cp)}b") == f"a⟨U+{cp:04X}⟩b", hex(cp)
 
 

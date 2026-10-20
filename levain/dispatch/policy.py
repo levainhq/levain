@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from levain import unshowable
 from levain.contracts.canon import canonical_bytes
 
 __all__ = ["FORMAT", "PolicyError", "ProviderPolicy", "match", "path_text_problem"]
@@ -56,8 +57,6 @@ _PROVIDER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _PATTERN_MAX = 512
 _PATTERNS_MAX = 256
 _PROVIDERS_MAX = 64
-# control, format, surrogate, line/paragraph separators, private use, unassigned: can show differently from itself
-_UNSHOWABLE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Co", "Cn"})
 
 
 class PolicyError(ValueError):
@@ -65,16 +64,14 @@ class PolicyError(ValueError):
 
 
 def path_text_problem(text: str, what: str = "path") -> str | None:
-    """Why ``text`` (a path or a pattern) holds a character that cannot show as itself: any control character,
-    newline and tab included, any format, separator, surrogate, private-use or unassigned code point, and any space
-    but U+0020. ``None`` when every character shows as what it is. One rule for contract paths and policy patterns."""
-    for ch in text:
-        if ch == " ":
-            continue
-        category = unicodedata.category(ch)
-        if category in _UNSHOWABLE or category == "Zs":
-            return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
-                    "from what is signed")
+    """Why ``text`` (a path or a pattern) holds a character that cannot show as itself (:mod:`levain.unshowable`,
+    newline and tab included). ``None`` when every character shows as what it is. One rule for contract paths and
+    policy patterns."""
+    found = unshowable.first_hidden(text, allow="")
+    if found is not None:
+        ch = found[1]
+        return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "
+                "from what is signed")
     return None
 
 

@@ -59,13 +59,13 @@ import os
 import re
 import sqlite3
 import sys
-import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import Link, Question, QuestionStore, QuestionStoreError
 
@@ -123,11 +123,12 @@ def answer_line(question: Question) -> str | None:
 
 
 def _escaped(text: str) -> str:
-    """``text`` as a JSON string with every control, format and line or paragraph separator character escaped too
+    """``text`` as a JSON string with every unshowable character (:mod:`levain.unshowable`) escaped too
     (``json.dumps`` escapes only U+0000-U+001F): NEL (U+0085), U+2028 and a bidi override all arrive as ``\\uXXXX``,
     a character past U+FFFF as its UTF-16 surrogate pair (``json.dumps`` of the one character), so it round-trips."""
-    return "".join(c if not (unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp"))
-                   else json.dumps(c)[1:-1] for c in json.dumps(text, ensure_ascii=False))
+    # judged on ``text`` itself, never on the JSON: there a selector after a newline would follow the letter of ``\n``
+    at = set(unshowable.hidden(text))
+    return '"' + "".join(json.dumps(c, ensure_ascii=i in at)[1:-1] for i, c in enumerate(text)) + '"'
 
 
 def question_context(directory: Path | str, agent: str, session: str | None) -> str | None:

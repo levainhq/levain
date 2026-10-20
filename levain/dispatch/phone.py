@@ -95,8 +95,14 @@ class DispatchPhone:
         from levain.dispatch.cli import job_view
         from levain.dispatch.jobs import TERMINAL
 
+        from levain.cockpit.display_safe import visible
+
         v = job_view(job)
         out = {k: v[k] for k in v if k not in ("filer_agent", "filer_session")}
+        # display only: the card shows these; what it signs is built from the stored job (``sign_payload``), never them
+        out["goal"], out["repo"] = visible(v["goal"]), visible(v["repo"])
+        out["read"] = [{**e, "path": visible(e["path"])} for e in v["read"]]
+        out["write"] = [{**e, "path": visible(e["path"])} for e in v["write"]]
         out.update({"kind": "dispatch", "agent": v["filer_agent"], "session": v["filer_session"],
                     "read_count": len(v["read"]), "write_count": len(v["write"]),
                     "can_sign": job.state == "filed" and job.lease_end > now and bool(signers), "can_cancel": job.state not in TERMINAL,

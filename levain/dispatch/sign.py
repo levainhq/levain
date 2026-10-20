@@ -33,12 +33,12 @@ only.
 """
 from __future__ import annotations
 
-import unicodedata
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from levain import unshowable
 from levain.authority import PASSKEY, AuthoritySnapshot, verify_link_sig
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import class_covers
@@ -109,7 +109,7 @@ def reason_problem(reason: Any) -> str | None:
         return "a cancel's reason is text"
     if len(reason) > FIELD_MAX:
         return f"a cancel's reason is at most {FIELD_MAX} characters"
-    if any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in reason):
+    if unshowable.first_hidden(reason, allow="") is not None:
         return "a cancel's reason is one line of plain text"
     return None
 

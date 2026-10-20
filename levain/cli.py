@@ -2565,17 +2565,17 @@ def _reading_queue(qdir: Path) -> object:
     return ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
 
 
-# What the terminal must never receive raw from an agent-sourced string: every C0/C1 control and DEL (Cc), every
-# format control, the bidi controls among them (Cf), a lone surrogate (Cs), and the line and paragraph separators
-# (Zl, Zp). Each is printed as its escape, \uXXXX (\UXXXXXXXX past the BMP).
-_TERM_UNSAFE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
-
-
+# What the terminal must never receive raw from an agent-sourced string: every character levain.unshowable calls
+# unshowable (controls, newline and tab included, format and bidi controls, separators, invisible spaces, fillers,
+# variation-selector runs). Each is printed as its escape, \uXXXX (\UXXXXXXXX past the BMP).
 def _term_safe(text: object) -> str:
-    import unicodedata
+    from levain import unshowable
 
-    return "".join((f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
-                   if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
+    return unshowable.mark(str(text), _escape, allow="")
+
+
+def _escape(cp: int) -> str:
+    return f"\\u{cp:04x}" if cp <= 0xFFFF else f"\\U{cp:08x}"
 
 
 def __getattr__(name: str) -> object:

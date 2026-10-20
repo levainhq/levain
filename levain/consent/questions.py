@@ -40,7 +40,6 @@ import json
 import os
 import re
 import sqlite3
-import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import open_durable, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
@@ -200,9 +200,9 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
 
 
 def _has_control(text: str) -> bool:
-    # control and format characters, and the line and paragraph separators (U+2028, U+2029), which a model or a
-    # renderer can read as a line break: a one-line field carries none of them
-    return any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in text)
+    # any unshowable character (levain.unshowable): control and format characters, the line and paragraph
+    # separators a model or a renderer can read as a line break, invisible spaces and fillers
+    return unshowable.first_hidden(text, allow="") is not None
 
 
 def _line(name: str, value: Any, low: int, high: int) -> str:

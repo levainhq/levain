@@ -63,12 +63,12 @@ import os
 import sqlite3
 import subprocess
 import sys
-import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
+from levain import unshowable
 from levain.authority import VerifierUnavailable
 from levain.dispatch import ContractRefused, DispatchError
 from levain.dispatch import capability as caps
@@ -87,7 +87,6 @@ __all__ = ["EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnamed", "InputRefu
 EXIT_OK, EXIT_REFUSED, EXIT_FAULT = 0, 2, 3
 # a contract is a few kilobytes; the bound only stops a stray file from being read whole
 _CONTRACT_MAX = 1024 * 1024
-_TERM_UNSAFE = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 NO_REGISTRY = "no template registry is set up; every contract is R2, which is never dispatched"
 
 
@@ -164,8 +163,11 @@ def resolvers(directory: Path | None = None, data_root: Path | None = None,
 
 def _safe(text: object) -> str:
     """``text`` with every character a terminal could act on (or show as something else) written as its escape."""
-    return "".join((f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
-                   if unicodedata.category(c) in _TERM_UNSAFE else c for c in str(text))
+    return unshowable.mark(str(text), _escape, allow="")
+
+
+def _escape(cp: int) -> str:
+    return f"\\u{cp:04x}" if cp <= 0xFFFF else f"\\U{cp:08x}"
 
 
 def _ascii(text: object) -> str:

@@ -27,6 +27,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Collection, Mapping, Sequence, Union
 
+from levain import unshowable
 from levain.contracts import ContractError
 from levain.contracts import canon
 from levain.slot import Refused
@@ -330,7 +331,8 @@ def _unique_strs(value: object, field: str, pattern: re.Pattern[str], cap: int) 
 
 
 def _display(value: object, field: str) -> str:
-    """§10.3's render alphabet (L, M, N, P, S, Zs minus bidi overrides/isolates), as an input rule."""
+    """§10.3's render alphabet (L, M, N, P, S, Zs minus bidi overrides/isolates), as an input rule, and no character
+    :mod:`levain.unshowable` calls unshowable (so no space but U+0020, no variation selector run, no filler)."""
     if type(value) is not str:
         raise Refused("wrong-type", f"{field} is a string")
     if not 1 <= len(value) <= MAX_REPO_LABEL:
@@ -338,6 +340,9 @@ def _display(value: object, field: str) -> str:
     for c in value:
         if c in _BIDI_CONTROLS or unicodedata.category(c) not in _DISPLAY_CATEGORIES:
             raise Refused("bad-value", f"{field}: U+{ord(c):04X}")
+    found = unshowable.first_hidden(value, allow="")
+    if found is not None:
+        raise Refused("bad-value", f"{field}: U+{ord(found[1]):04X}")
     return value
 
 
