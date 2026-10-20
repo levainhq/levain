@@ -33,6 +33,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   answer` and the phone page sign the queue's own record, so they carry the head with no change on your side. Answer and
   ruling formats move to `levain-consent-answer/2` and `levain-consent-ruling/2`; an old-format answer is refused when
   applied (answer the request again), and one already applied before the upgrade still delivers.
+- **Budgets per session, on by default.** Levain counts what each Claude Code and Codex session spends, its subagents
+  included: tool calls, active hours, fresh tokens, cache-read tokens, and how often one call repeats (a loop). Every
+  call is counted, read-only ones too. When a session passes a limit, its next call waits and you get one ping:
+  **Extend** (that limit doubles and the call goes on) or **End**. End, or no answer before the hold runs out, stops
+  the session (Claude Code's turn ends; Codex has every later call refused) until you extend it, from the phone or with
+  `levain limits extend <session>`. Nothing is ever cut off silently, and the agent is told a
+  budget you set stopped it, not a fault. The defaults sit well above a heavy day's sessions: 3,000 calls, 12 active
+  hours, 15M fresh tokens, 600M cache-read tokens, one call 8 times in any 10. Change them with
+  `levain limits set <limit> <value>` (per agent with `--agent`); see the counts with `levain limits show`; `levain
+  doctor` shows the limits in force. Dollars are not enforced (a price table goes stale and a subscription is not billed
+  per token).
+- **`levain publish`: Levain publishes a package for the agent, only on your yes.** `levain publish pypi <files>` and
+  `levain publish npm <tarball>` show you the exact package, version, files (their digests), target index and, for npm,
+  the dist-tag and access; on your signed yes Levain uploads exactly those files to exactly that index itself. The name
+  and version are read from inside the files, never from what the agent typed, and a file changed after asking changes
+  nothing (Levain uploads its own copy). Settings that could send the upload elsewhere (environment variables,
+  `.npmrc`, `publishConfig`) are overridden. PyPI credentials come from `TWINE_USERNAME` / `TWINE_PASSWORD`, or the
+  `~/.pypirc` section for that exact index; with none, it refuses before asking you.
+
 
 ### Changed
 - **Agent config and hooks are refused when nothing can approve the edit.** Until now, with no enrolled key that could
@@ -100,6 +119,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   every answer it signed then fails `verify`.
 - A signed head over zero receipts always matches (the empty log's root is fixed): it attests nothing.
 - An answer signed from the phone page (passkey) carrying the head has not been run on a phone yet.
+- A limit is checked at tool calls, and tokens are read from the agent's own transcript, which can lag: a session can
+  pass a token limit by up to the turn in flight.
+- Without the session sandbox the agent's own shell can edit `limits.json`: a brake on a runaway, not a bound on an
+  agent that tries.
+- The loop limit catches one call repeating; a loop that changes an argument every time is caught later by the call and
+  token limits.
+- After an Extend, a call that itself needs your approval is asked for again (the agent is told to run it again), so
+  two waits never share one hook.
+- A Codex command typed into a terminal it opened earlier is not counted and is not stopped by a limit.
+- `levain publish` is a path the agent is told to take, not a wall: a `twine upload` or `npm publish` the agent runs
+  itself is not gated until Levain's hands run as another user.
+- `levain publish` runs the twine and npm found on your PATH (Homebrew, `~/.local/bin`), which are writable by your user.
 
 ## [0.11.9] — 2026-10-19
 
