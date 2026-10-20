@@ -13,11 +13,13 @@
 //   Agents are small chips on the task they work. A session with no task object sits in an "unattached work" block, never a
 //   guessed task. Waiting (a pending record the operator can answer) and stuck (silence, no record) never merge. In a
 //   narrow card the columns stack: records, tasks, each task's outcomes beneath it.
-//   Agents lens: the hub, then one column per group, one row per node.
+//   Agents lens: the graph as the F12 mock draws it. One hub (the install), the groups on its two sides, each group's sessions beside it
+//   with a subagent under its parent, every node with its face and a state ring, edges hub -> group -> node -> child that carry particle
+//   streams whose density is the node's rate. A file conflict is the file's name on a chip between its nodes.
 //
 // Unknown is drawn as unknown: a null cost, token count, rate, conflict list or model reads "not tracked" / "model unknown",
-// never 0. No particles are drawn: the feed has no per-edge events, only a node's rate, and a column layout has no edge to
-// carry them.
+// never 0. The Work lens draws no particles (it has no edge to carry them). The Agents lens draws a stream only on an edge whose node has a
+// real positive rate and is not idle: a null rate, a rate of 0 and an idle node are still, and under prefers-reduced-motion nothing moves.
 (function (root) {
   "use strict";
 
@@ -103,7 +105,10 @@
   // its one decimal, tokens as K / M, an open loop's age as the provider's day count). The clock (as_of, a node's last_event) and the
   // `opened` stamp are not in it, so a poll that moved nothing the operator can see repaints nothing and a visible change always does
   function signature(v, l) {
-    const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, rate: isNum(n.rate) ? n.rate.toFixed(1) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
+    // The Agents lens also draws an idle node's "quiet since" and "ran", and an errored node's "failed at": those stamps are drawn, so they are in
+    // the signature (as the clock text the face writes); a running node's run time ticks on its own and is not.
+    const stamp = (n) => (l === "agents" && isObj(n) && (n.state === "idle" || n.state === "errored") ? [clock(n.last_event), fmtDur(span(n.started, n.last_event))] : undefined);
+    const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, stamp: stamp(n), rate: isNum(n.rate) ? n.rate.toFixed(1) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
     const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined, cost: isObj(t.cost) ? Object.assign({}, t.cost, { usd: fmtUsd(t.cost.usd), tokens: fmtTokens(t.cost.tokens) }) : t.cost }) : t);
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
                                                    tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
@@ -111,7 +116,11 @@
     return JSON.stringify([l, sane, Array.from(shownAll)]);
   }
   // one OS-level observer at a time: the card calls this before it replaces its children
-  function release() { if (linkObserver) { linkObserver.disconnect(); linkObserver = null; } }
+  function release() {
+    if (linkObserver) { linkObserver.disconnect(); linkObserver = null; }
+    if (streamStop) { streamStop(); streamStop = null; }
+    if (ticker) { root.clearInterval(ticker); ticker = null; }
+  }
 
   // ---- small formatters ----
   function fmtTokens(n) {
@@ -407,63 +416,400 @@
     return wrap;
   }
 
-  // ---- the Agents lens ----
-  function nodeRow(n, lost, opts, depth) {
-    const r = el("div", "tv-node " + n.state + (depth ? " sub" : ""));
-    r.dataset.node = n.id;
-    r.append(dot(n.state));
-    const body = el("div", "tv-node-b");
-    const top = el("div", "tv-node-t");
-    top.appendChild(el("b", null, n.label));
-    const risk = riskMark(lost.get(n.id));
-    if (risk) top.appendChild(risk);
-    if (n.state !== "running") top.appendChild(tag(n.state, NODE_WORDS[n.state] || n.state));
-    body.appendChild(top);
-    body.appendChild(el("div", "tv-node-m", [n.agent, n.model || "model unknown"].filter(Boolean).join(" · ")));
-    const tok = fmtTokens(n.tokens);
-    const bits = [tok === null ? "tokens not tracked" : tok + " tok", isNum(n.rate) ? n.rate.toFixed(1) + " events/min" : "rate not tracked"];
-    if (typeof n.tool === "string" && n.tool) bits.push(n.tool);
-    const since = clock(n.started);
-    if (since) bits.push("since " + since);
-    body.appendChild(el("div", "tv-node-f", bits.join(" · ")));
-    r.appendChild(body);
-    if (n.state === "waiting") openable(r, n.card, opts);
-    return r;
+  // ---- the Agents lens: the graph as the mock draws it (F12 mock v2, `topology/mock/src/index.tpl.html`) ----
+  // One hub, the groups on its two sides, each group's sessions stacked outward of it with a subagent indented under its parent, the
+  // face of every node on its outward side. The layout is columns, not a physics pass (the mock's own buildLayout). Nodes, edges, rings and
+  // faces are SVG (every one a real element a test or a screen reader can reach); only the particle streams are a canvas under it.
+  // A stream's density is the node's rate (events per minute). A null rate, a rate of 0 and an idle node have NO stream, never a decoration;
+  // the loop runs only while some edge streams, adapts to the frame time, and draws nothing under prefers-reduced-motion.
+  const MIN_LW = 920;                      // the graph is laid out at no less than this width and scaled down to fit a narrower card
+  const MIN_H = 540;
+  const RING_H = [0.2, 0.34];
+  const PARTICLE_CAP = 1500;
+  let ticker = null;                       // the one interval that keeps run times honest between repaints (no repaint, no signature change)
+  let streamStop = null;                   // stops the one particle loop
+
+  const sv = (tag, attrs, cls, text) => {
+    const n = document.createElementNS(SVG_NS, tag);
+    if (cls) n.setAttribute("class", cls);
+    if (attrs) for (const k of Object.keys(attrs)) n.setAttribute(k, String(attrs[k]));
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  };
+  const num = (x) => Math.round(x * 10) / 10;
+  function fmtDur(ms) {
+    if (!isNum(ms)) return null;
+    const m = Math.max(0, Math.round(ms / 60000));
+    if (m < 1) return Math.max(0, Math.round(ms / 1000)) + " s";
+    return m >= 60 ? Math.floor(m / 60) + " h " + String(m % 60).padStart(2, "0") + " m" : m + " m";
   }
-  function agentsLens(v, opts) {
-    const wrap = el("div", "tv-agents");
-    const hub = el("div", "tv-hub");
-    const hubLabel = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
-    hub.append(el("b", null, hubLabel), el("span", "tv-gloss", arr(v.groups).length + " groups · " + arr(v.nodes).length + " nodes"));
-    wrap.appendChild(hub);
-    const cols = el("div", "tv-cols");
-    const nodes = arr(v.nodes);
-    const lost = lostMap(v);
-    for (const g of arr(v.groups)) {
-      const mine = nodes.filter((n) => n.group === g.id);
-      const col = el("section", "tv-col");
-      col.dataset.group = g.id;
-      const h = el("div", "tv-col-h");
-      h.append(el("b", null, g.label), el("span", "tv-n", String(mine.length)));
-      col.appendChild(h);
-      const ids = new Set(mine.map((n) => n.id));
-      // a node whose parent is in this group sits under it, indented; the rest are the column's own rows
-      const roots = mine.filter((n) => !n.parent || !ids.has(n.parent));
-      // a parent cycle (a -> b -> a) has no root: every node is drawn once, the unvisited remainder at the column's own level
-      const seen = new Set();
-      const put = (n, depth) => {
-        if (seen.has(n.id)) return;
-        seen.add(n.id);
-        col.appendChild(nodeRow(n, lost, opts, depth));
-        for (const k of mine.filter((m) => m.parent === n.id)) put(k, depth + 1);
-      };
-      for (const n of roots) put(n, 0);
-      for (const n of mine) put(n, 0);
-      if (!mine.length) col.appendChild(el("p", "tv-none", "no nodes"));
-      cols.appendChild(col);
+  const span = (a, b) => { const x = Date.parse(a), y = Date.parse(b); return isNaN(x) || isNaN(y) ? null : y - x; };
+  // what a node's face says. `dur` pieces carry their millisecond value so the ticker can keep them moving without a repaint.
+  function faceOf(n, asOf) {
+    const model = n.model || "model unknown";
+    const tk = fmtTokens(n.tokens);
+    const l2 = model + " · " + (tk === null ? "tokens unknown" : tk + " tok");
+    const tool = typeof n.tool === "string" && n.tool ? n.tool : null;
+    const run = span(n.started, asOf), quiet = span(n.last_event, asOf), ran = span(n.started, n.last_event);
+    const f = { l1: n.label, l2, unknownModel: !n.model, tag: null, tagDur: null, l3: "", l3Dur: null };
+    if (n.state === "idle") {
+      const at = clock(n.last_event);
+      f.l3 = (at ? "quiet since " + at : "idle") + (fmtDur(ran) ? " · ran " + fmtDur(ran) : "");
+    } else if (n.state === "errored") {
+      const at = clock(n.last_event);
+      f.l3 = (tool || "tool") + " · failed" + (at ? " " + at : "");
+    } else {
+      f.l3 = tool || "no tool";
+      if (run !== null) { f.l3Dur = run; f.l3 += " · " + fmtDur(run); }
     }
-    wrap.appendChild(cols);
+    f.tag = { waiting: "WAITING ON YOU", errored: "ERRORED", stalled: "STALLED", idle: "IDLE", running: null }[n.state] || null;
+    if (n.state === "stalled" && quiet !== null) { f.tag = "STALLED · no event " + fmtDur(quiet); f.tagDur = quiet; }
+    return f;
+  }
+  // the geometry of the graph (pure: positions only, no DOM). `measure(text, font)` returns a pixel width.
+  function layoutGraph(v, LW, measure) {
+    const nodes = arr(v.nodes), groups = arr(v.groups).slice();
+    const gids = new Set(groups.map((g) => g.id));
+    if (nodes.some((n) => !gids.has(n.group))) groups.push({ id: null, label: "ungrouped", repo: null, loose: true });   // a node with no group of its own is still drawn
+    const groupOf = (n) => (gids.has(n.group) ? n.group : null);
+    const mineOf = (g) => nodes.filter((n) => groupOf(n) === g.id);
+    const live = groups.filter((g) => mineOf(g).length);
+    const rowsOf = (g) => mineOf(g).length;
+    const order = live.slice().sort((a, b) => rowsOf(b) - rowsOf(a));
+    const side = { L: [], R: [] }, load = { L: 0, R: 0 };
+    for (const g of order) { const s = load.L <= load.R ? "L" : "R"; side[s].push(g); load[s] += rowsOf(g); }
+    const gapOf = (l) => Math.max(0, l.length - 1) * 26;
+    const need = (s) => load[s] * 64 + gapOf(side[s]);
+    const H = Math.max(MIN_H, Math.round(70 + Math.max(need("L"), need("R"))));
+    const hub = { x: LW / 2, y: H / 2 + 6, r: 30 };
+    const gx0 = Math.max(76, Math.min(190, LW / 2 - 262 - 120));
+    const pos = {}, gpos = {};
+    const placed = new Set();
+    for (const sd of ["L", "R"]) {
+      const dir = sd === "L" ? -1 : 1, list = side[sd], gaps = gapOf(list);
+      const pitch = Math.max(64, Math.min(86, (H - 70 - gaps) / Math.max(1, load[sd])));
+      let y = hub.y - (load[sd] * pitch + gaps) / 2 + pitch / 2;
+      for (const g of list) {
+        const mine = mineOf(g), ids = new Set(mine.map((n) => n.id)), ys = [];
+        const put = (n, depth) => {
+          if (placed.has(n.id)) return;
+          placed.add(n.id);
+          const x = hub.x + dir * (gx0 + 120) - dir * Math.min(30 * depth, 90);
+          pos[n.id] = { id: n.id, x, y, side: dir, depth }; ys.push(y); y += pitch;
+          for (const k of mine) if (k.parent === n.id) put(k, depth + 1);
+        };
+        for (const n of mine) if (!n.parent || !ids.has(n.parent)) put(n, 0);
+        for (const n of mine) put(n, 0);                 // a parent cycle has no root: the rest sit at the column's own level
+        const gy = ys.reduce((s, q) => s + q, 0) / (ys.length || 1);
+        gpos[g.id === null ? "" : g.id] = { id: g.id, label: g.label, x: hub.x + dir * gx0, y: gy, r: 16 };
+        y += 26;
+      }
+    }
+    for (const n of nodes) {
+      const f = faceOf(n, v.as_of), p = pos[n.id];
+      let w = Math.max(measure(f.l1, "l1"), measure(f.l2, "l2"), measure(f.l3, "l2"));
+      if (f.tag) w = Math.max(w, measure(f.tag, "tag") + 16);
+      p.tw = w + 6;
+    }
+    return { LW, H, hub, gpos, pos, gkey: (n) => (gids.has(n.group) ? n.group : "") };
+  }
+  // an edge: far end `a` (the event source) to near end `b` (its parent), as the mock bends it
+  function mkEdge(a, b, bend) {
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, nx = -dy / len, ny = dx / len, off = len * bend;
+    return { a, b, len, nx, ny, c1: { x: a.x + dx * 0.33 + nx * off, y: a.y + dy * 0.33 + ny * off }, c2: { x: a.x + dx * 0.68 + nx * off * 0.6, y: a.y + dy * 0.68 + ny * off * 0.6 } };
+  }
+  const edgePath = (e) => "M" + num(e.a.x) + " " + num(e.a.y) + " C" + num(e.c1.x) + " " + num(e.c1.y) + " " + num(e.c2.x) + " " + num(e.c2.y) + " " + num(e.b.x) + " " + num(e.b.y);
+  function bez(e, t) {
+    const u = 1 - t;
+    return { x: u * u * u * e.a.x + 3 * u * u * t * e.c1.x + 3 * u * t * t * e.c2.x + t * t * t * e.b.x, y: u * u * u * e.a.y + 3 * u * u * t * e.c1.y + 3 * u * t * t * e.c2.y + t * t * t * e.b.y };
+  }
+  // the edges the stream runs on, each with its rate (null / 0 / idle = no stream). A group's stream is its nodes' rates summed (events roll up).
+  function graphEdges(v, L) {
+    const byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
+    const streams = (n) => n.state !== "idle" && isNum(n.rate) && n.rate > 0;
+    const gRate = new Map();
+    for (const n of arr(v.nodes)) { const k = L.gkey(n); gRate.set(k, (gRate.get(k) || 0) + (streams(n) ? n.rate : 0)); }
+    const out = [];
+    let i = 0;
+    for (const k of Object.keys(L.gpos)) {
+      const gp = L.gpos[k];
+      out.push({ kind: "hub", id: k, rate: gRate.get(k) || 0, state: null, e: mkEdge({ x: gp.x, y: gp.y }, { x: L.hub.x, y: L.hub.y }, (gp.x < L.hub.x ? -1 : 1) * 0.1 * (i++ % 2 ? 1 : -1)) });
+    }
+    for (const n of arr(v.nodes)) {
+      const a = L.pos[n.id], to = n.parent && L.pos[n.parent] && byId.has(n.parent) ? L.pos[n.parent] : L.gpos[L.gkey(n)];
+      out.push({ kind: "node", id: n.id, rate: streams(n) ? n.rate : 0, state: n.state, e: mkEdge({ x: a.x, y: a.y }, { x: to.x, y: to.y }, 0.12 * (a.y < to.y ? 1 : -1)) });
+    }
+    return out;
+  }
+  // a conflict is drawn between the first node on the file and each other one, the file's name on a chip on the first arc
+  function conflictArcs(v, L) {
+    const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
+    for (const c of arr(v.conflicts)) {
+      if (!isObj(c) || typeof c.path !== "string") continue;
+      const ids = arr(c.nodes).filter((id) => L.pos[id] && byId.has(id));
+      for (let k = 1; k < ids.length; k++) {
+        const A = L.pos[ids[0]], B = L.pos[ids[k]];
+        const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2, dx = B.x - A.x, dy = B.y - A.y, ln = Math.hypot(dx, dy) || 1;
+        const gp = L.gpos[L.gkey(byId.get(ids[0]))] || L.hub;
+        const sg = ((-dy / ln) * (mx - gp.x) + (dx / ln) * (my - gp.y)) >= 0 ? -1 : 1;
+        const cx = mx + (-dy / ln) * 62 * sg, cy = my + (dx / ln) * 62 * sg;
+        out.push({ path: c.path, A, B, cx, cy, chip: k === 1, lx: 0.25 * A.x + 0.5 * cx + 0.25 * B.x, ly: 0.25 * A.y + 0.5 * cy + 0.25 * B.y, ids: [ids[0], ids[k]] });
+      }
+    }
+    return out;
+  }
+
+  // ---- the SVG ----
+  function drawGraph(v, L, edges, measure, opts) {
+    const svg = sv("svg", { viewBox: "0 0 " + L.LW + " " + L.H, role: "group", "aria-label": "Agents graph", preserveAspectRatio: "xMidYMid meet" }, "tv-graph");
+    const nodes = arr(v.nodes), byId = new Map(nodes.map((n) => [n.id, n]));
+    const lost = lostMap(v);
+    for (const k of RING_H) svg.appendChild(sv("ellipse", { cx: num(L.hub.x), cy: num(L.hub.y), rx: num(L.LW * k * 1.15), ry: num(L.H * k * 1.05) }, "tv-gring"));
+    const eg = sv("g", null, "tv-edges");
+    for (const ed of edges) {
+      const live = ed.rate > 0, waiting = ed.kind === "node" && ed.state === "waiting";
+      const p = sv("path", { d: edgePath(ed.e), "data-edge": ed.kind + ":" + ed.id, "data-rate": live ? String(ed.rate) : "none" }, "tv-edge" + (live ? " live" : "") + (ed.kind === "hub" ? " hub" : "") + (waiting ? " waiting" : "") + (!live && !waiting ? " still" : ""));
+      eg.appendChild(p);
+    }
+    svg.appendChild(eg);
+    // file conflicts: the file on the arc
+    for (const a of conflictArcs(v, L)) {
+      const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
+      g.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y) }, "tv-confline"));
+      if (a.chip) {
+        const w = measure(a.path, "chip") + 16;
+        g.appendChild(sv("rect", { x: num(a.lx - w / 2), y: num(a.ly - 10), width: num(w), height: 20, rx: 6 }, "tv-confchip"));
+        g.appendChild(sv("text", { x: num(a.lx), y: num(a.ly + 4), "text-anchor": "middle" }, "tv-conftext", a.path));
+      }
+      svg.appendChild(g);
+    }
+    // the hub: the install, "N sessions · M running"
+    const running = nodes.filter((n) => n.state === "running").length, h = L.hub;
+    const hubLabel = isObj(v.hub) && typeof v.hub.label === "string" ? v.hub.label : "";
+    const hg = sv("g", { "data-hub": isObj(v.hub) && typeof v.hub.id === "string" ? v.hub.id : "" }, "tv-ghub");
+    hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r + 8 }, "tv-hubhalo"));
+    hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: h.r }, "tv-hubbody"));
+    hg.appendChild(sv("circle", { cx: num(h.x), cy: num(h.y), r: 9 }, "tv-hubcore" + (running ? " run" : "")));
+    const hsub = nodes.length + (nodes.length === 1 ? " session" : " sessions") + " · " + running + " running";
+    const hw = Math.max(measure(hsub, "l2"), 70);
+    hg.appendChild(sv("rect", { x: num(h.x - hw / 2 - 7), y: num(h.y - h.r - 42), width: num(hw + 14), height: 40, rx: 7 }, "tv-lblbg"));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 26), "text-anchor": "middle" }, "tv-hubname", hubLabel));
+    hg.appendChild(sv("text", { x: num(h.x), y: num(h.y - h.r - 10), "text-anchor": "middle" }, "tv-hubsub", hsub));
+    svg.appendChild(hg);
+    // the groups: "N agents · M running"
+    for (const k of Object.keys(L.gpos)) {
+      const gp = L.gpos[k], mem = nodes.filter((n) => L.gkey(n) === k);
+      const run = mem.filter((n) => n.state === "running").length, wait = mem.some((n) => n.state === "waiting");
+      const gg = sv("g", { "data-group": k }, "tv-ggroup" + (wait ? " waiting" : ""));
+      gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: gp.r }, "tv-gbody"));
+      gg.appendChild(sv("circle", { cx: num(gp.x), cy: num(gp.y), r: 4 }, "tv-gcore" + (run ? " run" : "")));
+      const sub = mem.length + (mem.length === 1 ? " agent" : " agents") + " · " + run + " running";
+      const lw = Math.max(measure(gp.label, "group"), measure(sub, "l2")), ly = gp.y + gp.r + 18;
+      gg.appendChild(sv("rect", { x: num(gp.x - lw / 2 - 7), y: num(ly - 14), width: num(lw + 14), height: 36, rx: 7 }, "tv-lblbg"));
+      gg.appendChild(sv("text", { x: num(gp.x), y: num(ly), "text-anchor": "middle" }, "tv-gname", gp.label));
+      gg.appendChild(sv("text", { x: num(gp.x), y: num(ly + 15), "text-anchor": "middle" }, "tv-gsub", sub));
+      svg.appendChild(gg);
+    }
+    // the nodes, each with its face
+    const tickers = [];
+    for (const n of nodes) {
+      const P = L.pos[n.id], f = faceOf(n, v.as_of), dir = P.side, wait = n.state === "waiting", r = wait ? 11 : 9;
+      const g = sv("g", { "data-node": n.id, "data-state": n.state }, "tv-gnode " + n.state);
+      g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: 17 }, "tv-hit"));
+      if (wait) {
+        for (let i = 6; i >= 1; i--) g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: r + i * 6, "fill-opacity": num((0.05 + 0.03 * 0.5) * (7 - i) / 6) }, "tv-glow"));
+        g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: r + 10 }, "tv-pulse"));
+      }
+      g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r }, "tv-ring"));
+      if (n.state === "errored") g.appendChild(sv("path", { d: "M" + num(P.x - 3.2) + " " + num(P.y - 3.2) + " L" + num(P.x + 3.2) + " " + num(P.y + 3.2) + " M" + num(P.x + 3.2) + " " + num(P.y - 3.2) + " L" + num(P.x - 3.2) + " " + num(P.y + 3.2) }, "tv-x"));
+      else g.appendChild(sv("circle", { cx: num(P.x), cy: num(P.y), r: wait ? 5.5 : n.state === "idle" ? 3.2 : 4.4 }, "tv-core"));
+      // the face sits outward of the node
+      const tx = P.x + dir * (wait ? 26 : 17), anchor = dir === 1 ? "start" : "end", top = P.y - 22;
+      const bw = P.tw + 8, bh = f.tag ? 66 : 50, bx = dir === 1 ? tx - 5 : tx - P.tw - 3;
+      g.appendChild(sv("rect", { x: num(bx), y: num(P.y - (f.tag ? 30 : 13)), width: num(bw), height: bh, rx: 6 }, "tv-facebg"));
+      if (f.tag) {
+        const tw = measure(f.tag, "tag") + 14, px = dir === 1 ? tx - 3 : tx - tw + 3;
+        if (wait) g.appendChild(sv("rect", { x: num(px), y: num(top - 8), width: num(tw), height: 16, rx: 8 }, "tv-tagpill"));
+        const t = sv("text", { x: num(dir === 1 ? px + 7 : px + tw - 7), y: num(top + 4), "text-anchor": anchor }, "tv-facetag", f.tag);
+        if (f.tagDur !== null) tickers.push({ el: t, ms: f.tagDur, text: (ms) => "STALLED · no event " + fmtDur(ms) });
+        g.appendChild(t);
+      }
+      g.appendChild(sv("text", { x: num(tx), y: num(top + 21), "text-anchor": anchor }, "tv-face1", f.l1));
+      g.appendChild(sv("text", { x: num(tx), y: num(top + 36), "text-anchor": anchor }, "tv-face2" + (f.unknownModel ? " unk" : ""), f.l2));
+      const l3 = sv("text", { x: num(tx), y: num(top + 50), "text-anchor": anchor }, "tv-face3", f.l3);
+      if (f.l3Dur !== null) { const base = f.l3.slice(0, f.l3.length - fmtDur(f.l3Dur).length); tickers.push({ el: l3, ms: f.l3Dur, text: (ms) => base + fmtDur(ms) }); }
+      g.appendChild(l3);
+      const risk = riskTitle(lost.get(n.id));
+      if (risk) g.appendChild(sv("circle", { cx: num(P.x + dir * 12), cy: num(P.y - 12), r: 3.5 }, "tv-gnode-risk"));
+      g.dataset.face = [f.tag, f.l1, f.l2, f.l3].filter(Boolean).join(" | ");
+      if (wait && typeof n.card === "string" && n.card && opts && typeof opts.openCard === "function") {
+        g.classList.add("tv-open");
+        g.setAttribute("role", "button");
+        g.setAttribute("tabindex", "0");
+        g.setAttribute("aria-label", n.label + ", waiting on you: open its card");
+        g.dataset.card = n.card;
+        const go = () => opts.openCard(n.card);
+        g.addEventListener("click", go);
+        g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
+      }
+      svg.appendChild(g);
+    }
+    return { svg, tickers };
+  }
+
+  // the hover card: the whole record of a node, local counts only
+  function tipRows(n, asOf) {
+    const run = fmtDur(span(n.started, asOf)), tk = fmtTokens(n.tokens);
+    const rows = [["state", NODE_WORDS[n.state] || n.state], ["agent", n.agent || "unknown"], ["model", n.model || "model unknown"],
+                  ["tokens", tk === null ? "tokens unknown" : tk + " tok"], ["tool", typeof n.tool === "string" && n.tool ? n.tool : "none"],
+                  ["run time", run || "unknown"], ["last event", clock(n.last_event) || "unknown"],
+                  ["rate", isNum(n.rate) ? n.rate.toFixed(1) + " events/min" : "rate not tracked"]];
+    if (typeof n.card === "string" && n.card) rows.push(["waiting on", n.card]);
+    return rows;
+  }
+
+  // ---- the particles: a canvas under the graph, drawn only while some edge streams ----
+  function startStreams(canvas, stage, edges, getScale) {
+    const reduced = !!(root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    const live = edges.filter((e) => e.rate > 0);
+    stage.dataset.streams = String(live.length);
+    stage.dataset.particles = "0";
+    stage.dataset.motion = reduced ? "off" : "on";
+    if (reduced || !live.length || !canvas.getContext || typeof root.requestAnimationFrame !== "function") return null;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const PART = [];
+    let quality = 1, ema = 16.7, last = 0, n = 0, stopped = false, raf = 0, color = "";
+    const step = (dt) => {
+      for (const ed of live) {
+        ed.acc = (ed.acc || 0) + ed.rate * (ed.kind === "hub" ? 5 : 10) * quality * dt;
+        while (ed.acc >= 1) { ed.acc -= 1; PART.push({ ed, t: 0, sp: 0.22 + Math.random() * 0.22, off: Math.random() + Math.random() - 1, sz: 1.3 + Math.random() * 1.3, hub: ed.kind === "hub" }); }
+      }
+      for (let i = PART.length - 1; i >= 0; i--) { const p = PART[i]; p.t += p.sp * dt * (p.ed.e.len > 200 ? 0.8 : 1.15); if (p.t >= 1) PART.splice(i, 1); }
+      const cap = Math.round(PARTICLE_CAP * quality);
+      if (PART.length > cap) PART.splice(0, PART.length - cap);
+    };
+    const draw = () => {
+      const s = getScale(), dpr = canvas.width / Math.max(1, canvas.clientWidth || canvas.width);
+      ctx.setTransform(dpr * s, 0, 0, dpr * s, 0, 0);
+      ctx.clearRect(0, 0, canvas.width / (dpr * s) + 1, canvas.height / (dpr * s) + 1);
+      ctx.fillStyle = color || "#999";
+      for (const p of PART) {
+        const e = p.ed.e, pt = bez(e, p.t), spread = (p.hub ? 7 : 4.2) * (0.25 + p.t) * p.off;
+        ctx.globalAlpha = Math.pow(Math.sin(Math.PI * Math.min(1, p.t)), 0.7) * (p.hub ? 0.62 : 0.8);
+        ctx.fillRect(pt.x + e.nx * spread - p.sz / 2, pt.y + e.ny * spread - p.sz / 2, p.sz, p.sz);
+      }
+      ctx.globalAlpha = 1;
+    };
+    const loop = (ts) => {
+      if (stopped) return;
+      if (!canvas.isConnected) { stopped = true; return; }
+      const dt = Math.min(0.05, last ? (ts - last) / 1000 : 0.016);
+      last = ts;
+      ema = ema * 0.9 + dt * 1000 * 0.1;                                  // frame-time adaptive: long frames thin the stream
+      if (ema > 24) quality = Math.max(0.15, quality * 0.93); else if (ema < 18) quality = Math.min(1, quality * 1.01);
+      if (n % 60 === 0) color = root.getComputedStyle(canvas).color;
+      step(dt);
+      draw();
+      if (++n % 20 === 0) { stage.dataset.particles = String(PART.length); stage.dataset.quality = quality.toFixed(2); }
+      raf = root.requestAnimationFrame(loop);
+    };
+    for (let i = 0; i < 260; i++) step(0.03);                             // the stream is already flowing when the lens opens
+    stage.dataset.particles = String(PART.length);
+    raf = root.requestAnimationFrame(loop);
+    return () => { stopped = true; if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); PART.length = 0; };
+  }
+
+  function agentsLens(v, opts) {
+    release();
+    const wrap = el("div", "tv-agents");
+    const stage = el("div", "tv-stage");
+    stage.appendChild(el("span", "tv-hint", "Click a node for its card. Hover for the face."));
+    const canvas = el("canvas", "tv-particles");
+    canvas.setAttribute("aria-hidden", "true");
+    stage.appendChild(canvas);
+    const tip = el("div", "tv-tip");
+    tip.hidden = true;
+    tip.setAttribute("aria-hidden", "true");
+    wrap.appendChild(stage);
+    let LW = 0, svgNode = null, scale = 1, built = false;
+    const mctx = document.createElement("canvas").getContext ? document.createElement("canvas").getContext("2d") : null;
+    const build = (W) => {
+      const cs = root.getComputedStyle(stage);
+      const fonts = { l1: "600 12px " + (cs.getPropertyValue("--round").trim() || "sans-serif"), l2: "500 11px " + (cs.getPropertyValue("--mono").trim() || "monospace"),
+                      tag: "700 10px " + (cs.getPropertyValue("--round").trim() || "sans-serif"), group: "700 13px " + (cs.getPropertyValue("--round").trim() || "sans-serif"),
+                      chip: "600 11px " + (cs.getPropertyValue("--mono").trim() || "monospace") };
+      const measure = (text, k) => { if (mctx) { mctx.font = fonts[k]; return mctx.measureText(String(text)).width; } return String(text).length * 6.4; };
+      LW = Math.max(MIN_LW, Math.round(W));
+      scale = Math.min(1, W / LW);
+      const L = layoutGraph(v, LW, measure);
+      const edges = graphEdges(v, L);
+      if (streamStop) { streamStop(); streamStop = null; }
+      if (svgNode) svgNode.remove();
+      const g = drawGraph(v, L, edges, measure, opts);
+      svgNode = g.svg;
+      stage.insertBefore(svgNode, canvas);
+      // the canvas keeps the graph's own proportions: CSS size follows the SVG, the backing store follows the device
+      const cssW = Math.round(W), cssH = Math.round(L.H * scale), dpr = Math.min(2, root.devicePixelRatio || 1);
+      canvas.width = Math.max(1, Math.round(cssW * dpr)); canvas.height = Math.max(1, Math.round(cssH * dpr));
+      canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
+      if (ticker) { root.clearInterval(ticker); ticker = null; }
+      if (g.tickers.length) {
+        const t0 = (root.performance && root.performance.now ? root.performance.now() : Date.now());
+        const nowMs = () => (root.performance && root.performance.now ? root.performance.now() : Date.now());
+        ticker = root.setInterval(() => {
+          if (!stage.isConnected) { root.clearInterval(ticker); ticker = null; return; }
+          const d = nowMs() - t0;
+          for (const t of g.tickers) t.el.textContent = t.text(t.ms + d);
+        }, 20000);
+      }
+      streamStop = startStreams(canvas, stage, edges, () => scale);
+      stage.dataset.nodes = String(arr(v.nodes).length);
+      built = true;
+    };
+    build(920);                                                           // a width to draw at before the card has one; the observer redraws at the real one
+    let seen = 0;
+    if (typeof ResizeObserver === "function") {
+      linkObserver = new ResizeObserver(() => {
+        const w = Math.round(stage.getBoundingClientRect().width);
+        if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
+      });
+      linkObserver.observe(stage);
+    }
+    // the hover card follows the pointer over a node, inside the stage
+    const nodeOf = (t) => (t && t.closest ? t.closest("[data-node]") : null);
+    const byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
+    stage.addEventListener("pointermove", (ev) => {
+      const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
+      if (!n) { tip.hidden = true; return; }
+      if (tip.dataset.node !== n.id) {
+        tip.dataset.node = n.id;
+        while (tip.firstChild) tip.removeChild(tip.firstChild);
+        tip.appendChild(el("b", null, n.label));
+        for (const [k, val] of tipRows(n, v.as_of)) { const r = el("div"); r.append(el("span", "tv-tl", k), val); tip.appendChild(r); }
+      }
+      tip.hidden = false;
+      const box = stage.getBoundingClientRect(), x = ev.clientX - box.left, y = ev.clientY - box.top;
+      tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, x + 16)) + "px";
+      tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
+    });
+    stage.addEventListener("pointerleave", () => { tip.hidden = true; tip.dataset.node = ""; });
+    stage.appendChild(tip);
     return wrap;
+  }
+
+  // the legend under the Agents graph: the five states and what a stream is
+  function legendAgents() {
+    const l = el("div", "tv-legend tv-legend-agents");
+    for (const st of ["waiting", "errored", "stalled", "running", "idle"]) {
+      const i = el("span", "tv-leg");
+      const k = el("i", "tv-lg " + st);
+      k.setAttribute("aria-hidden", "true");
+      i.append(k, st === "waiting" ? "waiting on you" : st);
+      l.appendChild(i);
+    }
+    l.appendChild(el("span", "tv-legdef", "streams carry events per minute; none when idle"));
+    return l;
   }
 
   // ---- the legend under the Work columns: the five states and the two definitions that keep waiting and stuck apart ----
@@ -566,7 +912,7 @@
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
     w.appendChild(which === "agents" ? agentsLens(v, o) : workLens(v, o));
-    if (which !== "agents") w.appendChild(legend());
+    w.appendChild(which === "agents" ? legendAgents() : legend());
     const q = quietLine(v);
     if (q) w.appendChild(q);
     return w;

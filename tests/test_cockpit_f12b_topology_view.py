@@ -215,7 +215,7 @@ def test_null_is_drawn_as_unknown_and_a_real_zero_stays_a_zero(tmp_path, monkeyp
     v = _value()
     probe = ("JSON.stringify({costs: Object.fromEntries([...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, (t.querySelector('.tv-cost') || {textContent: null}).textContent])), "
              "chips: [...%s.querySelectorAll('.tv-chip')].map(c => [c.textContent, c.title]), "
-             "nodes: Object.fromEntries([...%s.querySelectorAll('.tv-node')].map(n => [n.dataset.node, n.querySelector('.tv-node-m').textContent + ' | ' + n.querySelector('.tv-node-f').textContent]))})") % ((TV,) * 3)
+             "nodes: Object.fromEntries([...%s.querySelectorAll('.tv-gnode')].map(n => [n.dataset.node, n.dataset.face]))})") % ((TV,) * 3)
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe},
                                {"eval": _paint(v, "agents")}, {"eval": probe}])
     work, agents = json.loads(out[-3]), json.loads(out[-1])
@@ -227,25 +227,10 @@ def test_null_is_drawn_as_unknown_and_a_real_zero_stays_a_zero(tmp_path, monkeyp
     assert ["claude_code · ledgerline", "claude_code · claude-opus-5-5"] in work["chips"] or any("opus" in c[1] for c in work["chips"]), work
     assert any("model unknown" in c[1] for c in work["chips"]), work
     n1, n3, n4 = agents["nodes"]["n1"], agents["nodes"]["n3"], agents["nodes"]["n4"]
-    assert "claude-opus-5-5" in n1 and "412K tok" in n1 and re.search(r"3\.[23] events/min", n1), n1
-    assert "model unknown" in n3 and "tokens not tracked" in n3 and "rate not tracked" in n3, n3
-    assert "model unknown" in n4 and "96K tok" in n4 and "rate not tracked" in n4, n4
-    assert "0.0 events/min" in agents["nodes"]["n2"], agents                            # a log with no events is a real zero
+    assert "claude-opus-5-5" in n1 and "412K tok" in n1, n1
+    assert "model unknown" in n3 and "tokens unknown" in n3, n3
+    assert "model unknown" in n4 and "96K tok" in n4, n4
 
-
-@needs_browser
-def test_the_agents_lens_is_columns_under_a_hub_with_subagents_indented(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify({hub: %s.querySelector('.tv-hub b').textContent, "
-             "cols: [...%s.querySelectorAll('.tv-col')].map(c => [c.querySelector('.tv-col-h b').textContent, [...c.querySelectorAll('.tv-node')].map(n => n.dataset.node + (n.classList.contains('sub') ? '*' : ''))]), "
-             "x: [...%s.querySelectorAll('.tv-col')].map(c => Math.round(c.getBoundingClientRect().left)), canvas: !!%s.querySelector('canvas'), "
-             "waiting_open: !!%s.querySelector('.tv-node.waiting.tv-open')})") % ((TV,) * 5)
-    out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}])
-    got = json.loads(out[-1])
-    assert got["hub"] == "Sage" and got["canvas"] is False, got                          # columns, not a force graph
-    assert got["cols"] == [["ledgerline", ["n1", "n2*", "n3"]], ["tally", ["n4", "n5"]]], got
-    assert got["x"][0] != got["x"][1], got                                               # side by side
-    assert got["waiting_open"] is True, got
 
 
 @needs_browser
