@@ -132,11 +132,17 @@ def _qualified(repo: str, parent: str, frag: str | None = None) -> str:
 
 # --- the sessions ----------------------------------------------------------------------------------------------
 
-def _records(install_root: Path, now: datetime, back_s: float = 0.0) -> list[dict[str, Any]]:
+def _records(install_root: Path, now: datetime, back_s: float = 0.0, *, at: datetime | None = None,
+             meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """The session records the Sessions panel lists (its reader, caps and 24-hour horizon), newest first. Raises
     ``OSError`` for a sessions directory that cannot be read; no directory is no sessions. ``back_s`` widens the
     horizon by that much (a past read at ``now - back_s`` keeps every record last seen inside ITS 24 hours; the
-    caller then drops what had not started, or was quiet past the horizon, at that instant)."""
+    caller then drops what had not started, or was quiet past the horizon, at that instant).
+
+    A past read passes ``at`` (T): every record in the scan is read and the ones that could have been live at T are kept
+    BEFORE the ``SESSIONS_SHOWN`` cap (the newest files by mtime are the sessions still running now, which would
+    otherwise crowd out the ones that ended after T). When the scan limit or that cap still leaves out records that
+    might have been live at T, ``meta["truncated"]`` says so: the caller names the source, never draws it whole."""
     from levain.cockpit.providers import (SESSION_LISTED_S, SESSION_SKEW_S, SESSIONS_SCAN, SESSIONS_SHOWN,
                                           _session_record)
 
@@ -146,6 +152,8 @@ def _records(install_root: Path, now: datetime, back_s: float = 0.0) -> list[dic
         with os.scandir(sdir) as it:
             for n, e in enumerate(it):
                 if n >= SESSIONS_SCAN:
+                    if meta is not None:
+                        meta["truncated"] = True
                     break
                 try:
                     if e.name.endswith(".json") and e.is_file(follow_symlinks=False):
@@ -156,13 +164,21 @@ def _records(install_root: Path, now: datetime, back_s: float = 0.0) -> list[dic
         return []
     found.sort(key=lambda p: p[0], reverse=True)
     out = []
-    for _mt, path in found[:SESSIONS_SHOWN]:
+    for _mt, path in (found if at is not None else found[:SESSIONS_SHOWN]):
         rec = _session_record(path)
         if rec is None:
             continue
         age = (now - rec["_seen"]).total_seconds()
         if age < -SESSION_SKEW_S or age > SESSION_LISTED_S + back_s:
             continue
+        if at is not None:
+            first = min(act._parse(rec.get("first_seen")) or rec["_seen"], rec["_seen"])
+            if first > at:
+                continue                    # not started at T
+            if len(out) >= SESSIONS_SHOWN:
+                if meta is not None:
+                    meta["truncated"] = True
+                break
         out.append(rec)
     return out
 
@@ -366,6 +382,9 @@ def _consent_waiting(listing: Any, at: datetime | None, listed_at: datetime | No
     recent = getattr(listing, "recent", None)
     if recent is None:
         raise LookupError("this consent reader lists no decided requests")
+    if getattr(listing, "overflow", False) or getattr(listing, "skipped", 0):
+        raise LookupError("the consent listing is incomplete (a pending list cut at its cap, or rows that did not check "
+                          "out): a request waiting at T may be missing")
     if len(recent) >= RECENT_CAP:
         stamps = [t for t in (act._parse(e.decided_at) for e in recent if e.decided_at) if t is not None]
         if not stamps or min(stamps) > at:
@@ -602,10 +621,13 @@ def topology_reader(*, install_root: Path | None,
         if install_root is None:
             return Fault("topology is blind: no install root, the sessions are kept in the install")
         try:
-            recs = (_records(install_root, ctx.now, back_s=(ctx.now - now).total_seconds()) if past
+            meta: dict[str, Any] = {}
+            recs = (_records(install_root, ctx.now, back_s=(ctx.now - now).total_seconds(), at=at, meta=meta) if past
                     else _records(install_root, ctx.now))
         except OSError as exc:
             return Fault(f"topology is blind: the session records are unreadable ({type(exc).__name__})")
+        if meta.get("truncated"):
+            blind("session_records", f"{NOT_KEPT} (more session records than were read: a session live at T may be missing)")
 
         # who waits on a record: a session (agent, session id) -> its first card
         waiting_card: dict[tuple[str, str], str] = {}
@@ -673,15 +695,17 @@ def topology_reader(*, install_root: Path | None,
             # a past read always reads the log: the record's stamp at T may be its first, older than its activity at T
             if past or (now - seen).total_seconds() < SESSION_ACTIVE_S:
                 last_log, last_kind, rate = _log_signal(install_root, stem, now, past=past)
-            if past and _log_reaches(install_root, stem, now - timedelta(seconds=SESSION_ACTIVE_S)) is False:
+            rotated = past and _log_reaches(install_root, stem, now - timedelta(seconds=SESSION_ACTIVE_S)) is False
+            if rotated:
                 # rotated past T's window: its kind and rate at T are not kept (its newest event at or before T, when
                 # one survived, is still a real event); the node is drawn from the record, as one with no log is
-                unsure.add(nid)
                 last_kind, rate = None, None
             # no log: the record alone, which a turn's end never updates (so it never reads STALLED)
             last = max(t for t in (seen, last_log) if t is not None)
             if past and (now - last).total_seconds() > SESSION_LISTED_S:
                 continue                           # quiet past the Sessions panel's horizon at T: not listed then
+            if rotated:
+                unsure.add(nid)                    # counted only for a node that is drawn
             found, _why = tree_of(cwd)
             if found is not None:
                 repo = act.repo_label(found[0])
