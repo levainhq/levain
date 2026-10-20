@@ -1574,6 +1574,7 @@ body.ke .needs-headline { display: flex; align-items: baseline; gap: var(--sp-4)
 body.ke .needs-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .needs-count { font: var(--fw-bold) var(--fs-meta)/1 var(--mono); color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 999px; padding: var(--sp-1) var(--sp-3); }
 body.ke .needs-gloss { font-size: var(--fs-meta); color: var(--meta); }
+body.ke .needs-order { font-size: var(--fs-meta); color: var(--meta); text-transform: uppercase; letter-spacing: .06em; }
 body.ke .needs-history { margin-left: auto; font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
 body.ke .needs-history:hover { color: var(--text); border-color: var(--label); }
 body.ke .needs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: var(--gap); margin-top: var(--sp-4); align-items: stretch; }

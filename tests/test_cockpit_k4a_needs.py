@@ -57,12 +57,15 @@ def test_the_strip_lists_what_waits_loudest_first_and_a_bare_install_has_no_stri
             {"eval": f"JSON.stringify({{kinds: {CARDS}.map(c => c.dataset.needsCard), tools: {CARDS}.map(c => (c.querySelector('.consent-tool')||{{}}).textContent),"
                      " head: document.querySelector('#ck-needs').innerText.slice(0, 40),"
                      " order: (document.querySelector('#ck-needs .needs-order') || {textContent: ''}).textContent,"
+                     " bar: [...document.querySelectorAll('#ck-needs .needs-chip-btn')].map(b => b.textContent),"
                      " above: document.getElementById('ck-needs').getBoundingClientRect().top > document.getElementById('ck-hero').getBoundingClientRect().top})"}])["values"][-1]
     got = json.loads(got)
     assert got["kinds"] == ["question", "consent", "consent"], got      # as the mock draws it: the open question first, then the clocked requests, soonest expiry first
     assert got["tools"][1:] == ["Bash", "Write"], got
     assert got["head"].lower().startswith("needs you") and got["above"] is True, got
     assert "questions first, then soonest to expire" in got["order"].lower(), got
+    # the bar (the only surface on Build and Memory) leads with the clocked requests, as the mock's Build bar does
+    assert got["bar"][0].startswith("Bash ") and got["bar"][1].startswith("Write ") and len(got["bar"]) == 3, got   # consents, then the question
 
 
 @needs_browser
@@ -135,10 +138,10 @@ def test_time_left_reads_in_whole_units_never_minutes_and_seconds(tmp_path: Path
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         got = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": READY},
-            {"eval": "JSON.stringify({cards: [...document.querySelectorAll('#ck-needs .needs-left')].map(n => n.textContent),"
+            {"eval": "JSON.stringify({cards: [...document.querySelectorAll('#ck-needs .needs-consent .needs-left')].map(n => n.textContent),"
                      " tile: " + TILE + ".innerText.replace(/\\s+/g, ' ')})"}])["values"][-1]
     got = json.loads(got)
-    assert got["cards"][1].endswith(" m left") and not any(__import__("re").search(r"\d+m\d+s", c) for c in got["cards"]), got
+    assert got["cards"][0].endswith(" m left") and not any(__import__("re").search(r"\d+m\d+s", c) for c in got["cards"]), got
     assert not __import__("re").search(r"\d+m\d+s", got["tile"]), got
 
 

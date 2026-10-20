@@ -4254,7 +4254,9 @@
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
     head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
-    head.appendChild(el("span", "needs-order ext-meta", "questions first, then soonest to expire"));
+    if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
+      head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
+    }
     const hist = el("button", "needs-history", "all decisions");
     hist.type = "button";
     hist.title = "decided requests, outcomes and standing-rule proposals";
@@ -4317,7 +4319,10 @@
     bar.appendChild(el("b", "needs-bar-title", "Needs you"));
     bar.appendChild(el("span", "needs-count", String(items.length)));
     const chips = el("div", "needs-chips");
-    for (const it of items.slice(0, NEEDS_CHIPS)) {
+    // the bar is the only surface on Build and Memory: as the mock's Build bar draws it, the requests on a clock come first, so an
+    // expiring one is never folded behind "+N more" by questions (the cards keep the questions first)
+    const barOrder = items.filter((it) => it.kind === "consent").concat(items.filter((it) => it.kind !== "consent"));
+    for (const it of barOrder.slice(0, NEEDS_CHIPS)) {
       const chip = el("button", "needs-chip-btn", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
       chip.type = "button";
       const id = it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : "");
