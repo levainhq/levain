@@ -45,7 +45,7 @@ from levain.coordinator.store import (
     SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256,
 )
 from levain.dispatch.adopt import GitFault, branch_problem
-from levain.dispatch.contract import MAX_LIFETIME
+from levain.dispatch.contract import MAX_LIFETIME, git_env
 
 __all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStore"]
 
@@ -114,8 +114,7 @@ def _git_toplevel(repo: str) -> str | None:
     """The realpath of ``repo``'s work tree top, by git itself; None when it is not one (a bare repo included)."""
     try:
         cp = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True, timeout=30,
-                            env={**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-                                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+                            env=git_env(), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if cp.returncode != 0:
