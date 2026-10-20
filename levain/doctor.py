@@ -92,6 +92,14 @@ def _emit(r: CheckResult) -> None:
 
 
 def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
+    # one `claude --version` per run, however many rows ask for the version
+    from levain.consent.canary import versions_read_once
+
+    with versions_read_once():
+        return _run_doctor(path, invoke=invoke, repin_hooks=repin_hooks)
+
+
+def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain doctor — checking {install}\n")
 
@@ -2980,12 +2988,15 @@ def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[Che
                                 f"Run `levain update` to move them to {want_label}.", warn=True))
     else:
         hooks, label = want_hooks, want_label
-    stale = sorted({s for src in (local_ours, shared_ours) for groups in src.values() for g in groups
-                    for h in g.get("hooks", []) if (s := stale_levain_handler(h)) is not None})
-    if stale:
+    stale_at = {(event, s) for src in (local_ours, shared_ours) for event, groups in src.items() for g in groups
+                for h in g.get("hooks", []) if (s := stale_levain_handler(h)) is not None}
+    if stale_at:
+        events = sorted({e for e, _ in stale_at})
         rows.append(CheckResult("levain hook scripts", True,
-                                "a levain hook names a missing script (moved workspace?): " + ", ".join(stale)
-                                + " (UserPromptSubmit's exits 2, which blocks the prompt)",
+                                "a levain hook names a missing script (moved workspace?): "
+                                + ", ".join(sorted({s for _, s in stale_at})) + f" (on {', '.join(events)})"
+                                + ("; the UserPromptSubmit hook exits 2, which blocks the prompt"
+                                   if "UserPromptSubmit" in events else ""),
                                 "Run `levain update`.", warn=True))
     # the placeholder is the start folder: wrong only where a subfolder start loads the hooks (the local layout)
     templated = sorted({event for src in (local_ours, shared_ours) for event, groups in src.items() for g in groups
@@ -3014,7 +3025,7 @@ def _cc_local_layout_rows(install: Path) -> list[CheckResult]:
     ``.claude/settings.local.json`` (it carries this machine's absolute paths, and Claude Code holds a tracked
     file's allow rules until the folder is trusted)."""
     from levain.consent.canary import agent_version
-    from levain.host_guard import git_env, parse_cc_version
+    from levain.host_guard import git_binary, git_env, parse_cc_version
 
     rows: list[CheckResult] = []
     version = parse_cc_version(agent_version("claude_code", timeout=10.0) or "")
@@ -3026,10 +3037,11 @@ def _cc_local_layout_rows(install: Path) -> list[CheckResult]:
                                 "the root's), so a session started in a subfolder runs no levain hook",
                                 f"Update Claude Code to {floor} or later.", warn=True))
     rel = ".claude/settings.local.json"
+    git = git_binary()
     try:
-        r = subprocess.run(["git", "-C", str(install), "ls-files", "--", rel], capture_output=True, text=True,
-                           timeout=10, env=git_env())
-        tracked = r.returncode == 0 and bool(r.stdout.strip())
+        r = subprocess.run([git, "-C", str(install), "ls-files", "--", rel], capture_output=True, text=True,
+                           timeout=10, env=git_env()) if git is not None else None
+        tracked = r is not None and r.returncode == 0 and bool(r.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         tracked = False
     if tracked:
@@ -3043,12 +3055,16 @@ def _cc_local_layout_rows(install: Path) -> list[CheckResult]:
 
 def _entries_for(entries: Any, install: Path, script: str) -> list:
     """``entries`` (an event's groups) narrowed to the first handler targeting this install's ``script``, wherever
-    it sits in the list (the user's own handlers come first in a merged file); ``entries`` unchanged when none
-    does, so the checks below report the first command as before."""
+    it sits in the list (the user's own handlers come first in a merged file), as its own group (``matcher`` and
+    the group's other keys kept) holding only that handler; ``entries`` unchanged when none does, so the checks
+    below report the first command as before. A group whose ``hooks`` is not a list, or a handler that is not an
+    object with a string ``command``, is passed over: a malformed group after a valid one is not a crash (L3 r2)."""
     for g in entries if isinstance(entries, list) else ():
-        for h in (g.get("hooks") if isinstance(g, dict) else None) or ():
-            if isinstance(h, dict) and _hook_command_targets([{"hooks": [h]}], install, script):
-                return [{"hooks": [h]}]
+        hs = g.get("hooks") if isinstance(g, dict) else None
+        for h in hs if isinstance(hs, list) else ():
+            if (isinstance(h, dict) and isinstance(h.get("command"), str)
+                    and _hook_command_targets([{"hooks": [h]}], install, script)):
+                return [{**g, "hooks": [h]}]
     return entries
 
 

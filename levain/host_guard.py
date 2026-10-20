@@ -725,6 +725,20 @@ CC_HOOKS_ROOT_ONLY = ("Claude Code reads levain's hooks only when it starts at t
                       "started in a subfolder is not covered)")
 
 
+# The git levain asks (L3 r3 G1): a fixed binary, never one PATH finds (a session's PATH can name a workspace bin/
+# holding a planted git).
+GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+_GIT_BINARY: list[str | None] = []   # resolved once per process: [path] or [None]
+
+
+def git_binary() -> str | None:
+    """The first existing executable of :data:`GIT_CANDIDATES`, resolved once per process; None when there is none
+    (each caller then does what it does when git fails)."""
+    if not _GIT_BINARY:
+        _GIT_BINARY.append(next((g for g in GIT_CANDIDATES if os.path.isfile(g) and os.access(g, os.X_OK)), None))
+    return _GIT_BINARY[0]
+
+
 def git_env() -> dict[str, str]:
     """The environment for asking git about a workspace: this process's without any ``GIT_*`` variable, so a caller's
     GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE (a git hook, an alias) cannot make git answer about another repository."""
@@ -747,9 +761,13 @@ def cc_levain_hooks_file(install: str | os.PathLike[str]) -> Path:
     local = ws / ".claude" / "settings.local.json"
     env = git_env()
 
+    git = git_binary()
+
     def ask(*args: str) -> str | None:
+        if git is None:
+            return None
         try:
-            r = subprocess.run(["git", "-C", str(ws), "rev-parse", *args], capture_output=True, text=True,
+            r = subprocess.run([git, "-C", str(ws), "rev-parse", *args], capture_output=True, text=True,
                                timeout=10, env=env)
         except (OSError, subprocess.SubprocessError):
             return None

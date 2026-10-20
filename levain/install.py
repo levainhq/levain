@@ -2088,13 +2088,16 @@ def _ensure_local_settings_ignored(install: Path) -> str | None:
     interpreter and install paths. Returns a line to report, or None (not git, already ignored, or git missing)."""
     rel = "/".join(CC_LOCAL_SETTINGS_REL)
 
-    from levain.host_guard import git_env
+    from levain.host_guard import git_binary, git_env
 
     env = git_env()
+    binary = git_binary()
 
     def git(*args: str) -> int | None:
+        if binary is None:
+            return None
         try:
-            return subprocess.run(["git", "-C", str(install), *args], capture_output=True, timeout=10,
+            return subprocess.run([binary, "-C", str(install), *args], capture_output=True, timeout=10,
                                   env=env).returncode
         except (OSError, subprocess.SubprocessError):
             return None
@@ -2187,6 +2190,30 @@ def _write_claude_code_local_hooks(install: Path, in_local: bool, doc: dict | No
         emit(f"  {'/'.join(CC_LOCAL_SETTINGS_REL)}: levain's hooks taken out (they live in .claude/settings.json "
              f"for this workspace)")
     emit(f"  note: {CC_HOOKS_ROOT_ONLY}.")
+
+
+def _cc_local_refusal(install: Path, in_local: bool) -> str | None:
+    """`levain update`'s check of ``.claude/settings.local.json``, made before it writes anything: the line to print
+    when the file stops the update, else None. In the local layout (``in_local``) a file levain cannot read, or whose
+    hooks it cannot merge into (not an object, an event that is not a list), stops it. In the settings.json layout a
+    file levain cannot read is left alone and stops nothing (L3 r2 T1); one that holds levain's handlers and cannot
+    be rewritten without them stops it."""
+    key = "/".join(CC_LOCAL_SETTINGS_REL)
+    try:
+        doc = _read_local_settings(install.joinpath(*CC_LOCAL_SETTINGS_REL))
+    except (OSError, ValueError) as e:
+        return (f"  {key}: could not be read ({e}), so levain's hooks cannot be written to it; fix it and run "
+                f"`levain update` again.") if in_local else None
+    if not in_local and not _split_hooks(doc.get("hooks", {}), install, ours=True):
+        return None
+    try:
+        _merge_local_hooks(doc, {}, install)
+    except ValueError as e:
+        return (f"  {key}: could not be merged ({e}), so levain's hooks cannot be written to it; fix it and run "
+                f"`levain update` again." if in_local else
+                f"  {key}: holds levain's hooks and could not be rewritten without them ({e}); fix it and run "
+                f"`levain update` again.")
+    return None
 
 
 def _refresh_local_hooks(install: Path, ours: Mapping[str, Any], *, apply: bool, out: AdapterRefresh,
@@ -3453,6 +3480,20 @@ def _refresh_adapter(
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
             return out
+        cc_aliased = cc_in_local = False
+        if adapter == "claude-code":
+            from levain.host_guard import cc_settings_aliased
+
+            cc_aliased = cc_settings_aliased(install)
+            cc_in_local = not cc_aliased and _cc_hooks_in_local(install)
+            # before ANY write (L3 r2 S4): a local file that stops the hooks step stops the whole refresh, or the
+            # activation tree would move ahead of hooks that could not follow it
+            stop = None if cc_aliased else _cc_local_refusal(install, cc_in_local)
+            if stop is not None:
+                out.review.append("/".join(CC_LOCAL_SETTINGS_REL))
+                emit("\n• adapter files NOT refreshed, none of them (activation, carrier and settings alike):")
+                emit(stop)
+                return out
         _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
         # The default-mode lists below are the whole seed set on purpose: the eager and
@@ -3522,12 +3563,8 @@ def _refresh_adapter(
                 # inferred from the file's text (spore-866 L3 r1-r7; ruled 2026-10-10 "go
                 # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
-        carried = cc_aliased = False
-        cc_in_local = adapter == "claude-code" and _cc_hooks_in_local(install)
+        carried = False
         if adapter == "claude-code":
-            from levain.host_guard import cc_settings_aliased
-
-            cc_aliased = cc_settings_aliased(install)
             if cc_aliased:
                 # one file under two names: no split, no migration, no rewrite, never a delete (L3 r1)
                 out.review.append(".claude/settings.json")

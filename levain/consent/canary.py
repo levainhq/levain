@@ -24,6 +24,7 @@ request AND the agent reported the denial AND the sentinel file does not exist; 
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,9 +63,37 @@ class UntestedAgentVersion(RuntimeError):
     """The agent's version is not one the consent hook was tested with, and no override was given."""
 
 
+# Inside versions_read_once(): each (agent, binary) read's answer, reused; None outside it.
+_VERSIONS_READ: dict[tuple[str, str | None], str | None] | None = None
+
+
+@contextlib.contextmanager
+def versions_read_once() -> Iterator[None]:
+    """Within it each agent's version is read at most once (the first answer, a failed read included, is reused):
+    for a caller with several rows about one agent version, so one run spawns ``<bin> --version`` once."""
+    global _VERSIONS_READ
+    outer = _VERSIONS_READ
+    if outer is None:
+        _VERSIONS_READ = {}
+    try:
+        yield
+    finally:
+        _VERSIONS_READ = outer
+
+
 def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.0) -> str | None:
     """The installed agent's version: ``<bin> --version`` exited 0 and its whole output is the agent's version line
-    (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way."""
+    (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way. Inside
+    :func:`versions_read_once`, read once per agent and binary."""
+    memo = _VERSIONS_READ
+    if memo is None:
+        return _read_agent_version(agent, binary, timeout)
+    if (agent, binary) not in memo:
+        memo[(agent, binary)] = _read_agent_version(agent, binary, timeout)
+    return memo[(agent, binary)]
+
+
+def _read_agent_version(agent: str, binary: str | None, timeout: float) -> str | None:
     binary = binary or shutil.which(AGENT_BINS[agent])
     if not binary:
         return None

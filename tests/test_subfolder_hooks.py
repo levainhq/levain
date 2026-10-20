@@ -632,3 +632,128 @@ def test_r2_t7_the_local_file_is_replaced_whole_and_keeps_its_mode(tmp_path, ini
     st = os.stat(lfile)
     assert st.st_ino != ino and (st.st_mode & 0o777) == 0o640  # temp file + os.replace, mode carried
     assert not [p.name for p in (cc / ".claude").iterdir() if p.name.endswith(".tmp")]
+
+
+# --- fix r3 (b4/subhook_FIX_r3.md) -------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("junk", [{"hooks": 7}, {"hooks": [{"type": "command", "command": 5}]},
+                                  {"hooks": [7]}, "x"])
+def test_r3_u1_a_malformed_group_after_a_valid_one_is_not_a_crash(make_install, junk):
+    cc = make_install("cc")
+    lfile = cc.joinpath(*LOCAL)
+    doc = _json(lfile)
+    for event in ("SessionStart", "UserPromptSubmit"):
+        mine = {"hooks": [{"type": "command", "command": "/bin/echo mine"}]}
+        doc["hooks"][event] = [mine, junk, *doc["hooks"][event]]
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+    res = doctor._check_claude_code(cc)
+    for event, script in (("SessionStart", "session_start.py"), ("UserPromptSubmit", "user_prompt_submit.py")):
+        r = _row(res, f"settings {event} → {script}")
+        assert r.ok and "wired to this install" in r.detail, r
+
+
+def test_r3_u1_the_narrowed_group_keeps_its_matcher(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "activation" / "hooks").mkdir(parents=True)
+    script = ws / "activation" / "hooks" / "session_start.py"
+    script.write_text("", encoding="utf-8")
+    h = {"type": "command", "command": f'"/py" "{script}"'}
+    entries = [{"hooks": [{"type": "command", "command": "/bin/echo mine"}]},
+               {"matcher": "startup", "timeout": 9, "hooks": [{"type": "command", "command": "/bin/true"}, h]}]
+    assert doctor._entries_for(entries, ws, "session_start.py") == [{"matcher": "startup", "timeout": 9,
+                                                                      "hooks": [h]}]
+
+
+def _activation_from_an_older_release(install: Path) -> tuple[Path, bytes]:
+    """An unedited activation hook an older levain wrote, so `levain update` replaces it: (path, its bytes)."""
+    rel = "hooks/_levain_hook.py"
+    hook = install / "activation" / rel
+    old = b"# old hook\n"
+    hook.write_bytes(old)
+    receipt = inst.activation_receipt_path(install)
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data["files"][rel]["installed"] = hashlib.sha256(old).hexdigest()
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    return hook, old
+
+
+def test_r3_u2_update_writes_nothing_when_the_local_file_stops_it(make_install):
+    cc = make_install("cc")
+    lfile, shared = cc.joinpath(*LOCAL), cc / ".claude" / "settings.json"
+    hook, old = _activation_from_an_older_release(cc)
+    doc = _json(lfile)
+    doc["hooks"]["Stop"] = 7
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+    before = {p: p.read_bytes() for p in (lfile, shared, cc / "CLAUDE.md", inst.activation_receipt_path(cc))}
+    r, text = _refresh(cc)
+    assert "/".join(LOCAL) in r.review and not r.refreshed and "not lists" in text, text
+    assert "NOT refreshed, none of them" in text, text
+    assert hook.read_bytes() == old
+    assert {p: p.read_bytes() for p in before} == before
+    # the same install with the local file fixed: the activation hook is replaced (the setup was a real change)
+    doc["hooks"].pop("Stop")
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+    r, text = _refresh(cc)
+    assert "activation/hooks/_levain_hook.py" in r.refreshed and hook.read_bytes() != old, text
+
+
+def test_r3_u2_update_writes_nothing_when_the_local_file_is_unreadable(make_install):
+    cc = make_install("cc")
+    hook, old = _activation_from_an_older_release(cc)
+    cc.joinpath(*LOCAL).write_bytes(b"{not json")
+    r, text = _refresh(cc)
+    assert "/".join(LOCAL) in r.review and "could not be read" in text and hook.read_bytes() == old, text
+    assert cc.joinpath(*LOCAL).read_bytes() == b"{not json"
+
+
+def _stale_on(install: Path, event: str) -> None:
+    """Point levain's ``event`` handlers at a workspace that no longer exists (a moved one's leftovers)."""
+    lfile = install.joinpath(*LOCAL)
+    doc = _json(lfile)
+    doc["hooks"][event] = json.loads(json.dumps(doc["hooks"][event]).replace(str(install), "/nonexistent/old-ws"))
+    lfile.write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.mark.parametrize("event,blocks", [("SessionStart", False), ("UserPromptSubmit", True)])
+def test_r3_u3_the_stale_row_names_the_event_and_blocks_only_for_userpromptsubmit(make_install, event, blocks):
+    cc = make_install("cc")
+    _stale_on(cc, event)
+    row = _row(doctor._check_claude_code(cc), "levain hook scripts")
+    assert row.warn and f"(on {event})" in row.detail, row.detail
+    assert ("UserPromptSubmit" in row.detail) == blocks and ("blocks the prompt" in row.detail) == blocks, row.detail
+
+
+def test_r3_u4_the_layout_git_calls_never_run_a_git_from_path(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    _g("init", "-q", str(ws))
+    (ws / ".claude").mkdir()
+    planted = tmp_path / "bin"
+    planted.mkdir()
+    marker = tmp_path / "planted-git-ran"
+    (planted / "git").write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n", encoding="utf-8")
+    (planted / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert REAL_LAYOUT(ws) == ws.joinpath(*LOCAL)  # the fixed git answered
+    inst._ensure_local_settings_ignored(ws)
+    doctor._cc_local_layout_rows(ws)
+    assert not marker.exists()
+    # no git at a fixed path: what each call does when git fails
+    monkeypatch.setattr(host_guard, "_GIT_BINARY", [None])
+    assert REAL_LAYOUT(ws) == ws / ".claude" / "settings.json"
+    assert inst._ensure_local_settings_ignored(ws) is None
+    assert not [r for r in doctor._cc_local_layout_rows(ws) if r.name == "levain hooks file tracked"]
+    assert not marker.exists()
+
+
+def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tmp_path, monkeypatch, capsys):
+    cc = make_install("cc")
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    count = tmp_path / "version-reads"
+    (fake / "claude").write_text(f"#!/bin/sh\necho x >> '{count}'\necho '2.1.300 (Claude Code)'\n",
+                                 encoding="utf-8")
+    (fake / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+    doctor.run_doctor(cc)
+    capsys.readouterr()
+    assert count.read_text(encoding="utf-8").count("x") == 1
