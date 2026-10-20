@@ -265,6 +265,21 @@ def test_a_paired_device_whose_key_is_not_enrolled_cannot_write(world):
     assert _state(w, out["pending_id"]) == "WAITING" and _text(w.spores, 0) == "seed 0"
 
 
+def test_a_c1_record_parses_only_as_a_signed_pending():
+    # K8 moves the journal's contract: a device's C1 is journalled, signed; a reported C1 is still corrupt
+    from levain.autonomic.journal import JournalCorruptError
+    from levain.cockpit.consent import encode
+    from levain.cockpit.firejournal import _parse_record, new_pending_id, record_sha256
+
+    pid = new_pending_id()
+    rec = {"operation_id": pid, "verb": "spore_update", "intent": "sign", "tier": "C1",
+           "issued_at": "2026-10-10T20:00:00.000000Z", "expires_at": "2026-10-10T20:15:00.000000Z", "effects": []}
+    _parse_record(pid, encode(rec), record_sha256(encode(rec)))
+    rec["intent"] = "reported"
+    with pytest.raises(JournalCorruptError):
+        _parse_record(pid, encode(rec), record_sha256(encode(rec)))
+
+
 def test_the_consent_queue_still_takes_no_c1():
     # the journal's C1 (a device's signed pending) never widens the consent queue's tiers, which read _TIER_NEEDS
     from levain.cockpit.firejournal import _TIER_NEEDS
