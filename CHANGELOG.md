@@ -133,6 +133,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   bounded time and never rewrites that line after.
 - A phone whose browser lost its saved pairing (site data cleared) cannot turn pings on again from the phone link while its
   old pairing still owns the subscription: `levain ping revoke` that phone, then turn pings on again.
+- A phone whose pings were made for another Levain install (a reinstall, a rotated key) has them switched off when its page
+  opens, and the page says so; turn pings on again. A browser that does not show a subscription's key is not checked: the
+  laptop retires that phone's pings the first time Apple's push service refuses them (other push services' refusals were not measured), and the phone reads "on" until you tap
+  Turn off, then turn on. If the page is opened and Turn off is tapped within one round trip, or the laptop does not answer
+  at that moment, the stale entry is retired by the next ping instead.
 - On an install whose cockpit is governed, the phone takes no writes until the cockpit has run once on the laptop (it keeps
   the authority log the phone checks); reads work from the start.
 

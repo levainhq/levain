@@ -405,16 +405,19 @@
       if (!k.ok || !k.body.key) return false;
       const a = new Uint8Array(had), b = b64uToBytes(k.body.key);
       return a.length !== b.length || a.some((v, i) => v !== b[i]);
-    }, () => false);
+    }).catch(() => false);
   }
   function resync() {
     if (!token() && !deviceToken()) return;
     currentSub().then((s) => !s ? null : keyMismatch(s).then((stale) => {
       if (stale) {
         const endpoint = s.endpoint;
-        return s.unsubscribe().catch(() => {}).then(() => api("POST", "/webpush/unsubscribe", { endpoint: endpoint })).catch(() => {}).then(() => {
-          pingNote = "this phone's pings were made for a different Levain install, so they were switched off: turn pings on again"; pingNoteKind = "bad";
-          return refreshSub();
+        return s.unsubscribe().catch(() => {}).then(() => api("POST", "/webpush/unsubscribe", { endpoint: endpoint })).catch(() => {}).then(refreshSub).then(() => {
+          // the browser's own state decides what the note may claim
+          pingNote = subState === "off"
+            ? "this phone's pings were made for a different Levain install, so they were switched off: turn pings on again"
+            : "this phone's pings were made for a different Levain install and could not be switched off here: tap Turn off, then turn on";
+          pingNoteKind = "bad"; renderPings();
         });
       }
       return sendSub(s).then((r) => {

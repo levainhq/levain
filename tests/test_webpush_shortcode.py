@@ -399,6 +399,7 @@ def test_the_page_drops_a_subscription_made_under_another_installs_key():
     js = _JS.read_text(encoding="utf-8")
     for words in ("function keyMismatch(s)", "s.options.applicationServerKey", 'api("GET", "/webpush/key")',
                   "a.length !== b.length || a.some((v, i) => v !== b[i])",
-                  "were made for a different Levain install, so they were switched off"):
+                  "were made for a different Levain install, so they were switched off",
+                  "could not be switched off here: tap Turn off, then turn on", 'pingNote = subState === "off"'):
         assert words in js, words
     assert "keyMismatch(s).then((stale) =>" in js
