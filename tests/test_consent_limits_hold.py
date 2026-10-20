@@ -69,7 +69,7 @@ def test_end_halts_the_root_and_its_subagents(tmp_path, keys, authority, monkeyp
     t.join()
     assert not out.go and out.stop and "operator chose End" in out.text
     sub = _check(q, 4, session="s1#agent:a1")
-    assert not sub.go and sub.stop and "STOPPED by a budget" in sub.text
+    assert not sub.go and sub.stop and "STOPPED by a budget" in sub.text and "operator chose End" in sub.text
     assert L.snapshot(q.directory)[0]["counts"]["calls"] == 3   # a halted root counts nothing
 
 
@@ -267,3 +267,85 @@ def test_a_late_allow_that_itself_lifted_the_halt_still_plans_its_resume(tmp_pat
     assert L.release_if_extended(q, "claude_code", "s1")     # r1's own allow lifts it (as the gate would)
     assert L.extended_by(q.directory, rid)
     assert "already extended" not in delivery.plan(q, rid).reason
+
+
+# --- the parallel-crossing race (1020+52): a hold filed, answered and cleared between a crossing's count and its look --
+
+def _crossed(q, i, session):
+    v = L.count_call(q.directory, "claude_code", session, {"tool_use_id": f"t{i}"}, tool_name="Read",
+                     tool_input={"file_path": f"/x/{i}"})
+    assert v.state == "crossed"
+    return v
+
+
+def _requests(q):
+    conn = L._connect(q.directory)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _hold(q, v, session, sleep=time.sleep):
+    return L._hold("claude_code", q, q.directory, L.session_root(session), v.kind, v, hold=2.0,
+                   notify=lambda _t: None, resume=None, cwd="/work", sleep=sleep, now=time.time)
+
+
+def test_a_crossing_counted_before_another_crossings_extend_joins_it(tmp_path, keys, authority, monkeypatch):
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    v = _crossed(q, 10, "s1#agent:a1")                 # counted while the limit is 2 ...
+    t = _answer_when_filed(q, keys["phone"], "allow")
+    assert _check(q, 11, session="s1#agent:a0").go     # ... then a0 crosses, is extended, and its hold is cleared
+    t.join()
+    out = _hold(q, v, "s1#agent:a1")                   # a1's claim finds no hold: it must join a0's Extend
+    assert out.go and out.extended == "calls" and _requests(q) == 1
+
+
+def test_a_joiner_whose_hold_is_answered_and_cleared_between_polls_goes_on(tmp_path, keys, authority, monkeypatch):
+    from datetime import timedelta
+
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    v = _crossed(q, 10, "s1#agent:a1")
+    assert L._claim(q.directory, "claude_code", "s1", "calls", time.time()) == (True, None)   # a0 claimed, not filed
+
+    def a0_files_and_is_extended(_s):                  # all of it inside one of a1's join polls
+        if _requests(q):
+            return
+        call = L.limit_call("claude_code", "s1", "calls", 3, 2)
+        r = q.file(agent="claude_code", agent_session_id="s1", tool_name=L.LIMIT_TOOL, tool_input=call, cwd="/work",
+                   hold=timedelta(seconds=30), tier=L.LIMIT_TIER)
+        L._record_filed(q.directory, "claude_code", "s1", "calls", r.id, "crossed", time.time())
+        payload, sig = signed(q, r, keys["phone"], "allow")
+        q.answer(r.id, payload, sig)
+        assert L._resolve("claude_code", q, q.directory, "s1", "calls", r.id, sleep=time.sleep, now=time.time).go
+        assert L._hold_id(q.directory, "claude_code", "s1", "calls") is None   # cleared
+
+    out = _hold(q, v, "s1#agent:a1", sleep=a0_files_and_is_extended)
+    assert out.go and out.extended == "calls" and _requests(q) == 1
+
+
+def test_a_halt_landing_after_the_count_stops_the_late_crossing_too(tmp_path, keys, authority, monkeypatch):
+    q = _q(tmp_path, authority)
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    v = _crossed(q, 10, "s1#agent:a1")
+    t = _answer_when_filed(q, keys["phone"], "deny")
+    assert not _check(q, 11, session="s1#agent:a0").go  # a0's crossing is Ended: the root halts
+    t.join()
+    out = _hold(q, v, "s1#agent:a1")
+    assert not out.go and out.stop and "operator chose End" in out.text and _requests(q) == 1
+
+
+def test_an_extend_does_not_carry_a_late_crossing_past_a_newer_end(tmp_path, keys, authority, monkeypatch):
+    q = _q(tmp_path, authority)                         # L3 r1 (codex HIGH, complement MED): the root's halt wins
+    _check(q, 1, monkeypatch=monkeypatch), _check(q, 2)
+    v = _crossed(q, 10, "s1#agent:a1")                 # call 3, counted at the limit of 2
+    t = _answer_when_filed(q, keys["phone"], "allow")
+    assert _check(q, 11, session="s1#agent:a0").go     # call 4: Extend to 4
+    t.join()
+    t = _answer_when_filed(q, keys["phone"], "deny")
+    assert not _check(q, 12, session="s1#agent:a0").go  # call 5: End, the root halts
+    t.join()
+    out = _hold(q, v, "s1#agent:a1")                   # a1's settled Extend is older than the End
+    assert not out.go and out.stop and "STOPPED by a budget" in out.text and "operator chose End" in out.text
