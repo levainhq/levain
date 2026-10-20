@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from levain.coordinator.store import KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread, _check_source
+from levain.coordinator.store import (KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread,
+                                      check_source)
 from levain.dispatch.jobs import JobStoreError
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
@@ -59,7 +60,7 @@ def cwd_source(cwd: str | None = None) -> Source:
         return Source()
     source = Source("cwd", os.path.realpath(top), ref, head)
     try:
-        return _check_source(source)
+        return check_source(source)
     except CoordError:
         return Source()          # a path the store cannot hold (not UTF-8, a hidden character) is recorded as none
 

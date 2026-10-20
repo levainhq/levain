@@ -262,7 +262,7 @@ def _check_words(words: Any) -> str:
     return words
 
 
-def _check_source(source: Source) -> Source:
+def check_source(source: Source) -> Source:
     if not isinstance(source, Source) or source.how not in SOURCE_HOW:
         raise CoordError(f"a drop's source is one of {', '.join(SOURCE_HOW)}")
     if source.how == "none":
@@ -340,7 +340,7 @@ class CoordStore:
             outbox_id = "ob-" + secrets.token_hex(16)
         if not isinstance(outbox_id, str) or _OUTBOX_ID.fullmatch(outbox_id) is None:
             raise CoordError("an outbox_id is 8 to 128 of A-Z a-z 0-9 . _ - (starting with a letter or digit)")
-        source = _check_source(source)
+        source = check_source(source)
         sha = _words_sha256(words)
         with self._write() as (conn, now):
             row = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (outbox_id,)).fetchone()
