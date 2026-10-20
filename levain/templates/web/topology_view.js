@@ -471,6 +471,81 @@
     return l;
   }
 
+  // ---- Lost if closed (F12c): its own panel beside the Sessions card; per live session, what closing it now would lose ----
+  // Built only from `lost_if_closed`. Unknown is drawn as unknown: a null count is a dashed chip that says so, a session whose git state
+  // was not read never claims "nothing at risk".
+  const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
+  function lostChip(text, unknown) { return el("span", "lc-chip" + (unknown ? " unk" : ""), text); }
+  function lostHead(count, losers) {
+    const h = el("div", "lc-h");
+    h.appendChild(el("h2", null, "Lost if closed"));
+    if (count !== null) {
+      h.appendChild(el("span", "ck-count", String(count)));
+      h.appendChild(el("span", "lc-sum", losers + " would lose work"));
+    }
+    return h;
+  }
+  function lostShell(head) {
+    const p = el("section", "panel lc");
+    p.dataset.lc = "1";
+    p.appendChild(head);
+    return p;
+  }
+  // the panel's own unavailable line (the topology provider failed: the same fault the Sessions card says)
+  function renderLostFault(text) {
+    const p = lostShell(lostHead(null, 0));
+    p.appendChild(el("p", "lc-none err", "Unavailable: " + text));
+    return p;
+  }
+  function renderLost(v) {
+    const byId = new Map();
+    for (const n of arr(v.nodes)) byId.set(n.id, n);
+    const rows = arr(v.lost_if_closed).filter(isObj);
+    const known = (x) => isNum(x);
+    const risky = (l) => [l.dirty, l.unpushed, l.running_children, l.uncaptured_episodes].some((x) => known(x) && x > 0);
+    const losers = rows.filter(risky);
+    const p = lostShell(lostHead(rows.length ? rows.length : null, losers.length));
+    if (!rows.length) { p.appendChild(el("p", "lc-none", "No live sessions, so nothing to lose.")); }
+    const name = (l) => { const n = byId.get(l.node); return n ? n.label : String(l.node); };
+    const dotFor = (l) => { const n = byId.get(l.node); return dot(n ? n.state : "idle"); };
+    for (const l of losers) {
+      const s = el("div", "lc-sess");
+      s.dataset.node = l.node;
+      const top = el("div", "lc-top");
+      top.append(dotFor(l), el("b", null, name(l)));
+      s.appendChild(top);
+      const chips = el("div", "lc-chips");
+      if (l.dirty === null || l.dirty === undefined) chips.appendChild(lostChip("dirty files not read", true));
+      else if (l.dirty > 0) chips.appendChild(lostChip(plural(l.dirty, "dirty file", "dirty files")));
+      if (l.unpushed === null || l.unpushed === undefined) chips.appendChild(lostChip("unpushed not read", true));
+      else if (l.unpushed > 0) chips.appendChild(lostChip(plural(l.unpushed, "unpushed", "unpushed")));
+      if (l.uncaptured_episodes === null || l.uncaptured_episodes === undefined) chips.appendChild(lostChip("uncaptured unknown", true));
+      else if (l.uncaptured_episodes > 0) chips.appendChild(lostChip(plural(l.uncaptured_episodes, "uncaptured episode", "uncaptured episodes")));
+      if (l.running_children === null || l.running_children === undefined) chips.appendChild(lostChip("running lanes unknown", true));
+      else if (l.running_children > 0) chips.appendChild(lostChip(plural(l.running_children, "running lane", "running lanes")));
+      s.appendChild(chips);
+      const names = arr(l.dirty_names).filter((x) => typeof x === "string" && x);
+      const branches = arr(l.branches).filter((x) => typeof x === "string" && x);
+      const mono = names.join(", ") + (branches.length ? (names.length ? " · " : "") + "branch " + branches.join(", ") : "");
+      if (mono) s.appendChild(el("div", "lc-mono", mono));
+      p.appendChild(s);
+    }
+    const quiet = [];
+    for (const l of rows) {
+      if (risky(l)) continue;
+      const r = el("div", "lc-line");
+      r.dataset.node = l.node;
+      r.append(dotFor(l), el("span", "lc-name", name(l)));
+      // clear only when git was read and found nothing: an unread tree says so instead
+      if (known(l.dirty) && known(l.unpushed)) r.appendChild(el("span", "lc-ok", "✓ nothing at risk"));
+      else r.appendChild(el("span", "lc-unread", "git state not read"));
+      quiet.push(r);
+    }
+    if (quiet.length) { const q = el("div", "lc-quiet"); for (const r of quiet) q.appendChild(r); p.appendChild(q); }
+    if (rows.length) p.appendChild(el("p", "lc-foot", "Read-only: git, the session registry and the episodic store. Closing a session never runs anything."));
+    return p;
+  }
+
   // ---- the body ----
   // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to}
   function render(v, opts) {
@@ -490,6 +565,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render };
+  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render, renderLost, renderLostFault };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -2113,7 +2113,13 @@
     }
     const fp = ts && ts.p ? ts.p : ep;
     if (fp) fp.classList.toggle("ck-faulted", !!tfault);       // a faulted topology panel is the one error panel: the page's hide rule leaves it alone
-    sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), card);
+    // Lost if closed (F12c): its own panel, right of the card from 1440 px, below it under that; drawn whenever the topology feed is
+    let lost = null;
+    try { if (TV && TV.renderLost) lost = tfault ? TV.renderLostFault(tfault) : tv ? TV.renderLost(tv) : null; } catch (e) { lost = null; }
+    const wrap = el("div", "k7-sess-wrap" + (lost ? " k7-has-lost" : ""));
+    wrap.appendChild(card);
+    if (lost) wrap.appendChild(lost);
+    sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), wrap);
     tintRepos();
   }
   // "Results & edits": the Work zone's own heading, shown on Build only, and the one line a Results card says when no job has
