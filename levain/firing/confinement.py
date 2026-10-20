@@ -479,11 +479,16 @@ def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
 def _run_git_config(args: list[str], environ) -> str | None:
     """``git config --global <args>`` run with the operator's git environment (``HOME``,
     ``XDG_CONFIG_HOME``, ``GIT_CONFIG_GLOBAL`` from ``environ``), outside any repository; its stdout,
-    or None when git is missing, fails or finds nothing."""
+    or None when git is missing, fails or finds nothing. git is :func:`levain.consent.push.git_bin`'s
+    root-owned one, never a PATH lookup: this runs as the operator, outside any sandbox, at every
+    policy build, and a workspace PATH entry (an activated venv) is somewhere the agent can write. A
+    failure of a git that exists is logged, since the files it would have named are not added."""
+    from levain.consent.push import PushRefused, git_bin
     from levain.launch import child_env
 
-    exe = shutil.which("git")
-    if exe is None:
+    try:
+        exe = git_bin()
+    except PushRefused:
         return None
     genv = child_env()
     for var in ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
@@ -493,9 +498,33 @@ def _run_git_config(args: list[str], environ) -> str | None:
     try:
         done = subprocess.run([exe, "config", "--global", *args], capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, cwd="/", env=genv, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        _warn_git_config_unread(args, f"{type(exc).__name__}: {exc}")
         return None
-    return done.stdout if done.returncode == 0 else None
+    if done.returncode == 0:
+        return done.stdout
+    # Exit 1 is git's "nothing matched", and with no global config file at all a --list fails
+    # too. Neither loses a file, and both are routine.
+    if done.returncode != 1 and _global_git_config_present(environ):
+        _warn_git_config_unread(args, f"exit {done.returncode}: {done.stderr.strip()[:200]}")
+    return None
+
+
+def _global_git_config_present(environ) -> bool:
+    """Whether a global git config file git would read exists (or is a link) in ``environ``."""
+    home = environ.get("HOME") or os.path.expanduser("~")
+    git_global = environ.get("GIT_CONFIG_GLOBAL")
+    if git_global:
+        candidates = [os.path.expanduser(git_global)]
+    else:
+        xdg = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        candidates = [os.path.join(home, ".gitconfig"), os.path.join(xdg, "git", "config")]
+    return any(os.path.lexists(c) for c in candidates)
+
+
+def _warn_git_config_unread(args: list[str], reason: str) -> None:
+    _log.warning("git config --global %s failed (%s); the files the operator's global git config makes "
+                 "git read were not added to the write-protected startup files", " ".join(args), reason)
 
 
 def _git_config_read_files(environ) -> list[Path]:
@@ -7226,6 +7255,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr, runtime_roots)
     # The persistence files ride the same loop: outside $HOME's frozen top level (a relocated git
     # config, a file git includes) nothing else stops bash writing one.
+    persistence_files = set(policy.persistence_write_files)
     for f in _dedup_paths([*policy.deny_write_files, *policy.own_memory_files,
                            *policy.persistence_write_files]):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
@@ -7241,6 +7271,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             # The absent target of a configuration link that leads nowhere bash can create anything
             # (``gpg.conf -> /nonexistent/gpg.conf``): nothing to plant, so no mask, and no pin that
             # would have to create ``/nonexistent`` (RUN in CI's bwrap job 2026-10-13: bash refused).
+            continue
+        if f in persistence_files and not os.path.lexists(f) and not _creatable_by_me(f):
+            # The same for a startup file git names under a directory this user cannot create in (an
+            # include under /etc): nothing can be planted, and its mountpoint is one bwrap cannot make.
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the

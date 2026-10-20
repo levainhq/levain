@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import logging
 import os
 from pathlib import Path
 
@@ -14,6 +15,9 @@ import pytest
 from levain.firing import confinement as conf
 from levain.firing import seatbelt_guard
 from levain.firing import ssh_agent
+
+# Taken at import, before the autouse fixture replaces it with "no git" for every test.
+_REAL_RUN_GIT_CONFIG = conf._run_git_config
 
 
 def _policy(tmp_path: Path, monkeypatch) -> conf.CrownJewelsPolicy:
@@ -199,6 +203,114 @@ def test_a_missing_or_failing_git_adds_nothing(tmp_path, monkeypatch) -> None:
     assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
     monkeypatch.setattr(conf, "_run_git_config", lambda args, environ: "")
     assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+
+
+def _script(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.chmod(0o755)
+    return path
+
+
+def _planted_git_on_path(tmp_path: Path, monkeypatch) -> Path:
+    """An executable ``git`` first on PATH, as an activated workspace venv would put it; returns the
+    marker it leaves when anything runs it."""
+    marker = tmp_path / "planted-git-ran"
+    _script(tmp_path / "venv-bin" / "git",
+            f": > '{marker}'\nprintf 'file:{tmp_path}/planted.cfg\\000k\\000'")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'venv-bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    return marker
+
+
+def test_git_config_never_runs_a_git_found_on_path(tmp_path, monkeypatch) -> None:
+    # L3 r2 (codex HIGH): the derivation runs git as the operator at every policy build, so a PATH
+    # lookup ran whatever the agent could plant in a workspace-local PATH entry.
+    from levain.consent import push
+    marker = _planted_git_on_path(tmp_path, monkeypatch)
+    trusted_ran = tmp_path / "trusted-git-ran"
+    trusted = _script(tmp_path / "root-owned" / "git", f": > '{trusted_ran}'")
+    monkeypatch.setattr(push, "git_bin", lambda: str(trusted))
+    assert _REAL_RUN_GIT_CONFIG(["--list"], {"HOME": str(tmp_path / "home")}) == ""
+    assert trusted_ran.exists()
+    assert not marker.exists()
+
+
+def test_no_root_owned_git_derives_nothing_and_runs_nothing(tmp_path, monkeypatch) -> None:
+    from levain.consent import push
+    marker = _planted_git_on_path(tmp_path, monkeypatch)
+
+    def refuse():
+        raise push.PushRefused("no root-owned git")
+
+    monkeypatch.setattr(push, "git_bin", refuse)
+    monkeypatch.setattr(conf, "_run_git_config", _REAL_RUN_GIT_CONFIG)
+    assert conf._git_config_read_files({"HOME": str(tmp_path / "home")}) == []
+    assert not marker.exists()
+
+
+def _git_that(tmp_path: Path, monkeypatch, body: str) -> dict:
+    """A trusted git that runs ``body``, and an operator environment whose global config exists."""
+    from levain.consent import push
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".gitconfig").write_text("[user]\n\tname = x\n")
+    git = _script(tmp_path / "root-owned" / "git", body)
+    monkeypatch.setattr(push, "git_bin", lambda: str(git))
+    return {"HOME": str(home)}
+
+
+def _git_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.name == "levain.firing.confinement" and r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("body", ["exit 3", "echo 'fatal: bad config line 1' >&2; exit 128"])
+def test_a_failing_git_config_call_warns_that_the_derived_files_were_not_added(
+        tmp_path, monkeypatch, caplog, body) -> None:
+    # L3 r2 (complement LOW): fail-open stays, but it is no longer silent.
+    environ = _git_that(tmp_path, monkeypatch, body)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    [msg] = _git_warnings(caplog)
+    assert "git config" in msg and "not added" in msg
+
+
+def test_a_git_that_cannot_run_or_hangs_warns(tmp_path, monkeypatch, caplog) -> None:
+    import subprocess
+    from levain.consent import push
+    environ = _git_that(tmp_path, monkeypatch, "exit 0")
+    monkeypatch.setattr(push, "git_bin", lambda: str(tmp_path / "gone" / "git"))
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert len(_git_warnings(caplog)) == 1
+
+    def hang(*a, **kw):
+        raise subprocess.TimeoutExpired(a[0], 10)
+
+    caplog.clear()
+    monkeypatch.setattr(conf.subprocess, "run", hang)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert len(_git_warnings(caplog)) == 1
+
+
+def test_nothing_found_absent_config_or_missing_git_stay_silent(tmp_path, monkeypatch, caplog) -> None:
+    # MEASURED on git 2.50.1: a --get / --get-regexp that matches nothing exits 1, and a --list with
+    # no global config file at all exits 128; both are every-build normal and lose nothing.
+    from levain.consent import push
+    environ = _git_that(tmp_path, monkeypatch, "exit 1")
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--get", "core.attributesFile"], environ) is None
+        (tmp_path / "home" / ".gitconfig").unlink()
+        _script(tmp_path / "root-owned" / "git", "exit 128")
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+
+        def refuse():
+            raise push.PushRefused("no root-owned git")
+
+        monkeypatch.setattr(push, "git_bin", refuse)
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert _git_warnings(caplog) == []
 
 
 def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) -> None:
