@@ -488,9 +488,11 @@
   // K8: a cockpit write signed by this phone's passkey. issue(fp) files the write as a pending under that passkey (the
   // phone app's POST /cockpit/verb, or a cancel) and resolves to the server's answer; the challenge then comes from the
   // server's STORED record, fetched by the pending's id (GET /cockpit/pending/<id>), never from bytes this page holds;
-  // review(pending, sign), when given, shows that same record and calls sign() from its own Sign tap (a fresh gesture
-  // for the passkey prompt); the broker verifies the signature over its own copy and decides. done(answer) gets every
-  // outcome. This page decides nothing: what it shows is the server's words.
+  // review(pending, sign) shows that same record and calls sign() from its own Sign tap (a fresh gesture for the passkey
+  // prompt), and is required: there is no signing without it. A pending the server no longer holds WAITING (expired,
+  // or decided elsewhere) gets no sheet and no prompt. The broker verifies the signature over its own copy and decides;
+  // the outcome names the signer the server persisted. done(answer) gets every outcome. This page decides nothing:
+  // what it shows is the server's words.
   function signPending(issue, fp, rawId, say, review, done) {
     if (busy) return;
     busy++;
@@ -503,6 +505,11 @@
       const base = "/cockpit/pending/" + encodeURIComponent(p.body.pending_id);
       return call("GET", base).then((c) => {
         if (!c.ok) { finish(c); return say(why(c), "bad"); }
+        // the server's own state, re-read: an expired or already decided pending is never put to the passkey
+        if (c.body.state !== "WAITING" || !c.body.challenge) {
+          finish(c);
+          return say("the write is " + c.body.state + (c.body.reason ? " (" + c.body.reason + ")" : "") + "; nothing to sign", "bad");
+        }
         const sign = () => {
           busy++;
           say("confirm with your passkey to apply " + c.body.verb + " (" + c.body.tier + ")…");
@@ -515,22 +522,32 @@
             // the passkey signed: once it is sent, only the server's own refusal (a 4xx) says nothing was applied
             if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it applied", "bad");
             if (!a.ok) return say("not applied: " + why(a), "bad");
-            say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + " · signed by " + fp, a.body.state === "COMMITTED" ? "ok" : "bad");
+            // the signer named is the one the server persisted, never the fingerprint this page sent
+            say(a.body.state + (a.body.reason ? " (" + a.body.reason + ")" : "") + (a.body.signer_fp ? " · signed by " + a.body.signer_fp : ""),
+                a.body.state === "COMMITTED" ? "ok" : "bad");
           }), (e) => {
             if (rawId && e && e.name === "NotAllowedError") forget(fp);
             finish(failed(e));
             say("the passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was applied", "bad");
           }).finally(() => { busy--; });
         };
-        return review ? review(c.body, sign) : sign();
+        return review(c.body, sign);
       });
     }).catch((e) => { finish(failed(e)); say("the page failed (" + ((e && e.name) || "error") + ")", "bad"); })
       .finally(() => { busy--; });
   }
   // the ONE hook the phone app signs through (Q4 ruling b): the consent ceremony's own start (the passkey picker), with
   // signPending as its continuation. No second copy of the ceremony lives in phone_app.js.
-  window.levainSign = (signers, say, actions, issue, review, done) =>
+  window.levainSign = (signers, say, actions, issue, review, done) => {
+    // the passkey signs only what a review sheet showed (B5 condition 3): with no review there is no signature, and
+    // nothing is filed
+    if (typeof review !== "function") {
+      say("nothing was signed: a write is signed only from its review sheet", "bad");
+      if (done) done({ ok: false, status: 0, body: { message: "no review sheet" } });
+      return;
+    }
     start(null, null, signers, say, actions, false, (fp, rawId) => signPending(issue, fp, rawId, say, review, done));
+  };
 
   $("refresh").addEventListener("click", load);
   $("enrol-btn").addEventListener("click", enrol);

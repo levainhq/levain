@@ -345,7 +345,8 @@ def _serve(qdir: Path) -> tuple[str, Any]:
     return f"http://localhost:{httpd.server_address[1]}", httpd
 
 
-def _call(base: str, path: str, body: dict | None = None, token: str | None = _TOK) -> tuple[int, dict]:
+def _call(base: str, path: str, body: dict | None = None, token: str | None = _TOK, *,
+          timeout: float = 60) -> tuple[int, dict]:
     from levain.phone_server import PHONE_TOKEN_HEADER
 
     headers = {"Content-Type": "application/json", "Origin": base} if body is not None else {}
@@ -354,7 +355,7 @@ def _call(base: str, path: str, body: dict | None = None, token: str | None = _T
     req = urllib.request.Request(base + path, method="POST" if body is not None else "GET", headers=headers,
                                  data=json.dumps(body).encode() if body is not None else None)
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
@@ -436,6 +437,264 @@ def test_the_phone_port_refuses_what_the_kernel_keeps_on_the_laptop_and_answers_
             assert (status, out["error"]) == (503, "standby"), out
         finally:
             holder.stop()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+# --- K8a fix 1: B6's three fixes and the L3 round 1 findings (k-reviews/K8a_FIX1.md) -------------------------------
+
+def test_a_device_cancels_only_a_pending_its_own_phone_issued(world):
+    # B6-A (run by B6: a phone passkey cancelled a laptop token's T2 pending): a device cancels only its own pendings
+    w = world
+    laptop_t2 = _edit(w, 1, cred=BROWSER, tier="T2", text="laptop wants this")["pending_id"]
+    laptop_t3 = _edit(w, 2, cred=BROWSER, tier="T3")["pending_id"]
+    for pid in (laptop_t2, laptop_t3):              # the T3 one also files no unsignable pending in the cap
+        e = _refused("refused", w.b.cancel, pid, credential=w.dev)
+        assert "own" in str(e) and _state(w, pid) == "WAITING"
+    # a cancel pending filed around the route (the broker's issue) is held by the passkey's own check
+    c = w.b.issue(verb="pending_cancel", params={}, target={"kind": "pending", "pending_id": laptop_t2}, tier="T2",
+                  credential=w.dev)
+    e = _refused("bad_signature", w.b.submit, c["pending_id"], w.phone.sign(c["record"].encode()))
+    assert "own" in str(e) and _state(w, laptop_t2) == "WAITING"
+    # the same passkey's pending from another transport (an earlier run) is still its own
+    old = _edit(w, 3, cred={**w.dev, "transport": "run-0123456789abcdef"})["pending_id"]
+    c = w.b.cancel(old, credential=w.dev)
+    assert w.b.submit(c["pending_id"], w.phone.sign(c["record"].encode()))["state"] == "COMMITTED"
+    assert _state(w, old) == "CANCELLED"
+
+
+def _drive_levainsign() -> dict:
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    root = Path(__file__).resolve().parent
+    cp = subprocess.run([node, str(root / "_phone_levainsign_drive.js"),
+                         str(root.parent / "levain" / "templates" / "web" / "phone.js")],
+                        capture_output=True, text=True, timeout=60)
+    assert cp.returncode == 0, cp.stderr
+    return json.loads(cp.stdout)
+
+
+def test_levainsign_signs_only_what_a_review_sheet_showed_and_only_a_waiting_pending():
+    got = _drive_levainsign()
+    # B6-B: no review callback, no signature: nothing filed, no passkey prompt, a refusal said
+    nr = got["no_review"]
+    assert (nr["issued"], nr["webauthn"]) == (0, 0), nr
+    assert nr["said"] and nr["said"][-1][1] == "bad" and nr["done"] and nr["done"][-1]["ok"] is False, nr
+    # L-1: a stored pending that is no longer WAITING gets no review sheet and no passkey prompt
+    nw = got["not_waiting"]
+    assert (nw["reviewed"], nw["webauthn"]) == (0, 0) and "EXPIRED" in nw["said"][-1][0], nw
+    # L-1: the outcome names the signer the server persisted, never the fingerprint the page submitted
+    s = got["signed"]
+    assert s["webauthn"] == 1 and s["posted"]["fingerprint"] == "SHA256:a", s
+    assert "SHA256:persisted" in s["said"][-1][0] and "SHA256:a" not in s["said"][-1][0], s
+
+
+def test_a_key_whose_material_is_a_passkey_never_signs_as_a_laptop_key(world):
+    # B6-C: the custody that picks the namespace and the checks is derived from the key material and must equal the
+    # stored one: a WebAuthn passkey (an rp-host application) declared custody fido does not sign in levain-cockpit
+    w = world
+    mis = SoftPasskey()
+    assert w.b.db is not None
+    enrol(w.b.db, mis, "display-phone", by=w.laptop, custody="fido")    # type: ignore[arg-type]
+    t2 = _edit(w, 1, cred=BROWSER, tier="T2")
+    e = _refused("bad_signature", w.b.submit, t2["pending_id"], mis.sign(t2["record"].encode(), COCKPIT_NAMESPACE))
+    assert "custody" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.spores, 1) == "seed 1"
+
+
+def test_a_device_at_its_pending_cap_can_still_cancel_its_own_pending_once(world):
+    # L-2: a device at PENDING_CAP files one cancel per own pending (never an unlimited run of them for one target)
+    w = world
+    pids = [_edit(w, i)["pending_id"] for i in range(PENDING_CAP)]
+    _refused("pending_cap", _edit, w, PENDING_CAP)
+    c = w.b.cancel(pids[0], credential=w.dev)
+    assert c["state"] == "WAITING", c
+    # a second cancel of the same target, under a fresh key, counts against the cap like any pending
+    _refused("pending_cap", w.b.cancel, pids[0], credential=w.dev, idempotency_key="again")
+    # another own target still gets its one cancel
+    assert w.b.cancel(pids[1], credential=w.dev)["state"] == "WAITING"
+    assert w.b.submit(c["pending_id"], w.phone.sign(c["record"].encode()))["state"] == "COMMITTED"
+    assert _state(w, pids[0]) == "CANCELLED"
+
+
+def test_a_device_c1_marked_reported_is_refused_on_the_broker(world):
+    # L-3 (glm): a device write with intent reported. The broker's reported refusal already holds it (complement);
+    # these two tests pin that, on the broker and over the phone port, with nothing stored
+    w = world
+    e = _refused("refused", w.b.issue, verb="spore_update", params={"text": "x"}, target=_target(w.spores, 0),
+                 tier="C1", credential=w.dev, intent="reported")
+    assert "device signs" in str(e)
+    assert w.b.db is not None
+    with w.b.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pendings").fetchone()[0] == 0
+
+
+def test_a_device_c1_marked_reported_is_refused_over_the_phone_port(install):
+    i = install
+    base, httpd = _serve(i.qdir)
+    try:
+        row = _tray_row(base)
+        body = {"fingerprint": i.phone.fingerprint, "verb": "spore_update", "panel_id": "tray", "row_id": row["id"],
+                "row_version": row["version"], "params": {"text": "reported"}}
+        status, dry = _call(base, "/cockpit/verb", {**body, "dry_run": True})
+        assert status == 200 and dry["gesture"] == "sign", dry
+        status, out = _call(base, "/cockpit/verb", {**body, "intent": "reported", "tier_seen": dry["tier"],
+                                                    "gesture_seen": dry["gesture"]})
+        assert status in (400, 403) and out["error"] in ("refused", "bad_request"), out
+        db = CockpitDB(i.root)
+        with db.read() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM pendings").fetchone()[0] == 0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_slow_signature_check_does_not_hold_the_phones_reads(install, monkeypatch):
+    # L-4 (glm): ssh-keygen runs twice, 10 s each at most; the board and pending reads answer meanwhile
+    import levain.cockpit.broker as broker_mod
+
+    w = install
+    entered, release = threading.Event(), threading.Event()
+    real = broker_mod.verify_cockpit_signature
+
+    def slow(*a: Any, **kw: Any) -> Any:
+        entered.set()
+        release.wait(20)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker_mod, "verify_cockpit_signature", slow)
+    base, httpd = _serve(w.qdir)
+    try:
+        row = _tray_row(base)
+        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "slow"}})
+        assert status == 200, out
+        pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
+        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
+        done: dict = {}
+        t = threading.Thread(target=lambda: done.update(r=_call(
+            base, f"/cockpit/pending/{out['pending_id']}/signature",
+            {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
+             "signature": _b64u(der)})))
+        t.start()
+        try:
+            assert entered.wait(20)
+            status, board = _call(base, "/app/board.json", timeout=3)
+            assert status == 200, board
+            status, again = _call(base, f"/cockpit/pending/{out['pending_id']}", timeout=3)
+            assert status == 200 and again["state"] == "WAITING", again
+        finally:
+            release.set()
+            t.join(30)
+        assert done["r"][0] == 200 and done["r"][1]["state"] == "COMMITTED", done
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_broker_pins_a_localhost_passkey_to_the_phone_ports_origin(world):
+    # L-5 (glm): the broker's own passkey check takes the phone port's origin, not only the port's conversion
+    w = world
+    out = _edit(w)
+    rec = out["record"].encode()
+    e = _refused("bad_signature", w.b.submit, out["pending_id"], w.phone.sign(rec, origin="http://localhost:9999"),
+                 page_origin="http://localhost:1234")
+    assert _state(w, out["pending_id"]) == "WAITING", e
+    done = w.b.submit(out["pending_id"], w.phone.sign(rec, origin="http://localhost:1234"),
+                      page_origin="http://localhost:1234")
+    assert done["state"] == "COMMITTED"
+
+
+def test_a_run_tokens_transport_names_its_run(install):
+    # L-6 (codex): a restart's fresh run token is a fresh transport (its own cap and idempotency namespace)
+    from levain.phone_app import transport_of
+
+    a, b = transport_of("run", None, run_token="token-a"), transport_of("run", None, run_token="token-a")
+    assert a == b and a != transport_of("run", None, run_token="token-b") and a.startswith("run-")
+    assert "token" not in a and Broker.principal_base_of({"class": "device", "fingerprint": "SHA256:x",
+                                                           "transport": a}) == f"device:SHA256:x@{a}"
+    w = install
+    base, httpd = _serve(w.qdir)
+    try:
+        row = _tray_row(base)
+        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "run"}})
+        assert status == 200, out
+        assert CockpitDB(w.root).load(out["pending_id"]).principal \
+            == f"device:{w.phone.fingerprint}@{transport_of('run', None, run_token=_TOK)}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_pending_read_answers_effective_state_and_the_persisted_signer(install, monkeypatch):
+    # L-1 (codex MED + complement LOW): an expired or decided pending gets no challenge; the signature's answer
+    # names the signer the journal persisted
+    import time
+
+    import levain.cockpit.broker as broker_mod
+    from datetime import timedelta
+
+    w = install
+    base, httpd = _serve(w.qdir)
+    try:
+        row = _tray_row(base)
+        verb = {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray", "row_id": row["id"],
+                "row_version": row["version"], "params": {"text": "signed"}}
+        status, out = _fire(base, verb)
+        assert status == 200, out
+        pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
+        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
+        status, done = _call(base, f"/cockpit/pending/{out['pending_id']}/signature",
+                             {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
+                              "client_data_json": _b64u(cdj), "signature": _b64u(der)})
+        assert status == 200 and done["state"] == "COMMITTED" and done["signer_fp"] == w.phone.fingerprint, done
+        status, after = _call(base, f"/cockpit/pending/{out['pending_id']}")
+        assert status == 200 and after["state"] == "COMMITTED" and "challenge" not in after, after
+        # an expired pending, still stored WAITING while no broker ran, reads EXPIRED with no challenge
+        monkeypatch.setattr(broker_mod, "PENDING_TTL", timedelta(seconds=1))
+        row = _tray_row(base)
+        status, out = _fire(base, {**verb, "row_version": row["version"], "params": {"text": "late"}})
+        assert status == 200, out
+        time.sleep(1.2)
+        status, late = _call(base, f"/cockpit/pending/{out['pending_id']}")
+        assert status == 200 and late["state"] == "EXPIRED" and "challenge" not in late, late
+        ad, cdj, der = w.phone.assertion(P.challenge(late["record_text"].encode(), COCKPIT_PHONE_NAMESPACE),
+                                         origin=base)
+        status, done = _call(base, f"/cockpit/pending/{out['pending_id']}/signature",
+                             {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
+                              "client_data_json": _b64u(cdj), "signature": _b64u(der)})
+        assert status == 200 and done["state"] == "EXPIRED" and done["signer_fp"] is None, done
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_pending_read_keeps_one_journal_reader(install, monkeypatch):
+    # L-7 (complement): one journal reader for the port's pending reads, never a new opener (and schema check) per GET
+    import levain.cockpit.firejournal as fj
+
+    w = install
+    made: list = []
+
+    class Counting(fj.CockpitDB):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            made.append(a[0] if a else kw.get("data_root"))
+            super().__init__(*a, **kw)
+
+    base, httpd = _serve(w.qdir)
+    try:
+        row = _tray_row(base)
+        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
+                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "x"}})
+        assert status == 200, out
+        monkeypatch.setattr(fj, "CockpitDB", Counting)
+        for _ in range(3):
+            assert _call(base, f"/cockpit/pending/{out['pending_id']}")[0] == 200
+        assert len(made) <= 1, made
     finally:
         httpd.shutdown()
         httpd.server_close()

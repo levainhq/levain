@@ -56,11 +56,15 @@ _PENDING_ID = re.compile(r"cp[0-9a-f]{32}")          # the broker's pending id (
 _ASSERTION = frozenset({"fingerprint", "authenticator_data", "client_data_json", "signature"})
 
 
-def transport_of(kind: str, device_id: "str | None") -> str:
-    """The transport a phone request came over, as a device principal records it: ``run`` for this run's phone token,
-    ``paired-<hash>`` for a paired device (a hash of its id, so the principal stays one well-formed word)."""
+def transport_of(kind: str, device_id: "str | None", *, run_token: "str | None" = None) -> str:
+    """The transport a phone request came over, as a device principal records it: ``run-<hash>`` for this run's
+    phone token (a hash of the token, so a restart's fresh token is a fresh transport, with its own pending cap and
+    idempotency namespace, and the token itself is never recorded), ``paired-<hash>`` for a paired device (a hash
+    of its id). Either keeps the principal one well-formed word."""
     if kind == "run":
-        return "run"
+        if not isinstance(run_token, str) or not run_token:
+            raise ValueError("a run transport is named by its run's token")
+        return "run-" + hashlib.sha256(b"levain-phone-run\0" + run_token.encode("utf-8")).hexdigest()[:16]
     return "paired-" + hashlib.sha256(str(device_id).encode("utf-8")).hexdigest()[:16]
 
 
@@ -84,7 +88,9 @@ def install_of(cockpit_root: Path) -> Path | None:
 
 class PhoneApp:
     """The state line and the board for one phone port. Built lazily on first use and cached; one lock serialises the
-    kernel calls (the phone port is threaded and the cockpit snapshot is built per request)."""
+    kernel calls (the phone port is threaded and the cockpit snapshot is built per request), except a signature's
+    decision, which runs under the write lock alone so the reads answer while ssh-keygen runs (its retier reads the
+    cockpit from that thread, as the laptop's server reads its cockpit from several)."""
 
     def __init__(self, queue_dir: Path, *, marker_directory: Path | None = None) -> None:
         from levain.authority import ReplayCache
@@ -92,6 +98,11 @@ class PhoneApp:
         self.queue_dir = Path(queue_dir)
         self._marker_directory = marker_directory
         self._lock = threading.Lock()
+        # the phone's writes take one broker at a time (each holds the data root's write lock while it answers); a
+        # signature's check runs under this one only, so the reads (``_lock``) answer while ssh-keygen runs. Order:
+        # ``_write_lock`` before ``_lock``, never the other way
+        self._write_lock = threading.Lock()
+        self._reader: Any = None
         self._built: tuple[Any, Any, Any] | None = None
         self._governed = False
         self._replays = ReplayCache()
@@ -297,7 +308,7 @@ class PhoneApp:
             raise PhoneAppError(400, "bad_request", "request must be a JSON object")
         credential = self._device(req.get("fingerprint"), transport)
         body = {k: v for k, v in req.items() if k != "fingerprint"}
-        with self._lock:
+        with self._write_lock, self._lock:
             source, cockpit, registry = self._parts()
             self._governed_refusal(cockpit)
             with self._broker(source, cockpit, registry) as broker:
@@ -309,18 +320,25 @@ class PhoneApp:
                     raise PhoneAppError(exc.http_status, exc.code, str(exc)) from None
 
     def _journal(self) -> Any:
+        """The port's one journal reader (each of its reads opens and closes its own connection); kept, so a pending
+        read does not open a new reader, and run its schema check, per GET. Called under ``_lock``."""
         from levain.cockpit.firejournal import DB_NAME, CockpitDB
 
         if self._data_root is None or not (self._data_root / DB_NAME).is_file():
             raise PhoneAppError(404, "not_found", "no cockpit journal on this install yet")
-        return CockpitDB(self._data_root)
+        if self._reader is None:
+            self._reader = CockpitDB(self._data_root)
+        return self._reader
 
     def pending(self, pending_id: str) -> dict[str, Any]:
         """``GET /cockpit/pending/<id>``: a phone pending's STORED record and the WebAuthn challenge built from those
         same bytes in ``levain-cockpit-phone``, for the sign sheet to render and the passkey to sign (B5 condition 3).
-        Only a pending a device issued is shown: a passkey signs no other."""
+        Only a pending a device issued is shown: a passkey signs no other. The state is the effective one, as
+        ``Broker.result`` answers it (a ``WAITING`` past its signed ``expires_at`` is ``EXPIRED``; a decided one is
+        ``applying``), and the challenge is given only for an effective ``WAITING``: nothing else can be signed."""
         from levain.autonomic.confirm import COCKPIT_PHONE_NAMESPACE
         from levain.cockpit.broker import Broker
+        from levain.cockpit.consent import parse_stamp
         from levain.cockpit.firejournal import UnknownPending
         from levain.consent.passkey import challenge
 
@@ -336,17 +354,27 @@ class PhoneApp:
         if signer is None:
             raise PhoneAppError(404, "not_found", "that pending was not issued from a phone")
         raw = bytes(view.record_bytes)
-        return {"pending_id": view.pending_id, "state": view.state, "verb": view.record.get("verb"),
-                "tier": view.record.get("tier"), "signer_fp": signer, "record": view.record,
-                "record_text": raw.decode("utf-8"), "reason": view.reason,
-                "challenge": base64.urlsafe_b64encode(challenge(raw, COCKPIT_PHONE_NAMESPACE)).decode("ascii")
-                .rstrip("=")}
+        state, reason = ("applying" if view.state == "DECIDED" else view.state), view.reason
+        if view.state == "WAITING" and parse_stamp(view.record["expires_at"]) <= datetime.now(timezone.utc):
+            state, reason = "EXPIRED", "expired"
+        out = {"pending_id": view.pending_id, "state": state, "verb": view.record.get("verb"),
+               "tier": view.record.get("tier"), "signer_fp": signer, "record": view.record,
+               "record_text": raw.decode("utf-8"), "reason": reason}
+        if state == "WAITING":
+            out["challenge"] = base64.urlsafe_b64encode(challenge(raw, COCKPIT_PHONE_NAMESPACE)).decode("ascii") \
+                .rstrip("=")
+        return out
 
     def pending_signature(self, pending_id: str, req: Any, *, page_origin: "str | None") -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` from the phone: the passkey's assertion (``fingerprint``,
         ``authenticator_data``, ``client_data_json``, ``signature``, base64url), wrapped as an SSHSIG in
         ``levain-cockpit-phone`` over the key enrolled in the install's authority log, then handed to the broker's
-        ``submit``, which verifies it over its own stored copy and decides."""
+        ``submit`` with this port's ``page_origin``, which verifies it over its own stored copy and decides. The
+        answer's ``signer_fp`` is the signer the journal PERSISTED for the pending (None when no signature decided
+        it, e.g. it had expired), never the fingerprint this request named.
+
+        Only building the cockpit parts takes the read lock: ssh-keygen (two runs, 10 s each at most) runs under the
+        write lock alone, so the board and pending reads answer meanwhile."""
         from levain.autonomic.confirm import COCKPIT_PHONE_NAMESPACE
         from levain.authority import PASSKEY
         from levain.cockpit.broker import BrokerError
@@ -359,28 +387,31 @@ class PhoneApp:
         with self._lock:
             source, cockpit, registry = self._parts()
             self._governed_refusal(cockpit)
-            with self._broker(source, cockpit, registry) as broker:
-                try:
-                    snap = broker.capture().authority
-                    key = snap.key(req["fingerprint"]) if snap is not None and isinstance(req["fingerprint"], str) \
-                        else None
-                    if key is None or not key.active or key.custody != PASSKEY:
-                        raise PhoneAppError(422, "no_passkey", "the signer is not an active passkey enrolled on this "
-                                            "install")
-                    signature = to_sshsig(key.public_key,
-                                          b64url_decode(req["authenticator_data"], "authenticator_data"),
-                                          b64url_decode(req["client_data_json"], "client_data_json"),
-                                          b64url_decode(req["signature"], "signature"),
-                                          namespace=COCKPIT_PHONE_NAMESPACE, page_origin=page_origin)
-                    return broker.submit(pending_id, signature)
-                except PasskeyError as exc:
-                    raise PhoneAppError(422, "bad_signature", str(exc)) from None
-                except BrokerError as exc:
-                    raise self._broker_error(exc) from None
+        with self._write_lock, self._broker(source, cockpit, registry) as broker:
+            try:
+                snap = broker.capture().authority
+                key = snap.key(req["fingerprint"]) if snap is not None and isinstance(req["fingerprint"], str) \
+                    else None
+                if key is None or not key.active or key.custody != PASSKEY:
+                    raise PhoneAppError(422, "no_passkey", "the signer is not an active passkey enrolled on this "
+                                        "install")
+                signature = to_sshsig(key.public_key,
+                                      b64url_decode(req["authenticator_data"], "authenticator_data"),
+                                      b64url_decode(req["client_data_json"], "client_data_json"),
+                                      b64url_decode(req["signature"], "signature"),
+                                      namespace=COCKPIT_PHONE_NAMESPACE, page_origin=page_origin)
+                out = broker.submit(pending_id, signature, page_origin=page_origin)
+                db = broker.db
+                return {**out, "signer_fp": db.load(pending_id).signer_fp if db is not None else None}
+            except PasskeyError as exc:
+                raise PhoneAppError(422, "bad_signature", str(exc)) from None
+            except BrokerError as exc:
+                raise self._broker_error(exc) from None
 
     def pending_cancel(self, pending_id: str, req: Any, *, transport: str) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/cancel`` from the phone: the broker's cancel with a ``device`` credential, which
-        is always a pending the passkey signs (own: C1; another's: its tier), never a cancel on the claim alone."""
+        is always a pending the passkey signs, never a cancel on the claim alone, and only of a pending this same
+        passkey's phone issued (the broker refuses any other)."""
         from levain.cockpit.broker import BrokerError
 
         if not _PENDING_ID.fullmatch(pending_id):
@@ -388,7 +419,7 @@ class PhoneApp:
         if not isinstance(req, dict) or not set(req) <= {"fingerprint", "idempotency_key"}:
             raise PhoneAppError(400, "bad_request", "request keys are 'fingerprint' and an optional 'idempotency_key'")
         credential = self._device(req.get("fingerprint"), transport)
-        with self._lock:
+        with self._write_lock, self._lock:
             source, cockpit, registry = self._parts()
             self._governed_refusal(cockpit)
             with self._broker(source, cockpit, registry) as broker:
