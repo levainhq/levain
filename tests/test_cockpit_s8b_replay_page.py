@@ -83,7 +83,7 @@ def test_a_scrub_asks_a_whole_minute_from_the_live_as_of_not_the_browser_clock_p
     live_asof = "window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full').then(p => p.value.as_of)"
     skew = "(() => { const n = Date.now.bind(Date); Date.now = () => n() + 3 * 86400000; return 1; })()"        # a browser clock three days off
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": skew}, {"eval": live_asof}, {"eval": _scrub(0.5)},
-                               {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": PROBE}])
+                               {"until": "(document.querySelector('#k7-sessions .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"}, {"eval": PROBE}])
     asof, got = out[-4], json.loads(out[-1])
     ats = _ats(got)
     assert len(ats) == 1, got
