@@ -63,13 +63,17 @@ def test_slot_state_round_trip_and_refusals():
     assert R.parse_slot_state(R.slot_state_bytes(free)) == free
     with pytest.raises(Refused) as e:
         R.slot_state_bytes(R.SlotState(SlotId("egress", 3), 1, 1, "leased", False, "2026-10-20T18:00:00Z"))
-    assert e.value.name == "bad-value"                       # leased names its session
+    assert e.value.name == "slot-state-malformed"            # leased names its session
     with pytest.raises(Refused) as e:
         R.parse_slot_state(data.replace(b'"leased"', b'"borrowed"'))
-    assert e.value.name == "bad-value"
+    assert e.value.name == "slot-state-malformed"
     with pytest.raises(Refused) as e:
         R.parse_slot_state(data.replace(b"{", b"{ ", 1))
-    assert e.value.name in ("record-malformed", "record-not-canonical")
+    assert e.value.name == "slot-state-malformed"
+    assert R.parse_slot_state(data, SlotId("egress", 3)) == s           # the path's slot, checked
+    with pytest.raises(Refused) as e:
+        R.parse_slot_state(data, SlotId("egress", 2))                   # e3's file under e2/
+    assert e.value.name == "slot-state-malformed"
 
 
 # --- render ------------------------------------------------------------------------------------------------

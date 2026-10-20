@@ -205,7 +205,7 @@ class World:
         return R.parse_alloc((self.L / "alloc" / f"{session}.json").read_bytes())
 
     def slot_state(self, slot: SlotId) -> R.SlotState:
-        return H.parse_slot_state_of((slot.slot_dir(self.L) / "state").read_bytes(), slot)
+        return R.parse_slot_state((slot.slot_dir(self.L) / "state").read_bytes(), slot)
 
     def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True) -> None:
         d = slot.slot_dir(self.L)

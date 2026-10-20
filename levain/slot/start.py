@@ -321,7 +321,7 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> bool:
             try:
                 H.wait_flock(lock, seams, "slot-locked")
                 raw = ctx.store.read(("slots", slot.tag), "state")
-                st = H.parse_slot_state_of(raw, slot) if raw is not None else None
+                st = R.parse_slot_state(raw, slot) if raw is not None else None
                 if st is None or st.state != "leased" or st.session != a.session or st.lease_seq != a.lease_seq:
                     return False
                 seams.at("scrubbed")

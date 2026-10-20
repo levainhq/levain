@@ -665,8 +665,21 @@ def slot_state_bytes(s: SlotState) -> bytes:
     return data
 
 
-def parse_slot_state(data: bytes) -> SlotState:
-    """Strict parse of a ``levain-slot-state/1`` file."""
+def parse_slot_state(data: bytes, slot: SlotId | None = None) -> SlotState:
+    """Strict parse of a ``levain-slot-state/1`` file. ``slot``: the slot whose ``L/slots/{e,v}<n>/state`` the
+    bytes were read from; the file's own (class, index) must name it (a state file copied into another slot's
+    directory is refused). Every refusal is ``slot-state-malformed`` (head ruling, 1020+18), its detail the
+    finer reason."""
+    try:
+        st = _parse_slot_state(data)
+    except Refused as e:
+        raise Refused("slot-state-malformed", f"{e.name}: {e.detail}" if e.detail else e.name) from None
+    if slot is not None and st.slot != slot:
+        raise Refused("slot-state-malformed", f"{slot.tag}'s state file names {st.slot.tag}")
+    return st
+
+
+def _parse_slot_state(data: bytes) -> SlotState:
     obj = _parse_canonical(data, "slot state")
     _keys(obj, SLOT_STATE_KEYS, SLOT_STATE_KEYS - {"session"}, "slot state")
     if obj["format"] != SLOT_STATE_FORMAT:

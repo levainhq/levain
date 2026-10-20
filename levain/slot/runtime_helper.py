@@ -39,6 +39,9 @@ from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
 from levain.slot import proc as PR
 from levain.slot import records as R
+# The slot state file's ONE definition is records.py's; these names stay importable from here (install_helper
+# imports them by name until the head moves it onto records).
+from levain.slot.records import SLOT_STATE_FORMAT, SLOT_STATES, SlotState, parse_slot_state, slot_state_bytes
 from levain.slot import render as RD
 from levain.slot import stage as ST
 from levain.slot.end import V5_FLOOR_BYTES
@@ -651,18 +654,10 @@ def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
     return v if v in VENDORS else "?"
 
 
-def parse_slot_state_of(data: bytes, slot: SlotId) -> R.SlotState:
-    """records' parse, plus the file's own (class, index) must be the directory it sits in."""
-    st = R.parse_slot_state(data)
-    if st.slot != slot:
-        raise Refused("slot-state-malformed", f"{slot.tag} holds {st.slot.tag}'s state")
-    return st
-
-
 def read_view(store: Store, slot: SlotId) -> SlotView:
     with store.dir("slots", slot.tag) as sfd:
         raw = read_at(sfd, "state", f"slots/{slot.tag}/state")
-        state = parse_slot_state_of(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
+        state = R.parse_slot_state(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
         creds: frozenset = frozenset()
         baseline = None
         if slot.slot_class == "egress":
@@ -1340,10 +1335,10 @@ def _read_stdin() -> bytes:
 
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
-           "RenderRun", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "kill_front",
-           "lease_slot", "main", "make_cgroup", "parse_slot_state_of", "pick_slot", "prepare", "proc_identity",
+           "RenderRun", "SLOT_STATE_FORMAT", "SLOT_STATES", "Seams", "SlotState", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "kill_front",
+           "lease_slot", "main", "make_cgroup", "parse_slot_state", "pick_slot", "prepare", "proc_identity",
            "read_view", "render", "render_layer_rows", "resume", "run", "session_dir_rows", "spawn_front",
-           "spawn_target", "status", "stub_front_args", "wait_child"]
+           "slot_state_bytes", "spawn_target", "status", "stub_front_args", "wait_child"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
