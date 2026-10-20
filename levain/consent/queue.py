@@ -154,8 +154,8 @@ from levain.consent.record import (
 __all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
            "REFUSED_REASONS", "REFUSED_UNENROLLED_PER_REQUEST", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
-           "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent", "authority_source",
-           "default_queue_dir", "gap_label", "session_handle"]
+           "ANSWER_KEYS", "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent",
+           "answer_refusal", "authority_source", "default_queue_dir", "gap_label", "session_handle", "signer_refusal"]
 
 DB_NAME = "queue.db"
 STORE_FORMAT = "levain-consent-queue/4"
@@ -163,8 +163,10 @@ STORE_FORMAT = "levain-consent-queue/4"
 PRIOR_FORMAT = "levain-consent-queue/3"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn", "undecided")
 TERMINAL: frozenset[str] = frozenset({"allowed", "denied", "expired", "withdrawn"})
-_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
-                          "signer_fp", "signed_at", "receipts_head"})
+# the keys of a signed answer record (``ANSWER_FORMAT``); public so another store's answers are checked by the same set
+ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
+                         "signer_fp", "signed_at", "receipts_head"})
+_ANSWER_KEYS = ANSWER_KEYS
 _GRANT_ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                                 "grant_id", "grant_seq", "grant_hash", "posture"})
 _RULING_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "gap", "decision", "signer_fp",
@@ -581,6 +583,137 @@ def default_queue_dir() -> Path:
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "consent").resolve()
 
 
+def answer_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any, authority: Any, *,
+                   ssh_keygen: Path | str | None = None, unchained_ok: bool = False) -> str | None:
+    """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
+    verifies. The one check an answer passes to be stored AND again every time it is delivered, in any store that
+    holds levain consent answers; applying one also checks its ``receipts_head`` against that store's receipts
+    (:func:`~levain.consent.receipt_log.head_refusal`, inside the applying write transaction, as
+    :meth:`ConsentQueue.answer` does), which this does not. ``unchained_ok`` (delivery and the verifier,
+    never the apply): an answer in the format from before the chaining is checked as that format, every
+    check but the head's, since it has none. ``authority`` is an :class:`AuthoritySnapshot` or any object whose
+    ``key(fingerprint)`` returns ``None`` or a key with ``public_key``, ``fingerprint``, ``active``, ``key_class`` and
+    ``custody``; ``ssh_keygen`` is the verifier binary (default: levain's own resolution). Every check, and the
+    bytes the signature is verified over, read one plain-dict copy of ``payload`` taken first; a caller stores what
+    it parsed, never a mapping that can change after this returns."""
+    if isinstance(payload, Mapping):
+        payload = dict(payload)
+    why = _answer_record_refusal(request, queue_id, payload, unchained_ok=unchained_ok)
+    if why is not None:
+        return why
+    return signer_refusal(request, payload, signature, authority, noun="answer", encode_record=answer_message,
+                          namespace=ANSWER_NAMESPACE, ssh_keygen=ssh_keygen)
+
+
+def _answer_record_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, *, unchained_ok: bool = False,
+                           window: bool = True) -> str | None:
+    """Every check of :func:`answer_refusal` but the signer's: why ``payload`` is not an answer record binding
+    this queue and ``request``. ``window`` false (a refused answer read as evidence,
+    :meth:`ConsentQueue._refused_reason`) skips only the check that it was signed before the request's hold ended."""
+    unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
+    if unchained and not unchained_ok:
+        return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
+                "chained: it covers no receipts head; answer the request again")
+    if not isinstance(payload, Mapping) \
+            or set(payload) != (_ANSWER_KEYS_UNCHAINED if unchained else _ANSWER_KEYS):
+        return "the answer is not an answer record"
+    if not unchained:
+        if payload["format"] != ANSWER_FORMAT:
+            return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
+        problem = head_problem(payload["receipts_head"])
+        if problem is not None:
+            return f"the answer's {problem}"
+    if payload["queue_id"] != queue_id:
+        return "the answer names another queue"
+    if payload["request_id"] != request.id:
+        return "the answer is for another request"
+    if payload["request_digest"] != request.digest:
+        return "the answer signs another version of this request"
+    if payload["expires_at"] != request.expires_at:
+        return "the answer names another expiry"
+    signed_at = payload["signed_at"]
+    try:
+        parse_stamp(signed_at)
+    except ConsentError:
+        return "the answer's signed_at is not a timestamp"
+    if signed_at < request.received_at:
+        return "the answer was signed before the request was filed"
+    if window and signed_at >= request.expires_at:
+        return "the answer was signed after the request expired"
+    decision = payload["decision"]
+    if decision not in DECISIONS:
+        return f"decision {decision!r} is not one of {DECISIONS}"
+    return None
+
+
+def signer_refusal(request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any, authority: Any, *,
+                   noun: str, encode_record: Callable[[dict[str, Any]], bytes], namespace: str,
+                   ssh_keygen: Path | str | None = None) -> str | None:
+    """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
+    ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
+    ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``. Like
+    :func:`answer_refusal`, it reads one plain-dict copy of ``payload`` taken first."""
+    if not isinstance(payload, Mapping):
+        return f"the {noun} is not a record"
+    payload = dict(payload)
+    if "decision" not in payload or "signer_fp" not in payload:
+        return f"the {noun} names no decision or no signer"
+    signer_fp = payload["signer_fp"]
+    key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
+    why = _key_refusal(key, payload["decision"], request, noun=noun)
+    if why is not None:
+        return why[1]
+    return _signature_refusal(key.public_key, key.fingerprint, key.custody, payload, signature, noun=noun,
+                              encode_record=encode_record, namespace=namespace, ssh_keygen=ssh_keygen)
+
+
+def _key_refusal(key: Any, decision: Any, request: ExternalGateRequest | None, *,
+                 noun: str) -> tuple[str | None, str] | None:
+    """Why ``key`` (``None``: the log does not hold it) is not authority for ``decision`` on ``request``, as
+    ``(subreason, refusal)`` with the subreason one of :data:`REFUSED_SUBREASONS` (``None`` for an allow that
+    names no request, never a kept refusal); ``None`` when it is authority. :func:`signer_refusal` gives the
+    refusal, :meth:`ConsentQueue._evidence` keeps both: one text for both."""
+    if key is None:
+        return "not-enrolled", "the signer is not an enrolled key"
+    if not key.active:
+        # answer_refusal's contract keys need not carry compromised_since (only the kept subreason reads it)
+        compromised = getattr(key, "compromised_since", None) is not None
+        return ("compromised" if compromised else "revoked"), "the signer's key is revoked"
+    if decision == "allow" and request is None:
+        return None, f"an allow {noun} names no request"
+    if decision == "allow" and not class_covers(key.key_class, request.tier):
+        return "class", f"key class {key.key_class} does not cover {request.tier}"
+    return None
+
+
+def _signature_refusal(public_key: str, fingerprint: str, custody: str | None, payload: Mapping[str, Any],
+                       signature: Any, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes], namespace: str,
+                       ssh_keygen: Path | str | None = None) -> str | None:
+    """Why ``signature`` does not verify over the record's bytes in ``namespace`` by ``public_key`` (whose
+    fingerprint is ``fingerprint``); ``None`` when it does. A passkey's (``custody``) own checks run first."""
+    if not isinstance(signature, str) or not signature:
+        return f"the {noun} carries no signature"
+    if custody == PASSKEY:
+        # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
+        # verification, not only where the phone port converted the assertion
+        from levain.consent.passkey import answer_signature_problem
+
+        problem = answer_signature_problem(signature, public_key)
+        if problem is not None:
+            return problem
+    try:
+        message = encode_record(dict(payload))
+    except ConsentError as exc:
+        return f"the {noun} cannot be encoded: {exc}"
+    kwargs: dict[str, Any] = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
+    try:
+        ok = verify_link_sig(message, signature, public_key=public_key, fingerprint=fingerprint,
+                             namespace=namespace, **kwargs)
+    except VerifierUnavailable as exc:
+        return f"the {noun} could not be verified: {exc}"
+    return None if ok else f"the {noun}'s signature does not verify"
+
+
 class AuthoritySource:
     """The trusted authority source for a queue; make it with :func:`authority_source`. Each call opens the
     cockpit database read-only, begins a read transaction and returns the verified log head that
@@ -588,9 +721,10 @@ class AuthoritySource:
     snapshot builder, DESIGN §3.4) takes in it: the anchor file read first, then the replay, then the replay
     checked against that anchor, so an append committing in between can only put the log ahead of the anchor.
     ``anchor=None`` checks no anchor, so the replay is only as trustworthy as the database file: production
-    passes the real anchor. Raises on any failure: capture's refusal (a refused log or anchor, a verifier that
-    cannot run, an empty or uninitialised log) as :class:`levain.authority.AuthorityError` with capture's
-    reason, a journal read as ``sqlite3.Error``; the queue turns either into no decision.
+    passes the real anchor. Raises on any failure: a verifier that cannot run during the replay as
+    :class:`levain.authority.VerifierUnavailable` (a machine fault, never a verdict on the log), capture's refusal (a
+    refused log or anchor, an empty or uninitialised log) as :class:`levain.authority.AuthorityError`, both with
+    capture's reason, a journal read as ``sqlite3.Error``; the queue turns any of them into no decision.
 
     A queue takes only this class (not a subclass, not any callable): freshness is the queue's guarantee,
     never a promise a caller's ``lambda: snapshot`` could break."""
@@ -613,6 +747,8 @@ class AuthoritySource:
             conn.execute("COMMIT")
         finally:
             conn.close()
+        if got.verifier_unavailable:
+            raise VerifierUnavailable(got.authority_error or "the authority log could not be verified")
         if got.authority is None or got.authority_error is not None:
             raise AuthorityError(got.authority_error or "the authority log yields no head")
         return got.authority
@@ -1287,116 +1423,35 @@ class ConsentQueue:
     # --- answers -------------------------------------------------------------------------------------
     def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
                  authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
-        """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
-        verifies. The one check an answer passes to be stored AND again every time it is delivered; applying it
-        also checks its ``receipts_head`` against the log (:func:`~levain.consent.receipt_log.head_refusal`, in
-        :meth:`answer`'s write transaction), which this does not. ``unchained_ok`` (delivery and the verifier,
-        never the apply): an answer in the format from before the chaining is checked as that format, every
-        check but the head's, since it has none."""
-        why = self._answer_record_refusal(request, queue_id, payload, unchained_ok=unchained_ok)
-        if why is not None:
-            return why
-        return self._signer_refusal(request, payload, signature, authority, noun="answer",
-                                    encode_record=answer_message, namespace=ANSWER_NAMESPACE)
+        """:func:`answer_refusal` with this queue's verifier."""
+        return answer_refusal(request, queue_id, payload, signature, authority, ssh_keygen=self._ssh_keygen,
+                              unchained_ok=unchained_ok)
 
     @staticmethod
     def _answer_record_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, *,
                                unchained_ok: bool = False, window: bool = True) -> str | None:
-        """Every check of :meth:`_refusal` but the signer's: why ``payload`` is not an answer record binding this
-        queue and ``request``. ``window`` false (a refused answer read as evidence, :meth:`_refused_reason`) skips
-        only the check that it was signed before the request's hold ended."""
-        unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
-        if unchained and not unchained_ok:
-            return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
-                    "chained: it covers no receipts head; answer the request again")
-        if not isinstance(payload, Mapping) \
-                or set(payload) != (_ANSWER_KEYS_UNCHAINED if unchained else _ANSWER_KEYS):
-            return "the answer is not an answer record"
-        if not unchained:
-            if payload["format"] != ANSWER_FORMAT:
-                return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
-            problem = head_problem(payload["receipts_head"])
-            if problem is not None:
-                return f"the answer's {problem}"
-        if payload["queue_id"] != queue_id:
-            return "the answer names another queue"
-        if payload["request_id"] != request.id:
-            return "the answer is for another request"
-        if payload["request_digest"] != request.digest:
-            return "the answer signs another version of this request"
-        if payload["expires_at"] != request.expires_at:
-            return "the answer names another expiry"
-        signed_at = payload["signed_at"]
-        try:
-            parse_stamp(signed_at)
-        except ConsentError:
-            return "the answer's signed_at is not a timestamp"
-        if signed_at < request.received_at:
-            return "the answer was signed before the request was filed"
-        if window and signed_at >= request.expires_at:
-            return "the answer was signed after the request expired"
-        decision = payload["decision"]
-        if decision not in DECISIONS:
-            return f"decision {decision!r} is not one of {DECISIONS}"
-        return None
+        """The module's :func:`_answer_record_refusal`."""
+        return _answer_record_refusal(request, queue_id, payload, unchained_ok=unchained_ok, window=window)
 
     def _signer_refusal(self, request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any,
                         authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
                         namespace: str) -> str | None:
-        """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
-        ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
-        ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
-        signer_fp = payload["signer_fp"]
-        key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
-        why = self._key_refusal(key, payload["decision"], request, noun=noun)
-        if why is not None:
-            return why[1]
-        return self._signature_refusal(key.public_key, key.fingerprint, key.custody, payload, signature, noun=noun,
-                                       encode_record=encode_record, namespace=namespace)
+        """:func:`signer_refusal` with this queue's verifier."""
+        return signer_refusal(request, payload, signature, authority, noun=noun, encode_record=encode_record,
+                              namespace=namespace, ssh_keygen=self._ssh_keygen)
 
     @staticmethod
     def _key_refusal(key: Any, decision: Any, request: ExternalGateRequest | None, *,
                      noun: str) -> tuple[str | None, str] | None:
-        """Why ``key`` (``None``: the log does not hold it) is not authority for ``decision`` on ``request``, as
-        ``(subreason, refusal)`` with the subreason one of :data:`REFUSED_SUBREASONS` (``None`` for an allow that
-        names no request, never a kept refusal); ``None`` when it is authority. :meth:`_signer_refusal` gives the
-        refusal, :meth:`_evidence` keeps both: one text for both."""
-        if key is None:
-            return "not-enrolled", "the signer is not an enrolled key"
-        if not key.active:
-            return ("compromised" if key.compromised_since is not None else "revoked"), "the signer's key is revoked"
-        if decision == "allow" and request is None:
-            return None, f"an allow {noun} names no request"
-        if decision == "allow" and not class_covers(key.key_class, request.tier):
-            return "class", f"key class {key.key_class} does not cover {request.tier}"
-        return None
+        """The module's :func:`_key_refusal`."""
+        return _key_refusal(key, decision, request, noun=noun)
 
     def _signature_refusal(self, public_key: str, fingerprint: str, custody: str | None, payload: Mapping[str, Any],
                            signature: Any, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
                            namespace: str) -> str | None:
-        """Why ``signature`` does not verify over the record's bytes in ``namespace`` by ``public_key`` (whose
-        fingerprint is ``fingerprint``); ``None`` when it does. A passkey's (``custody``) own checks run first."""
-        if not isinstance(signature, str) or not signature:
-            return f"the {noun} carries no signature"
-        if custody == PASSKEY:
-            # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
-            # verification, not only where the phone port converted the assertion
-            from levain.consent.passkey import answer_signature_problem
-
-            problem = answer_signature_problem(signature, public_key)
-            if problem is not None:
-                return problem
-        try:
-            message = encode_record(dict(payload))
-        except ConsentError as exc:
-            return f"the {noun} cannot be encoded: {exc}"
-        kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
-        try:
-            ok = verify_link_sig(message, signature, public_key=public_key, fingerprint=fingerprint,
-                                 namespace=namespace, **kwargs)
-        except VerifierUnavailable as exc:
-            return f"the {noun} could not be verified: {exc}"
-        return None if ok else f"the {noun}'s signature does not verify"
+        """The module's :func:`_signature_refusal` with this queue's verifier."""
+        return _signature_refusal(public_key, fingerprint, custody, payload, signature, noun=noun,
+                                  encode_record=encode_record, namespace=namespace, ssh_keygen=self._ssh_keygen)
 
     def _evidence(self, request: ExternalGateRequest, payload: Mapping[str, Any], signature: Any,
                   authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
@@ -1805,6 +1860,7 @@ class ConsentQueue:
         :data:`~levain.consent.record.AWAY_NAMESPACE`), its mark must still be the agent's latest with no leave
         stored, and its ``signed_at`` no later than the queue's clock read under the write lock plus
         :data:`RULING_SKEW`."""
+        payload = _detached(payload)        # read once, as answer() and answer_late() do: checked = applied
         agent = payload.get("agent") if isinstance(payload, Mapping) else None
         if agent not in AGENTS:
             raise AnswerRefused("the leave names no known agent")

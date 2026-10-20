@@ -33,8 +33,51 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   answer` and the phone page sign the queue's own record, so they carry the head with no change on your side. Answer and
   ruling formats move to `levain-consent-answer/2` and `levain-consent-ruling/2`; an old-format answer is refused when
   applied (answer the request again), and one already applied before the upgrade still delivers.
+- **Budgets per session, on by default.** Levain counts what each Claude Code and Codex session spends, its subagents
+  included: tool calls, active hours, fresh tokens, cache-read tokens, and how often one call repeats (a loop). Every
+  call is counted, read-only ones too. When a session passes a limit, its next call waits and you get one ping:
+  **Extend** (that limit doubles and the call goes on) or **End**. End, or no answer before the hold runs out, stops
+  the session (Claude Code's turn ends; Codex has every later call refused) until you extend it, from the phone or with
+  `levain limits extend <session>`. Nothing is ever cut off silently, and the agent is told a
+  budget you set stopped it, not a fault. The defaults sit well above a heavy day's sessions: 3,000 calls, 12 active
+  hours, 15M fresh tokens, 600M cache-read tokens, one call 8 times in any 10. Change them with
+  `levain limits set <limit> <value>` (per agent with `--agent`); see the counts with `levain limits show`; `levain
+  doctor` shows the limits in force. Dollars are not enforced (a price table goes stale and a subscription is not billed
+  per token).
+- **`levain publish`: Levain publishes a package for the agent, only on your yes.** `levain publish pypi <files>` and
+  `levain publish npm <tarball>` show you the exact package, version, files (their digests), target index and, for npm,
+  the dist-tag and access; on your signed yes Levain uploads exactly those files to exactly that index itself. The name
+  and version are read from inside the files, never from what the agent typed, and a file changed after asking changes
+  nothing (Levain uploads its own copy). Settings that could send the upload elsewhere (environment variables,
+  `.npmrc`, `publishConfig`) are overridden. PyPI credentials come from `TWINE_USERNAME` / `TWINE_PASSWORD`, or the
+  `~/.pypirc` section for that exact index; with none, it refuses before asking you.
+- **Web push to your phone (`levain ping`).** Levain can now ping your phone itself, without a notify command of your own:
+  Chrome on Android from the phone page as it is, and an iPhone (iOS 16.4 or later) once the phone page is added to the Home
+  Screen (the page shows the two taps). Pings go out for a gated call that waits on you, a re-ping, a ruling that waits, a
+  question an agent asked, and a push request. `levain ping test` sends a test to every phone; `levain ping devices` lists
+  paired phones and `levain ping revoke` removes one. A ping only opens the phone page: every answer still needs your passkey.
+  Your `notify_argv` command keeps working beside it.
+- **Pairing a phone by typed code.** On an iPhone the Home Screen app keeps its own storage, so a link opened in Safari does not
+  reach it. Tap "Install on this phone" in Safari and the page shows an 8-character code (good for 10 minutes, one use, only the
+  newest works); type it into the "Pairing code" box in the installed app. `levain ping pair` prints a fresh code from the
+  laptop. Five wrong tries in 10 minutes lock every short-code pairing until a new code is made.
+- **The phone app's state line and board.** From the phone you can set your state line (the same one the cockpit, `levain
+  state` and the TUI set; agents see it on their next prompt), and work your Tray: resolve and snooze an item. Open loops and
+  Keep are there to read. The phone does only what the cockpit's own tiers allow without a signature; anything more says
+  "on the laptop".
+- **The notification record.** Every ping Levain sent, where it went (each phone, and whether your `notify_argv` command
+  started), whether you opened it, and what came of it (answered, expired, ruled late, still waiting), read from the queue
+  when you look. On the phone, in the cockpit and with `levain ping record`.
 
 ### Changed
+- **Claude Code sessions started in a subfolder are gated too.** Claude Code reads a project's `.claude/settings.json`
+  only from the folder a session starts in, so a session started in a subfolder of a levain workspace ran none of
+  levain's hooks: no consent queue, no gate, no memory hooks. When the workspace is its own git repository's root,
+  levain now keeps its hooks in `.claude/settings.local.json` (which Claude Code also reads from the repository root),
+  every command naming its script by absolute path, and keeps that file out of git. `levain update` moves an existing
+  install over (your own entries in the local file stay, and a malformed local file stops the update with nothing
+  written), and `levain doctor` says where the hooks are, warns about a levain hook left in the wrong file, and warns
+  when Claude Code is too old to read the local file from the repository root.
 - **Agent config and hooks are refused when nothing can approve the edit.** Until now, with no enrolled key that could
   approve an edit of agent config or hooks, Claude Code and Codex in acceptEdits, bypass, auto or dontAsk mode (Codex
   with approvals off) could make the edit with no question. Now levain refuses it with a plain denial: the agent is told
@@ -50,6 +93,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `.husky/`, or one outside the repository, counts), and your `~/.gitconfig` and `~/.config/git/config`. Known edges: a
   shell command that writes agent config is not caught here (that belongs to the session sandbox); and a Codex hook that
   runs past Codex's timeout lets the call through, as Codex has no setting to block on a hook failure.
+
+### Fixed
+- **An OpenHands entity's turn runs once.** Saving a finished turn to memory used to run the conversation again, unchecked:
+  a turn stopped by `--max-iterations` (or any run the runtime ends in its error or stuck state) started over with a fresh
+  budget, and an action held at the gate during that second run was reported as one that ran. The turn now runs once; one
+  that ends in error or stuck is reported as failed (exit 3 from `levain run --task`) and nothing from it is saved.
+- **On macOS, bash now gets its own session ssh agent, not yours.** This landed in 0.11.7 without a line here: the 0.11.4
+  limit ("on macOS bash still receives your `$SSH_AUTH_SOCK`") no longer holds. bash's `$SSH_AUTH_SOCK` names levain's
+  session agent, which holds only keys you add with `levain ssh-add`, and a connect to any other unix socket by its path is
+  refused unless you granted it.
 
 ### Known edges
 - The hint is a pattern reader, not a shell parser: a command written to dodge the patterns gets no hint, and the full command
@@ -100,6 +153,50 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   every answer it signed then fails `verify`.
 - A signed head over zero receipts always matches (the empty log's root is fixed): it attests nothing.
 - An answer signed from the phone page (passkey) carrying the head has not been run on a phone yet.
+- A limit is checked at tool calls, and tokens are read from the agent's own transcript, which can lag: a session can
+  pass a token limit by up to the turn in flight.
+- Without the session sandbox the agent's own shell can edit `limits.json`: a brake on a runaway, not a bound on an
+  agent that tries.
+- The loop limit catches one call repeating; a loop that changes an argument every time is caught later by the call and
+  token limits.
+- After an Extend, a call that itself needs your approval is asked for again (the agent is told to run it again), so
+  two waits never share one hook.
+- A Codex command typed into a terminal it opened earlier is not counted and is not stopped by a limit.
+- `levain publish` is a path the agent is told to take, not a wall: a `twine upload` or `npm publish` the agent runs
+  itself is not gated until Levain's hands run as another user.
+- `levain publish` runs the twine and npm found on your PATH (Homebrew, `~/.local/bin`), which are writable by your user.
+- Only a workspace that is its own git repository's root gets the subfolder fix. A workspace nested inside a larger repository, a
+  linked worktree, a submodule, or a folder that is not under git keeps its hooks in `.claude/settings.json`, and a
+  session started in a subfolder there still runs none of them: start it at the workspace root.
+- A workspace set up before `git init` first takes the `settings.json` layout; run `git init`, then `levain update`, and
+  it moves to the local layout.
+- A write to `.claude/settings.local.json` is not locked against a running Claude Code saving a permission at the same
+  instant; an approval saved in that window can be lost.
+- A tool call through the gate from a subfolder was checked by replaying the hooks and by SessionStart in a real
+  Claude Code run, not by an authenticated tool call.
+- Someone on your tailnet who sends bad pairing codes fast enough can keep the phone server's per-minute cap full and block
+  short and long pairings alike until they stop (availability only; it never pairs anyone).
+- `levain ping pair` prints a live code, so run it yourself and not through an agent (the code would sit in the agent's
+  transcript for 10 minutes).
+- Capture (adding a new Tray item) is not offered on the phone: the cockpit tiers it above what the phone holds without a
+  signature.
+- Anything that can read your queue directory's `webpush/webpush.db` can send your phones a ping with its own words. The tap
+  opens the real phone page; the words are not trusted for anything.
+- The notification record keeps every ping (it is an append-only record); the phone and the cockpit show the newest 500.
+- Turning pings on from the phone page pairs that phone: it shows up in `levain ping devices` and `levain ping revoke`
+  stops it. A subscription saved before this change with no phone attached is switched off the first time Levain opens
+  its push store; turn pings on again from that phone.
+- A slow push service or network can leave a ping's delivery reading "no answer in time": Levain waits a
+  bounded time and never rewrites that line after.
+- A phone whose browser lost its saved pairing (site data cleared) cannot turn pings on again from the phone link while its
+  old pairing still owns the subscription: `levain ping revoke` that phone, then turn pings on again.
+- A phone whose pings were made for another Levain install (a reinstall, a rotated key) has them switched off when its page
+  opens, and the page says so; turn pings on again. A browser that does not show a subscription's key is not checked: the
+  laptop retires that phone's pings the first time Apple's push service refuses them (other push services' refusals were not measured), and the phone reads "on" until you tap
+  Turn off, then turn on. If Turn off (or Turn off and then on) is tapped within one round trip of the page opening, or the laptop
+  does not answer at that moment, the page may misreport once; the stale entry is retired by the next ping.
+- On an install whose cockpit is governed, the phone takes no writes until the cockpit has run once on the laptop (it keeps
+  the authority log the phone checks); reads work from the start.
 
 ## [0.11.9] — 2026-10-19
 

@@ -24,6 +24,10 @@ from levain.install import (
     refresh_adapter,
     run_init,
 )
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
 
 
 def _sha(data: bytes) -> str:
@@ -501,6 +505,10 @@ def test_a_pre_receipt_settings_leaf_edit_is_staged(make_install):
                 if first_string_leaf(v):
                     return True
         if isinstance(node, list):
+            for i, v in enumerate(node):
+                if isinstance(v, str) and "python" not in v.lower() and "/" not in v:
+                    node[i] = v + "-mine"  # settings.json's strings are list items since the hooks left it
+                    return True
             return any(first_string_leaf(v) for v in node)
         return False
 
@@ -512,14 +520,16 @@ def test_a_pre_receipt_settings_leaf_edit_is_staged(make_install):
 
 
 def test_a_pre_receipt_settings_from_another_interpreter_is_refreshed(make_install):
+    # the interpreter is in levain's hooks, which live in settings.local.json
     install = make_install()
-    settings = install / ".claude" / "settings.json"
+    settings = install / ".claude" / "settings.local.json"
     import sys
 
     settings.write_text(settings.read_text().replace(sys.executable, "/old/venv/bin/python"))
     install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
     r, _out = _refresh(install)
-    assert ".claude/settings.json" in r.refreshed
+    assert ".claude/settings.local.json (levain's hooks)" in r.refreshed
+    assert "/old/venv/bin/python" not in settings.read_text()
 
 
 def test_an_obsolete_activation_file_is_named_and_never_deleted(make_install):
