@@ -748,7 +748,7 @@ def _vanish_once(monkeypatch, name: str, trigger: Path, act) -> None:
     fired: list[bool] = []
 
     def racing(path, *args, **kwargs):
-        if not fired and Path(path) == trigger:
+        if not fired and isinstance(path, (str, os.PathLike)) and Path(path) == trigger:
             fired.append(True)
             act()
         return stock(path, *args, **kwargs)
@@ -783,6 +783,64 @@ def test_walk_treats_a_directory_replaced_by_a_file_as_a_file_target(tmp_path, m
     _vanish_once(monkeypatch, "scandir", sub, replace)
     _, _, files, _ = conf._persistence_agent_paths(home, workspace)
     assert sub in files
+
+
+@pytest.mark.parametrize("name", ["stat", "scandir"])
+@pytest.mark.parametrize("dangling", [False, True])
+def test_walk_classifies_a_directory_replaced_by_a_symlink(tmp_path, monkeypatch, name, dangling) -> None:
+    # L3 r1 W1: a queued directory swapped for a symlink is a link, not an absence; its target and
+    # the link dentry must be recorded exactly as a child symlink's are.
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+    target = tmp_path / ("missing.json" if dangling else "external.json")
+    if not dangling:
+        target.write_text("{}")
+
+    def replace() -> None:
+        shutil.rmtree(sub)
+        sub.symlink_to(target)
+
+    _vanish_once(monkeypatch, name, sub, replace)
+    _, _, files, pins = conf._persistence_agent_paths(home, workspace)
+    assert Path(os.path.realpath(target)) in files
+    assert sub in pins
+
+
+def test_walk_classifies_a_child_whose_lstat_raced_a_symlink_swap(tmp_path, monkeypatch) -> None:
+    home, workspace, sub = _walk_tree(tmp_path, monkeypatch)
+    child = sub / "child.json"
+    target = tmp_path / "missing.json"
+
+    def replace() -> None:
+        child.unlink()
+        child.symlink_to(target)
+        raise FileNotFoundError(errno.ENOENT, "gone", str(child))
+
+    _vanish_once(monkeypatch, "lstat", child, replace)
+    _, _, files, pins = conf._persistence_agent_paths(home, workspace)
+    assert Path(os.path.realpath(target)) in files
+    assert child in pins
+
+
+def test_walk_does_not_skip_an_inode_whose_scan_failed_under_another_alias(tmp_path, monkeypatch) -> None:
+    # L3 r1 W2: ``a`` is renamed onto the already-queued ``b`` while its scan runs; the inode must
+    # still be walked under ``b``.
+    home, workspace, _ = _walk_tree(tmp_path, monkeypatch)
+    root = workspace / ".claude"
+    a, b = root / "a", root / "b"
+    a.mkdir()
+    b.mkdir()
+    target = tmp_path / "external.json"
+    target.write_text("{}")
+    (a / "link").symlink_to(target)
+
+    def rename() -> None:
+        b.rmdir()
+        a.rename(b)
+
+    _vanish_once(monkeypatch, "scandir", a, rename)
+    _, _, files, pins = conf._persistence_agent_paths(home, workspace)
+    assert Path(os.path.realpath(target)) in files
+    assert b / "link" in pins
 
 
 @pytest.mark.parametrize(("name", "reason"), [

@@ -697,46 +697,55 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
 
     def scan_protected_directories() -> None:
         # Other sessions create and delete entries under the agent roots while this walk runs. An
-        # entry that is gone by the time it is inspected has nothing left to protect, and anything
-        # re-created there later lands inside a protected subtree that is already write-denied. Only
-        # absence is skipped: every other failure to inspect still refuses the floor.
+        # inspection that reports absence is only a hint: the entry is re-read with lstat before it
+        # is skipped. Gone -> skip, since anything re-created there later lands inside a protected
+        # subtree that is already write-denied. A symlink -> classified exactly as a child symlink,
+        # so a dangling link is a write target, never an absence. Any other non-directory -> a
+        # file target. A directory again, or any failure to re-read -> refuse the floor. An inode
+        # is marked visited only once its scan completed, so a failed scan never hides it from
+        # another alias.
+        def confirm_gone(path: Path, exc: OSError) -> None:
+            try:
+                st = os.lstat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return
+            except OSError as lstat_exc:
+                refuse(path, f"an entry that cannot be inspected ({lstat_exc})", lstat_exc)
+            if stat.S_ISLNK(st.st_mode):
+                classify(path)
+            elif stat.S_ISDIR(st.st_mode):
+                refuse(path, f"a protected directory that cannot be walked ({exc})", exc)
+            else:
+                file_targets.append(path)
+
         visited: set[tuple[int, int]] = set()
         while directories_to_walk:
             directory = directories_to_walk.pop(0)
             try:
                 st = os.stat(directory)
-            except (FileNotFoundError, NotADirectoryError):
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                confirm_gone(directory, exc)
                 continue
             except OSError as exc:
                 refuse(directory, f"an unresolvable directory target ({exc})", exc)
             identity = (st.st_dev, st.st_ino)
             if identity in visited:
                 continue
-            visited.add(identity)
             try:
                 with os.scandir(directory) as scanned:
                     entries = sorted(scanned, key=lambda entry: entry.name)
-            except FileNotFoundError:
-                continue
-            except NotADirectoryError as exc:
-                # Replaced by a non-directory since it was queued: deny it as the file it now is.
-                try:
-                    replaced = os.lstat(directory)
-                except (FileNotFoundError, NotADirectoryError):
-                    continue
-                except OSError as lstat_exc:
-                    refuse(directory, f"an entry that cannot be inspected ({lstat_exc})", lstat_exc)
-                if stat.S_ISDIR(replaced.st_mode):
-                    refuse(directory, f"a protected directory that cannot be walked ({exc})", exc)
-                file_targets.append(directory)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                confirm_gone(directory, exc)
                 continue
             except OSError as exc:
                 refuse(directory, f"a protected directory that cannot be walked ({exc})", exc)
+            visited.add(identity)
             for entry in entries:
                 child = Path(entry.path)
                 try:
                     child_st = os.lstat(child)
-                except (FileNotFoundError, NotADirectoryError):
+                except (FileNotFoundError, NotADirectoryError) as exc:
+                    confirm_gone(child, exc)
                     continue
                 except OSError as exc:
                     refuse(child, f"an entry that cannot be inspected ({exc})", exc)
