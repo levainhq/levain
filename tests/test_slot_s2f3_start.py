@@ -3,7 +3,7 @@ plus lane F2's three follow-ups (the named slot, the front's fixed argv, one pro
 
 Built on lane F2's harness (``World``: a tmp store, the REAL CONTROL, owners recorded, not applied). The launch
 through the wall is a fake process table here: what a spawn was GIVEN (its argv, its parsed spec, its cgroup, its
-exec pipe) is recorded, and the fake vendor either execs (closes nothing: the parent's close is the EOF) or fails
+exec pipe) is recorded, and the fake vendor either execs (writes the ``+`` marker the wall's last hop writes) or fails
 (writes the byte). The real clone as a slot uid, the real drop and the real fd inheritance through launchctl /
 nsenter / bwrap are 2g VM rows; the exact git flag set is run here, as the test user, against a real bundle.
 """
@@ -113,6 +113,7 @@ class Launches:
         self.spawns: list[dict] = []
         self.codes: dict[str, int] = {}
         self.mode = "exec"
+        self.forwarder_ready = True        # the forwarder writes its ready byte after bind + listen
         self.next_pid = 61000
         self.states_at_spawn: list[str] = []
         self.states_at_wait: list[str] = []
@@ -129,8 +130,13 @@ class Launches:
         self.states_at_spawn.append(st.state if st else None)
         if exec_w is not None:
             rec["exec_w_open"] = _fd_open(exec_w)
-            if self.mode == "fail":
+            if spec["target"] == "forwarder":
+                if self.forwarder_ready:
+                    os.write(exec_w, wall.EXEC_OK)
+            elif self.mode == "fail":
                 os.write(exec_w, b"!")
+            elif self.mode == "exec":
+                os.write(exec_w, wall.EXEC_OK)
         if spec["target"] != "clone":
             self.table.add(pid, spec["uid"], cg=cgroup is not None)
         return pid
@@ -395,8 +401,10 @@ def test_vendor_spec_fds_and_the_stage_closes_the_rest(darwin_platform):
                                                           sp.profile: b"(version 1)\n(deny default)\n"})
     with pytest.raises(Execd):
         wall.stage_main(3, fake.calls)
-    assert fake.at_exec["fds"] == {0, 1, 2, 4} and fake.at_exec["inheritable"] == {0, 1, 2}
-    assert fake.written == []                                     # an exec writes nothing: EOF alone
+    # macOS: the pipe rides through sandbox-exec to the trampoline, which writes the marker under the profile
+    assert fake.at_exec["fds"] == {0, 1, 2, 4} and fake.at_exec["inheritable"] == {0, 1, 2, 4}
+    assert fake.at_exec["argv"][3:] == list(wall.trampoline_argv(wall.EXEC_FD, sp.argv))
+    assert fake.written == []                                     # the stage is not the last hop here
     # a refusal writes the byte, so the helper never reads a refusal as the exec
     bad = StageFake(sp, fds={0, 1, 2, 3, 4}, files={sp.env_file: b"HOME=" + S.encode() + b"\n"})
     assert wall.stage_main(3, bad.calls) == wall.STAGE_EXIT and bad.at_exec is None
@@ -457,7 +465,8 @@ class StageFake:
         (self.inheritable.add if v else self.inheritable.discard)(fd)
 
     def _exec(self, path, argv, env):
-        self.at_exec = {"fds": set(self.fds), "inheritable": set(self.inheritable) & self.fds, "env": env}
+        self.at_exec = {"fds": set(self.fds), "inheritable": set(self.inheritable) & self.fds, "env": env,
+                        "path": path, "argv": list(argv), "written": list(self.written)}
         raise Execd()
 
 

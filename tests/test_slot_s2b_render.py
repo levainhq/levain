@@ -380,8 +380,12 @@ CONTRACT_5_5 = {
 }
 
 
+#: Head ruling (S2 fix round 2, comp r1 7): HOME's two .config names also where the env's XDG_CONFIG_HOME points.
+XDG_5_5 = {"xdg/config/git", "xdg/config/anthropic"}
+
+
 def test_planted_discovery_refused_by_name():
-    assert {r: set(n) for r, n in rd.DISCOVERY.items()} == CONTRACT_5_5
+    assert {r: set(n) for r, n in rd.DISCOVERY.items()} == {**CONTRACT_5_5, "home": CONTRACT_5_5["home"] | XDG_5_5}
     assert rd.discovery_refusals({"claude": [".claude.json", "backups/", "sessions"], "codex": ["auth.json"],
                                   "home": ["root", "repo", "config", "xdg", "tmp", "sock", "in"]}) == []
     for root, names in rd.DISCOVERY.items():

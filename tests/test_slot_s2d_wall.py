@@ -241,7 +241,8 @@ def test_launch_spec_paths_derived_from_session(darwin):
     assert spec("darwin", "step", V0).env_file == S["darwin"] + "/root/env"
     assert spec("darwin", "step", V0).resolve
     fw = spec("linux", "forwarder")
-    assert fw.argv[-4:] == ("--port", "47100", "--unix", "/run/levain/gw/slot0/gw.sock")
+    assert fw.argv[-6:] == ("--port", "47100", "--unix", "/run/levain/gw/slot0/gw.sock", "--ready-fd", "4")
+    assert fw.keep_fds == (wall.READY_FD,) and fw.exec_fd is None
     assert fw.cwd == S["linux"] + "/tmp" and fw.env_file is None and not fw.extra_env
 
 
@@ -463,7 +464,7 @@ def test_stage_refuses_a_profile_off_macos(linux):
 
 
 GOLDEN_E0 = (
-    "--unshare-ipc", "--unshare-pid", "--unshare-uts",
+    "--die-with-parent", "--unshare-ipc", "--unshare-pid", "--unshare-uts",
     "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc",
     "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin", "--symlink", "usr/lib", "/lib",
     "--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
@@ -514,7 +515,7 @@ def test_linux_view_prefix_outside_usr_is_bound_ro(monkeypatch):
     from levain.slot import root_tree
     monkeypatch.setitem(root_tree.VENDOR_PREFIX, "linux", PurePosixPath("/opt/levain-vendor"))
     a = wall.linux_view_args(E0, SESSION, kind="interactive", queue_grant=False, host_links=LINKS)
-    assert ("--ro-bind", "/opt/levain-vendor", "/opt/levain-vendor") == a[9:12]
+    assert ("--ro-bind", "/opt/levain-vendor", "/opt/levain-vendor") == a[10:13]
 
 
 def test_netns_missing_refused():
