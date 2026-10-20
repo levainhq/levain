@@ -388,8 +388,9 @@ def main(argv: list[str] | None = None) -> int:
             "cockpit shows, verbatim with its age. "
             "It is never parsed, scored or used to limit what the partner does; you are "
             "the authority on your own state. With TEXT, sets it; with no argument, shows "
-            "it; --clear removes it. It expires after 12 hours: a stale state is dropped, "
-            "not shown. Stored in .levain/context.json."
+            "it; --clear removes it. The line expires after 12 hours, but each one you set "
+            "is also saved once, word for word, as a `felt,state` memory episode that stays "
+            "until you tombstone it in the cockpit. Stored in .levain/context.json."
         ),
     )
     state_p.add_argument(
@@ -589,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
     _add_dispatch_parsers(subparsers)
+    _add_coordinator_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1056,8 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Make `levain serve --write` always-on — start on login and survive a crash — so "
             "the cockpit just works without an ad-hoc `nohup`. Per-user, no admin/root: a "
-            "launchd user agent on macOS (systemd --user / Task Scheduler are planned "
-            "pure-additions). An always-on serve is a 24/7 loopback-LOCAL write window; "
+            "launchd user agent on macOS, a systemd --user unit on Linux (Windows Task Scheduler "
+            "is a planned pure-addition). An always-on serve is a 24/7 loopback-LOCAL write window; "
             "off-box serve is never daemonized (install-bearing serve is loopback-only)."
         ),
     )
@@ -2542,6 +2544,14 @@ def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
 def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
     """``levain dispatch``: the dispatch job's planner and operator door (``levain.dispatch.cli``)."""
     from levain.dispatch.cli import add_parsers
+
+    add_parsers(subparsers)
+
+
+def _add_coordinator_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain drop``, ``levain drops`` and ``levain thread``: the coordinator's drops and threads
+    (``levain.coordinator.cli``)."""
+    from levain.coordinator.cli import add_parsers
 
     add_parsers(subparsers)
 
