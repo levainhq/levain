@@ -1099,7 +1099,13 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     live-state in ``scope.context_json`` (``write_state``'s lock, no continuity lock or backup;
     ``check`` is the cockpit's version compare, run under that lock),
     bounded by ``dashboard.STATE_MAX_TEXT_LEN`` with an allowlisted provenance tag. The text is stored verbatim apart from whitespace collapse and
-    is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``."""
+    is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``.
+
+    A line SET (not cleared, not re-set to the same text) also appends one raw ``observation``
+    episode tagged ``felt,state`` to ``scope.anneal.episodic_db`` (``write_state`` computes
+    both): an INPUT the consolidate reads, like any episode, never a write into the felt layer.
+    The result's ``episode`` says what happened; a failed episode leaves the line set and
+    reports ``episode_error``."""
     ctx = scope.context_json
     if ctx is None:
         raise EditError(
@@ -1122,12 +1128,19 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     from levain.dashboard import StateLockUnavailable, write_state
 
     try:
-        write_state(ctx, collapsed, source=source, check=check)
+        done = write_state(ctx, collapsed, source=source, check=check,
+                           episodic_db=scope.anneal.episodic_db)
     except StateLockUnavailable as exc:
         raise EditError("lock_unavailable", 501, str(exc)) from exc
     except OSError as exc:      # the lock file or the write itself: retryable, never a bare 500
         raise EditError("store_unavailable", 503, f"state file unavailable: {exc}") from exc
-    return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}
+    result: dict[str, Any] = {"ok": True, "kind": "operator_state", "cleared": collapsed == "",
+                              "episode": done.episode}
+    if done.episode == "failed":    # the line is set; its felt episode is not: say so, never fail the set
+        result["episode_error"] = done.episode_error
+        warnings.warn(f"state line set but its felt episode was not written ({done.episode_error})",
+                      RuntimeWarning, stacklevel=2)
+    return result
 
 
 def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:

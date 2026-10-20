@@ -84,6 +84,7 @@ __all__ = [
     "SubstrateView",
     "build_substrate_view",
     "write_state",
+    "StateWrite",
     "render_text",
     "render_summary",
     "run_dashboard",
@@ -821,8 +822,48 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
         os.close(fd)    # closing the descriptor releases the flock
 
 
+@dataclass(frozen=True)
+class StateWrite:
+    """What one ``write_state`` did beyond the line itself: the felt episode it owed.
+    ``episode`` is ``written`` (one new episode), ``unchanged`` (the live line already read
+    this text: a re-set refreshes the stamp and writes no episode), ``cleared`` (a clear sets
+    nothing), ``no_store`` (no episodic store to write to) or ``failed`` (the line is set, the
+    episode is not; ``episode_error`` says why)."""
+
+    text: str
+    episode: str
+    episode_error: str | None = None
+
+
+STATE_EPISODE_SOURCE = "levain-state"
+STATE_EPISODE_TAGS = ("felt", "state")
+
+
+def _record_state_episode(episodic_db: Path, text: str, source: str) -> StateWrite:
+    """Append the one ``observation`` episode, tagged ``felt,state``, that carries the line
+    verbatim: an input the consolidate reads, never a write into the felt layer. Fail-soft: the
+    line is already set, so any fault here is reported in the result, never raised. A store
+    that does not exist is not created for a state line."""
+    if not episodic_db.is_file():
+        return StateWrite(text, "no_store")
+    try:
+        from anneal_memory import Store   # lazy, as the view's own read
+
+        # audit=False: anneal's audit sidecar is a single-writer hash chain, and a consolidate may
+        # hold it; this append is a plain WAL INSERT and needs no chain entry
+        with Store(str(episodic_db), audit=False) as store:
+            store.record(
+                content=text, episode_type="observation", source=STATE_EPISODE_SOURCE,
+                metadata={"tags": list(STATE_EPISODE_TAGS), "state_source": source},
+            )
+    except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
+        return StateWrite(text, "failed", f"{type(exc).__name__}: {exc}")
+    return StateWrite(text, "written")
+
+
 def write_state(context_json: Path, text: str, *, source: str = "cli",
-                check: "Callable[[], None] | None" = None) -> None:
+                check: "Callable[[], None] | None" = None,
+                episodic_db: Path | None = None) -> StateWrite:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
     write-peer of ``_read_state``, kept adjacent so the contract (the three keys, a
     tz-aware ISO stamp) cannot drift between read and write.
@@ -837,14 +878,29 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     revert a just-set line (re-set is one keystroke). A blank text
     CLEARS by popping all three keys. The parent dir is created if absent; a
     corrupt/unreadable existing file is replaced rather than failing the set. The text is
-    stored verbatim apart from whitespace collapse; nothing reads meaning into it."""
+    stored verbatim apart from whitespace collapse; nothing reads meaning into it.
+
+    This is the ONE place "a state line was set" is computed. Given ``episodic_db`` it also
+    appends ONE ``observation`` episode tagged ``felt,state`` carrying the line verbatim, AFTER
+    the line is written and outside the lock (never an episode without the line); none for a
+    clear, and none when the live line already read this text (decided under the lock, so a
+    retried request writes the line again, as before, and no second episode). A writer that
+    passes no ``episodic_db`` records no episode."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     with _state_lock(context_json, required=check is not None):
         if check is not None:
             check()
+        prior = _read_state(context_json, datetime.now(timezone.utc))
         _write_context_line(context_json, "state", collapsed, source=source)
+    if not collapsed:
+        return StateWrite("", "cleared")
+    if prior is not None and prior.text == collapsed:
+        return StateWrite(collapsed, "unchanged")
+    if episodic_db is None:
+        return StateWrite(collapsed, "no_store")
+    return _record_state_episode(episodic_db, collapsed, source)
 
 
 @dataclass
@@ -1986,10 +2042,13 @@ def run_state(
         text = ""
     if text is not None:
         try:
-            write_state(context_json, text, source=source)
+            done = write_state(context_json, text, source=source,
+                               episodic_db=install_root / ".levain" / "memory.db")
         except (ValueError, OSError) as exc:
             print(f"state not set: {exc}", file=sys.stderr)
             return 2
+        if done.episode == "failed":
+            print(f"note: state set, but its felt episode was not written: {done.episode_error}", file=sys.stderr)
         print(f"state set: {' '.join(text.split())}" if text.strip() else "state cleared")
         return 0
     state = _read_state(context_json, datetime.now(timezone.utc))
