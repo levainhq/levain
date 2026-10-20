@@ -106,7 +106,16 @@ def test_pf_release_keeps_the_token_unless_pf_confirms_it_gone(tmp_path):
     gone = _Pf(x_fail="pfctl: pf not enabled\n", fail_tokens={"4242"})
     ok, why = pf.release_enable_reference(tok, gone)
     assert ok is True and not tok.exists() and "no longer held" in why
-    assert pf.PF_TOKEN_GONE == ("pf not enabled",)
+    assert pf.PF_TOKEN_GONE == ("pf not enabled", "pf: token invalid")
+
+
+def test_pf_release_treats_token_invalid_as_gone(tmp_path):
+    """pf enabled by something else, the token forgotten: pfctl's measured text (1c VM row C21)."""
+    tok = tmp_path / "pf.token"
+    tok.write_text("4242\n")
+    gone = _Pf(x_fail="pfctl: pf: token invalid\n", fail_tokens={"4242"})
+    ok, why = pf.release_enable_reference(tok, gone)
+    assert ok is True and not tok.exists() and "no longer held" in why
 
 
 def test_pf_token_written_atomically(tmp_path, monkeypatch):
@@ -282,15 +291,22 @@ def test_stdin_cap_counts_bytes_of_a_wide_memoryview():
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_preflight_checks_extra_tools(host):
-    extras = extra_tools(host)
+    extras = extra_tools(host, "setup")
     want = {"darwin": ("/usr/sbin/dseditgroup", "/usr/bin/pkill", "/usr/bin/pgrep"),
             "linux": tuple(hands._abs(n) for n in ("bwrap", "pkill", "pgrep"))}[host]
     assert extras == want and all(t.startswith("/") for t in extras)
+    assert extra_tools(host, "replenish") == want
+    # TRIAGE r1 (A1 report): undo never reads the system bwrap, so a host without one can still undo
+    undo_want = tuple(t for t in want if host != "linux" or not t.endswith("/bwrap"))
+    assert extra_tools(host, "undo") == undo_want
     for t in extras:
         facts_kw = dict(tool_present=lambda p, gone=t: p != gone)
         with pytest.raises(Refused) as ei:
             _plan(host, **facts_kw)
         assert ei.value.name == "tool-missing" and t in ei.value.detail
+        if t not in undo_want:
+            _undo(host, {"_levain_s0": 3999 if host == "darwin" else 899}, **facts_kw)
+            continue
         with pytest.raises(Refused) as ei:
             _undo(host, {"_levain_s0": 3999 if host == "darwin" else 899}, **facts_kw)
         assert ei.value.name == "tool-missing" and t in ei.value.detail

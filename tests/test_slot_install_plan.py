@@ -15,6 +15,7 @@ from levain.slot.ids import (RANGES, SHARED_GROUPS, SINGLETONS, SlotId, read_ret
                              write_retired_ids)
 from levain.slot.install_helper import (HostFacts, operator_record, operator_record_text, parse_operator_record,
                                         plan_replenish, plan_setup, plan_undo, preflight)
+from levain.slot.intent import INTENT_PATH
 from levain.slot.layout import RUN, STORE, operator_record_path
 from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, install_sudoers_text, runtime_sudoers_text)
 
@@ -164,11 +165,13 @@ def test_second_operator_refused_by_name(host):
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_operator_record_written_last_and_removed_last(host):
-    """§23: the record is setup's LAST step (``already-set-up`` = a complete install) and undo's last
-    removal; undo takes the runtime rule out first and the install rule out just before the record."""
+    """§23 + §25: the record is setup's last act on the install (``already-set-up`` = a complete
+    install), followed only by the journal's removal, and undo's last removal; undo takes the runtime
+    rule out first and the install rule out just before the journal and the record."""
     plan = plan_setup(_setup(), _facts(host))
     writes = [i for i, s in enumerate(plan.steps) if s.write and s.write[0] == operator_record_path(host)]
-    assert writes == [len(plan.steps) - 1]
+    assert writes == [len(plan.steps) - 2]
+    assert plan.steps[-1].argv[1:] == ("-f", str(INTENT_PATH[host]))
     path, text, mode = plan.steps[writes[0]].write
     assert mode == 0o644 and parse_operator_record(text.encode()) == operator_record(OP, OP_UID)
     assert text == operator_record_text(OP, OP_UID)
@@ -180,7 +183,8 @@ def test_operator_record_written_last_and_removed_last(host):
                      shared_groups=SHARED_GROUPS)
     assert undo.steps[-1].argv[1:] == ("-f", str(operator_record_path(host)))
     assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
-    assert undo.steps[-2].argv[-1] == str(INSTALL_SUDOERS)
+    assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))
+    assert undo.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
     assert [s.argv[-1] for s in undo.steps if s.argv and "sudoers" in s.argv[-1]] == [str(RUNTIME_SUDOERS),
                                                                                        str(INSTALL_SUDOERS)]
     retire = next(i for i, s in enumerate(undo.steps) if s.write)
@@ -396,9 +400,12 @@ def test_sudoers_text(host):
         assert verb not in disp
     for verb in ("prepare", "render", "start", "resume", "teardown", "status"):
         assert f"{h}/runtime-helper {verb}" in disp
-    # F15: one spec per verb, each `<verb> *` (which matches the bare verb too); no separate bare `status`
+    # sudo's `<verb> *` needs at least one argument (measured in the 1c VM: bare `status` was denied by
+    # `status *`), so bare `status` has a spec of its own
     specs = disp.split("NOPASSWD: ", 1)[1].split(", ")
-    assert specs == [f"{h}/runtime-helper {v} *" for v in ("prepare", "render", "start", "resume", "teardown", "status")]
+    assert specs == [f"{h}/runtime-helper {v} *" for v in ("prepare", "render", "start", "resume", "teardown",
+                                                           "status")] + [f"{h}/runtime-helper status"]
+    assert disp.rstrip().endswith(f", {h}/runtime-helper status")
     it = install_sudoers_text(host, OP)
     assert "NOPASSWD" not in it
     for bad in ("ALL", "a b", "x,ALL", "#0", "root", "Defaults", "defaults", "DEFAULTS", "User_Alias",
@@ -410,7 +417,7 @@ def test_sudoers_text(host):
     for ok in ("alice", "default", "alias", "bob_aliases"):
         assert install_sudoers_text(host, ok)                 # positive control: the reserved words only
     plan = plan_setup(_setup(), _facts(host))
-    last = plan.steps[-3:-1]
+    last = plan.steps[-4:-2]
     assert [s.write[0] for s in last] == [RUNTIME_SUDOERS, INSTALL_SUDOERS]
     assert all(s.write[2] == 0o440 and s.validate[-1] == "-cf" for s in last)
 

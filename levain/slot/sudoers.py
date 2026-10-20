@@ -25,8 +25,9 @@ DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "status")
 def runtime_sudoers_text(host: HostOS, operator: str) -> str:
     op = check_operator_name(operator)
     h = str(runtime_helper_path(host))
-    # `<verb> *` also matches the verb with no argument at all (`status` alone), so no bare spec is needed.
-    dispatch_cmds = ", ".join(f"{h} {v} *" for v in DISPATCH_VERBS)
+    # sudo's `cmd *` needs at least one argument (measured in the 1c VM); the bare form lists `status`
+    # with no arguments.
+    dispatch_cmds = ", ".join([*(f"{h} {v} *" for v in DISPATCH_VERBS), f"{h} status"])
     return (
         "# Written by the Levain install helper (CONTRACT §5.1); removed by its undo verb.\n"
         f"Defaults!{h} use_pty\n"

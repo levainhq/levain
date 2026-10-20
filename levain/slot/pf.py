@@ -98,11 +98,11 @@ def anchor_text(slots: Iterable[SlotId], ids: Mapping[str, int]) -> str:
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
-#: What pfctl prints when the reference a token names is already gone. "pf not enabled" is pfctl's text
-#: for pf holding no reference at all, the state a reboot leaves when nothing else enabled pf; that -X
-#: prints it there is reasoned, not run. A token pf forgot while something else keeps pf enabled prints
-#: some other text and so is KEPT: a release that may not have happened is never recorded as done.
-PF_TOKEN_GONE = ("pf not enabled",)
+#: What pfctl -X prints (exit 1) when the reference a token names is already gone, both measured (1c VM
+#: row C21): "pf not enabled" with pf holding no reference at all, the state a reboot leaves when nothing
+#: else enabled pf; "pf: token invalid" for a token pf no longer knows while pf stays enabled. Any other
+#: text KEEPS the token: a release that may not have happened is never recorded as done.
+PF_TOKEN_GONE = ("pf not enabled", "pf: token invalid")
 
 
 def _token_gone(r: "subprocess.CompletedProcess[str]") -> bool:

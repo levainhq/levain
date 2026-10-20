@@ -120,7 +120,9 @@ def test_preflight_refuses_missing_tool(host, monkeypatch):
         assert _refusal(plan_setup, _setup(), _facts(host, xcode_ready=lambda: False),
                         program_exists=lambda p: True) == "tool-missing"
     # undo and replenish check theirs too
-    assert _refusal(check_tools, _facts(host, tool_present=lambda p: False), plan.steps) == "tool-missing"
+    for verb in ("undo", "replenish"):
+        assert _refusal(check_tools, _facts(host, tool_present=lambda p: False), plan.steps,
+                        verb=verb) == "tool-missing"
 
 
 # --- §23 re-runs --------------------------------------------------------------------------------------------
@@ -188,8 +190,8 @@ def test_undo_reruns_after_failure(host):
     ids = dict(plan.allocation.ids)
     undo = _undo(host, ids)
     assert undo.steps[0].argv[-1] == str(RUNTIME_SUDOERS)
-    assert undo.steps[-2].argv[-1] == str(INSTALL_SUDOERS)
-    assert [i for i, s in enumerate(undo.steps) if s.argv and str(INSTALL_SUDOERS) in s.argv] == [len(undo.steps) - 2]
+    assert undo.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
+    assert [i for i, s in enumerate(undo.steps) if s.argv and str(INSTALL_SUDOERS) in s.argv] == [len(undo.steps) - 3]
     for s in undo.steps:
         if s.argv and Path(s.argv[0]).name in ("groupdel", "apparmor_parser") or "-delete" in s.argv:
             assert s.skip_if, s.why
@@ -197,7 +199,7 @@ def test_undo_reruns_after_failure(host):
             assert s.skip_if, s.why
     # the re-run after a failure past the tombstones: no live accounts left, half the groups gone
     again = _undo(host, {}, shared=SHARED_GROUPS[:3], retired=undo.retired_after)
-    assert again.steps[0].argv[-1] == str(RUNTIME_SUDOERS) and again.steps[-2].argv[-1] == str(INSTALL_SUDOERS)
+    assert again.steps[0].argv[-1] == str(RUNTIME_SUDOERS) and again.steps[-3].argv[-1] == str(INSTALL_SUDOERS)
     assert again.retired_after == undo.retired_after
 
 

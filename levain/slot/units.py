@@ -208,10 +208,42 @@ class _PlistChanges:
         return _launchd_job_absent(label, self._run)
 
 
+class _UnitChanges:
+    """Linux twin of :class:`_PlistChanges`: whether each unit file on disk differed from the one setup
+    is about to write, recorded BEFORE the write. ``enable --now`` starts a stopped unit with the new
+    definition but leaves a running one on the old, so a unit that changed and is active is restarted
+    once, after ``daemon-reload``; an unchanged or inactive one is left to ``enable --now``."""
+
+    def __init__(self, systemctl: str, run: Callable[..., object] | None = None,
+                 read: Callable[[Path], bytes | None] = _read_or_none) -> None:
+        self.changed: dict[str, bool] = {}
+        self._systemctl, self._run, self._read = systemctl, run, read
+
+    def record(self, name: str, path: Path, text: str) -> tuple[bool, str]:
+        self.changed[name] = self._read(path) != text.encode("utf-8")
+        return True, ""
+
+    def restart_if_changed(self, name: str) -> tuple[bool, str]:
+        import subprocess
+
+        if name not in self.changed:
+            return False, f"{name}: no record of whether its unit changed (the record step did not run)"
+        if not self.changed[name]:
+            return True, ""
+        run = self._run or subprocess.run
+        systemctl = self._systemctl
+        if getattr(run([systemctl, "is-active", "--quiet", name], capture_output=True), "returncode", 1) != 0:
+            return True, ""
+        r = run([systemctl, "restart", name], capture_output=True)
+        ok = getattr(r, "returncode", 1) == 0
+        return ok, "" if ok else f"systemctl restart {name} failed"
+
+
 def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..., object] | None = None,
                   read: Callable[[Path], bytes | None] = _read_or_none) -> list[Step]:
-    """Write each of ``services``' units, then start each in :func:`start_order`. macOS: a job already
-    loaded is restarted only when its plist changed (``run``/``read``: launchctl and the plist read)."""
+    """Write each of ``services``' units, then start each in :func:`start_order`. A unit already running
+    is restarted only when its definition changed (``run``/``read``: launchctl or systemctl, and the
+    unit file read)."""
     names = {x.name for x in services}
     chosen = [s for s in services_for(host) if s.name in names]
     steps: list[Step] = []
@@ -233,11 +265,17 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
     if not chosen:
         return steps
     systemctl = _abs("systemctl")
+    unit_changes = _UnitChanges(systemctl, run, read)
     for s in chosen:
-        steps.append(Step(f"write the systemd unit {systemd_name(s)} ({s.title}, as {s.user})",
-                          write=(systemd_path(systemd_name(s)), systemd_unit_text(s), 0o644)))
+        name, text = systemd_name(s), systemd_unit_text(s)
+        path = systemd_path(name)
+        steps.append(Step(f"note whether {path} on disk differs from the one about to be written",
+                          call=lambda n=name, p=path, t=text: unit_changes.record(n, p, t)))
+        steps.append(Step(f"write the systemd unit {name} ({s.title}, as {s.user})", write=(path, text, 0o644)))
     steps.append(Step("tell systemd about the units", (systemctl, "daemon-reload")))
     for name in start_order(host, chosen):
+        steps.append(Step(f"restart {name} if it is active and its unit changed",
+                          call=lambda n=name: unit_changes.restart_if_changed(n)))
         steps.append(Step(f"enable and start {name}", (systemctl, "enable", "--now", name)))
     return steps
 
