@@ -1079,6 +1079,32 @@
   // the static caps allow); `s.units` is how many it could draw, `s.hidden` how many it does not (a "+N more" line), `s.clamp` whether
   // a run of text had to be cut to two lines. fitWidget() finds the budget that fits the tile's real height.
   const moreNote = (host, n) => { if (n > 0) host.appendChild(el("div", "xnote", "+" + n + " more")); };
+  // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
+  // first (levain-needs, dashboard_core.js, orders both); Sessions says live and quiet and names the busiest.
+  function glanceFace(d, n, host) {
+    const N = root.LevainNeeds;
+    if (d.pid === "decisions" && n && N && Array.isArray(d.lines)) {
+      const items = N.items(d.lines);
+      if (items.length) {
+        host.appendChild(el("div", "sub glance-top", N.name(items[0])));
+        host.appendChild(el("div", "sub glance-sum", N.summary(items)));
+      }
+      return;
+    }
+    if (d.pid === "sessions" && Array.isArray(d.lines)) {
+      const sess = d.lines.map((l) => l && l.sess).filter(isObj);
+      if (!sess.length) return;
+      const live = sess.filter((x) => x.active), quiet = sess.length - live.length;
+      const pool = live.length ? live : sess;
+      let top = pool[0];
+      for (const x of pool) if ((x.tokens || 0) > (top.tokens || 0)) top = x;
+      const line = d.lines.find((l) => l && l.sess === top);
+      const meter = isNum(top.tokens) && top.tokens > 0 ? (top.window ? " \u00b7 " + Math.round(100 * top.tokens / top.window) + "% of context" : " \u00b7 " + k7K(top.tokens) + " tokens") : "";
+      // one line: a strip tile draws only its first sub line, and the counts are what the reader wants first
+      host.appendChild(el("div", "sub glance-top", live.length + " live \u00b7 " + quiet + " quiet \u00b7 busiest: " +
+        ((line && line.text) || top.agent || "session").replace(/\s+/g, " ").trim() + meter));
+    }
+  }
   function paintWidget(s, host) {
     const d = s.data;
     const cap = s.budget == null ? Infinity : s.budget;
@@ -1095,6 +1121,7 @@
       const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
       else if (d.note) host.appendChild(el("div", "sub", d.note));
+      glanceFace(d, n, host);
       return;
     }
     if (d.kind === "status-dots") {
