@@ -35,7 +35,9 @@ classifiers. It is INJECTED (``landing_tier(repo, paths)``) and there is no defa
 it returns but ``"T2"``/``"T3"``, and any exception from it, refuses the land.
 
 Known edge (F11 §8): until S1 places principals, every actor is the operator's uid, so a planner can merge a staged
-ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Stdlib only.
+ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Known edge (F11 §10): the
+contract's expiry and a ``max_age_hours`` criterion are judged at the land's one stamp, taken before the floor, so a land
+that straddles the bound by its own duration authorises once. Stdlib only.
 """
 from __future__ import annotations
 
@@ -952,9 +954,11 @@ def land(store: JobStore, job_id: str, *,
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
     if job.state == "authorised":
         return _finish(store, job)
+    # the records first, then the job read again: a lease the records' sweep lapsed is the state the floor judges
+    records = store.run_records(job.id)
+    job = store.get(job.id) or job
     stamp = store.stamp()
     payload = human[0] if human is not None else None
-    records = store.run_records(job.id)
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,
                     policy=policy, now=stamp, human=payload if isinstance(payload, Mapping) else
                     ({} if human is not None else None), rules=rules)
@@ -999,7 +1003,8 @@ def land(store: JobStore, job_id: str, *,
         if again.state == "failed" and again.history[-1].cause == "base_moved":
             return Landing(outcome="failed", job=again, message="another land found the base moved")
         if again.state != "authorised":
-            raise
+            return Landing(outcome="refused", job=again, message=f"job {again.id} became {again.state} during this "
+                                                                 "land; nothing moved")
         job = again
     return _finish(store, job)
 

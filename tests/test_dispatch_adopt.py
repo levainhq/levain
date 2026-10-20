@@ -916,3 +916,32 @@ def test_the_finish_reads_only_the_authorised_runs_row(jstore, cstore, repo, log
          "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
     monkeypatch.setattr(jstore, "run_records", lambda job_id: 1 / 0)        # every-row read: never on this path
     assert adopt._finish(jstore, stale).outcome == "adopted"
+
+
+@pytest.mark.parametrize("when", ["records", "authorise"])
+def test_a_job_that_ends_during_a_land_is_refused_never_raised(when, jstore, cstore, repo, log, keys, tmp_path,
+                                                               monkeypatch):
+    # L3 r1 codex 3 + complement 1: the lease lapsing inside the land's own reads raised TransitionRefused
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    real_records, real_authorise = JobStore.run_records, JobStore.authorise
+
+    def records(self, job_id):
+        out = real_records(self, job_id)
+        if when == "records" and self.get(job_id).state == "verified":
+            self._transition(job_id, "failed", "lease_lapsed")
+        return out
+
+    def authorise(self, job_id, **kw):
+        if when == "authorise":
+            self._transition(job_id, "cancelled", "human_cancel")
+        return real_authorise(self, job_id, **kw)
+
+    monkeypatch.setattr(JobStore, "run_records", records)
+    monkeypatch.setattr(JobStore, "authorise", authorise)
+    out = land(jstore, job.id, landing_tier=T2, resolve_template=resolver(cstore), policy=active_policy(cstore),
+               onto="main", rules=lambda: adoption_rules_at(cstore))
+    assert out.outcome == "refused", out.message
+    assert git(repo[0], "rev-parse", "main") == repo[1]
