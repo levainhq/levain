@@ -22,7 +22,7 @@ from levain.coordinator.store import KINDS, STATES, CoordError, CoordStore, Drop
 from levain.dispatch.jobs import JobStoreError
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
-_REFUSED = (CoordError, JobStoreError, sqlite3.Error)
+_REFUSED = (CoordError, JobStoreError, sqlite3.Error, OSError)
 
 __all__ = ["add_parsers", "cwd_source"]
 
@@ -48,10 +48,13 @@ def cwd_source(cwd: str | None = None) -> Source:
     """Where a CLI drop is made from: the work tree's top, the checked-out branch and its head; ``Source()`` (none)
     outside a repo or on a detached HEAD."""
     cwd = cwd or os.getcwd()
-    top = _git(cwd, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    top = _git(cwd, "rev-parse", "--show-toplevel")          # already absolute; one line or it is not trusted
     ref = _git(cwd, "symbolic-ref", "-q", "HEAD")
     head = _git(cwd, "rev-parse", "--verify", "-q", "HEAD")
-    if not top or not ref or not ref.startswith("refs/heads/") or not head:
+    # a checkout between the calls would pair one branch with another's head: read the branch again, and record
+    # nothing if it moved
+    if not top or "\n" in top or not top.startswith("/") or not ref or not ref.startswith("refs/heads/") \
+            or not head or _git(cwd, "symbolic-ref", "-q", "HEAD") != ref:
         return Source()
     return Source("cwd", os.path.realpath(top), ref, head)
 
@@ -216,10 +219,10 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
         elif cmd == "detach":
             t = store.detach(args.thread_id, args.drop_id, by=args.by)
         elif cmd == "add":
-            if args.about and args.attach:
+            if args.about is not None and args.attach:
                 raise CoordError("--about names what a NEW thread concerns; an attach joins an existing one")
             part = _parse_attach(args.attach) if args.attach else _parse_part(args.thread)
-            if args.about:
+            if args.about is not None:
                 part = Part(part.kind, part.title, about=args.about)
             t = store.add(args.drop_id, part, by=args.by)
         else:   # set

@@ -335,3 +335,48 @@ def test_cli_words_from_stdin_and_after_double_dash(tmp_path, monkeypatch, capsy
     assert "not UTF-8" in capsys.readouterr().err
     assert main(["drop", "--queue-dir", str(q), "--json", "--", "-dash first"]) == 0
     assert json.loads(capsys.readouterr().out)["words"] == "-dash first"
+
+
+# --- L3 r1 -----------------------------------------------------------------------------------------------------------
+
+def test_no_path_leaves_an_open_ask_about_a_closed_thread(store):
+    ask, w, a = _work_and_ask(store)
+    drop = w.members[0]
+    (w2,) = [t for t in store.threads_of(drop) if t.thread_id != w.thread_id]
+    store.detach(w.thread_id, drop)                  # empties w: w closes, and the ask about it closes with it
+    assert store.thread(w.thread_id).state == "closed"
+    closed = store.thread(a.thread_id)
+    assert closed.state == "closed" and store.events(a.thread_id)[-1][4] == "service"
+    _, w3, a3 = _work_and_ask(store)
+    store.set_state(w3.thread_id, "closed", by="operator")
+    assert store.thread(a3.thread_id).state == "closed"
+
+
+def test_detach_refuses_a_done_or_closed_thread(store):
+    d, _ = store.accept_drop(TWO, surface="cli")
+    x, y = store.split(d.drop_id, [work("x"), work("y")])
+    store.set_state(x.thread_id, "done", by="coordinator")
+    with pytest.raises(CoordError, match="reopen it first"):
+        store.detach(x.thread_id, d.drop_id)
+
+
+def test_merge_carries_a_working_claim(store):
+    d, _ = store.accept_drop(COPY, surface="cli")
+    x, y = store.split(d.drop_id, [work("x"), work("y")])
+    store.set_state(y.thread_id, "working", by="coordinator")
+    assert store.merge(x.thread_id, y.thread_id).state == "working"
+
+
+def test_source_takes_a_sha256_repository_head(store):
+    src = Source("cwd", "/tmp/r", "refs/heads/main", "a" * 64)
+    drop, _ = store.accept_drop("from a sha256 repo", surface="cli", source=src)
+    assert drop.source.head == "a" * 64
+    with pytest.raises(CoordError, match="40 or 64"):
+        store.accept_drop("bad head", surface="cli", source=Source("cwd", "/tmp/r", "refs/heads/main", "a" * 50))
+
+
+def test_cli_store_it_cannot_create_exits_1(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    assert main(["drop", "--queue-dir", str(blocker / "q"), "--no-source", "words"]) == 1
+    assert "levain drop:" in capsys.readouterr().err

@@ -77,7 +77,7 @@ _SENT_SKEW = timedelta(minutes=2)
 _DROP_ID = re.compile(r"dr-[0-9a-f]{32}")
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
 _OUTBOX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}")
-_SHA1 = re.compile(r"[0-9a-f]{40}")
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")      # a SHA-1 or a SHA-256 repository
 
 # (from, to) -> who may take the step. The coordinator claims work and its end; you close (from the review queue)
 # and reopen; the service closes a thread that is not work once it is done, and one a regroup left empty
@@ -270,13 +270,18 @@ def _check_source(source: Source) -> Source:
             raise CoordError("a drop with no source records no repo, ref or head")
         return source
     if not isinstance(source.repo, str) or not source.repo.startswith("/") or len(source.repo) > _REPO_MAX \
-            or "\x00" in source.repo:
+            or unshowable.first_hidden(source.repo, allow="", selectors=False) is not None:
         raise CoordError("a drop's source repo is an absolute path")
     if not isinstance(source.ref, str) or not source.ref.startswith("refs/heads/") or len(source.ref) > 1024 \
             or unshowable.first_hidden(source.ref, allow="", selectors=False) is not None:
         raise CoordError("a drop's source ref is a branch, refs/heads/<name>")
-    if not isinstance(source.head, str) or _SHA1.fullmatch(source.head) is None:
-        raise CoordError("a drop's source head is a full 40-hex commit sha")
+    if not isinstance(source.head, str) or _OID.fullmatch(source.head) is None:
+        raise CoordError("a drop's source head is a full commit id (40 or 64 hex)")
+    try:
+        source.repo.encode("utf-8")
+        source.ref.encode("utf-8")
+    except UnicodeEncodeError:
+        raise CoordError("a drop's source repo and ref must be text UTF-8 can hold") from None
     return source
 
 
@@ -377,6 +382,8 @@ class CoordStore:
             self._must_drop(conn, drop_id)
             if self._receipts(conn, drop_id, "split"):
                 raise CoordError(f"drop {drop_id} is already split; regroup it with add, merge or detach")
+            if not all(isinstance(p, Part) for p in parts):
+                raise CoordError("every split part is a Part")
             touched: list[str] = [""] * len(parts)
             # the parts about no thread first (new threads, attaches), then those about one: the order a caller
             # lists parts in never changes what the split is allowed to do
@@ -388,6 +395,8 @@ class CoordStore:
                     touched[i] = self._place(conn, drop_id, part, by, now, first=True)
             for i, part in enumerate(parts):
                 if _sibling(part):
+                    if part.attach is not None:
+                        raise CoordError("a part about @N is a new thread; it names no attach")
                     n = _sibling_index(part, len(parts))
                     if parts[n].about is not None or parts[n].attach is not None:
                         raise CoordError(f"about @{n + 1} names a part that is not a new thread of this split")
@@ -436,9 +445,11 @@ class CoordStore:
                 raise CoordError(f"other threads are about {other}; it cannot be merged away")
             if b.repo and not a.repo:
                 self._event(conn, into, "repo", b.repo, f"merged from {other}", by, now)
+            if b.state == "working" and a.state == "open":      # the claim on other's work moves with it
+                self._event(conn, into, "state", "working", f"merged from {other}", "service", now)
             self._revise(conn, into, set(a.members) | set(b.members), "resplit", now)
             self._revise(conn, other, (), "resplit", now)
-            self._event(conn, other, "state", "closed", f"merged into {into} by {by}", "service", now)
+            self._close(conn, other, f"merged into {into} by {by}", "service", now)
             for d in sorted(set(b.members)):
                 self._drop_receipt(conn, d, "resplit", now)
             return self._thread(conn, into)
@@ -451,6 +462,8 @@ class CoordStore:
         with self._write() as (conn, now):
             self._must_drop(conn, drop_id)
             t = self._must_thread(conn, thread_id)
+            if t.state in ("done", "closed"):
+                raise CoordError(f"thread {thread_id} is {t.state}; reopen it first")
             if drop_id not in t.members:
                 raise CoordError(f"drop {drop_id} is not in thread {thread_id}")
             if not [x for x in self._threads_of(conn, drop_id)
@@ -458,8 +471,8 @@ class CoordStore:
                 raise CoordError(f"drop {drop_id} is in no other open thread; add it to one before detaching it")
             left = set(t.members) - {drop_id}
             self._revise(conn, thread_id, left, "resplit", now)
-            if not left and t.state != "closed":
-                self._event(conn, thread_id, "state", "closed", f"emptied by {by}", "service", now)
+            if not left:
+                self._close(conn, thread_id, f"emptied by {by}", "service", now)
             self._drop_receipt(conn, drop_id, "resplit", now)
             return self._thread(conn, thread_id)
 
@@ -481,9 +494,12 @@ class CoordStore:
                 raise CoordError("the service never closes a work thread; you do (a regroup that empties one closes it)")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")
-            self._event(conn, thread_id, "state", state, cause or state, by, now)
+            if state == "closed":
+                self._close(conn, thread_id, cause or state, by, now)
+            else:
+                self._event(conn, thread_id, "state", state, cause or state, by, now)
             if state == "done" and t.kind != "work":
-                self._event(conn, thread_id, "state", "closed", f"{t.kind} closes itself once done", "service", now)
+                self._close(conn, thread_id, f"{t.kind} closes itself once done", "service", now)
             return self._thread(conn, thread_id)
 
     def set_field(self, thread_id: str, field: str, value: str, *, by: str = "coordinator", cause: str = "") -> Thread:
@@ -664,6 +680,15 @@ class CoordStore:
         self._event(conn, thread_id, "kind", part.kind, "split", by, now)
         self._event(conn, thread_id, "title", title, "split", by, now)
         return thread_id
+
+    def _close(self, conn: sqlite3.Connection, thread_id: str, cause: str, by: str, now: str) -> None:
+        """Close a thread, and with it every thread about it that is not closed yet: an ask or note about closed work
+        has nothing left to concern (``about`` never changes, and a closed thread is reopened only by you). Every close
+        goes through here, so no path leaves an open thread pointing at a closed one."""
+        self._event(conn, thread_id, "state", "closed", cause, by, now)
+        for dependent in self._dependents(conn, thread_id):
+            if self._thread(conn, dependent).state != "closed":
+                self._close(conn, dependent, f"the thread it is about ({thread_id}) closed", "service", now)
 
     @staticmethod
     def _dependents(conn: sqlite3.Connection, thread_id: str) -> list[str]:
