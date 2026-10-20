@@ -476,6 +476,130 @@ def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
     return list(_dedup_paths(dirs)), list(_dedup_paths(files))
 
 
+_git_bin_refusal_warned = False
+
+
+def _run_git_config(args: list[str], environ) -> str | None:
+    """``git config --global <args>`` run with the operator's git environment (``HOME``,
+    ``XDG_CONFIG_HOME``, ``GIT_CONFIG_GLOBAL`` from ``environ``), outside any repository; its stdout,
+    or None when git is missing, fails or finds nothing. git is :func:`levain.consent.push.git_bin`'s
+    root-owned one, never a PATH lookup: this runs as the operator, outside any sandbox, at every
+    policy build, and a workspace PATH entry (an activated venv) is somewhere the agent can write. A
+    failure of a git that exists is logged, since the files it would have named are not added."""
+    from levain.consent.push import PushRefused, git_bin
+    from levain.launch import child_env
+
+    global _git_bin_refusal_warned
+    try:
+        exe = git_bin()
+    except PushRefused as exc:
+        # Fail-open, like a failing git, so it is said; once, since every build asks again.
+        if not _git_bin_refusal_warned:
+            _git_bin_refusal_warned = True
+            _log.warning("%s; the files the operator's global git config makes git read were not "
+                         "added to the write-protected startup files", exc)
+        return None
+    genv = child_env()
+    for var in ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
+        genv.pop(var, None)
+        if environ.get(var):
+            genv[var] = environ[var]
+    try:
+        done = subprocess.run([exe, "config", "--global", *args], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, cwd="/", env=genv, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _warn_git_config_unread(args, f"{type(exc).__name__}: {exc}")
+        return None
+    if done.returncode == 0:
+        return done.stdout
+    # Exit 1 is git's "nothing matched", and with no global config file at all a --list fails
+    # too. Neither loses a file, and both are routine.
+    if done.returncode != 1 and _global_git_config_present(environ):
+        _warn_git_config_unread(args, f"exit {done.returncode}: {done.stderr.strip()[:200]}")
+    return None
+
+
+def _global_git_config_present(environ) -> bool:
+    """Whether a global git config file git would read exists (or is a link) in ``environ``."""
+    home = environ.get("HOME") or os.path.expanduser("~")
+    git_global = environ.get("GIT_CONFIG_GLOBAL")
+    if git_global:
+        candidates = [os.path.expanduser(git_global)]
+    else:
+        xdg = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        candidates = [os.path.join(home, ".gitconfig"), os.path.join(xdg, "git", "config")]
+    return any(os.path.lexists(c) for c in candidates)
+
+
+def _warn_git_config_unread(args: list[str], reason: str) -> None:
+    _log.warning("git config --global %s failed (%s); the files the operator's global git config makes "
+                 "git read were not added to the write-protected startup files", " ".join(args), reason)
+
+
+def _git_config_read_files(environ) -> list[Path]:
+    """The files the operator's global git config makes git read, as git itself reports them: every
+    file a ``--show-origin`` listing names (the config and everything it includes), every
+    ``include.path`` / ``includeIf.*.path`` target (a conditional include shows only inside its
+    repository, and an absent target is where a config could be planted), and
+    ``core.attributesFile``. A relative include path is the including file's sibling, as git resolves
+    it. Nothing when git is missing or fails."""
+    out: list[Path] = []
+    listing = _run_git_config(["--includes", "--show-origin", "--name-only", "--list", "-z"], environ)
+    if listing:
+        fields = listing.split("\0")
+        for origin in fields[0::2]:
+            if origin.startswith("file:") and os.path.isabs(origin[5:]):
+                out.append(Path(origin[5:]))
+    includes = _run_git_config(["--includes", "--show-origin", "-z", "--get-regexp",
+                                r"^include(if\..*)?\.path$"], environ)
+    if includes:
+        fields = includes.split("\0")
+        for origin, entry in zip(fields[0::2], fields[1::2]):
+            _key, _, value = entry.partition("\n")
+            value = os.path.expanduser(value)
+            if not value or not origin.startswith("file:"):
+                continue
+            if not os.path.isabs(value):
+                value = os.path.join(os.path.dirname(origin[5:]), value)
+            if os.path.isabs(value):
+                out.append(Path(value))
+    attributes = _run_git_config(["--includes", "--get", "core.attributesFile"], environ)
+    if attributes and attributes.strip():
+        value = os.path.expanduser(attributes.strip())
+        if os.path.isabs(value):
+            out.append(Path(value))
+    return out
+
+
+def _git_config_overrides(environ=None) -> tuple[list[Path], list[Path]]:
+    """``(subtrees, files)`` of operator git config beyond the defaults: git reads
+    ``$XDG_CONFIG_HOME/git/{config,attributes}`` when that variable is set, the file a
+    ``GIT_CONFIG_GLOBAL`` names, and whatever :func:`_git_config_read_files` derives from git itself;
+    a filter driver any of them names runs during the cockpit's status reads. A non-empty RELATIVE
+    value of either variable refuses the floor: git resolves it against its own working directory,
+    which for the cockpit is the agent's workspace. ``/dev/null`` exactly is exempt (how a caller
+    switches the global config off); every other spelling, under ``/dev`` or not, is protected."""
+    env = os.environ if environ is None else environ
+    subtrees: list[Path] = []
+    files: list[Path] = []
+    for var in ("XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
+        value = os.path.expanduser(env.get(var, ""))
+        if value and not os.path.isabs(value):
+            raise ConfinementError(
+                f"${var} is the relative path {value!r}, which git resolves against whatever directory "
+                "it runs in, the agent's workspace included — refusing to build the floor "
+                f"(fail-closed). Set {var} to an absolute path, or unset it."
+            )
+    xdg = os.path.expanduser(env.get("XDG_CONFIG_HOME", ""))
+    if xdg:
+        subtrees.append(Path(xdg) / "git")
+    git_global = os.path.expanduser(env.get("GIT_CONFIG_GLOBAL", ""))
+    if git_global and os.path.normpath(git_global) != "/dev/null":
+        files.append(Path(git_global))
+    files += [f for f in _git_config_read_files(env) if os.path.normpath(f) != "/dev/null"]
+    return list(_dedup_paths(subtrees)), list(_dedup_paths(files))
+
+
 def _cred_dir_sources() -> list[Path]:
     """The credential directories that are a tool's whole home, lexical: the defaults and every
     override (:data:`_CRED_DIR_ENV`)."""
@@ -568,14 +692,19 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
     """
     s = str(spec)
     raw = Path.home() / s[2:] if s == "~" or s.startswith("~/") else Path(s)
-    try:
-        raw.parent.resolve()
-        raw.resolve()
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ConfinementError(
-            f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
-            "refusing to build the floor (fail-closed)"
-        ) from exc
+    # Strict, because non-strict resolve stopped reporting a symlink loop in Python 3.13.
+    for path in (raw.parent, raw):
+        try:
+            path.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            # absent, or under a directory this user may not search (non-strict resolve's old
+            # tolerance): protected lexically, as an absent persistence path always was
+            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
+                "refusing to build the floor (fail-closed)"
+            ) from exc
     return _spellings(spec)
 
 
@@ -696,26 +825,57 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
             file_targets.append(target)
 
     def scan_protected_directories() -> None:
+        # Other sessions create and delete entries under the agent roots while this walk runs. An
+        # inspection that reports absence is only a hint: the entry is re-read with lstat before it
+        # is skipped. Gone -> skip, since anything re-created there later lands inside a protected
+        # subtree that is already write-denied. A symlink -> classified exactly as a child symlink,
+        # so a dangling link is a write target, never an absence. Any other non-directory -> a
+        # file target. A directory again, or any failure to re-read -> refuse the floor. An inode
+        # is marked visited only once its scan completed, so a failed scan never hides it from
+        # another alias.
+        def confirm_gone(path: Path, exc: OSError) -> None:
+            try:
+                st = os.lstat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return
+            except OSError as lstat_exc:
+                refuse(path, f"an entry that cannot be inspected ({lstat_exc})", lstat_exc)
+            if stat.S_ISLNK(st.st_mode):
+                classify(path)
+            elif stat.S_ISDIR(st.st_mode):
+                refuse(path, f"a protected directory that cannot be walked ({exc})", exc)
+            else:
+                file_targets.append(path)
+
         visited: set[tuple[int, int]] = set()
         while directories_to_walk:
             directory = directories_to_walk.pop(0)
             try:
                 st = os.stat(directory)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                confirm_gone(directory, exc)
+                continue
             except OSError as exc:
                 refuse(directory, f"an unresolvable directory target ({exc})", exc)
             identity = (st.st_dev, st.st_ino)
             if identity in visited:
                 continue
-            visited.add(identity)
             try:
                 with os.scandir(directory) as scanned:
                     entries = sorted(scanned, key=lambda entry: entry.name)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                confirm_gone(directory, exc)
+                continue
             except OSError as exc:
                 refuse(directory, f"a protected directory that cannot be walked ({exc})", exc)
+            visited.add(identity)
             for entry in entries:
                 child = Path(entry.path)
                 try:
                     child_st = os.lstat(child)
+                except (FileNotFoundError, NotADirectoryError) as exc:
+                    confirm_gone(child, exc)
+                    continue
                 except OSError as exc:
                     refuse(child, f"an entry that cannot be inspected ({exc})", exc)
                 if stat.S_ISLNK(child_st.st_mode):
@@ -2455,6 +2615,11 @@ def build_policy(
     # unlike ordinary jewels, an unresolvable spelling refuses the floor because Seatbelt's
     # canonical data-write matching would make a lexical-only deny inert.
     persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
+    # Still uncovered: the system and repository configs, a relative core.attributesFile, includes
+    # nested inside a conditional include's target, and anything the config gains after this build.
+    # On Linux an absent derived file under a directory nobody here can create makes bwrap refuse to
+    # start (its mountpoint cannot be made): fail-closed, and accepted as a known edge (L3 r4).
+    git_env_subtrees, git_env_files = _git_config_overrides()
     persistence_write_subtrees = _dedup([
         p
         for root, label in (
@@ -2462,6 +2627,7 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
+            *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
             # zsh's startup files when ~/.zshenv sets ZDOTDIR to the usual XDG place.
             (home / ".config" / "zsh", "operator zsh config"),
             # Linux's own: the systemd user manager reads units and environment from these, a
@@ -2485,6 +2651,8 @@ def build_policy(
                 ".zshrc", ".zprofile", ".zlogin", ".zshenv", ".bashrc", ".bash_profile",
                 ".bash_login", ".profile", ".gitconfig",
             )),
+            *((f, "operator git config ($GIT_CONFIG_GLOBAL or a file git reports reading)")
+              for f in git_env_files),
         )
         for p in _required_spellings(root, label)
     ])
@@ -5671,6 +5839,7 @@ class _HandsSeatbeltShell(_SeatbeltShell):
 #   deny_write_dirs (ancestors)  --bind P P (self-bind)     rename EBUSY, writes INSIDE still OK
 #   deny_write_files             --ro-bind P P (self-bind)  read OK, write EROFS
 #   own_memory_files             --ro-bind P P (self-bind)  read OK, write EROFS
+#   persistence_write_files      the deny_write_files loop  (the same op, not separately measured)
 #   ssh_dir (agent mode)         --tmpfs, then bind back    key material ENOENT; known_hosts and
 #                                known_hosts + config (both config read OK / write EROFS
 #                                ro) INTO the tmpfs
@@ -7131,7 +7300,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     # ``runtime_roots`` given: the spawn's one read of the runtime dirs (`BwrapProvider._prepare`), which
     # its grant, agent and environment steps use too; the views here are made from that same value.
     runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr, runtime_roots)
-    for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
+    # The persistence files ride the same loop: outside $HOME's frozen top level (a relocated git
+    # config, a file git includes) nothing else stops bash writing one.
+    for f in _dedup_paths([*policy.deny_write_files, *policy.own_memory_files,
+                           *policy.persistence_write_files]):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f.name in _GNUPG_CONF_WRITE_DENIED and any(

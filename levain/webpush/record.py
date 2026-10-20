@@ -1,7 +1,8 @@
 """levain.webpush.record: the notification record (P4), every ping Levain sent and what happened to it.
 
 Phill ruled the shape 10-19 (project_memory/1019-app/SHAPE.md, c1, *"that is approved"*): each ping with when and why, where
-it went (each phone's push service, and whether the notify command started), whether it was opened and on which phone, and
+it went (each phone's push service, and whether the notify command started: a ping only the command carried is a row
+with no deliveries), whether it was opened and on which phone, and
 its OUTCOME, which is read from the consent queue and the question store at display time and never copied into the
 record. The record says what Levain did; the queue says what came of it; a second copy of the queue's state would be a
 second truth that drifts.

@@ -17,6 +17,10 @@ it serves only these:
   - ``POST /sign/<id>/challenge``, ``.../answer`` and ``.../deny``: a statement a caller filed for the operator's
     passkey to sign, in a namespace the command was started with (``--sign-namespace``), listed in ``consent.json``
     as ``sign_pending``, with ``sign_overflow`` the request files past the listing's cap (:mod:`levain.consent.sign`).
+  - ``POST /dispatch/<job>/challenge``, ``.../answer``, ``.../cancel-challenge`` and ``.../cancel``: a filed dispatch
+    job's contract signed, or a live one cancelled, with a passkey, verified by the job store against the same one
+    cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
+    (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
   - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
     ``POST /question/<n>/answer`` answers one by an option key or free text, once. An answer is UNSIGNED (no
     passkey) and authorises NOTHING: it is words the agent is told; it is then delivered to the agent's session
@@ -70,6 +74,7 @@ _QUESTION_ROUTE = re.compile(r"/question/([0-9]{1,12})/(answer|rule)")
 _KEY_LINE = "/passkey/key-line"
 _SIGN_PREFIX = "/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny")
+_DISPATCH_ROUTE = re.compile(r"/dispatch/(dj-[0-9a-f]{32})/(challenge|answer|cancel-challenge|cancel)")
 _MAX_BODY = 16 * 1024          # an assertion is well under 2 KB, an answer record under 1 KB
 _MAX_INFLIGHT = 4              # each answer replays the authority log; past this a caller gets 503, never a queue
 # how long a ruling's response waits for its delivery, which runs on its own thread holding no request slot (a
@@ -112,8 +117,9 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers
 _APP_ROUTES = {"/app/state.json": "GET", "/app/board.json": "GET", "/app/verb": "POST"}
-# failed unauthenticated pairing redeems a single process takes per minute: a code is 128 bits, so this only keeps a
-# caller from holding the push store's write lock with a stream of guesses
+# failed unauthenticated pairing redeems a single process takes per minute. A long code is 128 bits and a short one 40,
+# so beside the short code's own lock this is a second bound on guessing and keeps a caller from holding the push
+# store's write lock with a stream of guesses
 _REDEEMS_PER_MINUTE = 20
 
 
@@ -287,7 +293,8 @@ class _PhoneHandler(GuardedHandler):
         consent = _consent_route(route)
         sign = _sign_route(route)
         question = _QUESTION_ROUTE.fullmatch(route)
-        if consent is None and sign is None and question is None and route != _KEY_LINE:
+        dispatch = _DISPATCH_ROUTE.fullmatch(route)
+        if consent is None and sign is None and question is None and dispatch is None and route != _KEY_LINE:
             if not self._app_post(route):
                 self._reject(404, "not_found", "no such route")
             return
@@ -313,7 +320,8 @@ class _PhoneHandler(GuardedHandler):
         # an answer carries a signature the person just made with a passkey: it waits a moment for a slot rather than
         # throw that ceremony away; everything else answers busy at once
         waits = ((consent is not None and consent[1] in ("answer", "rule")) or (sign is not None and sign[1] == "answer")
-                 or (question is not None and question.group(2) == "rule"))
+                 or (question is not None and question.group(2) == "rule")
+                 or (dispatch is not None and dispatch.group(2) in ("answer", "cancel")))
         if not (self.server.request_gate.acquire(timeout=5) if waits else self.server.request_gate.acquire(blocking=False)):
             self._json({"error": "busy", "message": "the phone port is busy; try again"}, 503)
             return
@@ -322,6 +330,8 @@ class _PhoneHandler(GuardedHandler):
                 result = self.server.answer_step(consent[0], consent[1], req)
             elif sign is not None:
                 result = self.server.sign_step(sign[0], sign[1], req)
+            elif dispatch is not None:
+                result = self.server.dispatch_step(dispatch.group(1), dispatch.group(2), req)
             elif question is not None and question.group(2) == "rule":
                 result = self.server.question_rule(int(question.group(1)), req)
             elif question is not None:
@@ -347,7 +357,7 @@ class _PhoneServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], *, queue_dir: Path, rp_id: str, token: str,
-                 sign_namespaces: "tuple[str, ...]" = ()) -> None:
+                 sign_namespaces: "tuple[str, ...]" = (), dispatch_dir: Path) -> None:
         from levain.authority import ReplayCache
         from levain.consent.sign import Signer
 
@@ -367,6 +377,10 @@ class _PhoneServer(ThreadingHTTPServer):
         self.page_origin = f"http://localhost:{self.server_address[1]}" if rp_id == "localhost" else None
         signer.page_origin = self.page_origin
         self.signer = signer
+        from levain.dispatch.phone import DispatchPhone
+
+        self.dispatch_dir = dispatch_dir
+        self.dispatch = DispatchPhone(dispatch_dir, rp_id, self.page_origin, self._sign_keys, self._sign_authority)
         self._phone_app: Any = None
         self._app_lock = threading.Lock()
         self._redeems: list[float] = []
@@ -510,11 +524,13 @@ class _PhoneServer(ThreadingHTTPServer):
                 sign_note = f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names"
             page = self.signer.page(sign_signers)
             sign_pending, sign_overflow = page["rows"], page["overflow"]
+        dispatch_pending, dispatch_note, dispatch_overflow = self.dispatch.pending()
         return {"rp_id": self.rp_id, "questions": questions, "questions_overflow": questions_overflow,
                 "questions_note": questions_note,
                 "pending": rows, "undecided": undecided, "overflow": listing.overflow,
                 "enrolled": self._enrolled(memo), "sign_pending": sign_pending, "sign_note": sign_note,
-                "sign_overflow": sign_overflow}
+                "sign_overflow": sign_overflow, "dispatch_pending": dispatch_pending, "dispatch_note": dispatch_note,
+                "dispatch_overflow": dispatch_overflow}
 
     def _questions(self) -> "tuple[list[dict[str, Any]], int, str]":
         """The open questions (oldest first, capped like the pending list), how many were left out, and a note when
@@ -656,11 +672,9 @@ class _PhoneServer(ThreadingHTTPServer):
 
         return wait
 
-    def _sign_keys(self) -> "dict[str, Any]":
-        """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
-        verifies against): what may sign a sign request. A laptop key never does."""
-        from levain.authority import AuthorityError
-        from levain.consent.answering import hook_roots, passkey_keys
+    def _sign_root(self) -> Path:
+        """The ONE cockpit the queue's consent hooks name, whose passkeys sign a sign request or a dispatch job."""
+        from levain.consent.answering import hook_roots
         from levain.consent.sign import SignRefused
 
         roots = hook_roots(self.queue_dir)
@@ -670,8 +684,22 @@ class _PhoneServer(ThreadingHTTPServer):
         if len(roots) > 1:
             raise SignRefused("the consent hooks name more than one cockpit, so which passkeys sign is not one "
                               "answer: nothing is signed", 503)
+        return roots[0]
+
+    def _sign_authority(self) -> Any:
+        """The authority source of :meth:`_sign_root`'s cockpit: what a dispatch signature is verified against."""
+        return self._source(self._sign_root())
+
+    def _sign_keys(self) -> "dict[str, Any]":
+        """The active passkey keys enrolled on this name in the install's cockpit (the one the queue's consent hook
+        verifies against): what may sign a sign request. A laptop key never does."""
+        from levain.authority import AuthorityError
+        from levain.consent.answering import passkey_keys
+        from levain.consent.sign import SignRefused
+
+        root = self._sign_root()
         try:
-            return {k.fingerprint: k for k in passkey_keys(self._source(roots[0])(), self.rp_id)}
+            return {k.fingerprint: k for k in passkey_keys(self._source(root)(), self.rp_id)}
         except (AuthorityError, OSError, sqlite3.Error) as exc:
             raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
 
@@ -685,6 +713,15 @@ class _PhoneServer(ThreadingHTTPServer):
             word = {400: "bad_request", 404: "not_found", 409: "conflict", 503: "unavailable"}.get(exc.status,
                                                                                                    "sign_refused")
             raise PhoneError(exc.status, word, str(exc)) from None
+
+    def dispatch_step(self, job_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``/dispatch/<job>/<action>`` (:meth:`levain.dispatch.phone.DispatchPhone.step`)."""
+        from levain.dispatch.phone import DispatchRefused
+
+        try:
+            return self.dispatch.step(job_id, action, req)
+        except DispatchRefused as exc:
+            raise PhoneError(exc.status, exc.error, exc.message) from None
 
     def _enrolled(self, memo: "dict[Path, list[str] | str]") -> list[str]:
         """The passkey keys enrolled on this name in every cockpit a consent hook names (what the page's enrol
@@ -872,10 +909,14 @@ class _PhoneServer(ThreadingHTTPServer):
 
 
 def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", port: int = DEFAULT_PHONE_PORT,
-                      token: str | None = None, sign_namespaces: "tuple[str, ...]" = ()) -> _PhoneServer:
+                      token: str | None = None, sign_namespaces: "tuple[str, ...]" = (),
+                      dispatch_dir: Path | None = None) -> _PhoneServer:
     """A bound (not yet serving) phone port over the consent queue at ``queue_dir``, answering for the https name
-    ``rp_id``. Loopback only: the proxy in front of it is what reaches the phone."""
+    ``rp_id``, and over the dispatch store in ``dispatch_dir`` (default: where ``levain dispatch`` keeps it,
+    :func:`levain.dispatch.jobs.default_dispatch_dir`). Loopback only: the proxy in front of it is what reaches the
+    phone."""
     from levain.consent.passkey import is_host_name
+    from levain.dispatch.jobs import default_dispatch_dir
 
     if host != "localhost" and not _is_loopback_address(host):
         raise ValueError(f"the phone port binds loopback only (a proxy you run puts it on https), not {host!r}")
@@ -884,7 +925,8 @@ def make_phone_server(queue_dir: Path, rp_id: str, *, host: str = "127.0.0.1", p
                          "this port on (no scheme, port or path, not an address); `localhost` answers from this "
                          "machine's own browser")
     return _PhoneServer((host, port), queue_dir=Path(queue_dir), rp_id=rp_id, token=token or secrets.token_urlsafe(32),
-                        sign_namespaces=tuple(sign_namespaces))
+                        sign_namespaces=tuple(sign_namespaces),
+                        dispatch_dir=Path(dispatch_dir) if dispatch_dir is not None else default_dispatch_dir())
 
 
 def _is_loopback_address(host: str) -> bool:

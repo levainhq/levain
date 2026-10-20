@@ -92,6 +92,14 @@ def _emit(r: CheckResult) -> None:
 
 
 def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
+    # one `claude --version` per run, however many rows ask for the version
+    from levain.consent.canary import versions_read_once
+
+    with versions_read_once():
+        return _run_doctor(path, invoke=invoke, repin_hooks=repin_hooks)
+
+
+def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain doctor — checking {install}\n")
 
@@ -134,6 +142,7 @@ def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> i
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
+    core.extend(_check_consent_limits())
     for r in core:
         _emit(r)
 
@@ -276,6 +285,37 @@ def _check_consent_hooks(install: Path) -> list[CheckResult]:
     from levain.consent.canary import doctor_findings
 
     return [CheckResult(f.name, True, f.detail, f.hint, warn=f.warn) for f in doctor_findings(install)]
+
+
+def _check_consent_limits() -> list[CheckResult]:
+    """The session budgets (Q13): the limits in force per agent and where they came from, the sessions counted, how
+    many a limit halted, and a WARN when any root's counter is failing to count (its calls proceed uncounted)."""
+    from levain.consent import limits
+    from levain.install import _consent_queue_dir
+
+    name = "consent limits"
+    try:
+        qdir = _consent_queue_dir()
+        forces, not_counting, halted, counted = [], [], 0, 0
+        for agent in limits.AGENTS:
+            lim, src = limits.load_limits(qdir, agent)
+            shown = ", ".join(f"{k} {limits._num_text(k, v)}" for k, v in lim.items())
+            forces.append(f"{agent}: {shown} [{src}]")
+        for row in limits.snapshot(qdir):
+            counted += 1
+            halted += 1 if row["halt"] else 0
+            if limits._fail_read(limits._fail_path(qdir, row["agent"], row["root"])):
+                not_counting.append(row["root"][:12])
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
+                            "Check the consent directory's permissions.", warn=True)]
+    detail = f"{'; '.join(forces)}; {counted} session(s) counted, {halted} halted"
+    if not_counting:
+        return [CheckResult(name, True, f"NOT COUNTING: {', '.join(not_counting)} (the limits store is failing "
+                                        f"to take their calls, which go on uncounted); {detail}",
+                            f"Look at {qdir / limits.DB_NAME}: a full disk, a store of another levain version or a "
+                            "corrupt file. The next call is counted once it can be written.", warn=True)]
+    return [CheckResult(name, True, detail)]
 
 
 def _check_seed_content(install: Path) -> list[CheckResult]:
@@ -1447,15 +1487,67 @@ def _hook_command_targets(
     if not tokens or len(tokens) < 2:
         return False
     expected = (install / "activation" / "hooks" / expected_script).resolve()
+    return any(_hook_token_path(tok, install) == expected for tok in tokens[1:])
+
+
+def _hook_token_path(tok: str, install: Path) -> Path | None:
+    """A hook command token as the resolved path it names, reading the harness placeholder
+    ``${CLAUDE_PROJECT_DIR}`` (or ``$CLAUDE_PROJECT_DIR``) as this install; None when it cannot be resolved."""
+    candidate = tok.replace("${CLAUDE_PROJECT_DIR}", str(install)).replace("$CLAUDE_PROJECT_DIR", str(install))
+    try:
+        return Path(candidate).resolve()
+    except (OSError, RuntimeError, ValueError):  # RuntimeError: a symlink loop before Python 3.13 (L3 r1)
+        return None
+
+
+# The hook scripts levain ships in activation/hooks/ (the codex consent hook too): what a stale levain entry names.
+# Pinned against the package's templates/activation/hooks/ by tests/test_subfolder_hooks.py.
+LEVAIN_HOOK_SCRIPTS = frozenset({
+    "session_start.py", "user_prompt_submit.py", "post_tool_use.py", "stop.py", "automemory_mirror.py",
+    "consent_claude_code.py", "consent_codex.py"})
+
+
+def stale_levain_handler(h: Any) -> str | None:
+    """The missing script a stale levain handler names, else None: a command with an absolute literal token
+    ``<anything>/activation/hooks/<one of LEVAIN_HOOK_SCRIPTS>`` that does not exist on disk. What a moved or
+    copied workspace leaves behind in a settings file (its commands name scripts by absolute path); `levain update`
+    and `init --force` replace it as levain's own. A ``${CLAUDE_PROJECT_DIR}`` token is never stale (it follows the
+    start folder)."""
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+        return None
+    try:
+        tokens = shlex.split(h["command"])
+    except ValueError:
+        return None
     for tok in tokens[1:]:
-        # Token may be a literal path OR contain a harness placeholder like
-        # ${CLAUDE_PROJECT_DIR}. Substitute the known placeholder and check.
-        candidate = tok.replace("${CLAUDE_PROJECT_DIR}", str(install))
-        try:
-            if Path(candidate).resolve() == expected:
-                return True
-        except (OSError, RuntimeError):  # RuntimeError: a symlink loop before Python 3.13 (L3 r1)
+        if "CLAUDE_PROJECT_DIR" in tok or not os.path.isabs(tok):
             continue
+        p = Path(tok)
+        if (p.name in LEVAIN_HOOK_SCRIPTS and p.parent.name == "hooks" and p.parent.parent.name == "activation"
+                and not os.path.lexists(tok)):
+            return tok
+    return None
+
+
+def levain_hook_handler(h: Any, install: Path) -> bool:
+    """Whether the hook handler ``h`` is one levain wired for this install: a command whose token after the
+    interpreter is an absolute path (after :func:`_hook_token_path`'s placeholder reading) to a ``.py`` directly
+    in ``<install>/activation/hooks/``. The reading :func:`_hook_command_targets` makes for one named script,
+    widened to any of levain's scripts, so the consent hook's ``-m levain.hookrun <script>`` form counts too.
+    Anything else (another install's script, a team hook, the user's own) is not levain's."""
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+        return False
+    try:
+        tokens = shlex.split(h["command"])
+    except ValueError:
+        return False
+    hooks_dir = (install / "activation" / "hooks").resolve()
+    for tok in tokens[1:]:
+        if not os.path.isabs(tok.replace("${CLAUDE_PROJECT_DIR}", "/").replace("$CLAUDE_PROJECT_DIR", "/")):
+            continue
+        p = _hook_token_path(tok, install)
+        if p is not None and p.suffix == ".py" and p.parent == hooks_dir:
+            return True
     return False
 
 
@@ -1586,8 +1678,10 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         else:
             out.append(CheckResult(f"{label} consent hook", True, "wired to this install"))
     else:
-        staged = install.joinpath(*PENDING_REL, *((".claude", "settings.json") if adapter == "claude-code"
-                                                  else ("codex-home", "hooks.json")))
+        from levain.host_guard import cc_levain_hooks_file
+
+        staged = install.joinpath(*PENDING_REL, *((".claude", cc_levain_hooks_file(install).name)
+                                                  if adapter == "claude-code" else ("codex-home", "hooks.json")))
         hint = (f"`levain update` staged levain's version at {staged}: merge its PermissionRequest entry."
                 if staged.is_file() else
                 "`levain update` wires it unless the file holds your own edit, which it keeps: then add the entry back, "
@@ -2865,6 +2959,147 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
     return [CheckResult("context surface", True, detail)]
 
 
+def _cc_levain_hooks(install: Path, settings: dict) -> tuple[dict, str, list[CheckResult]]:
+    """(hooks object to check, the file it came from, rows about where levain's hooks are). Where they belong is
+    :func:`host_guard.cc_levain_hooks_file`'s answer: ``.claude/settings.local.json`` for a workspace that is the
+    toplevel of a main checkout (a session started in any subfolder loads it), else ``.claude/settings.json`` with
+    one row saying a subfolder start is not covered. The expected file's hooks are checked when they hold a levain
+    handler; else the other file's, when they do, with a WARN naming `levain update`. Also a WARN for levain's
+    hooks in both files, for a levain command naming a missing script (a moved workspace), for the two files being
+    one (a link), and, in the local layout, for a command naming its script through ``${CLAUDE_PROJECT_DIR}``, a
+    Claude Code too old to read the local file at the repository root, and a local file git tracks
+    (:func:`_cc_local_layout_rows`)."""
+    from levain.host_guard import CC_HOOKS_ROOT_ONLY, cc_levain_hooks_file, cc_settings_aliased
+    from levain.install import CC_LOCAL_SETTINGS_REL, _split_hooks
+
+    rows: list[CheckResult] = []
+    local_path = install.joinpath(*CC_LOCAL_SETTINGS_REL)
+    local_label, shared_label = "/".join(CC_LOCAL_SETTINGS_REL), ".claude/settings.json"
+    in_local = cc_levain_hooks_file(install).name == CC_LOCAL_SETTINGS_REL[-1]
+    if not in_local:
+        rows.append(CheckResult("levain hooks coverage", True, CC_HOOKS_ROOT_ONLY))
+    shared_hooks = settings.get("hooks", {})
+    shared_hooks = shared_hooks if isinstance(shared_hooks, dict) else {}
+    if cc_settings_aliased(install):
+        rows.append(CheckResult("levain hooks location", True,
+                                f"{local_label} and {shared_label} are one file (a link), so levain does not split "
+                                "or move its hooks there",
+                                f"Make {local_label} a file of its own, then run `levain update`.", warn=True))
+        return shared_hooks, shared_label, rows
+    local_hooks: Any = {}
+    try:
+        local = json.loads(local_path.read_text(encoding="utf-8"))
+        if not isinstance(local, dict):
+            raise ValueError("not a JSON object")
+        local_hooks = local.get("hooks", {})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        rows.append(CheckResult(local_label, not in_local, f"cannot be read: {e}",
+                                "Fix the file, then run `levain update`.", warn=not in_local))
+    local_hooks = local_hooks if isinstance(local_hooks, dict) else {}
+    local_ours = _split_hooks(local_hooks, install, ours=True)
+    shared_ours = _split_hooks(shared_hooks, install, ours=True)
+    want_hooks, want_ours, want_label = ((local_hooks, local_ours, local_label) if in_local else
+                                         (shared_hooks, shared_ours, shared_label))
+    other_hooks, other_ours, other_label = ((shared_hooks, shared_ours, shared_label) if in_local else
+                                            (local_hooks, local_ours, local_label))
+    if want_ours:
+        hooks, label = want_hooks, want_label
+        if other_ours:
+            rows.append(CheckResult("levain hooks location", True,
+                                    f"levain's hooks are in {other_label} too, so a session started at the "
+                                    "workspace folder may run them twice",
+                                    f"Run `levain update` to remove them from {other_label}.", warn=True))
+    elif other_ours:
+        hooks, label = other_hooks, other_label
+        why = ("Claude Code reads settings.json only for a session started in the workspace folder: a session "
+               "started in a subfolder runs no levain hook (no consent gate)" if in_local else
+               f"for this workspace levain wires them in {want_label} (see the coverage row)")
+        rows.append(CheckResult("levain hooks location", True, f"levain's hooks are in {other_label}: {why}",
+                                f"Run `levain update` to move them to {want_label}.", warn=True))
+    else:
+        hooks, label = want_hooks, want_label
+    stale_at = {(event, s) for src in (local_ours, shared_ours) for event, groups in src.items() for g in groups
+                for h in g.get("hooks", []) if (s := stale_levain_handler(h)) is not None}
+    if stale_at:
+        events = sorted({e for e, _ in stale_at})
+        rows.append(CheckResult("levain hook scripts", True,
+                                "a levain hook names a missing script (moved workspace?): "
+                                + ", ".join(sorted({s for _, s in stale_at})) + f" (on {', '.join(events)})"
+                                + ("; the UserPromptSubmit hook exits 2, which blocks the prompt"
+                                   if "UserPromptSubmit" in events else ""),
+                                "Run `levain update`.", warn=True))
+    # the placeholder is the start folder: wrong only where a subfolder start loads the hooks (the local layout)
+    templated = sorted({event for src in (local_ours, shared_ours) for event, groups in src.items() for g in groups
+                        for h in g.get("hooks", []) if "CLAUDE_PROJECT_DIR" in h.get("command", "")}
+                       ) if in_local else []
+    if templated:
+        rows.append(CheckResult("levain hook paths", True,
+                                f"{', '.join(templated)}: the command names its script through "
+                                "${CLAUDE_PROJECT_DIR}, which is the folder a session starts in, so from a "
+                                "subfolder the script is not found (the hook exits 2, which for UserPromptSubmit "
+                                "blocks the prompt)", "Run `levain update` to write absolute paths.", warn=True))
+    if in_local:
+        rows += _cc_local_layout_rows(install)
+    return hooks, label, rows
+
+
+# The Claude Code release that reads settings.local.json at the git repository root (code.claude.com/docs/en/settings:
+# "Before v2.1.211, Claude Code kept the file in the starting directory"): below it a session started in a subfolder
+# does not load the root's file, so the local layout covers nothing beyond the workspace folder.
+CC_LOCAL_AT_ROOT = (2, 1, 211)
+
+
+def _cc_local_layout_rows(install: Path) -> list[CheckResult]:
+    """The local layout's two WARNs (L2 r2): the installed Claude Code is below :data:`CC_LOCAL_AT_ROOT` (the version
+    read as the consent canary reads it; an unreadable version gives no row), and git tracks
+    ``.claude/settings.local.json`` (it carries this machine's absolute paths, and Claude Code holds a tracked
+    file's allow rules until the folder is trusted)."""
+    from levain.consent.canary import agent_version
+    from levain.host_guard import git_binary, git_env, parse_cc_version
+
+    rows: list[CheckResult] = []
+    version = parse_cc_version(agent_version("claude_code", timeout=10.0) or "")
+    if version is not None and version < CC_LOCAL_AT_ROOT:
+        floor = ".".join(map(str, CC_LOCAL_AT_ROOT))
+        rows.append(CheckResult("levain hooks: Claude Code version", True,
+                                f"Claude Code {'.'.join(map(str, version))} reads .claude/settings.local.json from "
+                                f"the folder a session starts in, not the repository root (from {floor} on it reads "
+                                "the root's), so a session started in a subfolder runs no levain hook",
+                                f"Update Claude Code to {floor} or later.", warn=True))
+    rel = ".claude/settings.local.json"
+    git = git_binary()
+    try:
+        r = subprocess.run([git, "-C", str(install), "ls-files", "--", rel], capture_output=True, text=True,
+                           timeout=10, env=git_env()) if git is not None else None
+        tracked = r is not None and r.returncode == 0 and bool(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        tracked = False
+    if tracked:
+        rows.append(CheckResult("levain hooks file tracked", True,
+                                f"git tracks {rel}: it holds this machine's absolute paths, and Claude Code holds a "
+                                "tracked file's allow rules until the folder is trusted",
+                                f"Untrack it (`git rm --cached {rel}`), then run `levain update`, which git-ignores "
+                                "it.", warn=True))
+    return rows
+
+
+def _entries_for(entries: Any, install: Path, script: str) -> list:
+    """``entries`` (an event's groups) narrowed to the first handler targeting this install's ``script``, wherever
+    it sits in the list (the user's own handlers come first in a merged file), as its own group (``matcher`` and
+    the group's other keys kept) holding only that handler; ``entries`` unchanged when none does, so the checks
+    below report the first command as before. A group whose ``hooks`` is not a list, or a handler that is not an
+    object with a string ``command``, is passed over: a malformed group after a valid one is not a crash (L3 r2)."""
+    for g in entries if isinstance(entries, list) else ():
+        hs = g.get("hooks") if isinstance(g, dict) else None
+        for h in hs if isinstance(hs, list) else ():
+            if (isinstance(h, dict) and isinstance(h.get("command"), str)
+                    and _hook_command_targets([{"hooks": [h]}], install, script)):
+                return [{**g, "hooks": [h]}]
+    return entries
+
+
 def _check_claude_code(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
@@ -2897,13 +3132,14 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             settings = None
 
         if settings is not None:
-            hooks = settings.get("hooks", {})
+            hooks, label, located = _cc_levain_hooks(install, settings)
+            results.extend(located)
             ss = hooks.get("SessionStart", [])
             ups = hooks.get("UserPromptSubmit", [])
             if ss and ups:
                 results.append(
                     CheckResult(
-                        ".claude/settings.json hooks",
+                        f"{label} hooks",
                         True,
                         "SessionStart + UserPromptSubmit configured",
                     )
@@ -2913,6 +3149,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
                     ("UserPromptSubmit", ups, "user_prompt_submit.py"),
                 )
                 for ev_name, entries, script_name in ev_scripts:
+                    # levain's handler wherever it sits: a merged file puts the user's own handlers first (L3 r1)
+                    entries = _entries_for(entries, install, script_name)
                     py = _extract_command_python(entries)
                     if py is None:
                         results.append(
@@ -2958,7 +3196,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
             else:
                 results.append(
                     CheckResult(
-                        ".claude/settings.json hooks",
+                        f"{label} hooks",
                         False,
                         "SessionStart or UserPromptSubmit missing",
                         "Re-run `levain init`.",
@@ -3040,6 +3278,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
+    results.append(_check_dispatch_server(
+        install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
     return results
 
@@ -3084,6 +3324,43 @@ def _check_band_server(where: str, server: object, agent: str, codex_home: Path 
                                            f"({sys.executable})", "levain update", warn=True)
     return CheckResult(BAND_ROW, True, f"{where}: {command} -P -m levain.consent.band_mcp "
                                        f"--agent {agent}")
+
+
+DISPATCH_ROW = "levain_dispatch MCP registered"
+
+
+def _check_dispatch_server(install: Path, server: object) -> CheckResult:
+    """The dispatch door's MCP server is registered in the workspace .mcp.json as levain writes it. Advisory only (a
+    WARN, never a FAIL): a planner files with `levain dispatch file` without it. `levain update` rewrites a .mcp.json
+    only while it is levain's last render; one carrying anything else is kept whole and levain's render is staged in
+    .levain/pending/, so the hint names the hand merge when that render is there."""
+    from levain.install import DISPATCH_SERVER, PENDING_REL, _is_levain_launcher
+
+    pending = install.joinpath(*PENDING_REL, ".mcp.json")
+    merge = (f"`levain update` keeps your .mcp.json whole, since it is not levain's last render; merge the "
+             f"levain_dispatch entry from {'/'.join(PENDING_REL)}/.mcp.json (staged by `levain update`) by hand")
+    if not isinstance(server, dict):
+        return CheckResult(DISPATCH_ROW, True, "missing from .mcp.json: a planner can still file with "
+                                               "`levain dispatch file`, not with the dispatch_file tool",
+                           merge if pending.is_file() else "levain update", warn=True)
+    command = server.get("command")
+    if not _is_levain_launcher({"mcp_servers": {DISPATCH_SERVER: server}}, None, server=DISPATCH_SERVER,
+                               agent="claude_code"):
+        args = server.get("args")
+        shown = " ".join(str(a) for a in args) if isinstance(args, list) else repr(args)
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json starts it as `{command} {shown}`, not levain's launcher "
+                                               "(<python> -P -m levain.dispatch.mcp --agent claude_code)",
+                           merge, warn=True)
+    extra = sorted(str(k) for k in server if k not in _BAND_KEYS)
+    if extra:  # an `env` or any other key changes what the server runs
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json's levain_dispatch entry carries {', '.join(extra)} beside "
+                                               "levain's launcher: it may not run the door levain ships",
+                           merge, warn=True)
+    if not _is_this_python(command):
+        return CheckResult(DISPATCH_ROW, True, f".mcp.json starts it with `{command}`, not this levain's Python "
+                                               f"({sys.executable})", "levain update", warn=True)
+    return CheckResult(DISPATCH_ROW, True, f".mcp.json: {command} -P -m levain.dispatch.mcp --agent claude_code "
+                                           "(each call needs the operator's approval)")
 
 
 BAND_ALLOW_ROW = "settings levain_band ask allowed"

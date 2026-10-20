@@ -63,7 +63,7 @@ def test_would_push_files_the_push_undecided_first_and_links_it_to_the_option(wo
     assert (state, request.tier, request.tool_name) == ("undecided", push_gate.PUSH_TIER, push_gate.PUSH_TOOL)
     assert world["queue"].is_halted("claude_code", S) is None          # nothing was refused to the agent
     assert QuestionStore(world["qdir"]).get(q.n).link == q.link and q.link.queue_id == world["queue"].queue_id
-    srv = make_phone_server(world["qdir"], "localhost", port=0)
+    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
     try:
         listing = srv.listing()
     finally:
@@ -98,7 +98,7 @@ def test_a_replayed_or_tampered_ruling_is_refused_and_moves_nothing(world, keys)
 
 def test_the_one_tap_route_records_the_answer_only_after_the_ruling_verifies(world, monkeypatch):
     q, _ = world["ask"]()
-    srv = make_phone_server(world["qdir"], "localhost", port=0)
+    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
     good = world["queue"].ruling_payload(q.link.request_id, "allow", "SHA256:x")
     body = {"option": "a", "payload": good, "authenticator_data": "AAAA", "client_data_json": "AAAA",
             "signature": "AAAA"}
@@ -128,7 +128,7 @@ def test_the_one_tap_route_records_the_answer_only_after_the_ruling_verifies(wor
                  "(?, 'a', 'push', ?, ?, '2026-10-19T00:00:00Z')", (plain.id, other.link.request_id,
                                                                     other.link.queue_id))
     conn.close()
-    srv = make_phone_server(world["qdir"], "localhost", port=0)
+    srv = make_phone_server(world["qdir"], "localhost", port=0, dispatch_dir=world["qdir"])
     try:
         forged = {**body, "payload": world["queue"].ruling_payload(other.link.request_id, "allow", "SHA256:x")}
         with pytest.raises(PhoneError) as exc:

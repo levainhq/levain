@@ -9,7 +9,7 @@ from pathlib import Path
 
 def register(subparsers) -> None:
     p = subparsers.add_parser(
-        "ping", help="Web push to the phone page: keys, a test ping, the notification record, paired devices.",
+        "ping", help="Web push to the phone page: keys, a test ping, the notification record, paired devices, pairing.",
         description="Web push for the phone page. A push is a nudge that opens the page; it authorises nothing.")
     sub = p.add_subparsers(dest="ping_cmd", required=True)
 
@@ -35,6 +35,9 @@ def register(subparsers) -> None:
     rv = common(sub.add_parser("revoke", help="Revoke a paired phone: its token and subscriptions stop working."))
     rv.add_argument("device_id")
     rv.set_defaults(func=_revoke)
+    pr = common(sub.add_parser("pair", help="Print a short pairing code to type into the installed phone app."))
+    pr.add_argument("--label", default=None, help="What to call the phone in `levain ping devices` (default: phone).")
+    pr.set_defaults(func=_pair)
 
 
 def _qdir(args: argparse.Namespace) -> Path:
@@ -85,6 +88,8 @@ def _record(args: argparse.Namespace) -> int:
     for p in pings:
         deliveries = ", ".join(f"sub {d['subscription_id']}: {_said(d['status'])}" for d in p["deliveries"]) \
             or "no subscription"
+        if p.get("command") is not None:
+            deliveries += "; notify command " + ("started" if p["command"] else "did not start")
         opened = f"opened {p['opens'][0]['at']}" if p["opens"] else "not opened"
         print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}; "
               f"{p['outcome']['words']}")
@@ -119,3 +124,19 @@ def _revoke(args: argparse.Namespace) -> int:
         conn.close()
     print(f"revoked {args.device_id}" if done else f"no live device {args.device_id}")
     return 0 if done else 1
+
+
+def _pair(args: argparse.Namespace) -> int:
+    from levain.webpush import devices
+    from levain.webpush.store import PushStore
+
+    conn = PushStore(_qdir(args)).connection()
+    try:
+        code = devices.mint_short_pairing(conn, args.label, datetime.now(timezone.utc))
+    finally:
+        conn.close()
+    minutes = int(devices.SHORT_PAIRING_TTL.total_seconds() // 60)
+    print(f"pairing code: {code}\n"
+          f"type it in the phone app's Pairing code box within {minutes} minutes; it works once, and a newer code "
+          "replaces it")
+    return 0

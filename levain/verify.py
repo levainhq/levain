@@ -142,7 +142,7 @@ def run_verify_hooks(path: Path) -> int:
                 "The install was wired to this Python (likely in a venv that's "
                 "been deleted or moved). Re-run `levain init --force` from the "
                 "venv you want to wire it to, or fix the path in "
-                ".claude/settings.json / ~/.codex/hooks.json."
+                ".claude/settings.local.json (or .claude/settings.json) / ~/.codex/hooks.json."
             ),
         ))
         print("\n1 check(s) FAILED.")
@@ -413,7 +413,8 @@ def _resolve_install_python(install: Path) -> str:
 def _resolve_install_launcher(install: Path) -> list[str]:
     """Return the Python interpreter path the install's adapter is wired to.
 
-    Reads it from `.claude/settings.json` (Claude Code) or `~/.codex/hooks.json`
+    Reads it from the file levain wires Claude Code's hooks into (host_guard.cc_levain_hooks_file:
+    `.claude/settings.local.json` or `.claude/settings.json`, then the other one) or `~/.codex/hooks.json`
     via CODEX_HOME (Codex). Falls back to `sys.executable` when no config is
     available or no python can be extracted. The point is to test the same
     interpreter the harness will actually invoke at fire time, which may
@@ -432,11 +433,16 @@ def _resolve_install_launcher(install: Path) -> list[str]:
     gets skipped — so verify-hooks never accidentally tests a non-Levain
     interpreter.
     """
-    # Claude Code: .claude/settings.json — gated by CLAUDE.md tag file.
+    # Claude Code: the file levain wires its hooks into (host_guard.cc_levain_hooks_file), then the other one (an
+    # install whose hooks `levain update` has not moved yet) — gated by CLAUDE.md tag file.
     if (install / "CLAUDE.md").is_file():
-        py = _launcher_from_hooks_config(install / ".claude" / "settings.json", install)
-        if py is not None:
-            return py
+        from levain.host_guard import cc_levain_hooks_file
+
+        wired = cc_levain_hooks_file(install)  # where levain wires them; the other file: an unmigrated install
+        for name in dict.fromkeys((wired.name, "settings.local.json", "settings.json")):
+            py = _launcher_from_hooks_config(install / ".claude" / name, install)
+            if py is not None:
+                return py
 
     # Codex: CODEX_HOME/hooks.json sidecar — gated by AGENTS.md tag file.
     if (install / "AGENTS.md").is_file():
@@ -453,8 +459,10 @@ def _resolve_install_launcher(install: Path) -> list[str]:
 
 # Claude Code's settings.template.json writes the hook command with a RUNTIME
 # harness placeholder, `${CLAUDE_PROJECT_DIR}`, that Claude Code substitutes at
-# fire time — NOT an install-time placeholder like {{PYTHON}}. So the
-# settings.json on disk literally contains the string
+# fire time. Where levain's hooks live in settings.local.json (host_guard.
+# cc_levain_hooks_file) `levain init` fills it with the install path; where
+# they live in settings.json, and on an install from before the local file
+# until `levain update`, the file literally contains
 # `${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py`. To match that
 # against this install's hooks dir we substitute it ourselves — the same
 # substitution doctor.py makes (see _hook_command_targets). Kept as a named
@@ -474,8 +482,8 @@ def _launcher_from_hooks_config(path: Path, install: Path) -> list[str] | None:
         {"hooks": {<event>: [{"hooks": [{"command": "..."}, ...]}]}}
 
     The script-path token may carry a RUNTIME harness placeholder
-    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — Claude Code's
-    template ships that shape and `levain init` does not rewrite it (the harness
+    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — settings.json
+    carries the template's shape wherever levain's hooks live there (the harness
     substitutes it at fire time). We substitute it here so the foreign-hook
     filter can still locate the script inside THIS install. Without this the
     filter would reject every Claude Code install's command as "foreign" and

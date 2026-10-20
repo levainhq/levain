@@ -235,6 +235,22 @@ def main(argv: list[str] | None = None) -> int:
             "--memory-load again to change it."
         ),
     )
+    init_p.add_argument(
+        "--default-grants",
+        choices=["ask", "no"],
+        default=None,
+        dest="default_grants",
+        help=(
+            "The default consent grant init offers once the consent hook is wired (claude-code and codex "
+            "adapters): one grant for the agent's workspace edit tools (Claude Code: Edit, Write, MultiEdit, "
+            "NotebookEdit, WebFetch under default and acceptEdits; Codex: apply_patch) inside this install's "
+            "directory, for 14 days. `ask` (the default): offered only when the authority log is initialised "
+            "and an enrolled laptop-presence key is in levain's key directory; at a terminal init prints the "
+            "grant and asks [y/N], elsewhere it prints the `levain consent grant create` command and signs "
+            "nothing. A live default grant for this directory is kept. `no`: never offered. There is no `yes`: a "
+            "signature never happens unattended."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -569,7 +585,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_consent_rule_parser(cs_sub)
     _add_consent_receipts_parser(cs_sub)
     _add_push_parser(subparsers)
+    _add_publish_parser(subparsers)
+    _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
+    _add_dispatch_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1177,7 +1196,8 @@ def main(argv: list[str] | None = None) -> int:
             "apply under review, and record the composed set. After a levain "
             "upgrade it also refreshes the activation tree and adapter files "
             "(hooks, posture.md, recency_directives.md, CLAUDE.md / AGENTS.md, "
-            ".claude/settings.json, .mcp.json, codex hooks): a file you edited is "
+            ".claude/settings.json, levain's hooks in .claude/settings.local.json or .claude/settings.json "
+            "(per workspace, see `levain doctor`), .mcp.json, codex hooks): a file you edited is "
             "kept, and where the new release changed it too, its new version is "
             "staged under .levain/pending/ and listed once. The fix for "
             "version-drift — a new anneal feature landing as a CONFLICT with stale "
@@ -1459,6 +1479,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print("levain init: --answers-template cannot be combined with --memory-load (it installs "
                   "nothing).")
             return 1
+        if args.default_grants is not None:
+            print("levain init: --answers-template cannot be combined with --default-grants (it installs "
+                  "nothing).")
+            return 1
         from levain.install import run_answers_template
 
         return run_answers_template(packs=args.pack)
@@ -1476,6 +1500,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if args.messaging is not None and args.web:
         print("levain init: --messaging cannot be combined with --web; drop --web, or run "
               "`levain init --messaging ...` in the terminal.")
+        return 1
+
+    if args.default_grants is not None and args.web:
+        print("levain init: --default-grants cannot be combined with --web (the browser onboarding offers no "
+              "grant); drop --web, or run `levain init --default-grants ...` in the terminal.")
         return 1
 
     if args.answers is not None and args.web:
@@ -1522,6 +1551,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         messaging=args.messaging,
         consent_hook=args.consent_hook,
         memory_load=args.memory_load,
+        default_grants=args.default_grants or "ask",
     )
 
 
@@ -1623,6 +1653,21 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
     verify_p.add_argument("--path", type=Path, default=None,
                           help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     verify_p.set_defaults(func=_cmd_consent_receipts_verify)
+    export_p = sub.add_parser(
+        "export", help="Write the queue's receipts in another format (AgentBoundary Action Receipts).",
+        description=(
+            "Writes the queue's receipts as a JSON array in the named format: one AgentBoundary Action Receipt "
+            "per settled receipt row, chained by prior_receipt, to stdout or to --out. A one-line count summary "
+            "goes to stderr, never into the JSON. Exits non-zero, with nothing on stdout, for a store that cannot "
+            "be read or an export clock ahead of the real one. Reads the store read-only."))
+    export_p.add_argument("--format", required=True, choices=("agentboundary",), dest="export_format",
+                          help="The receipt format. Only `agentboundary` today.")
+    export_p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
+                          help="The consent directory (default: $LEVAIN_HOME/consent, else ~/.levain/consent).")
+    export_p.add_argument("--out", type=Path, default=None, metavar="FILE",
+                          help="Write the JSON here instead of stdout (whole or not at all where the filesystem has hard "
+                               "links); refuses to overwrite a file.")
+    export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
 def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
@@ -1671,6 +1716,72 @@ def _cmd_consent_receipts_verify(args: argparse.Namespace) -> int:
                 else "the receipts cannot be read as a log")
         print(f"levain consent receipts verify: {what}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_consent_receipts_export(args: argparse.Namespace) -> int:
+    import json
+    import sqlite3
+    import tempfile
+
+    from levain.consent.agentboundary import ExportError, export
+
+    try:
+        qdir = _consent_queue_dir(args)
+        result = export(qdir)
+        # UTF-8 bytes whatever the locale or PYTHONIOENCODING says: the file and stdout carry the same JSON
+        data = (json.dumps(result.receipts, ensure_ascii=False) + "\n").encode("utf-8")
+        if args.out is not None:
+            try:
+                out = Path(os.path.abspath(args.out.expanduser()))
+            except RuntimeError as exc:                 # ~user that does not exist
+                raise OSError(str(exc)) from exc
+            if os.path.lexists(out):
+                raise FileExistsError(f"{out} exists; remove it or pick another --out")
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=out.parent)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                try:
+                    os.link(tmp_name, out)              # no-clobber publish: fails if the file appeared meanwhile
+                except FileExistsError:
+                    raise
+                except OSError:
+                    # a filesystem with no hard links (exFAT, some network mounts): an exclusive create, still never
+                    # over an existing file, at the cost of a partial file if the write itself fails
+                    efd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        with os.fdopen(efd, "wb") as fh:
+                            fh.write(data)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                    except BaseException:
+                        os.unlink(out)                  # ours (O_EXCL made it): never leave a partial file behind
+                        raise
+            finally:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+        else:
+            sys.stdout.flush()
+            try:
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            except BrokenPipeError:
+                # the reader went away (`| head`): stop quietly, and keep the interpreter's exit flush off the pipe
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+                return 1
+    except (ExportError, OSError, sqlite3.Error, UnicodeError) as exc:
+        print(f"levain consent receipts export: {_term_safe(exc)}", file=sys.stderr)
+        return 1
+    rep = result.report
+    states = ", ".join(f"{k} {v}" for k, v in rep.by_state.items()) or "none"
+    print(_term_safe(f"levain consent receipts export: {rep.receipts} receipt(s) ({states}); "
+                     f"{rep.pending_skipped} pending skipped, {rep.held_unsettled} held back unsettled"
+                     + ("" if rep.ledger_found else "; no authority ledger found")), file=sys.stderr)
     return 0
 
 
@@ -2382,9 +2493,30 @@ def _add_push_parser(subparsers: argparse._SubParsersAction) -> None:
     add_parser(subparsers)
 
 
+def _add_publish_parser(subparsers: argparse._SubParsersAction) -> None:
+    """``levain publish``: the gated PyPI / npm publish (``levain.consent.publish_gate``)."""
+    from levain.consent.publish_gate import add_parser
+
+    add_parser(subparsers)
+
+
+def _add_limits_parser(subparsers: argparse._SubParsersAction) -> None:
+    """``levain limits``: the per-session budgets (``levain.consent.limits_cli``)."""
+    from levain.consent.limits_cli import add_parser
+
+    add_parser(subparsers)
+
+
 def _add_band_parsers(subparsers: argparse._SubParsersAction) -> None:
     """``levain ask`` and ``levain question``: the question band (``levain.consent.band``)."""
     from levain.consent.band import add_parsers
+
+    add_parsers(subparsers)
+
+
+def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain dispatch``: the dispatch job's planner and operator door (``levain.dispatch.cli``)."""
+    from levain.dispatch.cli import add_parsers
 
     add_parsers(subparsers)
 

@@ -57,12 +57,17 @@ _SCHEMA: tuple[str, ...] = (
     "created TEXT, last_seen TEXT, revoked_at TEXT)",
     "CREATE TABLE IF NOT EXISTS pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
     "used_at TEXT)",
+    # the short code the operator types into the installed app, and the wrong guesses that lock it out; both are
+    # additive tables, so an existing store gains them on its next open with no format change
+    "CREATE TABLE IF NOT EXISTS short_pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
+    "used_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS redeem_failures (at TEXT NOT NULL)",
     # ``subscribed`` is the subscribe order, moved up on every re-subscribe: the caps retire by it
     "CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, "
     "endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created TEXT NOT NULL, "
     "last_status INTEGER, last_at TEXT, retired_at TEXT, subscribed INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS pings (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, "
-    "ref TEXT, title TEXT NOT NULL, body TEXT NOT NULL)",
+    "ref TEXT, title TEXT NOT NULL, body TEXT NOT NULL, command INTEGER)",
     "CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL, "
     "status INTEGER NOT NULL)",
@@ -133,6 +138,10 @@ class PushStore:
             if "subscribed" not in {r[1] for r in conn.execute("PRAGMA table_info(subscriptions)")}:
                 conn.execute("ALTER TABLE subscriptions ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0")
                 conn.execute("UPDATE subscriptions SET subscribed = id")
+            # ``command``: 1 the operator's notify command started for this ping, 0 it was set and could not start,
+            # NULL none was set (and every ping recorded before the column existed)
+            if "command" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
+                conn.execute("ALTER TABLE pings ADD COLUMN command INTEGER")
             # a subscription with no device is one no revoke can stop: none is stored any more, and any left is retired
             conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id IS NULL AND retired_at IS NULL",
                          (now_stamp(),))
@@ -194,13 +203,18 @@ class PushStore:
 
     def live_subscriptions(self) -> list[dict[str, Any]]:
         with self.read() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM subscriptions WHERE retired_at IS NULL ORDER BY id")]
+            # a subscription whose device was revoked is not live even if a revoke left its row unretired
+            return [dict(r) for r in c.execute(
+                "SELECT s.* FROM subscriptions s LEFT JOIN devices d ON d.id = s.device_id "
+                "WHERE s.retired_at IS NULL AND (d.id IS NULL OR d.revoked_at IS NULL) ORDER BY s.id")]
 
     # --- the record ----------------------------------------------------------------------------------
-    def add_ping(self, kind: str, ref: str | None, title: str, body: str) -> int:
+    def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None) -> int:
+        """Record one ping; ``command`` is whether the notify command started (None: none was set)."""
         with self.write() as c:
-            return int(c.execute("INSERT INTO pings (at, kind, ref, title, body) VALUES (?,?,?,?,?)",
-                                 (now_stamp(), kind, ref, title, body)).lastrowid)
+            return int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
+                                 (now_stamp(), kind, ref, title, body,
+                                  None if command is None else int(bool(command)))).lastrowid)
 
     def add_delivery(self, ping_id: int, subscription_id: int, status: int, *, retire: bool = False) -> None:
         with self.write() as c:
