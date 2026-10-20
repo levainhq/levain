@@ -271,7 +271,7 @@ class EnvelopeStore(CoordStore):
                 again = self._same_or_conflict(conn, self._parsed(body_text), payload, signature)
         except (CoordError, TypeError, ValueError):
             again = None          # not this exact record: the full checks below give the refusal
-        if again is not None:
+        if again is not None and again.origin == "worded":
             return again, False
         body, signer_class = self._checked(body_text, payload, signature, authority)
         if body["origin"] != "worded":

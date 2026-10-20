@@ -674,3 +674,9 @@ def test_final_insert_or_replace_cannot_rewrite_the_sequence_an_envelope_or_a_bi
     conn.rollback()
     assert ctx.rows("SELECT envelope_id FROM envelopes") == [(b["envelope_id"],)]
     assert len(ctx.rows("SELECT * FROM envelope_binds")) == 1
+
+
+def test_final_an_exact_structured_envelope_is_still_refused_by_accept_envelope(ctx):
+    _d, _fresh, _b, (text, payload, sig) = ctx.structured("arrives only with its drop")
+    with pytest.raises(CoordError, match="arrives with its drop"):
+        ctx.store.accept_envelope(text, payload, sig, authority=ctx.snap)
