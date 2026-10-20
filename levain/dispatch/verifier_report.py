@@ -40,8 +40,8 @@ __all__ = [
 REPORT_FORMAT = "levain-dispatch-verifier-report/1"
 ENVELOPE_FORMAT_NAME = "levain-verifier-envelope/1"
 MAX_STEPS = 16
-# mirrors S1's report cap (the contract's V21, on the BODY); S1 exposes no constant yet, and the test that pins the
-# two equal is written once it does
+# mirrors S1's report cap (the contract's V21, on the BODY), written here because S1 had no such constant when this was
+# (`git grep -n V21 -- levain/slot`); once it has one, import it or pin the two equal in a test
 MAX_REPORT_BYTES = 1 << 20
 # the envelope is the body plus the resolved entry and one small .exit record per step: the body's cap and room for
 # the rest, so an envelope is refused on its size before it is parsed
