@@ -434,11 +434,13 @@ def test_a_mixed_type_filed_at_cannot_escape_the_sort(world, monkeypatch) -> Non
     assert records == [] and note and "not shown" in note
 
 
-def test_a_signer_fault_outside_the_known_ones_is_not_called_a_store_fault(world) -> None:
+def test_a_keys_db_fault_is_a_signer_note_and_the_consent_cards_stay(world) -> None:
     file_job(world)
 
     def broken():
         raise sqlite3.OperationalError("keys db")
 
-    with pytest.raises(sqlite3.OperationalError):                   # not rewritten as "the dispatch store cannot be read"
-        phone_for(world, keys=broken).pending()
+    records, note, overflow = phone_for(world, keys=broken).pending()
+    assert note is None or isinstance(note, str)
+    assert overflow == 0
+    assert records and records[0]["signers"] == [] and "keys db" in records[0]["signer_note"]

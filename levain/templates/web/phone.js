@@ -237,6 +237,8 @@
     return card;
   }
 
+  let closePick = null;       // the open passkey picker's close, if one is up (it holds busy)
+
   function start(r, decision, signers, say, actions, ruling, go, what) {
     const run = go || ((fp, rawId) => answer(r, decision, fp, rawId, say, ruling));
     const local = mine();
@@ -248,16 +250,28 @@
     // the OS refuses it), else among every enrolled one (the OS then offers every passkey for this name, and a
     // pick of another device's key is refused at verify)
     const choices = known.length ? known : signers;
+    if (closePick) closePick();   // a second picker replaces the first
+    if (busy) return;
     // `what` names the act the pick signs ("to SIGN job …"), so the picker never reads as a bare key choice
     say(what ? "pick a passkey " + what + " (more than one is enrolled for this name; pick the one this phone holds):"
              : "more than one passkey is enrolled for this name; pick the one this phone holds:");
-    for (const old of actions.querySelectorAll(".pick")) old.remove();
+    // the picker holds the list still like any ceremony: busy is taken while it is up, released by a pick (run takes
+    // it again) or by dismissing it
+    busy++;
+    const picks = [];
+    const close = () => { picks.forEach((x) => x.remove()); busy--; closePick = null; };
+    closePick = close;
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => run(fp, known.length ? local[fp] : null));
-      actions.appendChild(p);
+      p.addEventListener("click", () => { close(); run(fp, known.length ? local[fp] : null); });
+      picks.push(p);
     }
+    const x = el("button", "quiet pick", "dismiss");
+    x.type = "button";
+    x.addEventListener("click", () => { close(); say(""); });
+    picks.push(x);
+    picks.forEach((b) => actions.appendChild(b));
   }
 
   // the one tap on a question's push option: the ruling's challenge for the linked request, the passkey, then the
@@ -453,8 +467,6 @@
   }
 
   const reasons = new Map();  // job id -> the cancel reason being typed, kept across redraws (open while present)
-  let reasonTimer = 0;        // the redraw scheduled when the reason box loses focus
-  let pressing = false;       // an action button on a dispatch card is held down
 
   // a dispatch job (levain.dispatch.phone): built with the phone app's card markup (row, title, chips, acts) so one
   // restyle covers both. It shows what the passkey signs: the contract's goal in full (exactly what the executor is
@@ -528,18 +540,13 @@
     reasonBox.hidden = !reasons.has(r.id);
     reasonBox.value = reasons.get(r.id) || "";
     reasonBox.addEventListener("input", () => reasons.set(r.id, reasonBox.value));
-    // load() holds still while the box has focus; leaving it redraws, after a beat so a tap on a button is not eaten
-    // the timer is kept: any tap on an action cancels it, so a redraw never lands on the card being acted on
-    reasonBox.addEventListener("blur", () => { clearTimeout(reasonTimer); reasonTimer = setTimeout(load, 600); });
+    // load() holds still while the box has focus; the next poll redraws once it has lost it
     const offer = (label, cancel) => {
       const btn = el("button", "dact", label);
       btn.type = "button";
-      btn.addEventListener("pointerdown", () => { clearTimeout(reasonTimer); pressing = true; });
-      for (const ev of ["pointerup", "pointercancel"]) btn.addEventListener(ev, () => { pressing = false; });
       btn.disabled = !usable || !signers.length;
       const what = (cancel ? "to CANCEL job " : "to SIGN job ") + r.id;
       btn.addEventListener("click", () => {
-        clearTimeout(reasonTimer);
         if (cancel && reasonBox.hidden) { reasonBox.hidden = false; reasons.set(r.id, reasonBox.value); reasonBox.focus(); return; }
         start(r, null, signers, say, acts, false, (fp, rawId) => dispatchRun(r, fp, rawId, say, cancel, cancel ? reasonBox.value : ""), what);
       });
@@ -637,10 +644,12 @@
     // a redraw would wipe words being typed into a question's box or a cancel's reason (and dismiss the keyboard)
     if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return;
     if (document.activeElement && document.activeElement.matches("input.reason")) return;
-    // a redraw would remove the passkey picker a dispatch card is waiting on, or detach the button being held
-    if (pressing || document.querySelector("article.dispatch .pick")) return;
     if (!token) { $("status").textContent = "open this page from the link `levain consent phone` printed (it carries the token)"; return; }
-    call("GET", "/consent.json").then((r) => { if (busy) return; if (r.ok) draw(r.body); else $("status").textContent = why(r); });
+    call("GET", "/consent.json").then((r) => {
+      // re-checked here, not only before the GET: a ceremony or a focused reason box that began meanwhile holds the list still
+      if (busy || (document.activeElement && document.activeElement.matches("input.reason"))) return;
+      if (r.ok) draw(r.body); else $("status").textContent = why(r);
+    });
   }
 
   $("refresh").addEventListener("click", load);

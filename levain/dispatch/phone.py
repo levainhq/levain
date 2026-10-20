@@ -80,7 +80,7 @@ class DispatchPhone:
 
         try:
             keys = self._keys()
-        except (SignRefused, AuthorityError, OSError) as exc:
+        except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:
             return {}, str(exc)
         ok = {fp: k for fp, k in keys.items() if class_covers(k.key_class, SIGN_TIER)}
         if not ok:

@@ -205,24 +205,6 @@ def test_a_missing_template_or_budget_field_draws_a_question_mark_never_undefine
     assert "undefined" not in text and "NaN" not in text and "null" not in text, text
 
 
-@needs_browser
-def test_leaving_the_reason_box_redraws_the_card(world, tmp_path: Path) -> None:
-    file_job(world)
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
-        url = base.replace("127.0.0.1", "localhost")
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            {"until": CARD + " && 1"},
-            {"eval": FETCH_HOOK},
-            {"eval": CANCEL_TAP},                                           # opens and focuses the reason box
-            {"eval": "document.querySelector('article.dispatch input.reason').focus() || 1"},
-            # a headless page may not hold window focus, so the blur is sent as the event too
-            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.blur();"
-                     " i.dispatchEvent(new Event('blur')); return window.__gets; })()"},
-            {"until": "window.__gets >= 1 && window.__gets", "ms": 4000},
-        ])
-    assert out["values"][5] >= 1, out
-
-
 # --- fix round 3 -----------------------------------------------------------------------------------------------------
 
 @needs_browser
@@ -243,8 +225,7 @@ def test_a_template_and_budget_absent_entirely_draw_question_marks_never_a_throw
     assert "undefined" not in text and "NaN" not in text, text
 
 
-@needs_browser
-def test_the_reason_boxs_redraw_never_removes_a_live_picker(world, tmp_path: Path) -> None:
+def _two_passkeys(world, tmp_path):
     import sqlite3
 
     from tests.test_dispatch_phone import SoftPasskey
@@ -256,23 +237,78 @@ def test_the_reason_boxs_redraw_never_removes_a_live_picker(world, tmp_path: Pat
     _enrol(conn, world["root"], tmp_path / "laptop", world["laptop_fp"],
            {"op": "enrol", "fingerprint": other.fp, "public_key": other.line, "class": "display-phone", "custody": "passkey"})
     conn.close()
+    return job
+
+
+# a poll is load(), which the Refresh button also calls; three of them stand in for more than two 10 s intervals
+POLLS = "(() => { for (let i = 0; i < 3; i++) document.getElementById('refresh').click(); return 1; })()"
+WAIT = "new Promise(r => setTimeout(() => r(1), 800))"
+PICKS = "document.querySelectorAll('article.dispatch .pick').length"
+TYPE_REASON = ("(() => { const i = document.querySelector('article.dispatch input.reason'); i.focus(); i.value = 'wrong files';"
+               " i.dispatchEvent(new Event('input')); return 1; })()")
+BLUR = "(() => { const i = document.querySelector('article.dispatch input.reason'); i.blur(); i.dispatchEvent(new Event('blur')); return 1; })()"
+
+
+@needs_browser
+def test_a_live_picker_survives_the_polls_and_a_pick_signs_then_the_card_refreshes(world, tmp_path: Path) -> None:
+    job = _two_passkeys(world, tmp_path)
     with _serve(world["qdir"], world["qdir"]) as (base, _):
         url = base.replace("127.0.0.1", "localhost")
         out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
             _authenticator(world["phone"]),
             {"until": CARD + " && 1"},
             {"eval": CANCEL_TAP},                                           # opens the reason box
-            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.focus(); i.value = 'wrong files';"
-                     " i.dispatchEvent(new Event('input')); return 1; })()"},
-            # a real tap: the blur fires first (the box loses focus), then the click opens the picker
-            {"eval": "(() => { const i = document.querySelector('article.dispatch input.reason'); i.blur(); i.dispatchEvent(new Event('blur'));"
-                     " return 1; })()"},
-            {"eval": CANCEL_TAP},
-            {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('article.dispatch .pick').length), 1200))"},
-            {"eval": "(() => { const ps = [...document.querySelectorAll('article.dispatch .pick')]; if (!ps.length) return 'no picker';"
+            {"eval": TYPE_REASON},
+            {"eval": BLUR},
+            {"eval": CANCEL_TAP},                                           # opens the picker
+            {"eval": POLLS},
+            {"eval": WAIT},
+            {"eval": POLLS},
+            {"eval": WAIT},
+            {"eval": PICKS},
+            {"eval": "(() => { const ps = [...document.querySelectorAll('article.dispatch .pick')];"
                      " ps.find(x => x.textContent.startsWith('" + world["phone"].fp[:18] + "')).click(); return 1; })()"},
             {"until": f"/^cancelled/.test({NOTE}) && {NOTE}", "ms": 8000},
+            {"until": "document.querySelectorAll('article.dispatch').length === 0 && 1", "ms": 8000},   # the next poll draws again
         ])
-    assert out["values"][5] >= 1, out                                       # the picker is still there after the beat
-    assert out["values"][7].startswith("cancelled"), out
+    assert out["values"][9] >= 2, out                                       # picker and its dismiss survived every poll
+    assert out["values"][11].startswith("cancelled"), out
     assert JobStore(world["qdir"]).get(job.id).state == "cancelled"
+
+
+@needs_browser
+def test_a_get_in_flight_when_the_picker_opens_does_not_remove_it(world, tmp_path: Path) -> None:
+    _two_passkeys(world, tmp_path)
+    hold = """(() => { const f = window.fetch; window.__release = null; window.fetch = (u, o) => {
+      if (!String(u).includes('consent.json')) return f(u, o);
+      return new Promise((res) => { window.__release = () => res(f(u, o)); }); };
+      document.getElementById('refresh').click(); return 1; })()"""
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": hold},                                                 # a GET is now parked
+            {"eval": CANCEL_TAP},
+            {"eval": CANCEL_TAP},                                           # the picker opens while it is in flight
+            {"eval": PICKS},
+            {"eval": "(() => { window.__release(); return 1; })()"},
+            {"eval": WAIT},
+            {"eval": PICKS},
+        ])
+    assert out["values"][4] >= 2 and out["values"][7] >= 2, out
+
+
+@needs_browser
+def test_a_press_dragged_off_a_button_leaves_polling_working(world, tmp_path: Path) -> None:
+    file_job(world)
+    with _serve(world["qdir"], world["qdir"]) as (base, _):
+        url = base.replace("127.0.0.1", "localhost")
+        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
+            {"until": CARD + " && 1"},
+            {"eval": FETCH_HOOK},
+            {"eval": "(() => { const b = document.querySelector('article.dispatch .acts button');"
+                     " b.dispatchEvent(new Event('pointerdown', { bubbles: true })); return 1; })()"},   # no pointerup ever follows
+            {"eval": POLLS},
+            {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
+        ])
+    assert out["values"][4] >= 3, out
