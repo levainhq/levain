@@ -288,6 +288,7 @@ def run_init(
     messaging: str | None = None,
     consent_hook: str | None = None,
     memory_load: Sequence[str] | None = None,
+    default_grants: str = "ask",
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -334,6 +335,11 @@ def run_init(
         return 1
     if consent_hook is not None and consent_hook not in CONSENT_HOOK_CHOICES:
         print(f"FAIL: --consent-hook must be one of {', '.join(CONSENT_HOOK_CHOICES)} (got {consent_hook!r}).")
+        return 1
+    from levain.consent.default_grants import MODES as _DEFAULT_GRANT_MODES
+
+    if default_grants not in _DEFAULT_GRANT_MODES:
+        print(f"FAIL: --default-grants must be one of {', '.join(_DEFAULT_GRANT_MODES)} (got {default_grants!r}).")
         return 1
     if messaging is not None and adapter is not None and adapter != "claude-code":
         print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
@@ -588,6 +594,12 @@ def run_init(
     store = install / ".levain" / "memory.db"
     _print_manifest(install, chosen, store, store_ok=result.store_ok)
     _print_next_steps(install, chosen, store_ok=result.store_ok)
+    if chosen in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(install) != "off":
+        # Q18: after the hook is wired. Asked only at a terminal, never under --answers (no one is there to answer).
+        from levain.consent.default_grants import offer as _offer_default_grant
+
+        _offer_default_grant(install, chosen, mode=default_grants,
+                             interactive=not non_interactive and sys.stdin.isatty() and sys.stdout.isatty())
     if result.review:
         print("NOT settled (exit 1): " + ", ".join(result.review))
     return 0 if result.complete else 1

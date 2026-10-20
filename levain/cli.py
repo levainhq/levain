@@ -235,6 +235,22 @@ def main(argv: list[str] | None = None) -> int:
             "--memory-load again to change it."
         ),
     )
+    init_p.add_argument(
+        "--default-grants",
+        choices=["ask", "no"],
+        default=None,
+        dest="default_grants",
+        help=(
+            "The default consent grant init offers once the consent hook is wired (claude-code and codex "
+            "adapters): one grant for the agent's workspace edit tools (Claude Code: Edit, Write, MultiEdit, "
+            "NotebookEdit, WebFetch under default and acceptEdits; Codex: apply_patch) inside this install's "
+            "directory, for 14 days. `ask` (the default): offered only when the authority log is initialised "
+            "and an enrolled laptop-presence key is in levain's key directory; at a terminal init prints the "
+            "grant and asks [y/N], elsewhere it prints the `levain consent grant create` command and signs "
+            "nothing. A live default grant for this directory is kept. `no`: never offered. There is no `yes`: a "
+            "signature never happens unattended."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -1462,6 +1478,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print("levain init: --answers-template cannot be combined with --memory-load (it installs "
                   "nothing).")
             return 1
+        if args.default_grants is not None:
+            print("levain init: --answers-template cannot be combined with --default-grants (it installs "
+                  "nothing).")
+            return 1
         from levain.install import run_answers_template
 
         return run_answers_template(packs=args.pack)
@@ -1479,6 +1499,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if args.messaging is not None and args.web:
         print("levain init: --messaging cannot be combined with --web; drop --web, or run "
               "`levain init --messaging ...` in the terminal.")
+        return 1
+
+    if args.default_grants is not None and args.web:
+        print("levain init: --default-grants cannot be combined with --web (the browser onboarding offers no "
+              "grant); drop --web, or run `levain init --default-grants ...` in the terminal.")
         return 1
 
     if args.answers is not None and args.web:
@@ -1525,6 +1550,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         messaging=args.messaging,
         consent_hook=args.consent_hook,
         memory_load=args.memory_load,
+        default_grants=args.default_grants or "ask",
     )
 
 
