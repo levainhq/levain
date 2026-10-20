@@ -19,6 +19,7 @@ from levain.dispatch import cli as dispatch_cli
 from levain.dispatch import sign as dispatch_sign
 from levain.slot import Refused
 from levain.slot import runtime_grammar
+from levain.webpush import devices
 
 
 def _unassigned() -> str:
@@ -60,6 +61,30 @@ TABLE = [
     ("plain text", "fix the bug now", []),
     ("newline", "a\nb", [1]),
     ("tab", "a\tb", [1]),
+    # presentation selectors: only after a base listed in emoji-variation-sequences.txt
+    ("information source + VS16", "ℹ️", []),
+    ("heart + VS16", "❤️", []),
+    ("copyright + VS16", "©️", []),
+    ("number sign + VS16", "#️", []),
+    ("asterisk + VS16", "*️", []),
+    ("keycap one", "1️⃣", []),
+    ("equals + VS16", "=️", [1]),
+    ("plus + VS15", "+︎", [1]),
+    ("rightwards arrow (not a listed base) + VS16", "→️", [1]),
+    ("covert bits after Sm", "=︎=️", [1, 3]),
+    ("look-alike path", "src/c+️+/x", [6]),
+    # combining marks: need a visible base, at most four on one
+    ("mark after a space", "rm ̸-rf", [3]),
+    ("mark at start", "̀abc", [0]),
+    ("thirty marks on one base", "a" + "́" * 30, list(range(5, 31))),
+    ("four marks on one base", "á̂̃̄", []),
+    ("mark after newline", "a\ń", [1, 2]),
+    ("e + acute", "é", []),
+    ("Vietnamese decomposed", "ệ", []),
+    ("Devanagari", "क्षि", []),
+    ("Thai", "กี่", []),
+    ("KHITAN FILLER U+16FE4", "a\U00016fe4b", [1]),
+    ("NULL NOTEHEAD U+1D159", "a\U0001d159b", [1]),
     ("VS16 after newline", "a\n️b", [1, 2]),
 ]
 IDS = [t[0] for t in TABLE]
@@ -115,8 +140,8 @@ def test_every_site_agrees_with_the_predicate(case: str, text: str, base: list[i
         want = _expected(text, base, allow)
         out = fn(text)
         for ch in set(text):
-            if ch.isascii() and ch.isalnum():
-                continue        # an escape or a marker spells hex digits and letters itself
+            if (ch.isascii() and ch.isalnum()) or ch == "+":
+                continue        # an escape or a marker spells hex digits, letters and the "+" of "U+" itself
             raw_kept = sum(1 for j, c in enumerate(text) if c == ch and j not in want)
             if ch == "\n" and name == "consent.band._escaped":
                 continue        # JSON escapes a newline itself, whatever the predicate says
@@ -131,3 +156,8 @@ def test_mark_formats_each_hidden_character() -> None:
     assert unshowable.mark("⚠️️", "<{:X}>", allow="") == "⚠️<FE0F>"
     assert unshowable.mark("a️", "<{:X}>", allow="") == "a<FE0F>"
     assert unshowable.mark("a​b", "") == "ab"
+
+
+def test_strip_sites_keep_words_apart_and_strip_the_rest() -> None:
+    assert publish._clean("a b　c​d") == "a b cd"         # a space becomes a space, not nothing
+    assert devices._label("ph​one‮") == "phone"

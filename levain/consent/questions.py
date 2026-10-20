@@ -322,8 +322,8 @@ class QuestionStore:
             raise
 
     @contextmanager
-    def _write(self, busy_ms: int | None = None) -> Iterator[sqlite3.Connection]:
-        with write_transaction(lambda: self._connect(busy_ms)) as conn:
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        with write_transaction(self._connect) as conn:
             yield conn
 
     @contextmanager
@@ -331,6 +331,9 @@ class QuestionStore:
         """As :meth:`_write`, but the write lock is waited for until ``deadline`` (``time.monotonic()``) by the wall
         clock: SQLite is told not to wait at all, and ``BEGIN IMMEDIATE`` is retried here. Past the deadline the
         lock's own ``OperationalError`` is raised."""
+        # Only ever called after _peek found a set-up store: _connect's own setup would BEGIN IMMEDIATE at busy 0,
+        # outside the retry loop below.
+        assert self._ready
         conn = self._connect(busy_ms=0)
         try:
             while True:
@@ -354,8 +357,8 @@ class QuestionStore:
             conn.close()
 
     @contextmanager
-    def _peek(self, busy_ms: int = HOOK_BUSY_MS) -> Iterator[sqlite3.Connection | None]:
-        """Every read: a snapshot opened read-only, waiting at most ``busy_ms`` on a lock; it never
+    def _peek(self) -> Iterator[sqlite3.Connection | None]:
+        """Every read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
         creates, sets up or writes the store, so a tool call with nothing to deliver takes no write lock. ``None``
         when there is no store yet (no file, an empty one, or one a filer has not set up); a store of another
         format raises :class:`QuestionStoreError`."""
@@ -367,10 +370,10 @@ class QuestionStore:
             yield None
             return
         self._check_directory()
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=busy_ms / 1000,
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=HOOK_BUSY_MS / 1000,
                                isolation_level=None)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
+            conn.execute(f"PRAGMA busy_timeout = {HOOK_BUSY_MS}")
             conn.execute("BEGIN")
             have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None

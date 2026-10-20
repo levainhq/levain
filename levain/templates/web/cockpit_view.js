@@ -25,15 +25,17 @@
   };
 
   // ONE sanitising boundary. Every string in the manifest and the panels goes through clean() once, on
-  // entry, so no per-field guard can miss a field. It shows as <U+XXXX> the characters that can move or
-  // hide neighbouring text: control characters (a tab and newlines are structure and stay), the bidi
-  // controls and marks, the invisible format characters, a byte-order mark, lone surrogates and the line
-  // and paragraph separators. The zero-width joiner and non-joiner stay: emoji sequences and Persian or
-  // Indic text need them.
-  const HOSTILE = /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
+  // entry, so no per-field guard can miss a field. The server's visible() (levain.unshowable) runs first; this is
+  // the second layer, over the same set as unshowable.is_unshowable: it shows as <U+XXXX> every control, format,
+  // surrogate, separator, private-use, unassigned or default-ignorable character, every space but U+0020, and
+  // the characters that draw nothing. Kept as they are: a tab and newlines (structure); the zero-width joiner and
+  // non-joiner (emoji sequences and Persian or Indic text need them); U+FE0E and U+FE0F, whose context rule is the
+  // server's (it has already marked every one that hides, and marking the rest here would break "⚠️").
+  const HOSTILE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Zs}\p{Default_Ignorable_Code_Point}\u2800\u{16fe4}\u{1d159}]/gu;
+  const KEPT = new Set(["\n", "\t", " ", "\u200c", "\u200d", "\ufe0e", "\ufe0f"]);
   function visible(v) {
     return String(v === null || v === undefined ? "" : v).replace(/\r\n/g, "\n").replace(HOSTILE,
-      (ch) => (ch === "\n" || ch === "\t" ? ch : "<U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + ">"));
+      (ch) => (KEPT.has(ch) ? ch : "<U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + ">"));
   }
   function clean(x) {
     if (typeof x === "string") return visible(x);

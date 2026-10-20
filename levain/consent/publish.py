@@ -70,6 +70,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import unicodedata
 import zipfile
 import zlib
 from collections.abc import Callable
@@ -654,9 +655,10 @@ def publish_env(call: dict[str, Any] | None = None) -> dict[str, str]:
 
 def _clean(text: str) -> str:
     """``text`` without terminal escapes or invisible characters (a tool's coloured output stays readable in the
-    receipt and on the agent's terminal)."""
+    receipt and on the agent's terminal). A space other than U+0020 becomes U+0020, so two words it separated stay
+    two words."""
     text = _ESCAPES.sub("", text)
-    return unshowable.mark(text, "", allow="\n\t")
+    return unshowable.mark(text, lambda cp: " " if unicodedata.category(chr(cp)) == "Zs" else "", allow="\n\t")
 
 
 def resolve_tool(index: str) -> list[str]:

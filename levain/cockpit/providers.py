@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
@@ -1040,7 +1041,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
-            work = "".join(c for c in work if c.isprintable())[:64]
+            work = unshowable.mark(work, "", allow="")[:64]
             listed.append((rec, chips, work, age < SESSION_ACTIVE_S))
         # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
         # started (never the session id, ruling 4). Two whose starts round alike (same minute; past an hour, same

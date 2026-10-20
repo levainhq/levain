@@ -97,12 +97,20 @@ class DispatchPhone:
 
         from levain.cockpit.display_safe import visible
 
-        v = job_view(job)
+        def shown(x: Any) -> Any:
+            if isinstance(x, str):
+                return visible(x)
+            if isinstance(x, dict):
+                return {k: shown(e) for k, e in x.items()}
+            if isinstance(x, (list, tuple)):
+                return tuple(map(shown, x)) if isinstance(x, tuple) else [shown(e) for e in x]
+            return x
+
+        # display only, every string the planner or the filing agent wrote (goal, repo, paths, template, grant, the
+        # filer, each history cause and its evidence) included: what the card signs is built from the stored job
+        # (``sign_payload``), never from this record
+        v = shown(job_view(job))
         out = {k: v[k] for k in v if k not in ("filer_agent", "filer_session")}
-        # display only: the card shows these; what it signs is built from the stored job (``sign_payload``), never them
-        out["goal"], out["repo"] = visible(v["goal"]), visible(v["repo"])
-        out["read"] = [{**e, "path": visible(e["path"])} for e in v["read"]]
-        out["write"] = [{**e, "path": visible(e["path"])} for e in v["write"]]
         out.update({"kind": "dispatch", "agent": v["filer_agent"], "session": v["filer_session"],
                     "read_count": len(v["read"]), "write_count": len(v["write"]),
                     "can_sign": job.state == "filed" and job.lease_end > now and bool(signers), "can_cancel": job.state not in TERMINAL,
