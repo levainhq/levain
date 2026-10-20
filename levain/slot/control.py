@@ -27,6 +27,7 @@ operator is refused ``verb-not-allowed-for-peer`` (see :data:`PEER_VERBS`). Ever
 from __future__ import annotations
 
 import base64
+import collections
 import os
 import socket
 import struct
@@ -78,6 +79,16 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
 EOF_RETRY_FIRST_S = 0.01
 EOF_RETRY_MAX_S = 1.0
 
+#: DECISION: a frame's remaining bytes must arrive within this once its first byte has (a lease connection
+#: idles legitimately BETWEEN frames, so only a frame already begun has a deadline).
+FRAME_READ_S = 10.0
+#: DECISION: the connections CONTROL serves at once (one thread each); one over is closed at accept. A
+#: session's lease connection lives as long as the session, and every other caller's is one exchange.
+MAX_CONNECTIONS = 256
+#: DECISION: dead leases kept to answer ``lease-dead`` (§3.3) once nothing else needs them; past this many the
+#: oldest is forgotten and its nonce answers ``nonce-unknown``, which refuses a replay just as surely.
+RETIRED_LEASES_MAX = 1024
+
 
 # --- framing --------------------------------------------------------------------------------------------
 
@@ -108,18 +119,29 @@ def _recv_exact(sock: socket.socket, n: int, *, eof_ok: bool) -> bytes | None:
     return bytes(buf)
 
 
-def read_frame(sock: socket.socket) -> dict | None:
+def read_frame(sock: socket.socket, *, frame_timeout: float | None = None) -> dict | None:
     """One frame's object, or ``None`` on a clean EOF between frames. Raises :class:`FrameTooLarge` or
-    :class:`FrameMalformed`."""
-    head = _recv_exact(sock, _LEN.size, eof_ok=True)
-    if head is None:
+    :class:`FrameMalformed`. ``frame_timeout``: once a frame's first byte is in, the rest must arrive within
+    it (else :class:`FrameMalformed`); the wait for that first byte keeps the socket's own timeout."""
+    first = _recv_exact(sock, 1, eof_ok=True)
+    if first is None:
         return None
-    (n,) = _LEN.unpack(head)
-    if n > FRAME_MAX:
-        raise FrameTooLarge(n)
-    if n == 0:
-        raise FrameMalformed("empty frame")
-    data = _recv_exact(sock, n, eof_ok=False)
+    restore = sock.gettimeout()
+    if frame_timeout is not None:
+        sock.settimeout(frame_timeout)
+    try:
+        head = first + _recv_exact(sock, _LEN.size - 1, eof_ok=False)
+        (n,) = _LEN.unpack(head)
+        if n > FRAME_MAX:
+            raise FrameTooLarge(n)
+        if n == 0:
+            raise FrameMalformed("empty frame")
+        data = _recv_exact(sock, n, eof_ok=False)
+    except socket.timeout:
+        raise FrameMalformed("a frame stalled past its read deadline") from None
+    finally:
+        if frame_timeout is not None:
+            sock.settimeout(restore)
     try:
         obj = canon.parse(data)
     except ContractError as e:
@@ -161,13 +183,24 @@ class StateStore:
 
     The records are held in memory as well (loaded by :meth:`load`, updated by :meth:`put`), so
     ``REVOKED-SET`` and ``STATUS`` are served without a disk read (§4.5: "from memory, no fsync"); every
-    write goes to disk first and reaches memory only once it is durable."""
+    write goes to disk first and reaches memory only once it is durable.
+
+    A write that failed AFTER its rename (:class:`records.NotDurable`) leaves disk ahead of memory, so the
+    session is marked UNSETTLED: no read serves its memory again until :meth:`_settle` has fsynced the
+    directory and reloaded the record from disk; until that succeeds every read of it is refused
+    ``record-unsettled``. ``on_settle(old, new)`` is told what the reload changed (CONTROL owes a revoke's
+    after-acts for a record that a failed write moved past live)."""
 
     def __init__(self, directory: Path, *, fsync: Callable[[int], None] = os.fsync) -> None:
         self.dir = Path(directory)
         self._fsync = fsync
         self._mem: dict[str, R.SessionState] = {}
+        #: session -> the mark of the failed write that unsettled it (a reload publishes only if no later
+        #: failed write re-marked the session while it read).
+        self._unsettled: dict[str, int] = {}
+        self._marks = 0
         self._mu = threading.Lock()
+        self.on_settle: Callable[[R.SessionState | None, R.SessionState | None], None] = lambda old, new: None
 
     def _path(self, session: str, suffix: str) -> Path:
         return self.dir / f"{R.check_session(session)}{suffix}"
@@ -205,21 +238,71 @@ class StateStore:
             out[session] = rec
         with self._mu:
             self._mem = dict(out)
+            self._unsettled.clear()
         return out
 
     def get(self, session: str) -> R.SessionState | None:
         with self._mu:
-            return self._mem.get(session)
+            if session not in self._unsettled:
+                return self._mem.get(session)
+        return self._settle(session)
 
     def all(self) -> list[R.SessionState]:
+        with self._mu:
+            unsettled = sorted(self._unsettled)
+        for session in unsettled:
+            self._settle(session)
         with self._mu:
             return list(self._mem.values())
 
     def put(self, rec: R.SessionState) -> None:
-        """Write ``rec`` durably (the caller holds the session lock), then publish it in memory."""
-        R.write_durably(self._path(rec.session, ".json"), R.state_bytes(rec), fsync=self._fsync)
+        """Write ``rec`` durably (the caller holds the session lock), then publish it in memory. A failure
+        after the rename marks the session unsettled before it propagates (see the class docstring)."""
+        try:
+            R.write_durably(self._path(rec.session, ".json"), R.state_bytes(rec), fsync=self._fsync)
+        except R.NotDurable:
+            with self._mu:
+                self._marks += 1
+                self._unsettled[rec.session] = self._marks
+            raise
         with self._mu:
             self._mem[rec.session] = rec
+            self._unsettled.pop(rec.session, None)
+
+    def _settle(self, session: str) -> R.SessionState | None:
+        """Make the record at the path durable (fsync the directory) and serve it from disk from here on.
+        Any failure leaves the session unsettled and is refused ``record-unsettled``. A reload publishes only
+        if the session still carries the mark it started under: a reader that raced a writer's later failed
+        write (and so may have read the bytes before it) leaves the session unsettled for the next read."""
+        p = self._path(session, ".json")
+        with self._mu:
+            mark = self._unsettled.get(session)
+        try:
+            dfd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                self._fsync(dfd)
+            finally:
+                os.close(dfd)
+            data = R.read_record(p)
+            rec = None if data is None else R.parse_state(data)
+        except (OSError, Refused) as e:
+            raise Refused("record-unsettled", f"{session}: {e}") from None
+        if rec is not None and rec.session != session:
+            raise Refused("record-unsettled", f"{p} names {rec.session}")
+        with self._mu:
+            now = self._unsettled.get(session)
+            if now is None:                              # another reader settled it first
+                return self._mem.get(session)
+            if now != mark:                              # a later failed write: what this read saw may be older
+                raise Refused("record-unsettled", f"{session}: written again while it was read")
+            old = self._mem.get(session)
+            if rec is None:
+                self._mem.pop(session, None)
+            else:
+                self._mem[session] = rec
+            del self._unsettled[session]
+        self.on_settle(old, rec)
+        return rec
 
 
 def _current(rec: R.SessionState, name: str) -> object:
@@ -310,11 +393,15 @@ class Control:
         self._clock = clock
         self._sleep = sleep
         self._mu = threading.Lock()
-        self._leases: dict[str, Lease] = {}            # nonce -> lease (kept after EOF: lease-dead)
+        self._leases: dict[str, Lease] = {}            # nonce -> lease (a dead one kept, bounded: _retire)
         self._session_lease: dict[str, Lease] = {}
         self._handles: dict[str, Handles] = {}
+        self._drops_owed: set[str] = set()
+        self._retired: collections.deque[str] = collections.deque()   # dead lease nonces, oldest first
         self._stopping = threading.Event()
+        #: The background threads still running (revokes, drop retries); each removes itself as it ends.
         self._eof_threads: list[threading.Thread] = []
+        store.on_settle = self._on_settle
         #: Exceptions a seam raised after a revoke landed (the revoke itself is durable by then).
         self.seam_errors: list[tuple[str, str, BaseException]] = []
 
@@ -332,11 +419,21 @@ class Control:
     def start(self) -> None:
         """CONTROL's start pass: load every record, then treat every record whose lease was live as a
         lease EOF (no lease survives a CONTROL restart): ``lease_live:false``, then live state ->
-        REVOKED, then the keys drop + reaper wake. Work is retained by END, which the reaper runs."""
+        REVOKED, then the keys drop + reaper wake. Work is retained by END, which the reaper runs.
+
+        Every record already at or past REVOKED gets its ``DROP-SESSION`` again (idempotent, §4.9): a
+        CONTROL that died between the REVOKED write and the drop, or whose drop never got an ack, owes it
+        still. Then one reaper wake."""
         self.store.load()
+        past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
             if rec.lease_live or rec.state in R.LIVE_STATES:
                 self._revoke_after_eof(rec.session)
+            else:
+                self._drop(rec.session)
+                past = True
+        if past:
+            self._wake()
 
     def stop(self) -> None:
         """Stop serving WITHOUT revoking: the records stay as they are, and the next :meth:`start` revokes
@@ -361,12 +458,90 @@ class Control:
         reaper. Called after the REVOKED write is durable and the session lock released."""
         with self._mu:
             self._handles.pop(session, None)
-        for name, call in (("drop_session", lambda: self._drop_session(session)),
-                           ("wake_reaper", self._wake_reaper)):
-            try:
-                call()
-            except BaseException as e:   # noqa: BLE001 - the revoke is durable; record the seam's failure
-                self.seam_errors.append((name, session, e))
+        self._drop(session)
+        self._wake()
+        self._prune(session)
+
+    def _wake(self) -> None:
+        try:
+            self._wake_reaper()
+        except BaseException as e:   # noqa: BLE001 - the reaper also runs on its own pass; record the failure
+            self.seam_errors.append(("wake_reaper", "", e))
+
+    def _drop(self, session: str) -> None:
+        """``DROP-SESSION`` once now; a failure is never taken as done: it is retried with backoff on a
+        background thread until keys acks it (or CONTROL stops, whose next start re-issues it)."""
+        with self._mu:
+            if session in self._drops_owed:
+                return                                   # a retry is already running
+        try:
+            self._drop_session(session)
+            return
+        except BaseException as e:   # noqa: BLE001 - the revoke is durable; the drop is owed
+            self.seam_errors.append(("drop_session", session, e))
+        with self._mu:
+            if session in self._drops_owed:
+                return
+            self._drops_owed.add(session)
+        self._spawn(self._drop_until_acked, session, name=f"control-drop-{session}")
+
+    def _drop_until_acked(self, session: str) -> None:
+        delay = EOF_RETRY_FIRST_S
+        try:
+            while not self._stopping.is_set():
+                self._sleep(delay)
+                delay = min(delay * 2, EOF_RETRY_MAX_S)
+                try:
+                    self._drop_session(session)
+                    return
+                except BaseException:   # noqa: BLE001 - noted once by _drop; retried until acked
+                    continue
+        finally:
+            with self._mu:
+                self._drops_owed.discard(session)
+
+    def drops_owed(self) -> frozenset[str]:
+        """The sessions whose ``DROP-SESSION`` keys has not acked yet (doctor / tests)."""
+        with self._mu:
+            return frozenset(self._drops_owed)
+
+    def _on_settle(self, old: R.SessionState | None, new: R.SessionState | None) -> None:
+        """A record reloaded after a write that failed past its rename (:meth:`StateStore._settle`). If the
+        failed write moved it out of live, the revoke's after-acts are owed, since its writer answered an error
+        and ran none; if it is live with no live lease bound, it is revoked as a lease EOF would."""
+        if new is None:
+            return
+        if new.state not in R.LIVE_STATES and (old is None or old.state in R.LIVE_STATES):
+            with self._mu:
+                self._handles.pop(new.session, None)
+            self._spawn(self._after_revoke, new.session, name=f"control-settled-{new.session}")
+        elif new.state in R.LIVE_STATES and not self._lease_live(new.session):
+            self._spawn_revoke(new.session)
+
+    def _prune(self, session: str) -> None:
+        """Unbind a dead lease once its session is past live (nothing reads the binding after that) and retire
+        it (:meth:`_retire`). A lease still live stays bound: its own EOF prunes it."""
+        with self._mu:
+            lease = self._session_lease.get(session)
+            if lease is None or lease.live:
+                return
+        rec = self.store.get(session)
+        if rec is not None and rec.state in R.LIVE_STATES:
+            return
+        with self._mu:
+            if self._session_lease.get(session) is lease and not lease.live:
+                del self._session_lease[session]
+                self._retire(lease)
+
+    def _retire(self, lease: Lease) -> None:
+        """A dead lease nothing reads any more (caller holds ``_mu``): kept, bounded, so a late ATTACH still reads
+        ``lease-dead``; past :data:`RETIRED_LEASES_MAX` the oldest is forgotten (``nonce-unknown``)."""
+        self._retired.append(lease.nonce)
+        while len(self._retired) > RETIRED_LEASES_MAX:
+            old = self._retired.popleft()
+            gone = self._leases.get(old)
+            if gone is not None and not gone.live:
+                del self._leases[old]
 
     # -- the lease EOF (§3.1 step 3) ------------------------------------------------------------------------
 
@@ -381,16 +556,28 @@ class Control:
             session = lease.session
             if session is not None:
                 self._handles.pop(session, None)
+            elif not lease.used and self._leases.get(lease.nonce) is lease:
+                self._retire(lease)                      # bound nothing and never will
         if session is None or self._stopping.is_set():
             return None
         return self._spawn_revoke(session)
 
     def _spawn_revoke(self, session: str) -> threading.Thread:
-        t = threading.Thread(target=self._revoke_after_eof, args=(session,), daemon=True,
-                             name=f"control-eof-{session}")
-        t.start()
+        return self._spawn(self._revoke_after_eof, session, name=f"control-eof-{session}")
+
+    def _spawn(self, target: Callable[[str], None], session: str, *, name: str) -> threading.Thread:
+        def run() -> None:
+            try:
+                target(session)
+            finally:
+                with self._mu:
+                    if t in self._eof_threads:
+                        self._eof_threads.remove(t)
+
+        t = threading.Thread(target=run, daemon=True, name=name)
         with self._mu:
             self._eof_threads.append(t)
+        t.start()
         return t
 
     def _revoke_after_eof(self, session: str) -> None:
@@ -423,12 +610,20 @@ class Control:
                 delay = min(delay * 2, EOF_RETRY_MAX_S)
         if revoked:
             self._after_revoke(session)
+        else:
+            self._prune(session)
 
     def join_eof(self, timeout: float | None = None) -> None:
-        with self._mu:
-            threads = list(self._eof_threads)
-        for t in threads:
-            t.join(timeout)
+        """Join the background threads, including any started while joining."""
+        while True:
+            with self._mu:
+                threads = [t for t in self._eof_threads if t.is_alive() and t is not threading.current_thread()]
+            if not threads:
+                return
+            for t in threads:
+                t.join(timeout)
+            if timeout is not None and any(t.is_alive() for t in threads):
+                return
 
     # -- dispatch ----------------------------------------------------------------------------------------
 
@@ -507,6 +702,8 @@ class Control:
         except BaseException:
             with self._mu:
                 lease.used = False
+                if not lease.live and self._leases.get(nonce) is lease:
+                    self._retire(lease)                  # its EOF came while ATTACH held it: nothing binds it now
             raise
         with self._mu:
             lease.session = session
@@ -524,11 +721,13 @@ class Control:
             fields: object) -> int:
         """§7.2 CAS. Static checks first (no lock): states named, the edge in :data:`records.EDGES` (or
         ``from == to``: a field-only CAS), every field CAS-writable and valid. Then, under the try-lock: a
-        CAS whose ``to`` is already the record's state, with every field already holding its value, counts
-        as done (§7.4) and answers the current generation, unless ``to`` is a live state and the lease is gone
-        (``lease-dead``, §3.3, checked in the shortcut too); else the generation must be the record's
-        (``stale-generation``), ``from`` its state, and a move into a live state needs the lease live.
-        ``null`` as a field value removes the field (DECISION)."""
+        CAS whose ``to`` is already the record's state, with every field already holding its value, AND whose
+        generation is exactly one behind the record's counts as done (§7.4: the retry of a CAS whose answer was
+        lost) and answers the current generation, unless ``to`` is a live state and the lease is gone
+        (``lease-dead``, §3.3, checked in the shortcut too); any other caller at an older generation is
+        ``stale-generation``, never told it won a move another made. Else the generation must be the record's,
+        ``from`` its state, and a move into a live state needs the lease live. ``null`` as a field value removes
+        the field (DECISION)."""
         session = R.check_session(session)
         generation = R._uint(generation, "generation")
         frm = R._enum(frm, "from", R.STATES)
@@ -555,7 +754,8 @@ class Control:
             if rec is None:
                 raise Refused("no-session")
             live_to = to in R.LIVE_STATES and to != R.ALLOCATED
-            if frm != to and rec.state == to and all(_current(rec, k) == v for k, v in checked.items()):
+            if (frm != to and rec.state == to and rec.generation == generation + 1
+                    and all(_current(rec, k) == v for k, v in checked.items())):
                 if live_to and not self._lease_live(session):
                     raise Refused("lease-dead")
                 return rec.generation                                  # §7.4: already done
@@ -590,7 +790,9 @@ class Control:
             rec = self.store.get(session)
             if rec is None:
                 raise Refused("no-session")
-            if not self._lease_live(session):
+            with self._mu:
+                lease = self._session_lease.get(session)
+            if lease is None or not lease.live:
                 raise Refused("lease-dead")
             if rec.state != R.RENDERING:
                 raise Refused("not-rendering")
@@ -605,10 +807,14 @@ class Control:
             if "front" in claims:
                 f = claims["front"]
                 self._keys_front_register(session, f["uid"], f["pid"], f["start"], claims["incarnation"])
-            new = self._write(rec, claims=merged, event_kind="none")
             h = Handles(token=new_handle() if self._is_brokered(merged) else None,
                         queue_cap=new_handle() if claims["queue_grant"] else None)
+            new = self._write(rec, claims=merged, event_kind="none")
+            # The lease can read EOF during the keys wire or the write (lease_eof takes no session lock): the
+            # handles are published only if that same lease is live NOW, under the lock lease_eof drops them under.
             with self._mu:
+                if self._session_lease.get(session) is not lease or not lease.live:
+                    raise Refused("lease-dead")
                 self._handles[session] = h
         return {"generation": new.generation}
 
@@ -627,7 +833,18 @@ class Control:
                 raise Refused("not-rendering")
             if generation != rec.generation:
                 raise Refused("stale-generation")
+            with self._mu:
+                lease = self._session_lease.get(session)
         self._keys_front_arm(session)
+        # The lock is not held across the relay, so the session can move under it: re-check both before root is
+        # told it may write the go byte.
+        with self._mu:
+            lease_ok = self._session_lease.get(session) is lease and lease is not None and lease.live
+        if not lease_ok:
+            raise Refused("lease-dead")
+        now = self.store.get(session)
+        if now is None or now.state != R.RENDERING or now.generation != rec.generation:
+            raise Refused("not-rendering")
         return {"generation": rec.generation}
 
     def _op_secrets(self, conn: Conn, args: dict) -> dict[str, object]:
@@ -702,10 +919,13 @@ class ControlServer:
     path); its owner and group are the service install's."""
 
     def __init__(self, control: Control, path: Path, *,
-                 peer_uid: Callable[[socket.socket], int | None] = kernel_peer_uid) -> None:
+                 peer_uid: Callable[[socket.socket], int | None] = kernel_peer_uid,
+                 max_connections: int = MAX_CONNECTIONS, frame_read_s: float = FRAME_READ_S) -> None:
         self.control = control
         self.path = Path(path)
         self._peer_uid = peer_uid
+        self.max_connections = max_connections
+        self.frame_read_s = frame_read_s
         self._listener: socket.socket | None = None
         self._conns: set[socket.socket] = set()
         self._mu = threading.Lock()
@@ -740,11 +960,16 @@ class ControlServer:
                 return
             sock.settimeout(None)
             with self._mu:
-                self._conns.add(sock)
+                full = len(self._conns) >= self.max_connections
+                if not full:
+                    self._conns.add(sock)
+            if full:
+                sock.close()                             # over the cap: closed at accept, nothing read
+                continue
             t = threading.Thread(target=self._serve, args=(sock,), daemon=True, name="control-conn")
-            t.start()
             with self._mu:
                 self._threads.append(t)
+            t.start()
 
     def _send(self, sock: socket.socket, answer: Mapping[str, object]) -> bool:
         try:
@@ -768,7 +993,7 @@ class ControlServer:
         try:
             while not self._stop.is_set():
                 try:
-                    req = read_frame(sock)
+                    req = read_frame(sock, frame_timeout=self.frame_read_s)
                 except FrameTooLarge:
                     self._send(sock, refused(None, "frame-too-large"))
                     return
@@ -788,6 +1013,9 @@ class ControlServer:
                 self.control.lease_eof(conn.lease)
             with self._mu:
                 self._conns.discard(sock)
+                me = threading.current_thread()
+                if me in self._threads:
+                    self._threads.remove(me)
             try:
                 sock.close()
             except OSError:
@@ -810,6 +1038,6 @@ class ControlServer:
             t.join(2)
 
 
-__all__ = ["CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FrameMalformed", "FrameTooLarge",
-           "Handles", "Lease", "PEER_VERBS", "StateStore", "check_request", "encode_frame", "new_handle", "ok",
-           "read_frame", "refused"]
+__all__ = ["CONTROL_FORMAT", "Conn", "Control", "ControlServer", "FRAME_MAX", "FRAME_READ_S", "FrameMalformed",
+           "FrameTooLarge", "Handles", "Lease", "MAX_CONNECTIONS", "PEER_VERBS", "RETIRED_LEASES_MAX", "StateStore",
+           "check_request", "encode_frame", "new_handle", "ok", "read_frame", "refused"]

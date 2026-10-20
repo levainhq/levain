@@ -693,6 +693,11 @@ def _parse_slot_state(data: bytes) -> SlotState:
 
 # --- the durable write -----------------------------------------------------------------------------------
 
+class NotDurable(OSError):
+    """:func:`write_durably` failed AFTER the rename: the new bytes are what a reader of ``path`` sees, but the
+    directory entry may not survive a crash. Distinct from a pre-rename failure, which leaves ``path`` as it was."""
+
+
 def write_durably(path: Path, data: bytes, *, mode: int = 0o600,
                   fsync: Callable[[int], None] = os.fsync) -> None:
     """Replace ``path`` with ``data`` so a reader sees the old record or the whole new one, and the new one
@@ -701,8 +706,8 @@ def write_durably(path: Path, data: bytes, *, mode: int = 0o600,
     holds whatever lock makes it the only writer of ``path`` (CONTROL: the session lock; root: the slot
     lock), which is why the temp name is fixed: a dead writer's temp is unlinked by the next write. A failure
     before the rename raises ``OSError`` with ``path`` untouched and the temp file removed; a failure of the
-    directory fsync after it raises with the new bytes already at ``path``, not yet durable (a retry of the
-    same write converges).
+    directory fsync after it raises :class:`NotDurable` (an ``OSError``) with the new bytes already at ``path``,
+    not yet durable: the caller must not go on serving the old record (a retry of the same write converges).
 
     ``fsync`` is the seam a test uses to fail the write at the durability step."""
     path = Path(path)
@@ -726,18 +731,22 @@ def write_durably(path: Path, data: bytes, *, mode: int = 0o600,
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        fsync(dfd)
-    finally:
-        os.close(dfd)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        raise NotDurable(e.errno, f"{path}: renamed, directory fsync failed: {e.strerror or e}") from e
 
 
 def read_record(path: Path, *, max_bytes: int = 1 << 20) -> bytes | None:
     """A record's bytes, ``None`` when absent. A link or a non-regular file is refused (``bad-root``);
     DECISION: a record past ``max_bytes`` is refused rather than read whole."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: a FIFO planted under a record's name must not block the reader; S_ISREG refuses it below.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
         return None
     except OSError as e:
@@ -757,7 +766,7 @@ __all__ = [
     "ACTIVE", "ALLOCATED", "ALLOC_FORMAT", "ARTIFACT_FIELDS", "ATTACH_CLAIM_KEYS", "Alloc", "AllocPolicy",
     "BRAKED", "CAS_FIELDS", "CREDENTIAL_PARKED", "DEAD", "EDGES", "END_FROM_STATES", "END_INTO_STATES",
     "EVENT_KINDS", "EXCLUSIVE_PAIRS", "FIELD_CHECKS", "FROZEN", "Front", "HELD", "LIVE_STATES",
-    "MINT_CLAIM_KEYS", "OBSERVED_ID_RE", "PURGED", "RENDERED", "RENDERING", "RETAINED", "REVOKED",
+    "MINT_CLAIM_KEYS", "NotDurable", "OBSERVED_ID_RE", "PURGED", "RENDERED", "RENDERING", "RETAINED", "REVOKED",
     "REVOKED_SET_STATES", "SLOT_STATES", "SLOT_STATE_FORMAT", "STATES", "STATE_FORMAT", "SessionState", "SlotState",
     "TOUCHED_NAMES", "TRASH", "alloc_bytes", "alloc_record",
     "cgroup_path", "check_alloc", "check_exclusive", "check_session", "check_state", "check_timestamp",
