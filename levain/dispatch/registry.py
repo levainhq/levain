@@ -34,7 +34,8 @@ whose verifier is black-box, the template's content hash (an edited template is 
 over to content it was not signed for) and the rule's own criteria (DESIGN §3.2: contrast-clean is necessary, never
 sufficient). The criteria are a closed, typed vocabulary (F11 §5, :func:`parse_criteria`): free text was checked by
 nothing when a job landed, so a rule holding any is refused when it is accepted and raises when it is read. A rule
-is judged when it is accepted AND again on every read (:func:`active_adoption_rules`), against the templates and verifiers active THEN: a later templates or verifiers
+is judged when it is accepted AND again on every read (:func:`active_adoption_rules`), against the templates and
+verifiers active THEN: a later templates or verifiers
 item can leave a rule pointing at content or a verifier it was not signed for, and such a rule raises rather than
 reads. The intent is that this reader is the only way to the rules: the store's public reader is meant to leave
 them out. No adoption runs here.
@@ -60,8 +61,9 @@ from levain.dispatch.policy import PolicyError, ProviderPolicy, match, path_text
 __all__ = [
     "ADOPTION_RULE_KEYS", "CRITERION_BOUNDS", "CRITERION_INT_MAX", "CRITERION_KEYS", "EXECUTION_BEARING_DIRS",
     "EXECUTION_BEARING_FILES", "KINDS", "R0_SOURCE_EXTENSIONS", "ROUTE_KEYS", "TEMPLATE_FORMAT", "TEMPLATE_KEYS",
-    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at", "active_policy", "body_refusal",
-    "execution_bearing", "legacy_rule_problem", "parse_criteria", "r0_write_refusal", "resolver", "template_content_hash", "template_from_mapping",
+    "RESIGN_RULES", "VERIFIER_KEYS", "AdoptionRule", "active_adoption_rules", "adoption_rules_at", "active_policy",
+    "body_refusal", "execution_bearing", "legacy_rule_problem", "parse_criteria", "r0_write_refusal", "resolver",
+    "template_content_hash", "template_from_mapping",
 ]
 
 KINDS = ("adoption_rules", "provider_policy", "routemap", "templates", "verifiers")
@@ -437,7 +439,8 @@ def _adoption_rules(body: Any, active: Mapping[str, Any]) -> str | None:
         if problem is not None:
             return f"the adoption rule for {tid}: {problem}"
         if template.tier != "R0":
-            return f"the adoption rule names template {tid}, which is {template.tier}; only an R0 template is adopted by rule"
+            return (f"the adoption rule names template {tid}, which is {template.tier}; only an R0 template is "
+                    "adopted by rule")
         if template.verifier_kind != "black-box":
             return (f"the adoption rule names template {tid}, whose verifier is {template.verifier_kind}; only a "
                     "black-box verifier may adopt by rule")
