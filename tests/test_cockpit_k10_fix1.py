@@ -100,16 +100,22 @@ def _value_for_signature() -> dict:
 def test_the_repaint_signature_follows_what_is_drawn_to_the_decimal_and_the_day():
     base = _value_for_signature()
     rate, age, clock = _value_for_signature(), _value_for_signature(), _value_for_signature()
+    cent, subcent = _value_for_signature(), _value_for_signature()
+    base["tasks"][0]["cost"] = {"usd": 1.234, "tokens": 5000, "source": "ledger"}
+    cent["tasks"][0]["cost"] = {"usd": 1.24, "tokens": 5000, "source": "ledger"}        # $1.23 -> $1.24 is drawn
+    subcent["tasks"][0]["cost"] = {"usd": 1.2341, "tokens": 5000, "source": "ledger"}   # $1.23 either way: not drawn
     rate["nodes"][0]["rate"] = 3.4                      # the Agents lens draws one decimal: 3.1 -> 3.4 is visible
     age["tasks"][0]["age_days"] = 3                     # "open 2 d" -> "open 3 d" after midnight, the server's day
     clock["as_of"] = "2026-10-20T12:05:00+00:00"        # the clock alone repaints nothing
     clock["nodes"][0]["last_event"] = "2026-10-20T12:04:00Z"
     clock["tasks"][0]["opened"] = "2026-10-18T00:00:01+00:00"   # not drawn any more: the server's age_days is
     sigs = json.loads(_node("const j = JSON.parse(process.argv[1]); console.log(JSON.stringify(j.map((v) => TV.signature(v, 'agents'))));"
-                            .replace("process.argv[1]", json.dumps(json.dumps([base, rate, age, clock])))))
+                            .replace("process.argv[1]", json.dumps(json.dumps([base, rate, age, clock, cent, subcent])))))
     assert sigs[0] != sigs[1], "a rate that moved 0.3 events/min is drawn and must repaint"
     assert sigs[0] != sigs[2], "an age that moved a day is drawn and must repaint"
     assert sigs[0] == sigs[3], "the clock and the undrawn opened stamp must not repaint"
+    assert sigs[0] != sigs[4], "a task cost that moved a cent is drawn and must repaint"
+    assert sigs[0] == sigs[5], "a task cost below the drawn cent must not repaint"
 
 
 _DAY_JS = r"""

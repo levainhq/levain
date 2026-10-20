@@ -104,7 +104,7 @@
   // `opened` stamp are not in it, so a poll that moved nothing the operator can see repaints nothing and a visible change always does
   function signature(v, l) {
     const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, rate: isNum(n.rate) ? n.rate.toFixed(1) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
-    const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined }) : t);
+    const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined, cost: isObj(t.cost) ? Object.assign({}, t.cost, { usd: fmtUsd(t.cost.usd), tokens: fmtTokens(t.cost.tokens) }) : t.cost }) : t);
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
                                                    tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
                                                    counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;

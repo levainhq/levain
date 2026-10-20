@@ -2770,15 +2770,6 @@
     t.setAttribute("data-ck-tag", "");
     return t;
   }
-  // a due stamp ("2026-10-12", or a longer ISO date) before today
-  function isOverdue(due) {
-    const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(due));
-    if (!m) return false;
-    const d = new Date();
-    const today = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-    return m[1] < today;
-  }
-
   // whole days a due stamp is before today (negative: still ahead; 0: today); NaN when it is no date. `today` is the server's
   // calendar day ("YYYY-MM-DD", carried on the row): the browser's own zone and clock are used only when the server sent none
   function daysLate(due, today) {
