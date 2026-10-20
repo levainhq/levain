@@ -1019,7 +1019,7 @@ class TestSession2Freshness:
 
     def test_freshness_reads_error_for_a_failing_panel(self, env) -> None:
         root, _s, ck = env
-        (root / ".levain" / "memory.spores.json").unlink()
+        (root / ".levain" / "memory.spores.json").write_text("{not json")     # present and unreadable: a real fault (an absent store is empty)
         ck.manifest(NONE_CRED)
         assert ck.freshness()["tray"]["status"] == "error"
 

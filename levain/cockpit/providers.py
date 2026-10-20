@@ -162,6 +162,14 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
     return row_version_of(spore_stored(open_spore_from(raw)), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
 
 
+# a fresh install has no spore store until something is dropped: each panel says what fills it
+SPORE_EMPTY = {
+    "tray": "Nothing yet. Drop a thought in the box above and Sage sorts it.",
+    "loops": "Nothing yet. What stays open after Sage sorts the Tray is listed here.",
+    "keep": "Nothing yet. Add a note above to keep something handy.",
+}
+
+
 def _spore_provider(
     source: SubstrateSource, bucket: str, *, apply_hold: bool = True
 ) -> Callable[[ReadContext], Result]:
@@ -1318,7 +1326,7 @@ def build_default_cockpit(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
-            empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
+            empty=SPORE_EMPTY[bucket], absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,
