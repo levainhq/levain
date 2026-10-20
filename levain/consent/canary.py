@@ -24,6 +24,8 @@ request AND the agent reported the denial AND the sentinel file does not exist; 
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -33,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,9 +64,40 @@ class UntestedAgentVersion(RuntimeError):
     """The agent's version is not one the consent hook was tested with, and no override was given."""
 
 
+# Inside versions_read_once(): each (agent, binary) read's answer, reused; None outside it. A ContextVar, so
+# overlapping runs in two threads (or tasks) each keep their own memo and reset by token.
+_VERSIONS_READ: contextvars.ContextVar[dict[tuple[str, str | None], str] | None] = contextvars.ContextVar(
+    "levain_versions_read", default=None)
+
+
+@contextlib.contextmanager
+def versions_read_once() -> Iterator[None]:
+    """Within it each agent's version is read at most once (a successful answer is reused; a failed read is
+    not memoized and re-reads): for a caller with several rows about one agent version, so one run spawns
+    ``<bin> --version`` once."""
+    token = _VERSIONS_READ.set({} if _VERSIONS_READ.get() is None else _VERSIONS_READ.get())
+    try:
+        yield
+    finally:
+        _VERSIONS_READ.reset(token)
+
+
 def agent_version(agent: str, *, binary: str | None = None, timeout: float = 30.0) -> str | None:
     """The installed agent's version: ``<bin> --version`` exited 0 and its whole output is the agent's version line
-    (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way."""
+    (:data:`_VERSION_OUTPUT`). ``None`` when it cannot be read, or reads any other way. Inside
+    :func:`versions_read_once`, a successful read is reused per agent and binary."""
+    memo = _VERSIONS_READ.get()
+    if memo is None:
+        return _read_agent_version(agent, binary, timeout)
+    if (agent, binary) in memo:
+        return memo[(agent, binary)]
+    got = _read_agent_version(agent, binary, timeout)
+    if got is not None:  # a failure re-reads: the key omits timeout, so a short-timeout failure must not stick
+        memo[(agent, binary)] = got
+    return got
+
+
+def _read_agent_version(agent: str, binary: str | None, timeout: float) -> str | None:
     binary = binary or shutil.which(AGENT_BINS[agent])
     if not binary:
         return None
@@ -184,6 +217,7 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
     referenced: nothing). Every finding is at most a WARN: the hooks fail toward the human's own dialog, never
     toward an allow. Waits on the agents at most about :data:`DOCTOR_BUDGET` seconds; an error is a WARN."""
     from levain.consent.adapters import claude_code, codex
+    from levain.host_guard import cc_levain_hooks_file
     from levain.install import CONSENT_HOOK_SCRIPTS
     deadline = time.monotonic() + DOCTOR_BUDGET
     out: list[Finding] = []
@@ -195,8 +229,7 @@ def doctor_findings(install: Path, *, codex_home: Path | None = None) -> list[Fi
             ("codex", install / ".codex" / "hooks" / codex.HOOK_SCRIPT_NAME, install / ".codex" / "hooks.json",
              False),
             # the shape `levain init` wires: a static script in the activation tree
-            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"], install / ".claude" / "settings.json",
-             True),
+            ("claude_code", hooks_dir / CONSENT_HOOK_SCRIPTS["claude-code"], cc_levain_hooks_file(install), True),
             ("codex", hooks_dir / CONSENT_HOOK_SCRIPTS["codex"], chome / "hooks.json", True)):
         try:
             out += _agent_findings(agent, install, script, config, codex_home, deadline, wired_by_init=by_init)

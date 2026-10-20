@@ -270,16 +270,22 @@ def gate_refusal(cwd: str, config_dir: str | None) -> str | None:
     from levain.consent.adapters.claude_code import GATE_EVENT, GATE_TIMEOUT, HOOK_FLAGS, HOOKRUN
     from levain.install import CONSENT_HOOK_SCRIPTS
 
+    from levain.host_guard import cc_project_settings_files
+
     user = Path(config_dir) if config_dir else Path.home() / ".claude"
+    # the project files Claude Code loads for a session in cwd: settings.local.json at the git root and beside
+    # settings.json, and settings.json from cwd itself (levain wires the gate in one of them, per workspace:
+    # host_guard.cc_levain_hooks_file)
+    local, shared = cc_project_settings_files(cwd)
     project = Path(cwd) / ".claude"
-    files = {f: _settings(f) for f in (project / "settings.json", project / "settings.local.json",
-                                        user / "settings.json")}
+    hook_files = [*local, shared, user / "settings.json"]
+    files = {f: _settings(f) for f in dict.fromkeys([*hook_files, project / "settings.local.json"])}
     off = [str(f) for f, doc in files.items() if doc.get("disableAllHooks") is True]
     if off:
         return f"{off[0]} turns every hook off"
     want = {"type": "command", "onFailure": "block", "timeout": GATE_TIMEOUT}
     lookalike = None
-    for f in (project / "settings.json", user / "settings.json"):
+    for f in dict.fromkeys(hook_files):
         hooks = files[f].get("hooks")
         groups = hooks.get(GATE_EVENT) if isinstance(hooks, dict) else None
         for group in groups if isinstance(groups, list) else ():

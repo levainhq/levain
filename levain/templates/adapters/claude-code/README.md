@@ -30,7 +30,8 @@ post-v1 item.)
 ├── CLAUDE.md                     <- from CLAUDE.md.template; @-imports the seed
 ├── .mcp.json                     <- from mcp.template.json + mcp.band.template.json; registers anneal_memory and levain_band (the question band)
 ├── .claude/
-│   └── settings.json             <- from settings.template.json; wires the hooks
+│   ├── settings.json             <- from settings.template.json; messaging keys (and the hooks, where noted under "Where the hooks live")
+│   └── settings.local.json       <- levain's hooks, when the directory is its own git repository's root
 ├── .levain/
 │   └── memory.db                 <- the anneal-memory store (created by `init`)
 ├── seed/                         <- the methodology-core (Levain layer 3)
@@ -92,6 +93,42 @@ described below.
   threshold it also appends the **Layer D ambient nudge**.
 - **`automemory_mirror.py`** → `PostToolUse` on `Write|Edit` (since 0.5.10), plus
   a start sweep from `session_start.py`. See "The auto-memory mirror" below.
+
+### Where the hooks live
+
+Claude Code reads a project's `.claude/settings.json` only from the folder a
+session starts in, so hooks kept there never run for a session started in a
+subfolder of the install. It also reads `.claude/settings.local.json` from the
+root of the git repository a session is in. So when the install directory is
+the root of its own git repository, `levain init` writes levain's hooks to
+`.claude/settings.local.json`, every command with an absolute script path, and
+keeps the rest (permissions, messaging keys, env) in `.claude/settings.json`.
+Levain adds its own `.claude/.gitignore` entry so the local file stays out of
+git, and merges into an existing local file rather than replacing it, keeping
+your own entries.
+
+`levain update` moves an existing install over: it takes levain's hooks out of
+`.claude/settings.json` and writes them to the local file, and it moves them
+back if the directory stops being a repository root. If the local file is
+malformed JSON (or an event's value is not a list), update stops before
+writing anything and says so; fix the file and run it again. `levain doctor`
+reports where the hooks are, warns about a levain hook left in the wrong file,
+and warns when Claude Code is older than the version that reads the local file
+from the repository root.
+
+What this covers:
+
+- **Install is a git repository's root:** a session started in the install or
+  any folder under it is gated.
+- **Install is nested inside a larger repository, a linked worktree, a
+  submodule or a non-git folder:** the hooks stay in `.claude/settings.json`,
+  and only a session started at the install root runs them. A session started
+  in a subfolder runs none of levain's hooks there.
+- **Initialised before `git init`:** the install first takes the
+  `settings.json` layout. Run `git init`, then `levain update`, and it moves to
+  the local layout.
+
+Codex is not affected: its hooks live in its own config home.
 
 Layer D (keeping sessions wrapped) is **folded into these two hooks** — there
 is no separate `Stop`/`SessionEnd` hook. A `Stop` hook injects context only
@@ -179,13 +216,20 @@ governed; it never edits the file.
    replace `{{INSTALL_DIR}}` with the **absolute path** of the partnership
    directory and `{{PYTHON}}` with the interpreter path from step 1.
 4. **Create `.claude/settings.json`** from `settings.template.json`: replace
-   `{{PYTHON}}` with the Python 3 path from step 1. If the directory already
-   has a `.claude/settings.json`, do not overwrite it — merge: append the
+   `{{PYTHON}}` with the Python 3 path from step 1. Where the hooks go depends
+   on the directory (see *Where the hooks live* below). If the directory is the
+   root of its own git repository, put the `hooks` object in
+   `.claude/settings.local.json` instead, with every hook command naming its
+   script by absolute path (a `${CLAUDE_PROJECT_DIR}` path points at the folder
+   a session started in, which is not the install from a subfolder), and keep
+   that file out of git. Otherwise keep the `hooks` object in
+   `.claude/settings.json`. In either file, if one already exists, do not
+   overwrite it — merge: append the
    `SessionStart`, `UserPromptSubmit` and `PostToolUse` entries into the existing `hooks`
    object's arrays for those events (each event's value is an *array* of
-   matcher groups; appending a group is safe, replacing the array is not), and
-   add the messaging keys of *What the adapter wires* §3, keeping any stricter
-   value you already have.
+   matcher groups; appending a group is safe, replacing the array is not). Add
+   the messaging keys of *What the adapter wires* §3 to `.claude/settings.json`,
+   keeping any stricter value you already have.
 5. **Initialize the memory store:**
    `<levain python> -P -m anneal_memory --db <absolute-install-path>/.levain/memory.db init --schema partnership`
 6. **Make the hooks executable:** `chmod +x activation/hooks/*.py` (optional —
@@ -203,8 +247,9 @@ it is skipped (`seed/memory.md`: "early on it will be near-empty").
 Claude Code shows three one-time approval dialogs the first time the install is
 opened — all are expected security prompts:
 
-- **Hooks** — `.claude/settings.json` wires the activation hooks; approve it or
-  the posture mechanism is off.
+- **Hooks** — `.claude/settings.local.json` (or `.claude/settings.json`, see
+  *Where the hooks live*) wires the activation hooks; approve it or the posture
+  mechanism is off.
 - **`@`-imports** — `CLAUDE.md` imports the seed files; approve it or the seed
   will not load.
 - **MCP server** — `.mcp.json` registers `anneal_memory`; approve it or the
