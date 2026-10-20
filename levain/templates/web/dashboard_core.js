@@ -1966,7 +1966,7 @@
       results.replaceChildren();
       if (rows.length === 0) {
         results.appendChild(el("p", "empty",
-          q ? "no loops match “" + raw.trim() + "”" : "no open prospective loops"));
+          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after Sage sorts the Tray is listed here."));
       } else {
         for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
       }
@@ -1998,7 +1998,7 @@
 
   function renderTray(entry, view) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "tray clear — nothing waiting", "disposition");
+      "Nothing yet. Drop a thought in the box above and Sage sorts it.", "disposition");
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
     if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
@@ -2010,7 +2010,7 @@
   // (when writable), then the list badged per-item (note → "note", parked loop → "parked").
   function renderKeep(entry, view) {
     const p = renderSporeProjection(entry, view, view.keep,
-      "keep empty — nothing kept", "keep");
+      "Nothing yet. Add a note above to keep something handy.", "keep");
     if (isVerbPanel(entry)) mountCaptureBox(p, buildKeepNote());
     return p;
   }
@@ -2097,7 +2097,7 @@
     const showRecent = () => {
       status.textContent = "";
       const shown = agentNow() ? list.filter((e) => e.agent === agentNow()) : list;
-      if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
+      if (list.length === 0) results.replaceChildren(el("p", "empty", "Nothing yet. Episodes appear here as sessions write them."));
       else renderRows(shown);
       reMeasure();
     };
