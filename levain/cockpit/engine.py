@@ -81,6 +81,9 @@ ROW_KINDS = ROW_ENGINE_KINDS + VALUE_ROW_KINDS
 VERSIONED_VALUE_KINDS = ("line", "brief")     # a value write binds to the value's version (§4.4)
 SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a windowed one) gets the box
 SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
+REPLAY_READ_CAP = 2           # past reads (``?at=``) that may run at once: their own pool, never a slot of WRITE_READ_CAP
+REPLAY_CACHE_S = 20.0         # a past read of one (panel, minute) is kept this long, so a repeated read does not re-read the source
+REPLAY_CACHE_MAX = 16
 REPLAY_WINDOW_S = 14 * 3600   # a past read (``?at=``) reaches back at most this far (F12 Replay: the last 14 h)
 SEARCH_LIMIT_MAX = 200    # the most rows a store search returns
 SEARCH_LIMIT_DEFAULT = 50
@@ -549,6 +552,8 @@ class Cockpit:
         self._edits_reader: Callable[[int], Any] | None = None
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
+        self._replay_live: list[list[Any]] = []                  # the past reads still running: their own bounded pool
+        self._replay_cache: dict[tuple[str, str], tuple[float, ProviderSpec, "_Snap"]] = {}
         # panel id -> its live store-search workers, capped at SEARCH_INFLIGHT, so hung hooks cost bounded threads
         self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
@@ -1057,7 +1062,7 @@ class Cockpit:
         state (a throwaway when it has none), the outcome handed back as-is."""
         def produce() -> Any:
             out = fn(*args)
-            if not isinstance(out, (Read, Absent, Fault)):
+            if not isinstance(out, (Read, Absent, Fault, _Snap)):
                 return Fault(f"provider returned {type(out).__name__}, not Read/Absent/Fault")
             return out
 
@@ -1581,7 +1586,7 @@ class Cockpit:
             **({"facets": sorted(spec.facets)} if spec.facets else {}),
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
             # the panel has a past read (``?at=``): a renderer draws a replay control only when this says so
-            **({"replay": True} if spec.read_at is not None else {}),
+            **({"replay": True} if spec.read_at is not None and spec.kind not in ROW_ENGINE_KINDS else {}),
         }
 
     @staticmethod
@@ -2062,16 +2067,8 @@ class Cockpit:
             raise QueryError(f"panel {panel_id!r} has no past read")
         t = check_replay_at(at, ctx.now)
         iso = t.isoformat()
-        if self._state_of(spec) is None:
-            res: Any = Fault("this panel was retired while it was being read")
-        else:
-            res = self._bounded_fresh(("replay", spec.id), spec.timeout_s, spec.read_at, ctx, iso)
-        raw = self._normalize(spec, ctx, res)
-        if isinstance(raw, _Snap):
-            snap = raw
-        else:
-            msg = raw.message if isinstance(raw, Fault) else f"source absent: {getattr(raw, 'reason', '')}"
-            snap = _Snap("error", None, None, [], [], None, _safe_str(msg), spec.note)
+        ctx.today = t.astimezone().date()           # a past read's calendar day is T's, not the server's today
+        snap = self._replay_snap(spec, ctx, iso)
         out: dict[str, Any] = dict(self._head(spec, snap, credential_class, ctx.today, auth, ctx.now))
         out["etag"] = _sha({"base": out["etag"], "at": iso})
         out["rows"], out["value"], out["next"] = None, None, None
@@ -2080,6 +2077,32 @@ class Cockpit:
             return out
         out["value"] = _compact_value(spec.kind, snap.value) if profile == "compact" else snap.value
         return out
+
+    def _replay_snap(self, spec: ProviderSpec, ctx: ReadContext, iso: str) -> "_Snap":
+        """One past read of ``spec`` at ``iso``, as a snapshot: ``read_at`` AND its normalisation run inside the one
+        bounded call (the live read's shape: provider data is never touched on the request thread), in the replay
+        pool (``REPLAY_READ_CAP`` at once, apart from the write pool). A good answer is kept ``REPLAY_CACHE_S`` under
+        (panel, minute), so a client re-reading one minute reads the source once; a refusal or fault is never kept."""
+        key, mono = (spec.id, iso), time.monotonic()
+        with self._lock:
+            hit = self._replay_cache.get(key)
+            if hit is not None and hit[1] is spec and mono - hit[0] < REPLAY_CACHE_S:
+                return hit[2]
+        if self._state_of(spec) is None:
+            raw: Any = Fault("this panel was retired while it was being read")
+        else:
+            def once(c: ReadContext) -> Any:
+                return self._normalize(spec, c, spec.read_at(c, iso))     # type: ignore[misc]
+            raw = self._bounded_fresh(("replay", spec.id), spec.timeout_s, once, ctx, pool="replay")
+        if isinstance(raw, _Snap):
+            if raw.status != "error":
+                with self._lock:
+                    if len(self._replay_cache) >= REPLAY_CACHE_MAX:
+                        self._replay_cache.pop(min(self._replay_cache, key=lambda k: self._replay_cache[k][0]))
+                    self._replay_cache[key] = (mono, spec, raw)
+            return raw
+        msg = raw.message if isinstance(raw, Fault) else f"source absent: {getattr(raw, 'reason', '')}"
+        return _Snap("error", None, None, [], [], None, _safe_str(msg), spec.note)
 
     @staticmethod
     def _seal_search(out: dict[str, Any]) -> None:
@@ -2276,25 +2299,33 @@ class Cockpit:
                 return Fault(f"provider output refused: {_safe_str(exc)}")
         return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
 
-    def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any,
+                       pool: str = "writes") -> Any:
         """A source read made inside a write. It never joins a flight another request started: a
         flight that began before this write's own read could hand it a version older than the source.
         The bound is on reads still running (a hung source's threads), not on requests: at most
         ``WRITE_READ_CAP_PER_SOURCE`` per source (a panel, a discoverer), so one hung source refuses
-        its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all."""
+        its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all. ``pool="replay"``
+        is the past read's own pool (``REPLAY_READ_CAP`` in all and per source): it never takes a write's slot."""
+        replay = pool == "replay"
+        per_cap, total_cap = (REPLAY_READ_CAP, REPLAY_READ_CAP) if replay else (WRITE_READ_CAP_PER_SOURCE, WRITE_READ_CAP)
         st = _State()
         entry = [st, False, source]     # state, returned, (kind, id): a namespaced key, so a panel
         with self._lock:                # id never shares a discoverer's count
             # live: a read whose call has not returned (reserved from here to its finally, so no
             # scheduler stall can make it uncounted), or one that returned while its worker still
             # runs (a hung source); a returned read whose worker ended is dropped at once
-            self._one_live = [e for e in self._one_live if not e[1] or e[0].pflight is not None]
-            if sum(1 for e in self._one_live if e[2] == source) >= WRITE_READ_CAP_PER_SOURCE:
-                return Fault(f"{WRITE_READ_CAP_PER_SOURCE} reads of {source[0]} {source[1]!r} are still "
+            live = [e for e in (self._replay_live if replay else self._one_live) if not e[1] or e[0].pflight is not None]
+            if replay:
+                self._replay_live = live
+            else:
+                self._one_live = live
+            if sum(1 for e in live if e[2] == source) >= per_cap:
+                return Fault(f"{per_cap} reads of {source[0]} {source[1]!r} are still "
                              "running (a hung source?); refused")
-            if len(self._one_live) >= WRITE_READ_CAP:
-                return Fault(f"{WRITE_READ_CAP} source reads are still running (a hung source?); refused")
-            self._one_live.append(entry)
+            if len(live) >= total_cap:
+                return Fault(f"{total_cap} source reads are still running (a hung source?); refused")
+            live.append(entry)
         try:
             return self._bounded(timeout_s, st, fn, *args)
         finally:
@@ -3042,7 +3073,10 @@ def check_replay_at(at: Any, now: datetime) -> datetime:
         raise QueryError("at must carry its zone (Z or an offset)")
     if t.second or t.microsecond:
         raise QueryError("at is on a whole minute (replay has minute resolution)")
-    t = t.astimezone(timezone.utc)
+    try:
+        t = t.astimezone(timezone.utc)
+    except OverflowError:               # 0001-01-01T00:00:00+23:59: a valid instant whose UTC form is out of range
+        raise QueryError(f"at is not an ISO-8601 instant: {at!r}") from None
     if t > now or t < now - timedelta(seconds=REPLAY_WINDOW_S):
         raise QueryError(f"at must be inside the last {REPLAY_WINDOW_S // 3600} h (now - {REPLAY_WINDOW_S // 3600} h .. now)")
     return t

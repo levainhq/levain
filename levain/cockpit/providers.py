@@ -237,9 +237,10 @@ def _overnight(v: Any) -> dict[str, Any] | None:
     at = getattr(wraps[0], "wrapped_at", None) if wraps else None
     if not at or isinstance(since, bool) or not isinstance(since, int) or since < 0:
         return None
-    if not _utc_at(at):         # a wrap time that does not parse (or has no zone) is unknown time, not a reason to fault the card
+    utc = _utc_at(at)
+    if not utc:                 # a wrap time that does not parse (or has no zone) is unknown time, not a reason to fault the card
         return None
-    return {"episodes": since, "since": _utc_at(at)}
+    return {"episodes": since, "since": utc}
 
 
 TOP_MAX_BEGIN = 110
@@ -317,7 +318,10 @@ def _utc_at(v: Any) -> str:
         return ""
     if d.tzinfo is None:
         return ""
-    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except OverflowError:       # an instant whose UTC form is out of range is unknown time too
+        return ""
 
 
 @dataclass
