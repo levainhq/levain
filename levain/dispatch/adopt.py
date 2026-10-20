@@ -844,6 +844,9 @@ def _settled(store: JobStore, job: Job, *, landed: str | None = None) -> Landing
     if again is None:
         raise TransitionRefused(f"no dispatch job {job.id}")
     if again.state == "adopted":
+        if landed:      # this land's own CAS moved the branch; another finisher recorded it first
+            return Landing(outcome="adopted", job=again, moved=True,
+                           message=f"moved the branch to {landed}; another land recorded the adoption")
         return Landing(outcome="adopted", job=again, message="another land adopted this job")
     note = (f"; this land had already moved the branch to {landed}: revert it with `git revert` if it is unwanted"
             if landed else "")
@@ -860,7 +863,8 @@ def _move(store: JobStore, job: Job, to: str, cause: str, evidence: str) -> Job 
     try:
         return store._transition(job.id, to, cause, evidence=evidence, expect=job.state)
     except TransitionRefused:
-        if store.get(job.id) is not None and store.get(job.id).state != job.state:      # lost a race
+        now = store.get(job.id)
+        if now is not None and now.state != job.state:      # lost a race
             return None
         raise
 

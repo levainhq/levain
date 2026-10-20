@@ -742,3 +742,17 @@ def test_a_git_that_fails_is_never_read_as_absent(repo, monkeypatch):
         adopt._read_branch(str(path), "main")
     with pytest.raises(adopt.GitFault):
         adopt._object_type(str(path), base)
+
+
+def test_a_finisher_whose_cas_moved_the_branch_says_so_when_another_recorded_it(jstore, cstore, repo, log, keys,
+                                                                                tmp_path, monkeypatch):
+    # L3 r2 codex: A's CAS moves the branch, B records adopted first; A must report moved=True
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    monkeypatch.setattr(adopt, "_after_cas", lambda: adopt._finish(jstore, stale, recs))   # B, inside A's window
+    out = adopt._finish(jstore, stale, recs)
+    assert out.outcome == "adopted" and out.moved and recs[0].staged_commit in out.message
