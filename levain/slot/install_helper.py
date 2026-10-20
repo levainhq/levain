@@ -21,6 +21,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HostOS, Step, _abs, _kill_all
+from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
 from levain.slot.intent import Intent, intent_remove_step, intent_write_step
 from levain.slot.accounts import (Account, Group, account_steps, accounts_of, delete_group_steps,
@@ -46,7 +47,8 @@ def _tool_present(path: str) -> bool:
 def _xcode_ready() -> bool:
     """macOS: ``/usr/bin/python3`` is a shim that runs only once the developer tools are installed."""
     try:
-        return subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True).returncode == 0
+        return subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True,
+                              env=child_env()).returncode == 0
     except OSError:
         return False
 
