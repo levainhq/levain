@@ -6,6 +6,11 @@ it records that repo and branch as where the drop was made from (C0 §3.1: a CLI
 where you typed it); a detached HEAD or no repo records none. Words come from the arguments, or from stdin with ``-``.
 ``levain drops split`` is the coordinator's door: it names the threads a drop becomes; ``levain drops list|show`` read
 them back.
+
+``levain envelope`` (echo, sign, accept, show, list, kill, narrow) and ``levain drop --envelope`` are the operator's own
+door to a thread envelope: what the coordinator may do for a thread, signed by you (y/N on your terminal, or ``--yes``).
+Exit codes follow C1's convention: 0 done, 1 refused or faulted (a store that would not answer, a signer that could
+not run included), the refusal on stderr; a drop whose envelope was refused still keeps its words and exits 1.
 """
 from __future__ import annotations
 
@@ -22,12 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from levain import unshowable
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, _words_sha256,
-                                      check_source)
+from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
+                                      check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
@@ -152,8 +157,10 @@ def _faults() -> tuple[type[BaseException], ...]:
     log or signer that would not answer. Lazy: the dispatch CLI is only loaded when an envelope command runs."""
     from levain.authority import AuthorityError, VerifierUnavailable
     from levain.dispatch import DispatchError
+    from levain.dispatch.cli import SignerUnavailable
 
-    return (*_REFUSED, env.EnvelopeError, DispatchError, AuthorityError, VerifierUnavailable, ValueError)
+    return (*_REFUSED, env.EnvelopeError, DispatchError, AuthorityError, VerifierUnavailable, SignerUnavailable,
+            ValueError)
 
 
 def _tick() -> datetime:
@@ -202,9 +209,10 @@ def _parse_where(specs: list[str]) -> list[dict[str, Any]]:
     out = []
     for spec in specs:
         repo, sep, paths = spec.partition("=")
-        listed = [p for p in paths.split(",") if p] if sep else ["."]
-        if not repo or not listed:
-            raise CoordError(f"--where is REPO or REPO=PATH,PATH (got {spec[:80]!r})")
+        listed = [p for p in paths.split(",") if p]
+        if not sep or not repo or not listed:
+            raise CoordError("--where is REPO=PATH,PATH; the whole repo is REPO=. written out, never left off "
+                             f"(got {spec[:80]!r})")
         out.append({"repo": _real(repo), "paths": listed})
     return out
 
@@ -216,12 +224,30 @@ def _parse_land(spec: str) -> dict[str, Any]:
     return {"repo": _real(repo), "onto": onto, "from": "named", "onto_from": "inferred", "criteria": []}
 
 
-def _store_id(store: EnvelopeStore) -> str:
-    return store.store_id()
-
-
 def _money(cents: int) -> str:
     return f"${cents // 100}.{cents % 100:02d}"
+
+
+# --- plain words: what a person reads before signing -------------------------------------------------------------------
+NOT_IN_FORCE_PLAIN = ("NOT IN FORCE YET: until Levain's separate-user setup is in place, signing this lets nothing run "
+                      "by itself; every land, push and publish still asks you separately.")
+_BOUND = "bound (not in force yet)"
+
+
+def _clock(dt: datetime) -> str:
+    """A moment in the system's local time and in UTC: ``7:42 PM EDT, 23:42 UTC``."""
+    local = dt.astimezone()
+    return f"{local.strftime('%I:%M %p %Z').lstrip('0')}, {dt.astimezone(timezone.utc).strftime('%H:%M')} UTC"
+
+
+def _span(delta: timedelta) -> str:
+    mins = max(int(delta.total_seconds() // 60), 0)
+    return f"{mins // 60}h {mins % 60}m"
+
+
+def _stops(stamp: str, now: datetime) -> str:
+    stop = parse_stamp(stamp)
+    return f"stops in {_span(stop - now)} ({_clock(stop)})" if stop > now else f"stopped {_clock(stop)}"
 
 
 def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) -> str:
@@ -229,32 +255,83 @@ def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) 
     if store is not None:
         try:
             t = store.thread(thread_id)
-            title = f"  {t.kind.upper()} {t.title}"
+            title = f"  {t.kind.upper()} {t.title}  (from the store, not signed)"
         except _REFUSED:
             pass
     return f"    {thread_id} rev {rev if rev is not None else '?'}{title}"
 
 
-def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds: bool = True) -> list[str]:
+def _effect_text(kind: str, e: dict[str, Any]) -> str:
+    if kind == "lands":
+        crit = ", ".join(json.dumps(c, sort_keys=True) for c in e["criteria"])
+        src = "the branch the drop was made from" if e["from"] == "source" else "named"
+        return f"{e['repo']}  onto {e['onto']}  ({src}; {'criteria: ' + crit if crit else 'may land with no conditions'})"
+    if kind == "pushes":
+        return f"{e['repo']}  {e['remote']} {e['url']}  branch {e['branch']}"
+    return f"{e['package']} {e['version']}  to {e['index']}"
+
+
+_EFFECT_HEAD = {"lands": "lands (merges) it may do:", "pushes": "pushes it may do:",
+                "publishes": "publishes it may do:"}
+
+
+def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
+    """The effect lists; against ``old`` (the envelope this supersedes) each line is marked + added, = unchanged,
+    ~ changed (same target, other criteria), and what ``old`` held and this does not is - removed."""
+    L: list[str] = []
+    for kind in env.EFFECT_LISTS:
+        L.append("  " + _EFFECT_HEAD[kind])
+        before = {env.effect_key(kind, e): e for e in old[kind]} if old is not None else {}
+        now_keys = set()
+        for e in body[kind]:
+            key = env.effect_key(kind, e)
+            now_keys.add(key)
+            mark = "" if old is None else "+ added: " if key not in before else \
+                "= unchanged: " if before[key] == e else "~ changed: "
+            L.append(f"    {mark}{_effect_text(kind, e)}")
+        for key, e in before.items():
+            if key not in now_keys:
+                L.append(f"    - removed: {_effect_text(kind, e)}")
+        if not body[kind] and not any(k not in now_keys for k in before):
+            L.append("    none")
+    return L
+
+
+def _wider(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """True when ``new`` grants anything ``old`` did not: a later stop, a bigger budget, a repo or path outside old's, an
+    effect old did not hold, or the same target with other criteria."""
+    if parse_stamp(new["stop_at"]) > parse_stamp(old["stop_at"]):
+        return True
+    if any(new["budget"][k] > old["budget"][k] for k in env.BUDGET_KEYS):
+        return True
+    for w in new["where"]:
+        allowed = tuple(p for o in old["where"] if o["repo"] == w["repo"] for p in o["paths"])
+        if not allowed or any(not env.path_within(p, allowed) for p in w["paths"]):
+            return True
+    for kind in env.EFFECT_LISTS:
+        before = {env.effect_key(kind, e): e for e in old[kind]}
+        if any(before.get(env.effect_key(kind, e)) != e for e in new[kind]):
+            return True
+    return False
+
+
+def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds: bool = True,
+              old: dict[str, Any] | None = None, now: datetime | None = None) -> list[str]:
     """An envelope body as the lines a human signs: where, each effect, the budget, the stop. One function for the
     echo, the sign view, the drop view and show, so what is signed is what was read."""
+    now = now or _tick()
     L = [f"  origin: {body['origin']}", "  where it may work:"]
-    L += [f"    {w['repo']}  paths: {', '.join(w['paths'])}" for w in body["where"]] or ["    nowhere"]
-    L.append("  lands (merges) it may do:")
-    for land in body["lands"]:
-        crit = ", ".join(json.dumps(c, sort_keys=True) for c in land["criteria"]) or "none"
-        L.append(f"    {land['repo']}  onto {land['onto']}  ({'the branch the drop was made from'
-                 if land['from'] == 'source' else 'named'}; criteria: {crit})")
-    if not body["lands"]:
-        L.append("    none")
-    L.append("  pushes it may do:")
-    L += [f"    {p['repo']}  {p['remote']} {p['url']}  branch {p['branch']}" for p in body["pushes"]] or ["    none"]
-    L.append("  publishes it may do:")
-    L += [f"    {p['package']} {p['version']}  to {p['index']}" for p in body["publishes"]] or ["    none"]
+    for w in body["where"]:
+        paths = ", ".join("the WHOLE repo (every file)" if p == "." else p for p in w["paths"])
+        L.append(f"    {w['repo']}  paths: {paths}")
+    if not body["where"]:
+        L.append("    nowhere")
+    L += _effects(body, old)
     b = body["budget"]
-    L.append(f"  budget (a gauge): {b['tool_calls']} tool calls, {b['tokens']} tokens, {_money(b['dollars_cents'])}, "
-             f"{b['hours']} hours")
-    L.append(f"  issued {body['issued_at']}, stops {body['stop_at']}")
+    L.append("  budget (the budget is a gauge: crossing it stops new steps, it is not a hard stop):")
+    L += [f"    tool calls: {b['tool_calls']} allowed", f"    tokens: {b['tokens']} allowed",
+          f"    dollars: {_money(b['dollars_cents'])} allowed", f"    hours: {b['hours']} allowed"]
+    L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {_stops(body['stop_at'], now)}")
     if body["supersedes"] is not None:
         L.append(f"  supersedes {body['supersedes']['envelope_id']}")
     if binds:
@@ -266,9 +343,38 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
     return L
 
 
-def _view(body: dict[str, Any], store: EnvelopeStore | None = None) -> str:
-    return "\n".join([f"envelope {body['envelope_id']}  digest {env.envelope_digest(body)}", *_describe(body, store),
-                      "signing this lets the coordinator do exactly this; nothing outside it."])
+def _old_of(body: dict[str, Any], store: EnvelopeStore | None) -> Any:
+    sup = body["supersedes"]
+    if sup is None or store is None:
+        return None
+    try:
+        return store.envelope(sup["envelope_id"])
+    except _REFUSED:
+        return None
+
+
+def _request_line(body: dict[str, Any], store: EnvelopeStore, words: str | None) -> str:
+    """What the envelope is for: the drop's words, read from the store and held to the hash the body signs."""
+    if words is None:
+        try:
+            drop = store.drop(body["drop_id"])
+        except _REFUSED:
+            return "  for your words: (that drop is not in this store)"
+        if drop.words_sha256 != body["words_sha256"]:
+            raise CoordError(f"drop {drop.drop_id} holds other words than this envelope names; echo it again")
+        words = drop.words
+    return f"  for your words: {_shown(words[:120])}"
+
+
+def _view(body: dict[str, Any], store: EnvelopeStore, *, words: str | None = None) -> str:
+    old = _old_of(body, store)
+    L = [f"envelope {body['envelope_id']}  digest {env.envelope_digest(body)}", NOT_IN_FORCE_PLAIN,
+         _request_line(body, store, words), *_describe(body, store, old=None if old is None else old.body)]
+    if old is not None:
+        L.append(f"WIDER than {old.envelope_id}: that is why it needs your signature"
+                 if _wider(old.body, body) else f"not wider than {old.envelope_id}")
+    L.append("if Levain later acts on it, it may do only this, nothing outside it.")
+    return "\n".join(L)
 
 
 def _read_file(path: Path, high: int, what: str) -> str:
@@ -296,31 +402,62 @@ def _snapshot(args: argparse.Namespace, store: EnvelopeStore) -> Any:
     return _authority_source(store.directory, args.data_root)()
 
 
-def _confirm(args: argparse.Namespace, out: Any, what: str) -> None:
-    """y/N on the operator's terminal (dispatch's own prompt); refused with no terminal unless ``--yes``."""
+def _need_terminal(args: argparse.Namespace, what: str) -> None:
+    from levain.dispatch import cli as dcli
+
+    if not args.yes and not dcli._is_tty():
+        raise CoordError(f"{what} asks y/N on your terminal and this process has none; run it in your own terminal, "
+                         "or pass --yes")
+
+
+def _confirm(args: argparse.Namespace, label: str, prompt: str) -> None:
+    """y/N on the operator's terminal (dispatch's own prompt); refused with no terminal unless ``--yes``. ``prompt``
+    names what is being signed."""
     from levain.dispatch import cli as dcli
 
     if args.yes:
         return
-    if not dcli._is_tty():
-        raise CoordError(f"{what} asks y/N on your terminal and this process has none; run it in your own terminal, "
-                         "or pass --yes")
+    _need_terminal(args, label)
     try:
-        answer = dcli._ask(args, f"{what}? [y/N] ")
+        answer = dcli._ask(args, f"{prompt}? [y/N] ")
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
         raise CoordError("not confirmed; nothing was signed or stored")
 
 
-def _live_lines(store: EnvelopeStore, envelope_id: str, thread_ids: list[str], authority: Any) -> dict[str, str]:
-    """Per bound thread: ``live`` or why not (the chain's, :meth:`EnvelopeStore.chain_live_refusal`)."""
-    out = {}
-    for t in thread_ids:
-        refused = None if authority is None else store.chain_live_refusal(envelope_id, t, authority=authority)
-        out[t] = "live" if authority is not None and refused is None else \
-            refused if refused is not None else "not checked (no authority log named; pass --data-root)"
-    return out
+def _signer_class(authority: Any, fp: str) -> str:
+    key = authority.key(fp)
+    return "not an enrolled key" if key is None else str(key.key_class)
+
+
+def _prompt(body: dict[str, Any], fp: str, klass: str) -> str:
+    return (f"sign {body['envelope_id']} (digest …{env.envelope_digest(body)[-8:]}, {len(body['binds'])} thread(s), "
+            f"{len(body['lands'])} land(s), stops {_clock(parse_stamp(body['stop_at']))}) as {fp} ({klass})")
+
+
+def _live_for(store: EnvelopeStore, envelope_id: str, thread_id: str, authority: Any, unchecked: str = "") -> str:
+    """``live`` or why not for one bound thread (the chain's, :meth:`EnvelopeStore.chain_live_refusal`)."""
+    if authority is None:
+        return unchecked or "not checked (no authority log named; pass --data-root)"
+    refused = store.chain_live_refusal(envelope_id, thread_id, authority=authority)
+    return "live" if refused is None else refused
+
+
+def _label(live: str) -> str:
+    """``live`` is true of the chain and misleading alone: nothing is in force yet."""
+    return _BOUND if live == "live" else live
+
+
+def _write_new(path: Path, text: str, force: bool) -> None:
+    p = path.expanduser()
+    try:
+        with open(p, "w" if force else "x", encoding="utf-8") as f:
+            f.write(text)
+    except FileExistsError:
+        raise CoordError(f"{p} already exists; pass --force to replace it") from None
+    except OSError as exc:
+        raise CoordError(f"cannot write {p}: {exc.strerror or exc}") from None
 
 
 def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
@@ -335,16 +472,13 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
     if not shared:
         raise CoordError("these threads share no drop; one envelope covers threads that hold the same drop")
     drop = store.drop(shared[0])
-    heads = []
-    for t in threads:
-        chain = store.envelopes_of(t.thread_id)
-        heads.append(chain[-1] if chain else None)
+    heads = [store.head(t.thread_id) for t in threads]
     first = heads[0]
     if any((h is None) != (first is None) or (h is not None and h.envelope_id != first.envelope_id) for h in heads):
         raise CoordError("these threads do not share one current envelope; echo them separately")
     where = _parse_where(args.where)
     now = _tick().replace(microsecond=0)
-    body = {"format": env.BODY_FORMAT, "store_id": _store_id(store), "envelope_id": "ev-" + secrets.token_hex(16),
+    body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256} for t in threads],
             "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest},
@@ -352,13 +486,10 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
             "budget": _parse_budget(args.budget), "stop_at": utc_stamp(now + _parse_stop(args.stop)),
             "issued_at": utc_stamp(now)}
     text = canonical(body)
-    env.parse_body(text)          # the shape this reader will sign, checked before a file holds it
-    if args.output is not None:
-        try:
-            args.output.expanduser().write_text(text + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise CoordError(f"cannot write {args.output}: {exc.strerror or exc}") from None
+    store.check_body(text)          # the shape and the disk checks this reader will sign, before a file holds it
     shown = _view(body, store)
+    if args.output is not None:
+        _write_new(args.output, text + "\n", args.force)
     _emit(out, args.json, {"body": body, "digest": env.envelope_digest(body),
                            "file": None if args.output is None else str(args.output)},
           shown + (f"\nbody written to {args.output}; sign it with `levain envelope sign {args.output} "
@@ -366,23 +497,22 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
-def _bound_threads(store: EnvelopeStore, envelope_id: str) -> list[str]:
-    """The threads ``envelope_id`` is bound to."""
-    return store.threads_of_envelope(envelope_id)
-
-
 def _accepted(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, created: bool,
-              authority: Any) -> None:
+              authority: Any, *, yes: bool = False) -> None:
     from levain.coordinator.envelopes import NOT_IN_FORCE
 
-    threads = _bound_threads(store, stored.envelope_id)
-    live = _live_lines(store, stored.envelope_id, threads, authority)
+    threads = store.threads_of_envelope(stored.envelope_id)
+    live = {t: _live_for(store, stored.envelope_id, t, authority) for t in threads}
     state = "accepted" if created else "already accepted (same record, nothing written)"
-    text = [f"envelope {stored.envelope_id} {state}, signed by {stored.signer_fp} ({stored.signer_class})"]
-    text += [f"  {t}: {live[t]}" for t in threads]
+    how = ", signed with --yes (no prompt)" if yes else ""
+    text = [f"envelope {stored.envelope_id} {state}, signed by {stored.signer_fp} ({stored.signer_class}){how}"]
+    text += [f"  {t}: {_label(live[t])}" for t in threads]
     text.append(f"  authority today: {NOT_IN_FORCE}")
     _emit(out, args.json, {"envelope_id": stored.envelope_id, "created": created, "signer_fp": stored.signer_fp,
-                           "live": live, "authority_today": NOT_IN_FORCE}, "\n".join(text))
+                           "live": live, "authority_today": NOT_IN_FORCE, "signed_with_yes": yes}, "\n".join(text))
+
+
+_MIN_LEFT = timedelta(minutes=5)
 
 
 def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
@@ -398,36 +528,48 @@ def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
         # a second signature would be a new signed_at, which the store refuses as another record for this id
         raise CoordError(f"envelope {stored.envelope_id} is already accepted; there is nothing to sign "
                          f"(levain envelope show {stored.envelope_id})")
+    body = store.check_body(text)          # a body the store can only refuse is never shown for signing
+    if parse_stamp(body["stop_at"]) - _tick() < _MIN_LEFT:
+        raise CoordError(f"envelope {body['envelope_id']} has stopped or stops within 5 minutes; echo again")
     print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
-    if not args.yes and not dcli._is_tty():
-        raise CoordError("signing asks y/N on your terminal and this process has none; run it in your own terminal, "
-                         "or pass --yes")
+    _need_terminal(args, "signing")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "envelope sign")
     authority = _snapshot(args, store)
+    _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(authority, signer_fp)))
+    # the clock is read only now: the store refuses a signed_at far from its own, and a slow reader is not a stale one
     payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())
-    _confirm(args, out, "sign this envelope")
     signature = dcli._sign_bytes(sign, env.sign_message(payload))
-    sigfile = args.file.expanduser().with_name(args.file.name + ".sig.json")
-    try:
-        sigfile.write_text(json.dumps({"payload": payload, "signature": signature}, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise CoordError(f"cannot write {sigfile}: {exc.strerror or exc}") from None
     stored, created = store.accept_envelope(text, payload, signature, authority=authority)
-    _accepted(args, out, store, stored, created, authority)
+    sigfile = args.file.expanduser().with_name(args.file.name + ".sig.json")
+    record: dict[str, Any] = {"payload": payload, "signature": signature}
+    if args.yes:
+        record["note"] = "signed with --yes (no prompt)"
+    try:
+        sigfile.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"levain envelope sign: accepted, but cannot write {sigfile}: {exc.strerror or exc}", file=sys.stderr)
+    _accepted(args, out, store, stored, created, authority, yes=args.yes)
     return 0
 
 
 def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
     store = _store(args)
-    text, _body = _body_from_file(args.file)
+    text, body = _body_from_file(args.file)
     raw = _read_file(args.sigfile, env.SIGNATURE_MAX + 4096, "the signature file")
     try:
         sig = json.loads(raw)
     except ValueError:
         raise CoordError("the signature file is not JSON") from None
-    if not isinstance(sig, dict) or set(sig) != {"payload", "signature"}:
+    if not isinstance(sig, dict) or not {"payload", "signature"} <= set(sig) <= {"payload", "signature", "note"}:
         raise CoordError('the signature file is {"payload": ..., "signature": ...}')
     authority = _snapshot(args, store)
+    payload = sig["payload"]
+    fp = payload.get("signer_fp") if isinstance(payload, dict) else None
+    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
+    if isinstance(fp, str):
+        print(f"signed by {fp[:80]} ({_signer_class(authority, fp)})"
+              + (f", {str(sig['note'])[:80]}" if "note" in sig else ""), file=sys.stderr if args.json else out,
+              flush=True)
     stored, created = store.accept_envelope(text, sig["payload"], sig["signature"], authority=authority)
     _accepted(args, out, store, stored, created, authority)
     return 0
@@ -436,18 +578,25 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
 _SPEC_KEYS = {"where", "lands", "pushes", "publishes", "budget", "stop"}
 
 
+def _spec_list(spec: dict[str, Any], key: str) -> list[Any]:
+    value = spec.get(key, [])
+    if not isinstance(value, list):
+        raise CoordError(f"{key} in an envelope spec is a list")
+    return value
+
+
 def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> dict[str, Any]:
     """The structured body a drop carries: the user's SPEC (where, lands, pushes, publishes, budget, stop) plus what the
     CLI picks (drop id, envelope id, the words' hash, the store, the clock)."""
     if not isinstance(spec, dict) or not set(spec) <= _SPEC_KEYS:
         raise CoordError(f"an envelope spec is a JSON object with keys among {sorted(_SPEC_KEYS)}")
     where = []
-    for w in spec.get("where", []):
-        if not isinstance(w, dict) or not isinstance(w.get("repo"), str):
+    for w in _spec_list(spec, "where"):
+        if not isinstance(w, dict) or not isinstance(w.get("repo"), str) or not isinstance(w.get("paths", ["."]), list):
             raise CoordError('each where entry is {"repo": ABSOLUTE_PATH, "paths": [...]}')
         where.append({"repo": _real(w["repo"]), "paths": w.get("paths", ["."])})
     lands = []
-    for land in spec.get("lands", []):
+    for land in _spec_list(spec, "lands"):
         if not isinstance(land, dict):
             raise CoordError("each land is an object")
         frm = land.get("from", "named")
@@ -459,27 +608,34 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
             onto = onto or (source.ref or "").removeprefix("refs/heads/")
         if not isinstance(repo, str) or not isinstance(onto, str):
             raise CoordError("each land names a repo and a branch to land onto")
+        criteria = land.get("criteria", [])
+        if not isinstance(criteria, list):
+            raise CoordError("a land's criteria are a list")
         lands.append({"repo": _real(repo), "onto": onto, "from": frm,
                       "onto_from": land.get("onto_from", "drop" if frm == "source" else "inferred"),
-                      "criteria": land.get("criteria", [])})
+                      "criteria": criteria})
     pushes = [{**p, "repo": _real(p["repo"])} if isinstance(p, dict) and isinstance(p.get("repo"), str) else p
-              for p in spec.get("pushes", [])]
-    budget = {**{k: 0 for k in env.BUDGET_KEYS}, **spec.get("budget", {})} if isinstance(spec.get("budget", {}), dict) \
-        else spec["budget"]
+              for p in _spec_list(spec, "pushes")]
+    publishes = _spec_list(spec, "publishes")
+    given = spec.get("budget", {})
+    if not isinstance(given, dict):
+        raise CoordError("budget in an envelope spec is an object")
+    budget = {**{k: 0 for k in env.BUDGET_KEYS}, **given}
     stop = spec.get("stop", "2h")
     if not isinstance(stop, str):
         raise CoordError('stop is a duration text like "2h"')
     now = _tick().replace(microsecond=0)
-    return {"format": env.BODY_FORMAT, "store_id": _store_id(store), "envelope_id": "ev-" + secrets.token_hex(16),
-            "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": _words_sha256(words),
+    return {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
+            "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": words_sha256(words),
             "binds": [], "supersedes": None, "where": where, "lands": lands, "pushes": pushes,
-            "publishes": spec.get("publishes", []), "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
+            "publishes": publishes, "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
             "issued_at": utc_stamp(now)}
 
 
 def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore, words: str, source: Source) -> int:
     from levain.dispatch import cli as dcli
 
+    check_words(words)          # a drop the store would refuse is never signed for
     try:
         spec = json.loads(_read_file(args.envelope, 64 * 1024, "the envelope spec"))
     except ValueError:
@@ -487,32 +643,43 @@ def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore
     body = _spec_body(spec, words, source, store)
     text = canonical(body)
     env.parse_body(text)
+    print(_view(body, store, words=words), file=sys.stderr if args.json else out, flush=True)
+    _need_terminal(args, "a drop with an envelope")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "a drop with an envelope")
     authority = _snapshot(args, store)
-    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
-    payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())
+    _confirm(args, "a drop with an envelope", _prompt(body, signer_fp, _signer_class(authority, signer_fp)))
+    payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())          # after the answer, not before
     signature = dcli._sign_bytes(sign, env.sign_message(payload))
     drop, created = store.accept_drop(words, surface="cli", outbox_id=args.outbox_id, source=source,
                                       envelope=(text, payload, signature), authority=authority)
     refused = None if drop.envelope_id else (store.envelope_refused(drop.drop_id) or "the envelope was not taken")
-    line = f"envelope: taken ({drop.envelope_id})" if drop.envelope_id else f"envelope: refused: {refused}"
+    how = " (signed with --yes, no prompt)" if args.yes else ""
+    line = f"envelope: taken ({drop.envelope_id}){how}" if drop.envelope_id \
+        else f"envelope: refused: {refused}\nyour words are kept: {drop.drop_id} holds them"
     state = "delivered" if created else "already delivered (resend, nothing written)"
     _emit(out, args.json, {**_drop_row(drop), "created": created,
                            "envelope": {"taken": drop.envelope_id is not None, "envelope_id": drop.envelope_id,
                                         "refused": refused}},
           f"drop receipt: {drop.drop_id} {state} at {drop.received_at}, {_where(drop)}\n{line}")
-    return 0
+    return 0 if drop.envelope_id else 1
 
 
 def run_envelope_show(args: argparse.Namespace, out: Any) -> int:
     store = _store(args)
     stored = store.envelope(args.envelope_id)
-    threads = _bound_threads(store, stored.envelope_id)
+    threads = store.threads_of_envelope(stored.envelope_id)
     if args.thread is not None:
         if args.thread not in threads:
             raise CoordError(f"envelope {stored.envelope_id} is not bound to thread {args.thread[:40]}")
         threads = [args.thread]
     return _show(args, out, store, stored, threads)
+
+
+def _ended(store: EnvelopeStore, thread_id: str, eff: dict[str, Any]) -> str | None:
+    """Why the envelope is over for this thread (an end writes the stop to its issue time), or None."""
+    if eff["stop_at"] != eff["issued_at"]:
+        return None
+    return "its thread is done" if store.thread(thread_id).state in ("done", "closed") else "killed by you"
 
 
 def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, threads: list[str]) -> int:
@@ -521,26 +688,33 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
         authority = _snapshot(args, store)
     except _faults() as exc:
         unchecked = f"not checked ({str(exc)[:160]})"
+    effs = {t: store.effective(stored.envelope_id, t) for t in threads}
+    ends = {t: _ended(store, t, effs[t]) for t in threads}
     head = [f"envelope {stored.envelope_id}  digest {stored.digest}  signed by {stored.signer_fp} "
             f"({stored.signer_class}), accepted {stored.accepted_at}"]
+    if threads and all(ends.values()):
+        head.insert(0, "ENDED (" + "; ".join(dict.fromkeys(str(r) for r in ends.values())) + ")")
     rows, text = [], list(head)
     if not threads:
         text += _describe(stored.body, store)
         text.append("  not bound to any thread yet (a structured envelope binds when its drop is split into one thread)")
         text.append("  authority today: " + store.authority_refusal(stored.envelope_id, ""))
     for t in threads:
-        eff = store.effective(stored.envelope_id, t)
-        live = unchecked
-        if authority is not None:
-            refused = store.chain_live_refusal(stored.envelope_id, t, authority=authority)
-            live = "live" if refused is None else refused
+        eff = effs[t]
+        live = _live_for(store, stored.envelope_id, t, authority, unchecked)
         now = store.authority_refusal(stored.envelope_id, t, authority=authority)
-        text.append(f"thread {t} (as narrowed):")
-        text += _describe(eff, store, binds=False)
-        for k in env.EFFECT_LISTS:
-            text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff[k]]
-        text += [f"  live: {live}", f"  authority today: {now}"]
-        rows.append({"thread_id": t, "effective": eff, "live": live, "authority_today": now})
+        if ends[t]:
+            text.append(f"thread {t}: ENDED ({ends[t]})" if not all(ends.values()) else f"thread {t}:")
+            text.append("  it had allowed:")
+            text += _describe(stored.body, store, binds=False)
+        else:
+            text.append(f"thread {t} (as narrowed):")
+            text += _describe(eff, store, binds=False)
+            for k in env.EFFECT_LISTS:
+                text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff[k]]
+        text += [f"  live: {_label(live)}", f"  authority today: {now}"]
+        rows.append({"thread_id": t, "effective": eff, "live": live, "authority_today": now,
+                     "ended": ends[t]})
     obj = {"envelope_id": stored.envelope_id, "digest": stored.digest, "origin": stored.origin,
            "signer_fp": stored.signer_fp, "accepted_at": stored.accepted_at, "body": stored.body, "threads": rows}
     _emit(out, args.json, obj, "\n".join(text))
@@ -578,17 +752,18 @@ class _Capture:
 def run_envelope_narrow(args: argparse.Namespace, out: Any) -> int:
     store = _store(args)
     if args.envelope_cmd == "kill":
-        kind, value, what = "kill", "", "killed"
+        kind, value, what, done = "kill", "", "ended", "already ended"
     elif args.stop_earlier is not None:
-        kind, value, what = "stop_earlier", args.stop_earlier, f"stop moved earlier to {args.stop_earlier}"
+        kind, value = "stop_earlier", args.stop_earlier
+        what, done = f"narrowed (stop moved earlier to {value})", f"already narrowed (stop already {value} or earlier)"
     else:
-        kind, value, what = "drop_effect", args.drop_effect, f"effect {args.drop_effect} dropped"
+        kind, value = "drop_effect", args.drop_effect
+        what, done = f"narrowed (effect {value} dropped)", f"already narrowed (effect {value} already dropped)"
     wrote = store.attenuate(args.envelope_id, kind, value, thread_id=args.thread, by="operator")
     scope = f" for thread {args.thread}" if args.thread else ""
     _emit(out, args.json, {"envelope_id": args.envelope_id, "kind": kind, "value": value, "thread_id": args.thread,
                            "written": wrote},
-          f"envelope {args.envelope_id}{scope}: {what} (a row was written)" if wrote
-          else f"envelope {args.envelope_id}{scope}: already so; nothing was written")
+          f"envelope {args.envelope_id}{scope}: {what if wrote else done}")
     return 0
 
 
@@ -604,6 +779,7 @@ def run_envelope(args: argparse.Namespace, out: Any = None) -> int:
     except _faults() as exc:
         print(f"levain envelope {args.envelope_cmd}: {exc}", file=sys.stderr)
         return 1
+
 
 
 def _parse_part(spec: str) -> Part:
@@ -741,6 +917,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                         "agent holds).")
     d.add_argument("--data-root", dest="data_root", type=Path, default=None,
                    help="The cockpit data root whose authority log verifies the signature.")
+    d.add_argument("--yes", action="store_true",
+                   help="With --envelope: do not ask y/N; the whole view is still printed.")
     common(d)
     d.set_defaults(func=run_drop)
 
@@ -830,8 +1008,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ee = e_sub.add_parser("echo", help="Write the worded envelope for threads you are about to sign.")
     ee.add_argument("threads", nargs="+", metavar="THREAD")
     ee.add_argument("--where", action="append", default=[], required=True, metavar="REPO[=PATH,PATH]",
-                    help="A repo the work may happen in, with the paths it may touch (default: the whole repo). "
-                         "Repeatable.")
+                    help="A repo the work may happen in, with the paths it may touch; the whole repo is REPO=. "
+                         "written out. Repeatable.")
     ee.add_argument("--land", action="append", default=[], metavar="REPO=ONTO",
                     help="A merge the coordinator may land onto that branch. Repeatable.")
     ee.add_argument("--stop", default="2h", metavar="DURATION", help="When it stops: 2h, 90m, 1h30m (at most 24h).")
@@ -839,6 +1017,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="tool_calls=N,tokens=N,dollars_cents=N,hours=N; any you leave out is 0.")
     ee.add_argument("-o", "--output", type=Path, default=None, metavar="FILE",
                     help="Write the canonical body here (default: print it).")
+    ee.add_argument("--force", action="store_true", help="Replace an existing -o file.")
     ee.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
     ee.add_argument("--json", action="store_true", help="Machine-readable output.")
 
