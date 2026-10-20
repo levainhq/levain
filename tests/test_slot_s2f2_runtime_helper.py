@@ -146,7 +146,7 @@ class World:
         self.seams = H.Seams(
             host=host, store=L, run=self.R, euid=lambda: 0,
             trusted=lambda st: st.st_uid == os.getuid() and not st.st_mode & 0o022,
-            chown=lambda fd, u, g, rel: self.chowns.append((rel, u, g)),
+            chown=lambda fd, u, g, rel: self.chowns.append((rel, u, g)), chowned_uid=lambda uid: os.getuid(),
             free_bytes=lambda fd: self.free, boot_id=lambda: BOOT,
             new_session=lambda: f"s-{next(n):016x}",
             account_uid=self._account, group_gid=lambda g: GROUPS[g], user_gid=lambda uid: OP_GID,

@@ -495,3 +495,107 @@ def test_read_record_refuses_a_fifo_without_blocking(tmp_path):
         t.join(2)
         pytest.fail("read_record blocked on a FIFO")
     assert out == {"refused": "bad-root"}
+
+
+# --- the onboarding pre-seed's dir is the session owner's, not root's (VM X4b: every real render was bad-root) ----------
+
+ME = os.getuid()
+
+
+def _owned_dir(tmp_path: Path, mode: int = 0o700) -> tuple[int, str]:
+    d = tmp_path / "claude"
+    d.mkdir()
+    os.chmod(d, mode)
+    return os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY), "claude"
+
+
+def test_slot_owned_dir_passes_only_for_alloc_owner(tmp_path):
+    """No seam: real dirs this test owns, checked against the uid alloc names."""
+    parent, name = _owned_dir(tmp_path)
+    try:
+        os.close(H.open_slot_owned_dir(parent, name, ME, "claude"))
+        for other in (ME + 1, 0):
+            with pytest.raises(Refused) as e:
+                H.open_slot_owned_dir(parent, name, other, "claude")
+            assert e.value.name == "bad-root"
+        for bad_mode in (0o770, 0o702, 0o720):
+            os.chmod(tmp_path / name, bad_mode)
+            with pytest.raises(Refused) as e:
+                H.open_slot_owned_dir(parent, name, ME, "claude")
+            assert e.value.name == "bad-root"
+        os.chmod(tmp_path / name, 0o700)
+        os.symlink(tmp_path / name, tmp_path / "link")
+        with pytest.raises(Refused) as e:
+            H.open_slot_owned_dir(parent, "link", ME, "link")
+        assert e.value.name == "bad-root"
+    finally:
+        os.close(parent)
+
+
+def test_session_owner_from_alloc(world):
+    import dataclasses
+
+    s = _prepared(world)
+    a = world.alloc(s)
+    assert H.session_owner_uid(a) == a.slot_uid                         # egress: the slot
+    v0 = SlotId("none", 0)
+    v = dataclasses.replace(a, slot=v0, child_uid=892, netns=v0.netns, cgroup=R.cgroup_path(v0, s))
+    assert H.session_owner_uid(v) == 892                                 # verifier: the child, never the driver
+
+
+def _as_owner(world, s: str, uid: int) -> None:
+    """Rewrite alloc so the session's owner is ``uid`` (the dirs on disk are this test's own)."""
+    import dataclasses
+
+    a = world.alloc(s)
+    (world.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(dataclasses.replace(a, slot_uid=uid, slot_gid=uid)))
+
+
+def _root_check_refusing_owner_dirs(world, s: str):
+    """The trusted seam as production's ``_root_trusted`` answers on this store: every dir root made passes (the test
+    uid stands for root), and the session owner's vendor dirs FAIL, as they do for real (owned by the slot)."""
+    owned = {os.stat(world.L / "live" / s / rel).st_ino for rel in H.SLOT_OWNED_RENDER_DIRS}
+    world.seams.chowned_uid = lambda uid: uid                           # the REAL owner check: alloc's uid as is
+    return lambda st: st.st_uid == ME and not st.st_mode & 0o022 and st.st_ino not in owned
+
+
+def test_render_preseed_under_the_root_check(world):
+    """X4b: render through a trusted check that refuses the owner's dirs, as the real one does."""
+    s = _prepared(world)
+    _as_owner(world, s, ME)
+    world.seams.trusted = _root_check_refusing_owner_dirs(world, s)
+    assert world.main(["render", s], _blob())[1] == {"ok": True}, world.last_err
+    assert (world.L / "live" / s / "config" / "claude" / ".claude.json").exists()
+    assert world.chown_of(f"live/{s}/config/claude/.claude.json") == (ME, ME)
+
+
+def test_render_preseed_refused_when_alloc_names_another_owner(world):
+    s = _prepared(world)                                                 # alloc names _levain_s0 (899), the dir is ours
+    world.seams.trusted = _root_check_refusing_owner_dirs(world, s)
+    line = world.main(["render", s], _blob())[1]
+    assert line == {"ok": False, "refused": "bad-root"}
+    assert "config/claude" in world.last_err
+    assert not (world.L / "live" / s / "config" / "claude" / ".claude.json").exists()
+
+
+def test_render_step3_files_with_the_root_check(world):
+    """render_step3_files run directly, the trusted seam left as the root check (not the permissive test one)."""
+    s = _prepared(world)
+    _as_owner(world, s, ME)
+    world.seams.trusted = _root_check_refusing_owner_dirs(world, s)
+    store = H.Store(world.seams)
+    try:
+        ctx = H.Ctx(world.seams, store, OP_UID, "operator", OP_UID, {})
+        run = H.RenderRun(ctx, world.alloc(s), canon_blob())
+        H.render_step2_policy(run)
+        H.render_step3_files(run)
+    finally:
+        store.close()
+    assert (world.L / "live" / s / "config" / "claude" / ".claude.json").read_bytes()
+    assert (world.L / "live" / s / "root" / "settings.json").exists()
+
+
+def canon_blob():
+    from levain.slot.runtime_grammar import parse_stdin
+
+    return parse_stdin("render", _blob())

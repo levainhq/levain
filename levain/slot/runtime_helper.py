@@ -338,6 +338,9 @@ class Seams:
     euid: Callable[[], int] = os.geteuid
     trusted: Callable[[os.stat_result], bool] = _root_trusted
     chown: Callable[[int, int, int, str], None] = _fchown
+    #: the owner a dir chowned to ``uid`` carries on disk: ``uid`` itself (a test whose ``chown`` only records maps
+    #: every uid to its own, since nothing was chowned).
+    chowned_uid: Callable[[int], int] = lambda uid: uid
     fsync: Callable[[int], None] = os.fsync
     free_bytes: Callable[[int], int] = _free_bytes
     clock: Callable[[], float] = time.time
@@ -1195,6 +1198,39 @@ def render_layer_rows(slot: SlotId, owner_gid: int) -> List[DirRow]:
     return [DirRow("in", 0, owner_gid, 0o750), DirRow("root", *layer), DirRow("root/hooks", *layer)]
 
 
+#: The §2.1 dirs ``prepare`` makes owned by the SESSION OWNER (egress: the slot; verifier: the child) that ``render``
+#: writes into: the onboarding pre-seed's. Every other render destination is root's and passes ``seams.trusted``.
+SLOT_OWNED_RENDER_DIRS = frozenset({"config/claude", "config/codex"})
+
+
+def session_owner_uid(a: R.Alloc) -> int:
+    """The uid that owns the session's vendor dirs (§2.1), from alloc: egress the slot uid, verifier the child uid."""
+    owner = a.slot_uid if a.slot.slot_class == "egress" else a.child_uid
+    if type(owner) is not int or owner <= 0:
+        raise Refused("bad-root", f"alloc {a.session} names no session owner")
+    return owner
+
+
+def slot_owned_dir_ok(st: os.stat_result, owner_uid: int) -> bool:
+    """A dir root may create a file in although the session owns it: a directory owned by EXACTLY ``owner_uid`` (this
+    session's, from alloc; never any other slot account, never root's check) and neither group- nor other-writable."""
+    return stat.S_ISDIR(st.st_mode) and owner_uid > 0 and st.st_uid == owner_uid and not st.st_mode & 0o022
+
+
+def open_slot_owned_dir(parent: int, name: str, owner_uid: int, where: str) -> int:
+    """``name`` below the root-owned ``parent`` dirfd, ``O_NOFOLLOW|O_DIRECTORY``, its owner and mode checked on the
+    opened fd (:func:`slot_owned_dir_ok`), else ``bad-root``. The owner cannot swap it after the check: its parent is
+    root's and not writable by it (§2.1 ``config/`` root : the owner's group 0750)."""
+    fd = _openat_dir(parent, name, where)
+    try:
+        if not slot_owned_dir_ok(os.fstat(fd), owner_uid):
+            raise Refused("bad-root", f"{where} is not this session's owner's alone")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def render_step3_files(run: RenderRun) -> None:
     """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``);
     then ``<S>/root/*`` and the onboarding pre-seed from ``render.render``, each a fresh file with its §2.1 row;
@@ -1214,11 +1250,27 @@ def render_step3_files(run: RenderRun) -> None:
         ST.stage_bundle(staging, dest, staging_uid=a.staging_uid, staging_gid=seams.user_gid(a.staging_uid),
                         dest_gid=facts.slot_gid, run_as=seams.stage_run_as, fsync=seams.fsync,
                         chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+    owner = session_owner_uid(a)
     for f in rendered.files:
         *parent, name = f.path.split("/")
-        with ctx.store.dir(*S, *parent) as pfd:
-            ctx.store.create_file(pfd, name, FileRow(f"live/{a.session}/{f.path}", f.data, f.uid, f.gid, f.mode))
+        row = FileRow(f"live/{a.session}/{f.path}", f.data, f.uid, f.gid, f.mode)
+        if "/".join(parent) not in SLOT_OWNED_RENDER_DIRS:
+            with ctx.store.dir(*S, *parent) as pfd:
+                ctx.store.create_file(pfd, name, row)
+                seams.fsync(pfd)
+            continue
+        # The pre-seed: its dir is the session owner's (root's trusted check refuses it), so it is opened from its
+        # root-owned parent and checked against alloc's owner; the file is created O_EXCL there and chowned to it.
+        if f.uid != owner:
+            raise Refused("bad-root", f"{row.rel} is rendered for uid {f.uid}, the session owner is {owner}")
+        *up, last = parent
+        with ctx.store.dir(*S, *up) as gfd:
+            pfd = open_slot_owned_dir(gfd, last, seams.chowned_uid(owner), f"live/{a.session}/{'/'.join(parent)}")
+        try:
+            ctx.store.create_file(pfd, name, row)
             seams.fsync(pfd)
+        finally:
+            os.close(pfd)
     # DECISION: only the names this render staged are removed (the verifier's driver_input.json is session 2f's to
     # stage, so it is never removed here unstaged); the dir itself is END's ("staging deleted").
     with ctx.store.dir("staging", a.session, trusted=False) as staging:
@@ -1503,10 +1555,11 @@ def _read_stdin() -> bytes:
 
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
-           "RenderRun", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "create_alloc",
-           "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "parse_slot_state_of", "pick_slot",
-           "prepare", "proc_identity", "read_view", "render", "render_layer_rows", "resume", "revert_lease", "run",
-           "session_dir_rows", "session_lock", "session_lock_name", "spawn_front", "spawn_target", "status",
+           "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots",
+           "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
+           "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
+           "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
+           "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
            "stub_front_args", "wait_child"]
 
 
