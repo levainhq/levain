@@ -18,15 +18,17 @@ CONTROL checks, never as a fact root acts on.
    existence), ``not-rendered`` when it is not RENDERED; else root makes ``<S>/repo`` empty (a dir a failed or
    interrupted clone left is removed first), slot-owned, 0700 (the slot cannot create it in a root-owned ``<S>``).
 5. ``clone``: ``git clone`` from ``<S>/in/repo.bundle`` AS THE SLOT through wall's clone target (the same path as
-   the vendor); a non-zero exit = ``clone-failed``, state unchanged and ``<S>/repo`` emptied again, so the start can
-   be retried. Success = end's ``mark_cloned``.
+   the vendor); a non-zero exit = ``clone-failed``, state unchanged, the session's kill domain killed and then
+   ``<S>/repo`` emptied again, so the start can be retried. Success = end's ``mark_cloned``.
 6. ``forwarder`` (Linux egress): the slot's TCP -> ``gw.sock`` relay in the netns, detached (§9.1); the helper
    waits (bounded) for its ready byte, written after bind + listen, and refuses ``forwarder-not-ready`` without it.
 7. ``secrets``: ``SECRETS`` from CONTROL (refused ``not-rendered`` unless RENDERED); the handles go ONLY into the
    vendor's extra env, under render's names (§3.2).
 8. ``exec``: the vendor forked through the wall with fds 0, 1, 2 (sudo's pty) and the exec pipe; the exec happened
-   only on the POSITIVE marker ``+`` (wall's last hop writes it just before the vendor's execve) with no ``!``
-   after it. EOF, ``!`` or no byte in the bound = ``exec-failed``, never ACTIVE.
+   only on the POSITIVE marker ``+`` (wall's last hop writes it just before the vendor's execve) followed by EOF
+   (the pipe is close-on-exec in that hop, so it closes AT the exec). EOF first, ``!`` anywhere, or no ``+``-then-EOF
+   within the bound = ``exec-failed``, never ACTIVE. Known edge: a last hop killed after ``+`` and before its execve
+   also reads as the exec; the vendor's exit is then observed at once.
 9. ``active``: CAS RENDERED -> ACTIVE; then the helper stays the vendor's parent until it exits: ``{ok, exit}``.
    A vendor that exec'd but is not recorded ACTIVE is killed with its whole domain (Linux: the session cgroup;
    macOS: every process of the slot uid), then reaped.
@@ -37,14 +39,14 @@ the pool lock). ``{ok, state}``.
 """
 from __future__ import annotations
 
+import errno
 import os
 import select
-import shutil
-import stat
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from levain.slot import Refused, wall
 from levain.slot import end as E
@@ -57,15 +59,10 @@ from levain.slot.runtime_grammar import RenderBlob, RuntimeRequest
 _SECRET_CAP = 512                 # DECISION: a handle is opaque printable ASCII up to this many bytes
 _SECRET_KEY = {RD.QUEUE_CAP_ENV: "queue_cap"}   # every other secret env name carries the session token
 
-#: DECISION: the bound on the vendor's first marker byte (macOS: asuser + the stage + sandbox-exec + the
-#: trampoline, two interpreter starts; Linux: nsenter + bwrap + the stage). Past it the start failed and the
+#: DECISION: the bound on the vendor's exec, ``+`` and then the pipe's EOF (macOS: asuser + the stage + sandbox-exec +
+#: the trampoline, two interpreter starts; Linux: nsenter + bwrap + the stage). Past it the start failed and the
 #: domain is killed, in case the vendor would still exec.
 EXEC_MARKER_S = 60.0
-#: DECISION: after ``+``, how long the helper looks for a ``!`` (the vendor's execve failed after the marker)
-#: before it takes the exec as done. An execve fails synchronously, right after the marker; on Linux bwrap's
-#: monitor keeps the pipe open for the vendor's life, so no EOF ever ends this wait early there. A ``!`` later
-#: than this is the residue: ACTIVE is recorded, and the vendor's exit status (wall.STAGE_EXIT) says it never ran.
-EXEC_GRACE_S = 0.25
 #: DECISION: the bound on the forwarder's ready byte (one interpreter start, a bind and a listen, in the netns).
 FORWARDER_READY_S = 10.0
 
@@ -182,17 +179,18 @@ def _readable(fd: int, bound_s: float) -> bool:
     return bool(select.select([fd], [], [], max(bound_s, 0.0))[0])
 
 
-def await_exec(fd: int, *, first_s: float, grace_s: float) -> str:
-    """The exec-marker pipe's answer: ``"exec"`` (``+``, then within ``grace_s`` either nothing or EOF),
-    ``"failed"`` (EOF or ``!`` first, or ``+`` followed by any byte: fail closed) or ``"timeout"`` (no byte in
-    ``first_s``). Reads byte by byte, never to EOF (which on Linux comes only when the vendor exits)."""
-    if not _readable(fd, first_s):
+def await_exec(fd: int, *, bound_s: float, clock: Callable[[], float] = time.monotonic) -> str:
+    """The exec-marker pipe's answer, all within ONE bound: ``"exec"`` (``+``, then EOF: the last hop's copy is
+    close-on-exec, so the pipe closes at the vendor's execve), ``"failed"`` (EOF or ``!`` first, or ``+`` followed by
+    any byte: fail closed) or ``"timeout"`` (no ``+``-then-EOF in ``bound_s``: never taken as an exec)."""
+    end = clock() + bound_s
+    if not _readable(fd, end - clock()):
         return "timeout"
     if os.read(fd, 1) != wall.EXEC_OK:
         return "failed"
-    if _readable(fd, grace_s) and os.read(fd, 1):
-        return "failed"
-    return "exec"
+    if not _readable(fd, end - clock()):
+        return "timeout"
+    return "exec" if os.read(fd, 1) == b"" else "failed"
 
 
 def kill_domain(ctx: H.Ctx, a: R.Alloc) -> bool:
@@ -209,30 +207,75 @@ def _abandon(ctx: H.Ctx, a: R.Alloc, pid: int, what: str) -> None:
     """A launch the start will not keep: its domain killed, then its pid reaped (``seams.kill``: SIGKILL + waitpid).
     A failure here is noted, never raised over the refusal the caller is about to raise."""
     try:
-        if not kill_domain(ctx, a):
-            _note(f"{a.session}: {what}: the kill domain was not proven empty within V12")
-    except Exception as e:   # noqa: BLE001 - the caller's refusal is the answer
-        _note(f"{a.session}: {what}: kill domain failed: {type(e).__name__}")
+        _kill_quiet(ctx, a, what)
     finally:
         ctx.seams.kill(pid)
 
 
+_O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+#: A non-directory unlink on a name that is a directory: Linux says EISDIR, macOS EPERM.
+_UNLINK_DIR = frozenset({errno.EISDIR, errno.EPERM})
+
+
+def remove_tree_at(parent: int, name: str) -> None:
+    """``name`` below the dirfd ``parent`` removed whole, every act relative to an fd and none following a link: a
+    directory is opened ``O_DIRECTORY|O_NOFOLLOW`` and emptied through its own fd, anything else is unlinked (an
+    open that meets a link fails, and the link itself is unlinked). A name that changes kind under the walk is
+    taken as what it is now; a directory is never handed to ``unlink``. Root's 3.9 has no
+    ``shutil.rmtree(dir_fd=)`` (3.11+), so this is the fd-relative remover, 3.9's calls only."""
+    try:
+        fd = os.open(name, _O_DIR, dir_fd=parent)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        if e.errno not in (errno.ELOOP, errno.ENOTDIR):
+            raise
+        try:
+            os.unlink(name, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        return
+    try:
+        with os.scandir(fd) as it:
+            entries = [(ent.name, ent.is_dir(follow_symlinks=False)) for ent in it]
+        for n, is_dir in entries:
+            if is_dir:
+                remove_tree_at(fd, n)
+                continue
+            try:
+                os.unlink(n, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                if e.errno not in _UNLINK_DIR:
+                    raise
+                remove_tree_at(fd, n)        # it became a directory (or EPERM on a file: the open says ENOTDIR)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent)
+
+
 def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
     """``<S>/repo`` empty, slot-owned, 0700: whatever a failed or interrupted clone left there is removed first, by
-    dirfd and never following a link (``<S>`` is root's: the slot can fill ``repo`` but never replace it)."""
+    dirfd and never following a link (:func:`remove_tree_at`; ``<S>`` is root's: the slot can fill ``repo`` but
+    never replace it)."""
     try:
-        st = os.stat("repo", dir_fd=sfd, follow_symlinks=False)
+        os.stat("repo", dir_fd=sfd, follow_symlinks=False)
     except FileNotFoundError:
-        st = None
-    if st is not None:
-        if not stat.S_ISDIR(st.st_mode):
-            os.unlink("repo", dir_fd=sfd)
-        elif not shutil.rmtree.avoids_symlink_attacks:
-            raise Refused("repo-not-empty", "this host's rmtree is not fd-based")
-        else:
-            shutil.rmtree("repo", dir_fd=sfd)
+        pass
+    else:
+        remove_tree_at(sfd, "repo")
     ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, 0o700, f"live/{a.session}/repo")
     ctx.seams.fsync(sfd)
+
+
+def _kill_quiet(ctx: H.Ctx, a: R.Alloc, what: str) -> None:
+    """:func:`kill_domain` before a cleanup; a failure is noted, never raised over the caller's refusal."""
+    try:
+        if not kill_domain(ctx, a):
+            _note(f"{a.session}: {what}: the kill domain was not proven empty within V12")
+    except Exception as e:   # noqa: BLE001 - the caller's refusal is the answer
+        _note(f"{a.session}: {what}: kill domain failed: {type(e).__name__}")
 
 
 # --- start (§5.1) ------------------------------------------------------------------------------------------------------
@@ -273,6 +316,7 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.make_cgroup(cgroup)
     code = seams.wait(seams.spawn(argv, spec.to_json(), cgroup, None, False))
     if code != 0:
+        _kill_quiet(ctx, a, "clone-failed")   # macOS: a stray slot-uid process could still write into repo
         with ctx.store.dir("live", a.session) as sfd:
             _fresh_repo(ctx, a, sfd)          # emptied, so the start can be retried
         raise Refused("clone-failed", f"exit {code}")
@@ -283,12 +327,17 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         spec = _spec(ctx, a, "forwarder")
         argv, cgroup = launch(ctx, a, spec)
         ready_r, ready_w = os.pipe()
+        fpid: Optional[int] = None
         try:
             try:
                 fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
             finally:
                 os.close(ready_w)
             ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
+        except BaseException:
+            if fpid is not None:
+                _abandon(ctx, a, fpid, "forwarder-not-ready")      # spawned, then the ready read failed
+            raise
         finally:
             os.close(ready_r)
         if not ready:
@@ -308,12 +357,12 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
             pid = seams.spawn(argv, spec.to_json(), cgroup, exec_w, False)
         finally:
             os.close(exec_w)
-        got = await_exec(exec_r, first_s=EXEC_MARKER_S, grace_s=EXEC_GRACE_S)
+        got = await_exec(exec_r, bound_s=EXEC_MARKER_S)
     finally:
         os.close(exec_r)
     if got == "timeout":
         _abandon(ctx, a, pid, "exec-failed")
-        raise Refused("exec-failed", f"no exec marker within {EXEC_MARKER_S:g}s")
+        raise Refused("exec-failed", f"no exec within {EXEC_MARKER_S:g}s")
     if got != "exec":
         code = seams.wait(pid)
         raise Refused("exec-failed", f"exit {code}")
@@ -460,6 +509,6 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return {"state": R.RETAINED}
 
 
-__all__ = ["EXEC_GRACE_S", "EXEC_MARKER_S", "FORWARDER_READY_S", "await_exec", "check_discovery",
-           "discovery_listings", "end_facts", "end_seams", "kill_domain", "launch", "read_record", "revoke",
-           "scrub_and_release", "secret_env", "start", "teardown", "vendor_argv"]
+__all__ = ["EXEC_MARKER_S", "FORWARDER_READY_S", "await_exec", "check_discovery", "discovery_listings", "end_facts",
+           "end_seams", "kill_domain", "launch", "read_record", "remove_tree_at", "revoke", "scrub_and_release",
+           "secret_env", "start", "teardown", "vendor_argv"]

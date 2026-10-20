@@ -741,7 +741,7 @@ def test_control_restart_ends_sessions_retained(env):
     rec4 = env.record(S4)
     assert rec4.state == "RETAINED" and rec4.lease_live is False
     assert rec4.generation == before[S4].generation + 1            # its stale lease_live corrected only
-    assert sorted(c[1] for c in env.seams.calls if c[0] == "drop") == [S1, S2, S3]
+    assert sorted(c[1] for c in env.seams.calls if c[0] == "drop") == [S1, S2, S3, S4]   # S4: past live, owed again
     root = env.client("root")
     assert root.ask("SECRETS", session=S2)["refused"] == "lease-dead"
     assert env.control.handles(S2) is None

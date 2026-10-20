@@ -59,9 +59,14 @@ DRIVER_WRITABLE = ("driver",)
 
 #: §5.3 + §24: the kinds for which an egress session gets its own loopback alias on macOS.
 LOOPBACK_KINDS = frozenset({"interactive", "login"})
-#: The env var each brokered vendor reads its session token from (§3.2: CC ``ANTHROPIC_API_KEY``; Codex the
-#: ``env_key`` of its rendered provider block). The token is never rendered: ``start`` adds it at exec (§3.2).
-TOKEN_ENV = {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY"}
+#: The env var each brokered vendor reads its session token from (§3.2; Codex the ``env_key`` of its rendered
+#: provider block). The token is never rendered: ``start`` adds it at exec (§3.2). Claude Code's is
+#: ``ANTHROPIC_AUTH_TOKEN`` (head ruling 1020+28, N1: CC sends it as ``Authorization: Bearer``, the header the 3b
+#: front reads, MB10), never ``ANTHROPIC_API_KEY``: on that one CC 2.1.303 stops at a "use this API key?" prompt
+#: before its input box (runs/s2-linux-rerun/N1_EXPERIMENT.md, both VMs).
+TOKEN_ENV = {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}
+#: The names that must be ABSENT from a vendor session's env, rendered or added at exec (:func:`check_env_absent`).
+ABSENT_ENV: Mapping[str, frozenset] = {"claude": frozenset({"ANTHROPIC_API_KEY"}), "codex": frozenset()}
 QUEUE_CAP_ENV = "LEVAIN_QUEUE_CAP"         # §3.2, added at exec like the token
 QUEUE_SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"   # §3.2, not a secret: rendered
 #: DECISION: the provider id Codex's brokered block is filed under (runs/macos-RB 1e measured the shape as "lv").
@@ -305,7 +310,23 @@ def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, s
     return env
 
 
+def check_env_absent(vendor: str, names: Iterable[str]) -> None:
+    """Refused ``env-forbidden`` when ``names`` holds one of :data:`ABSENT_ENV`'s for ``vendor``, so no later edit
+    can put ``ANTHROPIC_API_KEY`` (and its blocking prompt) back in a Claude Code session."""
+    bad = sorted(set(names) & ABSENT_ENV.get(vendor, frozenset()))
+    if bad:
+        raise Refused("env-forbidden", ",".join(bad))
+
+
 def render_env(blob: RenderBlob, facts: RenderFacts) -> dict[str, dict[str, str]]:
+    """§3.4 per role (:func:`_render_env`), each env checked against :data:`ABSENT_ENV`."""
+    envs = _render_env(blob, facts)
+    for env in envs.values():
+        check_env_absent(facts.vendor, env)
+    return envs
+
+
+def _render_env(blob: RenderBlob, facts: RenderFacts) -> dict[str, dict[str, str]]:
     """§3.4 exactly, per role. Egress: one env, ``slot``. Verifier: ``child`` (``HOME=<S>``, user ``_levain_c<n>``)
     and ``driver`` (``HOME=<S>/driver``, user ``_levain_v<n>``).
 
@@ -347,6 +368,7 @@ def secret_env_names(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
         out.append(TOKEN_ENV[facts.vendor])
     if "levain_queue" in blob.hooks:
         out.append(QUEUE_CAP_ENV)
+    check_env_absent(facts.vendor, out)
     return tuple(out)
 
 
@@ -772,6 +794,7 @@ def parse_driver_input(raw: bytes) -> object:
 __all__ = [
     "VENDOR_PREFIX", "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
+    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "render_profile", "render", "render_from_stdin", "expected_effective_cc",
     "expected_effective_codex", "readback_refusals", "refuse_readback", "repo_loosening_refusals",
