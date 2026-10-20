@@ -115,3 +115,23 @@ def test_a_dispatch_task_is_labelled_by_its_contracts_goal(tmp_path, monkeypatch
     assert ts[f"dispatch:{job.id}"]["label"] == "Round the money totals to cents"
     assert "nothing else" not in json.dumps(v)
     assert len(ts[f"dispatch:{other.id}"]["label"]) == 48
+
+
+def test_a_consent_cwd_under_the_servers_home_is_shortened_with_the_full_path_kept(tmp_path, monkeypatch):
+    from levain.consent.listing import home_relative
+
+    monkeypatch.setenv("HOME", str(tmp_path / "me"))
+    home = str(tmp_path / "me")
+    assert home_relative(f"{home}/ledgerline") == "~/ledgerline"
+    assert home_relative(f"{home}/a/b") == "~/a/b" and home_relative(home) == "~"
+    assert home_relative(f"{home}x/other") == f"{home}x/other"       # a sibling that shares the prefix is not under it
+    assert home_relative("/srv/app") == "/srv/app"
+
+
+def test_the_consent_body_carries_both_forms(tmp_path, monkeypatch):
+    from levain.consent.listing import entry_body, read_listing
+
+    monkeypatch.setenv("HOME", str(tmp_path))                # the rig's work dirs sit under the server's home
+    _ck, _root, _src, cdir, work = _rig(tmp_path, monkeypatch)
+    body = entry_body(read_listing(cdir, now=datetime.now(timezone.utc)).pending[0])
+    assert body["cwd"] == str(work / "wait") and body["cwd_short"] == "~/work/wait"

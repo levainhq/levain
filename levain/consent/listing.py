@@ -157,6 +157,20 @@ def find_entry(listing: ConsentListing, request_id: str) -> ConsentEntry | None:
     return None
 
 
+def home_relative(cwd: str) -> str:
+    """``cwd`` as ``~/...`` when it is the server user's home or under it, else unchanged: the home is the server's
+    (``Path.home()``), never the browser's."""
+    try:
+        home = str(Path.home()).rstrip("/\\")
+    except (RuntimeError, OSError):
+        return cwd
+    if not home or home == "/":
+        return cwd
+    if cwd == home:
+        return "~"
+    return "~" + cwd[len(home):] if cwd.startswith(home + os.sep) else cwd
+
+
 def entry_body(entry: ConsentEntry) -> dict[str, Any]:
     """What the page shows of one request beyond its panel row: the request as filed, where, what it names, how
     to answer it from a terminal, and, once decided, how it was. Served only to a caller holding a surface token
@@ -174,7 +188,8 @@ def entry_body(entry: ConsentEntry) -> dict[str, Any]:
         hints = []
     return {"id": r.id, "agent": visible(r.agent), "tool": visible(r.tool_name), "tier": r.tier, "state": entry.state,
             # agent-controlled text: invisible format characters show as markers (a bidi override must not reorder it)
-            "display": visible(r.display), "cwd": visible(r.cwd), "targets": visible(consent_targets(r)),
+            "display": visible(r.display), "cwd": visible(r.cwd), "cwd_short": visible(home_relative(r.cwd)),
+            "targets": visible(consent_targets(r)),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
             "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>" if answerable else None,
             "note": TOO_LONG if pending and not answerable else "",

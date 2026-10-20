@@ -4103,7 +4103,10 @@
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("pre", "consent-display", sv(b.display))];
     const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "in " + sv(b.cwd) + " \u00b7 targets " + sv(b.targets)));
+    // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
+    const where = el("span", "ext-meta", "in " + (sv(b.cwd_short) || sv(b.cwd)) + " \u00b7 targets " + sv(b.targets));
+    if (sv(b.cwd)) where.title = sv(b.cwd);
+    facts.appendChild(where);
     parts.push(facts);
     const hintBox = consentHintBox(b);
     if (hintBox) parts.push(hintBox);
