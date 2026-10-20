@@ -70,6 +70,15 @@ def _no_live_seatbelt_profile_unless_opted_in():
 
 
 @pytest.fixture(autouse=True)
+def _no_operator_git_config_reads(monkeypatch):
+    """TEST ONLY: ``build_policy`` asks git which files the operator's global config makes it read, which in a
+    test would be the real config of whoever runs the suite. Every test gets "no git"; a test of that derivation
+    sets its own runner."""
+    from levain.firing import confinement
+    monkeypatch.setattr(confinement, "_run_git_config", lambda args, environ: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_input_idle_source(monkeypatch):
     """The consent hook reads this Mac's real input idle (`levain.consent.auto_away.input_idle_seconds`), so a
     suite run while nobody touches the machine would hold requests no test meant to hold. Every in-process test

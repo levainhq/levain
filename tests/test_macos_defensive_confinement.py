@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -15,6 +16,9 @@ import pytest
 from levain.firing import confinement as conf
 from levain.firing import seatbelt_guard
 from levain.firing import ssh_agent
+
+# Taken at import, before the autouse fixture replaces it with "no git" for every test.
+_REAL_RUN_GIT_CONFIG = conf._run_git_config
 
 
 def _policy(tmp_path: Path, monkeypatch) -> conf.CrownJewelsPolicy:
@@ -93,6 +97,280 @@ def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monke
         assert f'(subpath "{path}")' in text
     for path in policy.persistence_agent_pins:
         assert f'(literal "{path}")' in text
+
+
+def _clear_git_env(monkeypatch) -> None:
+    for var in ("XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_xdg_config_home_git_subtree_is_write_denied(tmp_path, monkeypatch) -> None:
+    # git reads $XDG_CONFIG_HOME/git/{config,attributes}, and a filter driver either names runs
+    # during the cockpit's status reads.
+    _clear_git_env(monkeypatch)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for git_dir in (xdg / "git", Path(os.path.realpath(xdg)) / "git"):
+        assert git_dir in policy.persistence_write_subtrees
+        assert f'(subpath "{git_dir}")' in text
+        for name in ("config", "attributes"):
+            assert conf.crown_jewel_reason(policy, git_dir / name) is not None
+
+
+def test_git_config_global_file_is_write_denied(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    cfg = tmp_path / "elsewhere" / "gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for spelling in (cfg, Path(os.path.realpath(cfg))):
+        assert spelling in policy.persistence_write_files
+        assert f'(literal "{spelling}")' in text
+        assert conf.crown_jewel_reason(policy, spelling) is not None
+
+
+def _rebuild(tmp_path: Path) -> conf.CrownJewelsPolicy:
+    return conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
+                             deny_standard_creds=False)
+
+
+def test_git_config_global_dev_null_exactly_adds_nothing(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    baseline = _policy(tmp_path, monkeypatch)
+    for value in ("/dev/null", "/dev/./null"):
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", value)
+        assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+
+
+@pytest.mark.parametrize("value", ["/dev/shm/agent_gitcfg", "/dev/../tmp/levain-b2/operator.gitconfig"])
+def test_git_config_global_elsewhere_under_dev_is_protected(tmp_path, monkeypatch, value) -> None:
+    # git reads the real file: /dev/shm is a writable tmpfs on Linux, and /dev/.. is not /dev.
+    _clear_git_env(monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", value)
+    policy = _policy(tmp_path, monkeypatch)
+    assert Path(value) in policy.persistence_write_files
+    assert conf.crown_jewel_reason(policy, Path(os.path.realpath(value))) is not None
+
+
+@pytest.mark.parametrize("var,value", [("GIT_CONFIG_GLOBAL", "relative/gitconfig"),
+                                       ("XDG_CONFIG_HOME", "relative/xdg")])
+def test_a_relative_git_config_location_refuses_the_floor(tmp_path, monkeypatch, var, value) -> None:
+    # git resolves it against its own working directory, which for the cockpit is the workspace.
+    _clear_git_env(monkeypatch)
+    monkeypatch.setenv(var, value)
+    with pytest.raises(conf.ConfinementError, match=rf"\${var} is the relative path.*fail-closed"):
+        _policy(tmp_path, monkeypatch)
+
+
+def test_files_git_reports_reading_are_write_denied(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    home = tmp_path / "home"
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    seen: list[dict] = []
+
+    def fake_git(args, environ):
+        seen.append(dict(environ))
+        if "--list" in args:
+            return f"file:{home / '.gitconfig'}\0include.path\0file:{cfg / 'inc.cfg'}\0x.y\0command line:\0a.b\0"
+        if "--get-regexp" in args:
+            return (f"file:{home / '.gitconfig'}\0include.path\ninc.cfg\0"
+                    f"file:{home / '.gitconfig'}\0includeif.gitdir:~/w/.path\n~/cond.cfg\0"
+                    f"file:{cfg / 'inc.cfg'}\0include.path\n{cfg / 'absent.cfg'}\0")
+        if "core.attributesFile" in args:
+            return "~/attrs\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(conf, "_run_git_config", fake_git)
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+    for derived in (home / ".gitconfig", cfg / "inc.cfg", home / "inc.cfg", home / "cond.cfg",
+                    cfg / "absent.cfg", home / "attrs"):
+        for spelling in (derived, Path(os.path.realpath(derived))):
+            assert spelling in policy.persistence_write_files, spelling
+            assert f'(literal "{spelling}")' in text
+    # git is asked with the operator's environment.
+    assert seen and all(e.get("HOME") == str(home) for e in seen)
+
+
+def test_a_missing_or_failing_git_adds_nothing(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    baseline = _policy(tmp_path, monkeypatch)
+    monkeypatch.setattr(conf, "_run_git_config", lambda args, environ: None)
+    assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+    monkeypatch.setattr(conf, "_run_git_config", lambda args, environ: "")
+    assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+
+
+def _script(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.chmod(0o755)
+    return path
+
+
+def _planted_git_on_path(tmp_path: Path, monkeypatch) -> Path:
+    """An executable ``git`` first on PATH, as an activated workspace venv would put it; returns the
+    marker it leaves when anything runs it."""
+    marker = tmp_path / "planted-git-ran"
+    _script(tmp_path / "venv-bin" / "git",
+            f": > '{marker}'\nprintf 'file:{tmp_path}/planted.cfg\\000k\\000'")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'venv-bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    return marker
+
+
+def test_git_config_never_runs_a_git_found_on_path(tmp_path, monkeypatch) -> None:
+    # L3 r2 (codex HIGH): the derivation runs git as the operator at every policy build, so a PATH
+    # lookup ran whatever the agent could plant in a workspace-local PATH entry.
+    from levain.consent import push
+    marker = _planted_git_on_path(tmp_path, monkeypatch)
+    trusted_ran = tmp_path / "trusted-git-ran"
+    trusted = _script(tmp_path / "root-owned" / "git", f": > '{trusted_ran}'")
+    monkeypatch.setattr(push, "git_bin", lambda: str(trusted))
+    assert _REAL_RUN_GIT_CONFIG(["--list"], {"HOME": str(tmp_path / "home")}) == ""
+    assert trusted_ran.exists()
+    assert not marker.exists()
+
+
+def test_no_root_owned_git_derives_nothing_and_runs_nothing(tmp_path, monkeypatch) -> None:
+    from levain.consent import push
+    marker = _planted_git_on_path(tmp_path, monkeypatch)
+
+    def refuse():
+        raise push.PushRefused("no root-owned git")
+
+    monkeypatch.setattr(push, "git_bin", refuse)
+    monkeypatch.setattr(conf, "_run_git_config", _REAL_RUN_GIT_CONFIG)
+    assert conf._git_config_read_files({"HOME": str(tmp_path / "home")}) == []
+    assert not marker.exists()
+
+
+def _git_that(tmp_path: Path, monkeypatch, body: str) -> dict:
+    """A trusted git that runs ``body``, and an operator environment whose global config exists."""
+    from levain.consent import push
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".gitconfig").write_text("[user]\n\tname = x\n")
+    git = _script(tmp_path / "root-owned" / "git", body)
+    monkeypatch.setattr(push, "git_bin", lambda: str(git))
+    return {"HOME": str(home)}
+
+
+def _git_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.name == "levain.firing.confinement" and r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("body", ["exit 3", "echo 'fatal: bad config line 1' >&2; exit 128"])
+def test_a_failing_git_config_call_warns_that_the_derived_files_were_not_added(
+        tmp_path, monkeypatch, caplog, body) -> None:
+    # L3 r2 (complement LOW): fail-open stays, but it is no longer silent.
+    environ = _git_that(tmp_path, monkeypatch, body)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    [msg] = _git_warnings(caplog)
+    assert "git config" in msg and "not added" in msg
+
+
+def test_a_git_that_cannot_run_or_hangs_warns(tmp_path, monkeypatch, caplog) -> None:
+    import subprocess
+    from levain.consent import push
+    environ = _git_that(tmp_path, monkeypatch, "exit 0")
+    monkeypatch.setattr(push, "git_bin", lambda: str(tmp_path / "gone" / "git"))
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert len(_git_warnings(caplog)) == 1
+
+    def hang(*a, **kw):
+        raise subprocess.TimeoutExpired(a[0], 10)
+
+    caplog.clear()
+    monkeypatch.setattr(conf.subprocess, "run", hang)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert len(_git_warnings(caplog)) == 1
+
+
+def test_nothing_found_or_absent_config_stay_silent(tmp_path, monkeypatch, caplog) -> None:
+    # MEASURED on git 2.50.1: a --get / --get-regexp that matches nothing exits 1, and a --list with
+    # no global config file at all exits 128; both are every-build normal and lose nothing.
+    environ = _git_that(tmp_path, monkeypatch, "exit 1")
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--get", "core.attributesFile"], environ) is None
+        (tmp_path / "home" / ".gitconfig").unlink()
+        _script(tmp_path / "root-owned" / "git", "exit 128")
+        assert _REAL_RUN_GIT_CONFIG(["--list"], environ) is None
+    assert _git_warnings(caplog) == []
+
+
+def test_no_root_owned_git_warns_once_that_nothing_was_added(tmp_path, monkeypatch, caplog) -> None:
+    # L3 r3 (complement LOW-MED): with no git levain will run, the derived files are never added;
+    # that fail-open is said once, in git_bin's own words, not on every call.
+    from levain.consent import push
+
+    def refuse():
+        raise push.PushRefused("no root-owned git at /usr/bin/git")
+
+    monkeypatch.setattr(push, "git_bin", refuse)
+    monkeypatch.setattr(conf, "_git_bin_refusal_warned", False, raising=False)
+    with caplog.at_level(logging.WARNING, logger="levain.firing.confinement"):
+        assert _REAL_RUN_GIT_CONFIG(["--list"], {"HOME": str(tmp_path / "home")}) is None
+        assert _REAL_RUN_GIT_CONFIG(["--get", "core.attributesFile"], {}) is None
+    [msg] = _git_warnings(caplog)
+    assert "no root-owned git at /usr/bin/git" in msg and "not added" in msg
+
+
+def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    (xdg / "git").symlink_to(xdg / "git")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    with pytest.raises(conf.ConfinementError, match=r"XDG_CONFIG_HOME.*fail-closed"):
+        _policy(tmp_path, monkeypatch)
+
+    _clear_git_env(monkeypatch)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(loop))
+    with pytest.raises(conf.ConfinementError, match=r"GIT_CONFIG_GLOBAL.*fail-closed"):
+        conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
+                          deny_standard_creds=False)
+
+
+def test_required_spellings_refuses_a_loop_and_allows_an_absent_path(tmp_path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    with pytest.raises(conf.ConfinementError, match=r"loop target.*fail-closed"):
+        conf._required_spellings(loop, "loop target")
+    with pytest.raises(conf.ConfinementError, match=r"under a loop.*fail-closed"):
+        conf._required_spellings(loop / "child", "under a loop")
+
+    absent = tmp_path / "absent" / "deeper"
+    assert absent in conf._required_spellings(absent, "absent")
+
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert dangling in conf._required_spellings(dangling, "dangling")
+
+
+def test_required_spellings_passes_a_path_it_may_not_search(tmp_path, monkeypatch) -> None:
+    # L3 r4 (codex MED): an include under an unsearchable or TCC-protected directory raises
+    # PermissionError from a strict resolve; that is the old non-strict tolerance, not a refusal.
+    unsearchable = tmp_path / "locked" / "inc.cfg"
+    real_resolve = Path.resolve
+
+    def resolve(self, strict=False):
+        if self in (unsearchable, unsearchable.parent):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert unsearchable in conf._required_spellings(unsearchable, "unsearchable")
 
 
 def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
