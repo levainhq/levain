@@ -176,7 +176,7 @@ def test_a_passkey_key_gets_the_passkey_checks(job, keys, snapshot):
     payload = dsign.sign_payload(job, signer_fp=fp, signed_at=NOW + timedelta(minutes=1))
     # a plain ssh signature where the passkey's WebAuthn one belongs
     plain = keys["phone"].sign(dsign.sign_message(payload), NS)
-    assert dsign.refusal(payload, plain, snapshot, job) == "a passkey answer must be a WebAuthn signature"
+    assert dsign.refusal(payload, plain, snapshot, job) == "a passkey signature must be a WebAuthn signature"
     # a real WebAuthn assertion (recorded, over another message in another namespace) passes the passkey checks and
     # is then refused by the signature check itself
     recorded = to_sshsig(pk, bytes.fromhex(_FIX["authData_hex"]), _FIX["clientDataJSON"].encode(),
