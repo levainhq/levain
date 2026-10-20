@@ -575,3 +575,12 @@ def test_final_stop_earlier_takes_a_time_a_person_types_or_a_duration(run, repo,
     left = datetime.fromisoformat(stop) - datetime.now(timezone.utc)
     assert timedelta(minutes=28) < left <= timedelta(minutes=30)
     assert "a time with its zone" in run("envelope", "narrow", eid, "--stop-earlier", "2026-10-20T23:06:36", rc=1).err
+
+
+def test_final_stop_earlier_refuses_unicode_digits_and_an_unplaceable_year(run, repo, tmp_path, monkeypatch):
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    eid = got["body"]["envelope_id"]
+    assert "--stop-earlier is" in run("envelope", "narrow", eid, "--stop-earlier", "٣٠m", rc=1).err
+    assert "cannot place" in run("envelope", "narrow", eid, "--stop-earlier", "0001-01-01T00:00:00+05:00", rc=1).err

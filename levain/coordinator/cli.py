@@ -167,7 +167,7 @@ def _tick() -> datetime:
     return datetime.now(timezone.utc)
 
 
-_DURATION = re.compile(r"(?:(\d{1,3})h)?(?:(\d{1,4})m)?")
+_DURATION = re.compile(r"(?:([0-9]{1,3})h)?(?:([0-9]{1,4})m)?")
 
 
 def _parse_stop(text: str) -> timedelta:
@@ -195,7 +195,10 @@ def _parse_stop_earlier(text: str) -> str:
     if at is None or at.tzinfo is None:
         raise CoordError(f"--stop-earlier is a duration from now like 30m, or a time with its zone like "
                          f"2026-10-20T23:06:36Z (got {text[:40]!r})")
-    return utc_stamp(at.astimezone(timezone.utc))
+    try:
+        return utc_stamp(at.astimezone(timezone.utc))
+    except (OverflowError, ValueError):
+        raise CoordError(f"--stop-earlier is a time this machine cannot place (got {text[:40]!r})") from None
 
 
 def env_lifetime() -> timedelta:
