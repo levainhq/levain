@@ -146,6 +146,8 @@ class World:
         self.seams = H.Seams(
             host=host, store=L, run=self.R, euid=lambda: 0,
             trusted=lambda st: st.st_uid == os.getuid() and not st.st_mode & 0o022,
+            # Owners are recorded, not applied, so a slot-owned dir is ours here; the real check: s2k4's tests.
+            slot_owned=lambda st, owner: st.st_uid == os.getuid() and not st.st_mode & 0o022,
             chown=lambda fd, u, g, rel: self.chowns.append((rel, u, g)),
             free_bytes=lambda fd: self.free, boot_id=lambda: BOOT,
             new_session=lambda: f"s-{next(n):016x}",

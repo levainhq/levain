@@ -90,6 +90,11 @@ def _root_trusted(st: os.stat_result) -> bool:
     return st.st_uid == 0 and not st.st_mode & 0o022
 
 
+def _slot_owned(st: os.stat_result, owner: int) -> bool:
+    """A slot-owned directory root writes into: owned by exactly ``owner``, not group- or other-writable."""
+    return st.st_uid == owner and not st.st_mode & 0o022
+
+
 def _fchown(fd: int, uid: int, gid: int, rel: str) -> None:
     os.fchown(fd, uid, gid)
 
@@ -337,6 +342,7 @@ class Seams:
     run: Optional[Path] = None
     euid: Callable[[], int] = os.geteuid
     trusted: Callable[[os.stat_result], bool] = _root_trusted
+    slot_owned: Callable[[os.stat_result, int], bool] = _slot_owned
     chown: Callable[[int, int, int, str], None] = _fchown
     fsync: Callable[[int], None] = os.fsync
     free_bytes: Callable[[int], int] = _free_bytes
@@ -546,6 +552,34 @@ class Store:
     @contextmanager
     def dir(self, *parts: str, trusted: bool = True) -> Iterator[int]:
         fd = self.open_dir(*parts, trusted=trusted)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+    def open_slot_dir(self, *parts: str, owner: int) -> int:
+        """An fd on a SLOT-OWNED ``L/<parts…>`` root writes into (§2.1's 0700 dirs): every parent passes
+        ``seams.trusted`` (root's); the last component is opened ``O_NOFOLLOW|O_DIRECTORY`` from its parent's fd and
+        must pass ``seams.slot_owned`` for ``owner`` (the alloc's uid for that dir, never "any slot account"), checked
+        by ``fstat`` on that fd. The one check that admits a non-root owner."""
+        *parent, name = parts
+        if not name or name in (".", "..") or "/" in name:
+            raise Refused("bad-token", name[:64])
+        where = "/".join((str(self.path), *parts))
+        with self.dir(*parent) as pfd:
+            fd = _openat_dir(pfd, name, where)
+        try:
+            st = os.fstat(fd)
+            if not self.seams.slot_owned(st, owner):
+                raise Refused("bad-root", where)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @contextmanager
+    def slot_dir(self, *parts: str, owner: int) -> Iterator[int]:
+        fd = self.open_slot_dir(*parts, owner=owner)
         try:
             yield fd
         finally:
@@ -1184,6 +1218,10 @@ def render_step2_policy(run: RenderRun) -> None:
     write_alloc(ctx, run.alloc)
 
 
+#: §2.1's slot-owned 0700 config dirs ``prepare`` makes, the only dirs ``render`` writes into that root does not own.
+PRESEED_DIRS = frozenset({"config/claude", "config/codex"})
+
+
 def render_layer_rows(slot: SlotId, owner_gid: int) -> List[DirRow]:
     """§2.1 rows ``render`` makes: ``<S>/in/`` root : the slot (verifier: the child) 0750; ``<S>/root/`` root : the
     slot 0750 (verifier root : root 0755, as a none-class layer is world-readable, §2.1). DECISION: ``root/hooks/``
@@ -1214,9 +1252,18 @@ def render_step3_files(run: RenderRun) -> None:
         ST.stage_bundle(staging, dest, staging_uid=a.staging_uid, staging_gid=seams.user_gid(a.staging_uid),
                         dest_gid=facts.slot_gid, run_as=seams.stage_run_as, fsync=seams.fsync,
                         chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+    # The pre-seed's dirs are the owner's (§2.1), so they pass the owner check, never ``seams.trusted``. The owner
+    # is read from the alloc: the slot (verifier: the child).
+    owner = a.child_uid if a.slot.slot_class == "none" else a.slot_uid
+    assert owner is not None
     for f in rendered.files:
         *parent, name = f.path.split("/")
-        with ctx.store.dir(*S, *parent) as pfd:
+        if "/".join(parent) in PRESEED_DIRS:
+            assert f.uid == owner, f.path
+            opened = ctx.store.slot_dir(*S, *parent, owner=owner)
+        else:
+            opened = ctx.store.dir(*S, *parent)
+        with opened as pfd:
             ctx.store.create_file(pfd, name, FileRow(f"live/{a.session}/{f.path}", f.data, f.uid, f.gid, f.mode))
             seams.fsync(pfd)
     # DECISION: only the names this render staged are removed (the verifier's driver_input.json is session 2f's to
