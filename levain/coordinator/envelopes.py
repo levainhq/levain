@@ -138,6 +138,9 @@ class EnvelopeStore(CoordStore):
             body = env.parse_body(body_text)
         except env.EnvelopeError as exc:
             raise CoordError(str(exc)) from None
+        except (TypeError, ValueError, KeyError) as exc:
+            # a shape parse_body did not name is still a refusal, never a lost drop
+            raise CoordError(f"an envelope body this reader cannot read: {type(exc).__name__}") from None
         refused = env.refusal(payload, signature, authority, body, ssh_keygen=self._ssh_keygen)
         if refused is not None:
             raise CoordError(refused)
@@ -508,14 +511,22 @@ class EnvelopeStore(CoordStore):
             try:
                 kind, obj = effect
                 key = env.effect_key(kind, obj)
+                if not all(isinstance(k, str) for k in key):
+                    raise TypeError
             except (env.EnvelopeError, KeyError, TypeError, ValueError):
                 return "the effect asked for is not a land, push or publish this reader knows"
+        if scope is not None:
+            try:
+                repo, paths = scope
+                if not isinstance(repo, str) or isinstance(paths, str) or not all(isinstance(p, str) for p in paths):
+                    raise TypeError
+            except (TypeError, ValueError):
+                return "the scope asked for is not (repo, [paths])"
         for eid in self._chain(conn, envelope_id, thread_id):
             eff = self._effective(conn, eid, thread_id)
             if key is not None and key not in {env.effect_key(kind, e) for e in eff[kind]}:
                 return f"envelope {eid} does not hold that {kind[:-1]}"
             if scope is not None:
-                repo, paths = scope
                 allowed = {w["repo"]: tuple(w["paths"]) for w in eff["where"]}
                 if repo not in allowed:
                     return f"envelope {eid} does not reach {str(repo)[:120]}"

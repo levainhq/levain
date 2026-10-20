@@ -274,15 +274,6 @@ def parse_body(text: Any) -> dict[str, Any]:
         _criteria(land["criteria"], f"lands[{i}].criteria", scope[repo])
     if len({(x["repo"], x["onto"]) for x in lands}) != len(lands):
         raise EnvelopeError("lands names one repo and branch twice")
-    for kind in ("pushes", "publishes"):
-        if not isinstance(body[kind], list):
-            break
-        try:
-            keys = [effect_key(kind, e) for e in body[kind]]
-        except (KeyError, TypeError):
-            break  # the shape checks below say what is wrong
-        if len(set(keys)) != len(keys):
-            raise EnvelopeError(f"{kind} names one target twice")
     for i, p in enumerate(_list(body["pushes"], "pushes")):
         p = _exact(p, {"repo", "remote", "url", "branch"}, f"pushes[{i}]")
         if _repo(p["repo"], f"pushes[{i}].repo") not in scope:
@@ -300,6 +291,11 @@ def parse_body(text: Any) -> dict[str, Any]:
         _text(p["index"], f"publishes[{i}].index", 1024)
         if not isinstance(p["version"], str) or _VERSION.fullmatch(p["version"]) is None:
             raise EnvelopeError(f"publishes[{i}].version is one exact version")
+    # after every effect's shape is checked, so each key is text and hashable
+    for kind in ("pushes", "publishes"):
+        keys = [effect_key(kind, e) for e in body[kind]]
+        if len(set(keys)) != len(keys):
+            raise EnvelopeError(f"{kind} names one target twice")
     budget = _exact(body["budget"], set(BUDGET_KEYS), "budget")
     for k in BUDGET_KEYS:
         if type(budget[k]) is not int or not 0 <= budget[k] <= BUDGET_MAX[k]:
