@@ -1234,10 +1234,15 @@ def ruling_line(queue: ConsentQueue, ruling: Any, *, quote: bool = False) -> str
     """DESIGN §3.6's text for one claimed ruling (the hook's additionalContext, a resume's prompt), or ``None`` for an
     unknown ruling value (which skips that ruling only, never the rest). With ``quote`` (a resume's prompt, where the
     text arrives as the user's turn) the action is set in «…», which the prompt then names as the agent's own filing."""
+    got = queue.get(ruling.request_id)
+    if got is not None and got[0].tool_name == "levain_limit":   # Q13: a limit has no action to do
+        from levain.consent.limits import ruling_text
+
+        return ruling_text(ruling.ruling, ruling.gap, got[0].display, queue_dir=queue.directory,
+                           request_id=ruling.request_id)
     text = RULING_TEXT.get(ruling.ruling)
     if text is None:
         return None
-    got = queue.get(ruling.request_id)
     what = _what(got[0].tool_name, None, got[0].display) if got is not None else f"request {ruling.request_id}"
     if quote:   # the agent wrote ``what``: no closing mark or line break of its own can end the quote early
         what = what.translate({ord(c): None for c in "«»\r\n"})
@@ -1316,6 +1321,9 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         return _malformed(event, queue, settings, home=home)
     if tool_input is None:
         tool_input = {}
+    limited = _limits(event, queue, settings, session, tool_name, tool_input, cwd, home=home)
+    if limited is not None:
+        return limited
     try:
         send_repings(queue, settings)
     except Exception:
@@ -1343,6 +1351,27 @@ def gate(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, home: Pa
         spec["additionalContext"] = f"{spec['additionalContext']}\n{context}" if spec.get("additionalContext") \
             else context
     return out
+
+
+def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, session: str, tool_name: str,
+            tool_input: Any, cwd: str, *, home: Path | None) -> dict[str, Any] | None:
+    """Q13 at the top of the gate (:func:`levain.consent.limits.check`): every call is counted, gated or not, before
+    any of the gate's own exits; ``None`` lets the call on to the gate. A halt or an End ends the turn
+    (``continue: false``). A GATED call held at a limit and extended is denied with a retry line, so the gate's own
+    hold runs in a fresh hook and the two holds never share one hook's timeout."""
+    from levain.consent import limits
+
+    hold = min(settings.gate_hold_seconds, GATE_HOLD_CEILING)
+    got = limits.check(AGENT, event, queue, session, tool_name, tool_input, hold=hold, cwd=cwd,
+                       notify=lambda text: notify(settings, text, cwd=queue.directory), resume=resume_meta_of(event))
+    if got.go:
+        if got.extended and gate_class(tool_name, tool_input, cwd, home=home,
+                                       protected=protected_paths(Path(queue.directory), settings)) is not None:
+            return _pre("deny", limits.retry_text(got.extended))
+        return None
+    stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
+                                             "extends it."} if got.stop else {}
+    return _pre("deny", got.text, **stop)
 
 
 def _malformed(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSettings, *,

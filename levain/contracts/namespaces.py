@@ -34,6 +34,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                             "leaving an away mode set by `levain consent away on` (its away mark)"),
     "levain-dispatch-contract": ("reserved", "levain/dispatch/sign.py",
                                  "the operator's signature over a filed dispatch contract's digest (F2)"),
+    "levain-dispatch-config": ("reserved", "levain/dispatch/control.py",
+                               "a human-signed dispatch configuration item (templates, verifiers, provider policy, "
+                               "route map, adoption rules) under a monotonic generation"),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

@@ -54,6 +54,20 @@ turn began or the turn ended without it running: a no, or abandoned; which is no
 touches the request's state, answer or signature, and is never authority: it is the record of a decision levain
 did not make.
 
+A refused answer or late ruling that is EVIDENCE is kept apart, in ``refused_answers``
+(:meth:`ConsentQueue.refused_answers`): one that binds this queue, the request and its digest (a ruling also its
+gap) and whose signature verifies under the key it names (an enrolled key's stored public key; for a key the
+authority log does not hold, the key the SSHSIG embeds, whose fingerprint must be the named one), refused because
+that key is not authority for it (``approver-not-authorized``) or, authorised, because it came after the hold ended
+by the queue's clock or state (``approval-window-elapsed``; a ``signed_at`` after the hold is the signer's claim,
+never lateness). Nothing else is kept: not a duplicate answer to a decided or withdrawn request, a stale receipts
+head, an answer refused while the authority log cannot be replayed, a bad signature, a malformed record, or an
+unenrolled passkey's assertion. A kept refusal never moves the request, never changes the refusal the signer is
+given, is no receipt and no leaf of the receipts log, and is never authority; at most :data:`REFUSED_PER_REQUEST`
+by enrolled keys and :data:`REFUSED_UNENROLLED_PER_REQUEST` by others are kept per request (counted before any
+verify), each (request, signer, decision) once (a repeat costs no verify either), and keeping one waits at most
+:data:`REFUSED_BUSY_MS` for the lock.
+
 The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
 delivery or reading of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`,
 :meth:`ConsentQueue.take_ruled_allow`, :meth:`ConsentQueue.claim_rulings_for`) re-reads the stored answer or
@@ -108,6 +122,7 @@ import json
 import os
 import sqlite3
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -116,7 +131,8 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (
-    PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, verify_link_sig,
+    _WEBAUTHN_SIG_TYPE, PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable,
+    sshsig_public_key, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
@@ -135,7 +151,8 @@ from levain.consent.record import (
     ruling_message, ruling_payload, tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
+__all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
+           "REFUSED_REASONS", "REFUSED_UNENROLLED_PER_REQUEST", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
            "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent", "authority_source",
            "default_queue_dir", "gap_label", "session_handle"]
@@ -186,6 +203,27 @@ DIALOG_OUTCOMES: tuple[str, ...] = ("ran", "ran_unasked", "did_not_run")
 # runs a call it holds a session approval for 0.1 s after levain withdraws the request, and a person's yes in its
 # dialog came 12-13 s after [judged by levain seat lane H, 2026-10-17, against those two measured runs]
 UNASKED_WITHIN = timedelta(seconds=0.5)
+#: Why a refused answer or ruling was kept as evidence (:meth:`ConsentQueue.refused_answers`): its key is not one the
+#: authority log holds active, of a class covering the tier for an allow; or it is authorised and verifies, but
+#: reached the queue after the request's hold ended, by the queue's clock or state (never by its own ``signed_at``).
+REFUSED_NOT_AUTHORIZED = "approver-not-authorized"
+REFUSED_WINDOW_ELAPSED = "approval-window-elapsed"
+REFUSED_REASONS: tuple[str, ...] = (REFUSED_NOT_AUTHORIZED, REFUSED_WINDOW_ELAPSED)
+#: Which refusal of the key it was: ``not-enrolled``, ``revoked``, ``compromised`` (revoked with
+#: ``compromised_since``) and ``class`` go with :data:`REFUSED_NOT_AUTHORIZED`, ``late`` with
+#: :data:`REFUSED_WINDOW_ELAPSED`.
+REFUSED_SUBREASONS: tuple[str, ...] = ("not-enrolled", "revoked", "compromised", "class", "late")
+#: What was refused: an answer (:meth:`ConsentQueue.answer`) or a late ruling (:meth:`ConsentQueue.answer_late`).
+REFUSED_KINDS: tuple[str, ...] = ("answer", "ruling")
+#: The most refused answers kept per request by keys the authority log holds (``enrolled``): the first ones are
+#: kept, later ones are refused as before and kept nowhere.
+REFUSED_PER_REQUEST = 8
+#: The most kept per request by keys the log does not hold, counted apart from :data:`REFUSED_PER_REQUEST`: anyone
+#: can make a key, so throwaway keys never use up the room an enrolled key's evidence has.
+REFUSED_UNENROLLED_PER_REQUEST = 4
+#: How long keeping a refused answer waits for the queue's write lock, in ms: a refusal is never held up for the
+#: 30 s every other write waits (:func:`levain.autonomic.durable_sqlite.open_durable`); past it, nothing is kept.
+REFUSED_BUSY_MS = 2000
 
 def _requests_table(name: str) -> str:
     return (f"CREATE TABLE IF NOT EXISTS {name} (id TEXT PRIMARY KEY, agent TEXT NOT NULL, "
@@ -345,6 +383,21 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS away_leaves_no_replace BEFORE INSERT ON away_leaves "
     "WHEN EXISTS (SELECT 1 FROM away_leaves WHERE mark_id = NEW.mark_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an away leave is never replaced'); END",
+    # an answer or late ruling refused as authority but kept as EVIDENCE (:meth:`ConsentQueue.refused_answers`):
+    # never a receipt and never a leaf of the receipts log (a receipt is one per transition, and a refusal moves no
+    # state), never authority; one row per (request, signer, decision), since a signature need not be deterministic
+    "CREATE TABLE IF NOT EXISTS refused_answers (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL "
+    "REFERENCES requests(id), kind TEXT NOT NULL CHECK (kind IN ('answer','ruling')), refused_at TEXT NOT NULL, "
+    "reason_code TEXT NOT NULL CHECK (reason_code IN ('approver-not-authorized','approval-window-elapsed')), "
+    "subreason TEXT NOT NULL CHECK (subreason IN ('not-enrolled','revoked','compromised','class','late')), "
+    "enrolled INTEGER NOT NULL CHECK (enrolled IN (0, 1)), detail TEXT NOT NULL, "
+    "decision TEXT NOT NULL, signer_fp TEXT NOT NULL, signed_at TEXT NOT NULL, record TEXT NOT NULL, "
+    "signature TEXT NOT NULL, CHECK ((reason_code = 'approval-window-elapsed') = (subreason = 'late')), "
+    "UNIQUE (request_id, signer_fp, decision))",
+    "CREATE TRIGGER IF NOT EXISTS refused_answers_frozen BEFORE UPDATE ON refused_answers "
+    "BEGIN SELECT RAISE(ABORT, 'refused answers are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS refused_answers_kept BEFORE DELETE ON refused_answers "
+    "BEGIN SELECT RAISE(ABORT, 'refused answers are append-only'); END",
 )
 # what an away mark is read from (:meth:`ConsentQueue.away_mark`): a current-format store holding neither was made
 # before them (no mark); one holding only one of them is damaged
@@ -855,6 +908,22 @@ class ConsentQueue:
                                 (request_id,)).fetchall()
         return [{"state": r[0], "created_at": r[1], "face": json.loads(r[2])} for r in rows]
 
+    _REFUSED_COLUMNS = ("seq", "request_id", "kind", "refused_at", "reason_code", "subreason", "enrolled", "detail",
+                        "decision", "signer_fp", "signed_at", "record", "signature")
+
+    def refused_answers(self, request_id: str) -> list[dict[str, Any]]:
+        """Every refused answer or late ruling kept as evidence for the request, oldest first: ``kind`` one of
+        :data:`REFUSED_KINDS`, ``reason_code`` one of :data:`REFUSED_REASONS`, ``subreason`` one of
+        :data:`REFUSED_SUBREASONS`, ``enrolled`` whether the authority log held the key when it was refused,
+        ``detail`` why it was refused (for ``approver-not-authorized`` the key's refusal, which the signer may not
+        have been given: a late answer's signer is told the request expired), ``record`` the canonical signed bytes as text
+        and ``signature`` the signature over them, which verified under the key ``signer_fp`` names. Evidence that
+        an attempt was made and refused, never authority: no signed head covers these rows."""
+        with self._read() as conn:
+            rows = conn.execute(f"SELECT {', '.join(self._REFUSED_COLUMNS)} FROM refused_answers "
+                                "WHERE request_id = ? ORDER BY seq", (request_id,)).fetchall()
+        return [{**dict(zip(self._REFUSED_COLUMNS, r)), "enrolled": bool(r[6])} for r in rows]
+
     def gap(self, request_id: str) -> int | None:
         """The gap number the request was given when it went undecided, or ``None``."""
         with self._read() as conn:
@@ -1224,6 +1293,18 @@ class ConsentQueue:
         :meth:`answer`'s write transaction), which this does not. ``unchained_ok`` (delivery and the verifier,
         never the apply): an answer in the format from before the chaining is checked as that format, every
         check but the head's, since it has none."""
+        why = self._answer_record_refusal(request, queue_id, payload, unchained_ok=unchained_ok)
+        if why is not None:
+            return why
+        return self._signer_refusal(request, payload, signature, authority, noun="answer",
+                                    encode_record=answer_message, namespace=ANSWER_NAMESPACE)
+
+    @staticmethod
+    def _answer_record_refusal(request: ExternalGateRequest, queue_id: str, payload: Any, *,
+                               unchained_ok: bool = False, window: bool = True) -> str | None:
+        """Every check of :meth:`_refusal` but the signer's: why ``payload`` is not an answer record binding this
+        queue and ``request``. ``window`` false (a refused answer read as evidence, :meth:`_refused_reason`) skips
+        only the check that it was signed before the request's hold ended."""
         unchained = isinstance(payload, Mapping) and payload.get("format") == ANSWER_FORMAT_UNCHAINED
         if unchained and not unchained_ok:
             return (f"the answer is in format {ANSWER_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
@@ -1252,13 +1333,12 @@ class ConsentQueue:
             return "the answer's signed_at is not a timestamp"
         if signed_at < request.received_at:
             return "the answer was signed before the request was filed"
-        if signed_at >= request.expires_at:
+        if window and signed_at >= request.expires_at:
             return "the answer was signed after the request expired"
         decision = payload["decision"]
         if decision not in DECISIONS:
             return f"decision {decision!r} is not one of {DECISIONS}"
-        return self._signer_refusal(request, payload, signature, authority, noun="answer",
-                                    encode_record=answer_message, namespace=ANSWER_NAMESPACE)
+        return None
 
     def _signer_refusal(self, request: ExternalGateRequest | None, payload: Mapping[str, Any], signature: Any,
                         authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
@@ -1266,25 +1346,44 @@ class ConsentQueue:
         """The key and signature checks an answer, a ruling and an away leave share: the named signer is a key
         ``authority`` holds active, of a class covering the request's tier for an allow (an allow with no
         ``request`` is refused), and ``signature`` verifies over the record's bytes in ``namespace``."""
-        decision = payload["decision"]
         signer_fp = payload["signer_fp"]
         key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
+        why = self._key_refusal(key, payload["decision"], request, noun=noun)
+        if why is not None:
+            return why[1]
+        return self._signature_refusal(key.public_key, key.fingerprint, key.custody, payload, signature, noun=noun,
+                                       encode_record=encode_record, namespace=namespace)
+
+    @staticmethod
+    def _key_refusal(key: Any, decision: Any, request: ExternalGateRequest | None, *,
+                     noun: str) -> tuple[str | None, str] | None:
+        """Why ``key`` (``None``: the log does not hold it) is not authority for ``decision`` on ``request``, as
+        ``(subreason, refusal)`` with the subreason one of :data:`REFUSED_SUBREASONS` (``None`` for an allow that
+        names no request, never a kept refusal); ``None`` when it is authority. :meth:`_signer_refusal` gives the
+        refusal, :meth:`_evidence` keeps both: one text for both."""
         if key is None:
-            return "the signer is not an enrolled key"
+            return "not-enrolled", "the signer is not an enrolled key"
         if not key.active:
-            return "the signer's key is revoked"
+            return ("compromised" if key.compromised_since is not None else "revoked"), "the signer's key is revoked"
         if decision == "allow" and request is None:
-            return f"an allow {noun} names no request"
+            return None, f"an allow {noun} names no request"
         if decision == "allow" and not class_covers(key.key_class, request.tier):
-            return f"key class {key.key_class} does not cover {request.tier}"
+            return "class", f"key class {key.key_class} does not cover {request.tier}"
+        return None
+
+    def _signature_refusal(self, public_key: str, fingerprint: str, custody: str | None, payload: Mapping[str, Any],
+                           signature: Any, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
+                           namespace: str) -> str | None:
+        """Why ``signature`` does not verify over the record's bytes in ``namespace`` by ``public_key`` (whose
+        fingerprint is ``fingerprint``); ``None`` when it does. A passkey's (``custody``) own checks run first."""
         if not isinstance(signature, str) or not signature:
             return f"the {noun} carries no signature"
-        if key.custody == PASSKEY:
+        if custody == PASSKEY:
             # a passkey's checks that ssh-keygen does not make (user verification, the page's origin), on every
             # verification, not only where the phone port converted the assertion
             from levain.consent.passkey import answer_signature_problem
 
-            problem = answer_signature_problem(signature, key.public_key)
+            problem = answer_signature_problem(signature, public_key)
             if problem is not None:
                 return problem
         try:
@@ -1293,11 +1392,163 @@ class ConsentQueue:
             return f"the {noun} cannot be encoded: {exc}"
         kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
         try:
-            ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+            ok = verify_link_sig(message, signature, public_key=public_key, fingerprint=fingerprint,
                                  namespace=namespace, **kwargs)
         except VerifierUnavailable as exc:
             return f"the {noun} could not be verified: {exc}"
         return None if ok else f"the {noun}'s signature does not verify"
+
+    def _evidence(self, request: ExternalGateRequest, payload: Mapping[str, Any], signature: Any,
+                  authority: AuthoritySnapshot, *, noun: str, encode_record: Callable[[dict[str, Any]], bytes],
+                  namespace: str) -> tuple[tuple[str, str] | None, bool] | None:
+        """For a record that binds this queue and ``request`` (already checked) whose signature verifies under the
+        key it names: ``(why, enrolled)``, ``why`` the key's ``(subreason, refusal)`` when it is not authority for
+        the record (:meth:`_key_refusal`: not enrolled, revoked, compromised, or of a class not covering the tier
+        for an allow) and ``None`` when it is, ``enrolled`` whether ``authority`` holds the key. ``None`` when the
+        record is no evidence. A key ``authority`` does not hold is the one the SSHSIG embeds, whose fingerprint
+        must be the record's ``signer_fp``; an unenrolled passkey's assertion (a WebAuthn signature) is never
+        evidence, since nothing enrolled says which key or page it is."""
+        signer_fp = payload["signer_fp"]
+        if not isinstance(signer_fp, str):
+            return None
+        key = authority.key(signer_fp)
+        why = self._key_refusal(key, payload["decision"], request, noun=noun)
+        if why is not None and why[0] is None:
+            return None
+        if key is None:
+            try:
+                public_key, fingerprint, sig_type = sshsig_public_key(signature)
+            except ValueError:
+                return None
+            if fingerprint != signer_fp or sig_type == _WEBAUTHN_SIG_TYPE:
+                return None
+            custody = None
+        else:
+            public_key, fingerprint, custody = key.public_key, key.fingerprint, key.custody
+        if self._signature_refusal(public_key, fingerprint, custody, payload, signature, noun=noun,
+                                   encode_record=encode_record, namespace=namespace) is not None:
+            return None
+        return (None if why is None else (why[0], why[1])), key is not None
+
+    def _keep_refused(self, detail: str, request: ExternalGateRequest, payload: Any, signature: Any, *,
+                      late: bool, gap: tuple[int, str] | None = None, queue_id: str | None = None,
+                      authority: AuthoritySnapshot | None = None) -> AnswerRefused:
+        """The :class:`AnswerRefused` carrying ``detail``, after keeping the refused answer (``gap`` ``None``) or
+        late ruling (``gap`` the request's) in ``refused_answers`` when it is evidence (:meth:`_refused_reason`).
+        ``late``: the queue's clock or state says the request's hold had ended when it came. Keeping it is its own
+        transaction; a store, disk, verifier or record failure there is swallowed, and any other exception (a bug
+        in the keeping, a row the table's CHECKs refuse among them) is given as a :class:`RuntimeWarning`, never
+        raised, even with warnings as errors: the caller raises the same refusal either way."""
+        try:
+            self._record_refused(detail, request, payload, signature, late=late, gap=gap, queue_id=queue_id,
+                                 authority=authority)
+        except sqlite3.IntegrityError as exc:   # the insert ignores only the dedupe: a CHECK failing is a bug
+            bug: BaseException | None = exc
+        except (sqlite3.Error, OSError, VerifierUnavailable, ConsentError):
+            bug = None                      # the record is evidence, never a gate: the refusal stands as it is
+        except Exception as exc:            # a bug: seen by the tests, never by the signer
+            bug = exc
+        else:
+            bug = None
+        if bug is not None:
+            try:                            # warnings as errors (-W error) must not turn into the caller's error
+                warnings.warn(f"levain: a refused answer to {request.id} was not kept: {type(bug).__name__}: {bug}",
+                              RuntimeWarning, stacklevel=3)
+            except Warning:
+                pass
+        return AnswerRefused(detail)
+
+    def _refused_reason(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any, detail: str,
+                        *, late: bool, gap: tuple[int, str] | None,
+                        authority: AuthoritySnapshot) -> tuple[str, str, str, bool] | None:
+        """``(reason, subreason, detail, enrolled)`` for a refused answer or ruling that is kept (``reason`` one of
+        :data:`REFUSED_REASONS`, ``subreason`` of :data:`REFUSED_SUBREASONS`), or ``None`` when it is not: it must
+        be a well-formed record for this queue, request and digest (a ruling also for the request's gap) whose
+        signature verifies under the key it names (:meth:`_evidence`). An unauthorised one is kept with the KEY's
+        refusal as its detail, whatever the caller was told; an authorised answer only when ``late`` (by the
+        queue's clock or state: a ``signed_at`` after the hold, the signer's own claim, is never lateness), with
+        ``detail``; an authorised ruling never is."""
+        if gap is None:
+            shape = self._answer_record_refusal(request, queue_id, payload, window=False)
+            noun, encode_record, namespace = "answer", answer_message, ANSWER_NAMESPACE
+        else:
+            shape = self._ruling_record_refusal(request, queue_id, gap, payload)
+            noun, encode_record, namespace = "ruling", ruling_message, RULING_NAMESPACE
+        if shape is not None:
+            return None
+        verdict = self._evidence(request, payload, signature, authority, noun=noun, encode_record=encode_record,
+                                 namespace=namespace)
+        if verdict is None:
+            return None
+        why, enrolled = verdict
+        if why is not None:
+            return REFUSED_NOT_AUTHORIZED, why[0], why[1], enrolled
+        if gap is None and late:
+            return REFUSED_WINDOW_ELAPSED, "late", detail, enrolled
+        return None
+
+    def _connect_briefly(self) -> sqlite3.Connection:
+        """A queue connection that waits at most :data:`REFUSED_BUSY_MS` for a lock (keeping a refused answer)."""
+        conn = self._connect()
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {int(REFUSED_BUSY_MS)}")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _record_refused(self, detail: str, request: ExternalGateRequest, payload: Any, signature: Any, *,
+                        late: bool, gap: tuple[int, str] | None, queue_id: str | None,
+                        authority: AuthoritySnapshot | None) -> None:
+        def full(conn: sqlite3.Connection, enrolled: bool) -> bool:
+            kept = conn.execute("SELECT count(*) FROM refused_answers WHERE request_id = ? AND enrolled = ?",
+                                (request.id, int(enrolled))).fetchone()
+            return kept[0] >= (REFUSED_PER_REQUEST if enrolled else REFUSED_UNENROLLED_PER_REQUEST)
+
+        named = isinstance(payload, Mapping) and isinstance(payload.get("signer_fp"), str) \
+            and isinstance(payload.get("decision"), str)
+        head = payload.get("receipts_head") if isinstance(payload, Mapping) else None
+        # the first read: a repeat, a stale head, or both classes full costs no replay and no verify; one class full
+        # costs no verify, and no replay when the caller already holds one (only a replay says which class a key is
+        # in). The receipts are append-only, so a head that is the log's head of its size here stays so.
+        with read_transaction(self._connect_briefly) as conn:
+            if named and conn.execute("SELECT 1 FROM refused_answers WHERE request_id = ? AND signer_fp = ? "
+                                      "AND decision = ?", (request.id, payload["signer_fp"],
+                                                           payload["decision"])).fetchone() is not None:
+                return                      # this (request, signer, decision) is kept already
+            fulls = {enrolled: full(conn, enrolled) for enrolled in (False, True)}
+            if all(fulls.values()):
+                return
+            # after the cap: the head check hashes the log up to the head's size
+            if head_problem(head) is None and head_refusal(conn, head, noun="ruling" if gap else "answer") is not None:
+                return                      # not the log's head of its size: a stale head is never kept
+            if queue_id is None:
+                queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
+        if authority is not None and named and fulls[authority.key(payload["signer_fp"]) is not None]:
+            return                          # its class is full, known without a replay
+        if authority is None:
+            authority = self._fresh_authority()
+        if authority is None:
+            return                          # no verdict on the key is possible
+        if named and fulls[authority.key(payload["signer_fp"]) is not None]:
+            return                          # its class is full: no verify
+        kept = self._refused_reason(request, queue_id, payload, signature, detail, late=late, gap=gap,
+                                    authority=authority)
+        if kept is None:
+            return
+        reason, subreason, why, enrolled = kept
+        record = (answer_message if gap is None else ruling_message)(dict(payload)).decode("utf-8")
+        with write_transaction(self._connect_briefly) as conn:
+            if full(conn, enrolled):        # the count again under the lock: the cap holds across processes
+                return
+            # only the dedupe is ignored: a CHECK or NOT NULL failure is a bug in the keeping and is raised
+            conn.execute("INSERT INTO refused_answers (request_id, kind, refused_at, reason_code, subreason, "
+                         "enrolled, detail, decision, signer_fp, signed_at, record, signature) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                         "ON CONFLICT (request_id, signer_fp, decision) DO NOTHING",
+                         (request.id, "answer" if gap is None else "ruling", utc_stamp(_now_utc(self._clock)), reason,
+                          subreason, int(enrolled), why, payload["decision"], payload["signer_fp"],
+                          payload["signed_at"], record, signature))
 
     def _ruling_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any,
                         signature: Any, authority: AuthoritySnapshot, *, unchained_ok: bool = False) -> str | None:
@@ -1306,6 +1557,17 @@ class ConsentQueue:
         it is delivered or taken; applying it also checks its ``receipts_head`` against the log (in
         :meth:`answer_late`'s write transaction), which this does not. ``unchained_ok`` as :meth:`_refusal`'s: a
         ruling applied before the chaining is still delivered and taken, every check but the head's."""
+        why = self._ruling_record_refusal(request, queue_id, gap, payload, unchained_ok=unchained_ok)
+        if why is not None:
+            return why
+        return self._signer_refusal(request, payload, signature, authority, noun="ruling",
+                                    encode_record=ruling_message, namespace=RULING_NAMESPACE)
+
+    @staticmethod
+    def _ruling_record_refusal(request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any, *,
+                               unchained_ok: bool = False) -> str | None:
+        """Every check of :meth:`_ruling_refusal` but the signer's: why ``payload`` is not a ruling record binding
+        this queue, ``request`` and its gap."""
         unchained = isinstance(payload, Mapping) and payload.get("format") == RULING_FORMAT_UNCHAINED
         if unchained and not unchained_ok:
             return (f"the ruling is in format {RULING_FORMAT_UNCHAINED!r}, signed before the queue's receipts were "
@@ -1336,30 +1598,39 @@ class ConsentQueue:
             return "the ruling was signed before the request went undecided"
         if payload["decision"] not in DECISIONS:
             return f"decision {payload['decision']!r} is not one of {DECISIONS}"
-        return self._signer_refusal(request, payload, signature, authority, noun="ruling",
-                                    encode_record=ruling_message, namespace=RULING_NAMESPACE)
+        return None
 
     def answer(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
         was: an answer after ``expires_at`` is refused, and the request stays pending until its grace ends). The answer is verified against a fresh
         replay from the queue's authority source, and its ``receipts_head`` must be the head of its size over the
         receipts as they stand inside the write transaction that applies it ("the receipts changed under this
-        answer" otherwise). ``payload`` is read once, at entry: every check and the apply use that copy."""
+        answer" otherwise). ``payload`` is read once, at entry: every check and the apply use that copy.
+
+        A refused answer that is evidence (it binds this request and verifies under the key it names: an
+        unauthorised key, or an authorised one too late) is kept in ``refused_answers`` (:meth:`refused_answers`)
+        before the refusal is raised; the request is never moved by it and the refusal is the same."""
         payload = _detached(payload)
         got = self.get(request_id)                         # expires it first if it is due (UNDECIDED_GRACE)
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
         request, state = got
-        if state != "pending":
+        if state in ("expired", "undecided"):              # the hold ended before this answer came
+            raise self._keep_refused(f"request {request_id} is already {state}", request, payload, signature,
+                                     late=True)
+        if state != "pending":                             # decided or withdrawn: a duplicate, never kept
             raise AnswerRefused(f"request {request_id} is already {state}")
         if request.expires_at <= utc_stamp(_now_utc(self._clock)):
-            raise AnswerRefused(f"request {request_id} is already expired: its hold ended {request.expires_at}")
+            raise self._keep_refused(f"request {request_id} is already expired: its hold ended {request.expires_at}",
+                                     request, payload, signature, late=True)
         authority = self._fresh_authority()
         if authority is None:
             raise AnswerRefused("the authority log cannot be replayed now: no answer is authority")
-        why = self._refusal(request, self.queue_id, payload, signature, authority)
+        queue_id = self.queue_id
+        why = self._refusal(request, queue_id, payload, signature, authority)
         if why is not None:
-            raise AnswerRefused(why)
+            raise self._keep_refused(why, request, payload, signature, late=False, queue_id=queue_id,
+                                     authority=authority)
         decision = payload["decision"]
         message = answer_message(dict(payload))
         with self._write() as conn:
@@ -1373,7 +1644,10 @@ class ConsentQueue:
                 conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
                 signature=signature, signer_fp=payload["signer_fp"], via="signature")
         if stale is not None:
-            raise AnswerRefused(stale)
+            raise AnswerRefused(stale)                     # the receipts changed under it: never kept
+        if not moved and now_state in ("expired", "undecided"):
+            raise self._keep_refused(f"request {request_id} is already {now_state}", request, payload, signature,
+                                     late=True, queue_id=queue_id, authority=authority)
         if not moved:
             raise AnswerRefused(f"request {request_id} is already {now_state or 'gone'}")
         return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
@@ -1600,7 +1874,11 @@ class ConsentQueue:
         head of its size over the receipts as they stand under that lock. The move to ``allowed``/``denied``,
         its receipt and the release of a halt on this request are one transaction. Returns the :class:`Ruling`
         (information: applying a ruling delivers nothing; a ruled allow reaches the agent only through
-        :meth:`take_ruled_allow`). ``payload`` is read once, at entry, as :meth:`answer` reads it."""
+        :meth:`take_ruled_allow`). ``payload`` is read once, at entry, as :meth:`answer` reads it.
+
+        A refused ruling by a key that is not authority for it, whose signature verifies under the key it names
+        and which binds this request and gap, is kept in ``refused_answers`` as :meth:`answer` keeps a refused
+        answer; the request stays undecided and the refusal is the same."""
         payload = _detached(payload)
         request, gap, queue_id = self._undecided(request_id)
         authority = self._fresh_authority()
@@ -1608,7 +1886,8 @@ class ConsentQueue:
             raise AnswerRefused("the authority log cannot be replayed now: no ruling is authority")
         why = self._ruling_refusal(request, queue_id, gap, payload, signature, authority)
         if why is not None:
-            raise AnswerRefused(why)
+            raise self._keep_refused(why, request, payload, signature, late=False, gap=gap, queue_id=queue_id,
+                                     authority=authority)
         decision = payload["decision"]
         message = ruling_message(dict(payload))
         early = False

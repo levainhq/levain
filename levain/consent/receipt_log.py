@@ -36,6 +36,7 @@ Known edges (each stated, none built against):
     fails :func:`verify`;
   - a signed head of size 0 always matches (the empty tree's root is fixed): it attests nothing;
   - the authority ledger (:mod:`levain.consent.ledger`) is not part of this log;
+  - refused_answers rows are not leaves of this log; a raw writer can add or drop them;
   - a writer who also holds an enrolled key can sign a head over anything: the key is the root of trust.
 
 Stdlib only.
@@ -135,9 +136,10 @@ def head_problem(value: Any) -> str | None:
 
 
 def head_refusal(conn: sqlite3.Connection, signed: Mapping[str, Any], *, noun: str) -> str | None:
-    """Inside the caller's write transaction: why the signed head ``signed`` (well-formed, :func:`head_problem`) is
-    not the head of its size over the receipts ``conn`` holds now, or ``None`` when it is. ``noun`` names the
-    signed record in the reason (``answer``, ``ruling``)."""
+    """Inside the caller's transaction (the apply's write; the queue's refused-answer evidence read): why the
+    signed head ``signed`` (well-formed, :func:`head_problem`) is not the head of its size over the receipts
+    ``conn`` holds now, or ``None`` when it is. ``noun`` names the signed record in the reason (``answer``,
+    ``ruling``)."""
     size = signed["size"]
     try:
         data = leaves(conn, size)
