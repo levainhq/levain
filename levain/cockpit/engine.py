@@ -81,7 +81,7 @@ ROW_KINDS = ROW_ENGINE_KINDS + VALUE_ROW_KINDS
 VERSIONED_VALUE_KINDS = ("line", "brief")     # a value write binds to the value's version (§4.4)
 SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a windowed one) gets the box
 SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
-REPLAY_READ_CAP = 2           # past reads (``?at=``) that may run at once: their own pool, never a slot of WRITE_READ_CAP
+REPLAY_READ_CAP = 4           # past reads (``?at=``) that may run at once: their own pool, never a slot of WRITE_READ_CAP
 REPLAY_CACHE_S = 20.0         # a past read of one (panel, minute) is kept this long, so a repeated read does not re-read the source
 REPLAY_CACHE_MAX = 16
 REPLAY_WINDOW_S = 14 * 3600   # a past read (``?at=``) reaches back at most this far (F12 Replay: the last 14 h)
@@ -702,6 +702,8 @@ class Cockpit:
             del self._rowsets[old.rowset]
         states = dict(self._state)
         states.pop(sid, None)
+        for k in [k for k in self._replay_cache if k[0] == sid]:
+            del self._replay_cache[k]
         self._specs = specs
         self._state = states
 
@@ -1057,12 +1059,13 @@ class Cockpit:
             # joiners get the outcome only if it was fully committed; otherwise an error
             _set_once(fl.out, result if committed_ok else refused("the read could not be committed"))
 
-    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any,
+                 allow_snap: bool = False) -> Any:
         """A provider call that is not a panel read (entity, discovery, read_one): one flight on its own
         state (a throwaway when it has none), the outcome handed back as-is."""
         def produce() -> Any:
             out = fn(*args)
-            if not isinstance(out, (Read, Absent, Fault, _Snap)):
+            if not isinstance(out, (Read, Absent, Fault, _Snap) if allow_snap else (Read, Absent, Fault)):
                 return Fault(f"provider returned {type(out).__name__}, not Read/Absent/Fault")
             return out
 
@@ -2083,19 +2086,20 @@ class Cockpit:
         bounded call (the live read's shape: provider data is never touched on the request thread), in the replay
         pool (``REPLAY_READ_CAP`` at once, apart from the write pool). A good answer is kept ``REPLAY_CACHE_S`` under
         (panel, minute), so a client re-reading one minute reads the source once; a refusal or fault is never kept."""
-        key, mono = (spec.id, iso), time.monotonic()
-        with self._lock:
-            hit = self._replay_cache.get(key)
-            if hit is not None and hit[1] is spec and mono - hit[0] < REPLAY_CACHE_S:
-                return hit[2]
-        if self._state_of(spec) is None:
+        key = (spec.id, iso)
+        if self._state_of(spec) is None:             # retirement is checked before the cache: a retired panel is never served
             raw: Any = Fault("this panel was retired while it was being read")
         else:
+            with self._lock:
+                hit = self._replay_cache.get(key)
+                if hit is not None and hit[1] is spec and time.monotonic() - hit[0] < REPLAY_CACHE_S:
+                    return hit[2]
             def once(c: ReadContext) -> Any:
                 return self._normalize(spec, c, spec.read_at(c, iso))     # type: ignore[misc]
-            raw = self._bounded_fresh(("replay", spec.id), spec.timeout_s, once, ctx, pool="replay")
+            raw = self._bounded_fresh(("replay", spec.id), spec.timeout_s, once, ctx, pool="replay", allow_snap=True)
         if isinstance(raw, _Snap):
             if raw.status != "error":
+                mono = time.monotonic()               # the entry's age starts when the read succeeded, not before the provider ran
                 with self._lock:
                     if len(self._replay_cache) >= REPLAY_CACHE_MAX:
                         self._replay_cache.pop(min(self._replay_cache, key=lambda k: self._replay_cache[k][0]))
@@ -2300,7 +2304,7 @@ class Cockpit:
         return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
 
     def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any,
-                       pool: str = "writes") -> Any:
+                       pool: str = "writes", allow_snap: bool = False) -> Any:
         """A source read made inside a write. It never joins a flight another request started: a
         flight that began before this write's own read could hand it a version older than the source.
         The bound is on reads still running (a hung source's threads), not on requests: at most
@@ -2327,7 +2331,7 @@ class Cockpit:
                 return Fault(f"{total_cap} source reads are still running (a hung source?); refused")
             live.append(entry)
         try:
-            return self._bounded(timeout_s, st, fn, *args)
+            return self._bounded(timeout_s, st, fn, *args, allow_snap=allow_snap)
         finally:
             entry[1] = True
 

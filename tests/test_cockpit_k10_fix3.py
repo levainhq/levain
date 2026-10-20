@@ -252,3 +252,52 @@ def test_v2_the_overnight_line_takes_the_newest_wrap(tmp_path, monkeypatch):
     v.errors.pop("wraps", None), v.errors.pop("health", None)
     v.health = SimpleNamespace(episodes_since_wrap=4)
     assert prov._overnight(v)["since"].startswith("2026-10-19")
+
+
+# --- FIX4: the four defects fix3 itself introduced (L3 s78a r2) ------------------------------------------------------
+
+def test_fix4_1_the_replay_pool_is_four_wide():
+    assert eng.REPLAY_READ_CAP == 4
+
+
+def test_fix4_2_only_the_replay_path_may_hand_back_a_snap(tmp_path, monkeypatch):
+    ck, _root, _cdir, _work = _rig(tmp_path, monkeypatch)
+    snap = eng._Snap("error", None, None, [], [], None, "x", None)
+    out = ck._bounded(1.0, None, lambda: snap)
+    assert isinstance(out, eng.Fault) and "_Snap" in out.message
+    assert ck._bounded(1.0, None, lambda: snap, allow_snap=True) is snap
+    assert isinstance(ck._bounded_fresh(("panel", "topology"), 1.0, lambda: snap), eng.Fault)
+
+
+def test_fix4_3_a_cache_entrys_age_starts_when_the_read_succeeded(tmp_path, monkeypatch):
+    ck, _root, _cdir, _work = _rig(tmp_path, monkeypatch)
+    monkeypatch.setattr(eng, "REPLAY_CACHE_S", 0.25)
+    spec = ck._specs["topology"]
+    spec.timeout_s = 5.0
+    real, calls = spec.read_at, []
+
+    def slow(ctx, iso):
+        calls.append(iso)
+        time.sleep(0.4)                       # longer than the cache life: stamped before the read, the entry is born dead
+        return real(ctx, iso)
+    spec.read_at = slow
+    ck.panel("topology", credential_class="none", at=_z(_m(90)))
+    ck.panel("topology", credential_class="none", at=_z(_m(90)))
+    assert len(calls) == 1
+
+
+def test_fix4_4_a_retired_panel_is_never_served_from_the_replay_cache(tmp_path, monkeypatch):
+    ck, _root, _cdir, _work = _rig(tmp_path, monkeypatch)
+    spec = ck._specs["topology"]
+    ck.panel("topology", credential_class="none", at=_z(_m(90)))
+    assert any(k[0] == "topology" for k in ck._replay_cache)
+    ctx = eng.ReadContext(NOW, authority=ck.authority())
+    iso = _m(90).isoformat()
+    with ck._lock:
+        # retire without purging, as the old code did, to prove the lookup itself checks retirement
+        saved = dict(ck._replay_cache)
+        ck._unregister_locked("topology")
+        assert not any(k[0] == "topology" for k in ck._replay_cache)      # the purge
+        ck._replay_cache.update(saved)
+    snap = ck._replay_snap(spec, ctx, iso)
+    assert snap.status == "error" and "retired" in (snap.error or "")
