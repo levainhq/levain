@@ -13,7 +13,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Sequence
 
@@ -759,6 +759,30 @@ def _prose(source: SubstrateSource, kind: str, ident: str) -> Callable[[ReadCont
     return read
 
 
+def _utc_iso(ts: str, add_s: float = 0) -> str | None:
+    """``ts`` as a UTC ISO string with microseconds, so the kernel's string-wise newest-first ordering is the order of the
+    instants whatever offset the store wrote; ``None`` if it does not parse."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return (dt.astimezone(timezone.utc) + timedelta(seconds=add_s)).isoformat(timespec="microseconds")
+
+
+def _job_at(r: dict[str, Any], lease_s: int) -> str:
+    """When a job's result EXISTS, as a UTC instant: its finish for a terminal job; for a failed job with no finish (the
+    store projected a lease-expired record as failed) the instant its lease ran out, ``created_at + lease_s``
+    (``JobStore._lease_expired``); its creation while it is still pending or running. An unparseable stamp is kept as is."""
+    if r["status"] in ("done", "failed"):
+        if r.get("finished_at"):
+            return _utc_iso(r["finished_at"]) or r["finished_at"]
+        expired = _utc_iso(r["created_at"], lease_s)
+        if expired:
+            return expired
+    return _utc_iso(r["created_at"]) or r["created_at"]
+
+
 def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
     from levain.jobs import JobStoreCorruptError
 
@@ -769,14 +793,15 @@ def _jobs(job_store: Any) -> Callable[[ReadContext], Result]:
             recs = job_store.list_recent(ctx.now.isoformat(), 50)
         except JobStoreCorruptError as exc:
             return Fault(f"job store unreadable: {exc}")
+        ats = {r["job_id"]: _job_at(r, job_store.lease_s) for r in recs}
+        recs = sorted(recs, key=lambda r: ats[r["job_id"]], reverse=True)   # newest result first (UTC strings: instant order)
         rows = tuple(
             RowIn(
                 id=f"job:{r['job_id']}", title=f"{r['verb']} {r['status']}",
                 body=json.dumps(r.get("result")) if r.get("result") is not None else (r.get("error") or None),
                 # `at` is when the result EXISTS: the job's finish for a terminal job (so Results orders and words by it),
                 # its creation while it is still pending or running
-                facets={"job_status": r["status"], "verb": r["verb"],
-                        "at": (r.get("finished_at") if r["status"] in ("done", "failed") else None) or r["created_at"]},
+                facets={"job_status": r["status"], "verb": r["verb"], "at": ats[r["job_id"]]},
                 stored={"job_id": r["job_id"], "verb": r["verb"], "status": r["status"],
                         "created_at": r["created_at"], "started_at": r.get("started_at"),
                         "finished_at": r.get("finished_at"), "result": r.get("result"), "error": r.get("error")},
@@ -1057,9 +1082,12 @@ def _limit_lines() -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
     try:
         mod = importlib.import_module("levain.consent.limits")
         fn = getattr(mod, "panel", None)
-    except ImportError:
-        return "absent", {}
-    except Exception:  # noqa: BLE001 - a module that exists and cannot be loaded is not a budget being watched
+    except ModuleNotFoundError as exc:
+        # only THIS module (or a parent package) missing is "absent"; a dependency missing inside it is present and broken
+        if exc.name in ("levain.consent.limits", "levain.consent", "levain"):
+            return "absent", {}
+        return "unreadable", {}
+    except Exception:  # noqa: BLE001 - a module that exists and cannot be loaded (an ImportError included) is not a budget being watched
         return "unreadable", {}
     if not callable(fn):
         return "absent", {}

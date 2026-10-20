@@ -460,3 +460,57 @@ def test_a_bare_install_says_one_line_per_section_and_draws_no_empty_card(tmp_pa
     assert g["rows"] == 0 and g["tabs"] == 0, g
     assert "No results yet" in g["results"], g
     assert g["zone"].startswith("Results & edits"), g
+
+
+def test_results_list_newest_finish_first_even_when_the_store_orders_by_filing(tmp_path, monkeypatch):
+    from levain.jobs import JobStore
+
+    root, src, _ids = _install(tmp_path)
+    store = JobStore(root / ".levain" / "jobs.json")
+    now = datetime.now(timezone.utc)
+    iso = lambda mins: (now - timedelta(minutes=mins)).isoformat()   # noqa: E731
+    store.create("slow", "long check", iso(200)); store.claim_running("slow", iso(200))
+    store.finish("slow", "done", {"ok": True}, None, iso(1))                    # filed first, finished last
+    store.create("fast", "short check", iso(10)); store.claim_running("fast", iso(10))
+    # finished 5 min ago but written in a +14:00 offset: a string sort puts it after the 1-minute-ago UTC one wrongly
+    store.finish("fast", "done", {"ok": True}, None, (now - timedelta(minutes=5)).astimezone(timezone(timedelta(hours=14))).isoformat())
+    store.create("mid", "mid check", iso(20)); store.claim_running("mid", iso(20))
+    store.finish("mid", "done", {"ok": True}, None, (now - timedelta(minutes=2)).astimezone(timezone(timedelta(hours=-9))).isoformat())
+    p = build_default_cockpit(src, job_store=store).panel("jobs", credential_class="none")
+    assert [r["title"] for r in p["rows"]] == ["long check done", "mid check done", "short check done"], [r["title"] for r in p["rows"]]
+
+
+def test_a_lease_expired_job_gets_the_instant_its_lease_ran_out_as_its_finish(tmp_path, monkeypatch):
+    from levain.jobs import JobStore
+
+    root, src, _ids = _install(tmp_path)
+    store = JobStore(root / ".levain" / "jobs.json")
+    now = datetime.now(timezone.utc)
+    created = now - timedelta(seconds=store.lease_s + 3600)
+    store.create("lost", "lost check", created.isoformat()); store.claim_running("lost", created.isoformat())
+    store.create("ok", "ok check", (now - timedelta(minutes=90)).isoformat())
+    store.claim_running("ok", (now - timedelta(minutes=90)).isoformat())
+    store.finish("ok", "done", {"ok": True}, None, (now - timedelta(minutes=30)).isoformat())
+    p = build_default_cockpit(src, job_store=store).panel("jobs", credential_class="none")
+    by = {r["title"]: r for r in p["rows"]}
+    lost = by["lost check failed"]
+    assert datetime.fromisoformat(lost["facets"]["at"]) == created + timedelta(seconds=store.lease_s), lost["facets"]
+    assert lost["facets"]["at"] != created.isoformat()
+    assert [r["title"] for r in p["rows"]] == ["ok check done", "lost check failed"]
+
+
+def test_an_import_error_from_inside_the_limits_module_is_present_and_broken_not_absent(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    import builtins
+    import importlib
+
+    real = importlib.import_module
+
+    def fake(name, *a, **k):
+        if name == "levain.consent.limits":
+            raise ImportError("No module named 'some_dependency'", name="some_dependency")
+        return real(name, *a, **k)
+    monkeypatch.delitem(sys.modules, "levain.consent.limits", raising=False)
+    monkeypatch.setattr(importlib, "import_module", fake)
+    assert all(v["limits"] == {"counting": False} for v in _views(src).values())
+    del builtins
