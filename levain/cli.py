@@ -1677,8 +1677,8 @@ def _add_consent_receipts_parser(consent_sub: argparse._SubParsersAction) -> Non
                                "only one to one from Levain's own exact value, by a rule that selects on that field "
                                "alone, never from or to a call Levain did not decide; each renamed field is marked "
                                "synthesized: your export vouches for that mapping. The hash covers the renamed "
-                               "receipt, and each receipt_id includes the file's sha256, so one queue exported with "
-                               "two names files is two distinct sets of receipts.")
+                               "receipt, and each receipt_id includes a digest of the file's rules, so one queue "
+                               "exported with two different names files is two distinct sets of receipts.")
     export_p.set_defaults(func=_cmd_consent_receipts_export)
 
 
