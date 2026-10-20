@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- Setting your state line, from the cockpit, the web page, the terminal view, the phone app or
+  `levain state`, now also saves it once, word for word, as a memory episode tagged `felt,state`, so
+  your next consolidate can read how you said things were. Before, only the live line changed and
+  your memory never saw it. Setting the same words again while the line is still live, or clearing it, saves nothing new.
+  If the memory store is missing or busy, the line is still set: `levain state` prints a note and the
+  web response says `episode: failed`, and setting the same words again delivers the episode.
+- That saved copy outlives the line. The line itself disappears after 12 hours or on
+  `levain state --clear`; the episode stays in memory until you delete it. To delete it, tombstone
+  it from the Recent episodes panel of the writable cockpit (`levain web --write`) or the terminal view.
+
 ## [0.11.11] — 2026-10-20
 
 ### Added
