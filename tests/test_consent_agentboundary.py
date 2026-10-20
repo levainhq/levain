@@ -931,7 +931,9 @@ def test_an_authorised_answer_after_the_hold_keeps_expired_and_carries_the_stale
     r, exported = _expired_receipt(queue, clock.now + timedelta(days=2))
     assert r["refusal"] == {"verdict": "expired", "reason_code": "approval-window-elapsed"}
     assert r["execution"]["status"] == "blocked" and r["execution"]["completed_at"] == expired_at
-    assert r["approval"]["approver"] == {"id": f"ssh-key:{rkeys['laptop'].fp}"}   # `late` is not a role case (D4)
+    # his own authorised key, refused only for its timing: named the operator (head ruling 1019+45, built 1019+49)
+    assert r["approval"]["approver"] == {"id": f"ssh-key:{rkeys['laptop'].fp}", "role": "operator"}
+    assert r["provenance"]["approval.approver.role"] == "synthesized"
     assert r["approval"]["approved_at"] == payload["signed_at"]
     # the receipt is not earlier than the evidence it records
     assert r["issued_at"] == kept["refused_at"] and r["provenance"]["issued_at"] == "inferred"

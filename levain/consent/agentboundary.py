@@ -48,7 +48,7 @@ What each queue state becomes (``policy.decision`` / ``execution.status`` / ``re
   stays expired ``approval-window-elapsed``. Both carry an ``approval`` block: approver ``ssh-key:<signer_fp>``
   (inferred), ``approved_at`` the answer's ``signed_at`` (inferred: the signer's claim), a context naming it a
   refused answer with its key's standing and levain's reason. The approver gets ``role: operator`` only for a key
-  the authority log held, refused for its class or a plain revocation; an unenrolled key (anyone can make one) or a
+  the authority log held, refused for its class, a plain revocation or its timing (``late``); an unenrolled key (anyone can make one) or a
   compromised one gets no role (the schema's ``role`` is optional) and the context says ``enrolled`` / ``compromised``.
   The action stays ``blocked``. A refused deny is never approval evidence. ``issued_at`` is moved to the refusal's
   time when it is later than the row's.
@@ -180,9 +180,10 @@ _PRE_SQL = ("SELECT request_id, tool_use_id FROM calls WHERE phase = 'pre' AND r
 _REFUSED_SQL = ("SELECT seq, request_id, kind, refused_at, reason_code, subreason, enrolled, detail, decision, "
                 "signer_fp, signed_at FROM refused_answers ORDER BY seq")
 _REFUSED_REASONS = frozenset({"approver-not-authorized", "approval-window-elapsed"})
-# the refusals of a key the operator holds (enrolled, refused only for its class or a plain revocation): the only ones
-# whose signer is named an operator; an unenrolled key anyone can make, and a compromised one may be a thief's
-_OPERATOR_SUBREASONS = frozenset({"class", "revoked"})
+# the refusals of a key the operator holds (enrolled, refused only for its class, a plain revocation, or its timing: a
+# `late` answer is kept only after its key passed authority): the only ones whose signer is named an operator; an
+# unenrolled key anyone can make, and a compromised one may be a thief's
+_OPERATOR_SUBREASONS = frozenset({"class", "revoked", "late"})
 # a refused answer kept this long after an expired row counts as its evidence: SETTLE less the export clock's slack,
 # so one written after an export that took the row (``now - created >= SETTLE``, ``now`` at most the slack ahead of
 # the writer's clock) is past the window and changes nothing
