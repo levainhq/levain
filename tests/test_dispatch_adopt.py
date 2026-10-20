@@ -191,6 +191,20 @@ def test_the_staged_commit_is_deterministic(repo, jstore, cstore, tmp_path):
     assert a == b and shown == f"levain dispatch|levain dispatch|{repo[1]}"
 
 
+def test_staging_again_returns_the_held_commit_and_never_moves_a_ref(repo, jstore, cstore, tmp_path):
+    from levain.dispatch import DispatchError
+
+    job = verified_job(jstore, cstore, repo)
+    tree = make_tree(repo[0], repo[1], A_FIX, tmp_path)
+    kw = dict(job_id=job.id, run=0, contract_digest=job.digest, base=repo[1], tree=tree)
+    a = stage_commit(str(repo[0]), verified_at=VERIFIED_AT, **kw)
+    assert stage_commit(str(repo[0]), verified_at=VERIFIED_AT, **kw) == a
+    later = utc_stamp(NOW + timedelta(minutes=7))
+    with pytest.raises(DispatchError, match="never moved"):
+        stage_commit(str(repo[0]), verified_at=later, **kw)
+    assert git(repo[0], "rev-parse", staged_ref(job.id, 0)) == a
+
+
 # --- (a) crash after the swap, before adopted ----------------------------------------------------------------------
 
 def test_a_crash_after_the_swap_recovers_to_adopted_moving_nothing(jstore, cstore, repo, log, keys, tmp_path,
