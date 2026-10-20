@@ -976,11 +976,24 @@
   const replaySig = () => [R.at, R.cat, R.err, R.busy, R.ret];
   function abortFlight() { R.tok++; if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
   function clearReplay() { R.at = null; R.cat = null; R.value = null; R.anchor = null; R.busy = false; R.err = ""; R.ret = false; R.keyed = false; R.refocus = false; R.rtok++; }
-  // the live read behind the paused one: the page's refetch (cockpit_view.refetchPanel); always a promise
+  // the live read behind the paused one: the page's refetch (cockpit_view.refetchPanel). Resolves {ok: true} once the live value is drawn ("applied", or
+  // "fault", which draws the fault as live does), else {ok: false, msg}: a rejection, a throw, a `false` (the board was redrawn under the read) or a
+  // "superseded" that no newer read settled. A superseded read is followed by asking again (the newer owner is superseded in turn), at most 3 times.
   function resumeLive() {
     const rp = R.opts && R.opts.replay;
-    if (rp && typeof rp.resume === "function") { try { const p = rp.resume(); if (p && typeof p.then === "function") return p.then(() => {}, () => {}); } catch (_) { /* the next poll reads */ } }
-    return Promise.resolve();
+    if (!rp || typeof rp.resume !== "function") return Promise.resolve({ ok: true });
+    const msgOf = (e) => (e && e.message ? e.message : String(e));
+    const attempt = (n) => {
+      let p;
+      try { p = rp.resume(); } catch (e) { return Promise.resolve({ ok: false, msg: msgOf(e) }); }
+      if (!p || typeof p.then !== "function") return Promise.resolve({ ok: true });
+      return p.then((res) => {
+        if (res === false) return { ok: false, msg: "the live read was not drawn" };
+        if (res === "superseded") return n < 3 ? attempt(n + 1) : { ok: false, msg: "the live read was superseded" };
+        return { ok: true };
+      }, (e) => ({ ok: false, msg: msgOf(e) }));
+    };
+    return attempt(1);
   }
   // silent: the caller is already repainting and is leaving (the view went away, or replay did): the state is dropped now, nothing is kept.
   // Otherwise (Live, Esc, Back to live) the committed frame stays on screen, labelled "returning to live…", until the live read lands.
@@ -988,7 +1001,8 @@
     abortFlight();
     const had = R.at !== null, frame = R.value !== null && R.cat !== null;
     if (!had && !R.ret && R.err === "") return;
-    if (R.ret && !had) { if (silent) { clearReplay(); } return; }       // already on the way back
+    if (R.ret && !had && !R.err) { if (silent) { clearReplay(); } return; }       // already on the way back (a failed return is retried)
+    if (R.ret && !had && silent) { clearReplay(); return; }
     if (silent || !had || !frame) {
       clearReplay();
       if (had) resumeLive();
@@ -996,9 +1010,15 @@
       return;
     }
     const rt = ++R.rtok;
-    R.at = null; R.busy = false; R.err = ""; R.ret = true; R.anchor = null; R.keyed = false; R.refocus = false;
+    // R.anchor stays until the live read lands: a scrub made while returning is windowed by the live clock, never by the historical frame's as_of
+    R.at = null; R.busy = false; R.err = ""; R.ret = true; R.keyed = false; R.refocus = false;
     if (R.opts && R.opts.repaint) R.opts.repaint();
-    resumeLive().then(() => { if (R.rtok !== rt || !R.ret) return; clearReplay(); if (R.opts && R.opts.repaint) R.opts.repaint(); });
+    resumeLive().then((res) => {
+      if (R.rtok !== rt || !R.ret) return;
+      if (res.ok) clearReplay();
+      else R.err = "could not return to live: " + res.msg + " (Live tries again)";   // the frame stays, labelled; the Live pill retries
+      if (R.opts && R.opts.repaint) R.opts.repaint();
+    });
   }
   // one past read: T goes out once, the answer is kept only if no newer request superseded it (the token), and the frame already committed keeps its
   // own label while this one loads. A 400 that names the window re-anchors on a fresh live read and retries once.
@@ -1088,7 +1108,8 @@
       const t = ev.target, tag = t && t.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
       const d = root.document, inCard = [t, d.activeElement].some((n) => n && n.closest && n.closest(".k7-card, .tv"));
-      if (!inCard && d.querySelector(".modal-overlay, dialog[open], [role=\"dialog\"], [aria-modal=\"true\"]")) return;
+      const shown = (n) => (typeof n.checkVisibility === "function" ? n.checkVisibility() : n.getClientRects().length > 0);
+      if (!inCard && Array.from(d.querySelectorAll(".modal-overlay, dialog[open], [role=\"dialog\"], [aria-modal=\"true\"]")).some(shown)) return;
       leaveReplay(false);
     });
   }
@@ -1191,7 +1212,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { keep(LENS_KEY, id); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
+    bar.append(seg("Lens", [["work", "Work"], ["agents", "Agents"]], which, (id) => { if (id !== which && replaying()) leaveReplay(true); keep(LENS_KEY, id); if (o.repaint) o.repaint(); }), which === "agents" ? strip(v, which) : stripWork(v));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
@@ -1201,14 +1222,15 @@
     if (o.replay && replaying()) {
       const at = (ms) => clock(new Date(ms).toISOString());
       // requested is not committed: "live paused" only over the value whose as_of is T; while a read is out the badge says what is drawn
-      const text = R.ret ? "returning to live…"
+      const text = R.ret && R.err ? "could not return to live — showing replay " + (R.cat !== null ? at(R.cat) : "")
+        : R.ret ? "returning to live…"
         : R.busy ? "loading replay " + at(R.at) + "… " + (past && R.cat !== null ? "showing replay " + at(R.cat) : "showing live")
         : "replay " + at(R.at) + " — live paused";
       const b = el("div", "tv-rbadge", text);
       b.setAttribute("role", "status");
       const wrapB = el("div", "tv-rbadgewrap");
       wrapB.append(b);
-      if (!R.ret) {
+      if (!R.ret || R.err) {
         const back = el("button", "tv-rback", "Back to live");
         back.type = "button";
         back.addEventListener("click", () => leaveReplay(false));

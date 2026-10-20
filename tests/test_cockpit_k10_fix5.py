@@ -298,3 +298,85 @@ def test_a_key_that_ends_live_sets_no_refocus_for_the_next_repaint(tmp_path, mon
                                {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"}, {"until": "document.querySelector('#k7-sessions .tv.tv-replaying, #k7-sessions .tv[data-lens=agents]')"},
                                SLEEP(300), {"eval": "document.activeElement && document.activeElement.classList.contains('tv-rtrack')"}])
     assert out[-1] is False, out
+
+
+# --- FIX6: the return to live (anchor kept, failure kept visible), Esc counts visible overlays, a lens switch leaves replay --------------------
+
+
+_H = "document.querySelector('#h6 %s')"
+# a host the test owns: the real topology module and transport, with a `resume` the test steers (applied / false / reject / hang / superseded)
+HOST = ("""(async () => { const V = window.LevainTopologyView; const host = document.createElement('div'); host.id = 'h6'; document.body.appendChild(host);
+  window.__mode = 'applied'; window.__resumes = 0; window.__sup = 0;
+  const opts = {replay: {readJson: window.LevainCockpitTransport.readJson, resume: () => { window.__resumes++; const m = window.__mode;
+    if (m === 'reject') return Promise.reject(new Error('boom')); if (m === 'false') return Promise.resolve(false);
+    if (m === 'hang') return new Promise(() => {}); if (m === 'sup') return Promise.resolve('superseded');
+    if (m === 'sup-once') return Promise.resolve(window.__sup++ === 0 ? 'superseded' : 'applied'); return Promise.resolve('applied'); }},
+    repaint: () => { host.replaceChildren(V.render(V.replayValue() || window.__live, opts)); }};
+  const pl = await window.LevainCockpitTransport.readJson('/cockpit/panel/topology.json?profile=full'); window.__live = pl.value; opts.repaint(); return 1; })()""")
+H_INFO = ("JSON.stringify({badge: (%s || {}).textContent || null, err: (%s || {}).textContent || null, replaying: window.LevainTopologyView.replaying(), "
+          "rshown: (%s || {dataset: {}}).dataset.rshown || null, max: +%s.getAttribute('aria-valuemax'), resumes: window.__resumes, "
+          "urls: (window.__urls || []).filter(u => u.includes('at=')).length})") % (
+    _H % ".tv-rbadge", _H % ".tv-rerr", _H % ".tv", _H % ".tv-rtrack")
+H_SCRUB = _scrub(0.4).replace("#k7-sessions .tv-rtrack", "#h6 .tv-rtrack")
+H_LIVE = "document.querySelector('#h6 .tv-live').click(); 1"
+H_PAUSED = {"until": "((document.querySelector('#h6 .tv-rbadge') || {textContent: ''}).textContent).includes('live paused')", "ms": 8000}
+
+
+def _host_run(tmp_path, monkeypatch, steps, tag="a"):
+    (tmp_path / tag).mkdir(exist_ok=True)
+    _root, src = _sessions_fixture(tmp_path / tag, monkeypatch)
+    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": SPY}, *steps])
+
+
+@needs_browser
+def test_a_scrub_while_returning_to_live_keeps_the_live_anchors_window(tmp_path, monkeypatch):
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": H_INFO}, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE}, SLEEP(200), {"eval": H_INFO}])
+    before, mid = json.loads(out[-5]), json.loads(out[-1])
+    assert mid["badge"] == "returning to live…", mid
+    assert abs(mid["max"] - before["max"]) <= 120000, (before, mid)          # the window is the live clock's, not the historical frame's as_of (hours earlier)
+
+
+@needs_browser
+def test_a_return_to_live_that_resolves_false_or_rejects_keeps_the_frame_names_the_error_and_the_live_pill_retries(tmp_path, monkeypatch):
+    for mode in ("false", "reject"):
+        out = _host_run(tmp_path, monkeypatch, tag=mode, steps=[{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = '%s'; 1" % mode}, {"eval": H_LIVE},
+                                                {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 8000}, {"eval": H_INFO},
+                                                {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+        failed, done = json.loads(out[-5]), json.loads(out[-1])
+        assert failed["err"].startswith("could not return to live: "), failed
+        assert failed["replaying"] is True and failed["rshown"] not in (None, "live"), failed                    # the past frame stays, marked; the stale live value is never painted
+        assert done["replaying"] is False and done["badge"] is None and done["err"] is None, done                 # the retry lands
+
+
+@needs_browser
+def test_a_superseded_live_read_is_followed_and_only_a_standing_one_is_an_error(tmp_path, monkeypatch):
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'sup-once'; 1"}, {"eval": H_LIVE},
+                                            {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    done = json.loads(out[-1])
+    assert done["resumes"] == 2 and done["replaying"] is False, done                                              # asked again, the second landed
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'sup'; 1"}, {"eval": H_LIVE},
+                                            {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 8000}, {"eval": H_INFO}], tag="b")
+    stuck = json.loads(out[-1])
+    assert stuck["replaying"] is True and "superseded" in stuck["err"], stuck
+
+
+@needs_browser
+def test_escape_outside_the_card_ignores_a_hidden_dialog_but_not_a_visible_one(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    esc = "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return window.LevainTopologyView.replaying(); })()"
+    hidden = "(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.style.display = 'none'; document.body.appendChild(d); return 1; })()"
+    shown = ("(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.id = 'dlg'; d.style.cssText = 'position:fixed;top:0;left:0;width:50px;height:50px'; "
+             "document.body.appendChild(d); return 1; })()")
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": shown}, {"eval": esc}, {"eval": "document.getElementById('dlg').remove(); 1"},
+                               {"eval": hidden}, {"eval": esc}])
+    assert out[-4] is True, out                                   # a visible dialog keeps its own Esc
+    assert out[-1] is False, out                                  # a hidden one does not swallow the card's
+
+
+@needs_browser
+def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_the_new_lens(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "document.querySelector('#k7-sessions [data-tv=agents]').click(); 1"},
+                               {"until": "document.querySelector('#k7-sessions .tv[data-lens=agents]')"}, SLEEP(300), {"eval": INFO}])
+    got = json.loads(out[-1])
+    assert got["replaying"] is False and got["paused"] is False and got["badge"] is None and got["rat"] is None, got
