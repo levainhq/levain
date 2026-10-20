@@ -128,19 +128,77 @@ def test_git_config_global_file_is_write_denied(tmp_path, monkeypatch) -> None:
         assert conf.crown_jewel_reason(policy, spelling) is not None
 
 
-def test_git_config_global_dev_null_and_relative_values_add_nothing(tmp_path, monkeypatch) -> None:
+def _rebuild(tmp_path: Path) -> conf.CrownJewelsPolicy:
+    return conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
+                             deny_standard_creds=False)
+
+
+def test_git_config_global_dev_null_exactly_adds_nothing(tmp_path, monkeypatch) -> None:
     _clear_git_env(monkeypatch)
     baseline = _policy(tmp_path, monkeypatch)
-
-    def rebuild() -> conf.CrownJewelsPolicy:
-        return conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
-                                 deny_standard_creds=False)
-
-    for value in ("/dev/null", "relative/gitconfig"):
+    for value in ("/dev/null", "/dev/./null"):
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", value)
-        assert rebuild().persistence_write_files == baseline.persistence_write_files
-    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/xdg")
-    assert rebuild().persistence_write_subtrees == baseline.persistence_write_subtrees
+        assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+
+
+@pytest.mark.parametrize("value", ["/dev/shm/agent_gitcfg", "/dev/../tmp/levain-b2/operator.gitconfig"])
+def test_git_config_global_elsewhere_under_dev_is_protected(tmp_path, monkeypatch, value) -> None:
+    # git reads the real file: /dev/shm is a writable tmpfs on Linux, and /dev/.. is not /dev.
+    _clear_git_env(monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", value)
+    policy = _policy(tmp_path, monkeypatch)
+    assert Path(value) in policy.persistence_write_files
+    assert conf.crown_jewel_reason(policy, Path(os.path.realpath(value))) is not None
+
+
+@pytest.mark.parametrize("var,value", [("GIT_CONFIG_GLOBAL", "relative/gitconfig"),
+                                       ("XDG_CONFIG_HOME", "relative/xdg")])
+def test_a_relative_git_config_location_refuses_the_floor(tmp_path, monkeypatch, var, value) -> None:
+    # git resolves it against its own working directory, which for the cockpit is the workspace.
+    _clear_git_env(monkeypatch)
+    monkeypatch.setenv(var, value)
+    with pytest.raises(conf.ConfinementError, match=rf"\${var} is the relative path.*fail-closed"):
+        _policy(tmp_path, monkeypatch)
+
+
+def test_files_git_reports_reading_are_write_denied(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    home = tmp_path / "home"
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    seen: list[dict] = []
+
+    def fake_git(args, environ):
+        seen.append(dict(environ))
+        if "--list" in args:
+            return f"file:{home / '.gitconfig'}\0include.path\0file:{cfg / 'inc.cfg'}\0x.y\0command line:\0a.b\0"
+        if "--get-regexp" in args:
+            return (f"file:{home / '.gitconfig'}\0include.path\ninc.cfg\0"
+                    f"file:{home / '.gitconfig'}\0includeif.gitdir:~/w/.path\n~/cond.cfg\0"
+                    f"file:{cfg / 'inc.cfg'}\0include.path\n{cfg / 'absent.cfg'}\0")
+        if "core.attributesFile" in args:
+            return "~/attrs\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(conf, "_run_git_config", fake_git)
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+    for derived in (home / ".gitconfig", cfg / "inc.cfg", home / "inc.cfg", home / "cond.cfg",
+                    cfg / "absent.cfg", home / "attrs"):
+        for spelling in (derived, Path(os.path.realpath(derived))):
+            assert spelling in policy.persistence_write_files, spelling
+            assert f'(literal "{spelling}")' in text
+    # git is asked with the operator's environment.
+    assert seen and all(e.get("HOME") == str(home) for e in seen)
+
+
+def test_a_missing_or_failing_git_adds_nothing(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    baseline = _policy(tmp_path, monkeypatch)
+    monkeypatch.setattr(conf, "_run_git_config", lambda args, environ: None)
+    assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
+    monkeypatch.setattr(conf, "_run_git_config", lambda args, environ: "")
+    assert _rebuild(tmp_path).persistence_write_files == baseline.persistence_write_files
 
 
 def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) -> None:

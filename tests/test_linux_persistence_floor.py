@@ -316,3 +316,33 @@ def test_an_absent_tree_under_a_workspace_subdir_this_process_cannot_write_refus
             C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
     finally:
         sub.chmod(0o755)
+
+
+def _masks(argv: list[str]) -> list[str]:
+    return [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == "/dev/null"]
+
+
+def test_an_absent_git_config_global_outside_home_is_masked_read_only(home: Path, monkeypatch) -> None:
+    # L3 r1 (complement + codex HIGH): the persistence files never reached the bwrap plan, so outside
+    # $HOME's frozen top level bash could plant the config the cockpit's git status reads.
+    ent, ws = _entity(home)
+    cfg = Path("/tmp/x/operator.gitconfig")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    host = str(C._host_spelling(cfg))
+    if cfg.exists():
+        assert host in _ro_binds(argv)
+    else:
+        assert host in _masks(argv)
+
+
+def test_an_existing_git_config_global_outside_home_is_bound_read_only(
+        home: Path, tmp_path: Path, monkeypatch) -> None:
+    ent, ws = _entity(home)
+    cfg = tmp_path / "elsewhere" / "operator.gitconfig"
+    cfg.parent.mkdir()
+    cfg.write_text("[user]\n\tname = x\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    argv, _ = C._bwrap_plan(build_policy(ent, workspace=ws, deny_standard_creds=False))
+    assert str(C._host_spelling(cfg)) in _ro_binds(argv)
+    assert argv.index(str(C._host_spelling(cfg))) < _first_mask(argv)
