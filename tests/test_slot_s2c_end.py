@@ -107,12 +107,26 @@ def slot_state(L: Path, slot: SlotId, session: str = SESSION, lease_seq: int = L
         session=session if state == "leased" else None)))
 
 
+class _Exited:
+    """stage's threaded reader, whose ``wait()`` answers the exit status END requires (0: the thread ended)."""
+
+    def __init__(self, reader) -> None:
+        self._r = reader
+
+    def kill(self) -> None:
+        self._r.kill()
+
+    def wait(self) -> int:
+        self._r.wait()
+        return 0
+
+
 def thread_run_as(calls: list | None = None):
     """stage's in-process runner in the session-uid reader's shape (the drop is the VM's)."""
     def run_as(uid, gid, fn, wfd, keep=()):
         if calls is not None:
             calls.append((uid, gid, tuple(keep)))
-        return stage.thread_run_as(uid, gid, fn, wfd)
+        return _Exited(stage.thread_run_as(uid, gid, fn, wfd))
     return run_as
 
 

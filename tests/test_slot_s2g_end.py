@@ -55,15 +55,15 @@ class _Done:
     def kill(self) -> None:
         pass
 
-    def wait(self) -> None:
-        pass
+    def wait(self) -> int:
+        return 0
 
 
 def cannot_read_run_as(calls: list):
-    """A session-uid reader whose uid cannot open the file: it answers stage's ``staging-open-failed``."""
+    """A session-uid reader whose uid cannot open the file (EACCES): it answers END's ``link-unreadable``."""
     def run_as(uid, gid, fn, wfd, keep=()):
         calls.append((uid, gid, tuple(keep)))
-        name = b"staging-open-failed"
+        name = end_mod.LINK_UNREADABLE.encode("ascii")
         os.write(wfd, b"R" + bytes([len(name)]) + name)
         os.close(wfd)
         return _Done()
