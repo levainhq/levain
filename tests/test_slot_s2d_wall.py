@@ -469,8 +469,11 @@ GOLDEN_E0 = (
     "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin", "--symlink", "usr/lib", "/lib",
     "--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
     "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
+    "--perms", "0755", "--dir", "/var/levain", "--perms", "0711", "--dir", "/var/levain/live",   # F4 (lane K5)
     "--bind", "/var/levain/live/" + SESSION, "/var/levain/live/" + SESSION,
+    "--perms", "0755", "--dir", "/run/levain", "--perms", "0755", "--dir", "/run/levain/gw",
     "--bind", "/run/levain/gw/slot0", "/run/levain/gw/slot0",
+    "--perms", "0755", "--dir", "/run/levain/qb",
     "--bind", "/run/levain/qb/slot0", "/run/levain/qb/slot0",
     "--chdir", "/",
 )
@@ -578,7 +581,8 @@ def test_other_slot_cannot_list_session_plan_half():
         assert b.gid not in a.groups and a.gid not in b.groups
     a = wall.linux_view_args(E0, SESSION, kind="interactive", queue_grant=True, host_links=LINKS)
     b = wall.linux_view_args(E1, OTHER, kind="interactive", queue_grant=True, host_links=LINKS)
-    assert "/var/levain/live" not in a and "/var/levain" not in a
+    # L and L/live are only fresh empty --dir rows in the view (lane K5, F4), never a bind of the host's dirs
+    assert all(a[i - 1] == "--dir" for i, x in enumerate(a) if x in ("/var/levain", "/var/levain/live"))
     assert not any(OTHER in x or "slot1" in x for x in a) and not any(SESSION in x or "slot0" in x for x in b)
 
 

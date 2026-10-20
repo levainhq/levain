@@ -43,7 +43,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from levain.slot import Refused
 
@@ -445,6 +445,33 @@ def cgroup_dir(slot, session: str, leaf: Optional[str] = None) -> str:
     return base if leaf is None else f"{base}/{leaf}"
 
 
+def view_dir_modes() -> Dict[str, int]:
+    """The mode of every root-made Linux store and run dir, from layout.py's §2.1 / §2.2 rows (one source):
+    what :func:`linux_view_args` gives the view's copy of each ancestor of a bind."""
+    from levain.slot.layout import base_run_rows, base_store_rows
+
+    # DECISION: the operator name only sets L/queue/answers' owner, which no view ancestor is; a placeholder.
+    rows = base_store_rows("linux", operator="_levain_view") + base_run_rows("linux")
+    return {str(r.path): r.mode for r in rows if r.kind == "dir"}
+
+
+def _view_ancestors(target: PurePosixPath, base: PurePosixPath, made: set) -> List[str]:
+    """``--perms <mode> --dir <d>`` for each dir from ``base`` down to ``target``'s parent, top first, each
+    with its layout mode, skipping one already made (``made``). bwrap otherwise makes a bind's missing
+    parents ``root:root 0700``, so the slot cannot traverse to its own ``<S>`` or socket dir (VM run
+    s2-linux F4: the clone exited 121). A dir with no layout row is ``view-path-off-list``."""
+    modes = view_dir_modes()
+    out: List[str] = []
+    for d in [base] + [p for p in reversed(target.parents) if base in p.parents]:
+        if str(d) in made:
+            continue
+        if str(d) not in modes:
+            raise Refused("view-path-off-list", f"{d}: no layout row gives the view its mode (§2.1, §2.2)")
+        out += ["--perms", f"{modes[str(d)]:04o}", "--dir", str(d)]
+        made.add(str(d))
+    return out
+
+
 def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_links: Mapping[str, Optional[str]],
                     ro_prefixes: Optional[Iterable[str]] = None) -> Tuple[str, ...]:
     """The bwrap arguments for the §9.2 root view, an ALLOW-LIST: anything not named here is absent from the
@@ -452,16 +479,16 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
 
     ro ``/usr`` ``/etc`` + the vendor and import prefixes (bound only where ``/usr`` does not already hold
     them) · ``/bin /sbin /lib /lib64`` as the host's links into ``/usr`` · a fresh ``/proc`` (a new PID
-    namespace) · ``/dev`` bound with a fresh ``/dev/shm`` · tmpfs ``/tmp /var/tmp /run`` · rw ``<S>`` · the
-    slot's socket dirs: ``R/gw/slot<n>/`` (egress), ``R/qb/slot<n>/`` (queue grant), ``R/planner/slot<n>/``
-    (planner kind). No ``/sys``. Per-session IPC, PID and UTS namespaces (§9.1, plan §2e 7); bwrap always
+    namespace) · ``/dev`` bound with a fresh ``/dev/shm`` · tmpfs ``/tmp /var/tmp /run`` · ``L``, ``L/live``,
+    ``R`` and ``R/<grant>`` at their layout modes (:func:`_view_ancestors`) · rw ``<S>`` · the slot's socket dirs:
+    ``R/gw/slot<n>/`` (egress), ``R/qb/slot<n>/`` (queue grant), ``R/planner/slot<n>/`` (planner kind). No ``/sys``. Per-session IPC, PID and UTS namespaces (§9.1, plan §2e 7); bwrap always
     makes the mount namespace. The network namespace is joined by ``nsenter``, never unshared here.
     [not run: R-L1 built this view with hand mounts + ``pivot_root``; bwrap run AS ROOT building it (``/dev``
     recursion, no ``--cap-*`` so the slot's own nested bwrap keeps a full bounding set) is a 2g row.]
 
     A ro prefix off the allow-list, a socket grant the slot's class or kind does not carry, or a host link
     that does not point into ``/usr`` = ``view-path-off-list``, by name."""
-    from levain.slot.layout import IMPORT_TREE, RUN
+    from levain.slot.layout import IMPORT_TREE, RUN, STORE
     from levain.slot.root_tree import VENDOR_PREFIX
 
     S = _session_dir("linux", session)
@@ -496,14 +523,17 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
             raise Refused("view-path-off-list", f"{name} -> {target!r} is not a link into /usr (§9.2)")
         args += ["--symlink", target, name]
     args += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
-             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
-             "--bind", str(S), str(S)]
+             "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run"]
+    made: set = set()
+    args += _view_ancestors(PurePosixPath(str(S)), PurePosixPath(str(STORE["linux"])), made)
+    args += ["--bind", str(S), str(S)]
     if slot.slot_class == "egress":
         R = PurePosixPath(str(RUN["linux"]))
         grants = ["gw"] + (["qb"] if queue_grant else []) + (["planner"] if kind == "planner" else [])
         for g in grants:
-            d = str(R / g / f"slot{slot.index}")
-            args += ["--bind", d, d]
+            d = R / g / f"slot{slot.index}"
+            args += _view_ancestors(d, R, made)
+            args += ["--bind", str(d), str(d)]
     args += ["--chdir", "/"]
     return tuple(args)
 

@@ -32,7 +32,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import ContractError, canon
@@ -300,13 +300,34 @@ def wait_child(pid: int) -> int:
     return os.WEXITSTATUS(status)
 
 
-def make_cgroup(path: str) -> None:
+CGROUP_FS = "/sys/fs/cgroup"
+
+
+def make_cgroup(path: str, *, root: str = CGROUP_FS, lstat: Callable[[str], os.stat_result] = os.lstat,
+                mkdir: Callable[[str, int], None] = os.mkdir,
+                trusted: Callable[[os.stat_result], bool] = _root_trusted) -> None:
     """Linux: the session's cgroup (§7.3), made by ``start`` before the first process joins it (wall's
-    :func:`exec_launch` proves the join). DECISION: one that exists (a start that died after making it) is used."""
-    try:
-        os.mkdir(path, 0o755)
-    except FileExistsError:
-        pass
+    :func:`exec_launch` proves the join). The s2-linux VM run (F3) found no setup step making ``levain.slice``
+    or ``{e,v}<n>.scope``, so every missing dir from ``root`` down to the leaf is made here, root-owned 0755.
+
+    Walked top-down: each dir (``root`` itself included) is checked BEFORE anything is made inside it, and a
+    symlink, a non-dir, or one not root-owned or group/other-writable is ``cgroup-ancestor-untrusted``, by
+    name; so no uid but root can have placed a dir the session's processes are then joined below.
+    DECISION: one that exists (a start that died after making it) is used, after the same check; the leaf
+    gets the check too, and a dir made here is checked like one found."""
+    rel = PurePosixPath(path).relative_to(root)
+    cur = PurePosixPath(root)
+    for part in ("",) + rel.parts:
+        if part:
+            cur = cur / part
+            try:
+                mkdir(str(cur), 0o755)
+            except FileExistsError:
+                pass
+        st = lstat(str(cur))
+        if not stat.S_ISDIR(st.st_mode) or not trusted(st):
+            raise Refused("cgroup-ancestor-untrusted",
+                          f"{cur}: uid {st.st_uid} mode {stat.filemode(st.st_mode)} (root-owned, no g/o write)")
 
 
 def stub_front_args(host: str, slot: SlotId) -> Tuple[str, ...]:
