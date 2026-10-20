@@ -638,7 +638,8 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 continue
             rows.append(RowIn(
                 id=f"crystal:{name}", title=name, body=clause,
-                facets={"crystal_level": level, "permanence": perm, "last_activated_on": last or None, "tags": tags},
+                facets={"crystal_level": level, "permanence": perm, "activation_mode": act, "last_activated_on": last or None,
+                        "tags": tags},
                 stored={"name": name, "level": level, "one_clause": clause, "permanence": perm,
                         "activation_mode": act, "last_activated_on": last, "tags": tags}))
         return Read(rows=tuple(rows), skipped=((dropped, "malformed crystal row"),) if dropped else ())
@@ -1192,7 +1193,7 @@ def build_default_cockpit(
     ck.register(ProviderSpec(
         "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=100,
         size="tall", optional=True, order="crystal.level", rowset="crystals",
-        facets=frozenset({"crystal_level", "permanence", "last_activated_on", "tags"}),
+        facets=frozenset({"crystal_level", "permanence", "activation_mode", "last_activated_on", "tags"}),
         version_fields=("name", "level", "one_clause", "permanence", "activation_mode", "tags"),
         version_excluded=("last_activated_on",), search_fields=("title", "body"), edit_class=CLASS_C,
         empty="No crystals yet."))

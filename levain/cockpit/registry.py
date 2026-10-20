@@ -80,6 +80,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "undoable": ("bool", _is_bool),
     "crystal_level": ("int", _is_int),
     "permanence": ("str", _is_str),
+    "activation_mode": ("str", _is_str),
     "last_activated_on": ("date|null", _opt(_is_str)),
     "tags": ("list[str]", _is_str_list),
     "legacy_meta": ("str", _is_str),
