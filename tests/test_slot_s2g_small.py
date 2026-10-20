@@ -7,7 +7,6 @@ from __future__ import annotations
 import os
 import re
 import time
-from pathlib import Path
 
 import pytest
 
@@ -179,3 +178,12 @@ def test_already_done_into_live_state_answers_lease_dead(tmp_path):
     assert e.value.name == "lease-dead"
     _seed(store, S1, "REVOKED")
     assert ctl.cas(S1, 0, "ACTIVE", "REVOKED", {}) == 4      # a non-live target's shortcut still answers
+
+
+def test_timestamps_refuse_leap_seconds():
+    """L1 F10: strptime takes seconds 60 and 61; a record's timestamp is a real calendar time."""
+    assert R.check_timestamp("2026-10-20T23:59:59Z", "t") == "2026-10-20T23:59:59Z"
+    for bad in ("2026-10-20T23:59:60Z", "2026-10-20T23:59:61Z", "2026-02-30T00:00:00Z"):
+        with pytest.raises(Refused) as e:
+            R.check_timestamp(bad, "t")
+        assert e.value.name == "bad-value", bad

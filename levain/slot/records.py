@@ -148,7 +148,8 @@ def check_timestamp(value: object, where: str) -> str:
     """Header shared encodings: UTC ``YYYY-MM-DDTHH:MM:SSZ``, a real calendar time."""
     _match(value, where, _TS_RE)
     try:
-        time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        if time.strptime(value, "%Y-%m-%dT%H:%M:%SZ").tm_sec > 59:   # strptime takes 60 and 61 (L1 F10)
+            raise ValueError("leap second")
     except ValueError:
         raise Refused("bad-value", where) from None
     return value
