@@ -476,6 +476,26 @@ def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
     return list(_dedup_paths(dirs)), list(_dedup_paths(files))
 
 
+def _git_config_overrides(environ=None) -> tuple[list[Path], list[Path]]:
+    """``(subtrees, files)`` of operator git config that the environment relocates: git reads
+    ``$XDG_CONFIG_HOME/git/{config,attributes}`` when that variable is set and the file a
+    ``GIT_CONFIG_GLOBAL`` names, and a filter driver either one names runs during the cockpit's
+    status reads. Absolute values only, as for :func:`_cred_overrides`. A ``GIT_CONFIG_GLOBAL``
+    under ``/dev`` (``/dev/null`` is how a caller switches the global config off) names no file the
+    agent could plant into, and denying writes there would break every redirect to it."""
+    env = os.environ if environ is None else environ
+    subtrees: list[Path] = []
+    files: list[Path] = []
+    xdg = os.path.expanduser(env.get("XDG_CONFIG_HOME", ""))
+    if xdg and os.path.isabs(xdg):
+        subtrees.append(Path(xdg) / "git")
+    git_global = os.path.expanduser(env.get("GIT_CONFIG_GLOBAL", ""))
+    if git_global and os.path.isabs(git_global) and not (
+            git_global == "/dev" or git_global.startswith("/dev/")):
+        files.append(Path(git_global))
+    return list(_dedup_paths(subtrees)), list(_dedup_paths(files))
+
+
 def _cred_dir_sources() -> list[Path]:
     """The credential directories that are a tool's whole home, lexical: the defaults and every
     override (:data:`_CRED_DIR_ENV`)."""
@@ -2455,6 +2475,9 @@ def build_policy(
     # unlike ordinary jewels, an unresolvable spelling refuses the floor because Seatbelt's
     # canonical data-write matching would make a lexical-only deny inert.
     persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
+    # A config's include.path or core.attributesFile naming a writable file outside these paths is
+    # not denied (known edge).
+    git_env_subtrees, git_env_files = _git_config_overrides()
     persistence_write_subtrees = _dedup([
         p
         for root, label in (
@@ -2462,6 +2485,7 @@ def build_policy(
             (home / ".local" / "bin", "operator local bin"),
             (home / "Library" / "LaunchAgents", "operator LaunchAgents"),
             (home / ".config" / "git", "operator git config"),
+            *((t, "operator git config ($XDG_CONFIG_HOME)") for t in git_env_subtrees),
             # zsh's startup files when ~/.zshenv sets ZDOTDIR to the usual XDG place.
             (home / ".config" / "zsh", "operator zsh config"),
             # Linux's own: the systemd user manager reads units and environment from these, a
@@ -2485,6 +2509,7 @@ def build_policy(
                 ".zshrc", ".zprofile", ".zlogin", ".zshenv", ".bashrc", ".bash_profile",
                 ".bash_login", ".profile", ".gitconfig",
             )),
+            *((f, "operator git config ($GIT_CONFIG_GLOBAL)") for f in git_env_files),
         )
         for p in _required_spellings(root, label)
     ])

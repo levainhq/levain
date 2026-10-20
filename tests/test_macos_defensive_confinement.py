@@ -94,6 +94,73 @@ def test_persistence_policy_is_the_source_for_editor_and_profile(tmp_path, monke
         assert f'(literal "{path}")' in text
 
 
+def _clear_git_env(monkeypatch) -> None:
+    for var in ("XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_xdg_config_home_git_subtree_is_write_denied(tmp_path, monkeypatch) -> None:
+    # git reads $XDG_CONFIG_HOME/git/{config,attributes}, and a filter driver either names runs
+    # during the cockpit's status reads.
+    _clear_git_env(monkeypatch)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for git_dir in (xdg / "git", Path(os.path.realpath(xdg)) / "git"):
+        assert git_dir in policy.persistence_write_subtrees
+        assert f'(subpath "{git_dir}")' in text
+        for name in ("config", "attributes"):
+            assert conf.crown_jewel_reason(policy, git_dir / name) is not None
+
+
+def test_git_config_global_file_is_write_denied(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    cfg = tmp_path / "elsewhere" / "gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    policy = _policy(tmp_path, monkeypatch)
+    text = conf.SeatbeltProvider().render_profile(policy)
+
+    for spelling in (cfg, Path(os.path.realpath(cfg))):
+        assert spelling in policy.persistence_write_files
+        assert f'(literal "{spelling}")' in text
+        assert conf.crown_jewel_reason(policy, spelling) is not None
+
+
+def test_git_config_global_dev_null_and_relative_values_add_nothing(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    baseline = _policy(tmp_path, monkeypatch)
+
+    def rebuild() -> conf.CrownJewelsPolicy:
+        return conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
+                                 deny_standard_creds=False)
+
+    for value in ("/dev/null", "relative/gitconfig"):
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", value)
+        assert rebuild().persistence_write_files == baseline.persistence_write_files
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/xdg")
+    assert rebuild().persistence_write_subtrees == baseline.persistence_write_subtrees
+
+
+def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) -> None:
+    _clear_git_env(monkeypatch)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    (xdg / "git").symlink_to(xdg / "git")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    with pytest.raises(conf.ConfinementError, match=r"XDG_CONFIG_HOME.*fail-closed"):
+        _policy(tmp_path, monkeypatch)
+
+    _clear_git_env(monkeypatch)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(loop))
+    with pytest.raises(conf.ConfinementError, match=r"GIT_CONFIG_GLOBAL.*fail-closed"):
+        conf.build_policy(tmp_path / "entity", workspace=tmp_path / "workspace",
+                          deny_standard_creds=False)
+
+
 def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
