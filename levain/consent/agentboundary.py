@@ -10,8 +10,8 @@ hash kept anywhere. Both databases are opened read-only and never created, migra
     ``undecided``), in ``seq`` order; ``pending`` rows stay in the Q11 log and are not exported. An undecided request
     that was ruled later has two rows and so two receipts. The map is one to one, and each receipt names its leaf in
     ``execution.result_ref`` (``levain-receipt:<queue_id>:<seq>``);
-  - ``receipt_id`` is a UUIDv5 of ``<queue_id>:<seq>`` (with a names file, ``<queue_id>:<seq>:<names sha256>``: the
-    file is part of the receipt's identity) under a fixed namespace, and ``prior_receipt`` links each
+  - ``receipt_id`` is a UUIDv5 of ``<queue_id>:<seq>`` (with a names file, ``<queue_id>:<seq>:<rules digest>``: the
+    file's rules are part of the receipt's identity) under a fixed namespace, and ``prior_receipt`` links each
     receipt to the one before it in the export, so a re-export reproduces the same ids and the same chain with
     nothing stored. The first receipt omits ``prior_receipt`` (genesis);
   - every receipt carries ``provenance`` (per path: ``observed`` read from one queue column as it is, ``inferred``
@@ -115,8 +115,9 @@ first matching rule wins per field. What it can and cannot do, in plain words:
   - every renamed path is ``synthesized`` (the spec: produced at translation time), so a rename never raises
     ``completeness_score``; a name that hides a character (:mod:`levain.unshowable`) is refused at load;
   - a names file is part of the export's identity: with one, ``receipt_id`` is the UUIDv5 of
-    ``<queue_id>:<seq>:<names sha256>``, so a renamed receipt never shares an id with the unrenamed one. The
-    one-to-one map holds within one export; two names files make two distinct document sets;
+    ``<queue_id>:<seq>:<rules digest>`` (the sha256 of the validated rules, :func:`_rules_digest`), so a renamed
+    receipt never shares an id with the unrenamed one. The one-to-one map holds within one export; two names files
+    with different rules make two distinct document sets;
   - a later ``now`` still yields a prefix: an authority rule pins only its own field, so no receipt that comes later
     can be renamed differently from an earlier one with the same value. The one way a file that exported cleanly can
     fail later is a JOIN, a name that is also one of Levain's own values first seen on a later receipt (two
@@ -444,8 +445,9 @@ NAMES_MAX_BYTES = 1 << 20
 @dataclass(frozen=True)
 class Names:
     """A loaded, validated names file (:func:`load_names`): ``rules`` as ``(when, set)`` pairs in file order, every
-    string NFC, and ``sha256`` the hex digest of the file's bytes. :func:`export` re-validates the rules of any
-    ``Names`` it is handed (:func:`_check_rules`), so one built by hand passes only what a file would."""
+    string NFC, and ``sha256`` the hex digest of the file's bytes (reported, never part of a receipt's id).
+    :func:`export` re-validates the rules of any ``Names`` it is handed (:func:`_check_rules`), so one built by hand
+    passes only what a file would."""
     rules: tuple[tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]], ...]
     sha256: str
 
@@ -547,6 +549,13 @@ def _check_rules(rules: Any) -> None:
                 raise ExportError(f"names file: rule {i}: maps Levain's {f} {key[-1]!r} to {v!r}, which rule "
                                   f"{other[1]} already maps {other[0][-1]!r} to; an authority name maps one to one")
             backward[f].setdefault(v, (key, i))
+
+
+def _rules_digest(rules: Any) -> str:
+    """The sha256 of the validated rules themselves (compact JSON, file order), the names part of a renamed
+    ``receipt_id``: derived from what renames the receipt, never from the ``sha256`` a caller hands over."""
+    import hashlib
+    return hashlib.sha256(json.dumps(rules, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def load_names(data: bytes) -> Names:
@@ -1026,9 +1035,10 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
     receipt; a renamed path's provenance is ``synthesized`` (produced at translation time from the operator's file),
     and an authority name that does not map one to one across the export raises :class:`ExportError`. A names file
     is part of the export's identity: with one, each ``receipt_id`` is the UUIDv5 of
-    ``<queue_id>:<seq>:<names sha256>`` (and ``prior_receipt`` links follow), so a renamed receipt never reuses the id
-    of the unrenamed one or of one renamed by another file; the one-to-one map holds within one export, and two names
-    files make two distinct document sets. ``names`` is re-validated here whoever built it. Raises
+    ``<queue_id>:<seq>:<rules digest>`` (and ``prior_receipt`` links follow), computed here from the rules, never from
+    ``names.sha256``, so a renamed receipt never reuses the id of the unrenamed one or of one renamed by different
+    rules; the one-to-one map holds within one export, and two names files with different rules make two distinct
+    document sets. ``names`` is re-validated here whoever built it. Raises
     :class:`ExportError` when the store is not a readable current-format queue or a row cannot be made into a
     receipt."""
     if names is not None:
@@ -1037,6 +1047,7 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
         if type(names.sha256) is not str or _HEX64.fullmatch(names.sha256) is None:
             raise ExportError("names: sha256 is not the 64-hex digest of a names file")
         _check_rules(names.rules)
+        rules_digest = _rules_digest(names.rules)
     real = _utcnow()
     if now is None:
         now = real
@@ -1091,8 +1102,8 @@ def export(queue_dir: Path | str, *, now: datetime | None = None, names: Names |
             normalised += 1
             receipt = clean
         if names is not None:
-            # the names file is part of the receipt's identity: never the id of an unrenamed receipt
-            receipt["receipt_id"] = str(uuid.uuid5(LEVAIN_AB_NS, f"{queue_id}:{row.seq}:{names.sha256}"))
+            # the names rules are part of the receipt's identity: never the id of an unrenamed receipt
+            receipt["receipt_id"] = str(uuid.uuid5(LEVAIN_AB_NS, f"{queue_id}:{row.seq}:{rules_digest}"))
             levains = {k: tuple(_get(receipt, p) for p in paths) for k, paths in _AUTHORITY_KEYS.items()}
             changed = _rename(receipt, names)
             for k, paths in _AUTHORITY_KEYS.items():

@@ -71,7 +71,7 @@ def test_a_rename_lands_the_hash_verifies_and_the_chain_links_over_the_renamed_r
     renamed = 0
     for before, after in zip(plain.receipts, got.receipts):
         # the names file is part of the id: the leaf's id under this file, never the unrenamed one
-        assert after["receipt_id"] == str(uuid.uuid5(ab.LEVAIN_AB_NS, f"{_leaf(before)}:{names.sha256}"))
+        assert after["receipt_id"] == str(uuid.uuid5(ab.LEVAIN_AB_NS, f"{_leaf(before)}:{ab._rules_digest(names.rules)}"))
         assert before["receipt_id"] == str(uuid.uuid5(ab.LEVAIN_AB_NS, _leaf(before)))
         assert after["execution"] == before["execution"]                         # facts untouched, leaf included
         assert after["policy"]["decision"] == before["policy"]["decision"]
@@ -116,6 +116,22 @@ def test_a_names_file_is_part_of_the_receipt_identity(world):
     strip = {"receipt_id", "prior_receipt", "receipt_hash"}
     assert ([{k: v for k, v in r.items() if k not in strip} for r in exports[3].receipts]
             == [{k: v for k, v in r.items() if k not in strip} for r in plain.receipts])
+
+
+def test_the_receipt_id_comes_from_the_rules_never_from_a_handed_sha256(world):
+    """Two Names with different rules but one handed sha256 (L3 r2 codex HIGH): disjoint ids, because the id's
+    names part is computed from the rules; the same rules from byte-different files give the same receipts."""
+    queue, now, _ = world
+    _, one = _names(_policy_rules("levain.consent.T2", "acme.repo.merges", "7"))
+    _, two = _names(_policy_rules("levain.consent.T2", "acme.repo.writes", "8"))
+    forged = ab.Names(rules=two.rules, sha256=one.sha256)
+    a, b = (ab.export(queue.directory, now=now, names=n) for n in (one, forged))
+    assert not {r["receipt_id"] for r in a.receipts} & {r["receipt_id"] for r in b.receipts}
+    spaced = ab.load_names(json.dumps({"format": ab.NAMES_FORMAT,
+                                       "rules": _policy_rules("levain.consent.T2", "acme.repo.merges", "7")},
+                                      indent=4).encode())
+    assert spaced.sha256 != one.sha256
+    assert ab.export(queue.directory, now=now, names=spaced).receipts == a.receipts
 
 
 @pytest.mark.parametrize("field", ["policy.decision", "execution.status", "actor.type", "approval.approved_at",
