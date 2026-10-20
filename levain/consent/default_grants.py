@@ -7,12 +7,14 @@ only when the authority log the hook verifies against is initialised and an enro
 levain's key directory (where ``levain cockpit key create`` puts it). At a terminal it prints the exact grant and asks
 ``[y/N]`` (default No); a yes runs ``levain consent grant create`` itself, with the argv it printed, so the refusals and
 the passphrase or Touch ID prompt are that command's. Anywhere else it signs nothing and prints that command. A live
-default grant for the same workspace is kept and reported, never offered again. Nothing here creates a key or a log:
+default grant for the same workspace (that exact id shape and pack) is kept and reported, never offered again. Nothing
+is offered while the log says nothing may sign, and a Ctrl-C or a failure is one line: init goes on. Nothing here creates a key or a log:
 key custody stays an explicit act.
 """
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import shlex
 from collections.abc import Callable
@@ -56,6 +58,17 @@ def _hook_root(adapter: str) -> Path | None:
     return Path(root) if root else None
 
 
+def _is_default(g, agent: str, workspace: str, stamp: str) -> bool:
+    """``g`` is a live default grant for ``agent`` in ``workspace``: the exact ``cg-default-<agent>-<8 lowercase
+    hex>`` id, a consent grant, and exactly the agent's pack. A narrower or hand-made grant is not one."""
+    from levain.consent.grants import CONSENT_GRANT_KIND
+
+    tools, postures = PACKS[agent]
+    return (re.fullmatch(f"cg-default-{re.escape(agent)}-[0-9a-f]{{8}}", g.id) is not None
+            and g.kind == CONSENT_GRANT_KIND and g.agent == agent and g.workspace == workspace
+            and tuple(sorted(g.tools)) == tools and tuple(sorted(g.postures)) == postures and g.expires_at > stamp)
+
+
 def _resolve_key(rows: list) -> tuple[Path, str] | None:
     """``(key file, fingerprint)`` of an enrolled, live laptop-presence key whose public half is in levain's key
     directory: the private file beside it, else the ``.pub`` (a key an agent holds). None when there is none."""
@@ -82,12 +95,41 @@ def _resolve_key(rows: list) -> tuple[Path, str] | None:
 
 
 def offer(install: Path, adapter: str, *, mode: str = "ask", interactive: bool,
-          emit: Callable[[str], None] = print, input_fn: Callable[[str], str] = input,
+          emit: Callable[[str], None] = print, input_fn: Callable[[str], str] | None = None,
           clock: Callable[[], datetime] | None = None) -> None:
-    """Offer ``adapter``'s default grant for ``install`` (see the module docstring). Never raises for a refusal:
-    every outcome is one line or the grant-create command's own output."""
+    """Offer ``adapter``'s default grant for ``install`` (see the module docstring). Never raises: every outcome,
+    a Ctrl-C or a failure included, is one line or the grant-create command's own output, and init goes on."""
     if mode == "no" or adapter not in _AGENTS:
         return
+    state: dict = {}
+    try:
+        _offer(install, adapter, interactive=interactive, emit=emit, input_fn=input_fn or input, clock=clock,
+               state=state)
+    except KeyboardInterrupt:
+        emit("")
+        emit(f"  default grant: {_after_stop('interrupted', state)}")
+    except (SystemExit, Exception) as exc:  # noqa: BLE001 - nothing in the offer may fail init
+        why = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        emit(f"  default grant: failed ({why}), {_after_stop('', state).removeprefix(', ')}")
+
+
+def _after_stop(word: str, state: dict) -> str:
+    """What a stop in the middle of the offer left: signed only when the log holds the grant it was signing."""
+    gid, root, clock = state.get("gid"), state.get("root"), state.get("clock")
+    if gid and root and state.get("signing"):
+        try:
+            from levain.consent.grants import list_grants
+
+            if any(g.id == gid for g in list_grants(root, now=clock())):
+                return f"{word} after {gid} was signed" if word else f"{gid} was signed"
+        except Exception:  # noqa: BLE001
+            return (f"{word}, " if word else "") + f"unknown whether {gid} was signed: `levain consent grant list " \
+                f"--data-root {root}` says"
+    return f"{word}, not signed" if word else "not signed"
+
+
+def _offer(install: Path, adapter: str, *, interactive: bool, emit: Callable[[str], None],
+           input_fn: Callable[[str], str], clock: Callable[[], datetime] | None, state: dict) -> None:
     from levain.cockpit.consent import utc_stamp
     from levain.cockpit.keys import KeyError_, keys
     from levain.consent.grants import list_grants
@@ -104,8 +146,11 @@ def offer(install: Path, adapter: str, *, mode: str = "ask", interactive: bool,
         emit(f"  default grant: not offered: the consent settings name no cockpit, so no grant could answer the "
              f"hook (it would cover {covers})")
         return
+    if not root.is_absolute():
+        emit(f"  default grant: not offered: the consent settings' cockpit {str(root)!r} is not an absolute path")
+        return
     try:
-        rows, _why = keys(root, now=now)
+        rows, why = keys(root, now=now)
     except KeyError_ as exc:
         if "no cockpit journal" not in str(exc):
             emit(f"  default grant: not offered: the authority log at {root} is unusable ({exc})")
@@ -119,6 +164,9 @@ def offer(install: Path, adapter: str, *, mode: str = "ask", interactive: bool,
         emit(f"  default grant: not offered: it would cover {covers}; it needs an authority log first "
              f"(`levain cockpit ledger init`), then `levain init --force` offers it")
         return
+    if why is not None:
+        emit(f"  default grant: not offered: nothing may sign the authority log at {root} now ({why})")
+        return
     prefix = f"cg-default-{agent}-"
     try:
         grants = list_grants(root, now=now)
@@ -128,7 +176,7 @@ def offer(install: Path, adapter: str, *, mode: str = "ask", interactive: bool,
         return
     stamp = utc_stamp(now)
     for g in grants:
-        if g.id.startswith(prefix) and g.agent == agent and g.workspace == workspace and g.expires_at > stamp:
+        if _is_default(g, agent, workspace, stamp):
             emit(f"  default grant: {g.id} kept (expires {g.expires_at})")
             return
     gid = prefix + secrets.token_hex(4)
@@ -166,5 +214,6 @@ def offer(install: Path, adapter: str, *, mode: str = "ask", interactive: bool,
         return
     import levain.cli as cli
 
+    state.update(gid=gid, root=root, clock=clock or (lambda: datetime.now(timezone.utc)), signing=True)
     if cli.main(argv) != 0:
         emit("  default grant: not signed (refused above)")

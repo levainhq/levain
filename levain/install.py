@@ -594,12 +594,23 @@ def run_init(
     store = install / ".levain" / "memory.db"
     _print_manifest(install, chosen, store, store_ok=result.store_ok)
     _print_next_steps(install, chosen, store_ok=result.store_ok)
-    if chosen in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(install) != "off":
-        # Q18: after the hook is wired. Asked only at a terminal, never under --answers (no one is there to answer).
-        from levain.consent.default_grants import offer as _offer_default_grant
+    if default_grants != "no" and chosen in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(install) != "off":
+        # Q18: after the hook is wired, for a settled install only (a grant for an install that does not work is
+        # not offered). Asked only at a terminal, never under --answers (no one is there to answer).
+        if not result.complete:
+            print("  default grant: not offered: this install is not settled (" + (
+                ", ".join(result.review) if result.review else "the store did not initialize")
+                + "); `levain init --force` offers it once it is")
+        else:
+            try:
+                from levain.consent import default_grants as _default_grants
 
-        _offer_default_grant(install, chosen, mode=default_grants,
-                             interactive=not non_interactive and sys.stdin.isatty() and sys.stdout.isatty())
+                _default_grants.offer(install, chosen, mode=default_grants,
+                                      interactive=not non_interactive and sys.stdin.isatty() and sys.stdout.isatty())
+            except KeyboardInterrupt:  # belt: the offer never raises, and nothing around it may fail init either
+                print("\n  default grant: interrupted, not signed")
+            except (SystemExit, Exception) as e:  # noqa: BLE001
+                print(f"  default grant: failed ({type(e).__name__}), not signed")
     if result.review:
         print("NOT settled (exit 1): " + ", ".join(result.review))
     return 0 if result.complete else 1
