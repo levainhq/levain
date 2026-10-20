@@ -288,6 +288,7 @@ def run_init(
     messaging: str | None = None,
     consent_hook: str | None = None,
     memory_load: Sequence[str] | None = None,
+    default_grants: str = "ask",
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -334,6 +335,11 @@ def run_init(
         return 1
     if consent_hook is not None and consent_hook not in CONSENT_HOOK_CHOICES:
         print(f"FAIL: --consent-hook must be one of {', '.join(CONSENT_HOOK_CHOICES)} (got {consent_hook!r}).")
+        return 1
+    from levain.consent.default_grants import MODES as _DEFAULT_GRANT_MODES
+
+    if default_grants not in _DEFAULT_GRANT_MODES:
+        print(f"FAIL: --default-grants must be one of {', '.join(_DEFAULT_GRANT_MODES)} (got {default_grants!r}).")
         return 1
     if messaging is not None and adapter is not None and adapter != "claude-code":
         print(_MESSAGING_ADAPTER_REFUSAL.format(adapter=adapter))
@@ -588,6 +594,23 @@ def run_init(
     store = install / ".levain" / "memory.db"
     _print_manifest(install, chosen, store, store_ok=result.store_ok)
     _print_next_steps(install, chosen, store_ok=result.store_ok)
+    if default_grants != "no" and chosen in CONSENT_HOOK_SCRIPTS and persisted_consent_hook(install) != "off":
+        # Q18: after the hook is wired, for a settled install only (a grant for an install that does not work is
+        # not offered). Asked only at a terminal, never under --answers (no one is there to answer).
+        if not result.complete:
+            print("  default grant: not offered: this install is not settled (" + (
+                ", ".join(result.review) if result.review else "the store did not initialize")
+                + "); `levain init --force` offers it once it is")
+        else:
+            try:
+                from levain.consent import default_grants as _default_grants
+
+                _default_grants.offer(install, chosen, mode=default_grants,
+                                      interactive=not non_interactive and sys.stdin.isatty() and sys.stdout.isatty())
+            except KeyboardInterrupt:  # belt: the offer never raises, and nothing around it may fail init either
+                print("\n  default grant: interrupted, not signed")
+            except (SystemExit, Exception) as e:  # noqa: BLE001
+                print(f"  default grant: failed ({type(e).__name__}), not signed")
     if result.review:
         print("NOT settled (exit 1): " + ", ".join(result.review))
     return 0 if result.complete else 1
