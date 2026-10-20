@@ -108,11 +108,21 @@ def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "url
     return urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
 
 
+class _Dead(int):
+    """A status that is not 404 or 410 but retires the subscription all the same: the push service named the key as the
+    fault (VapidPkHashMismatch: the subscription was made under another Levain install's key), so no later ping fares better."""
+
+
 def _post(req: urllib.request.Request) -> int:
     try:
         with _OPENER.open(req, timeout=TIMEOUT) as resp:
             return int(resp.status)
     except urllib.error.HTTPError as err:
+        try:
+            if err.code in (400, 403) and b"VapidPkHashMismatch" in err.read(512):
+                return _Dead(err.code)
+        except Exception:   # noqa: BLE001 - an unreadable body is an ordinary refusal
+            pass
         return int(err.code)
     except Exception:   # noqa: BLE001 - unreachable service: recorded as status 0, never raised at the gate
         return 0
@@ -121,7 +131,7 @@ def _post(req: urllib.request.Request) -> int:
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
          command: bool | None = None, push: bool = True) -> list[tuple[int, int]]:
     """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
-    pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription. Every
+    pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
@@ -153,7 +163,7 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
             status, retire = 0, False
         else:
             status = answered.get(sub["id"], UNKNOWN)
-            retire = status in (404, 410)
+            retire = status in (404, 410) or isinstance(status, _Dead)
         store.add_delivery(ping_id, sub["id"], status, retire=retire)
         results.append((sub["id"], status))
     return results

@@ -250,3 +250,44 @@ def test_an_unknown_or_unanswered_delivery_reads_as_words_in_the_record_and_the_
     monkeypatch.setattr(cq, "default_queue_dir", lambda: tmp_path)
     sent = providers._notifications()(None).rows[0].stored["sent"]
     assert sent == "no answer in time, no answer"
+
+
+class _Refusal(sender.urllib.error.HTTPError):
+    def __init__(self, code, body):
+        super().__init__("https://web.push.apple.com/x", code, "refused", {}, None)
+        self._body = body
+
+    def read(self, n=-1):
+        return self._body[:n] if n >= 0 else self._body
+
+
+def _refused_by(monkeypatch, code, body):
+    def boom(req, timeout=None):
+        raise _Refusal(code, body)
+
+    monkeypatch.setattr(sender._OPENER, "open", boom)
+    return sender._post(object())
+
+
+def test_a_refusal_that_names_the_key_retires_the_subscription(tmp_path, monkeypatch):
+    # Apple's own reply for a subscription made under another install's VAPID key (measured on the iPhone, 10-19)
+    got = _refused_by(monkeypatch, 400, b'{"reason":"VapidPkHashMismatch"}')
+    assert got == 400 and isinstance(got, sender._Dead)
+    store = PushStore(tmp_path)
+    p, a = _ua_keys()
+    sid = store.add_subscription(FCM, p, a, "d")
+    monkeypatch.setattr(sender, "_post", lambda req: sender._Dead(400))
+    assert dict(sender.send(tmp_path, kind="test", ref=None, title="t", body="b"))[sid] == 400
+    assert store.live_subscriptions() == []
+
+
+def test_an_ordinary_400_or_an_unreadable_body_keeps_the_subscription(tmp_path, monkeypatch):
+    for body in (b'{"reason":"PayloadTooLarge"}', b""):
+        got = _refused_by(monkeypatch, 400, body)
+        assert got == 400 and not isinstance(got, sender._Dead)
+    store = PushStore(tmp_path)
+    p, a = _ua_keys()
+    sid = store.add_subscription(FCM, p, a, "d")
+    monkeypatch.setattr(sender, "_post", lambda req: 400)
+    sender.send(tmp_path, kind="test", ref=None, title="t", body="b")
+    assert [r["id"] for r in store.live_subscriptions()] == [sid]

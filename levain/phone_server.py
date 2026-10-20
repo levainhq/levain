@@ -112,8 +112,9 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 
 # the phone app's own routes (levain.phone_app), each with the one method it answers
 _APP_ROUTES = {"/app/state.json": "GET", "/app/board.json": "GET", "/app/verb": "POST"}
-# failed unauthenticated pairing redeems a single process takes per minute: a code is 128 bits, so this only keeps a
-# caller from holding the push store's write lock with a stream of guesses
+# failed unauthenticated pairing redeems a single process takes per minute. A long code is 128 bits and a short one 40,
+# so beside the short code's own lock this is a second bound on guessing and keeps a caller from holding the push
+# store's write lock with a stream of guesses
 _REDEEMS_PER_MINUTE = 20
 
 

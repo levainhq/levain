@@ -111,15 +111,25 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
     if not path.startswith("/webpush/"):
         return None
     if method == "POST" and path == "/webpush/pair/redeem":
-        # the installed app has no credential yet: the one-time code is the credential
+        # the installed app has no credential yet: the one-time code is the credential. ``{"code"}`` is the long code
+        # the manifest carries, ``{"short"}`` the one the operator typed
         obj = _body_json(body)
         conn = PushStore(queue_dir).connection()
         try:
-            got = devices.redeem(conn, obj.get("code") if obj else None, datetime.now(timezone.utc))
+            now = datetime.now(timezone.utc)
+            if obj is not None and "short" in obj:
+                got = devices.redeem_short(conn, obj.get("short"), now)
+            else:
+                got = devices.redeem(conn, obj.get("code") if obj else None, now)
         finally:
             conn.close()
         if got is None:
+            # the same words for both codes and every reason, and no count of the tries left
             return _err(403, "bad_code", "the pairing code is unknown, spent or expired")
+        if got[0] == devices.LOCKED:
+            seconds = int(got[1])
+            return _json(429, {"error": "locked", "message": f"too many wrong codes; try again in "
+                               f"{max(1, -(-seconds // 60))} min", "retry_after": seconds})
         return _json(200, {"device_id": got[0], "token": got[1]})
     if not authorized:
         return _err(403, "credential_required", "this page's credential is needed")
@@ -133,12 +143,17 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         return _json(200, {"pings": rec.record(Path(queue_dir), store.record(limit=rec.SHOWN))})
     if method == "POST" and path == "/webpush/pair":
         obj = _body_json(body) or {}
+        # both codes: the long one rides the manifest where a browser carries it into the installed app, the short one
+        # is typed where it does not
         conn = store.connection()
         try:
-            code = devices.mint_pairing(conn, obj.get("label"), datetime.now(timezone.utc))
+            now = datetime.now(timezone.utc)
+            code = devices.mint_pairing(conn, obj.get("label"), now)
+            short = devices.mint_short_pairing(conn, obj.get("label"), now)
         finally:
             conn.close()
-        return _json(200, {"code": code})
+        return _json(200, {"code": code, "short": short,
+                           "short_ttl_seconds": int(devices.SHORT_PAIRING_TTL.total_seconds())})
     if method == "POST" and path == "/webpush/subscribe":
         obj = _body_json(body)
         keys = obj.get("keys") if obj else None
