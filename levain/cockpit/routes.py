@@ -101,13 +101,17 @@ def handle_get(
         limit = int(limit_raw) if limit_raw else None
     except ValueError:
         return jerr(400, "bad_request", "limit must be an integer")
+    # ``at``: the panel at a past instant (F12 Replay), on this same route and so under the same read gate; a panel
+    # without a past read, or an instant outside the window, is a 400 (never clamped)
+    at = (qs.get("at") or [""])[0] or None
     try:
-        panel = cockpit.panel(panel_id, profile=profile, q=q, row=row, credential_class=cred["class"], limit=limit)
+        panel = cockpit.panel(panel_id, profile=profile, q=q, row=row, credential_class=cred["class"], limit=limit,
+                              **({"at": at} if at is not None else {}))
     except QueryError as exc:
         return jerr(400, "bad_request", str(exc))
     except RowNotFound:
         return jerr(404, "not_found", f"panel {panel_id!r} has no row {row!r}")
     if panel is None:
         return jerr(404, "not_found", f"no panel {panel_id!r}")
-    variant = ["panel", profile, q, row, limit, cred["class"]]
+    variant = ["panel", profile, q, row, limit, cred["class"]] + ([at] if at is not None else [])
     return ok(panel, variant)

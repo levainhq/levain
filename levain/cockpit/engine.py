@@ -81,6 +81,7 @@ ROW_KINDS = ROW_ENGINE_KINDS + VALUE_ROW_KINDS
 VERSIONED_VALUE_KINDS = ("line", "brief")     # a value write binds to the value's version (§4.4)
 SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a windowed one) gets the box
 SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
+REPLAY_WINDOW_S = 14 * 3600   # a past read (``?at=``) reaches back at most this far (F12 Replay: the last 14 h)
 SEARCH_LIMIT_MAX = 200    # the most rows a store search returns
 SEARCH_LIMIT_DEFAULT = 50
 SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current query plus one superseded by typing
@@ -225,11 +226,20 @@ class ProviderSpec:
     # "header" when the spec declared the legacy region; ``region`` then holds where it was normalised to.
     # Derived like ``legacy_kind``: a caller cannot set it.
     legacy_region: str = field(default="", init=False)
+    # the panel's read at a past instant (F12 Replay): ``read_at(ctx, iso)`` returning the same shape as ``read`` for
+    # that instant. Optional: None (and no ``read.read_at`` on the provider's read) means the panel has no past read,
+    # its head carries no ``replay`` flag and ``?at=`` on it is refused. A provider may also carry it on its read
+    # function as ``read.read_at`` (how the topology provider offers it); an explicit field wins.
+    read_at: Callable[["ReadContext", str], Result] | None = None
 
     def __post_init__(self) -> None:
         # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
         if type(self.rank) is not int:
             raise CockpitRegistrationError("a panel's rank must be an int")
+        if self.read_at is None and callable(getattr(self.read, "read_at", None)):
+            self.read_at = self.read.read_at  # type: ignore[attr-defined]
+        if self.read_at is not None and not callable(self.read_at):
+            raise CockpitRegistrationError("a panel's read_at must be callable")
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
@@ -1570,6 +1580,8 @@ class Cockpit:
             # never from the values the current rows happen to carry
             **({"facets": sorted(spec.facets)} if spec.facets else {}),
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
+            # the panel has a past read (``?at=``): a renderer draws a replay control only when this says so
+            **({"replay": True} if spec.read_at is not None else {}),
         }
 
     @staticmethod
@@ -1906,11 +1918,16 @@ class Cockpit:
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none",
-              limit: int | None = None) -> dict[str, Any] | None:
+              limit: int | None = None, at: str | None = None) -> dict[str, Any] | None:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
         ``compact``; ``q`` is the search (plain text, bounded: ``check_query``) over the panel's declared
         search fields, answered by the provider's ``search`` hook when the panel is a store-scope window;
-        ``limit`` caps a store search; ``row`` returns one row in full. ``q`` is never logged or journalled."""
+        ``limit`` caps a store search; ``row`` returns one row in full. ``q`` is never logged or journalled.
+        ``at`` is a past read (``_panel_at``)."""
+        if at is not None:
+            if q is not None or row is not None or limit is not None:
+                raise QueryError("at is a read of the whole panel: it takes no q, row or limit")
+            return self._panel_at(panel_id, at, profile=profile, credential_class=credential_class)
         q, limit = check_query(q, limit)
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
@@ -2026,6 +2043,42 @@ class Cockpit:
                 out["value"] = value
         if q and spec is not None and ("match_label" in out or "search_error" in out):
             self._seal_search(out)
+        return out
+
+    def _panel_at(self, panel_id: str, at: str, *, profile: str, credential_class: str) -> dict[str, Any] | None:
+        """The panel as it was at the past instant ``at`` (F12 Replay): the provider's ``read_at`` under the panel's own
+        timeout, called with this request's context (its authority, its ``now``) and T, served on the same route and
+        under the same read gate as the live read. Only a value panel whose provider declares a past read has one
+        (else ``QueryError``: a 400); T outside ``check_replay_at``'s bounds is refused, never clamped. It never
+        touches the live read's state: it does not join the live flight, commit a snapshot or move ``last good``.
+        The payload is the live one's shape plus ``at`` (T, as checked) and ``replay: true``; the value carries its
+        own ``as_of`` (T). Its validator covers T, so two instants never share an ETag."""
+        auth = self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
+        spec = self._specs.get(panel_id)
+        if spec is None:
+            return None
+        if spec.read_at is None or spec.kind in ROW_ENGINE_KINDS:
+            raise QueryError(f"panel {panel_id!r} has no past read")
+        t = check_replay_at(at, ctx.now)
+        iso = t.isoformat()
+        if self._state_of(spec) is None:
+            res: Any = Fault("this panel was retired while it was being read")
+        else:
+            res = self._bounded_fresh(("replay", spec.id), spec.timeout_s, spec.read_at, ctx, iso)
+        raw = self._normalize(spec, ctx, res)
+        if isinstance(raw, _Snap):
+            snap = raw
+        else:
+            msg = raw.message if isinstance(raw, Fault) else f"source absent: {getattr(raw, 'reason', '')}"
+            snap = _Snap("error", None, None, [], [], None, _safe_str(msg), spec.note)
+        out: dict[str, Any] = dict(self._head(spec, snap, credential_class, ctx.today, auth, ctx.now))
+        out["etag"] = _sha({"base": out["etag"], "at": iso})
+        out["rows"], out["value"], out["next"] = None, None, None
+        out["at"], out["replay"] = iso, True
+        if out["status"] == "error":
+            return out
+        out["value"] = _compact_value(spec.kind, snap.value) if profile == "compact" else snap.value
         return out
 
     @staticmethod
@@ -2973,6 +3026,26 @@ def check_query(q: str | None, limit: int | None = None) -> tuple[str | None, in
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise QueryError("limit must be a positive integer")
     return q, min(limit, SEARCH_LIMIT_MAX)
+
+
+def check_replay_at(at: Any, now: datetime) -> datetime:
+    """The kernel's bounds on a past read (``?at=``, a provider's ``read_at``): an ISO-8601 instant with an explicit
+    zone, on a whole minute, inside ``[now - REPLAY_WINDOW_S, now]``. Anything else is refused (``QueryError``, an
+    HTTP 400), never clamped to the window: a read of another instant than the one asked would pass as it."""
+    if not isinstance(at, str) or not at or len(at) > 40:
+        raise QueryError("at is an ISO-8601 instant, e.g. 2026-10-20T11:30:00Z")
+    try:
+        t = datetime.fromisoformat(at[:-1] + "+00:00" if at.endswith("Z") else at)
+    except ValueError:
+        raise QueryError(f"at is not an ISO-8601 instant: {at!r}") from None
+    if t.tzinfo is None:
+        raise QueryError("at must carry its zone (Z or an offset)")
+    if t.second or t.microsecond:
+        raise QueryError("at is on a whole minute (replay has minute resolution)")
+    t = t.astimezone(timezone.utc)
+    if t > now or t < now - timedelta(seconds=REPLAY_WINDOW_S):
+        raise QueryError(f"at must be inside the last {REPLAY_WINDOW_S // 3600} h (now - {REPLAY_WINDOW_S // 3600} h .. now)")
+    return t
 
 
 def _fold(text: str) -> str:
