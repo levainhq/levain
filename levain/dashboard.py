@@ -901,18 +901,18 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
                 check: "Callable[[], None] | None" = None,
                 episodic_db: Path | None = None) -> StateWrite:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
-    write-peer of ``_read_state``, kept adjacent so the contract (the four keys, a
+    write-peer of ``_read_state``, kept adjacent so the contract (the state keys, a
     tz-aware ISO stamp) cannot drift between read and write.
 
-    Held under an exclusive sidecar lock so concurrent writers (the CLI, the cockpit, a
-    phone app) serialise instead of racing the file's read-modify-write. ``check`` runs
-    INSIDE that lock before any write: a version-bound writer (the cockpit's
-    ``panel_version`` compare) passes the compare it needs, so the compare and the write are
-    ONE step, and the lock is REQUIRED for it (a platform with no flock refuses rather than
-    write unlocked). An unchecked writer (the CLI) degrades to an unlocked write there rather
-    than refusing to set a line: it has no compare to protect, and a lost write beside a
-    concurrent one is no worse than the unlocked state of every writer before the lock existed. A
-    blank text CLEARS by popping all four keys. The parent dir is created if absent; a
+    MERGE-preserving: reads the existing object and updates ONLY the four state keys,
+    so a file that carries other keys (a sensor app's superset, or keys an older
+    version wrote) keeps them. Atomic (temp + ``os.replace``, so a reader never sees a torn
+    file) and serialised with every other levain state writer by ``_state_lock``;
+    ``check`` (the cockpit's version compare) runs under that lock, so the compare and the
+    write are one step. A writer outside levain (a sensor app, the embedder's own state CLI) does
+    not take the lock: a concurrent whole-object writer holding an older snapshot can
+    revert a just-set line (re-set is one keystroke). A blank text
+    CLEARS by popping all four keys. The parent dir is created if absent; a
     corrupt/unreadable existing file is replaced rather than failing the set. The text is
     stored verbatim apart from whitespace collapse; nothing reads meaning into it.
 
