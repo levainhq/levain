@@ -62,9 +62,11 @@ SPEC_FD = 3
 #: DECISION: the fd ``start``'s exec-marker pipe (§5.1 start) sits on through the launch hops. The LAST hop before
 #: the vendor (Linux: the stage; macOS: the trampoline, under the applied profile) marks it close-on-exec, writes
 #: :data:`EXEC_OK` and execs the vendor; a refusal anywhere, or an execve that fails after the marker, writes
-#: :data:`EXEC_REFUSED`. EOF with no byte = the start failed (the helper never reads EOF as an exec: on Linux
-#: bwrap's monitor holds a copy of the pipe for the vendor's whole life [not run: the reviewers' read of bwrap's
-#: fork; a 2g row]). Never one of the vendor's fds.
+#: :data:`EXEC_REFUSED`. ``start`` takes the exec as done only on :data:`EXEC_OK` followed by EOF (the last
+#: close-on-exec copy closes AT the vendor's exec); EOF with no byte = the start failed. That EOF arrives through
+#: bwrap's monitor and pid-1 [measured: runs/s2-linux-r3 row L27, bubblewrap 0.9.0, kernel 7.2.6, ACTIVE in 0.4 s,
+#: 2026-10-20] and through ``launchctl asuser`` + the trampoline [measured: runs/s2-macos RESULT2, 2026-10-20].
+#: Never one of the vendor's fds.
 EXEC_FD = 4
 EXEC_OK = b"+"
 EXEC_REFUSED = b"!"
