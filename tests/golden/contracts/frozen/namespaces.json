@@ -34,6 +34,11 @@
    "owner": "levain/autonomic/confirm.py"
   },
   {
+   "namespace": "levain-cockpit-phone",
+   "status": "shipped",
+   "owner": "levain/autonomic/confirm.py"
+  },
+  {
    "namespace": "levain-team-entry",
    "status": "reserved",
    "owner": "S1 F9 / F12"

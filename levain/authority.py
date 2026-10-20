@@ -1269,7 +1269,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if not signer.active:
                 raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
             if signer.custody == PASSKEY:
-                # a passkey signs consent answers (its own namespace, the consent queue's check) and, in this log,
+                # a passkey signs consent answers (its own namespace, the consent queue's check), since K8 a cockpit
+                # pending of T2 at most in the phone namespace (the broker's check), and, in this log,
                 # one op: the removal of a consent or inert grant, which only ever narrows what an agent may do (a
                 # synced passkey stolen with its account can cost the operator prompts, never widen anything). Every
                 # other link it signed is refused whatever its class's rank would allow, and so is a revoke of any

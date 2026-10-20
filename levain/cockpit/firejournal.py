@@ -81,7 +81,11 @@ _PLANNED_STATES = ("DECIDED", "COMMITTED", "COMMITTED_INCOMPLETE")
 # Key classes in ascending authority, and the least class each tier needs (flow design §9 K2b: T2 fires
 # on laptop-presence or display-phone, T3 on laptop-presence only, presence on neither)
 _CLASS_RANK = {"presence": 1, "display-phone": 2, "laptop-presence": 3}
+# the tiers a consent request and a signed pending carry (levain.consent.queue reads this one: it takes no C1)
 _TIER_NEEDS = {"T2": 2, "T3": 3}
+# a pending's tier as a decision reads it: a C1 reaches the journal only as a device's signed pending (K8), which
+# any enrolled key covers
+_RECORD_TIER_NEEDS = {"C1": 1, **_TIER_NEEDS}
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -433,8 +437,9 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
     # the fields a decision reads off the record (its authority), each checked here, at the one parse
     if record.get("intent") not in ("sign", "reported"):
         raise _corrupt(op, f"record intent {record.get('intent')!r} is neither sign nor reported")
-    if record.get("tier") not in ("T2", "T3"):
-        raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3")
+    # a C1 is journalled only as a device's signed pending (K8): never a reported one
+    if record.get("tier") not in ("T2", "T3") and not (record.get("tier") == "C1" and record.get("intent") == "sign"):
+        raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3 (nor a signed C1)")
     for name in ("issued_at", "expires_at"):
         _check_stamp(str(op), f"record {name}", record.get(name), nullable=False)
     if parse_stamp(record["issued_at"]) >= parse_stamp(record["expires_at"]):
@@ -1310,7 +1315,7 @@ def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, 
         return "key not enrolled", None
     if not key.active:
         return "key revoked", None
-    need = _TIER_NEEDS.get(tier)
+    need = _RECORD_TIER_NEEDS.get(tier)
     have = _CLASS_RANK.get(key.key_class)
     if need is None or have is None or have < need:
         return f"key class {key.key_class} does not cover {tier}", None

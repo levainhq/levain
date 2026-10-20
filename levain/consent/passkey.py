@@ -222,7 +222,8 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
     namespaces (it runs this check for all three), the authority replay accepts it on a ``revoke_grant`` link only
     (and runs :func:`authority_signature_problem`, this check with https required, at every replay), and the
-    broker refuses it for anything. The phone port's sign requests (:mod:`levain.consent.sign`) also run this
+    cockpit broker accepts one only over a phone pending in ``levain-cockpit-phone``, T2 at most, running this
+    check before ssh-keygen (K8). The phone port's sign requests (:mod:`levain.consent.sign`) also run this
     check, for a caller outside levain, in namespaces levain never verifies; so does dispatch
     (:mod:`levain.dispatch.sign`), for the operator's
     signatures in its own namespaces (each one a ``levain-dispatch-`` row of ``levain/contracts/namespaces.py``). Its
