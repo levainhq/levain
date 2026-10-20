@@ -357,6 +357,21 @@ def test_required_spellings_refuses_a_loop_and_allows_an_absent_path(tmp_path) -
     assert dangling in conf._required_spellings(dangling, "dangling")
 
 
+def test_required_spellings_passes_a_path_it_may_not_search(tmp_path, monkeypatch) -> None:
+    # L3 r4 (codex MED): an include under an unsearchable or TCC-protected directory raises
+    # PermissionError from a strict resolve; that is the old non-strict tolerance, not a refusal.
+    unsearchable = tmp_path / "locked" / "inc.cfg"
+    real_resolve = Path.resolve
+
+    def resolve(self, strict=False):
+        if self in (unsearchable, unsearchable.parent):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert unsearchable in conf._required_spellings(unsearchable, "unsearchable")
+
+
 def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"

@@ -377,20 +377,3 @@ def test_an_absent_derived_git_file_under_a_dir_this_user_owns_keeps_its_mask(
     assert str(C._host_spelling(under_own)) in _masks(argv)
     assert str(C._host_spelling(writable)) in _masks(argv)
     assert str(C._host_spelling(existing)) in _ro_binds(argv)
-
-
-@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root owns and can write /")
-def test_an_absent_derived_git_file_nobody_here_can_create_gets_no_mask(
-        home: Path, monkeypatch) -> None:
-    # L3 r2 (complement MED): a mask over an absent path under a directory another user owns and
-    # this one cannot write needs a mountpoint bwrap cannot make, so the agent never started;
-    # nothing can be planted there.
-    ent, ws = _entity(home)
-    unreachable = Path("/levain-test-absent-root") / "sub" / "inc.cfg"
-    assert not os.path.lexists(unreachable.parent.parent)
-    _derived_includes(home, monkeypatch, unreachable)
-    policy = build_policy(ent, workspace=ws, deny_standard_creds=False)
-    assert unreachable in policy.persistence_write_files
-    argv, _ = C._bwrap_plan(policy)
-    for spelling in {str(unreachable), os.path.realpath(unreachable)}:
-        assert not any(spelling in a for a in argv), spelling

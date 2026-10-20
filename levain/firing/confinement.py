@@ -696,8 +696,10 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
     for path in (raw.parent, raw):
         try:
             path.resolve(strict=True)
-        except (FileNotFoundError, NotADirectoryError):
-            pass  # absent: protected lexically, as an absent persistence path always was
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            # absent, or under a directory this user may not search (non-strict resolve's old
+            # tolerance): protected lexically, as an absent persistence path always was
+            pass
         except (OSError, RuntimeError, ValueError) as exc:
             raise ConfinementError(
                 f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
@@ -2584,6 +2586,8 @@ def build_policy(
     persistence_home_dirs = _dedup(_required_spellings(home, "operator home"))
     # Still uncovered: the system and repository configs, a relative core.attributesFile, includes
     # nested inside a conditional include's target, and anything the config gains after this build.
+    # On Linux an absent derived file under a directory nobody here can create makes bwrap refuse to
+    # start (its mountpoint cannot be made): fail-closed, and accepted as a known edge (L3 r4).
     git_env_subtrees, git_env_files = _git_config_overrides()
     persistence_write_subtrees = _dedup([
         p
@@ -6486,22 +6490,6 @@ def _creatable_by_me(p: Path) -> bool:
     return a.is_dir() and os.access(a, os.W_OK)
 
 
-def _unplantable_by_me(p: Path) -> bool:
-    """Whether nothing running as this user could ever create ``p``: its nearest existing ancestor is
-    a real directory (not a link) that another user owns and this one cannot write into. Stricter
-    than ``not _creatable_by_me``: a directory this user owns but cannot write today is one it can
-    chmod, so it does not count. Anything this cannot read counts as plantable (fail-closed)."""
-    a = p.parent
-    while not os.path.lexists(a) and a != a.parent:
-        a = a.parent
-    try:
-        st = os.lstat(a)
-    except OSError:
-        return False
-    return (stat.S_ISDIR(st.st_mode) and st.st_uid != os.geteuid()
-            and not os.access(a, os.W_OK | os.X_OK))
-
-
 # Every gpg-agent option that names a program the agent executes, with the gpgconf component that is
 # its default when the option is absent: ONE table read by both :func:`_gpg_program_spellings` (the
 # options in gpg-agent.conf) and :func:`_gpg_components` (the defaults). The set is gpg-agent's own
@@ -7299,11 +7287,6 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
             # The absent target of a configuration link that leads nowhere bash can create anything
             # (``gpg.conf -> /nonexistent/gpg.conf``): nothing to plant, so no mask, and no pin that
             # would have to create ``/nonexistent`` (RUN in CI's bwrap job 2026-10-13: bash refused).
-            continue
-        if f in persistence_files and not os.path.lexists(f) and _unplantable_by_me(f):
-            # The same for a startup file git names under a directory another user owns and this one
-            # cannot create in (an include under /etc): nothing can be planted, and its mountpoint is
-            # one bwrap cannot make. A directory this user owns keeps the mask: it can be chmodded back.
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
