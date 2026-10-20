@@ -1737,6 +1737,58 @@
     const t = queryTheme() || storedTheme();
     if (html && html.dataset && t) html.dataset.theme = t;
   })();
+  // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
+  // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
+  // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
+  const LAYOUT_KEY = "levain_cockpit_layout_v1";
+  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
+  // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
+  let memLayout = null, memStale = false;
+  const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
+  function readLayout() {
+    if (memStale && memLayout) return copyLayout(memLayout);
+    const out = { zones: Object.create(null), collapsed: [] };
+    let v = null;
+    try { v = JSON.parse(root.localStorage.getItem(LAYOUT_KEY)); } catch (_) { return out; }
+    if (!v || typeof v !== "object" || v.v !== 1) return out;
+    if (v.zones && typeof v.zones === "object") {
+      for (const z of Object.keys(v.zones)) {
+        const o = v.zones[z];
+        if (o && typeof o === "object" && Array.isArray(o.order)) out.zones[z] = strings(o.order);
+      }
+    }
+    out.collapsed = strings(v.collapsed);
+    return out;
+  }
+  function writeLayout(l) {
+    const zones = {};
+    for (const z of Object.keys(l.zones)) zones[z] = { order: l.zones[z] };
+    memLayout = copyLayout(l);
+    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
+  }
+  // A store that refuses the removal still holds the old copy: the page then keeps an EMPTY layout in memory (the stored one is never read
+  // back) and drops it only after a removal that worked.
+  function resetLayout() {
+    try { root.localStorage.removeItem(LAYOUT_KEY); memLayout = null; memStale = false; }
+    catch (_) { memLayout = { zones: Object.create(null), collapsed: [] }; memStale = true; }
+  }
+  // the stored names first, in their stored order; every key the page has and the store does not name follows in the order it came
+  function layoutOrder(zoneId, keys) {
+    const stored = readLayout().zones[zoneId] || [];
+    const have = new Set(keys), seen = new Set(), head = [];
+    for (const k of stored) if (have.has(k) && !seen.has(k)) { seen.add(k); head.push(k); }
+    return head.concat(keys.filter((k) => !seen.has(k)));
+  }
+  const layoutCollapsed = () => new Set(readLayout().collapsed);
+  // true when anything is saved (a stored order or a collapsed panel): the one condition under which a Reset layout control is drawn
+  function hasLayout() { const l = readLayout(); return l.collapsed.length > 0 || Object.keys(l.zones).length > 0; }
+  function setLayoutOrder(zoneId, order) { const l = readLayout(); l.zones[zoneId] = order; writeLayout(l); }
+  function setLayoutCollapsed(panelId, on) {
+    const l = readLayout(), s = new Set(l.collapsed);
+    if (on) s.add(panelId); else s.delete(panelId);
+    l.collapsed = Array.from(s);
+    writeLayout(l);
+  }
   // ---- the modes and the keys ----
   // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
   // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
@@ -1764,6 +1816,8 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
+    // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
+    if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
   // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
   // tab list (page chrome) is on every tab.
@@ -2223,6 +2277,13 @@
       const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
       if (b) setTheme(b.dataset.themeSet, true);
     });
+    document.addEventListener("click", (ev) => {
+      if (!(ev.target && ev.target.closest && ev.target.closest("[data-layout-reset]"))) return;
+      const D = root.LevainDashboard;
+      if (D && D.hasUnsavedEdit && D.hasUnsavedEdit()) return;   // the gate comes before the write: a draft or a running job keeps the layout as it is
+      resetLayout();
+      if (D && D.redraw) root.LevainDashboard.redraw();
+    });
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
@@ -2258,7 +2319,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, hashMode, revealTab });
+  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

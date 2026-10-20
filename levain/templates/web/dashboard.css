@@ -1591,8 +1591,7 @@ body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-co
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel { grid-column: 1 / -1; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel { grid-column: auto; }
 body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; grid-column: 1 / -1; }
-body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="tray"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="loops"] { order: 1; }
-body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="now"], body.ke[data-mode="board"] .ck-col .panel[data-ck-panel="keep"] { order: 2; }
+/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops over Keep until a saved layout says otherwise) */
 
 /* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
    Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
@@ -1849,6 +1848,28 @@ body.ke[data-mode="memory"] .ck-widgets { display: none; }
 body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
 body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 
+/* K5: collapse and reorder. The controls sit at the end of a card's head, quiet until the card is hovered or holds focus; on touch they are
+   always shown. A folded card keeps its head (title and count) and hides everything under it. */
+.ck-lay { display: inline-flex; gap: var(--sp-1); align-items: center; margin-left: auto; align-self: center; }
+.ck-lay-btn { border: 0; background: none; color: var(--label); width: 24px; height: 24px; border-radius: var(--r-sm); cursor: pointer; display: grid; place-items: center;
+  font-size: var(--fs-meta); line-height: 1; padding: 0; }
+.ck-lay-btn:hover:not(:disabled) { background: var(--card-2); color: var(--text); }
+.ck-lay-btn:disabled { opacity: 0.3; cursor: default; }
+.ck-lay-btn:focus-visible { outline: 2px solid var(--hue-2); outline-offset: 1px; }
+.ck-lay-fold::before { content: ""; width: 6px; height: 6px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform var(--dur-micro) var(--ease-out); }
+.panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
+.panel.ck-collapsed > :not(.phead) { display: none; }
+body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
+/* a card whose place CSS `order` pins would take a move as a no-op: the page marks its box (one set of keys in dashboard_core.js), no move buttons, collapse stays */
+.ck-lay.ck-nomove .ck-lay-up, .ck-lay.ck-nomove .ck-lay-down { display: none; }
+body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
+body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
+body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }
+@media (hover: none) { body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 1; } }
+.layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
+  font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
+.layoutreset:hover { color: var(--text); }
+.ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
 /* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
    Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
 .panel.k-topology, [data-ck-panel="topology"] { display: none !important; }
