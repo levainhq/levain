@@ -409,7 +409,7 @@ def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_
 @needs_browser
 def test_a_hung_resume_times_out_to_the_failed_label_and_live_tries_again(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE},
-                                            SLEEP(10800), {"eval": "window.__opts.repaint(); 1"}, {"eval": H_INFO},     # the page's own card shares the module state: repaint the host by hand
+                                            {"until": "(window.__opts.repaint(), !!document.querySelector('#h6 .tv-rerr'))", "ms": 15000}, {"eval": H_INFO},   # the page's own card shares the module state: repaint the host by hand
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
     failed, done = json.loads(out[-5]), json.loads(out[-1])
     assert "timed out" in failed["err"] and failed["replaying"] is True and failed["rshown"] not in (None, "live"), failed
@@ -426,3 +426,45 @@ def test_a_visibility_hidden_dialog_does_not_block_escape(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": hidden}, {"eval": esc}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000},
                                {"eval": "window.LevainTopologyView.replaying()"}])
     assert out[-1] is False, out                                                                                 # the hidden dialog did not swallow the card's Esc
+
+
+# --- FIX8: Esc in the returning / failed state, the timer of a superseded return, the histogram's one read per minute ---------------------------
+
+
+@needs_browser
+def test_escape_works_in_the_returning_and_the_failed_return_state(tmp_path, monkeypatch):
+    esc = "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return 1; })()"
+    out = _host_run(tmp_path, monkeypatch, tag="a", steps=[{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": H_LIVE}, SLEEP(100), {"eval": H_INFO},
+                                                           {"eval": "window.__mode = 'applied'; 1"}, {"eval": esc}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    mid, done = json.loads(out[-5]), json.loads(out[-1])
+    assert mid["badge"] == "returning to live…", mid                       # Esc is pressed while at === null, ret === true
+    assert done["replaying"] is False and done["resumes"] == 2, done
+    out = _host_run(tmp_path, monkeypatch, tag="b", steps=[{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'false'; 1"}, {"eval": H_LIVE},
+                                                           {"until": "!!document.querySelector('#h6 .tv-rerr')", "ms": 8000}, {"eval": H_INFO},
+                                                           {"eval": "window.__mode = 'applied'; 1"}, {"eval": esc}, {"until": "!window.LevainTopologyView.replaying()", "ms": 8000}, {"eval": H_INFO}])
+    failed, done = json.loads(out[-5]), json.loads(out[-1])
+    assert failed["err"] and failed["replaying"] is True, failed
+    assert done["replaying"] is False and done["resumes"] == 2, done
+
+
+@needs_browser
+def test_a_scrub_that_supersedes_a_return_clears_the_returns_timer(tmp_path, monkeypatch):
+    spy = ("(() => { window.__set = []; window.__clr = []; const s = window.setTimeout.bind(window), c = window.clearTimeout.bind(window); "
+           "window.setTimeout = (f, ms, ...a) => { const id = s(f, ms, ...a); if (ms === 10000) window.__set.push(id); return id; }; "
+           "window.clearTimeout = (id) => { window.__clr.push(id); return c(id); }; return 1; })()")
+    scrub2 = H_SCRUB.replace("0.4", "0.7") if "0.4" in H_SCRUB else H_SCRUB
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": spy}, {"eval": H_LIVE}, SLEEP(100),
+                                            {"eval": scrub2}, SLEEP(300), {"eval": "JSON.stringify({set: window.__set, clr: window.__clr})"}])
+    got = json.loads(out[-1])
+    assert got["set"] and got["set"][-1] in got["clr"], got                  # the return's timer was cleared by the scrub, not left to fire into a dead token
+
+
+@needs_browser
+def test_a_visible_replay_strip_reads_the_histogram_at_most_once_a_minute_and_never_per_repaint(tmp_path, monkeypatch):
+    skew = "(() => { const n = Date.now.bind(Date); Date.now = () => n() + 61000; return 1; })()"
+    repaints = "(async () => { for (let i = 0; i < 6; i++) { window.__opts.repaint(); await new Promise(r => setTimeout(r, 150)); } return 1; })()"
+    count = "(window.__urls || []).filter(u => u.includes('activity.json')).length"
+    out = _host_run(tmp_path, monkeypatch, [{"eval": "(window.__urls = [], 1)"}, {"eval": repaints}, SLEEP(300), {"eval": count},
+                                            {"eval": skew}, {"eval": repaints}, SLEEP(500), {"eval": count}])
+    assert out[-5] <= 1, out                                                   # six repaints inside the minute: no read per repaint
+    assert out[-1] - out[-5] == 1, out                                         # the minute passed: six more repaints, exactly one read

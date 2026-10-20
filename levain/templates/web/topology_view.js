@@ -974,7 +974,7 @@
   function replaying() { return R.at !== null || R.ret; }
   function replayValue() { return replaying() ? R.value : null; }
   const replaySig = () => [R.at, R.cat, R.err, R.busy, R.ret];
-  function abortFlight() { R.tok++; if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } R.pend = null; }
+  function abortFlight() { R.tok++; if (R.ctl) { try { R.ctl.abort(); } catch (_) { /* gone */ } R.ctl = null; } if (R.timer) { root.clearTimeout(R.timer); R.timer = null; } if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; } R.pend = null; }
   function clearReplay() { R.at = null; R.cat = null; R.value = null; R.anchor = null; R.busy = false; R.err = ""; R.ret = false; R.keyed = false; R.refocus = false; R.rtok++; if (R.rtimer) { root.clearTimeout(R.rtimer); R.rtimer = null; } }
   // the live read behind the paused one: the page's refetch (cockpit_view.refetchPanel). Resolves {ok: true} once the live value is drawn ("applied", or
   // "fault", which draws the fault as live does), else {ok: false, msg}: a rejection, a throw, a `false` (the board was redrawn under the read) or a
@@ -1111,14 +1111,17 @@
     if (R.escBound || !root.document || !root.document.addEventListener) return;
     R.escBound = true;
     root.document.addEventListener("keydown", (ev) => {
-      if (ev.key !== "Escape" || R.at === null || ev.defaultPrevented) return;
+      if (ev.key !== "Escape" || (!replaying() && !R.err) || ev.defaultPrevented) return;
       const t = ev.target, tag = t && t.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
       const d = root.document, inCard = [t, d.activeElement].some((n) => n && n.closest && n.closest(".k7-card, .tv"));
-      const shown = (n) => (typeof n.checkVisibility === "function" ? n.checkVisibility({ visibilityProperty: true, opacityProperty: true })
-        : n.getClientRects().length > 0 && !(root.getComputedStyle && root.getComputedStyle(n).visibility === "hidden"));
+      // checkVisibility takes the visibility option only where the browser reads it (probed with a getter); anywhere else the computed style is asked
+      let vp = false;
+      try { d.documentElement.checkVisibility({ get visibilityProperty() { vp = true; return true; } }); } catch (_) { vp = false; }
+      const shown = (n) => (vp ? n.checkVisibility({ visibilityProperty: true })
+        : n.getClientRects().length > 0 && !(root.getComputedStyle && ["hidden", "collapse"].includes(root.getComputedStyle(n).visibility)));
       if (!inCard && Array.from(d.querySelectorAll(".modal-overlay, dialog[open], [role=\"dialog\"], [aria-modal=\"true\"]")).some(shown)) return;
-      leaveReplay(false);
+      returnToLive();
     });
   }
   // the two-hour marks on the LOCAL clock: the first even local hour at or after lo, stepping a local hour at a time (any zone, any offset)
