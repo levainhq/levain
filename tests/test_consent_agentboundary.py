@@ -825,3 +825,190 @@ def test_receipt_hash_agrees_with_an_independent_rfc_8785_implementation(scratch
     for r in scratch[2].receipts:
         body = {k: v for k, v in r.items() if k != "receipt_hash"}
         assert hashlib.sha256(rfc8785.dumps(body)).hexdigest() == r["receipt_hash"], r["execution"]["result_ref"]
+
+
+# --- S-R2 (1019+45 B5, REFUSED_ANSWER_DESIGN D4): a kept refused answer exported as the evidence of a refusal ------
+
+@pytest.fixture(scope="module")
+def rkeys(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ab-refused-keys")
+    return {n: Key(d, n) for n in ("laptop", "presence", "revoked", "thief", "stranger")}
+
+
+def _refused_world(tmp_path, rkeys):
+    """A queue over a log holding laptop (laptop-presence), presence (presence: does not cover T2), revoked (a plain
+    revocation) and thief (revoked as compromised); stranger is never enrolled."""
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", rkeys)
+    log.enrol("laptop", "laptop-presence")
+    log.enrol("presence", "presence")
+    log.enrol("revoked", "display-phone")
+    log.revoke("revoked")
+    log.enrol("thief", "display-phone")
+    since = log.source().key(rkeys["thief"].fp).enrolled_seq
+    log.link({"op": "revoke_key", "fingerprint": rkeys["thief"].fp, "compromised_since": since})
+    clock = Clock(datetime.now(timezone.utc))
+    return ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock), clock
+
+
+HOLD = timedelta(minutes=5)
+
+
+def _file(queue, command="x"):
+    return queue.file(agent="claude_code", agent_session_id="s-r", tool_name="Bash", tool_input={"command": command},
+                      cwd="/w", hold=HOLD, tier="T2")
+
+
+def _attempt(queue, request, key, decision="allow"):
+    from levain.consent import AnswerRefused
+    payload, sig = signed(queue, request, key, decision)
+    with pytest.raises(AnswerRefused):
+        queue.answer(request.id, payload, sig)
+    return payload
+
+
+def _lapse(queue, clock):
+    clock.now += HOLD + UNDECIDED_GRACE + timedelta(seconds=1)
+    assert queue.sweep() == 1
+
+
+def _expired_receipt(queue, now):
+    exported = ab.export(queue.directory, now=now)
+    [r] = [r for r in exported.receipts if "refusal" in r and r["refusal"]["verdict"] in ("expired", "deny")]
+    return r, exported
+
+
+@pytest.mark.parametrize("key, operator, enrolled, compromised, subreason", [
+    ("stranger", False, False, False, "not-enrolled"),
+    ("presence", True, True, False, "class"),
+    ("revoked", True, True, False, "revoked"),
+    ("thief", False, True, True, "compromised"),
+])
+def test_an_unauthorised_approval_exports_as_deny_with_the_approval_as_evidence(tmp_path, rkeys, key, operator,
+                                                                                enrolled, compromised, subreason):
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    payload = _attempt(queue, request, rkeys[key])
+    _lapse(queue, clock)
+    r, exported = _expired_receipt(queue, clock.now + timedelta(days=2))
+    assert r["refusal"] == {"verdict": "deny", "reason_code": "approver-not-authorized"}
+    assert r["policy"]["decision"] == "require-approval" and r["execution"]["status"] == "blocked"
+    approver = r["approval"]["approver"]
+    assert approver["id"] == f"ssh-key:{rkeys[key].fp}"
+    # never attribute a thief's or a stranger's signature to the operator: no role at all (the schema's is optional)
+    assert ("role" in approver) is operator and approver.get("role", "operator") == "operator"
+    assert r["approval"]["approved_at"] == payload["signed_at"]
+    context = json.loads(r["approval"]["context"])
+    assert (context["refused"], context["via"], context["enrolled"], context["compromised"], context["subreason"]) == \
+        (True, "refused-answer", enrolled, compromised, subreason)
+    assert context["request_id"] == request.id and context["levain_reason"]
+    p = r["provenance"]
+    assert (p["approval.approver.id"], p["approval.approved_at"], p["approval.context"]) == ("inferred",) * 3
+    assert ("approval.approver.role" in p) is operator
+    assert r["completeness_score"] == ab._score_milli(r, p) / 1000.0 and r["receipt_hash"] == ab.receipt_hash(r)
+    assert exported.report.refused_not_authorized == 1 and exported.report.refused_window_elapsed == 0
+    if _has_ab():
+        assert ab_validate(r) == []                 # the spec's own schema (where agentboundary is installed)
+
+
+def _has_ab() -> bool:
+    try:
+        import agentboundary  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def test_an_authorised_answer_after_the_hold_keeps_expired_and_carries_the_stale_approval(tmp_path, rkeys):
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _lapse(queue, clock)
+    expired_at = utc_stamp(clock.now)
+    clock.now += timedelta(seconds=30)
+    payload = _attempt(queue, request, rkeys["laptop"])
+    [kept] = queue.refused_answers(request.id)
+    assert (kept["reason_code"], kept["subreason"], kept["enrolled"]) == ("approval-window-elapsed", "late", True)
+    r, exported = _expired_receipt(queue, clock.now + timedelta(days=2))
+    assert r["refusal"] == {"verdict": "expired", "reason_code": "approval-window-elapsed"}
+    assert r["execution"]["status"] == "blocked" and r["execution"]["completed_at"] == expired_at
+    assert r["approval"]["approver"] == {"id": f"ssh-key:{rkeys['laptop'].fp}"}   # `late` is not a role case (D4)
+    assert r["approval"]["approved_at"] == payload["signed_at"]
+    # the receipt is not earlier than the evidence it records
+    assert r["issued_at"] == kept["refused_at"] and r["provenance"]["issued_at"] == "inferred"
+    assert exported.report.refused_window_elapsed == 1 and exported.report.refused_not_authorized == 0
+
+
+def test_a_refused_deny_is_never_approval_evidence_and_the_row_exports_as_plain_expired(tmp_path, rkeys):
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _attempt(queue, request, rkeys["stranger"], "deny")
+    assert [k["decision"] for k in queue.refused_answers(request.id)] == ["deny"]
+    _lapse(queue, clock)
+    r, exported = _expired_receipt(queue, clock.now + timedelta(days=2))
+    assert r["refusal"] == {"verdict": "expired", "reason_code": "approval-window-elapsed"}
+    assert "approval" not in r and not any(k.startswith("approval") for k in r["provenance"])
+    assert exported.report.refused_not_authorized == exported.report.refused_window_elapsed == 0
+
+
+def test_the_latest_refused_allow_in_the_window_is_the_one_exported(tmp_path, rkeys):
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _attempt(queue, request, rkeys["stranger"])
+    clock.now += timedelta(seconds=10)
+    _attempt(queue, request, rkeys["presence"])
+    clock.now += timedelta(seconds=10)
+    _attempt(queue, request, rkeys["revoked"], "deny")                  # later, but a deny: passed over
+    _lapse(queue, clock)
+    r, _ = _expired_receipt(queue, clock.now + timedelta(days=2))
+    assert r["approval"]["approver"]["id"] == f"ssh-key:{rkeys['presence'].fp}"
+
+
+def test_a_refusal_kept_after_the_row_was_exported_never_changes_the_receipt(tmp_path, rkeys):
+    """R10 SETTLE: an expired row with no outcome is held until it is SETTLE old; a refused answer inside the window
+    is in the export, and one kept after an export took the row (even with the writer's clock the full slack behind
+    the export clock) changes nothing."""
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _lapse(queue, clock)
+    created = clock.now
+    held = ab.export(queue.directory, now=created + timedelta(minutes=1))
+    assert held.receipts == [] and held.report.held_unsettled == 1
+    now = created + ab.SETTLE                                          # the first moment the row is exported
+    first = ab.export(queue.directory, now=now)
+    [r] = first.receipts
+    assert r["refusal"] == {"verdict": "expired", "reason_code": "approval-window-elapsed"} and "approval" not in r
+    clock.now = now - ab._CLOCK_SLACK
+    _attempt(queue, request, rkeys["stranger"])
+    assert len(queue.refused_answers(request.id)) == 1                 # kept, as evidence, but past the window
+    assert ab.export(queue.directory, now=now + timedelta(hours=1)).receipts == first.receipts
+    # the same refusal one second inside the window, while the row is still held, is the receipt's evidence
+    (tmp_path / "b").mkdir()
+    q2, c2 = _refused_world(tmp_path / "b", rkeys)
+    r2 = _file(q2)
+    _lapse(q2, c2)
+    created2 = c2.now
+    c2.now = created2 + ab.SETTLE - ab._CLOCK_SLACK - timedelta(seconds=1)
+    _attempt(q2, r2, rkeys["stranger"])
+    [counted] = ab.export(q2.directory, now=created2 + ab.SETTLE).receipts
+    assert counted["refusal"] == {"verdict": "deny", "reason_code": "approver-not-authorized"}
+
+
+def test_a_malformed_refused_row_is_passed_over_never_an_export_error(tmp_path, rkeys):
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _lapse(queue, clock)
+    conn = sqlite3.connect(queue.path)
+    try:
+        with conn:
+            conn.execute("INSERT INTO refused_answers (request_id, kind, refused_at, reason_code, subreason, enrolled, "
+                         "detail, decision, signer_fp, signed_at, record, signature) VALUES "
+                         "(?, 'answer', ?, 'approver-not-authorized', 'not-enrolled', 0, 'd', 'allow', 'SHA256:x', "
+                         "'not a time', '{}', 's')", (request.id, utc_stamp(clock.now)))
+    finally:
+        conn.close()
+    r, _ = _expired_receipt(queue, clock.now + timedelta(days=2))
+    assert r["refusal"]["verdict"] == "expired" and "approval" not in r
+
+
+def test_the_scratch_queue_has_no_refused_answers_and_exports_as_before(scratch):
+    assert scratch[2].report.refused_not_authorized == scratch[2].report.refused_window_elapsed == 0

@@ -3,8 +3,8 @@
 AgentBoundary (jamjet-labs/agentboundary) is a receipt format for what an agent was allowed to do: closed JSON,
 RFC 8785 (JCS) plus SHA-256 for ``arguments_hash`` and ``receipt_hash``, a singly linked ``prior_receipt`` chain.
 This module is a MAPPING of ``queue.db`` (and, for what ran, the authority ledger beside it) onto it, computed on
-every call from the rows, like :mod:`levain.consent.receipt_log`: no second store, no schema change, no hash kept
-anywhere. Both databases are opened read-only and never created, migrated or written.
+every call from the rows, like :mod:`levain.consent.receipt_log`: no second store, no schema change of its own, no
+hash kept anywhere. Both databases are opened read-only and never created, migrated or written.
 
   - one AgentBoundary receipt per TERMINAL receipt row (``allowed``, ``denied``, ``expired``, ``withdrawn``,
     ``undecided``), in ``seq`` order; ``pending`` rows stay in the Q11 log and are not exported. An undecided request
@@ -41,6 +41,17 @@ What each queue state becomes (``policy.decision`` / ``execution.status`` / ``re
   NO approval block (a denial is not an approval; the signer stays findable through ``execution.result_ref``) ·
   expired: require-approval / blocked / expired ``approval-window-elapsed`` · undecided and withdrawn:
   require-approval / blocked / require-approval with the reason ``undecided`` or ``withdrawn``.
+  An expired request with no counted dialog outcome that holds a kept refused ALLOW (``refused_answers``: an
+  answer that verified under the key it names and was refused) carries it as the evidence of the refusal, the
+  latest one kept less than ``SETTLE`` before the row and less than ``SETTLE`` minus the clock slack after it:
+  ``approver-not-authorized`` -> refusal deny ``approver-not-authorized``; ``approval-window-elapsed`` -> the refusal
+  stays expired ``approval-window-elapsed``. Both carry an ``approval`` block: approver ``ssh-key:<signer_fp>``
+  (inferred), ``approved_at`` the answer's ``signed_at`` (inferred: the signer's claim), a context naming it a
+  refused answer with its key's standing and levain's reason. The approver gets ``role: operator`` only for a key
+  the authority log held, refused for its class or a plain revocation; an unenrolled key (anyone can make one) or a
+  compromised one gets no role (the schema's ``role`` is optional) and the context says ``enrolled`` / ``compromised``.
+  The action stays ``blocked``. A refused deny is never approval evidence. ``issued_at`` is moved to the refusal's
+  time when it is later than the row's.
   A withdrawn or expired request left to the agent's own dialog gets its counted ``dialog_outcomes`` row mapped over
   the queue's state, because the queue's state then describes a request the agent answered, not levain, and
   ``blocked`` for a tool that ran would be a false record: ``did_not_run``: blocked with no refusal · ``ran`` (a yes
@@ -78,6 +89,9 @@ a timestamp that does not parse, an empty required string, a score that is not a
 :class:`ExportError`, never an invalid receipt. A column is parsed only where it is used.
 
 Known edges (each stated, none built against):
+  - a kept refused answer is covered by no signed head (``refused_answers`` is outside the Q11 log): a raw writer of
+    ``queue.db`` can add or drop one, so the approval block of a refusal is evidence that an attempt was made and
+    refused, never authority. A malformed row is passed over, never an export error;
   - NO signature and NO COSE envelope. The spec's envelope is Ed25519 only, while an operator key may be a security
     key or a passkey (P-256), and a key Levain held itself would be the mediator's signature Q11 refused. Authenticity
     stays Levain's own: the operator's signed answer and the Q11 head, checked by ``levain consent receipts verify``.
@@ -163,6 +177,16 @@ _POSTS_SQL = ("SELECT rowid, agent, agent_session_id, tool_use_id, tool_name, to
               "FROM calls WHERE phase IN ('post', 'post_failure') ORDER BY received_at, rowid")
 _PRE_SQL = ("SELECT request_id, tool_use_id FROM calls WHERE phase = 'pre' AND request_id IS NOT NULL "
             "AND tool_use_id IS NOT NULL")
+_REFUSED_SQL = ("SELECT seq, request_id, kind, refused_at, reason_code, subreason, enrolled, detail, decision, "
+                "signer_fp, signed_at FROM refused_answers ORDER BY seq")
+_REFUSED_REASONS = frozenset({"approver-not-authorized", "approval-window-elapsed"})
+# the refusals of a key the operator holds (enrolled, refused only for its class or a plain revocation): the only ones
+# whose signer is named an operator; an unenrolled key anyone can make, and a compromised one may be a thief's
+_OPERATOR_SUBREASONS = frozenset({"class", "revoked"})
+# a refused answer kept this long after an expired row counts as its evidence: SETTLE less the export clock's slack,
+# so one written after an export that took the row (``now - created >= SETTLE``, ``now`` at most the slack ahead of
+# the writer's clock) is past the window and changes nothing
+_REFUSAL_AFTER = SETTLE - _CLOCK_SLACK
 
 
 class ExportError(ValueError):
@@ -193,6 +217,20 @@ class _Row(NamedTuple):
     oevent: Any
 
 
+class _Refused(NamedTuple):
+    seq: Any
+    request_id: Any
+    kind: Any
+    refused_at: Any
+    reason_code: Any
+    subreason: Any
+    enrolled: Any
+    detail: Any
+    decision: Any
+    signer_fp: Any
+    signed_at: Any
+
+
 @dataclass(frozen=True)
 class Report:
     """What an export did. ``by_state``: exported receipts per receipt-row state. ``pending_skipped``: ``pending``
@@ -205,7 +243,8 @@ class Report:
     ``execution_failed``: receipts whose tool call ended in failure. ``execution_unrecorded``: allowed requests old
     enough to settle with no ledger evidence, exported ``blocked``. ``ledger_found``: whether the authority ledger
     was there to read. ``held_unsettled``: terminal rows not exported because the first unsettled row and all after
-    it were held back."""
+    it were held back. ``refused_not_authorized`` / ``refused_window_elapsed``: expired rows exported with a kept
+    refused answer as their approval evidence, for each reason."""
     receipts: int
     by_state: Mapping[str, int]
     pending_skipped: int
@@ -219,6 +258,8 @@ class Report:
     execution_unrecorded: int
     ledger_found: bool
     held_unsettled: int
+    refused_not_authorized: int
+    refused_window_elapsed: int
 
 
 @dataclass(frozen=True)
@@ -310,9 +351,10 @@ def _open(queue_dir: Path) -> sqlite3.Connection:
     return _open_ro(Path(queue_dir) / DB_NAME, "the queue")
 
 
-def _read(queue_dir: Path) -> tuple[str, list[_Row]]:
-    """``(queue_id, rows)`` in one read snapshot. Raises :class:`ExportError` when the store is not a readable
-    current-format consent queue."""
+def _read(queue_dir: Path) -> tuple[str, list[_Row], dict[str, list[_Refused]]]:
+    """``(queue_id, rows, refused)`` in one read snapshot, ``refused`` the kept refused answers by request id (empty
+    for a store from before the table). Raises :class:`ExportError` when the store is not a readable current-format
+    consent queue."""
     from levain.consent.queue import STORE_FORMAT
     conn = _open(queue_dir)
     try:
@@ -333,11 +375,15 @@ def _read(queue_dir: Path) -> tuple[str, list[_Row]]:
             else:
                 sql = _SQL.format(outcome="NULL", closed="NULL", event="NULL", join="")
             rows = [_Row(*r) for r in conn.execute(sql).fetchall()]
+            refused: dict[str, list[_Refused]] = {}
+            if "refused_answers" in have:
+                for r in conn.execute(_REFUSED_SQL).fetchall():
+                    refused.setdefault(r[1], []).append(_Refused(*r))
         except sqlite3.Error as exc:
             raise ExportError(f"the store cannot be read: {exc}") from None
     finally:
         conn.close()                # ends the read transaction with it; nothing here can replace an ExportError
-    return meta["queue_id"], rows
+    return meta["queue_id"], rows, refused
 
 
 class _Evidence:
@@ -436,6 +482,34 @@ def _counted_outcome(row: _Row) -> tuple[str, str, str] | None:
     return row.outcome, row.closed, row.oevent
 
 
+def _refused_evidence(row: _Row, kept: list[_Refused]) -> _Refused | None:
+    """The kept refused answer an ``expired`` row exports as its approval evidence: the latest (by ``refused_at``,
+    then ``seq``) refused ALLOW kept less than ``SETTLE`` before the row's ``created_at`` and less than
+    :data:`_REFUSAL_AFTER` after it. A refused deny is never approval evidence and is passed over. So is a row that
+    is not well-formed (text columns, a known reason, parseable times): the table is covered by no signed head, so a
+    raw writer's malformed row neither fails the export nor reaches a receipt."""
+    created = _stamp(row.created, "stamp", row.seq)
+    best: tuple[tuple[datetime, int], _Refused] | None = None
+    for r in kept:
+        if type(r.seq) is not int or type(r.enrolled) is not int or r.enrolled not in (0, 1):
+            continue
+        if not all(type(v) is str and v for v in (r.kind, r.refused_at, r.reason_code, r.subreason, r.detail,
+                                                  r.decision, r.signer_fp, r.signed_at)):
+            continue
+        if r.decision != "allow" or r.reason_code not in _REFUSED_REASONS:
+            continue
+        try:
+            at = parse_stamp(r.refused_at)
+            parse_stamp(r.signed_at)
+        except ConsentError:
+            continue
+        if not -SETTLE < at - created < _REFUSAL_AFTER:
+            continue
+        if best is None or (at, r.seq) > best[0]:
+            best = ((at, r.seq), r)
+    return None if best is None else best[1]
+
+
 def _approved_at(answer: Any, decided: str) -> tuple[str, bool]:
     """``(approved_at, from the answer)``: the signed answer's ``signed_at`` when it is before the decision time."""
     try:
@@ -448,10 +522,11 @@ def _approved_at(answer: Any, decided: str) -> tuple[str, bool]:
 
 
 def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidence: tuple[str, str] | None,
-         counters: dict[str, int]) -> tuple[dict[str, Any], dict[str, str]]:
+         counters: dict[str, int], refused: _Refused | None = None) -> tuple[dict[str, Any], dict[str, str]]:
     """The receipt (without ``prior_receipt``, ``provenance``, score and hash) and its provenance entries.
     ``outcome`` is the row's dialog outcome when it counts (:func:`_counted_outcome`), ``evidence`` the ledger's
-    ``(status, time)`` for an allowed request, else ``None``."""
+    ``(status, time)`` for an allowed request, ``refused`` the kept refused answer of an expired row with no counted
+    outcome (:func:`_refused_evidence`), else ``None``."""
     seq, rstate, created, qstate, via = row.seq, row.rstate, row.created, row.qstate, row.via
     _stamp(created, "stamp", seq)
     issued = created
@@ -526,6 +601,29 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
         refusal = ("deny", "operator-denied")
     elif rstate == "expired":
         refusal = ("expired", "approval-window-elapsed")
+        if refused is not None and outcome is None:
+            # an answer that verified under the key it names and was refused: the evidence of the refusal (spec
+            # v0.2-alpha section 2.3 rule 3), never an approval of the action, which stays blocked
+            if refused.reason_code == "approver-not-authorized":
+                refusal = ("deny", "approver-not-authorized")
+                counters["refused_not_authorized"] += 1
+            else:
+                counters["refused_window_elapsed"] += 1
+            operator = refused.enrolled == 1 and refused.subreason in _OPERATOR_SUBREASONS
+            approver: dict[str, str] = {"id": f"ssh-key:{refused.signer_fp}"}
+            if operator:
+                approver["role"] = "operator"
+            approval = {"approver": approver, "approved_at": refused.signed_at,
+                        "context": json.dumps({"queue": queue_id, "request_id": row.request_id,
+                                               "via": "refused-answer", "refused": True, "kind": refused.kind,
+                                               "enrolled": refused.enrolled == 1,
+                                               "compromised": refused.subreason == "compromised",
+                                               "subreason": refused.subreason, "levain_reason": refused.detail},
+                                              sort_keys=True, separators=(",", ":"))}
+            prov.update({"approval.approver.id": "inferred", "approval.approved_at": "inferred",
+                         "approval.context": "inferred"})
+            if operator:
+                prov["approval.approver.role"] = "synthesized"
     elif rstate in ("undecided", "withdrawn"):
         refusal = ("require-approval", rstate)
     if rstate in ("withdrawn", "expired") and outcome is not None and outcome[0] == "did_not_run":
@@ -559,6 +657,11 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
     # the later of the row's stamp and the execution's time, so nothing completes after its receipt was issued
     if _stamp(completed, "execution time", seq) > _stamp(created, "stamp", seq):
         issued = completed
+        prov["issued_at"] = "inferred"
+    # ... and of the refused answer it records, kept after the hold lapsed (a late one), so the evidence a receipt
+    # carries is never later than the receipt
+    if approval is not None and refused is not None and parse_stamp(refused.refused_at) > _stamp(issued, "stamp", seq):
+        issued = refused.refused_at
         prov["issued_at"] = "inferred"
     receipt: dict[str, Any] = {
         "version": AB_VERSION,
@@ -597,11 +700,11 @@ def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
     if now > real + _CLOCK_SLACK:
         raise ExportError("now is ahead of the real clock: an export clock in the future would settle rows early "
                           "and let a later record change a receipt already exported")
-    queue_id, rows = _read(Path(queue_dir))
+    queue_id, rows, kept = _read(Path(queue_dir))
     ledger = _Evidence(Path(queue_dir))
     counters = {"synthesized_arguments_hash": 0, "dialog_ran": 0, "dialog_ran_unasked": 0,
                 "dialog_did_not_run": 0, "approved_at_fallback": 0, "execution_failed": 0,
-                "execution_unrecorded": 0}
+                "execution_unrecorded": 0, "refused_not_authorized": 0, "refused_window_elapsed": 0}
     by_state: dict[str, int] = {}
     receipts: list[dict[str, Any]] = []
     pending = normalised = held = 0
@@ -632,7 +735,11 @@ def export(queue_dir: Path | str, *, now: datetime | None = None) -> Export:
         if stopped:
             held += 1
             continue
-        receipt, prov = _map(queue_id, row, outcome, evidence, counters)
+        # an expired row with no counted outcome is exported only once it is SETTLE old (the stop above), so every
+        # refused answer inside its window is already kept when it is read here
+        refused = (_refused_evidence(row, kept.get(row.request_id, []))
+                   if row.rstate == "expired" and outcome is None else None)
+        receipt, prov = _map(queue_id, row, outcome, evidence, counters, refused)
         clean = _nfc(receipt)
         if clean != receipt:
             normalised += 1
