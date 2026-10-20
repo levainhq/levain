@@ -504,6 +504,8 @@
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
+    const needsHost = document.getElementById("ck-needs");
+    if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
@@ -706,7 +708,12 @@
       // a count tile is one answer with a list behind it: it opens that list in the focus modal (a button, so the keyboard reaches it).
       // Any other tile that does not draw everything it has (a "+N more", a clipped run of text) is the same kind of button: the
       // fit pass in cockpit_view.js says so with a "levain-hidden" event on the tile's body, and the focus view shows all of it.
-      const open = () => openModal(findEntry(currentView, entryKey(e)) || e, node, true);
+      // Decisions has no modal while something waits: the strip under the band is where it is answered, so the tile takes the
+      // reader there. With nothing waiting it opens the history (decided requests, outcomes, proposals).
+      const open = () => {
+        if (e.id === "decisions" && needsFocus()) return;
+        openModal(findEntry(currentView, entryKey(e)) || e, node, true);
+      };
       const onKey = (ev) => {
         if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
         ev.preventDefault();
@@ -1339,6 +1346,7 @@
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
     // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind
     for (const zone of view.ke.zones) guardRegion(zone.title, () => renderZone(zone, view, byId, board), (node) => board.appendChild(node));
@@ -3757,23 +3765,19 @@
     consentBodies.set(key, got);
     return got;
   }
-  function drawConsentBody(row, slot, b, pending) {
-    const sv = (x) => (typeof x === "string" ? x : "");
-    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
-    const parts = [el("pre", "consent-display", sv(b.display))];
-    const facts = el("div", "consent-facts");
-    facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
-    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
-    parts.push(facts);
-    // Q12 / Q16: the two digests the terminal prints before signing (short, the whole value one click away) and what a shell
-    // command looks like; text only, and a hint informs, never authorises
+  // Q12 / Q16: the hint box (what a shell command looks like; text only, and a hint informs, never authorises) and the two
+  // digests the terminal prints before signing (short, the whole value one click away). Shared by the row and the strip's card.
+  function consentHintBox(b) {
     const hints = Array.isArray(b.hints) ? b.hints.filter((h) => typeof h === "string" && h) : [];
-    if (hints.length) {
-      const box = el("div", "consent-facts consent-hint");
-      box.appendChild(el("span", "ext-meta", "hint (a few patterns only; informs, never authorises)"));
-      for (const h of hints) box.appendChild(el("div", h === "no pattern matched: read the command" ? "consent-dgtext consent-none" : "consent-dgtext", "\u2022 " + h));
-      parts.push(box);
-    }
+    if (!hints.length) return null;
+    const box = el("div", "consent-facts consent-hint");
+    box.appendChild(el("span", "ext-meta", "hint (a few patterns only; informs, never authorises)"));
+    for (const h of hints) box.appendChild(el("div", h === "no pattern matched: read the command" ? "consent-dgtext consent-none" : "consent-dgtext", "\u2022 " + h));
+    return box;
+  }
+  function consentDigestLines(b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const parts = [];
     for (const [label, value] of [["input digest", b.tool_input_digest], ["request digest", b.digest]]) {
       const full = sv(value);
       if (!full) {                                 // a missing digest is shown as missing, never dropped
@@ -3796,6 +3800,19 @@
       line.append(el("span", "ext-meta", label), code);
       parts.push(line);
     }
+    return parts;
+  }
+  function drawConsentBody(row, slot, b, pending) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const parts = [el("pre", "consent-display", sv(b.display))];
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "cwd " + sv(b.cwd)));
+    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
+    parts.push(facts);
+    const hintBox = consentHintBox(b);
+    if (hintBox) parts.push(hintBox);
+    parts.push(...consentDigestLines(b));
     if (sv(b.note)) parts.push(el("div", "consent-note ext-meta", sv(b.note)));
     if (!pending && sv(b.audit)) {
       const audit = row.querySelector(".consent-audit");
@@ -3959,6 +3976,7 @@
     for (const o of options) {
       const key = sv(o && o.key);
       const btn = el("button", "undo-btn question-option", key + " · " + sv(o && o.label) + (key === sv(b.rec) ? " (recommended)" : ""));
+      if (key === sv(b.rec)) btn.classList.add("question-rec");
       btn.type = "button";
       btn.title = "answer with option " + key;
       btn.addEventListener("click", () => send({ option: key }));
@@ -4005,6 +4023,159 @@
     });
     head.appendChild(btn);
     return row;
+  }
+
+  // ---- The Needs-you strip (K4, F4 a / F11 a) ----
+  // What waits on the operator, drawn as cards under the now band: each PENDING consent request and each OPEN question of the
+  // Decisions panel, the requests on a clock first (soonest expiry), then the questions. The strip is absent when nothing waits
+  // (never an empty strip), and on a tab that is not Morning or Board it is the header alone. A consent card carries no rec:
+  // Allow and Deny weigh the same and the hint line is what informs (F11 a). A question keeps its rec, which is the agent's
+  // words and authorises nothing. This page signs nothing: the card says to answer on the phone, and its buttons copy the CLI
+  // command for a terminal; the question's answer goes through the verb path the board already has. History (decided rows,
+  // outcomes, standing-rule proposals) stays in the Decisions focus view, behind the strip's "all decisions" button.
+  function needsItems(lines) {
+    const consents = [], questions = [];
+    for (const ln of Array.isArray(lines) ? lines : []) {
+      if (!ln || typeof ln !== "object") continue;
+      if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
+      else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+    }
+    const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
+    consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
+    return consents.concat(questions);
+  }
+  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
+  // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
+  function needsName(it) {
+    return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");
+  }
+  function needsSummary(items) {
+    const nc = items.filter((it) => it.kind === "consent").length, nq = items.length - nc;
+    const parts = [];
+    if (nc) parts.push(nc + (nc === 1 ? " consent" : " consents"));
+    if (nq) parts.push(nq + (nq === 1 ? " question" : " questions"));
+    const first = items.find((it) => it.kind === "consent");
+    return parts.join(" · ") + (first && Number.isFinite(Date.parse(first.c.expiresAt)) ? " · soonest " + consentLeft(first.c.expiresAt) : "");
+  }
+  function needsHead(card, kindChip, agent, tail) {
+    const head = el("div", "consent-head needs-head");
+    head.appendChild(kindChip);
+    head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
+    if (tail) head.appendChild(tail);
+    card.appendChild(head);
+  }
+  // an answer-on-your-phone note, and the CLI route behind "details" (the digests, the note and the two commands)
+  function needsDetails(parts) {
+    const d = el("details", "needs-details");
+    d.appendChild(el("summary", null, "details"));
+    d.append(...parts);
+    return d;
+  }
+  function drawConsentCard(card, slot, b) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
+    const parts = [el("pre", "consent-display", sv(b.display))];
+    const facts = el("div", "consent-facts");
+    facts.appendChild(el("span", "ext-meta", "in " + sv(b.cwd)));
+    facts.appendChild(el("span", "ext-meta", "targets " + sv(b.targets)));
+    parts.push(facts);
+    const hintBox = consentHintBox(b);
+    if (hintBox) parts.push(hintBox);
+    // Allow and Deny are one component at one weight: neither is filled, neither leads. This page signs nothing, so each
+    // copies the terminal command that answers; the phone is where the answer is signed.
+    const acts = el("div", "needs-actions");
+    const cmds = [];
+    for (const [label, cmd] of [["Allow", sv(b.answer_allow)], ["Deny", sv(b.answer_deny)]]) {
+      if (!cmd) continue;
+      const btn = el("button", "needs-btn", label);
+      btn.type = "button";
+      btn.dataset.label = label;
+      btn.title = "copy the " + label.toLowerCase() + " command; this page signs nothing";
+      const code = el("code", "consent-code", cmd);
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      acts.appendChild(btn);
+      const line = el("div", "consent-cmd");
+      line.appendChild(code);
+      cmds.push(line);
+    }
+    if (acts.childElementCount) parts.push(acts);
+    parts.push(el("div", "needs-phone ext-meta", "answer on your phone to sign it with Face ID, or copy a command for a terminal"));
+    const more = [...consentDigestLines(b)];
+    if (sv(b.note)) more.push(el("div", "consent-note ext-meta", sv(b.note)));
+    more.push(...cmds);
+    parts.push(needsDetails(more));
+    slot.replaceChildren(...parts);
+  }
+  function consentCard(c) {
+    const card = el("div", "needs-card needs-consent");
+    card.dataset.needsCard = "consent";
+    needsHead(card, el("b", "consent-tool", c.tool), c.agent, (() => {
+      const left = el("span", "consent-left needs-left", consentLeft(c.expiresAt));
+      left.dataset.consentExpires = c.expiresAt;
+      if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
+      return left;
+    })());
+    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[1]);
+    const slot = el("div", "needs-body ext-meta", "reading the request…");
+    card.appendChild(slot);
+    if (c.id) consentBody(c, card).then((b) => drawConsentCard(card, slot, b));
+    else slot.textContent = "this request has no id";
+    return card;
+  }
+  function questionCard(q) {
+    const card = el("div", "needs-card needs-question");
+    card.dataset.needsCard = "question";
+    needsHead(card, el("span", "needs-chip", "question"), q.agent, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    const slot = el("div", "needs-body ext-meta", "reading the question…");
+    card.appendChild(slot);
+    questionBody(q, card).then((b) => {
+      drawQuestionBody(q, slot, b);
+      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")]));
+    });
+    return card;
+  }
+  function clearNeeds(host) {
+    host.replaceChildren();
+    host.hidden = true;
+    delete host.dataset.sig;
+  }
+  function renderNeeds(view) {
+    const host = document.getElementById("ck-needs");
+    if (!host) return;
+    const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    if (!items.length) { clearNeeds(host); return; }
+    // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
+    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
+    const sig = items.map(needsKey).join("\n");
+    if (host.dataset.sig === sig && !host.hidden) return;
+    host.dataset.sig = sig;
+    const head = el("div", "needs-headline");
+    head.appendChild(el("h3", null, "Needs you"));
+    head.appendChild(el("span", "needs-count", String(items.length)));
+    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign on your phone, or answer a question here."));
+    const hist = el("button", "needs-history", "all decisions");
+    hist.type = "button";
+    hist.title = "decided requests, outcomes and standing-rule proposals";
+    hist.addEventListener("click", () => {
+      const entry = currentView && Array.isArray(currentView.layout) ? currentView.layout.find((e) => e.id === "decisions") : null;
+      if (entry) openModal(findEntry(currentView, entryKey(entry)) || entry, hist, true);
+    });
+    head.appendChild(hist);
+    const grid = el("div", "needs-grid");
+    for (const it of items) grid.appendChild(it.kind === "consent" ? consentCard(it.c) : questionCard(it.q));
+    host.replaceChildren(head, grid);
+    host.hidden = false;
+  }
+  // the focus the Decisions tile hands the operator in place of a modal: the first card, scrolled to
+  function needsFocus() {
+    const host = document.getElementById("ck-needs");
+    if (!host || host.hidden) return false;
+    const first = host.querySelector(".needs-card");
+    if (!first) return false;
+    first.tabIndex = -1;
+    if (typeof first.scrollIntoView === "function") first.scrollIntoView({ block: "center", behavior: "smooth" });
+    first.focus({ preventScroll: true });
+    return true;
   }
 
   // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
@@ -4706,6 +4877,7 @@
     for (const k of Object.keys(rows)) if (rows[k].panel_id === pid) delete rows[k];
     for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
     if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
+    if (pid === "decisions") { try { renderNeeds(currentView); } catch (e) { /* the strip keeps what it showed */ } }
   }
   // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
@@ -4718,5 +4890,6 @@
     }
   }
 
+  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size };
 })();
