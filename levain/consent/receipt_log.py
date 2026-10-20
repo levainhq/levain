@@ -36,6 +36,7 @@ Known edges (each stated, none built against):
     fails :func:`verify`;
   - a signed head of size 0 always matches (the empty tree's root is fixed): it attests nothing;
   - the authority ledger (:mod:`levain.consent.ledger`) is not part of this log;
+  - refused_answers rows are not leaves of this log; a raw writer can add or drop them;
   - a writer who also holds an enrolled key can sign a head over anything: the key is the root of trust.
 
 Stdlib only.

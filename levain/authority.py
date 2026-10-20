@@ -575,6 +575,9 @@ _SSHSIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
 _SSHSIG_END = "-----END SSH SIGNATURE-----"
 _SK_USER_PRESENT = 0x01
 _WEBAUTHN_SIG_TYPE = "webauthn-sk-ecdsa-sha2-nistp256@openssh.com"
+# a key type :func:`sshsig_public_key` will name: it is written into an allowed-signers line, so a space, a newline
+# or a quote in it would add options or a second line (``no-touch-required``) to what ssh-keygen trusts
+_KEY_TYPE_RE = re.compile(r"[A-Za-z0-9@._-]+")
 
 
 class _Wire:
@@ -624,8 +627,8 @@ def sshsig_public_key(armored: Any) -> tuple[str, str, str]:
     """What an armored SSHSIG CLAIMS about its signer: the public key embedded in it as ``<type> <base64>``, that
     key's fingerprint in the ``SHA256:...`` form ssh-keygen prints, and the signature's algorithm. Nothing here
     verifies the signature: the key is only the one the blob names, for :func:`verify_link_sig` to verify against
-    (it is never authority on its own). Raises ValueError on anything malformed or longer than any signature
-    levain verifies."""
+    (it is never authority on its own). Raises ValueError on anything malformed, longer than any signature
+    levain verifies, or naming a key type outside ``[A-Za-z0-9@._-]+``."""
     if not isinstance(armored, str) or len(armored) > _MAX_SIGNATURE:
         raise ValueError("not a signature levain reads")
     try:
@@ -636,6 +639,8 @@ def sshsig_public_key(armored: Any) -> tuple[str, str, str]:
         raise ValueError(f"not an SSH signature ({type(exc).__name__})") from None
     if not key_type or not sig_type:
         raise ValueError("the signature names no key type or no algorithm")
+    if not _KEY_TYPE_RE.fullmatch(key_type):
+        raise ValueError("the signature's key type is not one ssh-keygen names")
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii").rstrip("=")
     return f"{key_type} {base64.b64encode(key_blob).decode('ascii')}", fingerprint, sig_type
 

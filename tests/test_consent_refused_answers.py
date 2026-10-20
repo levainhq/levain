@@ -14,7 +14,10 @@ import base64
 import json
 import sqlite3
 import struct
+import time
+import warnings
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -22,12 +25,13 @@ from levain.authority import sshsig_public_key
 from levain.cockpit.consent import utc_stamp
 from levain.consent import AnswerRefused, ConsentQueue, answer_message, answer_payload
 from levain.consent.queue import (
-    REFUSED_NOT_AUTHORIZED, REFUSED_PER_REQUEST, REFUSED_WINDOW_ELAPSED, STORE_FORMAT, UNDECIDED_GRACE,
+    REFUSED_BUSY_MS, REFUSED_NOT_AUTHORIZED, REFUSED_PER_REQUEST, REFUSED_WINDOW_ELAPSED, STORE_FORMAT,
+    UNDECIDED_GRACE,
 )
 from levain.consent.receipt_log import head as receipts_head
 from levain.consent.receipt_log import verify as verify_receipts
 from levain.consent.record import RULING_NAMESPACE, ruling_message
-from tests.test_consent_queue import NOW, Clock, FakeAgent, Log, _raw, signed
+from tests.test_consent_queue import NOW, Clock, FakeAgent, Key, Log, _raw, signed
 from tests.test_consent_queue import authority, clock, keys, queue  # noqa: F401 - the shared fixtures
 from tests.test_consent_queue_v4 import _v3_module, ruled, undecided
 
@@ -54,15 +58,16 @@ def _table_rows(q):
 
 # --- what is kept, and why ---------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name, decision, tier, why", [
-    ("stranger", "allow", "T2", "the signer is not an enrolled key"),
-    ("stranger", "deny", "T2", "the signer is not an enrolled key"),
-    ("revoked", "allow", "T2", "the signer's key is revoked"),
-    ("revoked", "deny", "T2", "the signer's key is revoked"),
-    ("presence", "allow", "T2", "key class presence does not cover T2"),
-    ("phone", "allow", "T3", "key class display-phone does not cover T3"),
+@pytest.mark.parametrize("name, decision, tier, why, subreason, enrolled", [
+    ("stranger", "allow", "T2", "the signer is not an enrolled key", "not-enrolled", False),
+    ("stranger", "deny", "T2", "the signer is not an enrolled key", "not-enrolled", False),
+    ("revoked", "allow", "T2", "the signer's key is revoked", "revoked", True),
+    ("revoked", "deny", "T2", "the signer's key is revoked", "revoked", True),
+    ("presence", "allow", "T2", "key class presence does not cover T2", "class", True),
+    ("phone", "allow", "T3", "key class display-phone does not cover T3", "class", True),
 ])
-def test_an_unauthorised_signer_is_kept_and_the_request_never_moves(queue, keys, name, decision, tier, why):
+def test_an_unauthorised_signer_is_kept_and_the_request_never_moves(queue, keys, name, decision, tier, why,
+                                                                    subreason, enrolled):
     request = FakeAgent(queue).ask(tier=tier)
     payload, sig = signed(queue, request, keys[name], decision)
     assert _refused(queue, request.id, payload, sig) == why          # the refusal is exactly as before
@@ -76,6 +81,7 @@ def test_an_unauthorised_signer_is_kept_and_the_request_never_moves(queue, keys,
     assert row["record"] == answer_message(payload).decode("utf-8")
     assert row["signature"] == sig
     assert row["refused_at"] == utc_stamp(NOW)
+    assert (row["kind"], row["subreason"], row["enrolled"]) == ("answer", subreason, enrolled)
 
 
 def test_an_authorised_answer_after_the_hold_is_kept_as_window_elapsed(queue, clock, keys):
@@ -87,6 +93,7 @@ def test_an_authorised_answer_after_the_hold_is_kept_as_window_elapsed(queue, cl
     assert queue.get(request.id)[1] == "pending"                     # still in its grace: the hook marks it
     [row] = queue.refused_answers(request.id)
     assert (row["reason_code"], row["detail"], row["signer_fp"]) == (REFUSED_WINDOW_ELAPSED, why, keys["phone"].fp)
+    assert (row["kind"], row["subreason"], row["enrolled"]) == ("answer", "late", True)
     assert row["refused_at"] == utc_stamp(clock.now)
 
 
@@ -110,21 +117,36 @@ def test_an_authorised_answer_to_an_undecided_request_is_kept(queue, keys):
     assert row["reason_code"] == REFUSED_WINDOW_ELAPSED
 
 
-def test_an_unauthorised_answer_after_the_hold_is_kept_as_not_authorised(queue, clock, keys):
-    request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
-    payload, sig = signed(queue, request, keys["stranger"])
+@pytest.mark.parametrize("name, why, subreason", [
+    ("stranger", "the signer is not an enrolled key", "not-enrolled"),
+    ("revoked", "the signer's key is revoked", "revoked"),
+])
+def test_an_unauthorised_answer_after_the_hold_keeps_the_key_s_refusal(queue, clock, keys, name, why, subreason):
+    """W1: the caller is told the request expired; the row keeps the verdict on the KEY, never that text."""
+    agent = FakeAgent(queue)
+    request, other = agent.ask("a", hold=timedelta(seconds=30)), agent.ask("b", hold=timedelta(seconds=30))
+    payload, sig = signed(queue, request, keys[name], "deny")
+    p, s = signed(queue, other, keys[name], "deny")
     clock.now = NOW + timedelta(seconds=30)
-    _refused(queue, request.id, payload, sig)
-    assert [r["reason_code"] for r in queue.refused_answers(request.id)] == [REFUSED_NOT_AUTHORIZED]
+    told = _refused(queue, request.id, payload, sig)
+    assert told == f"request {request.id} is already expired: its hold ended {request.expires_at}"
+    [row] = queue.refused_answers(request.id)
+    assert (row["reason_code"], row["subreason"], row["detail"]) == (REFUSED_NOT_AUTHORIZED, subreason, why)
+    clock.now = NOW + timedelta(seconds=30) + UNDECIDED_GRACE           # and once expired: the same verdict kept
+    assert _refused(queue, other.id, p, s) == f"request {other.id} is already expired"
+    assert [(r["subreason"], r["detail"]) for r in queue.refused_answers(other.id)] == [(subreason, why)]
 
 
-def test_an_authorised_answer_signed_after_the_hold_is_kept(queue, keys):
+def test_a_signed_at_after_the_hold_alone_is_never_lateness(queue, keys):
+    """W8: ``signed_at`` is the signer's claim. An authorised answer refused only for it is kept nowhere; an
+    unauthorised one is kept for its key, never as late."""
     request = FakeAgent(queue).ask()
-    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp,
-                             signed_at=request.expires_at, receipts_head=receipts_head(queue))
-    sig = keys["phone"].sign(answer_message(payload))
-    assert _refused(queue, request.id, payload, sig) == "the answer was signed after the request expired"
-    assert [r["reason_code"] for r in queue.refused_answers(request.id)] == [REFUSED_WINDOW_ELAPSED]
+    for name, kept in (("phone", []), ("stranger", [(REFUSED_NOT_AUTHORIZED, "not-enrolled")])):
+        payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys[name].fp,
+                                 signed_at=request.expires_at, receipts_head=receipts_head(queue))
+        sig = keys[name].sign(answer_message(payload))
+        assert _refused(queue, request.id, payload, sig) == "the answer was signed after the request expired"
+        assert [(r["reason_code"], r["subreason"]) for r in queue.refused_answers(request.id)] == kept
     assert queue.get(request.id)[1] == "pending"
 
 
@@ -229,62 +251,59 @@ def test_a_malformed_record_is_not_kept(queue, keys):
     assert _table_rows(queue) == []
 
 
-def test_an_unenrolled_passkey_assertion_is_not_kept(queue, keys, monkeypatch):
-    """A WebAuthn signature by a key the log does not hold is never evidence, even one that would verify."""
-    request = FakeAgent(queue).ask()
-    payload, sig = signed(queue, request, keys["stranger"])
-
-    def u32(n):
-        return struct.pack(">I", n)
-
-    def string(b):
-        return u32(len(b)) + b
-
-    text = sig.strip()
-    blob = base64.b64decode("".join(text.splitlines()[1:-1]))
-    pos = 10
-    fields = []
-    for _ in range(5):
-        n = struct.unpack(">I", blob[pos:pos + 4])[0]
-        fields.append(blob[pos + 4:pos + 4 + n])
-        pos += 4 + n
-    inner = string(b"webauthn-sk-ecdsa-sha2-nistp256@openssh.com") + string(b"x" * 64) + bytes([5]) + u32(1) \
-        + string(b"https://example.test") + string(b"{}") + string(b"")
-    forged = blob[:10] + b"".join(string(f) for f in fields[:4]) + string(inner)
-    armored = "-----BEGIN SSH SIGNATURE-----\n" + base64.b64encode(forged).decode() + "\n-----END SSH SIGNATURE-----"
-    assert sshsig_public_key(armored)[1] == keys["stranger"].fp     # it names the very key the record names
-    monkeypatch.setattr(ConsentQueue, "_signature_refusal", lambda self, *a, **kw: None)   # as if it verified
-    _refused(queue, request.id, payload, armored)
-    assert queue.refused_answers(request.id) == []
-    _refused(queue, request.id, payload, sig)                         # the plain SSH signature still is kept
-    assert len(queue.refused_answers(request.id)) == 1
-
-
 # --- bound, dedupe, failure ---------------------------------------------------------------------------------------
 
-def test_at_most_the_bound_is_kept_per_request_first_ones_first(queue, clock, keys):
+@pytest.fixture(scope="module")
+def strangers(tmp_path_factory):
+    """Keys no authority log holds, more than the bound."""
+    d = tmp_path_factory.mktemp("consent-strangers")
+    return [Key(d, f"s{i}") for i in range(REFUSED_PER_REQUEST + 3)]
+
+
+def test_at_most_the_bound_is_kept_per_request_first_ones_first(queue, clock, keys, strangers):
     agent = FakeAgent(queue)
     request, other = agent.ask("a", hold=timedelta(hours=1)), agent.ask("b", hold=timedelta(hours=1))
-    signed_ats = []
-    for i in range(REFUSED_PER_REQUEST + 3):
-        clock.now = NOW + timedelta(seconds=i)                        # a new signed_at: a new signature
-        payload, sig = signed(queue, request, keys["stranger"])
-        signed_ats.append(payload["signed_at"])
+    for i, k in enumerate(strangers):
+        clock.now = NOW + timedelta(seconds=i)
+        payload, sig = signed(queue, request, k)
         assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
     kept = queue.refused_answers(request.id)
-    assert [r["signed_at"] for r in kept] == signed_ats[:REFUSED_PER_REQUEST]
+    assert [r["signer_fp"] for r in kept] == [k.fp for k in strangers[:REFUSED_PER_REQUEST]]
     assert [r["seq"] for r in kept] == sorted(r["seq"] for r in kept)
     payload, sig = signed(queue, other, keys["stranger"])           # the bound is per request
     _refused(queue, other.id, payload, sig)
     assert len(queue.refused_answers(other.id)) == 1
 
 
-def test_the_same_signature_is_kept_once(queue, keys):
-    request = FakeAgent(queue).ask()
-    payload, sig = signed(queue, request, keys["stranger"])
-    for _ in range(3):
+def test_a_full_request_is_counted_before_any_verify(queue, clock, strangers, monkeypatch):
+    """W4: once the bound is reached, a refusal does no replay and no verify to learn it keeps nothing."""
+    import levain.consent.queue as qmod
+    request = FakeAgent(queue).ask(hold=timedelta(hours=1))
+    for k in strangers[:REFUSED_PER_REQUEST]:
+        payload, sig = signed(queue, request, k)
+        _refused(queue, request.id, payload, sig)
+    calls = []
+    real = qmod.verify_link_sig
+    monkeypatch.setattr(qmod, "verify_link_sig", lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    payload, sig = signed(queue, request, strangers[REFUSED_PER_REQUEST])
+    assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert calls == []
+    assert len(queue.refused_answers(request.id)) == REFUSED_PER_REQUEST
+
+
+def test_one_key_and_decision_is_kept_once_whatever_its_signatures(queue, clock, keys):
+    """W5: a signature need not be deterministic (ECDSA, a passkey), so one key re-signing must not fill the bound:
+    a (request, signer, decision) is kept once; the other decision is its own row."""
+    request = FakeAgent(queue).ask(hold=timedelta(hours=1))
+    for i in range(REFUSED_PER_REQUEST + 2):
+        clock.now = NOW + timedelta(seconds=i)                        # a new signed_at: a new signature
+        payload, sig = signed(queue, request, keys["stranger"])
         assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
-    assert len(queue.refused_answers(request.id)) == 1
+    payload, sig = signed(queue, request, keys["stranger"], "deny")
+    _refused(queue, request.id, payload, sig)
+    kept = queue.refused_answers(request.id)
+    assert [(r["decision"], r["signed_at"]) for r in kept] == [("allow", utc_stamp(NOW)),
+                                                               ("deny", utc_stamp(clock.now))]
 
 
 def test_a_failure_to_keep_never_changes_the_refusal(queue, keys, monkeypatch):
@@ -439,3 +458,231 @@ def test_sshsig_public_key_reads_the_signer_s_key(keys):
 def test_sshsig_public_key_refuses_what_is_not_a_signature(bad):
     with pytest.raises(ValueError):
         sshsig_public_key(bad)
+
+
+# --- r1 (refused_FIX_r1): the key's standing, kind, lock, golden texts, processes ---------------------------------
+
+def test_a_key_revoked_as_compromised_is_kept_as_compromised(tmp_path, keys, clock):
+    """W2: a stolen key's attempt is real and kept, named ``compromised``, enrolled."""
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    log.enrol("phone", "display-phone")
+    since = log.source().key(keys["phone"].fp).enrolled_seq
+    log.link({"op": "revoke_key", "fingerprint": keys["phone"].fp, "compromised_since": since})
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request = FakeAgent(q).ask()
+    payload, sig = signed(q, request, keys["phone"])
+    assert _refused(q, request.id, payload, sig) == "the signer's key is revoked"
+    [row] = q.refused_answers(request.id)
+    assert (row["reason_code"], row["subreason"], row["enrolled"], row["detail"]) == \
+        (REFUSED_NOT_AUTHORIZED, "compromised", True, "the signer's key is revoked")
+
+
+def test_the_kind_names_an_answer_or_a_ruling(queue, keys):
+    """W7."""
+    request, _gap = undecided(queue)
+    payload, sig = ruled(queue, request.id, keys["stranger"], "deny")
+    _late_refused(queue, request.id, payload, sig)
+    other = FakeAgent(queue).ask("b")
+    p, s = signed(queue, other, keys["stranger"], "deny")
+    _refused(queue, other.id, p, s)
+    assert [(r["kind"], r["subreason"], r["enrolled"]) for r in queue.refused_answers(request.id)] == \
+        [("ruling", "not-enrolled", False)]
+    assert [r["kind"] for r in queue.refused_answers(other.id)] == ["answer"]
+
+
+def test_the_store_refuses_a_row_whose_reason_and_subreason_disagree(queue, keys):
+    request = FakeAgent(queue).ask()
+    for kind, reason, sub, enrolled in (("answer", "approval-window-elapsed", "class", 1),
+                                        ("answer", "approver-not-authorized", "late", 1),
+                                        ("answer", "approver-not-authorized", "bogus", 1),
+                                        ("other", "approver-not-authorized", "class", 1),
+                                        ("answer", "approver-not-authorized", "class", 2)):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw(queue, ("INSERT INTO refused_answers (request_id, kind, refused_at, reason_code, subreason, enrolled, "
+                         "detail, decision, signer_fp, signed_at, record, signature) "
+                         "VALUES (?, ?, 'x', ?, ?, ?, '', 'allow', 'f', 's', 'r', 'y')",
+                         (request.id, kind, reason, sub, enrolled)))
+
+
+def _armored(blob):
+    return "-----BEGIN SSH SIGNATURE-----\n" + base64.b64encode(blob).decode() + "\n-----END SSH SIGNATURE-----"
+
+
+def _sshsig_fields(sig):
+    blob = base64.b64decode("".join(sig.strip().splitlines()[1:-1]))
+    pos, fields = 10, []
+    for _ in range(5):
+        n = struct.unpack(">I", blob[pos:pos + 4])[0]
+        fields.append(blob[pos + 4:pos + 4 + n])
+        pos += 4 + n
+    return blob[:10], fields
+
+
+def _string(b):
+    return struct.pack(">I", len(b)) + b
+
+
+@pytest.mark.parametrize("key_type", [b"ssh-ed25519\nno-touch-required", b"ssh-ed25519 cert-authority",
+                                      b'ssh-ed25519"', b"ssh-ed25519\r", b"ssh-ed\x00"])
+def test_sshsig_public_key_refuses_a_key_type_that_would_change_the_signers_line(keys, key_type):
+    """W3: the key type is written into ssh-keygen's allowed-signers line; a newline would add a second line."""
+    head, fields = _sshsig_fields(keys["stranger"].sign(b"hello"))
+    key_blob = fields[0]
+    n = struct.unpack(">I", key_blob[:4])[0]
+    crafted_key = _string(key_type) + key_blob[4 + n:]
+    crafted = head + _string(crafted_key) + b"".join(_string(f) for f in fields[1:])
+    with pytest.raises(ValueError, match="key type"):
+        sshsig_public_key(_armored(crafted))
+    ok_key = _string(b"sk-ssh-ed25519@openssh.com") + key_blob[4 + n:]  # the allowed alphabet still reads
+    assert sshsig_public_key(_armored(head + _string(ok_key) + b"".join(_string(f) for f in fields[1:])))[0] \
+        .startswith("sk-ssh-ed25519@openssh.com ")
+
+
+_PASSKEY = json.loads((Path(__file__).parent / "fixtures" / "passkey_assertion_virtual.json").read_text("utf-8"))
+
+
+def test_an_unenrolled_passkey_assertion_is_not_kept(queue, keys, monkeypatch):
+    """A real WebAuthn SSHSIG (the recorded assertion) by a passkey the log does not hold is never evidence, even
+    with ssh-keygen's verdict forced to yes; the same forced yes keeps an unenrolled SSH key's answer."""
+    import levain.consent.queue as qmod
+    from levain.authority import _WEBAUTHN_SIG_TYPE
+    from levain.cockpit.keys import fingerprint_of
+    from levain.consent.passkey import public_key_line, to_sshsig
+    spki = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") + bytes.fromhex(
+        _PASSKEY["pub_point_hex"])
+    key = public_key_line(spki, _PASSKEY["rp_id"])
+    sig = to_sshsig(key, bytes.fromhex(_PASSKEY["authData_hex"]), _PASSKEY["clientDataJSON"].encode(),
+                    bytes.fromhex(_PASSKEY["sig_der_hex"]), namespace=_PASSKEY["namespace"])
+    fp = fingerprint_of(key)
+    assert sshsig_public_key(sig)[1:] == (fp, _WEBAUTHN_SIG_TYPE)    # it names the very key the record names
+    request = FakeAgent(queue).ask()
+    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=fp,
+                             signed_at=utc_stamp(NOW), receipts_head=receipts_head(queue))
+    monkeypatch.setattr(qmod, "verify_link_sig", lambda *a, **kw: True)   # as if it verified over this record
+    assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert queue.refused_answers(request.id) == []
+    p, s = signed(queue, request, keys["stranger"])
+    _refused(queue, request.id, p, s)
+    assert [r["signer_fp"] for r in queue.refused_answers(request.id)] == [keys["stranger"].fp]
+
+
+def test_a_locked_store_never_holds_the_refusal_or_changes_it(queue, keys):
+    """W4/W6/W10: another writer holds the lock; keeping waits at most REFUSED_BUSY_MS (not the 30 s of every
+    other write), the real OperationalError is swallowed with no warning, the refusal is the same text, and
+    nothing is left held."""
+    request = FakeAgent(queue).ask()
+    payload, sig = signed(queue, request, keys["stranger"])
+    locker = sqlite3.connect(queue.path, isolation_level=None, timeout=0)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            t0 = time.monotonic()
+            assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+            took = time.monotonic() - t0
+        assert [w for w in seen if issubclass(w.category, RuntimeWarning)] == []
+        assert REFUSED_BUSY_MS / 1000 * 0.9 <= took < 10
+        locker.execute("ROLLBACK")
+    finally:
+        locker.close()
+    assert queue.refused_answers(request.id) == []
+    probe = sqlite3.connect(queue.path, isolation_level=None, timeout=0)   # nothing of the refusal holds a lock
+    try:
+        probe.execute("BEGIN IMMEDIATE")
+        probe.execute("ROLLBACK")
+    finally:
+        probe.close()
+    assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert len(queue.refused_answers(request.id)) == 1                 # unlocked, it is kept
+
+
+def test_a_bug_in_keeping_is_a_warning_never_a_changed_refusal(queue, keys, monkeypatch):
+    """W6: only store, disk, verifier and record failures are swallowed silently; anything else is a bug, shown as
+    a RuntimeWarning, and the signer still gets the same refusal."""
+    request = FakeAgent(queue).ask()
+    payload, sig = signed(queue, request, keys["stranger"])
+
+    def bug(self, *a, **kw):
+        raise KeyError("subreason")
+
+    monkeypatch.setattr(ConsentQueue, "_refused_reason", bug)
+    with pytest.warns(RuntimeWarning, match="was not kept: KeyError"):
+        assert _refused(queue, request.id, payload, sig) == "the signer is not an enrolled key"
+    assert queue.get(request.id)[1] == "pending"
+
+
+def test_the_refusal_texts_are_those_of_f06ed8ff(queue, clock, keys, authority):
+    """W10: every path's refusal, copied from the code before refused answers were kept (f06ed8ff)."""
+    from levain.consent.queue import RULING_SKEW
+    agent = FakeAgent(queue)
+    request, other = agent.ask("a"), agent.ask("b")
+    payload, sig = signed(queue, request, keys["phone"])
+    assert _refused(queue, "cr-nope", payload, sig) == "no sealed request 'cr-nope'"
+    assert _refused(queue, request.id, payload, "") == "the answer carries no signature"
+    assert _refused(queue, request.id, payload, keys["stranger"].sign(answer_message(payload))) == \
+        "the answer's signature does not verify"
+    assert _refused(queue, other.id, payload, sig) == "the answer is for another request"
+    p = {**payload, "queue_id": "cq-" + "1" * 32}
+    assert _refused(queue, request.id, p, keys["phone"].sign(answer_message(p))) == "the answer names another queue"
+    p = {**payload, "decision": "maybe"}
+    assert _refused(queue, request.id, p, keys["phone"].sign(answer_message(p))) == \
+        "decision 'maybe' is not one of ('allow', 'deny')"
+    assert _late_refused(queue, request.id, payload, sig) == \
+        f"request {request.id} is pending, not undecided: a ruling answers only an undecided request"
+    late, gap = undecided(queue, "c")
+    rp, rs = ruled(queue, late.id, keys["phone"])
+    assert _late_refused(queue, late.id, rp, keys["stranger"].sign(ruling_message(rp), RULING_NAMESPACE)) == \
+        "the ruling's signature does not verify"
+    assert _late_refused(queue, late.id, {**rp, "gap": gap + 1}, rs) == \
+        f"the ruling names gap {gap + 1!r}, not this request's gap #{gap}"
+    early, es = ruled(queue, late.id, keys["phone"], signed_at=utc_stamp(NOW + timedelta(minutes=10)))
+    assert _late_refused(queue, late.id, early, es) == \
+        (f"the ruling's signed_at {early['signed_at']} is later than the queue's clock {utc_stamp(NOW)} plus "
+         f"{int(RULING_SKEW.total_seconds())} s")
+    queue.answer_late(late.id, rp, rs)
+    assert _late_refused(queue, late.id, rp, rs) == \
+        f"request {late.id} is allowed, not undecided: a ruling answers only an undecided request"
+
+
+def _refuse_in_a_process(qdir, cockpit_db, request_id, attempts, out):
+    from levain.consent.queue import AnswerRefused as Refused, ConsentQueue as Q, authority_source as src
+    q = Q(qdir, authority=src(cockpit_db, anchor=None), clock=lambda: NOW + timedelta(minutes=1))
+    told = []
+    for payload, sig in attempts:
+        try:
+            q.answer(request_id, payload, sig)
+        except Refused as exc:
+            told.append(str(exc))
+    out.put(told)
+
+
+def test_the_bound_and_the_dedupe_hold_across_processes(tmp_path, keys, clock, strangers):
+    """W10: three processes refusing the same request at once, each with its own signatures by the same unenrolled
+    keys: exactly the bound is kept, one row per (signer, decision), and every caller got the same refusal."""
+    import multiprocessing
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    d = tmp_path / "consent"
+    q = ConsentQueue(d, authority=log.source, clock=clock)
+    request = FakeAgent(q).ask(hold=timedelta(hours=1))
+    batches = []
+    for proc in range(3):
+        clock.now = NOW + timedelta(seconds=proc)                    # each process its own signatures
+        batches.append([signed(q, request, k) for k in strangers])
+    ctx = multiprocessing.get_context("spawn")
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_refuse_in_a_process, args=(d, log.path, request.id, b, out)) for b in batches]
+    for p in procs:
+        p.start()
+    got = [out.get(timeout=120) for _ in procs]
+    for p in procs:
+        p.join(timeout=60)
+    assert all(t == ["the signer is not an enrolled key"] * len(strangers) for t in got)
+    kept = q.refused_answers(request.id)
+    assert len(kept) == REFUSED_PER_REQUEST
+    assert len({(r["signer_fp"], r["decision"]) for r in kept}) == REFUSED_PER_REQUEST
+    assert {r["signer_fp"] for r in kept} <= {k.fp for k in strangers}
+    assert q.get(request.id)[1] == "pending"
