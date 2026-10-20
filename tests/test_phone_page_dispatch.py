@@ -406,6 +406,9 @@ def test_putting_the_page_away_dismisses_an_open_picker_and_polling_resumes(worl
             {"eval": FETCH_HOOK},
             {"eval": POLLS},
             {"until": "window.__gets >= 3 && window.__gets", "ms": 4000},
+            {"eval": WAIT},
+            {"eval": NOTE},
         ])
     assert out["values"][2] >= 2 and out["values"][4] == 0, out             # the picker was up, then gone
     assert out["values"][7] >= 3, out                                       # busy released: the list polls again
+    assert not out["values"][9].startswith("pick a passkey"), out           # no instruction left over a gone picker

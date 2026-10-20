@@ -272,10 +272,13 @@
       closed = true;
       picks.forEach((x) => x.remove());
       busy--;
-      if (closePick === close) closePick = null;
+      if (closePick === dismiss) closePick = null;
       return true;
     };
-    closePick = close;
+    // every dismissal that is not a pick (the dismiss button, a second picker, the page put away) also clears the
+    // "pick a passkey" line, which the note store would otherwise draw again over a card with no picker under it
+    const dismiss = () => { if (!close()) return false; say(""); return true; };
+    closePick = dismiss;
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
@@ -284,7 +287,7 @@
     }
     const x = el("button", "quiet pick", "dismiss");
     x.type = "button";
-    x.addEventListener("click", () => { if (close()) say(""); });
+    x.addEventListener("click", dismiss);
     picks.push(x);
     picks.forEach((b) => actions.appendChild(b));
   }
