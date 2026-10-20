@@ -423,15 +423,19 @@ class Control:
 
         Every record already at or past REVOKED gets its ``DROP-SESSION`` again (idempotent, §4.9): a
         CONTROL that died between the REVOKED write and the drop, or whose drop never got an ack, owes it
-        still. Then one reaper wake."""
+        still. Then one reaper wake. The split keys off the STATE alone: a record past live that still says
+        ``lease_live:true`` (CONTROL died between a CAS into REVOKED and its after-acts) has the flag cleared,
+        then its drop and the wake like every other record past live."""
         self.store.load()
         past = False
         for rec in sorted(self.store.all(), key=lambda r: r.session):
-            if rec.lease_live or rec.state in R.LIVE_STATES:
+            if rec.state in R.LIVE_STATES:
                 self._revoke_after_eof(rec.session)
-            else:
-                self._drop(rec.session)
-                past = True
+                continue
+            if rec.lease_live:
+                self._revoke_after_eof(rec.session)      # past live: clears the flag only
+            self._drop(rec.session)
+            past = True
         if past:
             self._wake()
 
@@ -525,7 +529,10 @@ class Control:
             lease = self._session_lease.get(session)
             if lease is None or lease.live:
                 return
-        rec = self.store.get(session)
+        try:
+            rec = self.store.get(session)
+        except Refused:
+            return                                       # unsettled: the dead lease stays bound (it reads dead)
         if rec is not None and rec.state in R.LIVE_STATES:
             return
         with self._mu:

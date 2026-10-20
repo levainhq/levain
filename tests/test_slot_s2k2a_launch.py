@@ -79,8 +79,8 @@ def _no_active(w, s):
 # --- EXEC MARKER: the helper's read --------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("data,close,want", [
-    (b"+", True, "exec"),            # + then EOF (macOS: the trampoline was the last holder)
-    (b"+", False, "exec"),           # + then nothing (Linux: bwrap's monitor holds the pipe)
+    (b"+", True, "exec"),            # + then EOF: the last hop's close-on-exec copy closed at the execve
+    (b"+", False, "timeout"),        # + then nothing in the bound: never an exec (S2_L3_r2 g2-N2)
     (b"+!", True, "failed"),         # the vendor's execve failed after the marker
     (b"!", True, "failed"),
     (b"", True, "failed"),           # EOF with no byte: every holder exited, no marker
@@ -94,7 +94,7 @@ def test_await_exec_reads_the_positive_marker(data, close, want):
         if close:
             os.close(w)
             w = -1
-        assert SS.await_exec(r, first_s=0.05, grace_s=0.05) == want
+        assert SS.await_exec(r, bound_s=0.05) == want
     finally:
         os.close(r)
         if w >= 0:

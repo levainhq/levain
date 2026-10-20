@@ -490,16 +490,20 @@ def replace_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable
     fsync(dirfd)
 
 
+class LinkedNotDurable(OSError):
+    """:func:`create_at` failed AFTER its link: ``name`` EXISTS (a reader may already see it) but is not proved
+    durable. The caller treats the record as created for every later decision (``prepare`` removes it durably before
+    it gives any lease back)."""
+
+
 def create_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable[[int], None]) -> None:
     """:func:`replace_at` that never replaces: the temp is LINKED to ``name`` (``linkat`` fails on an existing name,
     atomically), so an existing record raises ``FileExistsError`` and is left as it was; a reader never sees a
-    partial file. The temp name is ``name.new`` (DECISION: never :func:`replace_at`'s, so neither sweeps the
-    other's)."""
-    tmp = name + ".new"
-    try:
-        os.unlink(tmp, dir_fd=dirfd)        # a temp a dead writer left
-    except FileNotFoundError:
-        pass
+    partial file. Each writer's temp is its own (``name.<random>.new``, ``O_EXCL``), and a writer only ever unlinks
+    the temp it made, so two writers of one name never touch each other's (DECISION: never :func:`replace_at`'s name
+    either). Any failure after the link raises :class:`LinkedNotDurable`: the record exists from the link on.
+    A writer killed mid-write leaves its temp, which no reader takes for a record."""
+    tmp = f"{name}.{os.urandom(8).hex()}.new"
     fd = os.open(tmp, _O_NEW, mode, dir_fd=dirfd)
     try:
         os.fchmod(fd, mode)
@@ -512,9 +516,14 @@ def create_at(dirfd: int, name: str, data: bytes, *, mode: int, fsync: Callable[
     os.close(fd)
     try:
         os.link(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-    finally:
+    except BaseException:
         os.unlink(tmp, dir_fd=dirfd)
-    fsync(dirfd)
+        raise
+    try:
+        os.unlink(tmp, dir_fd=dirfd)
+        fsync(dirfd)
+    except BaseException as e:
+        raise LinkedNotDurable(getattr(e, "errno", None) or errno.EIO, f"{name} linked, not durable: {e}") from e
 
 
 @dataclass(frozen=True)
@@ -1094,7 +1103,11 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
             child_uid=ids[second] if slot.slot_class == "none" else None,
             netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None)
         seams.at("alloc")
-        create_alloc(ctx, alloc)
+        try:
+            create_alloc(ctx, alloc)
+        except LinkedNotDurable:
+            created = True                           # the alloc exists from its link on (it names the slot)
+            raise
         created = True
         claims = {"operator_uid": alloc.operator_uid, "supervisor_uid": alloc.supervisor_uid,
                   "slot": R.slot_obj(slot), "class": slot.slot_class, "kind": alloc.kind, "vendor": alloc.vendor,
@@ -1131,15 +1144,19 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
 
 
 def _undo_prepare(ctx: Ctx, leased: Leased, created: Optional[str]) -> None:
-    """A CLEAN prepare failure (CONTROL holds no record): the alloc it created removed, then the slot lease put back
-    (:func:`revert_lease`), in that order, so a crash between them leaves the reaper's alloc-less orphan, never an
-    alloc naming a reusable slot. Best effort: the refusal that got here is the answer, and a step that fails leaves
-    the rest to the reaper (an alloc it cannot remove keeps the slot leased)."""
-    try:
-        if created is not None:
+    """A CLEAN prepare failure (CONTROL holds no record): the alloc it created removed DURABLY (unlinked, the directory
+    fsynced), then the slot lease put back (:func:`revert_lease`), in that order, so a crash between them leaves the
+    reaper's alloc-less orphan, never an alloc naming a reusable slot. Best effort: the refusal that got here is the
+    answer. An alloc removal that is not proved durable (any failure, the alloc already gone included) gives nothing
+    back: the slot stays leased for the reaper (fail closed)."""
+    if created is not None:
+        try:
             with ctx.store.dir("alloc") as afd:
                 os.unlink(f"{created}.json", dir_fd=afd)
                 ctx.seams.fsync(afd)
+        except (OSError, Refused):
+            return
+    try:
         revert_lease(ctx.store, leased)
     except (OSError, Refused):
         pass
@@ -1584,8 +1601,9 @@ def _read_stdin() -> bytes:
 
 
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
-           "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
-           "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots",
+           "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
+           "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
+           "configured_slots",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
