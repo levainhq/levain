@@ -510,22 +510,37 @@ def _copy_index(gitdir: Path, private: Path) -> None:
         room -= max(0, _copy_owned(gitdir / name, private / name, room))
 
 
-def _private_config(common: Path, left: Callable[[], float]) -> str:
-    """The private git directory's config: ``MIRRORED`` keys read from the repository's ``config`` (with
-    ``--no-includes``, which runs nothing; a value of any other shape is left out), and nothing that names a
-    program, a filter, an include or another repository."""
+def _mirrored(f: Path, left: Callable[[], float], extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """The ``MIRRORED`` keys (and ``extra``) one config file sets, read with ``git config --file --no-includes``,
+    which runs nothing: lower-cased, the last one winning as in git, a value of any other shape left out (an
+    ``extra`` key is returned unchecked, for the caller to read as it means). Absent is empty."""
     got: dict[str, str] = {}
-    if os.path.lexists(common / "config"):
-        pattern = "^(" + "|".join(k.replace(".", r"\.") for k in MIRRORED) + ")$"
-        code, out = _run([_real_git(), "--no-pager", "config", "--file", str(common / "config"), "--no-includes",
-                          "-z", "--get-regexp", pattern], left())
-        if code not in (0, 1):
-            raise GitRefused(f"its config does not parse (git config exited {code}), not read")
-        for item in out.split("\0"):
-            key, _sep, val = item.partition("\n")
-            key, val = key.lower(), val.strip().lower()
-            if key in MIRRORED and val in MIRRORED[key]:
-                got[key] = val                                     # the last one wins, as in git
+    if not os.path.lexists(f):
+        return got
+    keys = (*MIRRORED, *extra)
+    pattern = "^(" + "|".join(k.replace(".", r"\.") for k in keys) + ")$"
+    code, out = _run([_real_git(), "--no-pager", "config", "--file", str(f), "--no-includes", "-z",
+                      "--get-regexp", pattern], left())
+    if code not in (0, 1):
+        raise GitRefused(f"its {f.name} does not parse (git config exited {code}), not read")
+    for item in out.split("\0"):
+        key, _sep, val = item.partition("\n")
+        key, val = key.lower(), val.strip().lower()
+        if key in extra or (key in MIRRORED and val in MIRRORED[key]):
+            got[key] = val
+    return got
+
+
+def _private_config(common: Path, gitdir: Path, left: Callable[[], float]) -> str:
+    """The private git directory's config: ``MIRRORED`` keys read from the repository's ``config`` and then, when
+    that config sets ``extensions.worktreeConfig``, from this worktree's ``config.worktree`` (``<gitdir>``'s; the
+    main worktree's is in the common git dir), which wins, as in git. Only ``core.*`` keys come from
+    ``config.worktree``: the object format is the repository's. Nothing that names a program, a filter, an include
+    or another repository crosses from either file."""
+    got = _mirrored(common / "config", left, ("extensions.worktreeconfig",))
+    on = got.pop("extensions.worktreeconfig", "false") in ("true", "yes", "on", "1", "")    # a bare key is true
+    if on:
+        got.update((k, v) for k, v in _mirrored(gitdir / "config.worktree", left).items() if k.startswith("core."))
     fmt = got.pop("extensions.objectformat", "sha1")
     lines = ["[core]", f"\trepositoryformatversion = {1 if fmt != 'sha1' else 0}", "\tbare = false",
              "\tuntrackedCache = false", "\tlogAllRefUpdates = false",
@@ -547,8 +562,9 @@ def git_worktree_state(common: Path, gitdir: Path, top: Path, timeout: float) ->
     with every program-naming key overridden (``NEUTRALISE``). The status itself runs on a private git directory
     (``tempfile.mkdtemp``, 0700, removed after, whatever happens): the config ``_private_config`` writes, ``HEAD``
     detached at that commit, a copy of the worktree's index (``_copy_index``) and of ``info/exclude``, the
-    repository's objects by ``GIT_OBJECT_DIRECTORY``, and ``--work-tree`` the real top; plus no optional locks and
-    no submodule entered (``STATUS_NEUTRALISE``). So no config, ``info/attributes`` or hook the agent writes is
+    repository's objects by ``GIT_OBJECT_DIRECTORY``, and ``--work-tree`` the real top; plus no optional locks
+    (``--no-optional-locks``, besides ``_git_env``'s ``GIT_OPTIONAL_LOCKS=0``) and no submodule entered
+    (``STATUS_NEUTRALISE``). So no config, ``info/attributes`` or hook the agent writes is
     read by the git that compares contents, and an attribute naming a driver names one nobody defined (the
     operator's own global config aside, which is trusted). Raises ``subprocess.TimeoutExpired``, ``OSError`` or
     ``RuntimeError`` (git refused or exited non-zero: the caller shows the counts as unknown, never as 0)."""
@@ -557,7 +573,7 @@ def git_worktree_state(common: Path, gitdir: Path, top: Path, timeout: float) ->
     if why is not None:
         raise GitRefused(why)
     real = [_real_git(), "--no-pager", *NEUTRALISE, f"--git-dir={gitdir}"]
-    config = _private_config(common, left)
+    config = _private_config(common, gitdir, left)
     code, out = _run([*real, "symbolic-ref", "-q", "HEAD"], left())
     if code not in (0, 1):
         raise RuntimeError(f"git symbolic-ref exited {code}")
@@ -576,8 +592,8 @@ def git_worktree_state(common: Path, gitdir: Path, top: Path, timeout: float) ->
         _copy_index(gitdir, private)
         _copy_owned(common / "info" / "exclude", private / "info" / "exclude", EXCLUDE_MAX)
         code, out = _run([_real_git(), "--no-pager", *NEUTRALISE, *STATUS_NEUTRALISE, f"--git-dir={private}",
-                          f"--work-tree={top}", "status", "--porcelain=v2", "-z", "--no-renames",
-                          "--ignore-submodules=all", "--untracked-files=normal"], left(),
+                          f"--work-tree={top}", "--no-optional-locks", "status", "--porcelain=v2", "-z",
+                          "--no-renames", "--ignore-submodules=all", "--untracked-files=normal"], left(),
                          {"GIT_OBJECT_DIRECTORY": str(common / "objects")})
     finally:
         shutil.rmtree(private, ignore_errors=True)

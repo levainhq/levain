@@ -13,7 +13,8 @@ no record behind it: a session whose last logged event is a prompt or a tool cal
 ``STALL_S``, an open loop, which no session is linked to.
 
 "Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
-dir the cockpit owns, so no repository config reaches it; see that function), bounded by the same whole-scan deadline,
+dir the cockpit owns, which takes only allow-listed, shape-checked settings from the repository's config and
+``config.worktree``; see that function), bounded by the same whole-scan deadline,
 each working tree past it named, and cached for ``LOST_CACHE_S``.
 
 Not tracked on this branch, sent as null (never a zero, never an estimate): a session's current tool (the session
@@ -36,7 +37,7 @@ import re
 import subprocess
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -56,6 +57,11 @@ LOST_CACHE_S = 30.0
 LABEL_MAX = 48
 UNNAMED = "(unnamed)"
 _MARKER = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
+#: a session record's file stem, as ``_session_record`` accepts it (the hash of its agent and session id): the
+#: node id is ``session:<stem>``, the Sessions panel's row id, so a stem of any other shape is never drawn
+_STEM = re.compile(r"[0-9a-f]{24}")
+#: the room a clashing repository label's parent-directory name may take, so the suffix is never cut off
+PARENT_MAX = 16
 HUB_ID = "levain"
 UNATTACHED_ID = "unattached"
 NO_COST = {"usd": None, "tokens": None, "source": None}
@@ -76,26 +82,38 @@ def _iso(t: datetime) -> str:
     return t.astimezone(timezone.utc).isoformat()
 
 
-def _wire(text: Any, *, base: bool = False) -> str:
+def _wire(text: Any, *, base: bool = False, limit: int = LABEL_MAX) -> str:
     """The ONE normaliser every string this provider puts on the wire goes through: ``visible`` (no invisible or
     format character); for a ``base`` name, ``/`` and ``\\`` shown as visible markers (a name is a basename, never a
     path, and is never refused); whitespace collapsed to single spaces; an empty result the fixed ``UNNAMED``; then
-    the ``LABEL_MAX`` cut, which never splits a ``⟨U+XXXX⟩`` marker. The engine's validator refuses what this never
-    emits."""
+    the ``limit`` cut (``LABEL_MAX`` unless a caller keeps room for a suffix), which never splits a ``⟨U+XXXX⟩``
+    marker. The engine's validator refuses what this never emits."""
     s = visible(str(text))
     if base:
         s = s.replace("/", "⟨U+002F⟩").replace("\\", "⟨U+005C⟩")
     s = " ".join(s.split())
     if not s:
         return UNNAMED
-    if len(s) <= LABEL_MAX:
+    if len(s) <= limit:
         return s
-    cut = LABEL_MAX - 1
+    cut = limit - 1
     for m in _MARKER.finditer(s):
         if m.start() < cut < m.end():
             cut = m.start()
             break
     return s[:cut] + "…"
+
+
+def _hash(text: str, n: int = 8) -> str:
+    """A short stable hash of a path, for an id that must tell two places apart without carrying either path."""
+    return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()[:n]
+
+
+def _qualified(repo: str, parent: str, frag: str | None = None) -> str:
+    """A clashing repository label: ``repo (parent)``, or ``repo (parent · frag)`` when that still clashes. The
+    parent takes at most ``PARENT_MAX`` and the repository name is cut to leave the suffix whole."""
+    sfx = f" ({_wire(parent, limit=PARENT_MAX)}{f' · {frag}' if frag else ''})"
+    return _wire(repo, limit=LABEL_MAX - len(sfx)) + sfx
 
 
 # --- the sessions ----------------------------------------------------------------------------------------------
@@ -403,20 +421,23 @@ def topology_reader(*, install_root: Path | None,
 
         for rec in recs:
             stem, agent, sid, cwd = rec["_stem"], rec["agent"], rec["session_id"], rec["cwd"]
+            if not (isinstance(stem, str) and _STEM.fullmatch(stem)):
+                errors.append("sessions: a record of an unknown name, not drawn")
+                continue
             nid = f"session:{stem}"
             found, _why = tree_of(cwd)
             if found is not None:
                 repo = act.repo_label(found[0])
                 # the id is a hash of the common git dir, so two repositories with one basename are two groups
-                gid = "repo:" + hashlib.sha1(str(found[0]).encode("utf-8", "surrogateescape")).hexdigest()[:8]
+                gid = "repo:" + _hash(str(found[0]))
                 if gid not in groups:
                     main = found[0].parent if found[0].name == ".git" else found[0]
                     parent_of[gid] = act._base(str(main.parent))
-                    groups[gid] = {"id": gid, "label": _wire(repo), "repo": _wire(repo)}
+                    groups[gid] = {"id": gid, "label": _wire(repo), "repo": repo}
             else:
-                base = act._base(cwd) or "?"
-                gid = f"dir:{_wire(base)}"
-                groups.setdefault(gid, {"id": gid, "label": _wire(base), "repo": None})
+                # the id a hash of the directory, so two directories with one basename are two groups
+                gid = "dir:" + _hash(os.path.normpath(cwd))
+                groups.setdefault(gid, {"id": gid, "label": _wire(act._base(cwd) or "?"), "repo": None})
             last_log, last_kind, rate = (None, None, None)
             age = (now - rec["_seen"]).total_seconds()
             if age < SESSION_ACTIVE_S:
@@ -438,13 +459,17 @@ def topology_reader(*, install_root: Path | None,
             if (now - last).total_seconds() < SESSION_ACTIVE_S:
                 live.append((nid, cwd))
 
-        clash: dict[str, int] = {}
-        for g in groups.values():
-            if g["id"] in parent_of:
+        # a repository label two groups share names the parent directory, then a fragment of the id if still shared
+        repos = [g for g in groups.values() if g["id"] in parent_of]
+        for frag in (False, True):
+            clash: dict[str, int] = {}
+            for g in repos:
                 clash[g["label"]] = clash.get(g["label"], 0) + 1
-        for g in groups.values():
-            if g["id"] in parent_of and clash[g["label"]] > 1:
-                g["label"] = _wire(f"{g['repo']} ({parent_of[g['id']]})")
+            for g in repos:
+                if clash[g["label"]] > 1:
+                    g["label"] = _qualified(g["repo"], parent_of[g["id"]], g["id"][5:11] if frag else None)
+        for g in repos:
+            g["repo"] = _wire(g["repo"])
 
         tasks: list[dict[str, Any]] = []
         worker_of = lambda a, s: by_session.get((a, s))  # noqa: E731

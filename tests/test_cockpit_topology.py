@@ -271,7 +271,7 @@ def test_waiting_and_stalled_are_two_states_and_unattached_work_is_never_a_guess
     assert v["conflicts"] is None and v["counts"] == {"tokens_today": None}
     # the open loop from the install is a task
     assert any(t["kind"] == "spore" and t["label"] == "a loop" for t in v["tasks"])
-    assert {g["id"] for g in v["groups"]} >= {"dir:wait", "dir:stall"}
+    assert {g["label"] for g in v["groups"] if g["id"].startswith("dir:")} >= {"wait", "stall"}
     wire = json.dumps(v)
     assert "SECRET-WORDS" not in wire and "rm -rf" not in wire and "SECRET-LOG-WORDS" not in wire
     assert str(tmp_path) not in wire                                 # no absolute path reaches the wire
@@ -841,3 +841,120 @@ def test_a_session_with_no_log_has_no_rate_not_a_zero(tmp_path, monkeypatch):
     v = _good()
     v["nodes"][0]["rate"] = None
     assert _panel(v)["status"] == "ok"
+
+
+# --- F12a fix 3 (L3 r1: C1-C4) ----------------------------------------------------------------------------------
+
+def _filemode_worktree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """A linked worktree on a repository whose common config says ``core.filemode=false``, a tracked file in it."""
+    repo = _repo(tmp_path / "work" / "main")
+    _commit(repo, "one", {"a.txt": "a\n"})
+    _git(repo, "config", "core.filemode", "false", check=True)
+    wt = tmp_path / "work" / "main-seat"
+    _git(repo, "worktree", "add", "-q", "-b", "seat", str(wt), check=True)
+    common, gitdir, top = act.find_worktree(str(wt), str(tmp_path))[0]
+    return repo, common, gitdir, top
+
+
+def test_a_linked_worktrees_config_worktree_core_settings_shape_the_count(tmp_path):
+    repo, common, gitdir, top = _filemode_worktree(tmp_path)
+    (gitdir / "config.worktree").write_text("[core]\n\tfilemode = true\n")
+    (top / "a.txt").chmod(0o755)
+    # without extensions.worktreeConfig git ignores config.worktree, and so does the read
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 0
+    assert _git(top, "status", "--porcelain").stdout == ""
+    _git(repo, "config", "extensions.worktreeConfig", "true", check=True)
+    assert _git(top, "status", "--porcelain").stdout.strip() == "M a.txt"  # control: git now counts the mode change
+    assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 1
+    # the main worktree's own config.worktree lives in the common git dir
+    (repo / "a.txt").chmod(0o755)
+    mcommon, mgitdir, mtop = act.find_worktree(str(repo), str(tmp_path))[0]
+    assert act.git_worktree_state(mcommon, mgitdir, mtop, 3.0)["dirty"] == 0
+    (common / "config.worktree").write_text("[core]\n\tfilemode = true\n")
+    assert _git(repo, "status", "--porcelain").stdout.strip() == "M a.txt"
+    assert act.git_worktree_state(mcommon, mgitdir, mtop, 3.0)["dirty"] == 1
+
+
+def test_only_allowlisted_shape_checked_keys_cross_from_config_worktree(tmp_path):
+    repo, common, gitdir, _top = _filemode_worktree(tmp_path)
+    _git(repo, "config", "extensions.worktreeConfig", "true", check=True)
+    (gitdir / "config.worktree").write_text(
+        "[core]\n\tfilemode = true\n\tfsmonitor = /tmp/evil\n\thooksPath = /tmp/evil\n\tautocrlf = $(evil)\n"
+        "\teol = crlf\n[filter \"x\"]\n\tclean = /tmp/evil\n[extensions]\n\tobjectformat = sha256\n"
+        "[include]\n\tpath = /tmp/evil.cfg\n")
+    cfg = act._private_config(common, gitdir, act._budget(3.0))
+    assert "\tfilemode = true" in cfg and "\teol = crlf" in cfg
+    for bad in ("evil", "fsmonitor", "hookspath", "filter", "include", "sha256", "worktreeconfig", "autocrlf"):
+        assert bad not in cfg.lower(), (bad, cfg)
+    assert cfg.count("filemode") == 1, cfg                               # merged over common, never doubled
+
+
+def test_the_status_read_passes_no_optional_locks_itself(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "r")
+    common, gitdir, top = act.find_worktree(str(repo), str(tmp_path))[0]
+    seen: list[tuple[list[str], dict[str, str] | None]] = []
+    real = act._run
+
+    def spy(argv, timeout, extra_env=None):
+        seen.append((argv, extra_env))
+        return real(argv, timeout, extra_env)
+
+    monkeypatch.setattr(act, "_run", spy)
+    act.git_worktree_state(common, gitdir, top, 3.0)
+    status = [a for a, _e in seen if "status" in a]
+    assert len(status) == 1 and "--no-optional-locks" in status[0], status
+
+
+def test_repo_labels_that_still_clash_after_the_parent_get_a_stable_fragment_and_keep_their_suffix(tmp_path):
+    long = "l" * 46
+    repos = {"a": _repo(tmp_path / "one" / "x" / "ledger"), "b": _repo(tmp_path / "two" / "x" / "ledger"),
+             "c": _repo(tmp_path / "alpha" / long), "d": _repo(tmp_path / "beta" / long)}
+    root = tmp_path / "inst"
+    for sid, r in repos.items():
+        _session(root, sid, str(r), timedelta(minutes=2))
+    read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None,
+                                hub_label=lambda c: "x", home=str(tmp_path), scan=_stub_scan([]))
+    v = read(ReadContext(datetime.now(timezone.utc))).value
+    assert _panel(v)["status"] == "ok", _panel(v)
+    labels = [g["label"] for g in v["groups"]]
+    assert len(set(labels)) == 4, labels
+    assert all(len(lb) <= topo.LABEL_MAX for lb in labels), labels
+    assert sum(lb.endswith("(alpha)") for lb in labels) == 1 and sum(lb.endswith("(beta)") for lb in labels) == 1
+    assert sum(lb.startswith("ledger (x · ") for lb in labels) == 2, labels
+    again = read(ReadContext(datetime.now(timezone.utc))).value
+    assert [g["label"] for g in again["groups"]] == labels                # stable across reads
+
+
+def test_non_repo_directories_with_one_basename_are_two_groups(tmp_path):
+    a, b = tmp_path / "alpha" / "work", tmp_path / "beta" / "work"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    root = tmp_path / "inst"
+    _session(root, "a", str(a), timedelta(minutes=2))
+    _session(root, "b", str(b), timedelta(minutes=2))
+    v = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None, hub_label=lambda c: "x",
+                             home=str(tmp_path), scan=_stub_scan([]))(ReadContext(datetime.now(timezone.utc))).value
+    assert _panel(v)["status"] == "ok", _panel(v)
+    assert len(v["groups"]) == 2 and [g["label"] for g in v["groups"]] == ["work", "work"], v["groups"]
+    assert all(g["id"].startswith("dir:") and "work" not in g["id"] for g in v["groups"]), v["groups"]
+    by_node = {n["id"]: n["group"] for n in v["nodes"]}
+    assert by_node[_stem("claude_code", "a")] != by_node[_stem("claude_code", "b")]
+
+
+def test_a_session_stem_not_of_the_registry_shape_never_becomes_an_id(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "work" / "r")
+    root = tmp_path / "inst"
+    _session(root, "s", str(repo), timedelta(minutes=2))
+    real = topo._records
+
+    def forged(install_root, now):
+        recs = real(install_root, now)
+        return [*recs, {**recs[0], "_stem": "a​b‮c", "session_id": "other"}]
+
+    monkeypatch.setattr(topo, "_records", forged)
+    v = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: None, hub_label=lambda c: "x",
+                             home=str(tmp_path), scan=_stub_scan([]))(ReadContext(datetime.now(timezone.utc))).value
+    assert _panel(v)["status"] in ("ok", "partial"), _panel(v)
+    assert [n["id"] for n in v["nodes"]] == [_stem("claude_code", "s")]
+    assert "sessions: a record of an unknown name, not drawn" in v["errors"]
+    assert [r["node"] for r in v["lost_if_closed"]] == [_stem("claude_code", "s")]
