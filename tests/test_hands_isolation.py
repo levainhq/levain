@@ -200,6 +200,22 @@ def test_setup_refuses_an_operator_name_that_could_change_a_sudoers_rule(tmp_pat
         plan_setup(_entity(tmp_path), operator=bad, host="linux", hands_id=999)
 
 
+@pytest.mark.parametrize("bad", ["ALL", "ADMINS", "alice\n"])
+def test_setup_refuses_a_sudoers_keyword_or_alias_as_the_operator(tmp_path: Path, monkeypatch, bad) -> None:
+    # `ALL` or an all-uppercase name is a keyword / alias to sudoers: the rule would grant every user it covers.
+    entity = _entity(tmp_path)
+    for host in ("linux", "darwin"):
+        with pytest.raises(HandsSetupError, match="refusing the account name"):
+            plan_setup(entity, operator=bad, host=host, hands_id=999)
+    with pytest.raises(HandsSetupError, match="refusing the account name"):
+        sudoers_text(bad, "_levain_coyote_abcdef")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", bad)
+    with pytest.raises(HandsSetupError, match="refusing the account name"):
+        hands.invoking_operator()
+    plan_setup(entity, operator="Alice", host="darwin", hands_id=499)   # mixed case is a user name
+
+
 def test_remote_login_is_refused_only_through_a_checked_sshd_drop_in(tmp_path: Path) -> None:
     assert not [s for s in _setup(tmp_path / "a").steps if s.write and "sshd" in str(s.write[0])]
     plan = _setup(tmp_path / "b", sshd_dropins=True)
