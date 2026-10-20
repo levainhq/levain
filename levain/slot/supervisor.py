@@ -73,6 +73,8 @@ _CSI_REPORTS = frozenset({
     ("", "$", "u"), ("", "$", "w"),                     # DECRQTSR, DECRQPSR
     ("?", "", "S"), ("?", "", "m"),                     # XTSMGRAPHICS, XTQMODKEYS
     ("", "*", "y"),                                     # DECRQCRA (a checksum of screen contents)
+    ("", "'", "|"), ("", "#", "|"),                     # DECRQLP (the locator report), XTREPORTSGR
+    ("", "&", "u"), ("", '"', "v"),                     # DECRQUPSS, DECRQDE
 })
 #: XTWINOPS (``CSI Ps t``) with these first parameters REPORTS (window state, sizes, the icon label, the title).
 _WINOPS_REPORTS = frozenset({11, 13, 14, 15, 16, 18, 19, 20, 21})
@@ -80,6 +82,10 @@ _WINOPS_REPORTS = frozenset({11, 13, 14, 15, 16, 18, 19, 20, 21})
 #: the clipboard or move files, iTerm2's 1337 among them). Titles (0, 1, 2), cwd (7), hyperlinks (8), notifications
 #: (9, 777) and prompt marks (133) pass; colour SETS pass, colour QUERIES (a ``?`` field) do not.
 _OSC_PASS = frozenset({0, 1, 2, 7, 8, 9, 133, 777})
+#: DEC private modes that make the terminal SEND (mouse, focus, bracketed paste). They pass (what they send is the
+#: operator's own input, which the slot gets anyway), and every one passed is reset when the session ends
+#: (:meth:`TermFilter.reset`). DECISION: 9 (X10 mouse) is the same class as 1000-1006.
+_REPORTING_MODES = frozenset({9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004})
 _OSC_COLOUR = frozenset({4, 104, *range(10, 20), *range(110, 120)})
 _ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
 _CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
@@ -97,8 +103,10 @@ class TermFilter:
         self._u8 = bytearray()       # a multibyte UTF-8 character still arriving
         self._need = 0
         self._cp = 0
+        self._lo, self._hi = 0x80, 0xBF   # the range of the character's NEXT continuation byte
         self._taint = False          # the OSC being parsed is dropped at its terminator
         self._over = False           # the OSC payload passed _OSC_MAX: discard to the terminator
+        self._modes: set = set()     # _REPORTING_MODES the filter passed set and not since reset
 
     # -- the UTF-8 layer: whole code points, or one stray byte ------------------------------------------------------
 
@@ -123,9 +131,17 @@ class TermFilter:
         self._st, self._seq = _G, bytearray()
         return bytes(out)
 
+    def reset(self) -> bytes:
+        """The sequence that turns off every reporting mode this filter let the slot set (empty when none). Sent at
+        the session's end, after :meth:`flush`, so the operator's shell is never left sending mouse or focus
+        reports."""
+        modes, self._modes = sorted(self._modes), set()
+        return b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l" if modes else b""
+
     def _byte(self, b: int, out: bytearray) -> None:
         if self._need:
-            if 0x80 <= b <= 0xBF:
+            if self._lo <= b <= self._hi:
+                self._lo, self._hi = 0x80, 0xBF
                 self._u8.append(b)
                 self._cp = (self._cp << 6) | (b & 0x3F)
                 self._need -= 1
@@ -141,14 +157,19 @@ class TermFilter:
             self._u8, self._need, self._cp = bytearray((b,)), 1, b & 0x1F
         elif 0xE0 <= b <= 0xEF:
             self._u8, self._need, self._cp = bytearray((b,)), 2, b & 0x0F
+            # An overlong (E0 80-9F) or a surrogate (ED A0-BF) is cut at its second byte: both are stray bytes.
+            self._lo, self._hi = {0xE0: (0xA0, 0xBF), 0xED: (0x80, 0x9F)}.get(b, (0x80, 0xBF))
         elif 0xF0 <= b <= 0xF4:
             self._u8, self._need, self._cp = bytearray((b,)), 3, b & 0x07
+            # An overlong (F0 80-8F) or past U+10FFFF (F4 90-BF): the same.
+            self._lo, self._hi = {0xF0: (0x90, 0xBF), 0xF4: (0x80, 0x8F)}.get(b, (0x80, 0xBF))
         else:
             self._stray(b, out)
 
     def _broken(self, out: bytearray) -> None:
         """A multibyte character cut short: its bytes are stray, one by one (the terminal shows U+FFFD)."""
         held, self._u8, self._need = bytes(self._u8), bytearray(), 0
+        self._lo, self._hi = 0x80, 0xBF
         for x in held:
             self._stray(x, out)
 
@@ -164,6 +185,11 @@ class TermFilter:
     def _unit(self, cp: int, raw: bytes, out: bytearray) -> None:
         if 0x80 <= cp <= 0x9F:
             return                    # a C1 control as a code point: dropped in every state (never a string end)
+        if cp >= 0:
+            # The filter emits only bytes it built: a decoded character is re-encoded, never passed in the input's
+            # own form, so no spelling of ESC it did not parse as ESC can reach the terminal. A stray byte (cp -1)
+            # is 0xA0-0xFF, never a control.
+            raw = chr(cp).encode("utf-8")
         st = self._st
         if st == _G:
             if cp == ESC:
@@ -220,6 +246,7 @@ class TermFilter:
             keep = self._st == _CSI and not _csi_is_report(seq)
             self._ground()
             if keep:
+                self._track_modes(seq)
                 out += seq
             return
         if not 0x20 <= cp <= 0x3F:
@@ -231,6 +258,17 @@ class TermFilter:
         body = bytes(self._seq[2:])
         if len(self._seq) > _CSI_MAX or not _csi_shape(body):
             self._st = _CSI_IGN                         # malformed: consumed to its final byte and dropped
+
+    def _track_modes(self, seq: bytes) -> None:
+        # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores).
+        if seq[2:3] != b"?" or seq[-1:] not in (b"h", b"l", b"r"):
+            return
+        for p in seq[3:-1].split(b";"):
+            if p.isdigit() and int(p) in _REPORTING_MODES:
+                if seq[-1:] == b"l":
+                    self._modes.discard(int(p))
+                else:
+                    self._modes.add(int(p))
 
     def _osc(self, cp: int, raw: bytes, out: bytearray) -> None:
         if self._st == _OSC_ESC:
@@ -364,6 +402,44 @@ def parse_helper_line(data: bytes, verb: str) -> Dict[str, object]:
     return _answer(data[:-1], verb)
 
 
+#: §5.1 prepare's answer for an egress session: ``levain-prepare-result/1 {session, slot:{class,index}, gwport,
+#: staging}`` (the supervisor only ever prepares egress, so ``gwport`` is required).
+PREPARE_KEYS = frozenset({"format", "session", "slot", "staging", "gwport"})
+
+
+def prepare_answer(prep: Mapping[str, object], *, host: str, store: Path) -> Tuple[str, int]:
+    """``prepare``'s answer checked whole, before the session is taken as known: the exact format and key set, the
+    session id, an egress slot (not necessarily the one asked for: §5.1 prepare falls back from a named slot that
+    is not REUSABLE), the gateway port §3.4 gives that slot on this host, and the staging dir under ``store``.
+    Anything else is ``prepare-answer-malformed`` naming the field. Returns (session, slot index)."""
+    from levain.slot.ids import SlotId
+    from levain.slot.render import gwport_for
+    from levain.slot.runtime_helper import PREPARE_RESULT_FORMAT
+
+    def bad(what: str) -> Refused:
+        return Refused("prepare-answer-malformed", what)
+
+    if set(prep) != PREPARE_KEYS:
+        raise bad("keys: " + ",".join(sorted(set(prep) ^ PREPARE_KEYS))[:128])
+    if prep["format"] != PREPARE_RESULT_FORMAT:
+        raise bad("format")
+    session = prep["session"]
+    if type(session) is not str or not SESSION_RE.fullmatch(session):
+        raise bad("session")
+    sl = prep["slot"]
+    if type(sl) is not dict or set(sl) != {"class", "index"} or sl["class"] != "egress" or type(sl["index"]) is not int:
+        raise bad("slot")
+    try:
+        sid = SlotId("egress", sl["index"])
+    except Refused:
+        raise bad("slot") from None
+    if type(prep["gwport"]) is not int or prep["gwport"] != gwport_for(host, sid):   # type: ignore[arg-type]
+        raise bad("gwport")
+    if prep["staging"] != str(Path(store) / "staging" / session):
+        raise bad("staging")
+    return session, sid.index
+
+
 def start_result(tail: bytes) -> Dict[str, object]:
     """``start``'s line, read off the END of the pty stream: it follows the vendor's last byte (which may not end
     its own line), and the ptys between add ``\\r``. The rightmost ``{`` on the last non-empty line whose suffix is
@@ -480,7 +556,7 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
     """The clone's committed settings layers, parsed: repo-relative name -> JSON value, for every tree entry whose
     name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
     such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
-    repeats a key (DECISION: two values for one key is refused, not resolved)."""
+    repeats a key (DECISION: two values for one key is refused, not resolved), or nests too deep to parse."""
     want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
     docs: Dict[str, Any] = {}
     for mode, typ, sha, name in _ls_tree(clone, "HEAD", git=git, run=run):
@@ -502,7 +578,7 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
                         refusal="repo-settings-malformed").stdout
             try:
                 docs[path] = json.loads(blob.decode("utf-8"), object_pairs_hook=_no_dup)
-            except (UnicodeDecodeError, ValueError):
+            except (UnicodeDecodeError, ValueError, RecursionError):   # nesting past the parser's depth: untrusted
                 raise Refused("repo-settings-malformed", f"{path}: not JSON") from None
     return docs
 
@@ -583,20 +659,24 @@ HOOKS_BY_AUTH: Mapping[str, Tuple[str, ...]] = {"brokered": (), "passthrough": (
 
 def render_blob(vendor: str, auth: str, routes: Sequence[str], identity: Optional[Mapping[str, str]],
                 label: Optional[str]) -> bytes:
-    """The §5.3 blob as canonical bytes, checked by the helper's own grammar before it is sent. A ``repo_label`` the
-    grammar refuses is dropped (DECISION: it is display only); a git identity it refuses is ``git-identity-invalid``."""
+    """The §5.3 blob as canonical bytes, checked by the helper's own grammar before it is sent. The operator's two
+    inputs are each checked alone, so a refusal names its cause: a git identity the grammar refuses is
+    ``git-identity-invalid``; a ``repo_label`` it refuses is dropped (DECISION: it is display only). The whole
+    blob is then checked once, and a route or hook it refuses is refused by the grammar's own name."""
+    def alone(**extra: object) -> bytes:
+        return canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": vendor, "routes": [], **extra})
+
     blob: Dict[str, object] = {"format": RENDER_FORMAT, "vendor": vendor, "routes": list(routes),
                                "hooks": list(HOOKS_BY_AUTH[auth])}
     if identity is not None:
-        blob["git_identity"] = dict(identity)
         try:
-            parse_stdin("render", canon.canonical_bytes(blob))
+            parse_stdin("render", alone(git_identity=dict(identity)))
         except Refused:
             raise Refused("git-identity-invalid", "git config user.name / user.email") from None
+        blob["git_identity"] = dict(identity)
     if label is not None:
         try:
-            parse_stdin("render", canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": vendor, "routes": [],
-                                                         "repo_label": label}))
+            parse_stdin("render", alone(repo_label=label))
             blob["repo_label"] = label
         except Refused:
             pass
@@ -609,7 +689,19 @@ def render_blob(vendor: str, auth: str, routes: Sequence[str], identity: Optiona
 
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _INPUT_MAX = 1 << 20       # DECISION: operator input buffered ahead of the pty; past this, his stdin waits
+_OUTPUT_MAX = 1 << 20      # DECISION: filtered output held for a terminal that is not reading; past this the master
+#                            is not read (the vendor waits on its pty), and no byte is dropped
 START_GRACE_S = 10.0       # DECISION: after teardown, how long `start` gets to return before it is signalled
+#: DECISION: the wall each helper verb gets before it is ended (TERM, then KILL) and refused ``helper-timeout``.
+#: prepare takes two locks and an ATTACH; render validates, starts the front and mints; teardown is END (freeze,
+#: kill, retain), the longest. Generous: they bound a wedge, they do not time normal work.
+HELPER_DEADLINE_S: Mapping[str, float] = {"prepare": 120.0, "render": 300.0, "teardown": 600.0}
+HELPER_DEADLINE_DEFAULT_S = 120.0
+_HELPER_OUT_MAX = 1 << 20  # DECISION: a helper answer past this is no single line: refused malformed
+_HELPER_ERR_KEEP = 1 << 16
+KILL_GRACE_S = 2.0         # DECISION: between TERM and KILL for a helper being ended
+FINAL_DRAIN_S = 2.0        # DECISION: at the session's end, how long a terminal that is not reading gets for the rest
+SAY_WAIT_S = 1.0           # DECISION: how long a status line waits on stderr before it is held for the end of the run
 
 
 def _host() -> str:
@@ -652,6 +744,8 @@ class Seams:
     firewall_probe: Optional[Callable[[str], None]] = None
     tmp_parent: Optional[Path] = None
     start_grace_s: float = START_GRACE_S
+    helper_deadline_s: Mapping[str, float] = field(default_factory=lambda: dict(HELPER_DEADLINE_S))
+    kill_grace_s: float = KILL_GRACE_S
 
     def __post_init__(self) -> None:
         if self.helper is None:
@@ -676,16 +770,44 @@ class Supervisor:
         self.lease: Any = None
         self.session: Optional[str] = None
         self.stop_signal: Optional[int] = None
+        self._stops = 0                       # stop signals received (a second one ends even a teardown)
         self._wake_r = self._wake_w = -1
         self._old: Dict[int, Any] = {}
         self._proc: Optional["subprocess.Popen[bytes]"] = None
         self._master = self._slave = -1
+        self._held: List[str] = []           # status lines a terminal that was not reading has yet to take
 
     # -- small ------------------------------------------------------------------------------------------------------
 
     def say(self, msg: str) -> None:
-        self.err.write("levain: " + unshowable.mark(msg, allow="") + "\n")
+        """A status line on stderr. A terminal that is not reading (its emulator stalled, an ssh link wedged) never
+        holds the session's end: past :data:`SAY_WAIT_S` the line, and every one after it, waits for the end of
+        :meth:`run`, after teardown and the lease close, and is written there."""
+        line = "levain: " + unshowable.mark(msg, allow="") + "\n"
+        if self._held or not self._err_ready():
+            self._held.append(line)
+            return
+        self.err.write(line)
         self.err.flush()
+
+    def _err_ready(self) -> bool:
+        try:
+            fd = self.err.fileno()
+        except (AttributeError, OSError, ValueError):
+            return True                       # not an fd (a test's StringIO): it cannot stall
+        try:
+            return bool(select.select([], [fd], [], SAY_WAIT_S)[1])
+        except (OSError, ValueError):
+            return True
+
+    def _release_held(self) -> None:
+        held, self._held = self._held, []
+        for line in held:
+            try:
+                self.err.write(line)
+                self.err.flush()
+            except (OSError, ValueError):
+                return
 
     def _lease_fds(self) -> Tuple[int, ...]:
         return (self.lease.fileno(),) if self.lease is not None else ()
@@ -694,23 +816,118 @@ class Supervisor:
         if self.stop_signal is not None:
             raise Refused("stopped", signal.Signals(self.stop_signal).name)
 
-    def helper(self, *args: str, stdin: bytes = b"") -> Dict[str, object]:
+    def helper(self, *args: str, stdin: bytes = b"", stoppable: bool = True) -> Dict[str, object]:
         """One verb off the pty: stdin and stdout are pipes, stderr is read and shown escaped (root's refusal detail
-        may quote a slot-made name)."""
+        may quote a slot-made name). The pipes are driven in a bounded select loop that also watches the wake pipe:
+        a stop signal (``stoppable``; for teardown, which runs AFTER the first stop, only a later one) or the verb's
+        :attr:`Seams.helper_deadline_s` ends the helper (TERM, then KILL, reaped) and refuses ``stopped`` /
+        ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback."""
+        verb = args[0]
         argv = [*self.s.helper, *args]                                                  # type: ignore[misc]
-        p = self.s.spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         lease_fds=self._lease_fds(), env=self.s.env)
-        out, err = p.communicate(stdin)
-        for line in err.decode("utf-8", "replace").splitlines()[-5:]:
-            if line.strip():
-                self.say("  " + line.strip())
-        return parse_helper_line(out, args[0])
+        err = bytearray()
+        try:
+            try:
+                p = self.s.spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 lease_fds=self._lease_fds(), env=self.s.env)
+            except OSError as e:
+                raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
+            try:
+                out = self._drive(p, verb, stdin, err, stoppable)
+            except OSError as e:
+                raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
+            finally:
+                if p.poll() is None:
+                    self._end_helper(p)
+                for f in (p.stdin, p.stdout, p.stderr):
+                    if f is not None:
+                        try:
+                            f.close()
+                        except OSError:
+                            pass
+        finally:
+            for line in err.decode("utf-8", "replace").splitlines()[-5:]:
+                if line.strip():
+                    self.say("  " + line.strip())
+        return parse_helper_line(bytes(out), verb)
+
+    def _drive(self, p: "subprocess.Popen[bytes]", verb: str, data: bytes, err: bytearray,
+               stoppable: bool) -> bytearray:
+        """``communicate`` with a deadline and the stop flag: stdin written, stdout and stderr read, until both
+        close and the helper exits."""
+        deadline = time.monotonic() + self.s.helper_deadline_s.get(verb, HELPER_DEADLINE_DEFAULT_S)
+        stops = self._stops
+        fin, fout, ferr = p.stdin.fileno(), p.stdout.fileno(), p.stderr.fileno()   # type: ignore[union-attr]
+        for fd in (fin, fout, ferr):
+            os.set_blocking(fd, False)
+        view = memoryview(bytes(data))
+        if not view:
+            p.stdin.close()                                                          # type: ignore[union-attr]
+        out = bytearray()
+        readers = [fout, ferr]
+        while readers or p.poll() is None:
+            if (self.stop_signal is not None) if stoppable else (self._stops > stops):
+                raise Refused("stopped", f"{verb}: {signal.Signals(self.stop_signal or signal.SIGTERM).name}")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Refused("helper-timeout", f"{verb} did not answer in {self.s.helper_deadline_s.get(verb)}s")
+            rl = readers + ([self._wake_r] if self._wake_r >= 0 else [])
+            try:
+                ready, writable, _ = select.select(rl, [fin] if view else [], [], min(left, 0.2))
+            except InterruptedError:
+                continue
+            if self._wake_r in ready:
+                try:
+                    os.read(self._wake_r, 64)
+                except BlockingIOError:
+                    pass
+            if view and fin in writable:
+                try:
+                    view = view[os.write(fin, view):]
+                except BlockingIOError:
+                    pass
+                except BrokenPipeError:
+                    view = memoryview(b"")    # it stopped reading: its answer says why
+                if not view:
+                    p.stdin.close()                                                  # type: ignore[union-attr]
+            for fd in (fout, ferr):
+                if fd in ready:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        readers.remove(fd)
+                    elif fd == fout:
+                        out += chunk
+                        if len(out) > _HELPER_OUT_MAX:
+                            raise Refused("helper-output-malformed", f"{verb}: over {_HELPER_OUT_MAX} bytes")
+                    else:
+                        err += chunk
+                        del err[:-_HELPER_ERR_KEEP]
+        return out
+
+    def _end_helper(self, p: "subprocess.Popen[bytes]") -> None:
+        """TERM, then KILL after :attr:`Seams.kill_grace_s`, then reaped. (sudo relays the TERM to the root helper;
+        a KILL ends sudo alone.)"""
+        for send in (p.terminate, p.kill):
+            try:
+                send()
+            except OSError as e:
+                self.say(f"could not signal the runtime helper: {e.strerror or e}")
+                return
+            try:
+                p.wait(timeout=self.s.kill_grace_s)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        self.say(f"the runtime helper (pid {p.pid}) did not exit after SIGKILL")
 
     # -- signals ----------------------------------------------------------------------------------------------------
 
     def _on_stop(self, signum: int, _frame: object) -> None:
         if self.stop_signal is None:
             self.stop_signal = signum
+        self._stops += 1
         self._poke()
 
     def _on_winch(self, _signum: int, _frame: object) -> None:
@@ -765,13 +982,21 @@ class Supervisor:
         except Refused as e:
             self.say(f"refused {e.name}" + (f": {e.detail}" if e.detail else ""))
             return 1
+        except OSError as e:
+            # DECISION: an OS failure no step names (git missing, EMFILE at the pty) is refused `os-error` with its
+            # errno text; whatever session it hit was torn down on the way out (`_leased`'s finally).
+            self.say(f"refused os-error: {e}")
+            return 1
         finally:
-            if tmp is not None:
-                shutil.rmtree(tmp, ignore_errors=True)
-            if self.lease is not None:
-                self.lease.close()
-                self.lease = None
-            self._restore()
+            try:
+                if tmp is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                if self.lease is not None:
+                    self.lease.close()
+                    self.lease = None
+                self._restore()
+            finally:
+                self._release_held()
 
     def _leased(self, clone: Path, branch: str, blob: bytes) -> int:
         self.lease = self.s.client_factory(self.s.control_socket)                       # type: ignore[misc]
@@ -783,17 +1008,14 @@ class Supervisor:
         if self.req.slot is not None:
             args.append(str(self.req.slot))
         prep = self.helper(*args, stdin=canon.canonical_bytes({"lease_nonce": nonce}))
-        session = prep.get("session")
-        if type(session) is not str or not SESSION_RE.fullmatch(session):
-            raise Refused("prepare-answer-malformed", "session")
+        # A malformed answer is refused before the session is taken as known: teardown needs a name we trust, so
+        # the recovery is the lease close (CONTROL revokes on EOF).
+        session, index = prepare_answer(prep, host=self.s.host, store=self.s.store)   # type: ignore[arg-type]
+        staging = self.s.store / "staging" / session                                     # type: ignore[operator]
         self.session = session
         ok = False
         try:
-            staging = self.s.store / "staging" / session                                 # type: ignore[operator]
-            if prep.get("staging") != str(staging):
-                raise Refused("prepare-answer-malformed", "staging")
-            slot = prep.get("slot")
-            self.say(f"session {session} on slot {slot.get('index') if type(slot) is dict else '?'}")
+            self.say(f"session {session} on slot {index}")
             self._check()
             from levain.slot.stage import make_bundle
 
@@ -812,14 +1034,17 @@ class Supervisor:
             self.say(f"refused {e.name}" + (f": {e.detail}" if e.detail else ""))
         finally:
             # Teardown runs while the pty master is still open: closing it first would hang up `start` (sudo relays
-            # the SIGHUP) before END has frozen the slot. Only then does `start` get its grace, and the master close.
-            ok = self._teardown(session) and ok
-            self._end_start()
+            # the SIGHUP) before END has frozen the slot. Only then does `start` get its grace, and the master close,
+            # whatever teardown raised.
+            try:
+                ok = self._teardown(session) and ok
+            finally:
+                self._end_start()
         return 0 if ok and self.stop_signal is None else 1
 
     def _teardown(self, session: str) -> bool:
         try:
-            out = self.helper("teardown", session)
+            out = self.helper("teardown", session, stoppable=False)
         except Refused as e:
             self.say(f"teardown refused {e.name}: session {session} stays leased; nothing in it was removed")
             return False
@@ -861,11 +1086,18 @@ class Supervisor:
             tail = self._relay(master, proc)
         finally:
             if saved is not None:
-                termios.tcsetattr(self.s.stdin, termios.TCSAFLUSH, saved)
+                # TCSANOW, then the typed-ahead input discarded: TCSAFLUSH would wait for the output to drain,
+                # which a terminal that is not reading never does, and teardown is still to come.
+                termios.tcsetattr(self.s.stdin, termios.TCSANOW, saved)
+                termios.tcflush(self.s.stdin, termios.TCIFLUSH)
         if self.stop_signal is not None:
             self.say(f"{signal.Signals(self.stop_signal).name}: ending session {session}")
             return False
-        code = proc.wait()
+        try:
+            code = proc.wait(timeout=self.s.start_grace_s)
+        except subprocess.TimeoutExpired:
+            self.say("start did not exit after the vendor's terminal closed: ending the session")
+            return False
         try:
             res = start_result(tail)
         except Refused as e:
@@ -883,100 +1115,139 @@ class Supervisor:
         except OSError:
             pass
 
-    def _write(self, fd: int, data: bytes) -> bool:
-        view = memoryview(data)
-        while view:
-            try:
-                n = os.write(fd, view)
-            except InterruptedError:
-                continue
-            except BlockingIOError:
-                select.select([], [fd], [], 1.0)
-                continue
-            except OSError:
-                return False
-            view = view[n:]
-        return True
-
     def _relay(self, master: int, proc: "subprocess.Popen[bytes]") -> bytes:
-        """operator stdin -> pty master; pty master -> :class:`TermFilter` -> operator stdout. Ends when the helper
-        exited and the master is drained (or the master reads EOF / EIO), or on a stop signal. Returns the stream's
-        raw tail (where ``start``'s line is)."""
+        """operator stdin -> pty master; pty master -> :class:`TermFilter` -> operator stdout. Nothing in the loop
+        blocks: the master and the operator's stdout are non-blocking and both directions are buffered, so a
+        terminal that is not reading stops the master being read (past :data:`_OUTPUT_MAX`), never the loop, and the
+        wake pipe is always watched. Ends on a stop signal, or once the master is done (EOF / EIO, or the helper
+        exited and a read pass found it empty) and the output buffer is written. Returns the stream's raw tail
+        (where ``start``'s line is)."""
         filt = TermFilter()
         tail = bytearray()
-        stdin_open, out_open = True, True
+        stdin_open, out_open, master_done = True, True, False
         pending = bytearray()      # operator input the pty has not taken yet
-        # The master is non-blocking and the operator's input is buffered: a blocking write of a large paste would
-        # wait on the vendor while the vendor waits on us to read its output (Node writes a TTY synchronously).
+        outbuf = bytearray()       # filtered output the operator's terminal has not taken yet
+        stdout = self.s.stdout
+        # O_NONBLOCK is a property of the open file, which stdout may share with stdin (one tty): stdin's read
+        # then answers EAGAIN too, and both are put back as they were on every way out.
+        was_blocking = os.get_blocking(stdout)
         os.set_blocking(master, False)
-        while self.stop_signal is None:
-            rl = [master, self._wake_r] + ([self.s.stdin] if stdin_open and len(pending) < _INPUT_MAX else [])
-            try:
-                ready, writable, _ = select.select(rl, [master] if pending else [], [], 0.5)
-            except InterruptedError:
-                continue
-            if self._wake_r in ready:
-                try:
-                    pokes = os.read(self._wake_r, 64)
-                except BlockingIOError:
-                    pokes = b""
-                if b"w" in pokes:
-                    self._winsize(master)
-            if master in writable and pending:
-                try:
-                    del pending[:os.write(master, pending)]
-                except BlockingIOError:
-                    pass
-                except OSError:
-                    pending.clear()
-                    stdin_open = False
-            if master in ready:
-                try:
-                    data = os.read(master, 65536)
-                except BlockingIOError:
-                    data = None
-                except OSError as e:
-                    if e.errno != errno.EIO:
-                        raise
-                    data = b""
-                if data == b"":
+        os.set_blocking(stdout, False)
+        try:
+            while self.stop_signal is None:
+                if master_done and not (outbuf and out_open):
                     break
-                if data:
-                    tail = (tail + data)[-8192:]
-                    if out_open:
-                        out_open = self._write(self.s.stdout, filt.feed(data))
-            if stdin_open and self.s.stdin in ready:
+                exited = proc.poll() is not None      # read BEFORE the select: all its output is in the pty
+                read_master = not master_done and len(outbuf) < _OUTPUT_MAX
+                rl = [self._wake_r] + ([master] if read_master else [])
+                if stdin_open and not master_done and len(pending) < _INPUT_MAX:
+                    rl.append(self.s.stdin)
+                wl = ([master] if pending and not master_done else []) + ([stdout] if outbuf and out_open else [])
                 try:
-                    data = os.read(self.s.stdin, 65536)
-                except OSError:
-                    data = b""
-                if data:
-                    pending += data
-                else:
-                    stdin_open = False
-            if not ready and not writable and proc.poll() is not None:
-                break
-        if out_open:
-            self._write(self.s.stdout, filt.flush())
+                    ready, writable, _ = select.select(rl, wl, [], 0.5)
+                except InterruptedError:
+                    continue
+                if self._wake_r in ready:
+                    try:
+                        pokes = os.read(self._wake_r, 64)
+                    except BlockingIOError:
+                        pokes = b""
+                    if b"w" in pokes:
+                        self._winsize(master)
+                if stdout in writable:
+                    try:
+                        del outbuf[:os.write(stdout, outbuf)]
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    except OSError:
+                        out_open = False          # his terminal is gone: nothing more can be shown
+                        outbuf.clear()
+                if master in writable and pending:
+                    try:
+                        del pending[:os.write(master, pending)]
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        pending.clear()
+                        stdin_open = False
+                if master in ready:
+                    try:
+                        data = os.read(master, 65536)
+                    except BlockingIOError:
+                        data = None
+                    except OSError as e:
+                        if e.errno != errno.EIO:
+                            raise
+                        data = b""
+                    if data == b"":
+                        master_done = True
+                    elif data:
+                        tail = (tail + data)[-8192:]
+                        if out_open:
+                            outbuf += filt.feed(data)
+                elif read_master and exited:
+                    master_done = True            # the helper is gone and nothing was left to read
+                if self.s.stdin in ready:
+                    try:
+                        data = os.read(self.s.stdin, 65536)
+                    except BlockingIOError:
+                        data = None
+                    except OSError:
+                        data = b""
+                    if data:
+                        pending += data
+                    elif data == b"":
+                        stdin_open = False
+        finally:
+            left = 0
+            try:
+                if out_open:
+                    left = self._last_output(outbuf + filt.flush() + filt.reset())
+            finally:
+                os.set_blocking(stdout, was_blocking)
+            if left:
+                self.say(f"your terminal did not take the session's last {left} bytes")
         return bytes(tail)
+
+    def _last_output(self, rest: bytearray) -> int:
+        """The session's last bytes (what the terminal had yet to take, then the reporting-mode reset), given
+        :data:`FINAL_DRAIN_S` and no more: a terminal that is not reading does not hold teardown. Returns how many
+        it did not take."""
+        deadline = time.monotonic() + FINAL_DRAIN_S
+        while rest:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                if select.select([], [self.s.stdout], [], left)[1]:
+                    del rest[:os.write(self.s.stdout, rest)]
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return 0                      # his terminal is gone
+        return len(rest)
 
     def _end_start(self) -> None:
         """After teardown: teardown ended the vendor (END freezes and kills the slot's processes), so ``start``
-        returns on its own; the master is drained (never shown) meanwhile so a full pty cannot block it, and it is
-        signalled only if it outlives :attr:`Seams.start_grace_s`. Then the master closes."""
+        returns on its own; the master is drained (never shown) meanwhile so a full pty cannot block it. Past
+        :attr:`Seams.start_grace_s` it gets TERM, past another KILL, and it is reaped. Then the master closes."""
         proc, master, slave = self._proc, self._master, self._slave
         self._proc, self._master, self._slave = None, -1, -1
         try:
             deadline = time.monotonic() + self.s.start_grace_s
-            signalled = False
+            sends = [] if proc is None else [proc.terminate, proc.kill]
             while proc is not None and proc.poll() is None:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    if signalled:
-                        self.say("start did not exit after teardown")
+                    if not sends:
+                        self.say(f"start (pid {proc.pid}) did not exit after SIGKILL")
                         break
-                    proc.terminate()
-                    signalled, deadline = True, time.monotonic() + self.s.start_grace_s
+                    try:
+                        sends.pop(0)()
+                    except OSError as e:
+                        self.say(f"could not signal start: {e.strerror or e}")
+                        break
+                    deadline = time.monotonic() + self.s.start_grace_s
                     continue
                 if master < 0:
                     try:

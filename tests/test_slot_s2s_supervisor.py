@@ -53,7 +53,7 @@ sess = "%(session)s"
 if verb == "prepare":
     staging = os.path.join(store, "staging", sess)
     os.makedirs(staging)
-    line({"format": "levain-prepare-result/1", "gwport": 47101, "ok": True, "session": sess,
+    line({"format": "levain-prepare-result/1", "gwport": 47100, "ok": True, "session": sess,
           "slot": {"class": "egress", "index": 0}, "staging": staging})
 elif verb == "render":
     assert os.path.getsize(os.path.join(store, "staging", sess, "repo.bundle")) > 16
