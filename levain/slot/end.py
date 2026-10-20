@@ -93,6 +93,23 @@ SLOT_LOCK_WAIT_S = 10.0
 SLOT_LOCK_FIRST_S = 0.02
 SLOT_LOCK_MAX_S = 0.5
 
+#: The slot-lock and END-lock descriptors this process holds (comp r2 L4). Every forked child (the session-uid
+#: reader, macOS's signalling child) closes them before it runs anything, so a child that outlives END can never
+#: keep either flock held; a closed duplicate leaves the parent's lock as it was.
+_LOCK_FDS: set[int] = set()
+
+
+def _close_lock_fds_in_child() -> None:
+    for fd in tuple(_LOCK_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _LOCK_FDS.clear()
+
+
+os.register_at_fork(after_in_child=_close_lock_fds_in_child)
+
 MANIFEST_FORMAT = "levain-end-manifest/1"
 META_FORMAT = "levain-retention-meta/1"
 OBJECT_FORMAT = "levain-retained-object/1"
@@ -1101,8 +1118,9 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
     """Each in-tree link of an outside-linked inode becomes a hard link to that inode's staged copy (the
     manifest step's: the bytes the session uid read and hashed), so an in-tree link set stays one inode
     and the outside file is no longer shared (root never chowns a shared inode, plan §2g 2). Redone after a
-    crash: an entry already placed (its inode is a staged copy's) is left, a temp link this step made and
-    did not rename is removed, and the staging dir goes last. Only a placement the filesystem REFUSES
+    crash: an entry already placed (its inode is a staged copy's) is left and its directory fsynced before
+    any staging copy is unlinked, a temp link this step made and did not rename is removed, and the staging
+    dir goes last. Only a placement the filesystem REFUSES
     (:data:`_PLACE_REFUSED`: an immutable directory or file, a link count at its limit) is noted, and that
     entry stays shared: unstripped, unchowned. Every other failure (ENOSPC, EIO, a failed fsync) propagates,
     so the tree phase stays journaled and the reserve's retry runs (codex r1 7); a temp link whose rename
@@ -1120,14 +1138,22 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
             if stat.S_ISREG(st.st_mode):
                 staged[nb] = st
         copies = {(st.st_dev, st.st_ino) for st in staged.values()}
+        synced: set[bytes] = set()   # the tree dirs (by path) fsynced since their last placement
         for e in walk(tree):
             if not stat.S_ISREG(e.st.st_mode):
                 continue
             key = (e.st.st_dev, e.st.st_ino)
+            parent = os.path.dirname(e.path)
             if key in copies:
                 if e.name.startswith(_LINK_TMP):
                     os.unlink(e.name, dir_fd=e.dirfd)
                     os.fsync(e.dirfd)
+                    synced.add(parent)
+                elif parent not in synced:
+                    # Placed by an earlier pass whose dir fsync may have failed (comp r2 N1): made durable
+                    # here, before the staging copies it links to are unlinked below.
+                    os.fsync(e.dirfd)
+                    synced.add(parent)
                 continue
             src = _staged_name(key)
             if src not in staged:
@@ -1144,13 +1170,17 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
             try:
                 os.rename(tmp, e.name, src_dir_fd=e.dirfd, dst_dir_fd=e.dirfd)
             except OSError as err:
-                os.unlink(tmp, dir_fd=e.dirfd)
+                try:
+                    os.unlink(tmp, dir_fd=e.dirfd)
+                except FileNotFoundError:   # comp r2 L3: never masks the rename's errno
+                    pass
                 if err.errno not in _PLACE_REFUSED:
                     raise
                 note(f"link {e.abspath!r}: not replaced by its copy ({err.strerror or err}); left unstripped, "
                      f"unchowned")
                 continue
             os.fsync(e.dirfd)
+            synced.add(parent)
         for nb in staged:
             os.unlink(nb, dir_fd=sfd)
         os.fsync(sfd)
@@ -1307,7 +1337,9 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     (:func:`classify`), stored as ``classes.jsonl``. An :data:`OUTSIDE` inode (L2 H2) is read once, by the
     session-uid reader, into ``L/retained/<s>/linkcopy/<dev>-<ino>`` (the copy keeps its mode less
     setuid/setgid; an UNREAD one is an empty 0600 placeholder); an :data:`UNOWNED` file is read once by it and
-    hashed, never copied (codex r1 4); that read is what the manifest records. The copy cap is checked
+    hashed, never copied (codex r1 4); that read is what the manifest records, and an UNOWNED file it cannot
+    read refuses ``unowned-unreadable`` (codex r2 N2: its real bytes stay in the tree, so UNREAD's size 0
+    would be a false record). The copy cap is checked
     before anything is read, and is ONE budget across every reader: each gets only what the reads before it
     left (codex r1 8), so files an outside holder grows after the sum cannot stage past it."""
     classes, outside = classify(facts.live, facts.extra, facts.uids)
@@ -1339,6 +1371,11 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
                 copied += got[0]
             else:
                 got = read_as_session(facts, seams, e, None, HASH_ONLY_CAP, budget)
+                if got == UNREAD:
+                    # codex r2 N2: an UNOWNED inode has no placeholder; it stays in the tree, so a size-0,
+                    # digest-"" line would misdescribe the bytes retained. Fail closed: HELD, named.
+                    raise Refused("unowned-unreadable",
+                                  f"{e.abspath!r}: no session uid can read it, and it is not copied")
             if got == UNREAD:
                 seams.note(f"{classes[key]} {e.abspath!r}: the session uid cannot read it; recorded, not copied")
             staged[key] = got
@@ -1743,6 +1780,7 @@ def slot_lock(facts: EndFacts, seams: EndSeams) -> Iterator[bool]:
         return
     except OSError as e:
         raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    _LOCK_FDS.add(fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not seams.owner_ok(st):
@@ -1762,6 +1800,7 @@ def slot_lock(facts: EndFacts, seams: EndSeams) -> Iterator[bool]:
                 delay = min(delay * 2, SLOT_LOCK_MAX_S)
         yield True
     finally:
+        _LOCK_FDS.discard(fd)
         os.close(fd)   # closing the only descriptor releases the flock
 
 
@@ -1796,6 +1835,7 @@ def end_lock(facts: EndFacts, seams: EndSeams) -> Iterator[None]:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as e:
         raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    _LOCK_FDS.add(fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not seams.owner_ok(st):
@@ -1809,6 +1849,7 @@ def end_lock(facts: EndFacts, seams: EndSeams) -> Iterator[None]:
             sweep_temps(facts.retained, "", owner_ok=seams.owner_ok)
         yield
     finally:
+        _LOCK_FDS.discard(fd)
         os.close(fd)   # closing the only descriptor releases the flock
 
 
@@ -1839,20 +1880,25 @@ def _reconcile(facts: EndFacts, seams: EndSeams, caps: Caps) -> RootIntent | Non
                      fault=seams.fault, retry=seams.retry, owner_ok=seams.owner_ok)
 
 
-#: The retain phases whose step reads or changes the session tree (or follows one that did, ``object``): a
-#: journal at one of them is finished only after :func:`reconcile_session` proves the slot ours and every
-#: session uid dead again (comp r1 3). DECISION: not ``init`` (a mkdir of root's own directory, before any
-#: read) and not ``commit`` (it writes root's ``retained_at`` and CASes; the tree is done): a crash between
-#: the RETAINED CAS and the journal delete leaves a ``commit`` journal that SCRUBBED may already have
-#: outlived, and finishing it must not need a slot that is no longer the session's.
-PROVEN_PHASES = ("manifest", "meta", "object", "tree")
+#: Per intent, the journal phases from which reconciling will run a step that reads or changes the session's
+#: ``live/``: a journal at one of them is finished only after :func:`reconcile_session` proves the slot ours
+#: and every session uid dead again (comp r1 3). The reconciler runs every LATER phase too, so the test is
+#: the phases still to run, not the one named: a retain ``init`` journal goes on to the manifest and the
+#: tree (codex r2 O3), and park's ``move`` renames the credential out of ``live/`` (comp r2 L2). Only
+#: ``commit`` is left out (retain's writes root's ``retained_at``, park's syncs ``keep/``; both then CAS):
+#: a crash between the CAS and the journal delete leaves a ``commit`` journal that SCRUBBED may already
+#: have outlived, and finishing it must not need a slot that is no longer the session's.
+PROVEN_PHASES: Mapping[str, tuple[str, ...]] = {
+    "retain": tuple(p for p in INTENT_PHASES["retain"] if p != "commit"),
+    "park": tuple(p for p in INTENT_PHASES["park"] if p != "commit"),
+}
 
 
 def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
                       held_attempts: int | None = None) -> RootIntent | None:
     """The reaper's step 2 / helper start for one session: finish its journal, from the journal and
-    the filesystem only, under the slot lock then root's per-session lock (:func:`slot_lock`). A retain
-    journal at a :data:`PROVEN_PHASES` phase is finished only after the proofs END runs (the slot ours,
+    the filesystem only, under the slot lock then root's per-session lock (:func:`slot_lock`). A journal
+    at one of its intent's :data:`PROVEN_PHASES` is finished only after the proofs END runs (the slot ours,
     then freeze, kill and no process for EVERY session uid): the journal outlives END's own proofs (HELD
     at ``tree``, a later pass), and a process of a session uid could have appeared since (comp r1 3). A proof
     that fails CASes HELD with that step as ``failed_step`` (``held_attempts`` one past the record's), as
@@ -1861,7 +1907,7 @@ def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
     :class:`CasNotSent`."""
     with slot_lock(facts, seams) as locked, end_lock(facts, seams):
         ri = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
-        if ri is not None and ri.intent == "retain" and ri.phase in PROVEN_PHASES:
+        if ri is not None and ri.phase in PROVEN_PHASES.get(ri.intent, ()):
             step = "slot-not-ours"
             try:
                 if not locked:
