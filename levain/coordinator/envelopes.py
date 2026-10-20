@@ -263,9 +263,9 @@ class EnvelopeStore(CoordStore):
     def accept_envelope(self, body_text: str, payload: Mapping[str, Any], signature: str, *,
                         authority: AuthoritySnapshot) -> tuple[Envelope, bool]:
         """Accept a WORDED envelope (the coordinator's echo, signed by you) bound to the thread revisions it names;
-        ``(envelope, True)``. The identical record again writes nothing: ``(stored, False)``, looked up before the
-        signature and disk checks, so a retry after a lost answer returns what was accepted even when its signer or a
-        branch has since gone (in force is decided at use, never by this record)."""
+        ``(envelope, True)``. The identical worded record again writes nothing: ``(stored, False)``, looked up before
+        the signature and disk checks, so a retry after a lost answer returns what was accepted even when its signer or
+        a branch has since gone (in force is decided at use, never by this record)."""
         try:
             with read_transaction(self._connect) as conn:
                 again = self._same_or_conflict(conn, self._parsed(body_text), payload, signature)
