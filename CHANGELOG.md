@@ -51,7 +51,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   nothing (Levain uploads its own copy). Settings that could send the upload elsewhere (environment variables,
   `.npmrc`, `publishConfig`) are overridden. PyPI credentials come from `TWINE_USERNAME` / `TWINE_PASSWORD`, or the
   `~/.pypirc` section for that exact index; with none, it refuses before asking you.
-
+- **Web push to your phone (`levain ping`).** Levain can now ping your phone itself, without a notify command of your own:
+  Chrome on Android from the phone page as it is, and an iPhone (iOS 16.4 or later) once the phone page is added to the Home
+  Screen (the page shows the two taps). Pings go out for a gated call that waits on you, a re-ping, a ruling that waits, a
+  question an agent asked, and a push request. `levain ping test` sends a test to every phone; `levain ping devices` lists
+  paired phones and `levain ping revoke` removes one. A ping only opens the phone page: every answer still needs your passkey.
+  Your `notify_argv` command keeps working beside it.
+- **Pairing a phone by typed code.** On an iPhone the Home Screen app keeps its own storage, so a link opened in Safari does not
+  reach it. Tap "Install on this phone" in Safari and the page shows an 8-character code (good for 10 minutes, one use, only the
+  newest works); type it into the "Pairing code" box in the installed app. `levain ping pair` prints a fresh code from the
+  laptop. Five wrong tries in 10 minutes lock every short-code pairing until a new code is made.
+- **The phone app's state line and board.** From the phone you can set your state line (the same one the cockpit, `levain
+  state` and the TUI set; agents see it on their next prompt), and work your Tray: resolve and snooze an item. Open loops and
+  Keep are there to read. The phone does only what the cockpit's own tiers allow without a signature; anything more says
+  "on the laptop".
+- **The notification record.** Every ping Levain sent, where it went (each phone, and whether your `notify_argv` command
+  started), whether you opened it, and what came of it (answered, expired, ruled late, still waiting), read from the queue
+  when you look. On the phone, in the cockpit and with `levain ping record`.
 
 ### Changed
 - **Claude Code sessions started in a subfolder are gated too.** Claude Code reads a project's `.claude/settings.json`
@@ -158,6 +174,29 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   instant; an approval saved in that window can be lost.
 - A tool call through the gate from a subfolder was checked by replaying the hooks and by SessionStart in a real
   Claude Code run, not by an authenticated tool call.
+- Someone on your tailnet who sends bad pairing codes fast enough can keep the phone server's per-minute cap full and block
+  short and long pairings alike until they stop (availability only; it never pairs anyone).
+- `levain ping pair` prints a live code, so run it yourself and not through an agent (the code would sit in the agent's
+  transcript for 10 minutes).
+- Capture (adding a new Tray item) is not offered on the phone: the cockpit tiers it above what the phone holds without a
+  signature.
+- Anything that can read your queue directory's `webpush/webpush.db` can send your phones a ping with its own words. The tap
+  opens the real phone page; the words are not trusted for anything.
+- The notification record keeps every ping (it is an append-only record); the phone and the cockpit show the newest 500.
+- Turning pings on from the phone page pairs that phone: it shows up in `levain ping devices` and `levain ping revoke`
+  stops it. A subscription saved before this change with no phone attached is switched off the first time Levain opens
+  its push store; turn pings on again from that phone.
+- A slow push service or network can leave a ping's delivery reading "no answer in time": Levain waits a
+  bounded time and never rewrites that line after.
+- A phone whose browser lost its saved pairing (site data cleared) cannot turn pings on again from the phone link while its
+  old pairing still owns the subscription: `levain ping revoke` that phone, then turn pings on again.
+- A phone whose pings were made for another Levain install (a reinstall, a rotated key) has them switched off when its page
+  opens, and the page says so; turn pings on again. A browser that does not show a subscription's key is not checked: the
+  laptop retires that phone's pings the first time Apple's push service refuses them (other push services' refusals were not measured), and the phone reads "on" until you tap
+  Turn off, then turn on. If Turn off (or Turn off and then on) is tapped within one round trip of the page opening, or the laptop
+  does not answer at that moment, the page may misreport once; the stale entry is retired by the next ping.
+- On an install whose cockpit is governed, the phone takes no writes until the cockpit has run once on the laptop (it keeps
+  the authority log the phone checks); reads work from the start.
 
 ## [0.11.9] — 2026-10-19
 
