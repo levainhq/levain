@@ -114,7 +114,7 @@ _CHILD = (f"import os, subprocess, sys; sys.path.insert(0, {str(Path(dv.__file__
 def test_a_process_that_only_mentions_the_session_does_not_count(ps_only, session):
     ps_only(lines=[f"101 levain consent rule 1 allow --session {session} --agent claude_code",
                    f"102 tail -f /Users/x/.claude/projects/-w/{session}.jsonl",
-                   f"103 vim --session={session} notes about resume {session}"])  # a "resume" with no codex token
+                   f"103 vim --session={session} notes about {session}"])          # the id, never a resume option's value
     assert dv.session_named_running(session) is False
 
 
@@ -214,14 +214,14 @@ def test_r2_a_resume_without_a_session_id_is_indeterminate_and_holds(standin, se
     assert got[0] == "hook" and got[1].startswith("a resume without a session id is running"), got
 
 
-def test_r2_an_id_less_word_in_a_prompt_or_another_tool_does_not_count(ps_only, standin, spawn, session):
+def test_r2_an_id_less_word_in_a_prompt_or_another_tool_does_not_count(ps_only, standin, spawn, session, tmp_path):
     other = str(uuid.uuid4())
     procs = [standin("codex", "exec", "please", "resume", "the", "work"),          # "resume" inside a prompt
              standin("claude", "-p", f"--resume={other}", "--permission-mode", "bypassPermissions", "use", "python",
                      "-c"),
              spawn("python3", "-c", "x", "claude", "-c")]                          # claude is not the program here
     ps_only(pids=[p.pid for p in procs])
-    assert dv.session_named_running(session) is False
+    assert dv.session_named_running(session, str(tmp_path)) is False   # r3 R2: the -c holds only in its cwd
 
 
 def test_r3_an_upper_case_id_counts_for_claude(standin, session):
@@ -243,7 +243,7 @@ def test_r4_attached_short_resume_forms_count(standin, session, form):
     ("codex exec resume --output-schema {o} {s} go", True),    # an option's value is not the selector
     ("codex exec resume --skip-git-repo-check -c k=v {s} go", True),
     ("codex exec resume -o {s} {o} go", False),
-    ("codex resume --last {s}", None),
+    ("codex resume --last {s}", True),                         # r3 R1: a strong form
 ])
 def test_f1_the_codex_selector_is_the_first_positional_word(ps_only, session, line, want):
     ps_only(lines=["301 " + line.format(s=session, o=uuid.uuid4())])
@@ -253,11 +253,11 @@ def test_f1_the_codex_selector_is_the_first_positional_word(ps_only, session, li
 @pytest.mark.parametrize("line, want", [
     ("worker --session-id {s}", False),
     ("worker -r={s}", False),
-    ("worker -r{s}", False),
-    ("worker --resume {s}", False),
-    ("grep claude -c file", False),
-    ("vim claude -c notes", False),
-    ("python3 -c x claude --resume", False),
+    ("worker -r{s}", True),                                    # r3 R1: strong forms need no program
+    ("worker --resume {s}", True),
+    ("grep claude -c file", None),                             # r3 R2: holds (no cwd to compare)
+    ("vim claude -c notes", None),
+    ("python3 -c x claude --resume", None),
     ("/Users/x/.local/share/claude/versions/2.1.304 --resume {s}", True),       # the native install's argv[0]
     ("/Users/x/.local/share/claude/versions/2.1.304 --resume /Users/x/.claude/projects/-w/{s}.jsonl -n seat", True),
     ("/Users/x/.local/share/claude/versions/2.1.304 --resume /Users/x/.claude/projects/-w/{o}.jsonl", False),
@@ -294,3 +294,68 @@ def test_f4_a_continue_holds_only_a_session_of_its_own_directory(ps_only, standi
 def test_f4_a_continue_whose_directory_cannot_be_read_holds(ps_only, session, tmp_path):
     ps_only(lines=["2147483000 claude --continue"])              # no such process: lsof reads no cwd
     assert dv.session_named_running(session, str(tmp_path)) is None
+
+
+# fix r3 (L3 r3, project_memory/1019-seatB/b5/resume_FIX_r3.md): the argv reading fails CLOSED
+
+_SPACED = "/Users/x/Library/Application Support/Claude/claude-code/2.1.304/claude"
+_NATIVE = "/Users/John Doe/.local/share/claude/versions/2.1.304"
+
+
+@pytest.mark.parametrize("line, want", [
+    # R1: the id as a resume option's value counts in any process, with no program check
+    ("env -u ANTHROPIC_API_KEY claude --resume {s}", True),
+    ("nohup claude -r {s}", True),
+    ("caffeinate -i claude --resume={s}", True),
+    ("time nice -n 5 codex exec resume {s} go", True),
+    ("sudo -u phill codex resume --skip-git-repo-check {s}", True),
+    (_SPACED + " --resume {s}", True),
+    ("node --require x /x/lib/node_modules/@anthropic-ai/claude-code/cli.js -r {s}", True),
+    ("worker --resume {s}", True),
+    ("worker -r{s}", True),
+    ("worker --resume=/x/.claude/projects/-w/{s}.jsonl", True),
+    ("notes about resume {s}", True),
+    # R2: the weaker forms count after any word that may be the CLI, with no wrapper list
+    ("env -u ANTHROPIC_API_KEY claude --session-id {s}", True),
+    ("nice -n 5 env -u K claude -r={s}", True),
+    (_SPACED + " --session-id={s}", True),
+    ("node --require x /x/lib/node_modules/@anthropic-ai/claude-code/cli.js --session-id {s}", True),
+    ("env -u ANTHROPIC_API_KEY claude --resume", None),
+    ("caffeinate -i codex resume --last", None),
+    ("time codex exec resume my-name go", None),
+    (_SPACED + " --resume", None),
+    (_NATIVE + " -r my-name", None),
+    ("node --require x /x/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume", None),
+    ("nohup claude -c", None),                                # its cwd cannot be read (pid 501 is synthetic)
+    # still not a resume of the session
+    ("levain consent rule --session {s}", False),
+    ("worker --session-id {s}", False),
+    ("worker -r={s}", False),
+    ("env -u K claude --resume {o} --session {s}", False),
+    ("caffeinate -i codex exec resume {o} look at {s}", False),
+])
+def test_r3_the_argv_reading_fails_closed(ps_only, session, line, want, tmp_path):
+    ps_only(lines=["501 " + line.format(s=session, o=uuid.uuid4())])
+    assert dv.session_named_running(session, str(tmp_path)) is want
+
+
+def test_r3_a_real_wrapped_resume_counts(standin, session):
+    standin("env", "-u", "ANTHROPIC_API_KEY", "claude", "--session-id", session)
+    assert dv.session_named_running(session) is True
+
+
+def test_r3_a_word_claude_in_another_tool_holds_only_on_a_cwd_match(ps_only, spawn, session, tmp_path):
+    proc = spawn("claude", "-c", "file")              # a python process whose args read like `grep claude -c file`
+    ps_only(pids=[proc.pid])
+    assert dv.session_named_running(session, str(tmp_path)) is False
+    assert dv.session_named_running(session, os.getcwd()) is None
+
+
+def test_r3_a_continue_matches_its_directory_whatever_the_case(ps_only, standin, session, tmp_path):
+    here = tmp_path / "Here"
+    here.mkdir()
+    upper = str(here).upper()
+    if not os.path.isdir(upper):
+        pytest.skip("a case-sensitive file system")
+    ps_only(pids=[standin("claude", "-c", cwd=here).pid])
+    assert dv.session_named_running(session, upper) is None
