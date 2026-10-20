@@ -458,9 +458,9 @@ def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
 
 
 def test_capture_turn_pins_entity_kind(tmp_path, monkeypatch):
-    """binding.capture_turn drives vagus_run with an explicit ISOLATED firing on the binding's own
-    entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; spore-438: carried, never
-    looked up)."""
+    """binding.capture_turn captures through capture_completed_turn with an explicit ISOLATED firing
+    on the binding's own entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; spore-438:
+    carried, never looked up). It never goes through vagus_run, which would run the conversation."""
     import levain.firing.openhands.capture as capmod
     from levain.firing.anneal import AnnealEntityFiring
 
@@ -468,8 +468,10 @@ def test_capture_turn_pins_entity_kind(tmp_path, monkeypatch):
     binding = build_entity_agent(ent, _stub_llm())
     seen: dict = {}
     monkeypatch.setattr(
-        capmod, "vagus_run", lambda conv, firing=None, **kw: seen.update(conv=conv, firing=firing, **kw)
+        capmod, "capture_completed_turn",
+        lambda conv, firing, **kw: seen.update(conv=conv, firing=firing, **kw),
     )
+    monkeypatch.setattr(capmod, "vagus_run", lambda *a, **kw: pytest.fail("capture_turn ran the conversation"))
     sentinel_conv = object()
     binding.capture_turn(sentinel_conv, session_id="s1")
     assert seen["conv"] is sentinel_conv

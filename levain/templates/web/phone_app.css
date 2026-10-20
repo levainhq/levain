@@ -67,6 +67,20 @@ button.go { background: var(--accent); color: var(--on-accent); border-color: va
 .pings .btnrow { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
 .pings .btnrow button { flex: 1 1 10rem; }
 
+/* the short code read off this screen and typed into the installed app: large, one line, selectable whole */
+.pings .shortcode { margin: var(--sp-3) 0 var(--sp-2); font: 700 34px/1.15 var(--mono); letter-spacing: 0.08em;
+                    text-align: center; white-space: nowrap; user-select: all; -webkit-user-select: all; }
+
+.pairing { margin: var(--sp-4) 0 0; background: var(--card); border: 1px solid var(--hair); border-top: 2px solid var(--accent);
+           border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); min-width: 0; }
+.pairing h2 { margin: 0 0 var(--sp-2); }
+.pairing .pair-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-top: var(--sp-4); }
+.pairing input { flex: 1 1 9rem; min-width: 0; min-height: var(--hit-min); font: 700 22px/1.2 var(--mono); letter-spacing: 0.06em;
+                 text-transform: uppercase; color: inherit; background: var(--card-2); border: 1px solid var(--hair-2);
+                 border-radius: var(--r-md); padding: 8px 10px; }
+.pairing input::placeholder { color: var(--meta); font-weight: 400; opacity: 0.6; }   /* a hint, never read as a code */
+.pairing .pair-row button { flex: 0 1 6rem; }
+
 .ping .when { font: 12px/1.3 var(--mono); color: var(--meta); }
 .ping .kind { font: 600 11px/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
 .ping .head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; justify-content: space-between; }

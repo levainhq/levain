@@ -139,8 +139,10 @@ Missing ``openhands`` extra, not an initialized entity, a sovereignty refusal, a
 confinement config, a bad ``--model``. Unchanged from ``levain run``'s existing convention."""
 
 EXIT_TURN_FAILED = 3
-"""The turn itself raised. The session is left un-resumable by design: a raised ``run()``
-leaves the SDK conversation in an ERROR state a later turn would resume FROM."""
+"""The turn itself raised, or its ``run()`` returned with the runtime in its error or stuck state
+(the per-run iteration cap, the loop detector). Either way the turn did not complete and nothing
+from it was captured. A later turn calls ``run()`` again, which starts the conversation over from
+that state with a fresh iteration budget: a new turn, checked like any other."""
 
 EXIT_GATED = 4
 """The turn HALTED AT THE EFFERENT GATE with actions awaiting the human (**K3**, ``spore-295``).
@@ -164,9 +166,8 @@ EXIT_TIMEOUT = 5
 
 Its own code, for the same reason :data:`EXIT_GATED` has one: collapsing it into an existing code
 inverts the operator's response. The tempting home is :data:`EXIT_TURN_FAILED` — a timeout does
-arrive as an exception — but ``3`` tells a supervisor *the work raised, the session is
-un-resumable, go read the traceback*, and it is a code that recurs identically on a retry because
-the cause is in the code. A timeout says the opposite: **the ENVIRONMENT stalled** (a hung model
+arrive as an exception — but ``3`` tells a supervisor *the turn failed, go read the error*, and
+it is a code that recurs identically on a retry because the cause is in the code or the task. A timeout says the opposite: **the ENVIRONMENT stalled** (a hung model
 call, a socket with no read timeout), nothing is wrong with the entity or the task, and the next
 scheduled run is free to start and will very likely succeed.
 
@@ -1101,7 +1102,8 @@ class EntitySession:
 
         Never raises for a failed turn: the error is returned in the result, because a driver
         holding a long-lived session (the server) must not lose the session to one bad turn.
-        The conversation IS left un-resumable after an error — see :attr:`EXIT_TURN_FAILED`.
+        A failed turn (raised, or ended in the runtime's error or stuck state) is reported, never
+        resumed silently: see :attr:`EXIT_TURN_FAILED` for what a following turn does.
         """
         if self._closed:
             # A RESULT, not a raise — codex L3, and it caught a real self-contradiction: this
@@ -1290,6 +1292,9 @@ class EntitySession:
                 return self._undeterminable_gate_result(nudged=nudged)
             if status:
                 return self._gated_result(nudged=nudged)
+            failed = self._run_failure()
+            if failed is not None:
+                return self._run_failed_result(failed, nudged=nudged)
 
             if self.with_tools and planned_without_acting(self.conversation.state.events):
                 nudged = True
@@ -1306,6 +1311,9 @@ class EntitySession:
                     return self._undeterminable_gate_result(nudged=nudged)
                 if status:
                     return self._gated_result(nudged=nudged)
+                failed = self._run_failure()
+                if failed is not None:
+                    return self._run_failed_result(failed, nudged=nudged)
 
             # CAPTURE ONLY A COMPLETED TURN — never a gated halt. This is the SAME defect the
             # nudge ordering above already paid for: `vagus_run` keys idempotency on the user
@@ -1318,6 +1326,11 @@ class EntitySession:
             # halts and is never resumed captures NOTHING for that turn. Correct — the turn did
             # not happen. An episode asserting "I ran X" for an action a human refused would be
             # memory recording a fiction.
+            #
+            # `capture_turn` only captures; it never runs the conversation. When it did (through
+            # `vagus_run`), its run reset a run that had ended in ERROR to RUNNING with a fresh
+            # iteration budget, and a halt inside that run was reported as an ungated turn with the
+            # held action listed as work that ran.
             self.binding.capture_turn(self.conversation)
         except TurnTimeout as exc:
             # BEFORE the generic handler. `TurnTimeout` derives from `BaseException` (so the agent
@@ -1469,6 +1482,47 @@ class EntitySession:
         except Exception:  # noqa: BLE001 — unreadable: the stop is taken to have ended the turn
             return True
         return False
+
+    def _run_failure(self) -> str | None:
+        """Why the last ``run()`` ended without completing the turn, or ``None`` if it did not fail.
+
+        The SDK's ``run()`` RETURNS, without raising, when it ends a run in ``error`` (the
+        per-run iteration cap) or ``stuck`` (its loop detector); an exception that escapes the
+        agent's step is re-raised instead and is handled by :meth:`_drive`'s ``except``. A run
+        that returns in either state did not complete the turn: it is reported as failed and not
+        captured, and nothing in this turn runs the conversation again, since a further
+        ``run()`` resets either status to running with a fresh iteration budget. The status is
+        matched by value, so this needs no SDK import.
+
+        An unreadable status is not a failure HERE: in a gated session :meth:`_gate_status` has
+        already ended the turn on it, and an ungated session never needed the status before."""
+        try:
+            status = self.conversation.state.execution_status
+        except Exception:  # noqa: BLE001 — see the docstring: the gate check owns "unreadable"
+            return None
+        value = getattr(status, "value", status)
+        if value not in ("error", "stuck"):
+            return None
+        why = "the runtime's loop detector judged the agent stuck" if value == "stuck" else None
+        try:
+            # With no turn start, a scan of the whole log could quote an EARLIER turn's error.
+            events = list(self.conversation.state.events) if self._turn_start is not None else []
+            for e in reversed(events[self._turn_start or 0:]):
+                if type(e).__name__ == "ConversationErrorEvent":
+                    why = f"{getattr(e, 'code', '')}: {getattr(e, 'detail', '')}".strip(": ")
+                    break
+        except Exception:  # noqa: BLE001 — the reason is a nicety; the status already decided
+            pass
+        return f"the turn ended in the runtime's {value} state ({why or 'no reason recorded'})"
+
+    def _run_failed_result(self, failure: str, *, nudged: bool) -> TurnResult:
+        """A turn whose run ended in the runtime's error or stuck state: failed, nothing captured."""
+        return TurnResult(
+            reply=None,
+            tool_activity=self._activity_after_fault(),
+            error=f"{failure}; it did not complete and nothing from it was captured.",
+            nudged=nudged,
+        )
 
     def _stopped_result(self, *, nudged: bool) -> TurnResult:
         """A turn ended by :meth:`request_stop`: timed out, nothing captured."""

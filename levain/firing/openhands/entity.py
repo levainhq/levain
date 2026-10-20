@@ -75,8 +75,10 @@ class EntityBinding:
     agent: Agent
 
     def capture_turn(self, conversation: object, *, session_id: str | None = None) -> None:
-        """Run + capture a completed turn to THIS binding's entity store (an explicit
-        ``AnnealEntityFiring`` on ``self.entity_dir``).
+        """Capture the completed turn to THIS binding's entity store (an explicit
+        ``AnnealEntityFiring`` on ``self.entity_dir``). Never runs the conversation: the driver
+        runs it and checks the gate and the runtime's status first (``EntitySession._drive``), and a
+        run here would be one nobody checks.
 
         Use this — NOT a bare ``vagus_run(conv)``, whose default ``firing_kind="anneal"`` resolves to
         the laptop flow store ``~/.anneal-memory/`` (the capture WRITE-leak, apparatus F1). The binding
@@ -85,11 +87,11 @@ class EntityBinding:
         is mutated after binding. (A stray bare ``vagus_run`` in an entity process REFUSES rather than
         reach the laptop store — ``anneal._refuse_in_entity_process``; this is the path that works.)"""
         from levain.firing.anneal import AnnealEntityFiring
-        from levain.firing.openhands.capture import vagus_run
+        from levain.firing.openhands.capture import capture_completed_turn
 
         # spore-438: an EXPLICIT firing on this binding's own entity — an entity is carried, never
         # looked up. The firing still re-guards its store per op.
-        vagus_run(
+        capture_completed_turn(
             conversation, AnnealEntityFiring(entity_dir=self.entity_dir), session_id=session_id
         )
 

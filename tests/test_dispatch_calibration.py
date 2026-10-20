@@ -244,8 +244,8 @@ def test_a_judge_that_abstains_on_the_hard_calls_fails_the_coverage_floor():
     assert (r.n_labelled, r.n_predicted, r.abstained) == (80, 30, 50)
     ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
     assert not ok and "answered 30 of 80 labelled requests" in why and "below 1/2" in why
-    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=Fraction(3, 8), max_dangerous=0) == (
-        True, "")
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage=Fraction(3, 8), max_dangerous=10) == (
+        True, "")                                   # its 10 abstentions on his denies count toward max_dangerous
 
 
 def test_min_coverage_is_required_and_validated():
@@ -311,3 +311,251 @@ def test_a_plain_label_list_must_state_whether_it_is_complete():
         agreement(cut, {"1": "allow"})
     with pytest.raises(DispatchError, match="incomplete="):
         deny_rate(cut)
+
+
+# --- F8 slice b: the judge replay -------------------------------------------------------------------------------
+
+from dataclasses import fields  # noqa: E402
+
+from levain.dispatch.calibration import JudgeContext, replay, report  # noqa: E402
+
+
+class Fixed:
+    local = True
+
+    def __init__(self, said):
+        self.said, self.seen = said, []
+
+    def predict(self, context):
+        self.seen.append(context)
+        return self.said
+
+
+def seeded(queue, keys, denies=2, allows=4):
+    reqs = [file_req(queue) for _ in range(denies + allows)]
+    for i, r in enumerate(reqs):
+        decide(queue, keys, r, "deny" if i < denies else "allow")
+    return read_labels(queue.directory, now=at(queue)), reqs
+
+
+def test_the_judge_sees_the_request_and_no_part_of_the_answer(queue, keys):
+    got, reqs = seeded(queue, keys)
+    assert {f.name for f in fields(JudgeContext)} == {"agent", "tool_name", "display", "tier"}
+    judge = Fixed("allow")
+    replay(got, judge)
+    assert len(judge.seen) == 6 and all(type(c) is JudgeContext for c in judge.seen)
+    blob = " ".join(repr(c) for c in judge.seen)
+    for r in reqs:
+        assert r.id not in blob                                          # the id is not shown
+    for word in ("signature", "ruling", "grant", "phone", "denied", "allowed"):
+        assert word not in blob
+    assert judge.seen[0].tool_name == "Edit" and judge.seen[0].tier == "T2" and judge.seen[0].agent == "claude_code"
+    assert "touch /tmp/x" in judge.seen[0].display
+
+
+def test_a_judge_that_raises_is_an_abstain_with_its_class_name(queue, keys):
+    got, _ = seeded(queue, keys)
+
+    class Boom:
+        local = True
+
+        def predict(self, context):
+            raise KeyError("x")
+
+    run = replay(got, Boom())
+    assert set(run.predictions.values()) == {"abstain"} and set(run.raised.values()) == {"KeyError"}
+    assert len(run.raised) == 6
+
+    class Weird(Boom):
+        def predict(self, context):
+            return "maybe"
+
+    assert set(replay(got, Weird()).raised.values()) == {"InvalidPrediction"}
+
+
+def test_a_judge_not_marked_local_is_refused(queue, keys):
+    got, _ = seeded(queue, keys)
+
+    class Remote:
+        local = False
+
+        def predict(self, context):
+            return "allow"
+
+    class Unmarked:
+        def predict(self, context):
+            return "allow"
+
+    for judge in (Remote(), Unmarked()):
+        with pytest.raises(DispatchError, match="local"):
+            replay(got, judge)
+        with pytest.raises(DispatchError, match="local"):
+            report(got, judge, min_n=1, min_agreement=0, min_coverage=0, max_dangerous=0)
+
+
+def test_replay_needs_a_label_set_and_skips_the_undecided(queue, keys):
+    got, _ = seeded(queue, keys, 1, 1)
+    with pytest.raises(DispatchError, match="LabelSet"):
+        replay(list(got.labels), Fixed("allow"))
+    queue_req = file_req(queue)
+    queue.mark_undecided(queue_req.id)
+    both = read_labels(queue.directory, now=NOW + timedelta(minutes=10))
+    assert any(lab.decision == "undecided" for lab in both.labels)
+    judge = Fixed("deny")
+    assert len(replay(both, judge).replayed) == 2 and len(judge.seen) == 2
+
+
+def test_report_end_to_end_on_a_real_queue_with_both_fixture_judges(queue, keys):
+    got, _ = seeded(queue, keys, denies=2, allows=4)
+    kw = dict(min_n=6, min_agreement="0.9", min_coverage=1, max_dangerous=0)
+    allow = report(got, Fixed("allow"), **kw)
+    deny = report(got, Fixed("deny"), **kw)
+    cls = ("claude_code", "Edit", "T2")
+    a, d = allow.classes[cls], deny.classes[cls]
+    assert (a.deny_rate.n, a.deny_rate.denies, a.deny_rate.rate) == (6, 2, Fraction(1, 3))
+    assert a.report.agreement == Fraction(4, 6) == a.report.baseline_agreement      # always-allow IS the baseline
+    assert (a.report.judge_allow_human_deny, d.report.judge_deny_human_allow) == (2, 4)
+    assert d.report.agreement == Fraction(2, 6)
+    assert not a.eligible and "does not beat the always-allow baseline" in a.why_not
+    assert not d.eligible
+    assert allow.caveat == CAVEAT and (allow.replayed, allow.raised, allow.incomplete) == (6, 0, False)
+
+
+def test_a_limit_samples_and_the_report_says_it_is_incomplete(queue, keys):
+    got, _ = seeded(queue, keys)
+    rep = report(got, Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0, max_dangerous=9, limit=3)
+    entry = rep.classes[("claude_code", "Edit", "T2")]
+    assert rep.replayed == 3 and rep.incomplete and entry.report.n_labelled == 3
+    assert not entry.eligible and "incomplete" in entry.why_not
+
+
+# --- F8 slice b, fix round 1 -------------------------------------------------------------------------------------
+
+from levain.dispatch.calibration import Judge, LabelSet  # noqa: E402
+
+
+def test_a_judge_that_abstains_on_his_denies_is_not_eligible():
+    """The L2 probe: 100 labels, the judge answers 85 allows right, catches 1 deny, abstains on 14 of 15 denies."""
+    labels = [L(f"a{i}", A, "allow") for i in range(85)] + [L(f"d{i}", A, "deny") for i in range(15)]
+    preds = {f"a{i}": "allow" for i in range(85)} | {"d0": "deny"}
+    r = agreement(labels, preds, incomplete=False)[A]
+    assert (r.denies, r.denies_answered, r.denies_caught, r.abstained_on_deny) == (15, 1, 1, 14)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.95", min_coverage="0.8", max_dangerous=0)
+    assert not ok and "deny" in why and "1 of 15" in why
+
+
+def test_abstaining_on_a_deny_counts_toward_the_dangerous_ceiling_alone():
+    labels = [L(f"a{i}", A, "allow") for i in range(40)] + [L("d0", A, "deny"), L("d1", A, "deny")]
+    preds = {f"a{i}": "allow" for i in range(40)} | {"d0": "deny"}                  # d1: no prediction
+    r = agreement(labels, preds, incomplete=False)[A]
+    assert (r.denies, r.denies_answered, r.abstained_on_deny) == (2, 1, 1)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=0)
+    assert not ok and "abstained-on-human-deny" in why
+    assert proposal_eligible(r, min_n=30, min_agreement="0.9", min_coverage="0.5", max_dangerous=1)[0] is True
+
+
+def test_a_class_with_no_denies_has_no_deny_coverage_to_fail():
+    labels = [L(f"a{i}", A, "allow") for i in range(5)] + [L("d", A, "deny")]
+    r = agreement(labels[:5], {lab.request_id: "allow" for lab in labels}, incomplete=False)[A]
+    assert r.denies == 0 and r.abstained_on_deny == 0
+
+
+def test_the_same_input_filed_forty_times_is_one_distinct_input():
+    labels = [Label(f"r{i}", A, "allow", "signature", "2026-10-13T20:00:00Z", "same-digest") for i in range(40)]
+    r = agreement(labels, {lab.request_id: "allow" for lab in labels}, incomplete=False)[A]
+    assert (r.n_predicted, r.distinct_inputs) == (40, 1)
+    ok, why = proposal_eligible(r, min_n=30, min_agreement="0.5", min_coverage=0, max_dangerous=0)
+    assert not ok and "distinct inputs" in why and "below min_n=30" in why
+    spread = [Label(f"r{i}", A, "allow", "signature", "2026-10-13T20:00:00Z", f"d{i}") for i in range(40)]
+    r2 = agreement(spread, {lab.request_id: "allow" for lab in spread}, incomplete=False)[A]
+    assert r2.distinct_inputs == 40
+    assert agreement([L("x", A, "allow"), L("y", A, "allow")], {"x": "allow", "y": "allow"},
+                     incomplete=False)[A].distinct_inputs == 2         # no digest read: each request stands alone
+
+
+def test_read_labels_carries_the_input_digest_from_the_real_queue(queue, keys):
+    reqs = [queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit", tool_input={"command": "same"},
+                       cwd="/work/proj", hold=timedelta(minutes=5), tier="T2") for _ in range(2)]
+    reqs.append(file_req(queue))
+    for r in reqs:
+        decide(queue, keys, r, "allow")
+    got = read_labels(queue.directory, now=at(queue))
+    digests = {lab.request_id: lab.input_digest for lab in got.labels}
+    assert all(digests.values()) and digests[reqs[0].id] == digests[reqs[1].id] != digests[reqs[2].id]
+    r = agreement(got, {lab.request_id: "allow" for lab in got.labels})[("claude_code", "Edit", "T2")]
+    assert (r.n_predicted, r.distinct_inputs) == (3, 2)
+
+
+def test_a_cut_display_is_left_out_and_counted(queue, keys):
+    short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
+                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             hold=timedelta(minutes=5), tier="T2")
+    decide(queue, keys, short, "allow")
+    decide(queue, keys, cut, "deny")
+    got = read_labels(queue.directory, now=at(queue))
+    assert [lab.request_id for lab in got.labels] == [short.id] and got.excluded_cut == 1
+    assert cut.id not in got.contexts
+
+
+def test_replay_goes_in_filing_order_not_decision_order():
+    def lab(rid, received, decided):
+        return Label(rid, A, "allow", "signature", decided, f"dg{rid}", received)
+    ctx = {rid: JudgeContext("claude_code", "Edit", f"Edit {{{rid}}}", "T2") for rid in "abc"}
+    got = LabelSet((lab("a", "2026-10-13T10:00:00Z", "2026-10-13T12:00:03Z"),
+                    lab("b", "2026-10-13T11:00:00Z", "2026-10-13T12:00:01Z"),
+                    lab("c", "2026-10-13T12:00:00Z", "2026-10-13T12:00:02Z")), contexts=ctx)
+    assert replay(got, Fixed("allow")).replayed == ("a", "b", "c")
+    assert replay(got, Fixed("allow"), limit=2).replayed == ("a", "b")       # the oldest FILED, whenever answered
+
+
+def test_the_cut_count_is_over_unique_labels():
+    ctx = {"a": JudgeContext("claude_code", "Edit", "Edit {}", "T2")}
+    one = Label("a", A, "allow", "signature", "2026-10-13T12:00:00Z", "d", "2026-10-13T10:00:00Z")
+    rep = report(LabelSet((one, one, one), contexts=ctx), Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0,
+                 max_dangerous=9, limit=1)
+    assert rep.replayed == 1 and rep.incomplete is False                      # nothing was cut: one request, shown
+
+
+def test_the_report_keeps_every_undecided_label_and_undecided_only_classes():
+    ctx = {"a": JudgeContext("claude_code", "Edit", "Edit {}", "T2")}
+    labels = LabelSet((Label("a", A, "allow", "signature", "2026-10-13T12:00:00Z", "d", "2026-10-13T10:00:00Z"),
+                       L("u1", A, "undecided"), L("u2", B, "undecided")), contexts=ctx)
+    rep = report(labels, Fixed("allow"), min_n=1, min_agreement=0, min_coverage=0, max_dangerous=9)
+    assert rep.classes[A].report.undecided == 1 and rep.classes[A].deny_rate.undecided == 1
+    assert B in rep.classes and rep.classes[B].report.undecided == 1 and rep.classes[B].report.n_labelled == 0
+    assert rep.classes[B].eligible is False
+
+
+def test_raised_is_counted_per_class(queue, keys):
+    a, b = file_req(queue, tool="Edit"), file_req(queue, tool="Write")
+    decide(queue, keys, a, "allow")
+    decide(queue, keys, b, "allow")
+
+    class OnBash:
+        local = True
+
+        def predict(self, context):
+            if context.tool_name == "Write":
+                raise ValueError("x")
+            return "allow"
+
+    rep = report(read_labels(queue.directory, now=at(queue)), OnBash(), min_n=1, min_agreement=0, min_coverage=0,
+                 max_dangerous=9)
+    assert rep.classes[("claude_code", "Edit", "T2")].raised == 0
+    assert rep.classes[("claude_code", "Write", "T2")].raised == 1 and rep.raised == 1
+
+
+def test_judge_is_a_plain_protocol_not_a_runtime_check():
+    with pytest.raises(TypeError):
+        isinstance(Fixed("allow"), Judge)
+
+
+def test_the_report_carries_the_cut_count(queue, keys):
+    short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
+                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             hold=timedelta(minutes=5), tier="T2")
+    decide(queue, keys, short, "allow")
+    decide(queue, keys, cut, "deny")
+    got = report(read_labels(queue.directory, now=at(queue)), Fixed("allow"), min_n=1, min_agreement=0,
+                 min_coverage=0, max_dangerous=0)
+    assert got.excluded_cut == 1
