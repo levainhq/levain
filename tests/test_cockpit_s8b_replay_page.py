@@ -165,7 +165,7 @@ def test_the_repaint_signature_carries_the_replay_time(tmp_path, monkeypatch):
     sig = "window.LevainTopologyView.signature(%s, 'work')" % json.dumps(_value())
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": sig}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": sig},
                                {"eval": _scrub(0.6)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"}, {"eval": sig}])
-    assert len({out[1], out[4], out[7]}) == 3, out[1:]                                                       # live, T1, T2 all repaint
+    assert len({out[2], out[5], out[8]}) == 3, out[2:]                                                       # live, T1, T2 all repaint
 
 
 # --- the conflict chip never covers a label --------------------------------------------------------------
@@ -190,3 +190,43 @@ def test_the_conflict_chip_covers_no_group_label_hub_label_or_face(tmp_path, mon
         out = _run(tmp_path, src, [*PRIME, {"eval": _paint(_conflict_value(path, a, b), "agents")}, {"eval": CHIP_PROBE}])
         got = json.loads(out[-1])
         assert got["w"] > 0 and got["labels"] == 0 and got["faces"] == 0, (path, a, b, got)
+
+
+# --- one request per scrub (the server's past read is a full source read: a drag must not fire one per minute crossed) ---
+
+
+def _drag(steps: int) -> str:
+    return ("(() => { const t = document.querySelector('#k7-sessions .tv-rtrack'); const r = t.getBoundingClientRect(); "
+            "const ev = (n, k) => new PointerEvent(n, {bubbles: true, clientX: r.left + r.width * k, clientY: r.top + 5, pointerId: 1}); "
+            "t.dispatchEvent(ev('pointerdown', 0.2)); for (let i = 1; i <= %d; i++) t.dispatchEvent(ev('pointermove', 0.2 + 0.5 * i / %d)); "
+            "t.dispatchEvent(ev('pointerup', 0.7)); return 1; })()") % (steps, steps)
+
+
+@needs_browser
+def test_a_drag_across_many_buckets_issues_one_request_on_release_and_never_an_empty_at(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _drag(60)}, {"until": "document.querySelector('#k7-sessions .tv-rbadge')"},
+                               {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": PROBE}])
+    got = json.loads(out[-1])
+    ats = _ats(got)
+    assert len(ats) == 1 and ats[0], got                                                                      # 60 moves, one read, a real T
+    assert not any(u.endswith("at=") or "at=&" in u for u in got["urls"]), got
+
+
+@needs_browser
+def test_keyboard_steps_coalesce_and_a_newer_read_aborts_the_older_in_flight_one(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    # three quick presses are one read; a slow read superseded by a second scrub is aborted (at most one in flight)
+    slow = ("(() => { const f = window.fetch; window.__aborted = 0; window.__open = 0; window.__max = 0; window.fetch = (u, o) => { "
+            "if (!String(u).includes('at=')) return f(u, o); window.__open++; window.__max = Math.max(window.__max, window.__open); "
+            "return new Promise((res, rej) => { const done = () => { window.__open--; }; "
+            "if (o && o.signal) o.signal.addEventListener('abort', () => { window.__aborted++; done(); rej(new DOMException('x', 'AbortError')); }); "
+            "setTimeout(() => f(u, o).then((r) => { done(); res(r); }, (e) => { done(); rej(e); }), 500); }); }; return 1; })()")
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _key("ArrowLeft")}, {"eval": _key("ArrowLeft")}, {"eval": _key("ArrowLeft")},
+                               {"eval": "new Promise(r => setTimeout(r, 900))"}, {"eval": PROBE},
+                               {"eval": slow}, {"eval": _scrub(0.3)}, {"eval": "new Promise(r => setTimeout(r, 100))"}, {"eval": _scrub(0.5)},
+                               {"until": "!document.querySelector('#k7-sessions .tv-rcap span').textContent.includes('reading')", "ms": 10000},
+                               {"eval": "JSON.stringify([window.__aborted, window.__max])"}])
+    keys = json.loads(out[-7])
+    assert len(_ats(keys)) == 1, keys
+    assert json.loads(out[-1]) == [1, 1], out[-1]                                                             # one aborted, never two in flight

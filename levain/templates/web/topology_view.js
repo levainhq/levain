@@ -567,6 +567,14 @@
   // a conflict is drawn between the first node on the file and each other one, the file's name on a chip on the first arc. The chip sits on
   // the arc where it covers no label, face or node: the middle first, then along the arc each way; with none free, where it covers least.
   const CHIP_AT = [0.5, 0.4, 0.6, 0.3, 0.7, 0.22, 0.78, 0.15, 0.85];
+  const CHIP_OFF = [0, 16, -16, 32, -32];
+  // a long path keeps its tail (the file's own name) on the chip, so a chip stays small enough to sit clear of the labels; the title keeps the whole path
+  function chipText(path, measure) {
+    if (measure(path, "chip") <= 150) return path;
+    let tail = path;
+    while (tail.length > 4 && measure("…" + tail, "chip") > 150) tail = tail.slice(1);
+    return "…" + tail;
+  }
   function conflictArcs(v, L, measure, boxes) {
     const out = [], byId = new Map(arr(v.nodes).map((n) => [n.id, n]));
     const bx = boxes || graphBoxes(v, L, measure);
@@ -583,13 +591,16 @@
         const at = (t) => ({ x: (1 - t) * (1 - t) * A.x + 2 * t * (1 - t) * cx + t * t * B.x, y: (1 - t) * (1 - t) * A.y + 2 * t * (1 - t) * cy + t * t * B.y });
         let lp = at(0.5);
         if (k === 1) {
-          const w = measure(c.path, "chip") + 16;
+          const w = measure(chipText(c.path, measure), "chip") + 16;
           let best = null;
-          for (const t of CHIP_AT) {
-            const p = at(t), r = box(p.x - w / 2, p.y - 10, w, 20);
-            const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0);
-            if (best === null || cost < best.cost) best = { cost, p };
-            if (cost === 0) break;
+          // on the arc first (the mock's place), then just off it either side: the chip still reads as the arc's
+          search: for (const off of CHIP_OFF) {
+            for (const t of CHIP_AT) {
+              const q = at(t), p = { x: q.x + (-dy / ln) * off, y: q.y + (dx / ln) * off }, r = box(p.x - w / 2, p.y - 10, w, 20);
+              const cost = obstacles.reduce((s, o) => s + overlap(r, o, 3), 0);
+              if (best === null || cost < best.cost) best = { cost, p };
+              if (cost === 0) break search;
+            }
           }
           lp = best.p;
         }
@@ -617,9 +628,10 @@
       const g = sv("g", { "data-conflict": a.path, "data-nodes": a.ids.join(",") }, "tv-gconf");
       g.appendChild(sv("path", { d: "M" + num(a.A.x) + " " + num(a.A.y) + " Q" + num(a.cx) + " " + num(a.cy) + " " + num(a.B.x) + " " + num(a.B.y) }, "tv-confline"));
       if (a.chip) {
-        const w = measure(a.path, "chip") + 16;
+        const label = chipText(a.path, measure), w = measure(label, "chip") + 16;
         g.appendChild(sv("rect", { x: num(a.lx - w / 2), y: num(a.ly - 10), width: num(w), height: 20, rx: 6 }, "tv-confchip"));
-        g.appendChild(sv("text", { x: num(a.lx), y: num(a.ly + 4), "text-anchor": "middle" }, "tv-conftext", a.path));
+        g.appendChild(sv("text", { x: num(a.lx), y: num(a.ly + 4), "text-anchor": "middle" }, "tv-conftext", label));
+        if (label !== a.path) g.appendChild(sv("title", null, null, a.path));
       }
       svg.appendChild(g);
     }
