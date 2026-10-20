@@ -135,6 +135,9 @@ class Verdict:
     limits: dict[str, float] = field(default_factory=dict)
     halt: dict[str, Any] | None = None
     reason: str = ""
+    # (newest extensions rowid, newest halts seq) of the root, read in the counting transaction: an Extend or halt past
+    # this mark settled the very crossing this call joined (see :func:`_settled_since`)
+    mark: tuple[int, int] | None = None
 
 
 def session_root(session: str) -> str:
@@ -422,6 +425,10 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
         window, recent, spend, scale = (_loads(row[6], []), _loads(row[7], []), _loads(row[8], {}),
                                         _loads(row[9], {}))
         lim, win = _scaled(in_force, scale)
+        mark = (conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM extensions WHERE agent = ? AND root = ?",
+                             (agent, root)).fetchone()[0],
+                conn.execute("SELECT COALESCE(MAX(seq), 0) FROM halts WHERE agent = ? AND root = ?",
+                             (agent, root)).fetchone()[0])
         if halt is not None:   # a halted root: deny, count nothing (the counts resume where they stopped on Extend)
             return Verdict("halted", kind=halt["kind"], halt=halt,
                            counts=_counts(calls, active_s, fresh, cache_read, window, win), limits=lim)
@@ -459,7 +466,8 @@ def _count(qdir: Path, agent: str, root: str, event: Mapping[str, Any], tool_nam
     counts = _counts(calls, active_s, fresh, cache_read, window, win, digest if counted else None)
     for kind in KINDS:
         if counts[kind] > lim[kind] or (kind == "repeat" and counts[kind] >= lim[kind]):
-            return Verdict("crossed", kind=kind, count=counts[kind], limit=lim[kind], counts=counts, limits=lim)
+            return Verdict("crossed", kind=kind, count=counts[kind], limit=lim[kind], counts=counts, limits=lim,
+                           mark=mark)
     return Verdict("ok", counts=counts, limits=lim)
 
 
@@ -665,14 +673,34 @@ def release_if_extended(queue: Any, agent: str, session: str, *, now: float | No
     return False
 
 
-def _claim(qdir: Path, agent: str, root: str, kind: str, now: float) -> tuple[bool, str | None]:
-    """(this hook files the request, the open request id when another hook already filed it)."""
+def _settled_since(conn: sqlite3.Connection, agent: str, root: str, kind: str,
+                   mark: tuple[int, int] | None) -> str | None:
+    """The request whose Extend or halt of (root, kind) landed after ``mark`` (what the call's count saw), or None.
+    The one hold of (root, kind) is gone once settled, so a crossing that finds no hold must ask this first: the
+    hold it would have joined may have been filed, answered and cleared between its count and its look."""
+    if mark is None:
+        return None
+    row = conn.execute("SELECT request_id FROM extensions WHERE agent = ? AND root = ? AND kind = ? AND rowid > ? "
+                       "ORDER BY rowid LIMIT 1", (agent, root, kind, mark[0])).fetchone()
+    if row is None:
+        row = conn.execute("SELECT request_id FROM halts WHERE agent = ? AND root = ? AND kind = ? AND seq > ? "
+                           "AND request_id IS NOT NULL ORDER BY seq LIMIT 1", (agent, root, kind, mark[1])).fetchone()
+    return row[0] if row else None
+
+
+def _claim(qdir: Path, agent: str, root: str, kind: str, now: float,
+           mark: tuple[int, int] | None = None) -> tuple[bool, str | None]:
+    """(this hook files the request, the open request id when another hook already filed it, or settled it since the
+    call's count saw ``mark``)."""
     with write_transaction(lambda: _connect(qdir)) as conn:
         _ensure(conn)
         row = conn.execute("SELECT request_id, claimed_at FROM holds WHERE agent = ? AND root = ? AND kind = ?",
                            (agent, root, kind)).fetchone()
         if row is not None and (row[0] is not None or now - row[1] < HOLD_STALE):
             return False, row[0]
+        settled = _settled_since(conn, agent, root, kind, mark) if row is None else None
+        if settled is not None:
+            return False, settled
         conn.execute("INSERT OR REPLACE INTO holds (agent, root, kind, request_id, claimed_at) VALUES (?, ?, ?, NULL, ?)",
                      (agent, root, kind, now))
         return True, None
@@ -755,7 +783,7 @@ def _hold(agent: str, queue: Any, qdir: Path, root: str, kind: str, v: Verdict, 
     withdrawn) is filed again."""
     from datetime import timedelta
 
-    filer, request_id = _claim(qdir, agent, root, kind, now())
+    filer, request_id = _claim(qdir, agent, root, kind, now(), v.mark)
     if not filer and request_id is not None:
         held = queue.get(request_id)
         if held is None or held[1] in ("expired", "withdrawn"):
@@ -763,7 +791,7 @@ def _hold(agent: str, queue: Any, qdir: Path, root: str, kind: str, v: Verdict, 
                 _ensure(conn)
                 conn.execute("DELETE FROM holds WHERE agent = ? AND root = ? AND kind = ? AND request_id = ?",
                              (agent, root, kind, request_id))
-            filer, request_id = _claim(qdir, agent, root, kind, now())
+            filer, request_id = _claim(qdir, agent, root, kind, now(), v.mark)
     if filer:
         call = limit_call(agent, root, kind, v.count or 0, v.limit or 0)
         try:
@@ -783,7 +811,7 @@ def _hold(agent: str, queue: Any, qdir: Path, root: str, kind: str, v: Verdict, 
         while request_id is None and waited < JOIN_WAIT:
             sleep(0.2)
             waited += 0.2
-            request_id = _hold_id(qdir, agent, root, kind)
+            request_id = _hold_id(qdir, agent, root, kind, v.mark)
         if request_id is None:
             return Outcome(False, f"levain: this session reached its {LABELS.get(kind, kind)} limit and the operator is "
                                   "being asked; the action was NOT taken. Try it again shortly.")
@@ -846,14 +874,17 @@ def _resolve(agent: str, queue: Any, qdir: Path, root: str, kind: str, request_i
                           "again to ask again.")
 
 
-def _hold_id(qdir: Path, agent: str, root: str, kind: str) -> str | None:
+def _hold_id(qdir: Path, agent: str, root: str, kind: str, mark: tuple[int, int] | None = None) -> str | None:
+    """The open hold's request id; once the hold is gone, the request that settled it since ``mark``."""
     conn = _connect(qdir)
     try:
         row = conn.execute("SELECT request_id FROM holds WHERE agent = ? AND root = ? AND kind = ?",
                            (agent, root, kind)).fetchone()
+        if row is None:
+            return _settled_since(conn, agent, root, kind, mark)
     finally:
         conn.close()
-    return row[0] if row else None
+    return row[0]
 
 
 def _extended(qdir: Path, request_id: str) -> bool:
