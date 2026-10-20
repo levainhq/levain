@@ -16,12 +16,14 @@ Two halves, one module:
 macOS (§8.2): ``launchctl asuser <uid>`` -> the stage (drop + assert -> ``RLIMIT_NPROC`` -> profile guard)
 -> ``sandbox-exec -f <S>/root/profile.sb <target>``, the R-M2 method (``vm/rm2_launch.sh``): sandbox-exec
 compiles and applies the profile, then execs the target, so a profile that fails to apply never reaches the
-target [not run: R-M2 never fed it a failing profile; a 2g row]. The front (§8.2 last sentence): the stage
-alone, no ``asuser``, no profile.
+target [not run: R-M2 never fed it a failing profile; a 2g row]. The vendor's target is the TRAMPOLINE
+(:func:`trampoline_main`), which runs under the applied profile, writes the exec marker and execs the vendor.
+The front (§8.2 last sentence): the stage alone, no ``asuser``, no profile.
 
 Linux (§9): the forked root child joins the session's cgroup, then ``nsenter --net=/run/netns/levain-{e,v}<n>``
--> Levain's bwrap copy, run as root, builds the §9.2 allow-listed root and the per-session mount, IPC, PID
-and UTS namespaces -> the stage (drop + assert) -> the target. That is R-L1's measured view (``vm/n3.sh``:
+-> Levain's bwrap copy, run as root with ``--die-with-parent``, builds the §9.2 allow-listed root and the
+per-session mount, IPC, PID and UTS namespaces -> the stage (drop + assert + ``no_new_privs``) -> the target.
+That is R-L1's measured view (``vm/n3.sh``:
 ro ``/usr`` ``/etc``, ``bin``/``sbin``/``lib`` links into ``/usr``, a fresh ``/proc``, rbind ``/dev`` with a
 fresh ``/dev/shm``, tmpfs, the session dir and the socket dirs) built by bwrap instead of hand mounts.
 
@@ -57,10 +59,18 @@ STAGE_EXIT = 121
 
 #: DECISION: the fd the spec pipe's read end sits on in the stage. Closed before the target's exec.
 SPEC_FD = 3
-#: DECISION: the fd ``start``'s "exec happened" pipe (§5.1 start) sits on through the launch hops: the stage keeps
-#: it, marks it close-on-exec just before it execs the target (so its EOF at the helper = the target's exec) and
-#: writes one byte to it on any refusal (EOF with no byte = exec happened). Never one of the target's fds.
+#: DECISION: the fd ``start``'s exec-marker pipe (§5.1 start) sits on through the launch hops. The LAST hop before
+#: the vendor (Linux: the stage; macOS: the trampoline, under the applied profile) marks it close-on-exec, writes
+#: :data:`EXEC_OK` and execs the vendor; a refusal anywhere, or an execve that fails after the marker, writes
+#: :data:`EXEC_REFUSED`. EOF with no byte = the start failed (the helper never reads EOF as an exec: on Linux
+#: bwrap's monitor holds a copy of the pipe for the vendor's whole life [not run: the reviewers' read of bwrap's
+#: fork; a 2g row]). Never one of the vendor's fds.
 EXEC_FD = 4
+EXEC_OK = b"+"
+EXEC_REFUSED = b"!"
+#: The forwarder's readiness pipe: spawn_target puts it on the same fd as the exec pipe; the forwarder keeps it
+#: and writes :data:`EXEC_OK` once its socket is bound and listening (EOF or :data:`EXEC_REFUSED` = not ready).
+READY_FD = EXEC_FD
 #: DECISION: the front's fixed argv from root (lane F3 b): at most this many strings of at most 4 KiB, no NUL.
 _FRONT_ARGS = 16
 
@@ -69,8 +79,9 @@ ENV_CAP = 64 * 1024
 PROFILE_CAP = 1024 * 1024
 
 TARGETS = ("vendor", "clone", "step", "driver", "forwarder", "front")
-#: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)).
-_ONE_EXTRA_FD = frozenset({"vendor", "front"})
+#: §3.1 step 4: a slot child holds 0, 1, 2 + its pty; the front 0, 1, 2 + its GO pipe (§5.1 render (4)); the
+#: forwarder 0, 1, 2 + its readiness pipe.
+_ONE_EXTRA_FD = frozenset({"vendor", "front", "forwarder"})
 #: Only these targets carry handles or a TERM (§3.2: start adds token + cap at the VENDOR's exec).
 _EXTRA_ENV = frozenset({"vendor", "front"})
 
@@ -294,7 +305,8 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     * ``step``: the ticket's argv, resolved on the env's PATH as the child, cwd ``<S>/repo`` (§5.6 step 2).
     * ``driver``: a template argv (the root interpreter or the import tree), cwd ``<S>/driver``; ``<S>/repo``
       is child 0700, unreadable to it by design (§5.6 step 3).
-    * ``forwarder`` (Linux): Levain's TCP->unix relay, cwd ``<S>/tmp``.
+    * ``forwarder`` (Linux): Levain's TCP->unix relay, cwd ``<S>/tmp``, keeping :data:`READY_FD` (its
+      readiness pipe, ``--ready-fd``); ``keep_fds`` is built here, never the caller's.
     * ``front``: drop + assert only (§8.2 last sentence): no profile, no ``RLIMIT_NPROC`` (V3 is per SLOT),
       no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe). ``argv`` is the front
       module's FIXED arguments, root's (never slot-supplied), appended after the module.
@@ -334,11 +346,12 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     elif target == "forwarder":
         if host != "linux":
             raise Refused("unsupported-host", "the forwarder is Linux's (§9.1); macOS slots dial the front's port")
-        if argv:
-            raise Refused("spec-malformed", "the forwarder builds its own argv")
+        if argv or tuple(keep_fds):
+            raise Refused("spec-malformed", "the forwarder builds its own argv and fds")
         sock = PurePosixPath(str(RUN[host])) / "gw" / f"slot{slot.index}" / "gw.sock"
-        argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock))
-        cwd = S / "tmp"
+        argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock),
+                           "--ready-fd", str(READY_FD))
+        cwd, keep_fds = S / "tmp", (READY_FD,)
     else:   # front
         if len(argv) > _FRONT_ARGS or not all(
                 isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES
@@ -465,7 +478,10 @@ def linux_view_args(slot, session: str, *, kind: str, queue_grant: bool, host_li
     elif kind == "verifier":
         raise Refused("bad-token", "kind verifier runs in a verifier pair")
 
-    args = ["--unshare-ipc", "--unshare-pid", "--unshare-uts",
+    # --die-with-parent: bwrap's sandbox (every process of it, the target included) is SIGKILLed when bwrap or
+    # its parent, the helper, dies, so a helper that dies or kills bwrap never leaves a vendor running past it.
+    # It also bounds the forwarder: it lives until the helper exits, no longer until END [not run: a 2g row].
+    args = ["--die-with-parent", "--unshare-ipc", "--unshare-pid", "--unshare-uts",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
     for p in prefixes:
         pp = PurePosixPath(p)
@@ -822,10 +838,36 @@ def _read_text(path: str) -> str:
         return fh.read()
 
 
+_PR_SET_NO_NEW_PRIVS, _PR_GET_NO_NEW_PRIVS = 38, 39    # <linux/prctl.h>
+
+
+def _linux_prctl(option: int, arg: int) -> int:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.prctl
+    fn.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    fn.restype = ctypes.c_int
+    r = fn(option, arg, 0, 0, 0)
+    if r < 0:
+        raise OSError(ctypes.get_errno(), "prctl")
+    return r
+
+
+def _linux_set_nnp() -> None:
+    _linux_prctl(_PR_SET_NO_NEW_PRIVS, 1)
+
+
+def _linux_get_nnp() -> int:
+    return _linux_prctl(_PR_GET_NO_NEW_PRIVS, 0)
+
+
 @dataclass
 class OsCalls:
-    """Every OS act the stage takes. ``getresuid`` / ``getresgid`` / ``capabilities``: Linux only (macOS has no
-    public ``getresuid``, plan §2f 8: there the drop is PROVED by ``seteuid(0)`` / ``setegid(0)`` failing)."""
+    """Every OS act the stage takes. ``getresuid`` / ``getresgid`` / ``capabilities`` / ``set_nnp`` /
+    ``get_nnp``: Linux only (macOS has no public ``getresuid``, plan §2f 8: there the drop is PROVED by
+    ``seteuid(0)`` / ``setegid(0)`` failing; XNU has no ``no_new_privs``: a setuid binary there is the
+    profile's to refuse)."""
 
     setgroups: Callable = os.setgroups
     setgid: Callable = os.setgid
@@ -842,6 +884,8 @@ class OsCalls:
     getresuid: Optional[Callable] = None
     getresgid: Optional[Callable] = None
     capabilities: Optional[Callable] = None
+    set_nnp: Optional[Callable] = None
+    get_nnp: Optional[Callable] = None
     read_fd: Callable = _read_fd
     read_file: Callable = _read_file
     chdir: Callable = os.chdir
@@ -863,6 +907,7 @@ def real_os_calls() -> OsCalls:
         c.getgroups = _darwin_kernel_groups
     elif sys.platform.startswith("linux"):
         c.getresuid, c.getresgid, c.capabilities = os.getresuid, os.getresgid, _linux_caps
+        c.set_nnp, c.get_nnp = _linux_set_nnp, _linux_get_nnp
     return c
 
 
@@ -977,16 +1022,36 @@ def _close_fds(keep: frozenset, c: OsCalls) -> None:
         raise Refused("fd-off-list", f"still open: {left}")
 
 
+def set_no_new_privs(c: OsCalls) -> None:
+    """Linux: ``prctl(PR_SET_NO_NEW_PRIVS, 1)`` after the drop, then PROVE it reads back 1, so
+    no setuid binary in the view (``/usr`` and ``/etc`` are plain ``--ro-bind``) runs with more than the target
+    holds. A no-op where the host has none (macOS)."""
+    if c.set_nnp is None:
+        return
+    _do("no_new_privs", c.set_nnp)
+    if c.get_nnp() != 1:
+        raise Refused("drop-assert", "no_new_privs does not read back 1")
+
+
+def trampoline_argv(exec_fd: int, argv: Sequence[str]) -> Tuple[str, ...]:
+    """The macOS vendor's target under ``sandbox-exec``: this module's :func:`trampoline_main` from the root
+    import tree, then the vendor's own argv after ``--``."""
+    return module_argv("darwin", "levain.slot.wall", "--exec-fd", str(exec_fd), "--", *argv)
+
+
 def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, err=None) -> int:
-    """The stage, in order: spec -> drop + assert (+ ``RLIMIT_NPROC``) -> the env file -> the profile guard ->
-    cwd -> the target's path -> the fd allowlist -> exec (macOS slot targets: ``sandbox-exec -f <profile>``).
-    Returns :data:`STAGE_EXIT` on any refusal or error, having exec'd nothing; a real ``execve`` never
-    returns."""
+    """The stage, in order: spec -> drop + assert (+ ``RLIMIT_NPROC``, + ``no_new_privs`` on Linux) -> the env
+    file -> the profile guard -> cwd -> the target's path -> the fd allowlist -> exec (macOS slot targets:
+    ``sandbox-exec -f <profile>``). The vendor's exec marker (:data:`EXEC_FD`): with no profile the stage is the
+    last hop, so it writes :data:`EXEC_OK` just before the execve; under a profile the trampoline writes it, so
+    ``+`` means the profile applied. Returns :data:`STAGE_EXIT` on any refusal or error, having exec'd nothing
+    (and written :data:`EXEC_REFUSED`, after a ``+`` too); a real ``execve`` never returns."""
     c = os_calls or real_os_calls()
     spec = None
     try:
         spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
         drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c)
+        set_no_new_privs(c)
         env = parse_env(c.read_file(spec.env_file, ENV_CAP)) if spec.env_file else {}
         for k, v in spec.extra_env:
             if k in env:
@@ -1004,11 +1069,15 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
         c.chdir(spec.cwd)
         path = _resolve(argv[0], env, c) if spec.resolve else argv[0]
         if spec.profile is not None:
-            path, argv = SANDBOX_EXEC, [SANDBOX_EXEC, "-f", spec.profile, path] + argv[1:]
+            target = [path] + argv[1:]
+            if spec.exec_fd is not None:      # the marker is the trampoline's, written under the profile
+                target = list(trampoline_argv(spec.exec_fd, target))
+            path, argv = SANDBOX_EXEC, [SANDBOX_EXEC, "-f", spec.profile] + target
         exec_keep = frozenset() if spec.exec_fd is None else frozenset({spec.exec_fd})
         _close_fds(frozenset({0, 1, 2}) | frozenset(spec.keep_fds) | exec_keep, c)
-        if spec.exec_fd is not None:
-            c.set_inheritable(spec.exec_fd, False)     # closed BY the exec: its EOF is the exec happening
+        if spec.exec_fd is not None and spec.profile is None:
+            c.set_inheritable(spec.exec_fd, False)     # the vendor never holds it
+            c.write_fd(spec.exec_fd, EXEC_OK)          # the last act before the execve
         c.execve(path, argv, env)
     except Refused as e:
         _say(err, f"levain wall: refused {e.name}" + (f": {e.detail}" if e.detail else ""))
@@ -1024,12 +1093,11 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
 
 
 def _exec_failed(spec: Optional[Spec], c: OsCalls) -> None:
-    """One byte on the exec pipe: the helper then reads "no exec", never an EOF it would take for one. A spec
-    that never parsed names no pipe; the stage's exit closes it with no byte (a known edge: the helper reads
-    that as the exec, and the vendor's exit status says STAGE_EXIT)."""
+    """:data:`EXEC_REFUSED` on the exec pipe (after a ``+`` too: an execve that failed). A spec that never parsed
+    names no pipe; the stage's exit then closes it with no byte, which the helper reads as a failed start."""
     if spec is not None and spec.exec_fd is not None:
         try:
-            c.write_fd(spec.exec_fd, b"!")
+            c.write_fd(spec.exec_fd, EXEC_REFUSED)
         except OSError:
             pass
 
@@ -1063,7 +1131,43 @@ def exec_launch(argv: Sequence[str], spec_read_fd: int, *, cgroup: Optional[str]
     c.execve(argv[0], list(argv), {})
 
 
+def trampoline_main(argv: Sequence[str], *, write: Callable = os.write, set_inheritable: Callable = os.set_inheritable,
+                    execve: Callable = os.execve, environ: Optional[Mapping[bytes, bytes]] = None, err=None) -> int:
+    """macOS, the vendor's last hop (``--exec-fd 4 -- <vendor argv>``), run by ``sandbox-exec`` AFTER it applied
+    the profile, as the dropped slot: :data:`EXEC_FD` close-on-exec -> :data:`EXEC_OK` -> execve the vendor with
+    the env it was given (the stage's). A failed execve after the marker writes :data:`EXEC_REFUSED`. A ``+``
+    that cannot be written (the helper is gone) execs nothing. Returns :data:`STAGE_EXIT`; never returns on an
+    exec."""
+    if len(argv) < 4 or argv[0] != "--exec-fd" or argv[1] != str(EXEC_FD) or argv[2] != "--" \
+            or not _abs_path(argv[3]):
+        _say(err, "levain wall: refused bad-token: usage: --exec-fd 4 -- /abs/vendor [args]")
+        if list(argv[:2]) == ["--exec-fd", str(EXEC_FD)]:   # only a pipe the argv names gets the byte
+            try:
+                write(EXEC_FD, EXEC_REFUSED)
+            except OSError:
+                pass
+        return STAGE_EXIT
+    target = [os.fsencode(a) for a in argv[3:]]
+    try:
+        set_inheritable(EXEC_FD, False)
+        write(EXEC_FD, EXEC_OK)
+    except OSError as e:
+        _say(err, f"levain wall: refused stage-error: exec marker errno {e.errno}")
+        return STAGE_EXIT
+    try:
+        execve(target[0], target, os.environb if environ is None else environ)
+    except OSError as e:
+        _say(err, f"levain wall: refused exec-failed: errno {e.errno}")
+    try:
+        write(EXEC_FD, EXEC_REFUSED)
+    except OSError:
+        pass
+    return STAGE_EXIT
+
+
 def main(argv: Sequence[str]) -> int:
+    if argv[:1] == ["--exec-fd"]:
+        return trampoline_main(argv)
     if len(argv) != 2 or argv[0] != "--spec-fd" or not re.fullmatch(r"[3-9]|[1-9][0-9]{1,3}", argv[1]):
         _say(None, "levain wall: refused bad-token: usage: --spec-fd N")
         return STAGE_EXIT
@@ -1074,9 +1178,10 @@ if __name__ == "__main__":
     os._exit(main(sys.argv[1:]))
 
 
-__all__ = ["EXEC_FD", "FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
+__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal",
+           "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
            "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
            "drop_and_assert", "exec_launch", "expected_slot_rules", "launch_spec", "linux_launch_argv",
            "linux_view_args", "macos_egress_ready", "macos_launch_argv", "module_argv", "parse_env", "parse_spec",
            "pf_printed", "principal", "read_host_links", "read_netns_names", "real_os_calls", "require_netns",
-           "stage_argv", "stage_main", "target_account"]
+           "set_no_new_privs", "stage_argv", "stage_main", "target_account", "trampoline_argv", "trampoline_main"]

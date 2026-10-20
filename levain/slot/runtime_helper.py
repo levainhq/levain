@@ -224,17 +224,29 @@ def spawn_front(argv: Sequence[str], spec_json: bytes, go_rfd: int) -> int:
     return pid
 
 
+def _child_refused(marker: Optional[int], write: Callable[[int, bytes], int] = os.write) -> None:
+    """:func:`spawn_target`'s child, failing before its exec: ``!`` on the pipe's fd (None: no pipe)."""
+    if marker is None:
+        return
+    try:
+        write(marker, wall.EXEC_REFUSED)
+    except OSError:
+        pass
+
+
 def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], exec_w: Optional[int],
                  detach: bool) -> int:
     """``start``'s fork through the wall (§5.1 start, §5.4 step 3, §9.1): the child keeps fds 0/1/2 (the helper's
     own stdio, sudo's pty; ``detach``: ``/dev/null`` + ``setsid``, the forwarder), the spec pipe (moved to
-    ``SPEC_FD`` by :func:`wall.exec_launch`) and, when ``exec_w`` is given, the exec pipe's write end on
-    :data:`wall.EXEC_FD`, which the stage closes at its exec of the target (EOF = exec happened) and writes one
-    byte to on any refusal. Every other fd is closed. Only root can run it (a VM row)."""
+    ``SPEC_FD`` by :func:`wall.exec_launch`) and, when ``exec_w`` is given, that pipe's write end on
+    :data:`wall.EXEC_FD`: the vendor's exec marker (the last hop writes ``+`` just before the vendor's execve) or
+    the forwarder's readiness pipe (:data:`wall.READY_FD`, the same fd). Every other fd is closed. A child that
+    fails before its exec writes ``!`` on whichever fd holds the pipe at that moment (``exec_w`` itself until
+    the dup2 onto ``EXEC_FD`` succeeded), so its failure is never only an EOF. Only root can run it (a VM row)."""
     spec_r, spec_w = os.pipe()
     pid = os.fork()
     if pid == 0:   # pragma: no cover - the root child; exercised only in the VM (2g)
-        hi_exec = -1
+        marker = exec_w            # where the refusal byte goes: exec_w until the dup2 below moved it
         try:
             if detach:
                 os.setsid()
@@ -248,16 +260,13 @@ def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], e
             if exec_w is not None:
                 hi_exec = fcntl.fcntl(exec_w, fcntl.F_DUPFD, 32)
                 os.dup2(hi_exec, wall.EXEC_FD)
+                marker = wall.EXEC_FD
                 keep.append(wall.EXEC_FD)
             _close_fds_except(keep)
             wall.exec_launch(argv, hi_spec, cgroup=cgroup)
         except BaseException:   # noqa: BLE001 - the child never returns into the helper's stack
             pass
-        if exec_w is not None:
-            try:
-                os.write(wall.EXEC_FD, b"!")
-            except OSError:
-                pass
+        _child_refused(marker)
         os._exit(70)
     os.close(spec_r)
     try:

@@ -14,15 +14,22 @@ CONTROL checks, never as a fact root acts on.
 2. ``discovery``: a planted §5.5 name under ``CLAUDE_CONFIG_DIR``, ``CODEX_HOME`` or ``HOME`` is refused by name,
    from listings read through dirfds (render's check decides).
 3. ``egress-ready`` (macOS egress): wall's live pf anchor + alias check, refused by its name.
-4. ``repo``: root makes ``<S>/repo`` empty, slot-owned, 0700 (the slot cannot create it in a root-owned ``<S>``).
+4. ``repo``: ``already-started`` when the record is ACTIVE or BRAKED or root's clone marker exists (never the dir's
+   existence), ``not-rendered`` when it is not RENDERED; else root makes ``<S>/repo`` empty (a dir a failed or
+   interrupted clone left is removed first), slot-owned, 0700 (the slot cannot create it in a root-owned ``<S>``).
 5. ``clone``: ``git clone`` from ``<S>/in/repo.bundle`` AS THE SLOT through wall's clone target (the same path as
-   the vendor); a non-zero exit = ``clone-failed``, state unchanged. Success = end's ``mark_cloned``.
-6. ``forwarder`` (Linux egress): the slot's TCP -> ``gw.sock`` relay in the netns, detached (§9.1).
+   the vendor); a non-zero exit = ``clone-failed``, state unchanged and ``<S>/repo`` emptied again, so the start can
+   be retried. Success = end's ``mark_cloned``.
+6. ``forwarder`` (Linux egress): the slot's TCP -> ``gw.sock`` relay in the netns, detached (§9.1); the helper
+   waits (bounded) for its ready byte, written after bind + listen, and refuses ``forwarder-not-ready`` without it.
 7. ``secrets``: ``SECRETS`` from CONTROL (refused ``not-rendered`` unless RENDERED); the handles go ONLY into the
    vendor's extra env, under render's names (§3.2).
-8. ``exec``: the vendor forked through the wall with fds 0, 1, 2 (sudo's pty) and the exec pipe; EOF with no byte =
-   the exec happened.
+8. ``exec``: the vendor forked through the wall with fds 0, 1, 2 (sudo's pty) and the exec pipe; the exec happened
+   only on the POSITIVE marker ``+`` (wall's last hop writes it just before the vendor's execve) with no ``!``
+   after it. EOF, ``!`` or no byte in the bound = ``exec-failed``, never ACTIVE.
 9. ``active``: CAS RENDERED -> ACTIVE; then the helper stays the vendor's parent until it exits: ``{ok, exit}``.
+   A vendor that exec'd but is not recorded ACTIVE is killed with its whole domain (Linux: the session cgroup;
+   macOS: every process of the slot uid), then reaped.
 
 ``teardown`` = END (§7.4): CAS live -> REVOKED, the END driver (end.py) with proc.py's real freeze / kill / proof,
 then SCRUBBED (proc.scrub over every uid of the slot) and the slot's state file back to ``reusable`` (rev + 1, under
@@ -31,6 +38,9 @@ the pool lock). ``{ok, state}``.
 from __future__ import annotations
 
 import os
+import select
+import shutil
+import stat
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +56,18 @@ from levain.slot.runtime_grammar import RenderBlob, RuntimeRequest
 
 _SECRET_CAP = 512                 # DECISION: a handle is opaque printable ASCII up to this many bytes
 _SECRET_KEY = {RD.QUEUE_CAP_ENV: "queue_cap"}   # every other secret env name carries the session token
+
+#: DECISION: the bound on the vendor's first marker byte (macOS: asuser + the stage + sandbox-exec + the
+#: trampoline, two interpreter starts; Linux: nsenter + bwrap + the stage). Past it the start failed and the
+#: domain is killed, in case the vendor would still exec.
+EXEC_MARKER_S = 60.0
+#: DECISION: after ``+``, how long the helper looks for a ``!`` (the vendor's execve failed after the marker)
+#: before it takes the exec as done. An execve fails synchronously, right after the marker; on Linux bwrap's
+#: monitor keeps the pipe open for the vendor's life, so no EOF ever ends this wait early there. A ``!`` later
+#: than this is the residue: ACTIVE is recorded, and the vendor's exit status (wall.STAGE_EXIT) says it never ran.
+EXEC_GRACE_S = 0.25
+#: DECISION: the bound on the forwarder's ready byte (one interpreter start, a bind and a listen, in the netns).
+FORWARDER_READY_S = 10.0
 
 
 # --- small reads ------------------------------------------------------------------------------------------------------
@@ -72,11 +94,16 @@ def _list_dir(ctx: H.Ctx, parts: Sequence[str]) -> List[str]:
 
 def discovery_listings(ctx: H.Ctx, session: str) -> Dict[str, List[str]]:
     """§5.5's three roots as render's check reads them: ``claude`` = ``<S>/config/claude``, ``codex`` =
-    ``<S>/config/codex``, ``home`` = ``<S>`` with ``.config/<name>`` for the nested names."""
+    ``<S>/config/codex``, ``home`` = ``<S>`` with ``.config/<name>`` for the nested names, plus the two XDG dirs
+    the env points the vendors' lookups at (render's ``XDG_CONFIG_HOME`` / ``XDG_DATA_HOME``), as
+    ``xdg/config/<name>`` and ``xdg/data/<name>``."""
     S = ("live", session)
     home = _list_dir(ctx, S)
     if ".config" in home:
         home += [f".config/{n}" for n in _list_dir(ctx, (*S, ".config"))]
+    if "xdg" in home:
+        for sub in ("config", "data"):
+            home += [f"xdg/{sub}/{n}" for n in _list_dir(ctx, (*S, "xdg", sub))]
     return {"claude": _list_dir(ctx, (*S, "config", "claude")), "codex": _list_dir(ctx, (*S, "config", "codex")),
             "home": home}
 
@@ -151,13 +178,61 @@ def secret_env(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
     return out
 
 
-def _read_to_eof(fd: int) -> bytes:
-    out = bytearray()
-    while True:
-        chunk = os.read(fd, 64)
-        if not chunk:
-            return bytes(out)
-        out += chunk
+def _readable(fd: int, bound_s: float) -> bool:
+    return bool(select.select([fd], [], [], max(bound_s, 0.0))[0])
+
+
+def await_exec(fd: int, *, first_s: float, grace_s: float) -> str:
+    """The exec-marker pipe's answer: ``"exec"`` (``+``, then within ``grace_s`` either nothing or EOF),
+    ``"failed"`` (EOF or ``!`` first, or ``+`` followed by any byte: fail closed) or ``"timeout"`` (no byte in
+    ``first_s``). Reads byte by byte, never to EOF (which on Linux comes only when the vendor exits)."""
+    if not _readable(fd, first_s):
+        return "timeout"
+    if os.read(fd, 1) != wall.EXEC_OK:
+        return "failed"
+    if _readable(fd, grace_s) and os.read(fd, 1):
+        return "failed"
+    return "exec"
+
+
+def kill_domain(ctx: H.Ctx, a: R.Alloc) -> bool:
+    """Every process of the session's kill domain, by proc.py's END kill (Linux: ``cgroup.kill`` on alloc's cgroup,
+    proven by ``populated 0``; macOS: SIGKILL sweeps of the slot uid). Never only one pid: on Linux the pid the
+    helper holds is bwrap's monitor, and the vendor is another process in the session's PID namespace."""
+    seams = ctx.seams
+    _, kill, _ = PR.end_seams(seams.host, a.cgroup if seams.host == "linux" else None,
+                              seams.proc_seams)   # type: ignore[arg-type]
+    return kill(a.slot_uid, PR.V12_SECONDS)
+
+
+def _abandon(ctx: H.Ctx, a: R.Alloc, pid: int, what: str) -> None:
+    """A launch the start will not keep: its domain killed, then its pid reaped (``seams.kill``: SIGKILL + waitpid).
+    A failure here is noted, never raised over the refusal the caller is about to raise."""
+    try:
+        if not kill_domain(ctx, a):
+            _note(f"{a.session}: {what}: the kill domain was not proven empty within V12")
+    except Exception as e:   # noqa: BLE001 - the caller's refusal is the answer
+        _note(f"{a.session}: {what}: kill domain failed: {type(e).__name__}")
+    finally:
+        ctx.seams.kill(pid)
+
+
+def _fresh_repo(ctx: H.Ctx, a: R.Alloc, sfd: int) -> None:
+    """``<S>/repo`` empty, slot-owned, 0700: whatever a failed or interrupted clone left there is removed first, by
+    dirfd and never following a link (``<S>`` is root's: the slot can fill ``repo`` but never replace it)."""
+    try:
+        st = os.stat("repo", dir_fd=sfd, follow_symlinks=False)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISDIR(st.st_mode):
+            os.unlink("repo", dir_fd=sfd)
+        elif not shutil.rmtree.avoids_symlink_attacks:
+            raise Refused("repo-not-empty", "this host's rmtree is not fd-based")
+        else:
+            shutil.rmtree("repo", dir_fd=sfd)
+    ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, 0o700, f"live/{a.session}/repo")
+    ctx.seams.fsync(sfd)
 
 
 # --- start (§5.1) ------------------------------------------------------------------------------------------------------
@@ -181,14 +256,15 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.egress_ready(a.slot, H.slot_ids(ctx, a.slot))
 
     seams.at("repo")
+    rec = read_record(ctx, a.session)
+    if E.cloned_path(ctx.store.path, a.session).exists() or (rec is not None and rec.state in (R.ACTIVE, R.BRAKED)):
+        # DECISION: a second start never clones twice. "Started" is what root and CONTROL recorded (ACTIVE or
+        # BRAKED, or root's clone marker: a repo a vendor may already have worked in), never the dir's existence.
+        raise Refused("already-started", a.session)
+    if rec is None or rec.state != R.RENDERED:
+        raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
     with ctx.store.dir("live", a.session) as sfd:
-        try:
-            os.stat("repo", dir_fd=sfd, follow_symlinks=False)
-            raise Refused("already-started", a.session)       # DECISION: a second start never clones twice
-        except FileNotFoundError:
-            pass
-        ctx.store.mkdir(sfd, "repo", a.slot_uid, a.slot_gid, 0o700, f"live/{a.session}/repo")
-        seams.fsync(sfd)
+        _fresh_repo(ctx, a, sfd)
 
     seams.at("clone")
     spec = _spec(ctx, a, "clone")
@@ -197,6 +273,8 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.make_cgroup(cgroup)
     code = seams.wait(seams.spawn(argv, spec.to_json(), cgroup, None, False))
     if code != 0:
+        with ctx.store.dir("live", a.session) as sfd:
+            _fresh_repo(ctx, a, sfd)          # emptied, so the start can be retried
         raise Refused("clone-failed", f"exit {code}")
     E.mark_cloned(ctx.store.path, a.session)
 
@@ -204,7 +282,18 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.at("forwarder")
         spec = _spec(ctx, a, "forwarder")
         argv, cgroup = launch(ctx, a, spec)
-        seams.spawn(argv, spec.to_json(), cgroup, None, True)    # DECISION: lives until END kills the cgroup
+        ready_r, ready_w = os.pipe()
+        try:
+            try:
+                fpid = seams.spawn(argv, spec.to_json(), cgroup, ready_w, True)   # lives until the helper exits
+            finally:
+                os.close(ready_w)
+            ready = _readable(ready_r, FORWARDER_READY_S) and os.read(ready_r, 1) == wall.EXEC_OK
+        finally:
+            os.close(ready_r)
+        if not ready:
+            _abandon(ctx, a, fpid, "forwarder-not-ready")
+            raise Refused("forwarder-not-ready", f"no ready byte within {FORWARDER_READY_S:g}s")
 
     seams.at("secrets")
     handles = secret_env(ctx, a)
@@ -218,11 +307,14 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         try:
             pid = seams.spawn(argv, spec.to_json(), cgroup, exec_w, False)
         finally:
-            os.close(exec_w)       # the child's copy is the only writer left: its exec (or exit) is the EOF
-        failed = _read_to_eof(exec_r)
+            os.close(exec_w)
+        got = await_exec(exec_r, first_s=EXEC_MARKER_S, grace_s=EXEC_GRACE_S)
     finally:
         os.close(exec_r)
-    if failed:
+    if got == "timeout":
+        _abandon(ctx, a, pid, "exec-failed")
+        raise Refused("exec-failed", f"no exec marker within {EXEC_MARKER_S:g}s")
+    if got != "exec":
         code = seams.wait(pid)
         raise Refused("exec-failed", f"exit {code}")
 
@@ -231,9 +323,9 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         gen = H.state_generation(ctx, a.session)
         ctx.call("CAS", session=a.session, generation=gen, **{"from": R.RENDERED, "to": R.ACTIVE}, fields={})
     except BaseException:
-        # DECISION: a vendor that exec'd but is not recorded ACTIVE (the lease died, the record moved, anything
-        # between the exec and the CAS) is killed: it is the helper's own unreaped child, so the pid is its own.
-        seams.kill(pid)
+        # A vendor that exec'd but is not recorded ACTIVE (the lease died, the record moved, anything between the
+        # exec and the CAS) is killed with its whole domain, then its pid reaped.
+        _abandon(ctx, a, pid, "active-refused")
         raise
     seams.at("wait")
     return {"exit": seams.wait(pid)}
@@ -368,5 +460,6 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return {"state": R.RETAINED}
 
 
-__all__ = ["check_discovery", "discovery_listings", "end_facts", "end_seams", "launch", "read_record", "revoke",
+__all__ = ["EXEC_GRACE_S", "EXEC_MARKER_S", "FORWARDER_READY_S", "await_exec", "check_discovery",
+           "discovery_listings", "end_facts", "end_seams", "kill_domain", "launch", "read_record", "revoke",
            "scrub_and_release", "secret_env", "start", "teardown", "vendor_argv"]

@@ -700,7 +700,9 @@ DISCOVERY: Mapping[str, tuple[str, ...]] = {
     "codex": ("config.toml", ".env", "AGENTS.md", "AGENTS.override.md", "hooks.json", "rules", "agents",
               "environments.toml"),
     "home": ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".mcp.json", ".gitconfig", ".config/git",
-             ".config/anthropic", ".agents", ".netrc", ".bash_profile", ".bash_login"),
+             ".config/anthropic", ".agents", ".netrc", ".bash_profile", ".bash_login",
+             # the same two names where the env's XDG_CONFIG_HOME (<S>/xdg/config) sends git's and Claude's lookups
+             "xdg/config/git", "xdg/config/anthropic"),
 }
 #: §5.5: the repo's own names, never refused, listed in the adopt preview.
 REPO_DISCOVERY = (".claude", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".agents")
