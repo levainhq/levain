@@ -930,13 +930,12 @@ def land(store: JobStore, job_id: str, records: Sequence[ArtifactRecord], *,
          rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
          now: str | None = None) -> Landing:
     """F11 §6 for job ``job_id``. ``human`` is ``(payload, signature, authority)`` for (A); ``rules`` returns the
-    active adoption rules and their generation for (B) (``lambda: adoption_rules_at(control_store)``). A MOVED BASE
-    before authorisation fails the job only under an (A) item whose signature verifies (the human named that run and
-    branch); an unverified item or a rule land is refused and the job and its staged refs are kept. ``landing_tier`` has no
+    active adoption rules and their generation for (B) (``lambda: adoption_rules_at(control_store)``). A MOVED BASE before
+    authorisation fails the job only under an (A) item whose signature verifies (the human named that run and branch);
+    an unverified item or a rule land is refused and the job and its staged refs are kept. ``landing_tier`` has no
     default. A verified/recommended job passes the floor and is authorised (the INTENT) before anything moves; an
     authorised job goes straight to :func:`_finish`. A refused signature is a ``refused`` landing; a verifier that
-    cannot run (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`)
-    raise."""
+    cannot run (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise."""
     job = store.get(job_id)
     if job is None:
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")

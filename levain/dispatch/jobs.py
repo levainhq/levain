@@ -28,20 +28,21 @@ writes the same place, compared without case (a case-insensitive disk holds ``A.
 same path, or one an ancestor of the other (``src/sub`` and ``src/sub/deep.py`` cannot both land), so an abandoned
 or runaway planner cannot hold a file past its lease.
 
-By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human
-signed for that result, and only adoption, the human cancel (:meth:`JobStore.cancel_by_human`, whose signed item is
-kept append-only beside the contract signature) or a moved base releases it: a land that finds its branch no longer at
-the base the verifier ran on fails the job (``base_moved``), because the authorised result was judged on that base. The lease protects against a planner that
-abandons a job, and an authorised job is no longer the planner's. A human cancel signed before the job's latest
-human-signed transition (the contract signature, a later authorisation) is refused: a stale cancel never kills a job
-the operator signed for after it.
+By intent, an AUTHORISED job is never swept, even past its expiry, and so keeps holding its write files: a human signed
+for that result, and only adoption, the human cancel (:meth:`JobStore.cancel_by_human`, whose signed item is kept
+append-only beside the contract signature) or a moved base releases it: a land that finds its branch no longer at the
+base the verifier ran on fails the job (``base_moved``), because the authorised result was judged on that base. The
+lease protects against a planner that abandons a job, and an authorised job is no longer the planner's. A human cancel
+signed before the job's latest human-signed transition (the contract signature, a later authorisation) is refused: a
+stale cancel never kills a job the operator signed for after it.
 
 The store is ``<directory>/dispatch.db``, the consent directory by default (:func:`default_dispatch_dir`), in a
 directory that is the operator's alone (0700, refused otherwise). Its tables are append-only (SQL triggers refuse
 UPDATE, DELETE and an INSERT OR REPLACE through every key a table has): a job, its transitions, its one signature, its
-one human cancel, its one human authorisation, the agent that filed it and the store's own metadata are rows written once, and a job's state is its
-latest transition. Every connection the store opens turns foreign keys on. At creation the store draws a random
-``store_id``, which every contract signature binds, so a signature made for a job in one store is refused by another.
+one human cancel, its one human authorisation, the agent that filed it and the store's own metadata are rows written
+once, and a job's state is its latest transition. Every connection the store opens turns foreign keys on. At creation
+the store draws a random ``store_id``, which every contract signature binds, so a signature made for a job in one store
+is refused by another.
 
 Signature checks tell a refusal from a fault by class: a signature or cancel that is not the operator's is a
 :class:`SignatureRefused`; an authority log that cannot be read (a database or file error) or a verifier that cannot
