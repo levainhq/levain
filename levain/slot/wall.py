@@ -334,7 +334,8 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
 
     slot_target = target != "front"
     if env_file is None and target in ("vendor", "clone", "step", "driver"):
-        env_file = str(root_layer / "env")
+        # A verifier renders two env files (§3.4: the driver's HOME is <S>/driver, the child's <S>).
+        env_file = str(root_layer / ("driver.env" if target == "driver" else "env"))
     if env_file is not None and (target in ("front", "forwarder") or not _under(env_file, root_layer)):
         raise Refused("view-path-off-list", f"env file {env_file!r} is not in {root_layer}")
     if host == "darwin" and slot_target:

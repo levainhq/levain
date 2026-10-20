@@ -236,7 +236,9 @@ def test_launch_spec_paths_derived_from_session(darwin):
     assert "tok" not in " ".join(wall.macos_launch_argv(sp))          # a handle never rides argv (§3.2)
     assert spec("darwin", "clone").argv == ("/usr/bin/git", "-c", "core.hooksPath=/dev/null", "clone", "--template=",
                                             S["darwin"] + "/in/repo.bundle", S["darwin"] + "/repo")
-    assert spec("darwin", "driver", V0).cwd == S["darwin"] + "/driver"
+    drv = spec("darwin", "driver", V0)
+    assert drv.cwd == S["darwin"] + "/driver" and drv.env_file == S["darwin"] + "/root/driver.env"
+    assert spec("darwin", "step", V0).env_file == S["darwin"] + "/root/env"
     assert spec("darwin", "step", V0).resolve
     fw = spec("linux", "forwarder")
     assert fw.argv[-4:] == ("--port", "47100", "--unix", "/run/levain/gw/slot0/gw.sock")
