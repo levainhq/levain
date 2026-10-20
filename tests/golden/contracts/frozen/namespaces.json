@@ -72,6 +72,11 @@
    "namespace": "levain-dispatch-cancel",
    "status": "reserved",
    "owner": "levain/dispatch/sign.py"
+  },
+  {
+   "namespace": "levain-dispatch-config",
+   "status": "reserved",
+   "owner": "levain/dispatch/control.py"
   }
  ],
  "families": [

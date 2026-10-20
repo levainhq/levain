@@ -85,6 +85,8 @@ def _record(args: argparse.Namespace) -> int:
     for p in pings:
         deliveries = ", ".join(f"sub {d['subscription_id']}: {_said(d['status'])}" for d in p["deliveries"]) \
             or "no subscription"
+        if p.get("command") is not None:
+            deliveries += "; notify command " + ("started" if p["command"] else "did not start")
         opened = f"opened {p['opens'][0]['at']}" if p["opens"] else "not opened"
         print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}; "
               f"{p['outcome']['words']}")

@@ -801,7 +801,10 @@ def _notifications() -> Callable[[ReadContext], Result]:
                 sent = ", ".join("no answer in time" if d["status"] < 0 else str(d["status"]) if d["status"] else
                                  "no answer" for d in p.get("deliveries") or ()) or "no phone"
                 opened = f"opened {len(p['opens'])}x" if p.get("opens") else "not opened"
-                meta = f"{p['at']} · {p['kind']} · push {sent} · {opened} · {outcome.get('words', 'outcome not read')}"
+                command = "" if p.get("command") is None else (
+                    " · notify command started" if p["command"] else " · notify command did not start")
+                meta = (f"{p['at']} · {p['kind']} · push {sent}{command} · {opened} · "
+                        f"{outcome.get('words', 'outcome not read')}")
                 rows.append(RowIn(id=f"ping:{p['id']}", title=p["title"], body=p.get("body") or None,
                                   facets={"at": p["at"], "legacy_meta": meta},
                                   stored={"at": p["at"], "kind": p["kind"], "ref": p.get("ref"), "sent": sent,

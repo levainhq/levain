@@ -2,9 +2,11 @@
 operator's.
 
 A planner files a contract (``file``) and gets the job's capability once; the door keeps it in the planner session's
-own record (:mod:`levain.dispatch.capability`) so a restarted session can still ``recommend`` or ``cancel``. A
-``--session`` that is not the session the agent's own environment names is refused: a planner reaches another
-session's job only by holding its capability (``--capability``). The operator reads a job RESOLVED as a signer sees
+own record (:mod:`levain.dispatch.capability`) so a restarted session can still ``recommend`` or ``cancel``. The
+planner's agent and session are DETECTED first (the ancestor process, else the agent's environment), never read from
+the flags: under a detected agent an ``--agent`` or ``--session`` that is not what was detected is refused, and the
+flags stand only when no agent is detected. A planner reaches another session's job only by holding its capability
+(``--capability``). A session record that cannot be kept stops the filing before it is made. The operator reads a job RESOLVED as a signer sees
 it (``show``), and signs its digest (``sign``) or cancels it (``cancel``) with an enrolled laptop key, after reading
 the same view, then a fixed-height summary right above the y/N prompt (so the view cannot have scrolled the point
 away), and answering y/N on a terminal. ``cancel`` acts as the PLANNER when the caller's session record holds the
@@ -44,7 +46,7 @@ import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from levain.authority import VerifierUnavailable
 from levain.dispatch import ContractRefused, DispatchError
@@ -106,16 +108,24 @@ def _safe(text: object) -> str:
 
 # --- the planner's identity and capability ----------------------------------------------------------------------------
 
-def agent_caller() -> str | None:
-    """The agent this process runs under (``claude_code`` / ``codex``): the nearest ``claude`` or ``codex``
-    ancestor, else the agent's own environment, as ``levain ask`` tells them; ``None`` when it is neither. An intent
-    check (see the module docstring), never a boundary."""
+def _detected() -> tuple[str | None, str | None]:
+    """The agent this process runs under and its session, told with no flag: the nearest ``claude`` or ``codex``
+    ancestor, else the agent's own environment, as ``levain ask`` tells them; ``None`` for what cannot be told."""
+    from levain.consent.band import NO_SESSION as BAND_NO_SESSION
     from levain.consent.band import _agent_and_session
 
     try:
-        return _agent_and_session(None, None)[0]
+        # no flag goes in: a supplied agent would stand in for the ancestor and the environment
+        agent, session = _agent_and_session(None, None)
     except ValueError:
-        return None
+        return None, None
+    return agent, None if session == BAND_NO_SESSION else session
+
+
+def agent_caller() -> str | None:
+    """The agent this process runs under (``claude_code`` / ``codex``), as :func:`_detected` tells it; ``None`` when
+    it is neither. An intent check (see the module docstring), never a boundary."""
+    return _detected()[0]
 
 
 def _refuse_an_agent(verb: str) -> None:
@@ -127,20 +137,33 @@ def _refuse_an_agent(verb: str) -> None:
 
 
 def planner_session(agent: str | None, session: str | None) -> tuple[str | None, str]:
-    """The planner's agent and session: the flags, else the agent's own environment, as ``levain ask`` reads them;
-    ``(None, NO_SESSION)`` when no agent can be told. A ``session`` that is not the one the environment names (when
-    it names one) is refused: another session's job is reached by its capability, never by naming the session."""
-    from levain.consent.band import NO_SESSION as BAND_NO_SESSION
+    """The planner's agent and session. Detection (:func:`_detected`) comes first and never reads the flags; once
+    an agent is detected, an ``agent`` or ``session`` flag that is not what was detected is refused (a session the
+    environment does not name included): another session's job is reached by its capability, never by naming the
+    agent or the session. The flags stand only when no agent is detected; ``(None, NO_SESSION)`` when there is
+    none either way."""
     from levain.consent.band import _agent_and_session
 
-    try:
-        agent, detected = _agent_and_session(agent, None)
-    except ValueError:
-        return None, caps.NO_SESSION
-    if session is not None and detected != BAND_NO_SESSION and session != detected:
-        raise InputRefused(f"--session {_safe(session)[:80]!r} is not this session ({_safe(detected)[:80]!r}, from "
-                           f"{agent}'s environment); a job filed in another session is reached with --capability")
-    session = detected if session is None else session
+    detected_agent, detected_session = _detected()
+    if detected_agent is None:
+        if agent is None:
+            return None, caps.NO_SESSION
+        try:
+            agent = _agent_and_session(agent, None)[0]    # the flag's own check: one of the known agents
+        except ValueError as exc:
+            raise InputRefused(str(exc)) from None
+    else:
+        if agent is not None and agent != detected_agent:
+            raise InputRefused(f"--agent {_safe(agent)[:40]!r} is not the agent this process runs under "
+                               f"({detected_agent}, from its process or environment); a job filed by another agent "
+                               "is reached with --capability")
+        if session is not None and session != detected_session:
+            shown = "none" if detected_session is None else repr(_safe(detected_session)[:80])
+            raise InputRefused(f"--session {_safe(session)[:80]!r} is not this session ({shown}, from "
+                               f"{detected_agent}'s environment); a job filed in another session is reached with "
+                               "--capability")
+        agent, session = detected_agent, detected_session
+    session = caps.NO_SESSION if session is None else session
     return agent, session if caps.session_problem(session) is None else caps.NO_SESSION
 
 
@@ -149,11 +172,23 @@ def file_job(store: JobStore, submission: Any, *, agent: str | None, session: st
              ) -> tuple[Job, str | None, str]:
     """File ``submission`` for the planner ``agent``/``session`` and keep its capability in that session's record;
     returns the job, its capability (``None`` on an idempotent replay) and one sentence on where the capability is
-    kept. ``resolved`` is (template resolver, policy), :func:`resolvers` when not given."""
+    kept. ``resolved`` is (template resolver, policy), :func:`resolvers` when not given.
+
+    The session's record is checked before the filing (:func:`levain.dispatch.capability.preflight`): a record that
+    cannot be kept for a reason already on disk is a fault on this machine, and nothing is filed. A record that
+    still fails after the filing does not undo it: the job IS filed, so the capability is shown this once with
+    "NOT kept" and the call succeeds; a retry with the same ``idem_key`` is the idempotent replay, which files
+    nothing new."""
     resolved = resolved if resolved is not None else resolvers()
     if resolved is None:
         raise ContractRefused(NO_REGISTRY)
     resolve_template, policy = resolved
+    if agent is not None:
+        try:
+            caps.preflight(store.directory, agent, session)
+        except (caps.CapabilityRecordError, OSError) as exc:
+            raise caps.CapabilityRecordError(f"this session's capability record cannot be kept ({exc}); nothing "
+                                             "was filed") from exc
     job, capability = store.file(submission, resolve_template=resolve_template, policy=policy,
                                  filer_session=session, idem_key=idem_key, filer_agent=agent)
     if capability is None:
@@ -367,26 +402,46 @@ def _signature(sign: Callable[[bytes], str], payload: dict[str, str]) -> str:
         raise InputRefused(str(exc)) from None
 
 
-def _not_done(store: JobStore, job: Job, verb: str) -> str:
-    """What a faulted ``sign`` / ``cancel`` did NOT do, with the job's state read again when the store answers."""
+_UNKNOWN = "state unknown: the store could not be read"
+_T = TypeVar("_T")
+
+
+def _not_done(store: JobStore, job_id: str, last: Job | None, verb: str) -> str:
+    """What a faulted ``sign`` / ``cancel`` of ``job_id`` did NOT do, with the job's state read again when the store
+    answers; ``last`` is the job as this call last read it, ``None`` when it never could."""
     try:
-        now = store.get(job.id)
+        now = store.get(job_id)
     except (*_FAULTS, DispatchError):
         now = None
-    state = now.state if now is not None else f"{job.state} when last read"
+    shown = _safe(job_id)[:40]
+    if now is None and last is None:
+        if verb == "sign":
+            return f"nothing was signed; job {shown} is unchanged ({_UNKNOWN})"
+        return f"job {shown} is NOT cancelled; its state is unknown: the store could not be read"
+    if now is not None and last is not None and now.state != last.state:
+        # the job moved: the fault may have come after this call's own write committed, so who moved it is not known
+        return f"job {shown} is now {now.state} (was {last.state}); the store faulted, so whether this call made that " \
+               "change is not known: read it with `levain dispatch show`"
+    state = now.state if now is not None else f"{last.state} when last read"
     if verb == "sign":
-        return f"nothing was signed; job {job.id} is " + ("unchanged " if now is None or now.state == job.state
-                                                           else "") + f"({state})"
+        return f"nothing was signed; job {shown} is unchanged ({state})"
     if now is not None and now.state in TERMINAL:
-        return f"this call cancelled nothing; job {job.id} is {now.state}"
-    return f"job {job.id} is NOT cancelled; it is still {state} and holds its files"
+        if last is None:
+            # never read before the fault, so whether this call's own write made it terminal is not known
+            return f"job {shown} is {now.state}; the store faulted, so whether this call made that change is not " \
+                   "known: read it with `levain dispatch show`"
+        return f"this call cancelled nothing; job {shown} is {now.state}"
+    return f"job {shown} is NOT cancelled; it is still {state} and holds its files"
 
 
-def _guarded(store: JobStore, job: Job, verb: str, act: Callable[[], Job]) -> Job:
+def _guarded(store: JobStore, job_id: str, verb: str, act: Callable[[dict[str, Job]], _T]) -> _T:
+    """``act(seen)`` with every machine fault it raises, the first store read included, said as what ``verb`` did
+    NOT do to ``job_id``; ``act`` puts the job in ``seen["job"]`` once it has read it."""
+    seen: dict[str, Job] = {}
     try:
-        return act()
+        return act(seen)
     except _FAULTS as exc:
-        raise _NotDone(exc, _not_done(store, job, verb)) from exc
+        raise _NotDone(exc, _not_done(store, job_id, seen.get("job"), verb)) from exc
 
 
 def _show_first(args: argparse.Namespace, job: Job, out: Any) -> None:
@@ -394,24 +449,22 @@ def _show_first(args: argparse.Namespace, job: Job, out: Any) -> None:
     print(render(job), file=sys.stderr if args.json else out, flush=True)
 
 
-def _signed_cancel(args: argparse.Namespace, store: JobStore, job: Job, out: Any) -> Job:
+def _signed_cancel(args: argparse.Namespace, store: JobStore, seen: dict[str, Job], out: Any) -> Job:
+    """The operator's signed cancel of ``args.job``; runs inside the cancel's :func:`_guarded`."""
     _refuse_an_agent("cancel")
     problem = dsign.reason_problem(args.reason)
     if problem is not None:
         raise InputRefused(problem)
+    job = seen["job"] = _must_get(store, args.job)
     if job.state in TERMINAL:
         raise TransitionRefused(f"job {job.id} is {job.state}, which is final; only a live job can be cancelled")
     _show_first(args, job, out)
-
-    def act() -> Job:
-        signer_fp, sign = _signer(args, dsign.DISPATCH_CANCEL_NAMESPACE, "the operator's signed cancel")
-        authority = _authority(args, store)
-        payload = dsign.cancel_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc),
-                                       reason=args.reason)
-        _confirm(args, job, "cancel", out)
-        return store.cancel_by_human(job.id, payload, _signature(sign, payload), authority)
-
-    return _guarded(store, job, "cancel", act)
+    signer_fp, sign = _signer(args, dsign.DISPATCH_CANCEL_NAMESPACE, "the operator's signed cancel")
+    authority = _authority(args, store)
+    payload = dsign.cancel_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc),
+                                   reason=args.reason)
+    _confirm(args, job, "cancel", out)
+    return store.cancel_by_human(job.id, payload, _signature(sign, payload), authority)
 
 
 def _run(args: argparse.Namespace, out: Any) -> int:
@@ -450,54 +503,62 @@ def _run(args: argparse.Namespace, out: Any) -> int:
         return EXIT_OK
     if cmd == "sign":
         _refuse_an_agent("sign")
-        job = _must_get(store, args.job)
-        if job.state != "filed":
-            raise SignatureRefused(f"job {job.id} is {job.state}; only a filed job can be signed")
-        _show_first(args, job, out)
 
-        def act() -> Job:
+        def sign_it(seen: dict[str, Job]) -> Job:
+            job = seen["job"] = _must_get(store, args.job)
+            if job.state != "filed":
+                raise SignatureRefused(f"job {job.id} is {job.state}; only a filed job can be signed")
+            _show_first(args, job, out)
             signer_fp, sign = _signer(args, dsign.DISPATCH_SIGN_NAMESPACE, "signing")
             authority = _authority(args, store)
             payload = dsign.sign_payload(job, signer_fp=signer_fp, signed_at=datetime.now(timezone.utc))
             _confirm(args, job, "sign", out)
             return store.sign(job.id, payload, _signature(sign, payload), authority)
 
-        job = _guarded(store, job, "sign", act)
+        job = _guarded(store, args.job, "sign", sign_it)
         emit({"id": job.id, "state": job.state, "signer_fp": job.signer_fp, "lease_end": job.lease_end},
              f"levain dispatch: signed job {job.id} as {job.signer_fp}; it is {job.state} until {job.lease_end}.")
         return EXIT_OK
-    if cmd in ("cancel", "recommend"):
+    if cmd == "recommend":
         agent, session = planner_session(args.agent, args.session)
-        cap = None if getattr(args, "human", False) else planner_capability(
-            store.directory, agent, session, args.job, args.capability)
-        if cmd == "recommend":
-            if cap is None:
-                raise CapabilityRefused("recommend is the filing planner's alone: this session's record holds no "
-                                        f"capability for {str(args.job)[:40]!r}; pass --capability")
-            job = store.recommend(args.job, cap)
-            emit({"id": job.id, "state": job.state, "as": "planner"},
-                 f"levain dispatch: job {job.id} is recommended (advisory: it authorises nothing).")
-            return EXIT_OK
-        if cap is not None:
-            try:
-                job = store.cancel_by_planner(args.job, cap)
-            except TransitionRefused as exc:
-                now = store.get(args.job)
-                if now is None or now.state != "authorised":
-                    raise
-                raise TransitionRefused(f"{exc}. The planner may cancel only before a human authorises; the "
-                                        "operator can still cancel it, signed: `levain dispatch cancel --human`") \
-                    from None
+        cap = planner_capability(store.directory, agent, session, args.job, args.capability)
+        if cap is None:
+            raise CapabilityRefused("recommend is the filing planner's alone: this session's record holds no "
+                                    f"capability for {str(args.job)[:40]!r}; pass --capability")
+        job = store.recommend(args.job, cap)
+        emit({"id": job.id, "state": job.state, "as": "planner"},
+             f"levain dispatch: job {job.id} is recommended (advisory: it authorises nothing).")
+        return EXIT_OK
+    if cmd == "cancel":
+        agent, session = planner_session(args.agent, args.session)
+
+        def cancel_it(seen: dict[str, Job]) -> tuple[Job, str]:
+            # every read from here on, the capability record's included, is inside the guard
+            cap = None if args.human else planner_capability(store.directory, agent, session, args.job,
+                                                             args.capability)
+            if cap is not None:
+                try:
+                    return store.cancel_by_planner(args.job, cap), "planner"
+                except TransitionRefused as exc:
+                    now = store.get(args.job)
+                    if now is None or now.state != "authorised":
+                        raise
+                    raise TransitionRefused(f"{exc}. The planner may cancel only before a human authorises; the "
+                                            "operator can still cancel it, signed: `levain dispatch cancel --human`") \
+                        from None
+            if args.capability is None and not args.human:
+                print(f"levain dispatch: no capability for job {_safe(args.job)[:40]} in this session's record "
+                      f"({agent or 'no agent'}, "
+                      f"{'no session' if session == caps.NO_SESSION else _safe(session)[:80]}); cancelling as the "
+                      "operator, signed.",
+                      file=sys.stderr if args.json else out, flush=True)
+            return _signed_cancel(args, store, seen, out), "human"
+
+        job, by = _guarded(store, args.job, "cancel", cancel_it)
+        if by == "planner":
             emit({"id": job.id, "state": job.state, "as": "planner"},
                  f"levain dispatch: cancelled job {job.id} as the PLANNER (its capability).")
             return EXIT_OK
-        if args.capability is None and not args.human:
-            print(f"levain dispatch: no capability for job {_safe(args.job)[:40]} in this session's record "
-                  f"({agent or 'no agent'}, "
-                  f"{'no session' if session == caps.NO_SESSION else _safe(session)[:80]}); cancelling as the "
-                  "operator, signed.",
-                  file=sys.stderr if args.json else out, flush=True)
-        job = _signed_cancel(args, store, _must_get(store, args.job), out)
         emit({"id": job.id, "state": job.state, "as": "human", "signer_fp": json.loads(job.history[-1].evidence)
               ["signer_fp"]},
              f"levain dispatch: cancelled job {job.id} as the HUMAN (signed); it holds none of its files now.")
@@ -541,8 +602,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     def planner(p: argparse.ArgumentParser) -> None:
         p.add_argument("--agent", default=None, choices=caps.AGENTS,
-                       help="The planner agent (default: read from the agent's environment).")
-        p.add_argument("--session", default=None, help="The planner session (default: from the agent's environment).")
+                       help="The planner agent, when none is detected (under a detected agent it must match).")
+        p.add_argument("--session", default=None,
+                       help="The planner session, when no agent is detected (under a detected agent it must match).")
 
     def signer(p: argparse.ArgumentParser) -> None:
         p.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
