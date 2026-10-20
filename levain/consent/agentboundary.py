@@ -614,14 +614,18 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
             approver: dict[str, str] = {"id": f"ssh-key:{refused.signer_fp}"}
             if operator:
                 approver["role"] = "operator"
-            approval = {"approver": approver, "approved_at": refused.signed_at,
+            # the signer's claimed time, capped at levain's refusal of it: a refused answer's signed_at is not bounded
+            # by the queue, and evidence is never later than the refusal it is the evidence of
+            claimed = parse_stamp(refused.signed_at) <= parse_stamp(refused.refused_at)
+            approval = {"approver": approver, "approved_at": refused.signed_at if claimed else refused.refused_at,
                         "context": json.dumps({"queue": queue_id, "request_id": row.request_id,
                                                "via": "refused-answer", "refused": True, "kind": refused.kind,
                                                "enrolled": refused.enrolled == 1,
                                                "compromised": refused.subreason == "compromised",
                                                "subreason": refused.subreason, "levain_reason": refused.detail},
                                               sort_keys=True, separators=(",", ":"))}
-            prov.update({"approval.approver.id": "inferred", "approval.approved_at": "inferred",
+            prov.update({"approval.approver.id": "inferred",
+                         "approval.approved_at": "inferred" if claimed else "synthesized",
                          "approval.context": "inferred"})
             if operator:
                 prov["approval.approver.role"] = "synthesized"
@@ -659,10 +663,11 @@ def _map(queue_id: str, row: _Row, outcome: tuple[str, str, str] | None, evidenc
     if _stamp(completed, "execution time", seq) > _stamp(created, "stamp", seq):
         issued = completed
         prov["issued_at"] = "inferred"
-    # ... and of the refused answer it records, kept after the hold lapsed (a late one), so the evidence a receipt
-    # carries is never later than the receipt
+    # ... and of the refused answer it records when that refusal is later (a late one): the action stayed blocked
+    # through levain's refusal of it, so the block's time moves with the receipt's and completed_at never precedes
+    # issued_at (the spec's LEVEL_4_COMPLETED_BEFORE_ISSUED); the evidence is never later than the receipt
     if approval is not None and refused is not None and parse_stamp(refused.refused_at) > _stamp(issued, "stamp", seq):
-        issued = refused.refused_at
+        issued = completed = refused.refused_at
         prov["issued_at"] = "inferred"
     receipt: dict[str, Any] = {
         "version": AB_VERSION,

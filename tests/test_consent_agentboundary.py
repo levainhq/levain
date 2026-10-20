@@ -859,9 +859,9 @@ def _file(queue, command="x"):
                       cwd="/w", hold=HOLD, tier="T2")
 
 
-def _attempt(queue, request, key, decision="allow"):
+def _attempt(queue, request, key, decision="allow", **override):
     from levain.consent import AnswerRefused
-    payload, sig = signed(queue, request, key, decision)
+    payload, sig = signed(queue, request, key, decision, **override)
     with pytest.raises(AnswerRefused):
         queue.answer(request.id, payload, sig)
     return payload
@@ -930,7 +930,10 @@ def test_an_authorised_answer_after_the_hold_keeps_expired_and_carries_the_stale
     assert (kept["reason_code"], kept["subreason"], kept["enrolled"]) == ("approval-window-elapsed", "late", True)
     r, exported = _expired_receipt(queue, clock.now + timedelta(days=2))
     assert r["refusal"] == {"verdict": "expired", "reason_code": "approval-window-elapsed"}
-    assert r["execution"]["status"] == "blocked" and r["execution"]["completed_at"] == expired_at
+    # the action stayed blocked through levain's refusal of the late answer: that refusal is the block's time, so
+    # completed_at never precedes issued_at (the spec's LEVEL_4_COMPLETED_BEFORE_ISSUED, run on this receipt 1019+49)
+    assert r["execution"]["status"] == "blocked" and r["execution"]["completed_at"] == kept["refused_at"]
+    assert r["execution"]["completed_at"] > expired_at and r["provenance"]["execution.completed_at"] == "inferred"
     # his own authorised key, refused only for its timing: named the operator (head ruling 1019+45, built 1019+49)
     assert r["approval"]["approver"] == {"id": f"ssh-key:{rkeys['laptop'].fp}", "role": "operator"}
     assert r["provenance"]["approval.approver.role"] == "synthesized"
@@ -938,6 +941,20 @@ def test_an_authorised_answer_after_the_hold_keeps_expired_and_carries_the_stale
     # the receipt is not earlier than the evidence it records
     assert r["issued_at"] == kept["refused_at"] and r["provenance"]["issued_at"] == "inferred"
     assert exported.report.refused_window_elapsed == 1 and exported.report.refused_not_authorized == 0
+
+
+def test_a_refused_answer_claiming_a_time_after_its_refusal_is_capped_at_the_refusal(tmp_path, rkeys):
+    """signed_at is the signer's claim and a refused answer's is not bounded by the queue: an approved_at later than
+    the refusal it is the evidence of is capped at the refusal and marked synthesized (as _approved_at does)."""
+    queue, clock = _refused_world(tmp_path, rkeys)
+    request = _file(queue)
+    _attempt(queue, request, rkeys["stranger"], signed_at=utc_stamp(clock.now + timedelta(days=30)))
+    _lapse(queue, clock)
+    r, _ = _expired_receipt(queue, clock.now + timedelta(days=2))
+    [kept] = queue.refused_answers(request.id)
+    assert r["approval"]["approved_at"] == kept["refused_at"]
+    assert r["provenance"]["approval.approved_at"] == "synthesized"
+    assert r["approval"]["approved_at"] <= r["issued_at"] <= r["execution"]["completed_at"]
 
 
 def test_a_refused_deny_is_never_approval_evidence_and_the_row_exports_as_plain_expired(tmp_path, rkeys):
