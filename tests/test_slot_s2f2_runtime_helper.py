@@ -161,7 +161,7 @@ class World:
             raise Refused("account-missing", name)
         return ACCOUNTS[name]
 
-    def _run_as(self, uid, gid, fn, wfd):
+    def _run_as(self, uid, gid, fn, wfd, keep=()):
         self.run_as_uids.append(uid)
         return ST.thread_run_as(uid, gid, fn, wfd)
 

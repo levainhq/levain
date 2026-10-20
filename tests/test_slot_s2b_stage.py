@@ -96,7 +96,7 @@ def test_root_rechecks_cap_the_reader_sent(dirs):
     """A reader that lies about the size (says more than the cap) is refused by root, not trusted."""
     staging, dest = dirs
 
-    def liar(uid, gid, fn, wfd):
+    def liar(uid, gid, fn, wfd, keep=()):
         write_all(wfd, b"S" + struct.pack(">Q", st.BUNDLE_CAP + 1))
         os.close(wfd)
         return _finished()
@@ -118,7 +118,7 @@ def test_stalled_reader_hits_deadline(dirs):
     staging, dest = dirs
     stop = threading.Event()
 
-    def stall(uid, gid, fn, wfd):
+    def stall(uid, gid, fn, wfd, keep=()):
         def body():
             write_all(wfd, b"S" + struct.pack(">Q", len(BUNDLE)) + BUNDLE[:100])
             stop.wait(10)
@@ -287,14 +287,14 @@ def test_destination_is_fresh(dirs):
 def test_reader_refusal_names_allowlisted(dirs):
     staging, dest = dirs
 
-    def bogus(uid, gid, fn, wfd):
+    def bogus(uid, gid, fn, wfd, keep=()):
         write_all(wfd, b"R\x05hello")
         os.close(wfd)
         return _finished()
 
     assert refused(copy, staging, dest, BUNDLE, run_as=bogus).name == "staging-reader-failed"
 
-    def silent(uid, gid, fn, wfd):
+    def silent(uid, gid, fn, wfd, keep=()):
         os.close(wfd)
         return _finished()
 
@@ -306,7 +306,7 @@ def test_reader_runs_as_staging_uid(dirs):
     staging, dest = dirs
     seen = []
 
-    def record(uid, gid, fn, wfd):
+    def record(uid, gid, fn, wfd, keep=()):
         seen.append((uid, gid))
         return st.thread_run_as(uid, gid, fn, wfd)
 

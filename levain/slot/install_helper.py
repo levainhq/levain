@@ -40,9 +40,10 @@ from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                policy_rows, reserve_row, reserve_steps, roots_steps, row_steps, run_dir_undo_steps,
-                                single_filesystem_steps, slot_rows, tmpfiles_steps, tmpfiles_undo_steps,
-                                ungroup_steps)
+                                parse_pool_config, policy_rows, pool_config_row, pool_config_steps,
+                                pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
+                                run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
+                                tmpfiles_undo_steps, ungroup_steps)
 from levain.slot.sudoers import remove_install_sudoers_steps, remove_runtime_sudoers_steps, sudoers_steps
 
 OPERATOR_FORMAT = "levain-operator/1"
@@ -211,13 +212,120 @@ def helper_pending() -> tuple[str, ...]:
 # --- the slot state files (CONTRACT §3.5 Pool, §2.1) -----------------------------------------------
 
 
+def _store_key(store: Path) -> str:
+    return os.path.abspath(os.fspath(store))
+
+
+#: The :class:`Quiesce` of the install run in progress, by store: at most one per store (the install lock).
+_QUIESCING: dict[str, "Quiesce"] = {}
+
+
+class Quiesce:
+    """CONTRACT §5.2 ``live-lease`` made a gate, not a snapshot (codex r1 g2 5): an install verb that refuses a
+    live lease holds ``L/slots/pool.lock`` from its live-lease check through its last act, so no ``prepare`` can
+    lease beneath it (``lease_slot`` waits for the same lock, then refuses ``pool-locked``). Lock order: the install
+    lock, then this. The live-lease count is taken under it, and counts :meth:`busy_slots` too: ``prepare`` holds its
+    slot lock from the lease until ``ATTACH`` has made the record that counts it live, so a slot lock held under the
+    pool lock is a lease the session records do not show yet.
+
+    While held, this process's own :func:`pool_lock` bodies (the slot state steps) run under it instead of
+    taking the lock again (a second ``flock`` on a new descriptor would wait on this one)."""
+
+    def __init__(self, store: Path, *, waits: RH.Seams | None = None) -> None:
+        self.store = Path(store)
+        self.waits = waits
+        self.fd = -1
+
+    @property
+    def held(self) -> bool:
+        return self.fd >= 0
+
+    def hold(self) -> bool:
+        """Take the lock. False when there is no lock file: no ``prepare`` can lease without it (``lease_slot``
+        refuses ``store-missing``), and a fresh ``setup`` takes it with :func:`quiesce_step` once its rows have made
+        the file. Raises ``pool-locked`` past the wait."""
+        # DECISION: the newest hold of a store is the registered one (one install run per process; a gather
+        # called without run(), as a test does, leaves its hold for the caller to release).
+        _QUIESCING[_store_key(self.store)] = self
+        if self.held:
+            return True
+        path = self.store / "slots" / "pool.lock"
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return False
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Refused("bad-root", f"{path} is not a regular file")
+            RH.wait_flock(fd, self.waits or RH.Seams(), "pool-locked")
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return True
+
+    def busy_slots(self) -> list[str]:
+        """Under the hold: the slots whose lock is held (a ``prepare`` before its ``ATTACH`` answered, or an END).
+        Each is TRIED, never waited on: the runtime's own rule, the pool lock never waits on a slot lock."""
+        assert self.held
+        busy = []
+        slots = self.store / "slots"
+        for name in sorted(os.listdir(slots)):
+            try:
+                lock = os.open(slots / name / "lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            try:
+                if not RH.try_flock(lock):
+                    busy.append(name)
+            finally:
+                os.close(lock)             # closing the only descriptor drops the flock it took
+        return busy
+
+    def live_leases(self) -> int:
+        """The live-lease count: the session records, plus :meth:`busy_slots` when held."""
+        return count_live_leases(self.store / "sessions") + (len(self.busy_slots()) if self.held else 0)
+
+    def release(self) -> None:
+        if _QUIESCING.get(_store_key(self.store)) is self:
+            del _QUIESCING[_store_key(self.store)]
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def quiesce_step(host: HostOS, *, store: Path | None = None) -> Step:
+    """A fresh ``setup``'s quiesce, once its rows have made ``L/slots/pool.lock`` and before any slot reads as
+    reusable: the run's :class:`Quiesce` takes the lock here and holds it to the run's end. DECISION: with no run in
+    progress (a plan applied outside :func:`run`) the step has nothing to hold and says so."""
+    L = Path(store) if store is not None else STORE[host]
+
+    def take() -> tuple[bool, str]:
+        q = _QUIESCING.get(_store_key(L))
+        if q is None:
+            return True, "no install run is quiescing this store"
+        if not q.hold():
+            return False, f"{L / 'slots' / 'pool.lock'} is missing after the rows that make it"
+        n = q.live_leases()
+        if n:   # nothing can lease before the runtime rule exists; a lease here is one this setup cannot see past
+            return False, f"live-lease: {n} lease(s) are live"
+        return True, ""
+
+    return Step(f"hold {L / 'slots' / 'pool.lock'} to the end of this run (no prepare leases beneath it)", call=take)
+
+
 @contextmanager
 def pool_lock(store: Path, *, missing_ok: bool = False, waits: RH.Seams | None = None) -> Iterator[None]:
-    """``L/slots/pool.lock`` held for the body: every writer of a slot state file holds it (§3.5). Install takes
-    no slot lock, so the lock order has nothing more to say here. Waited for as the runtime helper waits
+    """``L/slots/pool.lock`` held for the body: every writer of a slot state file holds it (§3.5). Install only
+    TRIES a slot lock, under this (:meth:`Quiesce.busy_slots`), so the pool-then-slot order holds. Waited for as the runtime helper waits
     (:func:`runtime_helper.wait_flock`; ``waits`` carries the clock and the bound), refused ``pool-locked`` past
     it. ``missing_ok``: with no lock file (a store emptied by hand) there is no writer to exclude and the body runs
-    unlocked; undo only, since setup and replenish made the file in an earlier step."""
+    unlocked; undo only, since setup and replenish made the file in an earlier step. Under this process's held
+    :class:`Quiesce` the body runs under that hold."""
+    q = _QUIESCING.get(_store_key(store))
+    if q is not None and q.held:
+        yield
+        return
     path = Path(store) / "slots" / "pool.lock"
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -471,9 +579,12 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *single_filesystem_steps(host, alloc.slots),
         *base_routes_steps(host),
         *roots_steps(host, roots),
+        *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *root_tree.tree_steps(host, package),
         *confinement,
         *units.install_steps(host, services),
+        # The quiesce, if the pool lock was not there to take at the live-lease check (a fresh setup).
+        quiesce_step(host),
         # Each slot's §3.5 Pool state once everything the slot needs is in place, before the rule that lets
         # prepare run (prepare picks only from these).
         *slot_state_steps(host, alloc.slots),
@@ -488,7 +599,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
     check_tools(facts, steps, verb="setup", python=True)
     kept = tuple(sorted(reuse.keep)) + tuple(sorted(reuse.keep_shared))
     return InstallPlan("setup", host, tuple(steps), alloc, accounts, groups,
-                       tuple(early + rows + [reserve_row(host)]), roots, facts.retired,
+                       tuple(early + rows + [reserve_row(host), pool_config_row(host)]), roots, facts.retired,
                        revived=tuple(a.name for a in revived), kept=kept,
                        pending=helper_pending() + skipped, services=tuple(s.name for s in services),
                        intent=intent)
@@ -582,6 +693,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *units.uninstall_steps(host),
         # With the services stopped nothing rewrites them: no slot reads as reusable from here on.
         *slot_state_undo_steps(host, slots_of(accounts)),
+        *pool_config_undo_steps(host),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
     ]
@@ -610,16 +722,21 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
 # --- replenish -------------------------------------------------------------------------------------
 
 
-def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifier_slots: int,
+def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, verifier_slots: int | None,
                    live: Mapping[SlotClass, Iterable[int]],
-                   accounts: Mapping[str, int] | None = None) -> InstallPlan:
-    """Bring each class back to its configured count with NEW indices (a retired index is never
-    reissued). ``live``: the indices of each class still in service; ``accounts``: their accounts,
-    name -> uid (macOS: the pf rules name every slot in service by uid, §23). With a replenish journal
-    (§25) the plan is that journal's slots, resumed, and nothing more."""
+                   accounts: Mapping[str, int] | None = None,
+                   configured: Mapping[SlotClass, Iterable[int]] | None = None) -> InstallPlan:
+    """Bring each class back to its configured count (``slots``, ``verifier_slots``: ``L/policy/pool``) with NEW
+    indices (a retired index is never reissued); None = no ``L/policy/pool``, refused ``pool-config-missing``
+    after the shared refusals. ``live``: the indices of each class still in service;
+    ``configured``: every index ``L/slots/`` holds, retired ones included, none of which is chosen again;
+    ``accounts``: the in-service slots' accounts, name -> uid (macOS: the pf rules name every slot in service by
+    uid, §23). With a replenish journal (§25) the plan is that journal's slots, resumed, and nothing more."""
     if cmd.verb != "replenish":
         raise Refused("wrong-verb", cmd.verb)
     preflight(cmd, facts)
+    if slots is None or verifier_slots is None:
+        raise Refused("pool-config-missing", "L/policy/pool: no configured counts to replenish to")
     host = facts.host
     rec = facts.operator_record
     assert rec is not None
@@ -644,8 +761,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int, verifie
         # setup finished); this run's journal write replaces it.
         for cls, want in (("egress", slots), ("none", verifier_slots)):
             have = set(live.get(cls, ()))
-            new[cls] = choose_indices(cls, max(0, want - len(have)),
-                                      spent_indices(cls, facts.existing_names) | have)
+            spent = spent_indices(cls, facts.existing_names) | have | set((configured or {}).get(cls, ()))
+            new[cls] = choose_indices(cls, max(0, want - len(have)), spent)
         alloc = allocate(host, egress=new["egress"], verifier=new["none"], used=facts.used_ids,
                          retired=facts.retired)
     made = accounts_of(alloc)
@@ -797,6 +914,12 @@ class Gathered:
     accounts: Mapping[str, int] = field(default_factory=dict)
     shared_groups: tuple[str, ...] = ()
     live: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    #: The pool-lock hold taken before the live-lease count, released by :func:`run` after the last act.
+    quiesce: Quiesce | None = None
+    #: replenish: ``L/policy/pool``'s ``(slots, verifier_slots)``, or None when it is absent.
+    pool: tuple[int, int] | None = None
+    #: replenish: every index ``L/slots/`` holds, by class, retired ones included.
+    configured: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 def _operator_of(store: RH.Store) -> Mapping[str, object] | None:
@@ -832,9 +955,23 @@ def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
     d = read_directory(host, run=run)
     rs = store_seams or RH.Seams(host=host)
     L = rs.L
+    q = Quiesce(L, waits=rs) if cmd.verb not in LEASE_EXEMPT else None
+    try:
+        g = _gather_held(cmd, host, caller_uid, d, rs, L, q, state_dir=state_dir, user_name=user_name)
+    except BaseException:
+        if q is not None:
+            q.release()
+        raise
+    return g
+
+
+def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Directory, rs: RH.Seams, L: Path,
+                 q: Quiesce | None, *, state_dir: Path | None, user_name: Callable[[int], str | None]) -> Gathered:
+    if q is not None and os.path.lexists(L):
+        q.hold()        # before the live-lease count below, so the count is one no prepare can change
     retired_path = Path(state_dir) / RETIRED_IDS_PATH[host].name if state_dir else RETIRED_IDS_PATH[host]
     intent_path = Path(state_dir) / INTENT_PATH[host].name if state_dir else INTENT_PATH[host]
-    orec, in_service = None, None
+    orec, in_service, pool, configured = None, None, None, {}
     if os.path.lexists(L):
         # Read as the runtime helper reads the store: one dirfd, every component O_NOFOLLOW, root's dirs only.
         store = RH.Store(rs)
@@ -842,6 +979,9 @@ def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
             orec = _operator_of(store)
             if cmd.verb == "replenish" and orec is not None:
                 in_service = slots_in_service(store)
+                configured = {cls: tuple(sorted(i)) for cls, i in RH.configured_slots(store).items()}
+                raw = store.read(("policy",), "pool")
+                pool = parse_pool_config(raw) if raw is not None else None
         finally:
             store.close()
     journal = read_intent(host, path=intent_path)
@@ -866,30 +1006,30 @@ def gather_facts(cmd: InstallCommand, host: HostOS, caller_uid: int, *,
     facts = HostFacts(
         host=host, caller_uid=caller_uid, caller_name=user_name(caller_uid),
         operator_uid=d.users.get(cmd.operator) if cmd.operator else None, operator_record=orec,
-        live_leases=count_live_leases(L / "sessions"),
+        live_leases=q.live_leases() if q is not None else count_live_leases(L / "sessions"),
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids)
     if cmd.verb == "undo":
-        return Gathered(facts, accounts, shared)
+        return Gathered(facts, accounts, shared, quiesce=q)
     if in_service is not None:
         wanted = {n for cls, idx in in_service.items() for i in idx for n in SlotId(cls, i).accounts}  # type: ignore[arg-type]
-        return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service)
-    return Gathered(facts)
+        return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service, quiesce=q,
+                        pool=pool, configured=configured)
+    return Gathered(facts, quiesce=q)
 
 
 def plan_for(cmd: InstallCommand, g: Gathered, **setup_kw) -> InstallPlan:
     """The verb's plan from what was gathered. ``setup_kw`` reaches :func:`plan_setup` (tests: its host seams).
-
-    DECISION (replenish): no store record holds the configured counts, so they are the slots in service; a
-    replenish without a journal then chooses no new index, and only a journaled one makes slots (§25 resume)."""
+    Replenish fills to ``L/policy/pool`` (head ruling 8) and refuses ``pool-config-missing`` without it."""
     if cmd.verb == "setup":
         return plan_setup(cmd, g.facts, **setup_kw)
     if cmd.verb == "undo":
         return plan_undo(cmd, g.facts, accounts=g.accounts, shared_groups=g.shared_groups)
     if cmd.verb == "replenish":
-        return plan_replenish(cmd, g.facts, slots=len(g.live.get("egress", ())),
-                              verifier_slots=len(g.live.get("none", ())), live=g.live, accounts=g.accounts)
+        slots, verifier_slots = g.pool if g.pool is not None else (None, None)
+        return plan_replenish(cmd, g.facts, slots=slots, verifier_slots=verifier_slots, live=g.live,
+                              accounts=g.accounts, configured=g.configured)
     raise Refused(f"verb-unbuilt:{cmd.verb}", cmd.verb)
 
 
@@ -932,7 +1072,8 @@ class Seams:
 def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextIO) -> dict[str, object]:
     """The verb's ok fields, or :class:`Refused`. The order is §25's: the install lock is taken BEFORE the host's
     facts are gathered, and held through the plan, its first step (the journal), every act, the record and the
-    journal's removal, so no second run plans against this one's half. Nothing before the lock reads the host."""
+    journal's removal, so no second run plans against this one's half. Nothing before the lock reads the host.
+    Inside it, the gather's :class:`Quiesce` (the pool lock) is held through the last act too."""
     if seams.euid() != 0:
         raise Refused("not-root", "the install helper runs as root")
     cmd = parse_install_argv(argv)
@@ -942,10 +1083,14 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
     host = seams.host()
     with seams.lock(host):
         gathered = seams.gather(cmd, host, caller_uid)
-        plan = seams.plan(cmd, gathered)
-        for line in plan.pending:
-            err.write(f"levain install-helper: pending: {line}\n")
-        failed = seams.apply(plan, err)
+        try:
+            plan = seams.plan(cmd, gathered)
+            for line in plan.pending:
+                err.write(f"levain install-helper: pending: {line}\n")
+            failed = seams.apply(plan, err)
+        finally:
+            if gathered.quiesce is not None:
+                gathered.quiesce.release()     # the pool lock, after the last act and before the install lock
         if failed is not None:
             raise Refused("step-failed", failed)
     fields: dict[str, object] = {"verb": plan.verb, "steps": len(plan.steps)}
@@ -980,7 +1125,8 @@ def main(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams | None = N
 __all__ = ["BUILT_VERBS", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
            "apply_steps", "check_account_ids", "check_tools", "count_live_leases", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
-           "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight",
+           "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
+           "quiesce_step",
            "read_directory", "remove_slot_state", "run", "slot_state_steps", "slot_state_undo_steps",
            "slots_in_service", "write_initial_slot_state"]
 
