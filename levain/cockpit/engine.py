@@ -179,6 +179,9 @@ class ProviderSpec:
     refresh_every_s: float | None = None
     stale_after_s: float = 900.0
     optional: bool = False
+    # a source the substrate only creates on first use (the spore store): absent before it was ever seen is an EMPTY panel,
+    # never a fault. Once seen, its disappearance is still a fault ("source disappeared").
+    absent_is_empty: bool = False
     timeout_s: float = 10.0
     order: str | None = None
     # other server orders of the SAME rows, as ``(id, title, ordering)``: a triage-list's views. The
@@ -1288,6 +1291,8 @@ class Cockpit:
                 if spec.optional and not st.ever_present:
                     return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
                                  f"not configured: {out.reason}", value_version=vv)
+                if spec.absent_is_empty and not st.ever_present and listy:
+                    return _Snap("empty", [], None, [], [], now_iso, None, spec.note, empty=None, value_version=vv)
                 why = "source disappeared" if st.ever_present else "source absent"
                 return dataclasses.replace(self._fault(spec, st, f"{why}: {out.reason}", now_iso), value_version=vv)
             message = out.message if isinstance(out, Fault) else f"unexpected outcome {type(out).__name__}"

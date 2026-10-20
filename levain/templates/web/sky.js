@@ -461,12 +461,12 @@
         if (offView(e, model.single)) return;
         var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (lev || strip ? 0 : (hash01(e.t + e.kind.length) - 0.5) * 12);
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
-        var hue = lev || !P.hues ? '' : P.hues[hueKey(e.repo)];
+        var hue = !P.hues || (lev && e.kind !== 'commit') ? '' : P.hues[hueKey(e.repo)];   // a levain feed hues its commits by repo; its own marks keep their kind colours
         if (lev && e.out === 'failed' && e.kind !== 'review') {   // a failure is a red ring, whatever failed
           g.globalAlpha = 1; g.strokeStyle = P.bad; g.lineWidth = 1.6; g.beginPath(); g.arc(x, y, R + 0.5, 0, 7); g.stroke();
         }
         else if (e.kind === 'commit') {
-          g.globalAlpha = lev ? Math.max(a, 0.6) : hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath();
+          g.globalAlpha = lev || hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath();
           g.arc(x, y, lev ? 2.6 * sc : ((hue ? 2 : 1.3) + hash01(e.t) * 0.9) * sc, 0, 7); g.fill();
         }
         else if (e.kind === 'review') {

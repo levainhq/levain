@@ -27,8 +27,9 @@ def test_a_tile_that_holds_items_back_is_a_button_and_one_that_holds_none_is_not
             DESKTOP,
             {"until": f"{HEALTH} && {HEALTH}.querySelector('.xnote')"},
             {"eval": f"(() => {{ const t = {HEALTH}; return [t.getAttribute('role'), t.getAttribute('aria-haspopup'), t.tabIndex, /\\+\\d+ more/.test(t.innerText)]; }})()"},
-            # a tile that draws everything it has (no "+N more") is no button
-            {"eval": "[...document.querySelectorAll('.ck-widgets .ck-card.w')].filter(c => !c.querySelector('.xnote') && c.dataset.ckKind !== 'count').map(c => c.getAttribute('role'))"},
+            # a tile that draws everything it has (no "+N more") is no button; the Levain health face (S4) is one answer
+            # over its checks, so it is a button to them without a "+N more" line
+            {"eval": "[...document.querySelectorAll('.ck-widgets .ck-card.w')].filter(c => !c.querySelector('.xnote') && c.dataset.ckKind !== 'count' && c.dataset.ckPanel !== 'doctor').map(c => c.getAttribute('role'))"},
         ])["values"]
     assert out[1] == ["button", "dialog", 0, True], out
     assert all(r is None for r in out[2]), out

@@ -320,7 +320,7 @@ def register_ordering(o: Ordering, *, builtin: bool = False) -> None:
 register_ordering(
     Ordering(
         "spore.tray", _tray_order_key, _tray_group,
-        (("today", "Today"), ("overdue", "Overdue"), ("also", "Also pending")),
+        (("overdue", "Overdue"), ("today", "Today"), ("also", "Also pending")),   # overdue leads: what is late is read first
         frozenset({"today", "overdue"}),
     ),
     builtin=True,

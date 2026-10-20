@@ -1504,7 +1504,18 @@ html {
 .rp-tag[data-repo="1"] { --tag: var(--hue-1); } .rp-tag[data-repo="2"] { --tag: var(--hue-2); } .rp-tag[data-repo="3"] { --tag: var(--hue-3); }
 .rp-tag[data-repo="4"] { --tag: var(--hue-4); } .rp-tag[data-repo="5"] { --tag: var(--hue-5); }
 
-/* (no colour strip on a panel: the colour of a panel's top edge carried no meaning; orange is spent on what waits on the operator) */
+/* variant B (Phill 10-14, restored 10-20): a 2px stripe across the top of a panel, by the levain subsystem it belongs to, as flow's cockpit
+   draws it: memory (blue), decisions (amber), the work lists (pink). Inside the card's own radius (the panel clips its overflow). */
+html { --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3); }
+html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"], [data-ck-panel="wraps"], [data-ck-panel^="section:"], [data-ck-panel^="config:"])::before { background: var(--stripe-memory); }
+html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
+html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
+html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"])::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
+html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
+/* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel.ck-is-empty { align-self: stretch; }
 
 /* the Decisions tile carries a soft halo only while something waits on the operator; calm otherwise */
 html .ck-card.w[data-ck-panel="decisions"][data-signal="on"] {
@@ -1732,7 +1743,7 @@ body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !importa
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
 /* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--accent); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
+body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 100%; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
@@ -2078,3 +2089,32 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
+
+/* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
+   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
+   Tray: what is late reads first, with a red stripe and "overdue N d" in red; Resolve and Snooze are always on the row, never hover-only. */
+body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
+body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
+body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
+body.ke:not([data-mode="build"]) [data-ck-panel="loops"] .row[data-heat] { border-left: 3px solid var(--heat); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] { border-left: 3px solid var(--bad); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="tray"] .row[data-band="overdue"] > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }
+body.ke [data-ck-panel="tray"] .row .verb-actions { opacity: 1; }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { box-shadow: inset 0 0 0 1px var(--hair); border-radius: var(--r-md); padding: 0 var(--sp-4); background: transparent; }
+
+/* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
+body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+
+/* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
+body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }
+body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
+body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
+/* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
+body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+.grp-col { display: contents; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
+body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
+@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; } }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }

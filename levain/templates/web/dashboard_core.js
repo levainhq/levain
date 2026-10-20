@@ -403,7 +403,45 @@
   // no longer overflows (search shrinking results, font reflow) so the scent never goes stale.
   // Reads layout synchronously; valid because render() builds into the live #board, so the
   // .clamped max-height is actually applied (a detached board would read zero overflow).
+  // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
+  // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
+  // or a resize unfolds first and measures again.
+  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "now"];
+  function foldRows(body) {
+    const panel = body.closest && body.closest(".panel[data-ck-panel]");
+    if (!panel || FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 || panel.closest(".modal")) return false;
+    for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
+    const old = panel.querySelector(":scope > .more-foot"); if (old) old.remove();
+    if (!(body.scrollHeight > body.clientHeight + 1)) return false;
+    const top = body.getBoundingClientRect().top;
+    const heldLine = body.querySelector(":scope > .held-line, .held-line");
+    const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
+    const items = Array.prototype.filter.call(body.querySelectorAll(".row, .grp-head"), (n) => !n.parentElement.closest(".row"));
+    let hidden = 0, cut = false;
+    for (const n of items) {
+      const r = n.getBoundingClientRect();
+      if (!cut && r.bottom - top > limit) cut = true;
+      if (cut) { n.style.display = "none"; n.dataset.folded = "1"; if (n.classList.contains("row")) hidden++; }
+    }
+    // a heading left with no row under it goes too
+    for (let i = 0; i < items.length; i++) {
+      if (!items[i].classList.contains("grp-head") || items[i].dataset.folded) continue;
+      const next = items.slice(i + 1).find((n) => !n.dataset.folded && n.classList.contains("row"));
+      const nextHead = items.slice(i + 1).findIndex((n) => n.classList.contains("grp-head") && !n.dataset.folded);
+      const nextRow = next ? items.indexOf(next) : -1;
+      if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { items[i].style.display = "none"; items[i].dataset.folded = "1"; }
+    }
+    if (!hidden) return false;
+    const more = el("button", "more-foot", hidden + " more");
+    more.type = "button";
+    more.setAttribute("aria-label", hidden + " more rows: open the full list");
+    more.addEventListener("click", () => { const x = panel.querySelector(".pexpand"); if (x) x.click(); });
+    panel.appendChild(more);
+    return true;
+  }
+
   function measureOverflow(body) {
+    if (foldRows(body)) { body.classList.remove("has-overflow", "at-end"); return; }
     const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 1;
     const over = body.scrollHeight > body.clientHeight + 1;
     body.classList.toggle("has-overflow", over);
@@ -1679,9 +1717,9 @@
   const VERBS_VISIBLE = 3;
   // Where the row is too narrow for the meta line (id, tag, date, age) beside the verbs, a container query on the row
   // (CSS, decided at render and on every resize) hides the inline verbs and shows a copy of each in the "···" menu.
-  function overflowVerbs(group, prefer) {
+  function overflowVerbs(group, prefer, shown) {
     const btns = Array.prototype.slice.call(group.querySelectorAll(":scope > .verb-btn"));
-    const visible = VERBS_VISIBLE;
+    const visible = shown || VERBS_VISIBLE;
     if (btns.length <= visible) return;
     let keep = [];
     for (const label of prefer || []) {
@@ -1771,8 +1809,8 @@
     group.appendChild(more);
     group.appendChild(menu);
   }
-  function appendRowVerbs(row, group, prefer) {
-    if (document.body.classList.contains("ke")) { row.tabIndex = 0; overflowVerbs(group, prefer); }
+  function appendRowVerbs(row, group, prefer, visible) {
+    if (document.body.classList.contains("ke")) { row.tabIndex = 0; overflowVerbs(group, prefer, visible); }
     row.appendChild(group);
     return row;
   }
@@ -1797,16 +1835,25 @@
       sf.setAttribute("data-ck-tag-state", "held");
       row.appendChild(sf);
     } else if (s.next) {
-      const due = tagEl("muted", "→ " + s.next);
-      if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
-      row.appendChild(due);
+      // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
+      const late = daysLate(s.next);
+      if (late > 0) {
+        row.dataset.band = "overdue";
+        const od = tagEl("muted", "overdue " + late + " d");
+        od.setAttribute("data-ck-tag-state", "overdue");
+        row.appendChild(od);
+        row.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      } else {
+        row.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
+      }
     }
+    if (panelKind !== "tray" && panelKind !== "keep" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) row.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); row.appendChild(rc); }
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["edit", "schedule", "dismiss"] : null);
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
@@ -1891,7 +1938,10 @@
       controls: (bar, redraw) => {
         if (heldLine) {
           const line = el("div", "ext-note held-line");
-          line.appendChild(el("span", null, heldLine.count + " held back — " + heldLine.reason + " "));
+          // the earliest surface date among the held rows: "1 held back until Dec 3"
+          const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
+          line.appendChild(el("span", null, nexts.length ? heldLine.count + " held back until " + surfaceLabel(nexts[0]) + " "
+            : heldLine.count + " held back — " + heldLine.reason + " "));
           const tog = el("button", "held-toggle");
           tog.type = "button";
           tog.dataset.heldToggle = "1";
@@ -1908,7 +1958,7 @@
             for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
           });
           line.appendChild(tog);
-          bar.after(line);
+          p.appendChild(line);   // at the foot of the list, as the mock draws it
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
@@ -1932,14 +1982,19 @@
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
+      let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
+        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) results.appendChild(el("div", "grp-head", s.group_title));
+        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
+          // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
+          box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
+          box.appendChild(el("div", "grp-head", s.group_title));
+        }
         lastGroup = g;
-        results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+        box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
       }
     }, opts);
     return p;
@@ -1974,7 +2029,7 @@
       results.replaceChildren();
       if (rows.length === 0) {
         results.appendChild(el("p", "empty",
-          q ? "no loops match “" + raw.trim() + "”" : "no open prospective loops"));
+          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after Sage sorts the Tray is listed here."));
       } else {
         for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
       }
@@ -2006,7 +2061,7 @@
 
   function renderTray(entry, view) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "tray clear — nothing waiting", "disposition");
+      "Nothing yet. Drop a thought in the box above and Sage sorts it.", "disposition");
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
     if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
@@ -2018,7 +2073,7 @@
   // (when writable), then the list badged per-item (note → "note", parked loop → "parked").
   function renderKeep(entry, view) {
     const p = renderSporeProjection(entry, view, view.keep,
-      "keep empty — nothing kept", "keep");
+      "Nothing yet. Add a note above to keep something handy.", "keep");
     if (isVerbPanel(entry)) mountCaptureBox(p, buildKeepNote());
     return p;
   }
@@ -2105,7 +2160,7 @@
     const showRecent = () => {
       status.textContent = "";
       const shown = agentNow() ? list.filter((e) => e.agent === agentNow()) : list;
-      if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
+      if (list.length === 0) results.replaceChildren(el("p", "empty", "Nothing yet. Episodes appear here as sessions write them."));
       else renderRows(shown);
       reMeasure();
     };
@@ -2695,7 +2750,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
-    reactivate: "spore_update", schedule: "spore_surface_at", metabolize: "spore_set_disposition",
+    reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     "→ tray": "spore_set_disposition", activate: "spore_set_disposition", "remind me": "spore_set_disposition",
     dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
@@ -2715,6 +2770,15 @@
     const today = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
     return m[1] < today;
   }
+
+  // whole days a due stamp is before today (negative: still ahead; 0: today); NaN when it is no date
+  function daysLate(due) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(due));
+    if (!m) return NaN;
+    const now = new Date();
+    return Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
+  }
+  const shortDate = (due) => String(due).slice(5, 10);
 
   function verbBtn(label, title, onClick) {
     const b = el("button", "verb-btn", label);
@@ -2775,9 +2839,9 @@
         b.disabled = false;
         verbErr(wrap, res);
       }));
-      wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+      wrap.appendChild(verbBtn("Snooze", "resurface on a future date", () => openSurfaceForm(wrap, s)));
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
-        wrap.appendChild(verbBtn("dismiss", "compost this inbox item", () =>
+        wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
       }
       return gateByActions(wrap, s.actions);
@@ -3056,7 +3120,7 @@
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
     const box = el("div", "tray-dump");
     const ta = el("textarea", "tray-dump-ta");
-    ta.placeholder = placeholder; ta.rows = 2;
+    ta.placeholder = placeholder; ta.title = "⌘/Ctrl+Enter sends"; ta.rows = 2;
     box.appendChild(ta);
     const controls = el("div", "tray-dump-controls");
     let sel = null;
@@ -3098,7 +3162,7 @@
   // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
   function buildTrayDump(entity) {
     return buildCaptureBox(
-      `dump anything — a to-do, a thought, a thread to pick up… ${entity} sorts it (⌘/Ctrl+Enter)`,
+      `Drop anything. ${entity} sorts it.`,
       "drop", "nothing to drop", true,
       (text, type) => {
         const req = { kind: "spore_seed", text };
@@ -3111,7 +3175,7 @@
   // cognition-excluded + resolve-exempt. No type (reference never resolves).
   function buildKeepNote() {
     return buildCaptureBox(
-      "add a note — a command, a pointer, durable reference to keep handy (⌘/Ctrl+Enter)",
+      "Add a note or a command",
       "keep", "nothing to keep", false,
       (text) => ({ kind: "spore_seed", text, disposition: "note" }));
   }
