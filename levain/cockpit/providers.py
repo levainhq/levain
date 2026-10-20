@@ -1041,7 +1041,7 @@ def _sessions(source: SubstrateSource, consent: Callable[[], Callable[[datetime]
             elif n := waiting.get((rec["agent"], rec["session_id"]), 0):
                 chips.append(f"{n} waiting")
             work = os.path.basename(rec["cwd"].rstrip("/\\")) or "/"
-            work = unshowable.mark(work, "", allow="")[:64]
+            work = unshowable.mark(work, "", allow="", selectors=False)[:64]
             listed.append((rec, chips, work, age < SESSION_ACTIVE_S))
         # Two listed sessions of one agent in one workspace would carry the same title: each such row says when it
         # started (never the session id, ruling 4). Two whose starts round alike (same minute; past an hour, same

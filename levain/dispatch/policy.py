@@ -65,9 +65,9 @@ class PolicyError(ValueError):
 
 def path_text_problem(text: str, what: str = "path") -> str | None:
     """Why ``text`` (a path or a pattern) holds a character that cannot show as itself (:mod:`levain.unshowable`,
-    newline and tab included). ``None`` when every character shows as what it is. One rule for contract paths and
-    policy patterns."""
-    found = unshowable.first_hidden(text, allow="")
+    newline and tab included, and the identifier rule: no presentation selector at all). ``None`` when every
+    character shows as what it is. One rule for contract paths, policy patterns and the registry's text fields."""
+    found = unshowable.first_hidden(text, allow="", selectors=False)
     if found is not None:
         ch = found[1]
         return (f"the {what} holds U+{ord(ch):04X} ({unicodedata.name(ch, 'unnamed')}), which can show differently "

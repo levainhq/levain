@@ -11,24 +11,34 @@ is one of the few assigned characters that draw nothing (``_DRAWS_NOTHING``).
 
 Two contextual rules, applied by :func:`hidden`:
 
-- A single U+FE0E or U+FE0F (text / emoji presentation) directly after a base listed in Unicode's
-  emoji-variation-sequences.txt (``_VARIATION_BASES``) is showable, so ordinary text such as "⚠️" passes: there the
-  selector visibly changes the glyph. Anywhere else (after any other character, at the start of the text, after
-  another selector, after an unshowable character, newline and tab included even where ``allow`` tolerates them) it is
-  unshowable: selectors there could carry bits the reader never sees.
+- Presentation selectors (U+FE0E text, U+FE0F emoji). In an identifier or a path (``selectors=False``) none is ever
+  showable: UTS #39's identifier profile excludes every Default_Ignorable_Code_Point, and two names that differ only
+  by a selector read alike. In prose (``selectors=True``, the default) a single selector directly after a base listed
+  in Unicode's emoji-variation-sequences.txt (``_VARIATION_BASES``) is showable only when it CHANGES that base's
+  default presentation (emoji-data.txt Emoji_Presentation): U+FE0F after a base that defaults to text
+  (``"⚠️"``, ``"↔️"``), U+FE0E after one that defaults to emoji (``_EMOJI_DEFAULT``, ``"⌚︎"``). A selector that
+  restates the default (``"↔︎"``, ``"⌚️"``) draws exactly what the bare base draws, so it is unshowable, as is a
+  selector anywhere else (after any other character, at the start of the text, after another selector, after an
+  unshowable character, newline and tab included even where ``allow`` tolerates them): selectors there could carry
+  bits the reader never sees.
 - A combining mark (category Mn or Me) is unshowable at the start of the text, right after a U+0020 space, or right
   after an unshowable character (newline and tab included): with no visible base it draws on nothing, or on a
   neighbour it was not written for. On one base, every mark past the ``_MAX_MARKS``-th is unshowable: a stack that
   deep draws over the line instead of decorating a letter. A presentation selector accepted by the first rule keeps
-  its base, so a keycap ("1️⃣") passes.
+  its base, so a keycap ("1️⃣") passes in prose.
+
+Linear time: table membership is a bisect, a run of printable ASCII is skipped in one regex step, and all-ASCII text
+is one regex scan for its controls.
 
 Stdlib only. It imports nothing from levain, so a module that must never reach ``levain.consent.hints`` (the cockpit's
 display guard) can use it.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
-from typing import Callable
+from bisect import bisect_right
+from typing import Callable, Iterator
 
 __all__ = ["first_hidden", "hidden", "is_unshowable", "mark"]
 
@@ -50,7 +60,8 @@ _DRAWS_NOTHING = frozenset({
     0x1D159,    # MUSICAL SYMBOL NULL NOTEHEAD
 })
 
-_PRESENTATION = frozenset("︎️")
+_TEXT_VS = "\ufe0e"     # VARIATION SELECTOR-15, text presentation
+_EMOJI_VS = "\ufe0f"    # VARIATION SELECTOR-16, emoji presentation
 
 # Unicode emoji-variation-sequences.txt, "# Version: 18.0.0" (Date: 2026-01-09): every base that has a text and an
 # emoji form (each has both an FE0E and an FE0F sequence there). Inclusive (lo, hi) ranges.
@@ -91,67 +102,135 @@ _VARIATION_BASES = (
     (0x1F6E9, 0x1F6E9), (0x1F6F0, 0x1F6F0), (0x1F6F3, 0x1F6F3),
 )
 
+# The variation bases above whose emoji-data.txt Emoji_Presentation is Yes (they draw as emoji by default, so U+FE0E
+# is the selector that changes them); every other base defaults to text, so U+FE0F changes it.
+# Source: emoji-data.txt, "# Version: 18.0.0" (Date: 2026-01-30), intersected with the bases above.
+_EMOJI_DEFAULT = frozenset({
+    0x231A, 0x231B, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23F0, 0x23F3, 0x25FD, 0x25FE, 0x2614, 0x2615, 0x2648, 0x2649,
+    0x264A, 0x264B, 0x264C, 0x264D, 0x264E, 0x264F, 0x2650, 0x2651, 0x2652, 0x2653, 0x267F, 0x2693, 0x26A1, 0x26AA,
+    0x26AB, 0x26BD, 0x26BE, 0x26C4, 0x26C5, 0x26CE, 0x26D4, 0x26EA, 0x26F2, 0x26F3, 0x26F5, 0x26FA, 0x26FD, 0x2705,
+    0x270A, 0x270B, 0x2728, 0x274C, 0x274E, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797, 0x27B0, 0x27BF,
+    0x2B1B, 0x2B1C, 0x2B50, 0x2B55, 0x1F004, 0x1F21A, 0x1F22F, 0x1F30D, 0x1F30E, 0x1F30F, 0x1F315, 0x1F31C, 0x1F378,
+    0x1F393, 0x1F3A7, 0x1F3AC, 0x1F3AD, 0x1F3AE, 0x1F3C2, 0x1F3C4, 0x1F3C6, 0x1F3CA, 0x1F3E0, 0x1F3ED, 0x1F408,
+    0x1F415, 0x1F41F, 0x1F426, 0x1F442, 0x1F446, 0x1F447, 0x1F448, 0x1F449, 0x1F44D, 0x1F44E, 0x1F453, 0x1F46A,
+    0x1F47D, 0x1F4A3, 0x1F4B0, 0x1F4B3, 0x1F4BB, 0x1F4BF, 0x1F4CB, 0x1F4DA, 0x1F4DF, 0x1F4E4, 0x1F4E5, 0x1F4E6,
+    0x1F4EA, 0x1F4EB, 0x1F4EC, 0x1F4ED, 0x1F4F7, 0x1F4F9, 0x1F4FA, 0x1F4FB, 0x1F508, 0x1F50D, 0x1F512, 0x1F513,
+    0x1F550, 0x1F551, 0x1F552, 0x1F553, 0x1F554, 0x1F555, 0x1F556, 0x1F557, 0x1F558, 0x1F559, 0x1F55A, 0x1F55B,
+    0x1F55C, 0x1F55D, 0x1F55E, 0x1F55F, 0x1F560, 0x1F561, 0x1F562, 0x1F563, 0x1F564, 0x1F565, 0x1F566, 0x1F567,
+    0x1F610, 0x1F687, 0x1F68D, 0x1F691, 0x1F694, 0x1F698, 0x1F6AD, 0x1F6B2, 0x1F6B9, 0x1F6BA, 0x1F6BC,
+})
+
 _MARKS = ("Mn", "Me")
 _MAX_MARKS = 4
 
+# A run of printable ASCII (U+0020..U+007E): every one shows, none is a mark or a selector, so the scan steps over it
+# whole. The only unshowable ASCII characters are the C0 controls and DEL (category Cc).
+_PLAIN_RUN = re.compile("[\x20-\x7e]+")
+_ASCII_HIDDEN = re.compile("[\x00-\x1f\x7f]")
+_ASCII_BASES = frozenset("#*0123456789")     # the ASCII variation bases (all default to text presentation)
 
-def _variation_base(cp: int) -> bool:
-    return any(lo <= cp <= hi for lo, hi in _VARIATION_BASES)
+
+def _in(table: tuple[tuple[int, int], ...]) -> Callable[[int], bool]:
+    """Membership in a sorted table of inclusive, disjoint (lo, hi) ranges, by bisect."""
+    los = tuple(lo for lo, _ in table)
+    his = tuple(hi for _, hi in table)
+
+    def contains(cp: int) -> bool:
+        i = bisect_right(los, cp) - 1
+        return i >= 0 and cp <= his[i]
+    return contains
+
+
+_ignorable = _in(_DEFAULT_IGNORABLE)
+_variation_base = _in(_VARIATION_BASES)
+
+
+def _alone(ch: str, cp: int, cat: str) -> bool:
+    return (cat in _CATEGORIES or (cat == "Zs" and ch != " ") or cp in _DRAWS_NOTHING or _ignorable(cp))
 
 
 def is_unshowable(ch: str) -> bool:
     """Whether the one character ``ch`` hides, on its own (no context: a presentation selector is always ``True``
     here, and an ordinary combining mark is ``False``; :func:`hidden` applies the contextual rules)."""
-    cat = unicodedata.category(ch)
-    if cat in _CATEGORIES or (cat == "Zs" and ch != " "):
-        return True
-    cp = ord(ch)
-    if cp in _DRAWS_NOTHING:
-        return True
-    return any(lo <= cp <= hi for lo, hi in _DEFAULT_IGNORABLE)
+    return _alone(ch, ord(ch), unicodedata.category(ch))
 
 
-def hidden(text: str, allow: str = "") -> list[int]:
-    """The indices in ``text`` of every unshowable character, in order. A character in ``allow`` (for example
-    ``"\\n\\t"``) is never reported, but it still counts as unshowable for both contextual rules."""
-    out: list[int] = []
+def _scan(text: str, allow: str, selectors: bool) -> Iterator[int]:
+    """The indices :func:`hidden` reports, lazily, in order."""
+    if text.isascii():
+        for m in _ASCII_HIDDEN.finditer(text):
+            if m.group() not in allow:
+                yield m.start()
+        return
+    n = len(text)
     prev_base = False       # the previous character may take one presentation selector
+    prev_emoji = False      # ... and draws as emoji by default (Emoji_Presentation=Yes)
     prev_bad = True         # the previous character hid (the start of the text counts as hidden)
     prev_space = False      # the previous character was U+0020
     marks = 0               # combining marks already drawn on the current base
-    for i, ch in enumerate(text):
-        if ch in _PRESENTATION and prev_base:
-            prev_base = False               # the one selector is shown; a second in the run is not
+    plain = _PLAIN_RUN.match
+    i = 0
+    while i < n:
+        run = plain(text, i)
+        if run is not None:
+            i = run.end()
+            last = text[i - 1]
+            prev_base, prev_emoji, prev_bad, prev_space, marks = last in _ASCII_BASES, False, False, last == " ", 0
+            continue
+        ch = text[i]
+        if prev_base and selectors and ch == (_TEXT_VS if prev_emoji else _EMOJI_VS):
+            prev_base = False               # the one selector changes the glyph; a second in the run does not
+            i += 1
             continue                        # the base, its mark count and prev_bad carry over
-        bad = is_unshowable(ch)
-        if not bad and unicodedata.category(ch) in _MARKS:
+        cp = ord(ch)
+        if cp < 0x80:                       # not in a printable run: a C0 control or DEL
+            bad, cat = True, "Cc"
+        else:
+            cat = unicodedata.category(ch)
+            bad = _alone(ch, cp, cat)
+        if not bad and cat in _MARKS:
             if prev_bad or prev_space or marks >= _MAX_MARKS:
                 bad = True
             else:
                 marks += 1
         elif not bad:
             marks = 0
-        prev_base = not bad and _variation_base(ord(ch))
+        prev_base = not bad and _variation_base(cp)
+        prev_emoji = prev_base and cp in _EMOJI_DEFAULT
         prev_bad = bad
-        prev_space = ch == " "
+        prev_space = False                  # U+0020 only ever arrives in a printable run
         if bad and ch not in allow:
-            out.append(i)
-    return out
+            yield i
+        i += 1
 
 
-def first_hidden(text: str, allow: str = "") -> tuple[int, str] | None:
-    """``(index, character)`` of the first unshowable character in ``text`` (``allow`` as in :func:`hidden`), or
-    ``None`` when every character shows as itself."""
-    found = hidden(text, allow)
-    return None if not found else (found[0], text[found[0]])
+def hidden(text: str, allow: str = "", selectors: bool = True) -> list[int]:
+    """The indices in ``text`` of every unshowable character, in order. A character in ``allow`` (for example
+    ``"\\n\\t"``) is never reported, but it still counts as unshowable for both contextual rules. ``selectors=False``
+    is the identifier and path rule: no presentation selector shows (UTS #39); the default is the prose rule."""
+    return list(_scan(text, allow, selectors))
 
 
-def mark(text: str, fmt: str | Callable[[int], str] = "⟨U+{:04X}⟩", allow: str = "\n\t") -> str:
-    """``text`` with every unshowable character (``allow`` as in :func:`hidden`) replaced by ``fmt``: a format string
-    given the code point, or a callable from the code point to the replacement (``""`` strips it)."""
-    found = hidden(text, allow)
-    if not found:
-        return text
+def first_hidden(text: str, allow: str = "", selectors: bool = True) -> tuple[int, str] | None:
+    """``(index, character)`` of the first unshowable character in ``text`` (``allow`` and ``selectors`` as in
+    :func:`hidden`), or ``None`` when every character shows as itself. Stops at the first one."""
+    i = next(_scan(text, allow, selectors), None)
+    return None if i is None else (i, text[i])
+
+
+def mark(text: str, fmt: str | Callable[[int], str] = "⟨U+{:04X}⟩", allow: str = "\n\t",
+         selectors: bool = True) -> str:
+    """``text`` with every unshowable character (``allow`` and ``selectors`` as in :func:`hidden`) replaced by
+    ``fmt``: a format string given the code point, or a callable from the code point to the replacement (``""``
+    strips it). One pass over ``text``."""
     render = fmt if callable(fmt) else fmt.format
-    at = set(found)
-    return "".join(render(ord(ch)) if i in at else ch for i, ch in enumerate(text))
+    parts: list[str] = []
+    last = 0
+    for i in _scan(text, allow, selectors):
+        parts.append(text[last:i])
+        parts.append(render(ord(text[i])))
+        last = i + 1
+    if not parts:
+        return text
+    parts.append(text[last:])
+    return "".join(parts)

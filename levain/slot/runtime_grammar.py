@@ -340,7 +340,7 @@ def _display(value: object, field: str) -> str:
     for c in value:
         if c in _BIDI_CONTROLS or unicodedata.category(c) not in _DISPLAY_CATEGORIES:
             raise Refused("bad-value", f"{field}: U+{ord(c):04X}")
-    found = unshowable.first_hidden(value, allow="")
+    found = unshowable.first_hidden(value, allow="", selectors=False)
     if found is not None:
         raise Refused("bad-value", f"{field}: U+{ord(found[1]):04X}")
     return value

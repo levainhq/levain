@@ -130,6 +130,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NPM_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _NPM_ACCESS = ("default", "public", "restricted")
 _ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+_RAW_TAIL = 4096     # characters of a tool's raw output read for its outcome (the 400 kept come from these)
 
 
 class PublishRefused(ValueError):
@@ -184,7 +185,7 @@ class PublishResult:
 
 
 def _showable(name: str, text: str) -> None:
-    found = unshowable.first_hidden(text, allow="")
+    found = unshowable.first_hidden(text, allow="", selectors=False)
     if found is not None:
         raise PublishRefused(f"the {name} carries an invisible or direction-changing character "
                              f"(U+{ord(found[1]):04X}); the operator could not read what he is asked to allow")
@@ -724,7 +725,10 @@ def _record(home: Path, key: str, result: PublishResult, receipt: Callable[[dict
 def _outcome(call: dict[str, Any], base: dict[str, Any], p: subprocess.CompletedProcess) -> PublishResult:
     """What the tool's exit says: ``status`` ``"unknown"`` for a non-zero twine exit on more than one file (the first
     may be on the index already)."""
-    tail = _clean((p.stderr or "").strip() or (p.stdout or "").strip()).strip()[-400:]
+    # the raw tail first (bounded work on any size of output), then cleaned, then the 400 kept; a cut through a
+    # terminal escape leaves its printable remainder, never a hidden character
+    raw = (p.stderr or "").strip() or (p.stdout or "").strip()
+    tail = _clean(raw[-_RAW_TAIL:]).strip()[-400:]
     if p.returncode != 0 and call["index"] == "pypi" and len(call["files"]) > 1:
         return PublishResult(ok=False, status="unknown", exit=p.returncode,
                              detail=f"twine exited {p.returncode} part way through {len(call['files'])} files: "

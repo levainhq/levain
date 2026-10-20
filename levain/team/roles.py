@@ -7,6 +7,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from levain import unshowable
+
 from .entry import HANDLE_RE, MODES, safe_handle
 
 
@@ -66,9 +68,10 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
     except tomllib.TOMLDecodeError as exc:
         raise RolesError(f"{where} is not valid TOML: {exc}") from None
     try:
-        # Folded on read, so a team.toml written before the printable rule still loads (refusing it would roll the
-        # roster back or drop the whole team); writers go through validate_team with the folded name.
-        project = " ".join("".join(c if c.isprintable() else " " for c in str(raw["project"])).split())
+        # Folded on read, so a team.toml written before the showable rule still loads (refusing it would roll the
+        # roster back or drop the whole team); writers go through validate_team with the folded name. Every
+        # character levain.unshowable calls hidden becomes a space, so the folded name passes validate_team.
+        project = " ".join(unshowable.mark(str(raw["project"]), " ", allow="").split())
         t = Team(project=project, owner=str(raw["owner"]),
                  members={str(k): str(v) for k, v in dict(raw.get("members", {})).items()},
                  client_owners=raw.get("client_owners", []),
@@ -94,9 +97,10 @@ def handle_problem(h: object) -> str | None:
 def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.mode not in MODES:
         raise RolesError(f"{where}: mode must be one of {', '.join(MODES)}")
-    if not t.project.isprintable():   # empty stays allowed, as in 0.6.3 (L3 r3: refusing it dropped old teams)
-        # The project name heads PROJECT.md and the hooks' lines: a line break in it would let whoever
-        # edits team.toml draw text that reads as levain's own.
+    # empty stays allowed, as in 0.6.3 (L3 r3: refusing it dropped old teams)
+    if unshowable.first_hidden(t.project, allow="") is not None:
+        # The project name heads PROJECT.md and the hooks' lines: a line break or a hidden character in it would
+        # let whoever edits team.toml draw text that reads as levain's own, or other than it is.
         raise RolesError(f"{where}: project must be a single line of printable text")
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")

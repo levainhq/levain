@@ -134,7 +134,7 @@ def _agent_and_session(agent: str | None, session: str | None) -> tuple[str, str
 
 def _showable(name: str, text: str) -> None:
     """Refuse a field the operator would read with a character he cannot see (``ValueError``)."""
-    found = unshowable.first_hidden(text, allow="")
+    found = unshowable.first_hidden(text, allow="", selectors=False)
     if found is not None:
         raise ValueError(f"the {name} carries an invisible or direction-changing character (U+{ord(found[1]):04X}); "
                          "the operator could not read what he is asked to allow")

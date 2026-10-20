@@ -202,10 +202,11 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
     return now
 
 
-def _has_control(text: str) -> bool:
+def _has_control(text: str, selectors: bool = True) -> bool:
     # any unshowable character (levain.unshowable): control and format characters, the line and paragraph
-    # separators a model or a renderer can read as a line break, invisible spaces and fillers
-    return unshowable.first_hidden(text, allow="") is not None
+    # separators a model or a renderer can read as a line break, invisible spaces and fillers. selectors=False for an
+    # id or a path (no presentation selector at all); the default is the rule for text a person reads
+    return unshowable.first_hidden(text, allow="", selectors=selectors) is not None
 
 
 def _line(name: str, value: Any, low: int, high: int) -> str:
@@ -418,9 +419,9 @@ class QuestionStore:
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {', '.join(AGENTS)}: {agent!r}")
         if (not isinstance(agent_session_id, str) or not 0 < len(agent_session_id) <= _SESSION_MAX
-                or _has_control(agent_session_id)):
+                or _has_control(agent_session_id, selectors=False)):
             raise ConsentError(f"agent_session_id must be 1 to {_SESSION_MAX} characters with no control characters")
-        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd):
+        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd) or _has_control(cwd, selectors=False):
             raise ConsentError("cwd must be an absolute path")
         what = _line("what", what, 1, _WHAT_MAX)
         opts = _options_of(options)
@@ -447,7 +448,8 @@ class QuestionStore:
                 raise ConsentError("a link must name one of the question's option keys")
             if link.kind != "push":
                 raise ConsentError(f"a link's kind must be push: {link.kind!r}")
-            if not all(isinstance(v, str) and v and not _has_control(v) for v in (link.request_id, link.queue_id)):
+            if not all(isinstance(v, str) and v and not _has_control(v, selectors=False)
+                       for v in (link.request_id, link.queue_id)):
                 raise ConsentError("a link names its request and queue by id")
         qid = "q-" + os.urandom(12).hex()
         stamp = utc_stamp(_now_utc(self._clock))

@@ -25,12 +25,14 @@
   };
 
   // ONE sanitising boundary. Every string in the manifest and the panels goes through clean() once, on
-  // entry, so no per-field guard can miss a field. The server's visible() (levain.unshowable) runs first; this is
-  // the second layer, over the same set as unshowable.is_unshowable: it shows as <U+XXXX> every control, format,
-  // surrogate, separator, private-use, unassigned or default-ignorable character, every space but U+0020, and
-  // the characters that draw nothing. Kept as they are: a tab and newlines (structure); the zero-width joiner and
-  // non-joiner (emoji sequences and Persian or Indic text need them); U+FE0E and U+FE0F, whose context rule is the
-  // server's (it has already marked every one that hides, and marking the rest here would break "⚠️").
+  // entry, so no per-field guard can miss a field. This is a RENDER ESCAPE, not the judge of what hides: the
+  // server's levain.unshowable is, and a row's text_hidden flag (computed there) is what locks its editing.
+  // HOSTILE is a context-free approximation of unshowable.is_unshowable: it shows as <U+XXXX> every control,
+  // format, surrogate, separator, private-use, unassigned or default-ignorable character, every space but U+0020,
+  // and the characters that draw nothing. Kept as they are: a tab and newlines (structure); the zero-width joiner
+  // and non-joiner (emoji sequences and Persian or Indic text need them); U+FE0E and U+FE0F, whose rule depends on
+  // the character before them (marking every one here would break "⚠️"). So a kept one may still hide: the
+  // server's flag, not this escape, decides whether that row's text can be edited here.
   const HOSTILE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Zs}\p{Default_Ignorable_Code_Point}\u2800\u{16fe4}\u{1d159}]/gu;
   const KEPT = new Set(["\n", "\t", " ", "\u200c", "\u200d", "\ufe0e", "\ufe0f"]);
   function visible(v) {
@@ -487,13 +489,14 @@
     // clean to one) rejects that panel alone; a collision in the manifest or between two panel ids is
     // refused whole, since the references between them cannot then be told apart.
     const snap = { manifest: clean(raw.manifest), panels: Object.create(null) };
-    // the rows whose text the sanitiser would change: known here, while the raw string is still in hand
+    // the rows whose text hides a character: the server's text_hidden flag (levain.unshowable over the raw
+    // title and body) is the one judge; the page never decides this itself
     const hiddenRows = new Set();
     for (const key of Object.keys(raw.panels || {})) {
       const rp = raw.panels[key];
       for (const r of (isObj(rp) ? (Array.isArray(rp.rows) ? rp.rows : []).concat(Array.isArray(rp.held) ? rp.held : []) : [])) {
         if (!isObj(r) || typeof r.id !== "string") continue;
-        if ([r.body, r.title].some((t) => typeof t === "string" && visible(t) !== t)) hiddenRows.add(visible(r.id));
+        if (r.text_hidden === true) hiddenRows.add(visible(r.id));
       }
     }
     for (const key of Object.keys(raw.panels || {})) {

@@ -68,7 +68,7 @@ def session_problem(session: Any) -> str | None:
         return "no session was named"
     if len(session) > _SESSION_MAX:
         return f"the session id is over {_SESSION_MAX} characters"
-    if unshowable.first_hidden(session, allow="") is not None:
+    if unshowable.first_hidden(session, allow="", selectors=False) is not None:
         return "the session id holds a control character"
     if _SUBAGENT in session:
         return "the session is a subagent's"
