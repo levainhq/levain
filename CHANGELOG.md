@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.11] — 2026-10-20
+
 ### Added
 - **Export with your organisation's names.** `levain consent receipts export --format agentboundary --names FILE` maps
   Levain's own names (the actor, the approver's key, the policy, the capability, the working directory) to the aliases
