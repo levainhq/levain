@@ -20,14 +20,27 @@ from typing import Any
 
 import pytest
 
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent import ConsentQueue, ruling_message
 from levain.consent import agentboundary as ab
+from levain.consent.ledger import Ledger
 from levain.consent.queue import UNDECIDED_GRACE
 from levain.consent.record import RULING_NAMESPACE
 from tests.test_consent_queue import Clock, Key, Log, signed
 
 HEX64 = re.compile(r"^[a-f0-9]{64}$")
+REAL_UTCNOW = ab._utcnow
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _far_future_real_clock():
+    """The exporter refuses an export clock ahead of the real one, and these tests export 'days later' on queues whose
+    own clock is real time: the real clock the exporter compares with is moved out of the way (the refusal itself is
+    tested with the real one)."""
+    patch = pytest.MonkeyPatch()
+    patch.setattr(ab, "_utcnow", lambda: datetime.now(timezone.utc) + timedelta(days=60))
+    yield
+    patch.undo()
 
 
 def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
@@ -48,29 +61,39 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     queue = ConsentQueue(tmp / "consent", authority=log.source, clock=clock)
     ids: dict[str, str] = {}
 
+    calls: dict[str, tuple[str, Any, str, str | None, str | None]] = {}     # name -> what the agent's hook reports
+
     def file(name: str, tool: str, tool_input: Any, *, agent: str = "claude_code", cwd: str = str(ws),
-             hold: timedelta = timedelta(minutes=5), tier: str = "T2"):
+             hold: timedelta = timedelta(minutes=5), tier: str = "T2", use_id: str | None = None,
+             ends: str | None = None):
+        """File a request; ``ends`` (``post`` / ``post_failure``) files the ledger row of its call at the end."""
         request = queue.file(agent=agent, agent_session_id=f"sess-{name}", tool_name=tool, tool_input=tool_input,
-                             cwd=cwd, hold=hold, tier=tier)
+                             cwd=cwd, hold=hold, tier=tier, event_id=use_id)
         ids[name] = request.id
+        if ends is not None:
+            calls[name] = (tool, tool_input, cwd, use_id, ends)
         return request
 
     edit = {"file_path": str(ws / "a.txt"), "old_string": "a", "new_string": "b"}
-    request = file("grant", "Edit", edit)
+    request = file("grant", "Edit", edit, use_id="tu-grant", ends="post")
     assert queue.answer_by_grant(request.id, tool_input=edit, posture="default") is not None
-    request = file("signed_allow", "Bash", {"command": "touch /tmp/x"})
+    request = file("signed_allow", "Bash", {"command": "touch /tmp/x"}, ends="post")
     answer = signed(queue, request, laptop, "allow")
     clock.now += timedelta(seconds=2)                      # the queue applies the answer after the signer signed it
     queue.answer(request.id, *answer)
-    request = file("signed_same", "Bash", {"command": "touch /tmp/same"})
+    request = file("signed_same", "Bash", {"command": "touch /tmp/same"}, ends="post")
     queue.answer(request.id, *signed(queue, request, laptop, "allow"))     # applied in the stamp it was signed in
+    request = file("failed", "Bash", {"command": "false"}, use_id="tu-failed", ends="post_failure")
+    queue.answer(request.id, *signed(queue, request, laptop, "allow"))
+    request = file("unrecorded", "Bash", {"command": "never ended"})        # permitted; no ledger row ever came
+    queue.answer(request.id, *signed(queue, request, laptop, "allow"))
     request = file("denied", "Write", {"file_path": "/tmp/y"}, agent="codex")
     answer = signed(queue, request, laptop, "deny")
     clock.now += timedelta(seconds=2)
     queue.answer(request.id, *answer)
     request = file("undecided", "Bash", {"command": "rm -r build"})
     assert queue.mark_undecided(request.id).state == "undecided"
-    request = file("ruled_allow", "Bash", {"command": "make"}, tier="T3")
+    request = file("ruled_allow", "Bash", {"command": "make"}, tier="T3", ends="post")
     assert queue.mark_undecided(request.id).gap == 1
     payload = queue.ruling_payload(request.id, "allow", laptop.fp)
     clock.now += timedelta(seconds=2)
@@ -85,11 +108,11 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     file("ran", "Bash", {"command": "echo ran"})
     clock.now += timedelta(seconds=2)                      # the operator answers the dialog after it opened
     assert queue.record_ran(agent="claude_code", agent_session_id="sess-ran", tool_name="Bash",
-                            tool_input={"command": "echo ran"}, event="post")[1] == "ran"      # answered while held
+                            tool_input={"command": "echo ran"}, event="PostToolUse")[1] == "ran"      # answered while held
     request = file("ran_unasked", "Bash", {"command": "echo unasked"})
     assert queue.withdraw(request.id)
     assert queue.record_ran(agent="claude_code", agent_session_id="sess-ran_unasked", tool_name="Bash",
-                            tool_input={"command": "echo unasked"}, event="post")[1] == "ran_unasked"
+                            tool_input={"command": "echo unasked"}, event="PostToolUse")[1] == "ran_unasked"
     request = file("did_not_run", "Bash", {"command": "echo no"})
     assert queue.withdraw(request.id)
     assert queue.close_unrun(agent="claude_code", agent_session_id="sess-did_not_run", event="stop") == [request.id]
@@ -99,7 +122,26 @@ def build_scratch(tmp: Path) -> tuple[ConsentQueue, dict[str, str]]:
     clock.now += timedelta(minutes=1) + UNDECIDED_GRACE + timedelta(seconds=1)
     assert queue.sweep() == 1
     file("pending", "Bash", {"command": "still waiting"})
+    file_ledger_rows(queue, ids, calls)
     return queue, ids
+
+
+def file_ledger_rows(queue: ConsentQueue, ids: dict[str, str], calls: dict[str, tuple], *,
+                     after: timedelta = timedelta(seconds=3)) -> None:
+    """The ledger rows the agent's PostToolUse / PostToolUseFailure hooks file for the calls that ended, the way
+    ``levain.consent.ledger.hook_record`` files them (agent, session key, tool, input, cwd, phase, tool-use id):
+    ``after`` past each request's decision."""
+    ledger = Ledger(queue.directory)
+    conn = sqlite3.connect(queue.path)
+    try:
+        decided = {name: conn.execute("SELECT decided_at FROM requests WHERE id = ?", (ids[name],)).fetchone()[0]
+                   for name in calls}
+    finally:
+        conn.close()
+    for name, (tool, tool_input, cwd, use_id, phase) in calls.items():
+        ledger.record_call(agent="claude_code", agent_session_id=f"sess-{name}", tool_name=tool, tool_input=tool_input,
+                           cwd=cwd, phase=phase, tool_use_id=use_id,
+                           received_at=parse_stamp(decided[name]) + after)
 
 
 def later(queue, days=2):
@@ -143,7 +185,7 @@ def test_every_terminal_row_is_one_receipt_in_seq_order_and_pending_is_not_expor
     # an undecided request that was ruled has two rows, so two receipts
     assert len([1 for r in terminal if r[1] == "undecided"]) == 3
     assert exported.report.receipts == len(terminal) == len(exported.receipts)
-    assert exported.report.by_state == {"allowed": 4, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 4}
+    assert exported.report.by_state == {"allowed": 6, "denied": 2, "expired": 1, "undecided": 3, "withdrawn": 4}
     assert exported.report.pending_skipped == len(rows) - len(terminal)
 
 
@@ -212,9 +254,17 @@ def test_a_signed_allow_requires_approval_and_carries_the_operators_approval(scr
     assert approval["approved_at"] < r["execution"]["completed_at"] == r["issued_at"]
     assert approval["approved_at"] == _signed_at(queue, ids["signed_allow"])
     assert r["provenance"]["approval.approved_at"] == "inferred"
-    assert r["provenance"]["execution.status"] == "synthesized"      # permitted, never known to have run
+    assert r["provenance"]["execution.status"] == "inferred"      # the ledger saw the call end
     assert json.loads(approval["context"]) == {"queue": queue.queue_id, "request_id": ids["signed_allow"],
                                                "via": "signature", "verify": "levain consent receipts verify"}
+
+
+def _decided_at(queue, request_id):
+    conn = sqlite3.connect(queue.path)
+    try:
+        return conn.execute("SELECT decided_at FROM requests WHERE id = ?", (request_id,)).fetchone()[0]
+    finally:
+        conn.close()
 
 
 def _signed_at(queue, request_id):
@@ -227,9 +277,9 @@ def _signed_at(queue, request_id):
 
 def test_a_signed_answer_in_the_stamp_it_was_applied_falls_back_to_the_decision_time_and_is_counted(scratch):
     r = _row(scratch, "signed_same", "allowed")
-    assert r["approval"]["approved_at"] == r["execution"]["completed_at"]
+    assert r["approval"]["approved_at"] == _decided_at(scratch[0], scratch[1]["signed_same"]) < r["execution"]["completed_at"]
     assert r["provenance"]["approval.approved_at"] == "synthesized"
-    assert scratch[2].report.approved_at_fallback == 1
+    assert scratch[2].report.approved_at_fallback == 3          # signed_same, failed, unrecorded: all signed in-stamp
 
 
 def test_approved_at_precedes_completed_at_for_every_signed_allow_but_the_counted_fallback(scratch):
@@ -240,7 +290,7 @@ def test_approved_at_precedes_completed_at_for_every_signed_allow_but_the_counte
             seen += 1
             if r["provenance"]["approval.approved_at"] == "inferred":
                 assert r["approval"]["approved_at"] < r["execution"]["completed_at"]
-    assert seen == 3 + 0           # signed_allow, signed_same, ruled_allow
+    assert seen == 5           # signed_allow, signed_same, ruled_allow, failed, unrecorded
 
 
 def test_a_denied_request_is_a_refusal_deny_with_no_approval_block(scratch):
@@ -326,7 +376,7 @@ def test_a_ran_unasked_outcome_is_an_allow_under_the_agents_own_permissions_with
     assert unasked["execution"]["status"] == "success" and "approval" not in unasked and "refusal" not in unasked
     assert unasked["execution"]["completed_at"] == _outcome_time(scratch, "ran_unasked")
     assert unasked["provenance"]["policy.name"] == "inferred" and unasked["provenance"]["policy.version"] == "synthesized"
-    assert ("claude-code.native-permissions", "unknown") in scratch[2].policy_store()
+    assert ("claude-code.native-permissions", "unknown") in scratch[2].referenced_policies()
     assert not ab_validate(unasked)
 
 
@@ -418,7 +468,7 @@ def test_an_empty_queue_exports_nothing(tmp_path):
     queue = ConsentQueue(tmp_path / "consent", authority=log.source)
     queue.sweep()                                                       # opens the store, creating the schema
     exported = ab.export(queue.directory)
-    assert exported.receipts == [] and exported.policy_store() == set()
+    assert exported.receipts == [] and exported.referenced_policies() == set()
     assert exported.report.receipts == 0 and exported.report.held_unsettled == 0 and exported.report.pending_skipped == 0
 
 
@@ -438,7 +488,7 @@ def _late_world(tmp_path):
 
 def _ran_late(queue):
     return queue.record_ran(agent="claude_code", agent_session_id="s-late", tool_name="Bash",
-                            tool_input={"command": "late"}, event="post")
+                            tool_input={"command": "late"}, event="PostToolUse")
 
 
 def test_a_late_outcome_inside_settle_is_held_back_then_exported_with_an_identical_prefix(tmp_path):
@@ -457,15 +507,21 @@ def test_a_late_outcome_inside_settle_is_held_back_then_exported_with_an_identic
 
 
 def test_the_export_stops_at_the_first_unsettled_row_and_counts_what_it_held(tmp_path):
-    queue, clock, t0 = _late_world(tmp_path)
+    queue, clock, t0 = _late_world(tmp_path)               # s-late: withdrawn at t0, settled by the time below
+    clock.now = t0 + ab.SETTLE + timedelta(hours=6)
+    young = queue.file(agent="claude_code", agent_session_id="s-young", tool_name="Bash", tool_input={"command": "y"},
+                       cwd=str(tmp_path), hold=timedelta(minutes=5), tier="T2")
+    assert queue.withdraw(young.id)                                     # the first unsettled row
     request = queue.file(agent="claude_code", agent_session_id="s-after", tool_name="Bash", tool_input={"command": "z"},
                          cwd=str(tmp_path), hold=timedelta(minutes=5), tier="T2")
     assert queue.mark_undecided(request.id).state == "undecided"        # a terminal row AFTER the unsettled one
-    held = ab.export(queue.directory, now=t0 + timedelta(minutes=1))
+    held = ab.export(queue.directory, now=clock.now + timedelta(minutes=1))
     assert held.report.held_unsettled == 2
-    assert held.report.receipts == 0 and held.receipts == []
-    assert ab.export(queue.directory, now=t0 + ab.SETTLE * 2).report.receipts == 2
-    assert all("s-after" not in r["actor"]["id"] for r in held.receipts)
+    assert held.report.receipts == 1 and len(held.receipts) == 1        # only the settled row before the stop
+    assert held.receipts[0]["actor"]["id"].endswith("session/s-late")
+    assert all("s-after" not in r["actor"]["id"] and "s-young" not in r["actor"]["id"] for r in held.receipts)
+    later_export = ab.export(queue.directory, now=clock.now + ab.SETTLE * 2)
+    assert later_export.report.receipts == 3 and later_export.receipts[0] == held.receipts[0]
 
 
 def test_a_row_older_than_settle_exports_by_state_and_a_later_outcome_changes_nothing(tmp_path):
@@ -528,3 +584,244 @@ def test_a_receipt_row_whose_request_is_missing_is_refused_not_dropped(tmp_path)
 def test_an_integer_past_the_safe_range_cannot_be_hashed():
     with pytest.raises(ab.ExportError):
         ab.receipt_hash({"n": 2 ** 60})
+
+
+# --- R11: execution comes from evidence -------------------------------------------------------------------------
+def _stamps_ordered(r):
+    return parse_stamp(r["execution"]["completed_at"]) <= parse_stamp(r["issued_at"])
+
+
+def test_an_allowed_request_takes_its_execution_from_the_ledger_row_of_its_call(scratch):
+    queue, ids, exported = scratch
+    grant = _row(scratch, "grant", "allowed")
+    assert grant["execution"]["status"] == "success" and "error_code" not in grant["execution"]
+    assert grant["execution"]["completed_at"] == grant["issued_at"] > _decided_at(queue, ids["grant"])
+    assert grant["provenance"]["issued_at"] == "inferred" and grant["provenance"]["execution.status"] == "inferred"
+    failed = _row(scratch, "failed", "allowed")
+    assert failed["execution"]["status"] == "failure" and failed["execution"]["error_code"] == "tool-failed"
+    assert failed["policy"]["decision"] == "require-approval" and "approval" in failed and "refusal" not in failed
+    assert failed["provenance"]["execution.error_code"] == "inferred"
+    unrecorded = _row(scratch, "unrecorded", "allowed")
+    assert unrecorded["execution"]["status"] == "blocked" and unrecorded["execution"]["error_code"] == "execution-unrecorded"
+    assert "refusal" not in unrecorded and "approval" in unrecorded
+    assert unrecorded["provenance"]["execution.status"] == "synthesized"
+    assert unrecorded["provenance"]["execution.error_code"] == "synthesized"
+    assert unrecorded["issued_at"] == unrecorded["execution"]["completed_at"] == _decided_at(queue, ids["unrecorded"])
+    assert (exported.report.execution_failed, exported.report.execution_unrecorded, exported.report.ledger_found) == (1, 1, True)
+    for r in (grant, failed, unrecorded):
+        assert not ab_validate(r)
+
+
+def test_completed_at_never_follows_issued_at(scratch):
+    for r in scratch[2].receipts:
+        assert _stamps_ordered(r), r["execution"]["result_ref"]
+
+
+def test_a_store_with_no_ledger_has_no_evidence(tmp_path):
+    queue, ids = build_scratch(tmp_path)
+    for p in queue.directory.glob("ledger.db*"):
+        p.unlink()
+    exported = ab.export(queue.directory, now=later(queue))
+    assert exported.report.ledger_found is False and exported.report.execution_unrecorded == 6
+    coded = [r for r in exported.receipts if "error_code" in r["execution"]]
+    assert len(coded) == 6 and {r["execution"]["error_code"] for r in coded} == {"execution-unrecorded"}
+    assert all(r["execution"]["status"] == "blocked" and "refusal" not in r for r in coded)
+    assert not any(not _stamps_ordered(r) for r in exported.receipts)
+
+
+def _allow_world(tmp_path, use_ids=(None,)):
+    """A bare queue holding one signed-allow request per entry of ``use_ids`` (the same call each time, a minute
+    apart); returns the queue, its clock, T0 and the requests."""
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "auth").mkdir()
+    laptop = Key(tmp_path / "keys", "laptop")
+    log = Log(tmp_path / "auth", {"laptop": laptop})
+    log.enrol("laptop", "laptop-presence")
+    clock = Clock(datetime.now(timezone.utc))
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    t0, requests = clock.now, []
+    for use_id in use_ids:
+        request = queue.file(agent="claude_code", agent_session_id="s-run", tool_name="Bash",
+                             tool_input={"command": "same"}, cwd=str(tmp_path), hold=timedelta(minutes=5),
+                             tier="T2", event_id=use_id)
+        queue.answer(request.id, *signed(queue, request, laptop, "allow"))
+        requests.append(request)
+        clock.now += timedelta(minutes=1)
+    return queue, clock, t0, requests
+
+
+def _post(queue, at, *, phase="post", use_id=None, tool="Bash", command="same", session="s-run"):
+    Ledger(queue.directory).record_call(agent="claude_code", agent_session_id=session, tool_name=tool,
+                                        tool_input={"command": command}, cwd=str(queue.directory.parent), phase=phase,
+                                        tool_use_id=use_id, received_at=at)
+
+
+def test_an_allowed_request_with_no_evidence_is_held_until_settle_then_exports_unrecorded(tmp_path):
+    queue, clock, t0, _ = _allow_world(tmp_path)
+    young = ab.export(queue.directory, now=t0 + timedelta(hours=1))
+    assert young.report.held_unsettled == 1 and young.receipts == []
+    old = ab.export(queue.directory, now=t0 + ab.SETTLE + timedelta(minutes=5))
+    assert old.report.held_unsettled == 0 and old.report.execution_unrecorded == 1
+    assert old.receipts[0]["execution"]["status"] == "blocked"
+    assert not ab_validate(old.receipts[0])
+
+
+def test_evidence_inside_the_window_counts_and_the_exported_prefix_never_changes(tmp_path):
+    queue, clock, t0, _ = _allow_world(tmp_path)
+    assert ab.export(queue.directory, now=t0 + timedelta(minutes=1)).receipts == []
+    _post(queue, t0 + timedelta(minutes=2))
+    first = ab.export(queue.directory, now=t0 + timedelta(minutes=3))
+    assert first.receipts[0]["execution"]["status"] == "success"
+    assert ab.export(queue.directory, now=t0 + ab.SETTLE * 3).receipts == first.receipts
+
+
+def test_evidence_past_the_window_changes_nothing(tmp_path):
+    queue, clock, t0, _ = _allow_world(tmp_path)
+    now = t0 + ab.SETTLE + timedelta(minutes=5)
+    before = ab.export(queue.directory, now=now)
+    _post(queue, now - timedelta(minutes=1))                    # lands past SETTLE from the terminal row
+    assert ab.export(queue.directory, now=now + timedelta(minutes=1)).receipts == before.receipts
+    assert before.receipts[0]["execution"]["error_code"] == "execution-unrecorded"
+
+
+@pytest.mark.parametrize("post", [
+    dict(at=timedelta(minutes=-1)),                              # before the decision: another call
+    dict(at=timedelta(minutes=2), use_id="tu-other"),            # both carry an id, and they differ
+    dict(at=timedelta(minutes=2), command="different"),          # another input digest
+    dict(at=timedelta(minutes=2), tool="Edit"),
+    dict(at=timedelta(minutes=2), session="s-other"),
+])
+def test_a_ledger_row_of_another_call_is_not_this_requests_evidence(tmp_path, post):
+    queue, clock, t0, _ = _allow_world(tmp_path, use_ids=("tu-1",))
+    post = dict(post)
+    _post(queue, t0 + post.pop("at"), **post)
+    exported = ab.export(queue.directory, now=t0 + ab.SETTLE + timedelta(hours=1))
+    assert exported.receipts[0]["execution"]["error_code"] == "execution-unrecorded"
+
+
+def test_an_equal_tool_use_id_pairs_and_a_row_serves_one_request(tmp_path):
+    queue, clock, t0, _ = _allow_world(tmp_path, use_ids=("tu-1", "tu-2"))
+    _post(queue, t0 + timedelta(minutes=3), use_id="tu-2")       # the second request's call, not the first's
+    exported = ab.export(queue.directory, now=t0 + ab.SETTLE + timedelta(hours=1))
+    first, second = exported.receipts
+    assert first["execution"]["error_code"] == "execution-unrecorded" and second["execution"]["status"] == "success"
+    # without ids, one ledger row serves the earliest request only
+    (tmp_path / "b").mkdir()
+    q2, c2, t2, _ = _allow_world(tmp_path / "b", use_ids=(None, None))
+    _post(q2, t2 + timedelta(minutes=3))
+    one, two = ab.export(q2.directory, now=t2 + ab.SETTLE + timedelta(hours=1)).receipts
+    assert one["execution"]["status"] == "success" and two["execution"]["error_code"] == "execution-unrecorded"
+
+
+def test_a_failure_event_closes_a_dialog_run_as_a_failure_and_a_non_tool_event_is_refused(tmp_path):
+    queue, clock, t0 = _late_world(tmp_path)
+    clock.now = t0 + timedelta(minutes=2)
+    assert queue.record_ran(agent="claude_code", agent_session_id="s-late", tool_name="Bash",
+                            tool_input={"command": "late"}, event="PostToolUseFailure")[1] == "ran"
+    r = ab.export(queue.directory, now=t0 + timedelta(minutes=3)).receipts[-1]
+    assert r["execution"]["status"] == "failure" and r["execution"]["error_code"] == "tool-failed"
+    assert r["policy"]["decision"] == "require-approval" and "approval" in r and "refusal" not in r
+    assert r["issued_at"] == r["execution"]["completed_at"] > r["approval"]["approved_at"]      # issued: the later stamp
+    assert r["provenance"]["issued_at"] == "inferred" and _stamps_ordered(r)
+    assert not ab_validate(r)
+    (tmp_path / "b").mkdir()
+    q2, c2, t2 = _late_world(tmp_path / "b")
+    c2.now = t2 + timedelta(minutes=2)
+    assert q2.record_ran(agent="claude_code", agent_session_id="s-late", tool_name="Bash",
+                         tool_input={"command": "late"}, event="Stop")[1] == "ran"
+    with pytest.raises(ab.ExportError, match="not a tool event"):
+        ab.export(q2.directory, now=t2 + timedelta(minutes=3))
+
+
+def test_an_export_clock_ahead_of_the_real_one_is_refused(tmp_path, monkeypatch):
+    queue, _ = build_scratch(tmp_path)
+    monkeypatch.setattr(ab, "_utcnow", REAL_UTCNOW)
+    with pytest.raises(ab.ExportError, match="ahead of the real clock"):
+        ab.export(queue.directory, now=datetime.now(timezone.utc) + timedelta(minutes=1))
+    ab.export(queue.directory, now=datetime.now(timezone.utc) + timedelta(seconds=2))      # within the slack
+
+
+# --- R11: provenance, fail-closed values, the score --------------------------------------------------------------
+OBSERVED_ALWAYS = {"issued_at": "observed", "tool.name": "observed", "target.resource_id": "observed"}
+COMPOSED = {"actor.id": "inferred", "agent.framework": "inferred", "policy.name": "inferred"}
+
+
+def test_the_provenance_of_composed_values_is_inferred_for_every_row_kind(scratch):
+    """Pinned per kind (the formula's own self-consistency is checked elsewhere): a value built from more than one
+    column, renamed or prefixed is `inferred`; only a column copied as it is, `observed`."""
+    exported = scratch[2]
+    for r in exported.receipts:
+        p = r["provenance"]
+        assert p["actor.id"] == p["agent.framework"] == "inferred", r["execution"]["result_ref"]
+        assert p["policy.name"] == "inferred" and p["tool.name"] == "observed" and p["target.resource_id"] == "observed"
+        assert p["agent.framework_version"] == p["agent.model"] == p["policy.version"] == "synthesized"
+        assert p["target.system"] == p["target.environment"] == "synthesized"
+        assert p["tool.capability"] == "inferred" and p["execution.result_ref"] == "inferred"
+        assert p["arguments_hash"] in ("observed", "synthesized")
+        if "approval" in r:
+            assert p["approval.approver.id"] == "inferred" and p["approval.context"] == "inferred"
+            assert p["approval.approver.role"] == "synthesized"
+    grant = _row(scratch, "grant", "allowed")["provenance"]
+    assert grant == {
+        "actor.id": "inferred", "actor.type": "inferred", "agent.framework": "inferred",
+        "agent.framework_version": "synthesized", "agent.model": "synthesized", "arguments_hash": "observed",
+        "execution.completed_at": "inferred", "execution.result_ref": "inferred", "execution.status": "inferred",
+        "issued_at": "inferred", "policy.decision": "inferred", "policy.name": "inferred",
+        "policy.version": "synthesized",
+        "receipt_id": "inferred", "target.environment": "synthesized", "target.resource_id": "observed",
+        "target.system": "synthesized", "tool.capability": "inferred", "tool.name": "observed"}
+    denied = _row(scratch, "denied", "denied")["provenance"]
+    assert denied["issued_at"] == "observed" and denied["refusal.verdict"] == denied["refusal.reason_code"] == "inferred"
+    assert "execution.error_code" not in denied and not any(k.startswith("approval") for k in denied)
+    ran = _row(scratch, "ran", "withdrawn")["provenance"]
+    assert (ran["approval.approver.id"], ran["approval.approved_at"], ran["approval.context"]) == (
+        "inferred", "synthesized", "inferred")
+    assert _row(scratch, "ran_unasked", "withdrawn")["provenance"]["policy.name"] == "inferred"
+
+
+def _corrupt(queue, sql, args=()):
+    conn = sqlite3.connect(queue.path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+            conn.execute(f'DROP TRIGGER "{name}"')
+        conn.execute(sql, args)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("sql,arg,match", [
+    ("UPDATE requests SET tool_input_digest = 'jcs:' || ? WHERE id = ?", "g" * 64, "64 lowercase hex"),
+    ("UPDATE requests SET tool_input_digest = 'jcs:' || ? WHERE id = ?", "A" * 64, "64 lowercase hex"),
+    ("UPDATE requests SET cwd = ? WHERE id = ?", "", "empty"),
+    ("UPDATE requests SET agent_session_id = ? WHERE id = ?", "", "empty"),
+    ("UPDATE requests SET decided_at = ? WHERE id = ?", "garbage", "decision time"),
+    ("UPDATE receipts SET created_at = ? WHERE request_id = ?", "garbage", "stamp"),
+])
+def test_a_value_the_spec_would_reject_is_an_export_error_not_a_receipt(tmp_path, sql, arg, match):
+    queue, ids = build_scratch(tmp_path)
+    _corrupt(queue, sql, (arg, ids["signed_allow"]))
+    with pytest.raises(ab.ExportError, match=match):
+        ab.export(queue.directory, now=later(queue))
+
+
+def test_a_dialog_outcome_time_is_parsed_only_where_it_is_used(tmp_path):
+    queue, ids = build_scratch(tmp_path)
+    clean = ab.export(queue.directory, now=later(queue))
+    _corrupt(queue, "INSERT INTO dialog_outcomes (request_id, outcome, closed_at, event) VALUES (?, 'ran', 'garbage', 'PostToolUse')",
+             (ids["denied"],))                                       # a denied row ignores any outcome
+    assert ab.export(queue.directory, now=later(queue)).receipts == clean.receipts
+
+
+@pytest.mark.parametrize("score", ["0.5", True, [1], float("nan"), float("inf")])
+def test_a_score_that_is_not_a_number_is_an_export_error(score):
+    with pytest.raises(ab.ExportError, match="not a number"):
+        ab.receipt_hash({"completeness_score": score})
+
+
+def test_receipt_hash_agrees_with_an_independent_rfc_8785_implementation(scratch):
+    rfc8785 = pytest.importorskip("rfc8785")
+    import hashlib
+    for r in scratch[2].receipts:
+        body = {k: v for k, v in r.items() if k != "receipt_hash"}
+        assert hashlib.sha256(rfc8785.dumps(body)).hexdigest() == r["receipt_hash"], r["execution"]["result_ref"]
