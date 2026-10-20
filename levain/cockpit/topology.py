@@ -602,7 +602,8 @@ def topology_reader(*, install_root: Path | None,
         if install_root is None:
             return Fault("topology is blind: no install root, the sessions are kept in the install")
         try:
-            recs = _records(install_root, ctx.now, (ctx.now - now).total_seconds())
+            recs = (_records(install_root, ctx.now, back_s=(ctx.now - now).total_seconds()) if past
+                    else _records(install_root, ctx.now))
         except OSError as exc:
             return Fault(f"topology is blind: the session records are unreadable ({type(exc).__name__})")
 
