@@ -149,9 +149,9 @@ def _steps_problem(steps: Any) -> str | None:
         _verifier_steps(plain)
     except Refused as exc:
         return f"the runtime helper refuses the ticket's steps: {exc}"[:256]
-    except ValueError:
-        # a value the helper could never be handed (a lone surrogate, an integer past canon's range): its own stdin
-        # parse refuses it before the validator runs, so the validator does not name it
+    except (ValueError, TypeError):
+        # a value the helper could never be handed (a lone surrogate, an integer past canon's range, a key that is not
+        # text): its own stdin parse refuses it before the validator runs, so the validator does not name it
         return "a ticket step holds a value the runtime helper's stdin parse refuses"
     return None
 

@@ -239,6 +239,7 @@ def minted(steps=STEPS, *, digest=None, **over) -> VerifierRun:
     minted(({"argv": [""], "wall_s": 1},)),
     minted(({"argv": ["true"], "wall_s": 901},)),
     minted(({"argv": ["true"], "wall_s": 10 ** 5000},), digest="sha256:" + "0" * 64),
+    minted(({1: "x", "argv": ["true"], "wall_s": 5},), digest="sha256:" + "0" * 64),
     minted(({"argv": ["a\ud800"], "wall_s": 1},), digest="sha256:" + "0" * 64),
 ], ids=lambda r: str(r.verifier.get("verifier_id")) + "/" + str(len(r.steps)))
 def test_a_minted_run_that_is_not_the_contracts_entry_and_steps_is_refused(run):
