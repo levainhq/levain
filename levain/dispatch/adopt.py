@@ -9,11 +9,13 @@ whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules
 coordinator build. Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
 records a land judges are the job store's own (:meth:`levain.dispatch.jobs.JobStore.run_records`, as
 :meth:`~levain.dispatch.jobs.JobStore.record_verification` wrote them); :func:`land` takes none from its caller,
-so a record built over another staged tree has no way in.
+so a record built over another staged tree has no way to land. Nor does it take a clock: expiry and record age
+are judged on the store's (:meth:`levain.dispatch.jobs.JobStore.stamp`).
 
 :func:`land` is F11 §6: on a verified or recommended job the floor runs in full and only then is ``authorised``
 written, its evidence the INTENT (authority, run, branch, staged commit, base, tree, artifact digest). That write is
-the linearisation point: an ``authorised`` job never re-enters the floor and reads nothing mutable again. From the
+the linearisation point: an ``authorised`` job never re-enters the floor and reads nothing mutable again (its run
+record is an append-only row, re-checked against its digest). From the
 intent: a branch that already contains the staged commit records ``adopted`` and moves nothing (a crash after the
 swap, or the operator's own merge with his commits on top); a branch still at ``base`` is checked out somewhere ->
 Levain prints the operator's own ``git -C <worktree> merge --ff-only <sha>`` and stops (it never touches a
@@ -889,7 +891,7 @@ def _fail_moved(store: JobStore, job: Job, line: str) -> Landing:
 
 def _finish(store: JobStore, job: Job) -> Landing:
     """An authorised job: decide on ``onto`` alone, from the intent (F11 §6); nothing mutable is read. The intent's
-    run record is the store's, and it must still be the one authorised."""
+    run record (that run's append-only row alone) must still be the one authorised."""
     intent = _intent(job)
     repo, onto, staged, base = job.repo, intent["onto"], intent["staged"], intent["base"]
     tip = _read_branch(repo, onto)
@@ -905,8 +907,8 @@ def _finish(store: JobStore, job: Job) -> Landing:
     shape = _commit_shape(repo, staged)
     if shape is None or shape[0] != [base] or shape[1] != intent["tree"]:
         return Landing(outcome="refused", job=job, message="the staged commit is no longer the one authorised")
-    mine = [r for r in store.run_records(job.id) if r.run == intent["run"]]
-    if not mine or artifact_digest(mine[0]) != intent["artifact_digest"]:
+    mine = store.run_record(job.id, intent["run"])
+    if mine is None or artifact_digest(mine) != intent["artifact_digest"]:
         return Landing(outcome="refused", job=job, message="the run's record is no longer the one authorised")
     if _symbolic(repo, onto):
         return Landing(outcome="refused", job=job, message=f"refs/heads/{onto} is a symbolic ref")
@@ -935,8 +937,7 @@ def land(store: JobStore, job_id: str, *,
          landing_tier: Callable[[str, tuple[str, ...]], str],
          resolve_template: Callable[[str], ResolvedTemplate | None], policy: ProviderPolicy,
          onto: str | None = None, human: tuple[Any, Any, Any] | None = None,
-         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None,
-         now: str | None = None) -> Landing:
+         rules: Callable[[], tuple[int, Sequence[dregistry.AdoptionRule]]] | None = None) -> Landing:
     """F11 §6 for job ``job_id``, over the job's own run records (:meth:`JobStore.run_records`; a stored row that
     does not match its digest raises :class:`levain.dispatch.jobs.JobStoreError`). ``human`` is ``(payload, signature,
     authority)`` for (A); ``rules`` returns the active adoption rules and their generation for (B) (``lambda:
@@ -951,7 +952,7 @@ def land(store: JobStore, job_id: str, *,
         raise TransitionRefused(f"no dispatch job {str(job_id)[:40]!r}")
     if job.state == "authorised":
         return _finish(store, job)
-    stamp = now or utc_stamp(store._clock())
+    stamp = store.stamp()
     payload = human[0] if human is not None else None
     records = store.run_records(job.id)
     verdict = floor(job, records, onto=onto, landing_tier=landing_tier, resolve_template=resolve_template,

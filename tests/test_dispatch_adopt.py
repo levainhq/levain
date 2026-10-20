@@ -858,7 +858,7 @@ def test_a_land_reads_the_records_the_verifier_wrote_and_takes_none_from_its_cal
     from tests import test_dispatch_verifier_report as tvr
 
     with_rule(cstore, log, keys, repo)
-    assert "records" not in inspect.signature(land).parameters
+    assert {"records", "now"}.isdisjoint(inspect.signature(land).parameters)   # no caller records, no caller clock
     path, base = repo
     # a job walked to verifying, then both runs through the verifier writer itself
     sub = {"template": "fix-lint", "goal": "Fix a.", "read": ["src/a.py"], "write": WRITES, "base": base,
@@ -886,3 +886,33 @@ def test_a_land_reads_the_records_the_verifier_wrote_and_takes_none_from_its_cal
     assert out.outcome == "adopted", out.message
     assert git(path, "rev-parse", "main") == stored[0].staged_commit
     assert git(path, "rev-parse", "main^{tree}") == tree
+
+
+@pytest.mark.parametrize("stored", ["absent", "another"])
+def test_an_authorised_job_whose_run_record_is_not_the_authorised_one_refuses(stored, jstore, cstore, repo, log, keys,
+                                                                             tmp_path, monkeypatch):
+    # only store damage reaches this: the finish reads the intent's run row alone, and moves nothing without it
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    other = ArtifactRecord(**{**recs[0].__dict__, "verified_at": utc_stamp(NOW)})
+    monkeypatch.setattr(jstore, "run_record", lambda job_id, run: None if stored == "absent" else other)
+    out = adopt._finish(jstore, stale)
+    assert out.outcome == "refused" and "no longer the one authorised" in out.message
+    assert git(repo[0], "rev-parse", "main") == repo[1]                       # nothing moved
+
+
+def test_the_finish_reads_only_the_authorised_runs_row(jstore, cstore, repo, log, keys, tmp_path, monkeypatch):
+    with_rule(cstore, log, keys, repo)
+    job = verified_job(jstore, cstore, repo)
+    recs = runs(repo, job, tmp_path, A_FIX)
+    put(jstore, recs)
+    stale = jstore.authorise(job.id, cause="human_adoption_rule", evidence=__import__("json").dumps(
+        {"authority": "B", "run": 0, "onto": "main", "staged": recs[0].staged_commit, "base": repo[1],
+         "tree": recs[0].tree, "artifact_digest": adopt.artifact_digest(recs[0]), "tier": "T2", "rule": None}))
+    monkeypatch.setattr(jstore, "run_records", lambda job_id: 1 / 0)        # every-row read: never on this path
+    assert adopt._finish(jstore, stale).outcome == "adopted"
