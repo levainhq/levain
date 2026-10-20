@@ -347,11 +347,13 @@
       out.hays = v.rows.map((r) => hayOfValue(r, fields));
       out.typed = true;
     } else if (kind === "topology") {
-      // F12a placeholder until the F12b renderer: the graph's counts as lines (full value, or the compact profile's numbers)
+      // the counts as lines (the jump box, the filter and a phone read them), and the full value for topology_view.js; the
+      // compact profile carries numbers where the full one carries arrays, and has nothing to draw
       const n = (x, c) => (Array.isArray(x) ? x.length : isNum(c) ? c : 0);
       const tasks = Array.isArray(v.tasks) ? v.tasks : [];
       const waiting = isNum(v.waiting) ? v.waiting : tasks.filter((t) => isObj(t) && t.state === "waiting").length;
-      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions · " + n(v.tasks, v.tasks) + " tasks · " + waiting + " waiting on you" }];
+      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
+      if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; }   // typed: the page keeps a live state for it (Build's Sessions card reads it)
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -2016,6 +2018,24 @@
     h.append(el("h3", null, title), el("span", null, gloss));
     return h;
   }
+  // A waiting task or node links to the Needs-you row it waits on. The page opens a consent or question row inside the
+  // Decisions focus view, so that is opened (its tile is the one door); the row is then marked and scrolled to by the card id
+  // the row carries (data-card). With no Decisions tile on the page, the Board tab is shown instead: the same rows live there.
+  function openNeedsYouCard(card) {
+    const tile = document.querySelector('.ck-card.w[data-ck-panel="decisions"]');
+    const mark = (tries) => {
+      const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
+      if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
+      if (tries > 0) root.setTimeout(() => mark(tries - 1), 150);
+    };
+    if (tile) {
+      const wasOpen = tile.classList.contains("w-open");
+      tile.classList.add("w-open");     // the tile opens only while it hides rows: a task linking to one asks for the focus view regardless
+      tile.click();
+      if (!wasOpen) tile.classList.remove("w-open");
+      mark(12);
+    } else applyMode("board", true);
+  }
   function paintBuildSessions() {
     const sec = k7Host();
     if (!sec) return;
@@ -2023,8 +2043,15 @@
     if (!s || document.body.dataset.mode !== "build") { if (!s) { sec.hidden = true; k7Sig = ""; } return; }
     const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
     const now = Date.now();
+    // the work view (topology_view.js): the topology panel's value, when the page has it and it holds anything to draw
+    const TV = root.LevainTopologyView;
+    const ts = TV ? Array.from(states).find((o) => o.pid === "topology" && o.p && o.p.isConnected) : null;
+    const tv = ts && !ts.fault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
+    const tfault = ts && ts.fault && TV ? ts.fault : "";
+    const topo = !!(tv || tfault) && TV.mode(root.innerWidth) === "topology";
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
-    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || ""]);
+    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", topo, tfault,
+                                tv ? TV.signature(tv, TV.lens()) : (ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
     if (sig === k7Sig && !sec.hidden) {
       for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
         const w = t.dataset.k7Pre + k7Ago(t.dataset.k7At, now);
@@ -2044,9 +2071,10 @@
       head.append(pill, el("span", "k7-sum", live + " live · " + (lines.length - live) + " quiet"));
     }
     head.appendChild(el("span", "k7-sp"));
-    // the hook for the `list | topology` switch: a later lane renders into this slot from its own file; no switch is drawn here
+    // the `list | topology` switch (topology_view.js owns the control and what persists); drawn only when there is work to show
     const slot = el("span", "k7-mode-slot");
     slot.dataset.k7Slot = "mode";
+    if (tv || tfault) slot.appendChild(TV.switchNode(topo ? "topology" : "list", () => { k7Sig = ""; paintBuildSessions(); }));
     head.appendChild(slot);
     if (lines.length) {
       const day = new Date(now).toDateString();
@@ -2059,9 +2087,16 @@
       head.appendChild(open);
     }
     card.appendChild(head);
-    if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
-    else if (!lines.length) { card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS)); card.classList.add("k7-lone"); }
-    else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    if (topo && tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
+    else if (topo) card.appendChild(TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard }));
+    else if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
+    else if (!lines.length) {
+      card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
+      // an empty graph that could not read a source says so beside the empty line, never in place of it
+      const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
+      if (q) card.appendChild(q);
+      card.classList.add("k7-lone");
+    } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
     sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), card);
     tintRepos();
   }
