@@ -820,12 +820,7 @@
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", zone.title));
     if (Object.hasOwn(ZONE_GLOSS, zone.id)) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
-    if (laid) {   // K5: the bar's Reset layout has no room on a phone, so each laid-out zone's head carries a copy there (CSS shows it under 480px)
-      const zr = el("button", "layoutreset ck-zreset", "Reset layout");
-      zr.type = "button";
-      zr.setAttribute("data-layout-reset", "");
-      head.appendChild(zr);
-    }
+    if (laid) ckZoneReset(head);   // K5: Reset layout lives in a laid-out zone's head, and only while a layout is saved
     sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
     const entryOf = new Map();   // node -> its manifest entry (the Memory tab's composition reads it)
@@ -924,6 +919,24 @@
     for (let j = i + dir; j >= 0 && j < order.length; j += dir) if (side(order[j]) === side(key)) return j;
     return -1;
   }
+  // the one Reset layout control: in a zone head (never the top bar, which has no room at any width), drawn only while a layout is saved
+  function ckZoneReset(head) {
+    const K = layoutKit(), have = head.querySelector(":scope > .ck-zreset");
+    if (K && K.hasLayout && K.hasLayout()) {
+      if (have) return;
+      const zr = el("button", "layoutreset ck-zreset", "Reset layout");
+      zr.type = "button";
+      zr.title = "Put the panels back in the default order and unfold them";
+      zr.setAttribute("data-layout-reset", "");
+      head.appendChild(zr);
+    } else if (have) have.remove();
+  }
+  function ckSyncResets() {
+    for (const g of document.querySelectorAll(".ck-zgrid")) {
+      const head = g._ckOrder && g.parentNode ? g.parentNode.querySelector(":scope > .zone-head") : null;
+      if (head) ckZoneReset(head);
+    }
+  }
   function ckRedraw() {
     if (!currentView || hasUnsavedEdit()) return;   // a draft in an open editor is not thrown away for a reorder; the saved order shows on the next draw
     renderKeepingPlace(currentView, lastOpts);
@@ -971,6 +984,7 @@
         const now = !p.classList.contains("ck-collapsed");
         K.setLayoutCollapsed(id, now);
         layoutControls(grid, p);
+        ckSyncResets();
       });
       box.appendChild(fold);
       head.appendChild(box);

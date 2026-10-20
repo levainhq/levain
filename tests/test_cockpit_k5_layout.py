@@ -157,14 +157,52 @@ def test_reset_layout_clears_the_key_and_redraws_the_kernel_order(tmp_path: Path
     out = _run(tmp_path, [
         {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"},
         SETTLE, {"eval": STACKS}, {"eval": STORED},
-        {"eval": "const b = document.querySelector('.themesw ~ [data-layout-reset], [data-layout-reset]'); const r = b.getBoundingClientRect(); "
-                 "const t = document.querySelector('.themesw').getBoundingClientRect(); b.click(); [b.textContent.trim(), Math.abs(r.top - t.top) < 40]"},
+        {"eval": "const b = [...document.querySelectorAll('[data-layout-reset]')].filter(x => x.getClientRects().length > 0)[0]; "
+                 "const r = [b.textContent.trim(), !!b.closest('.zone-head'), !!b.closest('.masthead')]; b.click(); r"},
         SETTLE, {"eval": STACKS}, {"eval": STORED}, {"eval": f"{PANEL % 'tray'}.classList.contains('ck-collapsed')"},
+        {"eval": "document.querySelectorAll('[data-layout-reset]').length"},
     ])
-    moved, stored, reset_ui, after, stored_after, folded = out[2], out[3], out[4], out[6], out[7], out[8]
+    moved, stored, reset_ui, after, stored_after, folded, left = out[2], out[3], out[4], out[6], out[7], out[8], out[9]
     assert moved["left"] == ["now", "tray"] and stored["collapsed"] == ["tray"], (moved, stored)
-    assert reset_ui[0] == "Reset layout" and reset_ui[1] is True, reset_ui     # beside the theme switch
+    assert reset_ui == ["Reset layout", True, False], reset_ui     # in a zone head, never in the bar
     assert after["left"] == ["tray", "now"] and stored_after is None and folded is False, (after, stored_after, folded)
+    assert left == 0, left     # nothing saved any more: no reset control anywhere
+
+
+@needs_browser
+def test_no_saved_layout_draws_no_reset_control_and_a_saved_one_draws_it_in_the_zone_head_only(tmp_path: Path) -> None:
+    ALL = "[...document.querySelectorAll('[data-layout-reset]')].filter(b => b.getClientRects().length > 0).map(b => [!!b.closest('.zone-head'), !!b.closest('.masthead')])"
+    for width in (1440, 390):
+        none = _run(tmp_path / f"n{width}", [{"eval": ALL}, {"eval": "document.querySelectorAll('.masthead [data-layout-reset]').length"}], width=width)
+        assert none == [[], 0], (width, none)
+        saved = _run(tmp_path / f"s{width}", _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: []})") + [{"eval": ALL}], width=width)[-1]
+        assert saved and all(z and not m for z, m in saved), (width, saved)
+    folded = _run(tmp_path / "f", [{"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE, {"eval": ALL}])[-1]
+    assert folded and all(z and not m for z, m in folded), folded       # a collapse alone is a saved layout
+
+
+@needs_browser
+def test_the_entity_name_in_the_bar_is_not_truncated_at_1440_with_a_saved_layout(tmp_path: Path) -> None:
+    out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
+        {"eval": "const e = document.getElementById('entity'); [e.scrollWidth, e.clientWidth, e.textContent]"}])[-1]
+    assert out[0] <= out[1], out
+
+
+@needs_browser
+def test_a_pinned_card_gets_no_move_control_and_every_move_control_shown_changes_the_order(tmp_path: Path) -> None:
+    ORDER = "[...document.querySelectorAll('.ck-zgrid .panel')].map(p => p.dataset.ckPanel).join(',')"
+    out = _run(tmp_path, [
+        {"eval": "[...document.querySelectorAll('.ck-zgrid [data-ck-panel=\"episodes\"] .ck-lay-up, .ck-zgrid [data-ck-panel=\"episodes\"] .ck-lay-down')].filter(b => !b.disabled && b.getClientRects().length > 0).length"},
+        {"eval": "document.querySelectorAll('.ck-zgrid [data-ck-panel=\"episodes\"] .ck-lay-fold').length"},
+        {"eval": "(async () => { const ord = () => " + ORDER + "; const res = [];"
+                 " const n = [...document.querySelectorAll('.ck-zgrid .ck-lay-up, .ck-zgrid .ck-lay-down')].filter(b => !b.disabled && b.getClientRects().length > 0).length;"
+                 " for (let i = 0; i < n; i++) { const b = [...document.querySelectorAll('.ck-zgrid .ck-lay-up, .ck-zgrid .ck-lay-down')].filter(b => !b.disabled && b.getClientRects().length > 0)[i]; if (!b) break;"
+                 " const before = ord(); b.click(); await new Promise(r => setTimeout(r, 400)); res.push([b.getAttribute('aria-label'), before !== ord()]); } return res; })()"},
+    ])
+    episodes_moves, episodes_fold, moves = out
+    assert episodes_moves == 0, episodes_moves           # CSS `order` pins it: a move would be a no-op
+    assert episodes_fold == 1                            # collapse stays
+    assert moves and all(ch for _l, ch in moves), moves
 
 
 @needs_browser
@@ -177,4 +215,4 @@ def test_the_controls_are_keyboard_reachable_buttons_with_names_at_phone_width(t
     btns, no_hscroll, resets = out
     assert len(btns) == 3 and all(t == "BUTTON" and ty == "button" and label and shown for t, ty, label, shown in btns), btns
     assert no_hscroll is True, "the controls must not widen the page at 390"
-    assert resets == [["Reset layout", True]], resets      # the bar is full at 390: one reset, in the zone head
+    assert resets == [], resets      # nothing saved: no reset control at all

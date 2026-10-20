@@ -1762,6 +1762,8 @@
     return head.concat(keys.filter((k) => !seen.has(k)));
   }
   const layoutCollapsed = () => new Set(readLayout().collapsed);
+  // true when anything is saved (a stored order or a collapsed panel): the one condition under which a Reset layout control is drawn
+  function hasLayout() { const l = readLayout(); return l.collapsed.length > 0 || Object.keys(l.zones).length > 0; }
   function setLayoutOrder(zoneId, order) { const l = readLayout(); l.zones[zoneId] = order; writeLayout(l); }
   function setLayoutCollapsed(panelId, on) {
     const l = readLayout(), s = new Set(l.collapsed);
@@ -2262,7 +2264,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

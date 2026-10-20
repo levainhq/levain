@@ -1442,7 +1442,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .seg { order: 2; flex: 1 1 100%; }
   body.ke .masthead .seg .mode { flex: 1 1 0; justify-content: center; }
   body.ke .masthead .readout, body.ke .masthead .indicators, body.ke .masthead .unit { display: contents; }
-  body.ke .masthead .indicators button, body.ke .masthead .themesw, body.ke .masthead .livechip, body.ke .masthead .layoutreset { order: 1; }
+  body.ke .masthead .indicators button, body.ke .masthead .themesw, body.ke .masthead .livechip { order: 1; }
   body.ke .masthead .jar, body.ke .masthead .stamp { order: 3; }
   body.ke .masthead .entity { display: none; }
 }
@@ -1466,8 +1466,6 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
   body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
   body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
-  body.ke .masthead .layoutreset { display: none; }   /* the bar's row is full at this width: each zone's head carries the reset instead */
-  body.ke .ck-zone .ck-zreset { display: inline-flex; }
 }
 
 /* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
@@ -1862,6 +1860,13 @@ body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 .panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
 .panel.ck-collapsed > :not(.phead) { display: none; }
 body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
+/* a card whose place CSS `order` pins (a fold line, Recent episodes on the Board, the Build jobs / edits / loops rows) would take a move as a no-op: no move buttons, collapse stays */
+body.ke .panel.ck-fold .ck-lay-up, body.ke .panel.ck-fold .ck-lay-down,
+body.ke[data-mode="board"] [data-ck-panel="episodes"] .ck-lay-up, body.ke[data-mode="board"] [data-ck-panel="episodes"] .ck-lay-down,
+body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"] .ck-lay-down,
+body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] .ck-lay-down,
+body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] .ck-lay-down,
+body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] .ck-lay-down { display: none; }
 body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
 body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
 body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }
@@ -1869,4 +1874,4 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
   font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
 .layoutreset:hover { color: var(--text); }
-.ck-zreset { display: none; margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
+.ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
