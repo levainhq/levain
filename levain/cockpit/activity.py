@@ -436,9 +436,14 @@ STATUS_NEUTRALISE = ("-c", "status.submoduleSummary=false", "-c", "diff.ignoreSu
 
 
 def _short(text: str) -> str:
-    """Repository-controlled text as one display-safe line of at most 48 characters (the topology's label rule)."""
+    """Repository-controlled text as one display-safe line of at most 48 characters (the topology's label rule). The
+    cut falls before a ``⟨U+…⟩`` marker it would split, never inside one."""
     s = visible(" ".join(text.split()))
-    return s if len(s) <= 48 else s[:47] + "…"
+    if len(s) <= 48:
+        return s
+    cut = s[:47]
+    i = cut.rfind("⟨")
+    return (cut[:i] if i != -1 and "⟩" not in cut[i:] else cut) + "…"
 
 
 def _status_name(path: str) -> str:

@@ -114,7 +114,7 @@ MALFORMED = [
     ("hub", "x", "value.hub"),
     ("hub.id", "", "value.hub.id"),
     ("hub.label", "x" * 49, "longer than 48"),
-    ("groups.0.id", "repo:ledgerline‮", "invisible or format character"),
+    ("groups.0.id", "repo:ledgerline\u202e", "invisible or format character"),
     ("groups.1.id", "repo:ledgerline", "repeated"),
     ("groups.0.repo", 3, "value.groups[0].repo"),
     ("nodes.0.group", "repo:nope", "must name a group id"),
@@ -217,7 +217,7 @@ def _rig(tmp_path: Path, monkeypatch):
     work.mkdir()
     for name in ("wait", "stall", "run", "done", "q", "old"):
         (work / name).mkdir()
-    q.file(agent="claude_code", agent_session_id="s-wait", tool_name="Bash", tool_input={"command": "rm -rf ‮ x"},
+    q.file(agent="claude_code", agent_session_id="s-wait", tool_name="Bash", tool_input={"command": "rm -rf \u202e x"},
            cwd=str(work / "wait"), hold=timedelta(minutes=5), event_id="e1")
     qs.file(agent="codex", agent_session_id="s-q", what="SECRET-WORDS ship it?", options=[("a", "A"), ("b", "B")],
             rec="a", blocks="x", cwd=str(work / "q"))
@@ -624,6 +624,16 @@ def test_the_repositorys_exclude_and_core_settings_still_shape_the_count(tmp_pat
     assert act.git_worktree_state(common, gitdir, top, 3.0)["dirty"] == 1
 
 
+def test_the_48_char_cut_never_splits_a_hidden_character_marker():
+    for pad in range(40, 48):
+        got = act._short("a" * pad + "\u202e" + "b" * 20)
+        assert len(got) <= 48 and got.endswith("…"), got
+        body = got[:-1]
+        assert body.count("⟨") == body.count("⟩"), got                    # whole marker or none
+        assert body in ("a" * pad, "a" * pad + "⟨U+202E⟩" + "b" * (47 - pad - 8)), got
+    assert act._short("x" * 48) == "x" * 48
+
+
 def test_a_split_index_reads_through_its_shared_index_copy(tmp_path):
     repo = _repo(tmp_path / "r")
     _commit(repo, "one", {"a.txt": "a\n", "b.txt": "b\n"})
@@ -686,7 +696,7 @@ def _marker_whole(s: str) -> bool:
     (" ", True, "(unnamed)"),
     ("", False, "(unnamed)"),
     ("\n\t ", False, "(unnamed)"),
-    ("a‮b", True, "a⟨U+202E⟩b"),
+    ("a\u202eb", True, "a⟨U+202E⟩b"),
     ("a   b\nc", False, "a b c"),
     (None, False, "None"),
 ])
@@ -700,7 +710,7 @@ def test_one_wire_normaliser_maps_every_hostile_string_to_something_the_validato
 
 def test_the_normaliser_cut_never_splits_a_marker():
     for lead in range(40, 50):
-        got = topo._wire("x" * lead + "‮" * 4 + "tail")
+        got = topo._wire("x" * lead + "\u202e" * 4 + "tail")
         assert len(got) <= topo.LABEL_MAX and _marker_whole(got.removesuffix("…")), (lead, got)
     assert topo._wire("x" * 200).endswith("…") and len(topo._wire("x" * 200)) == topo.LABEL_MAX
 
@@ -712,7 +722,7 @@ def _stub_scan(names: list[str], branch: str | None = "main"):
     return scan
 
 
-@pytest.mark.parametrize("names", [["a\\b.txt"], [" "], ["ㅤ"], ["a‮txt.exe"], ["x" * 60], ["a/b"]])
+@pytest.mark.parametrize("names", [["a\\b.txt"], [" "], ["ㅤ"], ["a\u202etxt.exe"], ["x" * 60], ["a/b"]])
 def test_a_hostile_file_name_leaves_the_panel_a_value_never_a_fault(tmp_path, names):
     repo = _repo(tmp_path / "work" / "ledgerline")
     root = tmp_path / "inst"
