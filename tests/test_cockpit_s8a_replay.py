@@ -141,9 +141,11 @@ def test_at_1230_the_consent_and_the_question_no_longer_wait(tmp_path, monkeypat
     assert _node("claude_code", "s-late") in nodes                    # started 11:40, before 12:30
 
 
-@pytest.mark.parametrize("t", [NOW - timedelta(hours=15), NOW + timedelta(minutes=1)])
-def test_an_instant_outside_the_14_h_window_is_refused_never_clamped(tmp_path, monkeypatch, t):
+@pytest.mark.parametrize("offset", [-timedelta(hours=15), timedelta(minutes=2)])
+def test_an_instant_outside_the_14_h_window_is_refused_never_clamped(tmp_path, monkeypatch, offset):
     ck, _root, _cdir, _work = _rig(tmp_path, monkeypatch)
+    # T from the clock at call time, not the module's import-time NOW: a long run passes NOW + 1 min and the "future" is past
+    t = datetime.now(timezone.utc).replace(second=0, microsecond=0) + offset
     with pytest.raises(QueryError, match="last 14 h"):
         ck.panel("topology", credential_class="none", at=_z(t))
     read_at = ck._specs["topology"].read_at
