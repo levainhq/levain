@@ -380,3 +380,12 @@ def test_cli_store_it_cannot_create_exits_1(tmp_path, capsys):
     blocker.write_text("x")
     assert main(["drop", "--queue-dir", str(blocker / "q"), "--no-source", "words"]) == 1
     assert "levain drop:" in capsys.readouterr().err
+
+
+def test_an_ask_closed_with_its_work_reopens_only_after_the_work(store):
+    _, w, a = _work_and_ask(store)
+    store.set_state(w.thread_id, "closed", by="operator")
+    with pytest.raises(CoordError, match="reopen that one first"):
+        store.set_state(a.thread_id, "open", by="operator")
+    store.set_state(w.thread_id, "open", by="operator")
+    assert store.set_state(a.thread_id, "open", by="operator").state == "open"

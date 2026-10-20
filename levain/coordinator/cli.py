@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from levain.coordinator.store import KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread
+from levain.coordinator.store import KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread, _check_source
 from levain.dispatch.jobs import JobStoreError
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
@@ -50,13 +50,18 @@ def cwd_source(cwd: str | None = None) -> Source:
     cwd = cwd or os.getcwd()
     top = _git(cwd, "rev-parse", "--show-toplevel")          # already absolute; one line or it is not trusted
     ref = _git(cwd, "symbolic-ref", "-q", "HEAD")
-    head = _git(cwd, "rev-parse", "--verify", "-q", "HEAD")
-    # a checkout between the calls would pair one branch with another's head: read the branch again, and record
-    # nothing if it moved
-    if not top or "\n" in top or not top.startswith("/") or not ref or not ref.startswith("refs/heads/") \
-            or not head or _git(cwd, "symbolic-ref", "-q", "HEAD") != ref:
+    if not top or "\n" in top or not top.startswith("/") or not ref or not ref.startswith("refs/heads/"):
         return Source()
-    return Source("cwd", os.path.realpath(top), ref, head)
+    # the head is read from the branch just named, never from HEAD again: a checkout in between cannot pair one
+    # branch with another's commit
+    head = _git(cwd, "rev-parse", "--verify", "-q", "--end-of-options", f"{ref}^{{commit}}")
+    if not head:
+        return Source()
+    source = Source("cwd", os.path.realpath(top), ref, head)
+    try:
+        return _check_source(source)
+    except CoordError:
+        return Source()          # a path the store cannot hold (not UTF-8, a hidden character) is recorded as none
 
 
 def _store(args: argparse.Namespace) -> CoordStore:
@@ -106,8 +111,8 @@ def _read_words(args: argparse.Namespace) -> str:
 
 def run_drop(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    store = _store(args)
     try:
+        store = _store(args)
         words = _read_words(args)
         source = Source() if args.no_source else cwd_source()
         drop, created = store.accept_drop(words, surface="cli", outbox_id=args.outbox_id, source=source)
@@ -137,8 +142,8 @@ def _parse_attach(spec: str) -> Part:
 
 def run_split(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    store = _store(args)
     try:
+        store = _store(args)
         parts = [_parse_part(s) for s in args.thread]
         if args.about is not None:
             if all(p.kind == "work" for p in parts):
@@ -158,8 +163,8 @@ def run_split(args: argparse.Namespace, out: Any = None) -> int:
 
 def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    store = _store(args)
     try:
+        store = _store(args)
         drop = store.drop(args.drop_id)
         threads = store.threads_of(args.drop_id)
         receipts = store.drop_receipts(args.drop_id)
@@ -191,8 +196,8 @@ def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
 
 def run_thread(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
-    store = _store(args)
     try:
+        store = _store(args)
         cmd = args.thread_cmd
         if cmd == "list":
             threads = store.threads(include_closed=args.all)

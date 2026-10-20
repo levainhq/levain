@@ -55,7 +55,7 @@ from levain.dispatch.jobs import JobStore
 
 __all__ = [
     "ACTORS", "KINDS", "REPLY_KINDS", "SCHEMA", "SOURCE_HOW", "STATES", "SURFACES", "CoordError", "CoordStore",
-    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "members_sha256",
+    "Drop", "DropConflict", "Part", "Reply", "Source", "Thread", "check_source", "members_sha256",
 ]
 
 SURFACES = ("cli", "phone", "cockpit")
@@ -494,6 +494,8 @@ class CoordStore:
                 raise CoordError("the service never closes a work thread; you do (a regroup that empties one closes it)")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")
+            if state == "open" and t.about is not None and self._thread(conn, t.about).state == "closed":
+                raise CoordError(f"thread {thread_id} is about {t.about}, which is closed; reopen that one first")
             if state == "closed":
                 self._close(conn, thread_id, cause or state, by, now)
             else:
