@@ -791,7 +791,8 @@ class TestL2Round2:
         apply_edit(rig.src.write_scope, {"kind": "operator_state", "text": "via kernel api"})   # TUI, kernel API
         rig.edit({"kind": "operator_state", "text": "via edit",
                   "panel_version": rig.ck.read_value_version("state").value})                # the cockpit alias
-        locks = [p for p in opened if p.endswith(".lock")]
+        # the felt-episode append opens anneal's own audit locks beside it: only the state file's count
+        locks = [p for p in opened if p.endswith(".json.lock")]
         assert locks == [os.path.realpath(cj) + ".lock"] * 3
 
     @pytest.mark.skipif(sys.platform == "win32", reason="no flock: an unchecked write is unlocked there")

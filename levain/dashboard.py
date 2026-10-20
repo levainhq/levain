@@ -39,6 +39,7 @@ make visible).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -84,6 +85,7 @@ __all__ = [
     "SubstrateView",
     "build_substrate_view",
     "write_state",
+    "StateWrite",
     "render_text",
     "render_summary",
     "run_dashboard",
@@ -653,7 +655,7 @@ STATE_LOCK_WAIT_S = 5.0   # how long a state write waits for another writer's lo
 @dataclass
 class State:
     """The operator's optional, freeform "what's going on" line, in their own words
-    (keys ``state`` / ``state_set_at`` / ``state_source`` in the context file). Rendered VERBATIM with its age, and NOTHING more: it is never
+    (keys ``state`` / ``state_set_at`` / ``state_source`` / ``state_run`` in the context file). Rendered VERBATIM with its age, and NOTHING more: it is never
     parsed, scored, classified, or used to gate, soften or reduce scope — the human is
     the authority on their own state. Expires after ``STATE_EXPIRES_AFTER_HOURS``: an
     expired, age-unknown or future-stamped state reads as unset (``text=None``)."""
@@ -663,6 +665,7 @@ class State:
     source: str | None
     age_label: str = ""  # "set 2h ago"; "" when text is None
     version: str | None = None  # the stored record's write version (``state_version``); None if unreadable
+    run: str | None = None  # ISO stamp at which this text's run began (``state_run``); ``set_at`` for a line written before it existed
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -685,7 +688,7 @@ def state_version(data: Any) -> str | None:
 
 
 def _read_state(context_json: Path | None, now: datetime) -> "State | None":
-    """Read ``{state, state_set_at, state_source}`` from the live-context file. None = no
+    """Read ``{state, state_set_at, state_source, state_run}`` from the live-context file. None = no
     source configured; fail-soft to ``text=None`` on a missing/unreadable/malformed file;
     whitespace collapsed; superset-tolerant (other keys are ignored). EXPIRY: a state whose age cannot be established, is further
     in the future than ``STATE_CLOCK_SKEW_SECONDS``, is older than
@@ -733,12 +736,22 @@ def state_from_data(data: Any, now: datetime) -> State:
     if delta < -STATE_CLOCK_SKEW_SECONDS or delta >= STATE_EXPIRES_AFTER_HOURS * 3600:
         return empty
     delta = max(delta, 0.0)
-    return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta), version=empty.version)
+    raw_run = data.get("state_run")
+    run = set_at        # a line written before the run was stored began its run when it was set
+    if isinstance(raw_run, str) and raw_run.strip():
+        try:
+            datetime.fromisoformat(raw_run)
+            run = raw_run
+        except ValueError:
+            pass
+    return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta), version=empty.version, run=run)
 
 
-def _write_context_line(context_json: Path, key: str, text: str, *, source: str) -> None:
-    """Merge-preserving atomic write of one ``{key, key_set_at, key_source}`` triple
-    (the body of ``write_state``)."""
+def _write_context_line(context_json: Path, key: str, text: str, *, source: str,
+                        run: str | None = None) -> "str | None":
+    """Merge-preserving atomic write of one ``{key, key_set_at, key_source, key_run}`` record
+    (the body of ``write_state``). ``key_run`` is ``run`` (the stamp a continuing run began at),
+    or this write's own stamp when ``run`` is None. Returns the run stamp it stored, None for a clear."""
     text = " ".join(text.split())  # collapse whitespace; "" → clear
     data: dict[str, Any] = {}
     try:
@@ -748,12 +761,14 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
                 data = existing
     except (OSError, ValueError):
         data = {}  # corrupt → start fresh; don't fail the operator's set
-    if text:
+    stamp = datetime.now(timezone.utc).isoformat() if text else None
+    if stamp is not None:
         data[key] = text
-        data[f"{key}_set_at"] = datetime.now(timezone.utc).isoformat()
+        data[f"{key}_set_at"] = stamp
         data[f"{key}_source"] = source
+        data[f"{key}_run"] = run or stamp
     else:
-        # CLEAR: POP all three keys — the exact shape the CLI/sensor clear writes
+        # CLEAR: POP all four keys — the exact shape the CLI/sensor clear writes
         # (drain_context_signals / perception_sweep pop, they don't leave a state="" +
         # a fresh live stamp). One on-disk contract for "unset", not two: an empty-string
         # tombstone carrying a current source/stamp is misleading to any raw-JSON reader
@@ -762,6 +777,7 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
         data.pop(key, None)
         data.pop(f"{key}_set_at", None)
         data.pop(f"{key}_source", None)
+        data.pop(f"{key}_run", None)
     # Write THROUGH a symlink to its target (don't clobber the link with a regular
     # file), and keep os.replace atomic by putting the temp in the TARGET's dir.
     target = Path(os.path.realpath(context_json)) if context_json.is_symlink() else context_json
@@ -778,6 +794,7 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+    return (run or stamp) if stamp is not None else None
 
 
 class StateLockUnavailable(RuntimeError):
@@ -821,13 +838,85 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
         os.close(fd)    # closing the descriptor releases the flock
 
 
+@dataclass(frozen=True)
+class StateWrite:
+    """What one ``write_state`` did beyond the line itself: the felt episode it owed.
+    ``episode`` is ``pending`` (only with ``defer_episode``: ``deliver`` finishes it), ``written`` (the store holds this run's episode: this call wrote it, or an
+    earlier call of the same run had; anneal does not say which), ``cleared`` (a clear sets
+    nothing), ``no_store`` (no episodic store to write to) or ``failed`` (the line is set, the
+    episode is not; ``episode_error`` says why)."""
+
+    text: str
+    episode: str
+    episode_error: str | None = None
+    deliver: "Callable[[], StateWrite] | None" = None   # set only with ``defer_episode``: episode ``pending``, this finishes it
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``Type: message`` for a result, without trusting the message: an exception whose ``__str__``
+    raises must still become a ``failed`` result, never a second exception after the line is set."""
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception:   # noqa: BLE001
+        return type(exc).__name__
+
+
+STATE_EPISODE_SOURCE = "levain-state"
+STATE_EPISODE_TAGS = ("felt", "state")
+
+
+def _state_origin_key(run: str, text: str) -> str:
+    """The episode's identity: the run (the stamp its text began at) and the text, hashed into
+    anneal's origin-key grammar. A different run or text never collides; the same run always does.
+    Two context files sharing one store that begin the same words at the same instant are one run
+    to the store: it keeps the first."""
+    return "levain.state:" + hashlib.sha256(f"{run}\n{text}".encode("utf-8")).hexdigest()
+
+
+def _record_state_episode(episodic_db: Path, text: str, source: str, *, run: str) -> StateWrite:
+    """Append the one ``observation`` episode, tagged ``felt,state``, that carries the line
+    verbatim: an input the consolidate reads, never a write into the felt layer. Fail-soft: the
+    line is already set, so any fault here is reported in the result, never raised. A store
+    that does not exist is not created for a state line.
+
+    The episode is stamped with the instant its run began and keyed on the run, so a retry, N
+    identical requests, or a writer whose episode lands late each find the one episode their run
+    owes and write no second; a line whose episode failed (locked store, a death between the two
+    writes) gets it on the next set of the same text. It is recorded with the store's default
+    agent trust, not ``operator``: this path is reachable by an HTTP write token an agent can hold,
+    so marking its text operator testimony would claim an authority the path cannot prove. Known
+    edge: an operator who tombstones a run's episode and then re-sets the same unchanged text gets
+    ``failed`` with anneal's refusal (a key is never reused); a changed text or a clear starts a new run."""
+    if not episodic_db.is_file():
+        return StateWrite(text, "no_store")
+    try:
+        from anneal_memory import Store   # lazy, as the view's own read
+
+        began = datetime.fromisoformat(run)
+        if began.tzinfo is None:
+            began = began.replace(tzinfo=timezone.utc)      # as the read treats a naive stamp
+        with Store(str(episodic_db)) as store:
+            store.record(
+                content=text, episode_type="observation", source=STATE_EPISODE_SOURCE,
+                metadata={"tags": list(STATE_EPISODE_TAGS), "state_source": source},
+                timestamp=began.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                origin_key=_state_origin_key(run, text),
+            )
+    except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
+        return StateWrite(text, "failed", _exc_text(exc))
+    return StateWrite(text, "written")
+
+
 def write_state(context_json: Path, text: str, *, source: str = "cli",
-                check: "Callable[[], None] | None" = None) -> None:
+                check: "Callable[[], None] | None" = None,
+                episodic_db: Path | None = None,
+                record_episode: "Callable[[str, str, str], None] | None" = None,
+                defer_episode: bool = False) -> StateWrite:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
-    write-peer of ``_read_state``, kept adjacent so the contract (the three keys, a
+    write-peer of ``_read_state``, kept adjacent so the contract (the state keys, a
     tz-aware ISO stamp) cannot drift between read and write.
 
-    MERGE-preserving: reads the existing object and updates ONLY the three state keys,
+    MERGE-preserving: reads the existing object and updates ONLY the four state keys,
     so a file that carries other keys (a sensor app's superset, or keys an older
     version wrote) keeps them. Atomic (temp + ``os.replace``, so a reader never sees a torn
     file) and serialised with every other levain state writer by ``_state_lock``;
@@ -835,16 +924,53 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     write are one step. A writer outside levain (a sensor app, the embedder's own state CLI) does
     not take the lock: a concurrent whole-object writer holding an older snapshot can
     revert a just-set line (re-set is one keystroke). A blank text
-    CLEARS by popping all three keys. The parent dir is created if absent; a
+    CLEARS by popping all four keys. The parent dir is created if absent; a
     corrupt/unreadable existing file is replaced rather than failing the set. The text is
-    stored verbatim apart from whitespace collapse; nothing reads meaning into it."""
+    stored verbatim apart from whitespace collapse; nothing reads meaning into it.
+
+    A RUN is the stretch of one text while it stays live. ``state_run`` stores the stamp it began
+    at, set in the same locked write as the line: a re-set of the live text keeps the run (and
+    refreshes ``state_set_at``); a changed, cleared or expired text begins a new one.
+
+    This is the ONE place "a state line was set" is computed. Given ``episodic_db`` it also
+    appends ONE ``observation`` episode tagged ``felt,state`` carrying the line verbatim, keyed on
+    its run, AFTER the line is written and outside the lock (never an episode without the line);
+    none for a clear, and a run never gets a second one. A writer that passes no ``episodic_db``
+    records no episode. ``record_episode(text, source, run)``, when given, is called INSTEAD of
+    recording into ``episodic_db`` (an embedder whose episode store is not an anneal store levain can
+    open): once per set, with the run, so its sink dedupes per run; a raise is ``failed``, never a
+    failed set. The sink is synchronous and must be bounded: it runs on the caller's thread. It
+    must key on ``run`` and not infer recency from call order (two concurrent sets can reach it
+    in the opposite order from the one in which they landed). ``levain state`` (the CLI) has no
+    scope, so it always records into the install's own store. With ``defer_episode`` the line is
+    set and the result is ``pending`` with ``deliver``: the caller finishes it AFTER dropping any
+    lock of its own, so a slow store or sink never holds that lock."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     with _state_lock(context_json, required=check is not None):
         if check is not None:
             check()
-        _write_context_line(context_json, "state", collapsed, source=source)
+        prior = _read_state(context_json, datetime.now(timezone.utc))   # hides an expired line
+        continues = prior is not None and prior.text == collapsed and collapsed != ""
+        run = _write_context_line(context_json, "state", collapsed, source=source,
+                                  run=prior.run if continues else None)
+    if run is None:
+        return StateWrite("", "cleared")
+    def deliver() -> StateWrite:
+        if record_episode is not None:
+            try:
+                record_episode(collapsed, source, run)
+            except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
+                return StateWrite(collapsed, "failed", _exc_text(exc))
+            return StateWrite(collapsed, "written")
+        if episodic_db is None:
+            return StateWrite(collapsed, "no_store")
+        return _record_state_episode(episodic_db, collapsed, source, run=run)
+
+    if defer_episode:
+        return StateWrite(collapsed, "pending", deliver=deliver)
+    return deliver()
 
 
 @dataclass
@@ -1985,11 +2111,19 @@ def run_state(
     if clear:
         text = ""
     if text is not None:
+        episodic_db = None      # the episode is secondary: a store that cannot be derived is no store
+        if text.strip():
+            try:
+                episodic_db = SubstrateSource.local(install_root).anneal.episodic_db
+            except Exception:   # noqa: BLE001
+                pass
         try:
-            write_state(context_json, text, source=source)
+            done = write_state(context_json, text, source=source, episodic_db=episodic_db)
         except (ValueError, OSError) as exc:
             print(f"state not set: {exc}", file=sys.stderr)
             return 2
+        if done.episode == "failed":
+            print(f"note: state set, but its felt episode was not written: {done.episode_error}", file=sys.stderr)
         print(f"state set: {' '.join(text.split())}" if text.strip() else "state cleared")
         return 0
     state = _read_state(context_json, datetime.now(timezone.utc))

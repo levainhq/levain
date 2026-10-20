@@ -228,7 +228,8 @@ def test_the_table_has_the_specified_shape():
         assert EDGES[(f, "failed")] >= {"lease_lapsed", "budget_cap", "floor_refused"}
         assert EDGES[(f, "cancelled")] == {"planner_cancel", "human_cancel"}
     assert EDGES[("authorised", "cancelled")] == {"human_cancel"}
-    assert ("authorised", "failed") not in EDGES
+    assert EDGES[("authorised", "failed")] == {"base_moved"}
+    assert "base_moved" in EDGES[("verified", "failed")] and "base_moved" in EDGES[("recommended", "failed")]
     assert EDGES[("verified", "authorised")] == EDGES[("recommended", "authorised")] == {
         "human_authorises", "human_adoption_rule"}
 
@@ -855,6 +856,43 @@ def test_the_filing_agent_is_kept_beside_the_job(store, repo):
     try:
         for sql in ("UPDATE job_filers SET agent = 'claude_code'", "DELETE FROM job_filers",
                     f"INSERT OR REPLACE INTO job_filers VALUES ('{job.id}', 'claude_code')"):
+            with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
+                conn.execute(sql)
+    finally:
+        conn.close()
+
+
+# --- F11-s1 --------------------------------------------------------------------------------------------------------
+
+def test_a_rule_firing_never_makes_a_fresher_human_cancel_stale(store, repo, keys, log, clock):
+    # a rule fires when it fires, not when the human signed it: a cancel signed before the rule fired is still the
+    # human's latest word over that job (staleness is dated by real signatures only)
+    job, _ = file_job(store, repo)
+    clock.now = NOW + timedelta(minutes=1)
+    for to, cause in PATH["verified"]:
+        job = store._transition(job.id, to, cause)
+    clock.now = NOW + timedelta(minutes=10)
+    job = store.authorise(job.id, cause="human_adoption_rule", evidence="{}")
+    payload, sig = cancel_item(job, keys["laptop"], at=NOW + timedelta(minutes=5))
+    assert store.cancel_by_human(job.id, payload, sig, log.source).state == "cancelled"
+
+
+def test_authorise_writes_only_from_verified_or_recommended_and_pairs_the_human_cause(store, repo):
+    job, _ = at_state(store, repo, "running")
+    with pytest.raises(TransitionRefused, match="only a verified or recommended"):
+        store.authorise(job.id, cause="human_adoption_rule", evidence="{}")
+    with pytest.raises(TransitionRefused, match="human's signed item"):
+        store.authorise(job.id, cause="human_authorises", evidence="{}")
+
+
+def test_the_authorise_table_is_append_only(store, repo):
+    job, _ = file_job(store, repo)
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        conn.execute(f"INSERT INTO authorise_signatures VALUES ('{job.id}', 'p', 's', 'f', 'a')")
+        for sql in ("UPDATE authorise_signatures SET signature = 'y'", "DELETE FROM authorise_signatures",
+                    f"INSERT OR REPLACE INTO authorise_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')",
+                    f"INSERT INTO authorise_signatures VALUES ('{job.id}', 'p2', 's2', 'f', 'a')"):
             with pytest.raises(sqlite3.IntegrityError, match="written once|never replaced"):
                 conn.execute(sql)
     finally:

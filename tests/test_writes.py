@@ -1921,7 +1921,8 @@ class TestOperatorStateEdit:
 
     def test_set_writes_the_three_keys(self, install: Path) -> None:
         res = apply_edit(_scope(install), {"kind": "operator_state", "text": "Acme arch review"})
-        assert res == {"ok": True, "kind": "operator_state", "cleared": False}
+        # the fixture holds no episodic store, so the line is set and no felt episode is owed
+        assert res == {"ok": True, "kind": "operator_state", "cleared": False, "episode": "no_store"}
         data = json.loads(self._ctx(install).read_text(encoding="utf-8"))
         assert data["state"] == "Acme arch review"
         assert data["state_source"] == "web"          # HTTP default (no source sent)
