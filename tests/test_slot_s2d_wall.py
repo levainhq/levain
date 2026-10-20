@@ -469,6 +469,11 @@ GOLDEN_E0 = (
     "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin", "--symlink", "usr/lib", "/lib",
     "--proc", "/proc", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/shm",
     "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
+    # each bind's ancestors, parents first, with §2.1 / §2.2's modes (VM run s2-linux F4)
+    "--perms", "0755", "--dir", "/var", "--perms", "0755", "--dir", "/var/levain",
+    "--perms", "0711", "--dir", "/var/levain/live",
+    "--perms", "0755", "--dir", "/run", "--perms", "0755", "--dir", "/run/levain",
+    "--perms", "0755", "--dir", "/run/levain/gw", "--perms", "0755", "--dir", "/run/levain/qb",
     "--bind", "/var/levain/live/" + SESSION, "/var/levain/live/" + SESSION,
     "--bind", "/run/levain/gw/slot0", "/run/levain/gw/slot0",
     "--bind", "/run/levain/qb/slot0", "/run/levain/qb/slot0",
@@ -578,7 +583,10 @@ def test_other_slot_cannot_list_session_plan_half():
         assert b.gid not in a.groups and a.gid not in b.groups
     a = wall.linux_view_args(E0, SESSION, kind="interactive", queue_grant=True, host_links=LINKS)
     b = wall.linux_view_args(E1, OTHER, kind="interactive", queue_grant=True, host_links=LINKS)
-    assert "/var/levain/live" not in a and "/var/levain" not in a
+    bound = {a[i + 1] for i, x in enumerate(a) if x in ("--bind", "--ro-bind", "--dev-bind")}
+    assert "/var/levain/live" not in bound and "/var/levain" not in bound   # only made empty in the view (F4)
+    made = {a[i + 1] for i, x in enumerate(a) if x == "--dir"}
+    assert not any(SESSION in d for d in made)                               # <S> is the one bind of the store
     assert not any(OTHER in x or "slot1" in x for x in a) and not any(SESSION in x or "slot0" in x for x in b)
 
 
