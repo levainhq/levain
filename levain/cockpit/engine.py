@@ -2744,6 +2744,15 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"{w}.{k}", "must be an ISO-8601 timestamp")
         if n.get("rate") is not None and (not _is_num(n["rate"]) or n["rate"] < 0):
             raise _bad(spec, f"{w}.rate", "must be a non-negative finite number (events per minute) or null (no log)")
+    parent_of = {n["id"]: n.get("parent") for n in nodes}
+    for i, n in enumerate(nodes):
+        # a parent chain that returns to itself has no root: the renderer would have nowhere to start
+        seen_p, cur = {n["id"]}, n.get("parent")
+        while cur is not None:
+            if cur in seen_p:
+                raise _bad(spec, f"value.nodes[{i}].parent", f"is part of a parent cycle through {cur!r} (a node's ancestors never include itself)")
+            seen_p.add(cur)
+            cur = parent_of.get(cur)
     if "conflicts" not in v:
         raise _bad(spec, "value.conflicts", "is required (null when the source is not tracked)")
     if v["conflicts"] is not None:

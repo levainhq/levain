@@ -2046,8 +2046,12 @@
     // the work view (topology_view.js): the topology panel's value, when the page has it and it holds anything to draw
     const TV = root.LevainTopologyView;
     const ts = TV ? Array.from(states).find((o) => o.pid === "topology" && o.p && o.p.isConnected) : null;
-    const tv = ts && !ts.fault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
-    const tfault = ts && ts.fault && TV ? ts.fault : "";
+    // a topology panel that failed says so three ways: a failed fetch (s.fault), an error record the kernel sent (data.error), or the page's
+    // own "unavailable" card (an external panel, no state of its own): the Sessions card says whichever it is
+    const ep = TV && !ts ? document.querySelector('[data-ck-panel="topology"][data-ck-external]') : null;
+    const epErr = ep ? ep.querySelector(".err") : null;
+    const tfault = !TV ? "" : ts ? (ts.fault || (ts.data && typeof ts.data.error === "string" ? ts.data.error : "")) : (epErr ? epErr.textContent : "");
+    const tv = ts && !tfault && ts.data && ts.data.topology && TV.hasWork(ts.data.topology) ? ts.data.topology : null;
     const topo = !!(tv || tfault) && TV.mode(root.innerWidth) === "topology";
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
     const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", topo, tfault,
@@ -2087,16 +2091,28 @@
       head.appendChild(open);
     }
     card.appendChild(head);
+    // the topology panel is hidden on the page (the card draws it), so its fault is the card's to say; a throw while drawing falls back to the list
+    let tbody = null, tfail = false;
+    if (TV) TV.release();           // the old body's resize observer goes with it, even when the list replaces the topology
+    if (topo && !tfault) {
+      try { tbody = TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard }); } catch (e) { tfail = true; }
+    }
     if (topo && tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
-    else if (topo) card.appendChild(TV.render(tv, { repaint: () => { k7Sig = ""; paintBuildSessions(); }, openCard: openNeedsYouCard }));
-    else if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
-    else if (!lines.length) {
-      card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
-      // an empty graph that could not read a source says so beside the empty line, never in place of it
-      const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
-      if (q) card.appendChild(q);
-      card.classList.add("k7-lone");
-    } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    else if (tbody) card.appendChild(tbody);
+    else {
+      if (tfault) card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
+      if (tfail) card.appendChild(el("p", "k7-none err", "The topology could not be drawn, so the sessions are listed."));
+      if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
+      else if (!lines.length) {
+        card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
+        // an empty graph that could not read a source says so beside the empty line, never in place of it
+        const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
+        if (q) card.appendChild(q);
+        card.classList.add("k7-lone");
+      } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    }
+    const fp = ts && ts.p ? ts.p : ep;
+    if (fp) fp.classList.toggle("ck-faulted", !!tfault);       // a faulted topology panel is the one error panel: the page's hide rule leaves it alone
     sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), card);
     tintRepos();
   }

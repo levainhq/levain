@@ -40,6 +40,7 @@
   const GROUP_CAP = 4;                     // tasks of one state the Work stack shows before "show N more"
   const SVG_NS = "http://www.w3.org/2000/svg";
   const shownAll = new Set();              // the groups the operator opened in full
+  let linkObserver = null;                 // the one ResizeObserver the Work lens's lines use: a new render replaces it, the card releases it
   const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
   const isNum = (x) => typeof x === "number" && Number.isFinite(x);
   const arr = (x) => (Array.isArray(x) ? x : []);
@@ -94,8 +95,16 @@
     return parts.length ? el("p", "tv-quiet", parts.join(" · ")) : null;
   }
 
-  // the value's content, for the card's repaint signature (the clock is not in it)
-  function signature(v, l) { return JSON.stringify([l, v, Array.from(shownAll)]); }
+  // the value's content, for the card's repaint signature: only what is drawn. The clock (as_of, a node's last_event) is not in it, and
+  // a rate and a token count enter as the display rounds them, so a poll that moved nothing the operator can see repaints nothing
+  function signature(v, l) {
+    const lean = (n) => (isObj(n) ? Object.assign({}, n, { last_event: undefined, rate: isNum(n.rate) ? Math.round(n.rate) : n.rate, tokens: fmtTokens(n.tokens) }) : n);
+    const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
+                                                   counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;
+    return JSON.stringify([l, sane, Array.from(shownAll)]);
+  }
+  // one OS-level observer at a time: the card calls this before it replaces its children
+  function release() { if (linkObserver) { linkObserver.disconnect(); linkObserver = null; } }
 
   // ---- small formatters ----
   function fmtTokens(n) {
@@ -137,6 +146,30 @@
 
   function dot(state) { const d = el("i", "tv-dot " + state); d.setAttribute("aria-hidden", "true"); return d; }
   function tag(state, text) { return el("span", "tv-tag " + state, text); }
+  // what closing a live node would lose (the value's lost_if_closed), by node id; null counts are unknown, never zero
+  function lostMap(v) {
+    const m = new Map();
+    for (const l of arr(v.lost_if_closed)) if (isObj(l) && typeof l.node === "string") m.set(l.node, l);
+    return m;
+  }
+  function riskTitle(l) {
+    if (!isObj(l)) return null;
+    const c = (x) => (isNum(x) ? x : null);
+    const d = c(l.dirty), u = c(l.unpushed), r = c(l.running_children), e = c(l.uncaptured_episodes);
+    if (!((d || 0) > 0 || (u || 0) > 0 || (r || 0) > 0 || (e || 0) > 0)) return null;      // nothing known to be at risk: no mark
+    const parts = [d === null ? "dirty not tracked" : d + " dirty", u === null ? "unpushed not tracked" : u + " unpushed", r === null ? "running not tracked" : r + " running"];
+    if (e) parts.push(e + " uncaptured");
+    return parts.join(" · ");
+  }
+  function riskMark(l) {
+    const t = riskTitle(l);
+    if (t === null) return null;
+    const m = el("i", "tv-risk");
+    m.title = t;
+    m.setAttribute("role", "img");
+    m.setAttribute("aria-label", "at risk: " + t);
+    return m;
+  }
 
   // ---- the header strip ----
   function strip(v, which) {
@@ -152,9 +185,9 @@
     };
     row.append(stat("groups", arr(v.groups).length, "groups"), stat("nodes", nodes.length, "nodes"), stat("running", running, "running"),
                stat("waiting", waiting, "waiting on you", waiting ? "hot" : ""));
-    const conflicts = v.conflicts;
+    const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;       // anything but a list is "not tracked", never a zero
     let c;
-    if (conflicts === null || conflicts === undefined) { c = el("span", "tv-stat dim", "conflicts not tracked"); }
+    if (conflicts === null) { c = el("span", "tv-stat dim", "conflicts not tracked"); }
     else if (!conflicts.length) { c = el("span", "tv-stat"); c.append(el("b", null, "0"), " conflicts"); }
     else { c = el("span", "tv-stat warn"); c.append(el("b", null, conflicts.length), conflicts.length === 1 ? " file conflict" : " file conflicts"); }
     c.dataset.k = "conflicts";
@@ -187,23 +220,25 @@
   function conflictList(v) {
     const list = arr(v.conflicts);
     if (!list.length) return null;
-    const label = {};
-    for (const n of arr(v.nodes)) label[n.id] = n.label;
+    const label = new Map();
+    for (const n of arr(v.nodes)) label.set(n.id, n.label);
     const d = el("details", "tv-conf");
     d.appendChild(el("summary", null, list.length === 1 ? "1 file two live sessions are both writing" : list.length + " files two live sessions are both writing"));
-    for (const c of list) d.appendChild(el("div", "tv-conf-row", c.path + " — " + arr(c.nodes).map((id) => label[id] || id).join(" and ")));
+    for (const c of list) d.appendChild(el("div", "tv-conf-row", c.path + " — " + arr(c.nodes).map((id) => label.get(id) || id).join(" and ")));
     return d;
   }
 
   // ---- the Work lens ----
-  function workerChip(n) {
+  function workerChip(n, lost) {
     const c = el("span", "tv-chip");
     c.dataset.node = n.id;
     c.title = [n.agent, n.model || "model unknown"].filter(Boolean).join(" · ");
     c.append(dot(n.state), n.label);
+    const risk = riskMark(lost.get(n.id));
+    if (risk) c.appendChild(risk);
     return c;
   }
-  function taskCard(t, byId, opts, link) {
+  function taskCard(t, byId, lost, opts) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));
     c.dataset.task = t.id;
     c.dataset.kind = t.kind;
@@ -216,8 +251,8 @@
     c.appendChild(head);
     const foot = el("div", "tv-task-f");
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-kind", KIND_WORDS[t.kind] || t.kind));
-    const workers = arr(t.workers).map((id) => byId[id]).filter(Boolean);
-    for (const n of workers) foot.appendChild(workerChip(n));
+    const workers = arr(t.workers).map((id) => byId.get(id)).filter(Boolean);
+    for (const n of workers) foot.appendChild(workerChip(n, lost));
     const waits = arr(t.waits_on);
     if (!workers.length && t.kind !== "unattached") foot.appendChild(el("span", "tv-none", "no agent attached"));
     if (t.kind === "unattached") foot.appendChild(el("span", "tv-none", "no task record, none guessed"));
@@ -249,7 +284,7 @@
     r.dataset.rec = t.id;
     const ti = el("b", "tv-rec-t", t.label);
     ti.title = t.label;
-    const who = arr(t.workers).map((id) => byId[id]).filter(Boolean).map((n) => n.label);
+    const who = arr(t.workers).map((id) => byId.get(id)).filter(Boolean).map((n) => n.label);
     const m = el("span", "tv-rec-m", [KIND_WORDS[t.kind] || cardWords(t.card)].concat(who).join(" · "));
     r.append(ti, m);
     openable(r, t.card, opts);
@@ -258,9 +293,8 @@
   // one line joining two drawn things, in the wrap's own coordinates; none when the columns are stacked
   function drawLinks(wrap, svg, links) {
     while (svg.firstChild) svg.removeChild(svg.firstChild);
-    const left = wrap.querySelector(".tv-wl");
-    const probe = wrap.querySelector(".tv-task");
-    if (!left || !probe || left.getBoundingClientRect().right > probe.getBoundingClientRect().left + 1) return;   // stacked: no side to draw
+    // stacked is a one-column grid: the container's own tracks say so, whichever card happens to come first
+    if (getComputedStyle(wrap).gridTemplateColumns.split(" ").filter(Boolean).length < 2) return;
     const box = wrap.getBoundingClientRect();
     for (const [from, to, cls] of links) {
       if (!from.isConnected || !to.isConnected || from.offsetParent === null || to.offsetParent === null) continue;
@@ -274,16 +308,24 @@
     }
   }
   function workLens(v, opts) {
-    const byId = {};
-    for (const n of arr(v.nodes)) byId[n.id] = n;
+    const byId = new Map();
+    for (const n of arr(v.nodes)) byId.set(n.id, n);
+    const lost = lostMap(v);
     const tasks = arr(v.tasks);
+    release();
     const wrap = el("div", "tv-work");
     const heads = ["Waiting on you", "Tasks · who is working on them", "Outcomes"].map((txt, i) => { const h = el("div", "tv-colh tv-colh" + i, txt); wrap.appendChild(h); return h; });
     // the left column: a record for every pending consent / question, and for a dispatch contract waiting on its signature
     const left = el("div", "tv-wl");
-    const recs = tasks.filter((t) => t.state === "waiting" && (t.kind === "consent" || t.kind === "question" || t.card));
-    const recBy = {};
-    for (const t of recs) { const r = recordCard(t, byId, opts); left.appendChild(r); if (typeof t.card === "string" && t.card) recBy[t.card] = r; }
+    // waiting is the task's state, whether or not it has a card to open: only the click needs one
+    const recs = tasks.filter((t) => t.state === "waiting");
+    const recBy = new Map();
+    for (const t of recs) {
+      const r = recordCard(t, byId, opts);
+      left.appendChild(r);
+      recBy.set(t.id, r);
+      if (typeof t.card === "string" && t.card) recBy.set(t.card, r);
+    }
     if (!recs.length) left.appendChild(el("p", "tv-none", "nothing is waiting on you"));
     wrap.appendChild(left);
     // the centre: every other task, loudest state first; the right: its outcomes, on the same row
@@ -292,25 +334,25 @@
     for (const t of tasks) if (t.kind === "unattached") centre.push(t);
     const links = [];
     let row = 2;
-    const seen = {}, total = {};
-    for (const t of centre) if (t.kind !== "unattached") total[t.state] = (total[t.state] || 0) + 1;
+    const seen = new Map(), total = new Map();
+    for (const t of centre) if (t.kind !== "unattached") total.set(t.state, (total.get(t.state) || 0) + 1);
     const place = (node, col) => { node.style.setProperty("--tv-r", String(row)); node.style.setProperty("--tv-c", String(col)); };
     for (const t of centre) {
       const folds = t.kind !== "unattached" && t.state !== "waiting" && t.state !== "failed";
-      const idx = folds ? (seen[t.state] = (seen[t.state] || 0) + 1) : 0;
+      const idx = folds ? (seen.set(t.state, (seen.get(t.state) || 0) + 1), seen.get(t.state)) : 0;
       const hide = folds && idx > GROUP_CAP && !shownAll.has(t.state);
-      const c = taskCard(t, byId, opts);
+      const c = taskCard(t, byId, lost, opts);
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;
       if (!hide) { place(c, 2); if (o) place(o, 3); }
       wrap.appendChild(c);
       if (o) wrap.appendChild(o);
-      for (const id of new Set(arr(t.waits_on).concat(t.state === "waiting" && t.card ? [t.card] : []))) if (recBy[id] && !hide) links.push([recBy[id], c, "waiting"]);
+      for (const id of new Set(arr(t.waits_on).concat(t.state === "waiting" && t.card ? [t.card] : []))) if (recBy.has(id) && !hide) links.push([recBy.get(id), c, "waiting"]);
       if (o && !hide) for (const li of o.children) links.push([c, li, li.classList.contains("bad") ? "bad" : "ok"]);
       if (!hide) row += 1;
       // a long run of one state (a Tray's open loops) shows its first few and one button for the rest; the choice outlives a redraw
-      if (folds && idx === total[t.state] && idx > GROUP_CAP) {
+      if (folds && idx === total.get(t.state) && idx > GROUP_CAP) {
         const st = t.state, open = shownAll.has(st);
         const more = el("button", "tv-more", open ? "show fewer" : "show " + (idx - GROUP_CAP) + " more");
         more.type = "button";
@@ -332,20 +374,22 @@
       svg.setAttribute("aria-hidden", "true");
       wrap.insertBefore(svg, wrap.firstChild);
       const redraw = () => drawLinks(wrap, svg, links);
-      if (typeof ResizeObserver === "function") new ResizeObserver(redraw).observe(wrap);
+      if (typeof ResizeObserver === "function") { linkObserver = new ResizeObserver(redraw); linkObserver.observe(wrap); }
       else if (root.requestAnimationFrame) root.requestAnimationFrame(redraw);
     }
     return wrap;
   }
 
   // ---- the Agents lens ----
-  function nodeRow(n, opts, depth) {
+  function nodeRow(n, lost, opts, depth) {
     const r = el("div", "tv-node " + n.state + (depth ? " sub" : ""));
     r.dataset.node = n.id;
     r.append(dot(n.state));
     const body = el("div", "tv-node-b");
     const top = el("div", "tv-node-t");
     top.appendChild(el("b", null, n.label));
+    const risk = riskMark(lost.get(n.id));
+    if (risk) top.appendChild(risk);
     if (n.state !== "running") top.appendChild(tag(n.state, NODE_WORDS[n.state] || n.state));
     body.appendChild(top);
     body.appendChild(el("div", "tv-node-m", [n.agent, n.model || "model unknown"].filter(Boolean).join(" · ")));
@@ -367,6 +411,7 @@
     wrap.appendChild(hub);
     const cols = el("div", "tv-cols");
     const nodes = arr(v.nodes);
+    const lost = lostMap(v);
     for (const g of arr(v.groups)) {
       const mine = nodes.filter((n) => n.group === g.id);
       const col = el("section", "tv-col");
@@ -377,11 +422,16 @@
       const ids = new Set(mine.map((n) => n.id));
       // a node whose parent is in this group sits under it, indented; the rest are the column's own rows
       const roots = mine.filter((n) => !n.parent || !ids.has(n.parent));
+      // a parent cycle (a -> b -> a) has no root: every node is drawn once, the unvisited remainder at the column's own level
+      const seen = new Set();
       const put = (n, depth) => {
-        col.appendChild(nodeRow(n, opts, depth));
+        if (seen.has(n.id)) return;
+        seen.add(n.id);
+        col.appendChild(nodeRow(n, lost, opts, depth));
         for (const k of mine.filter((m) => m.parent === n.id)) put(k, depth + 1);
       };
       for (const n of roots) put(n, 0);
+      for (const n of mine) put(n, 0);
       if (!mine.length) col.appendChild(el("p", "tv-none", "no nodes"));
       cols.appendChild(col);
     }
@@ -420,6 +470,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, render };
+  root.LevainTopologyView = { WIDE_PX, mode, lens, switchNode, hasWork, quietLine, signature, release, render };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

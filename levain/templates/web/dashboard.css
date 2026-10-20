@@ -1872,7 +1872,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
 /* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
    Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
-.panel.k-topology, [data-ck-panel="topology"] { display: none !important; }
+.panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
 .k7-mode-slot .tv-seg { margin: 0; }
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
 .tv-seg { display: inline-flex; border: 1px solid var(--hair-2); border-radius: var(--r-md); overflow: hidden; }
@@ -1900,6 +1900,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-dot.waiting { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 25%, transparent); }
 .tv-dot.stuck, .tv-dot.stalled { background: var(--warn); }
 .tv-dot.failed, .tv-dot.errored { background: var(--bad); }
+.tv-risk { display: inline-block; flex: none; width: 8px; height: 8px; margin-left: var(--sp-1); border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 2px color-mix(in oklch, var(--warn) 25%, transparent); }
 .tv-tag { flex: none; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-bold) var(--fs-micro)/1.7 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); border: 1px solid var(--hair-2); }
 .tv-tag.waiting { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .tv-tag.stuck, .tv-tag.stalled { color: var(--warn); border: 1px dashed var(--warn); }
