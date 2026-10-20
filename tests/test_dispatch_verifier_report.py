@@ -234,6 +234,12 @@ def minted(steps=STEPS, *, digest=None, **over) -> VerifierRun:
     minted(({"argv": [1], "wall_s": 1},)),
     minted(({"argv": ["true"], "wall_s": True},)),
     minted(({"argv": ["true"], "wall_s": 0},)),
+    # S1's own step validator judges the steps (L3 r2 G1): an empty argument, a wall over V20, a wall too long to
+    # digest, an argument that is not encodable text
+    minted(({"argv": [""], "wall_s": 1},)),
+    minted(({"argv": ["true"], "wall_s": 901},)),
+    minted(({"argv": ["true"], "wall_s": 10 ** 5000},), digest="sha256:" + "0" * 64),
+    minted(({"argv": ["a\ud800"], "wall_s": 1},), digest="sha256:" + "0" * 64),
 ], ids=lambda r: str(r.verifier.get("verifier_id")) + "/" + str(len(r.steps)))
 def test_a_minted_run_that_is_not_the_contracts_entry_and_steps_is_refused(run):
     raw, digest = envelope(run)

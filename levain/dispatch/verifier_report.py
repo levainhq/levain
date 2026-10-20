@@ -17,9 +17,9 @@ event's digest and the :class:`VerifierRun` the supervisor minted, and returns t
 :data:`ENVELOPE_FORMAT_NAME` is documentation only.
 
 The minted run is not trusted as given either (:func:`run_problem`, refusal ``verifier-entry``): its entry is exactly
-the contract's seven fields in their syntax, its steps the ticket step shape, the entry's ``steps_digest`` is
-recomputed over those steps and its ``driver_input_digest`` is the run's, so an envelope that echoes the entry back is
-bound to the steps and the driver input it claims.
+the contract's seven fields in their syntax, its steps the ticket steps S1's runtime grammar accepts, the entry's
+``steps_digest`` is recomputed over those steps and its ``driver_input_digest`` is the run's, so an envelope that
+echoes the entry back is bound to the steps and the driver input it claims.
 
 Known edge: no S1 code writes the envelope yet, so this is checked against fixture bytes that follow the contract's
 envelope field for field; the ``.exit`` member types are this module's reading of the contract, which names the
@@ -37,6 +37,8 @@ from levain import unshowable
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import DispatchError
+from levain.slot import Refused
+from levain.slot.runtime_grammar import _verifier_steps
 
 __all__ = [
     "ENVELOPE_FORMAT_NAME", "EXIT_KEYS", "MAX_ENVELOPE_BYTES", "MAX_REPORT_BYTES", "MAX_STEPS", "NOTE_MAX",
@@ -67,20 +69,17 @@ _VERIFIER_ID = re.compile(r"[a-z0-9-]{1,48}")
 _DRIVER_TEMPLATE = re.compile(r"[a-z0-9_]{1,48}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _KINDS = ("black-box", "in-process")
-_TICKET_STEP_KEYS = frozenset({"argv", "wall_s"})
-_ARGV_MAX = 64
-_ARG_MAX_BYTES = 4 << 10
 
 # every name check_envelope refuses with, closed: the minted run is not the contract's entry and steps; no envelope
-# bytes to read; the event's digest is not the file's; the
-# file is over the cap; it does not parse or is not canonical; its members are not the envelope's; session, ticket,
-# verifier entry, driver input or input bundle is not the one minted; its .exit records are not one per ticket step of
-# the right shape; the body's format, members, step list or count is wrong; its result disagrees with its steps
+# bytes to read; the event's digest is not the file's; the file is over the cap; it does not parse or is not canonical;
+# its members are not the envelope's; session, ticket, verifier entry, driver input or input bundle is not the one
+# minted; its .exit records are not one per ticket step of the right shape; the body's format, members, step list or
+# count is wrong; its result disagrees with its steps
 REFUSALS = (
-    "verifier-entry", "report-missing", "report-digest-mismatch", "report-too-large", "report-not-canonical", "envelope-members",
-    "envelope-session", "envelope-ticket", "envelope-verifier", "envelope-driver-input", "envelope-input-bundle",
-    "envelope-steps",
-    "report-format", "report-body", "report-step-count", "report-result-disagrees",
+    "verifier-entry", "report-missing", "report-digest-mismatch", "report-too-large", "report-not-canonical",
+    "envelope-members", "envelope-session", "envelope-ticket", "envelope-verifier", "envelope-driver-input",
+    "envelope-input-bundle", "envelope-steps", "report-format", "report-body", "report-step-count",
+    "report-result-disagrees",
 )
 
 
@@ -139,21 +138,22 @@ def _exit_ok(rec: Any) -> bool:
             and _int(rec["truncated_bytes"]) and _int(rec["lingering_killed"]))
 
 
-def _ticket_step_ok(step: Any) -> bool:
-    if not isinstance(step, Mapping) or set(step) != _TICKET_STEP_KEYS:
-        return False
-    argv, wall = step["argv"], step["wall_s"]
-    if not isinstance(argv, (list, tuple)) or not 1 <= len(argv) <= _ARGV_MAX:
-        return False
-    for arg in argv:
-        if not isinstance(arg, str) or "\x00" in arg:
-            return False
-        try:
-            if len(arg.encode("utf-8")) > _ARG_MAX_BYTES:
-                return False
-        except UnicodeEncodeError:
-            return False
-    return type(wall) is int and wall > 0
+def _steps_problem(steps: Any) -> str | None:
+    # dispatch must judge the ticket steps exactly as the runtime helper will, so there is one validator and it is
+    # S1's _verifier_steps, private or not; the steps reach it in the JSON types it reads them in
+    if not isinstance(steps, (list, tuple)):
+        return "the ticket's steps are not a list"
+    plain = [{k: list(v) if k == "argv" and isinstance(v, tuple) else v for k, v in s.items()}
+             if isinstance(s, Mapping) else s for s in steps]
+    try:
+        _verifier_steps(plain)
+    except Refused as exc:
+        return f"the runtime helper refuses the ticket's steps: {exc}"[:256]
+    except ValueError:
+        # a value the helper could never be handed (a lone surrogate, an integer past canon's range): its own stdin
+        # parse refuses it before the validator runs, so the validator does not name it
+        return "a ticket step holds a value the runtime helper's stdin parse refuses"
+    return None
 
 
 def run_problem(run: VerifierRun) -> str | None:
@@ -172,11 +172,9 @@ def run_problem(run: VerifierRun) -> str | None:
     for k in ("verifier_artifact_digest", "driver_template_digest", "steps_digest", "driver_input_digest"):
         if _DIGEST.fullmatch(entry[k]) is None:
             return f"the {k} is not sha256:<64 hex>"
-    if not isinstance(steps, (list, tuple)) or not 1 <= len(steps) <= MAX_STEPS:
-        return f"the ticket's steps are a list of 1 to {MAX_STEPS}"
-    if not all(_ticket_step_ok(s) for s in steps):
-        return (f"a ticket step is not {{argv: 1 to {_ARGV_MAX} strings of at most {_ARG_MAX_BYTES} bytes and no "
-                "NUL, wall_s: a positive int}")
+    problem = _steps_problem(steps)
+    if problem is not None:
+        return problem
     canon = canonical_bytes([{"argv": list(s["argv"]), "wall_s": s["wall_s"]} for s in steps])
     if entry["steps_digest"] != "sha256:" + hashlib.sha256(canon).hexdigest():
         return "the entry's steps_digest is not the digest of the ticket's steps"

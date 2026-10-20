@@ -398,6 +398,24 @@ def _terminal_event(event: Any, run: VerifierRun) -> tuple[str | None, str | Non
     return None, digest
 
 
+def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
+    """The run record one ``run_records`` row holds, or :class:`JobStoreError`: the row parses to a record of the
+    record's own shape, for this job and run, in its canonical bytes, under the digest stored beside it. The one check
+    every reader of a stored row uses, so the pass count never trusts a row a land would refuse."""
+    from levain.dispatch.adopt import ArtifactRecord, artifact_digest
+
+    try:
+        fields = json.loads(text)
+        rec = ArtifactRecord(**fields) if isinstance(fields, dict) else None
+    except (TypeError, ValueError):
+        rec = None
+    if rec is None or rec.problem() is not None or rec.job_id != job_id or rec.run != run or \
+            canonical(rec.to_mapping()) != text or artifact_digest(rec) != digest:
+        raise JobStoreError(f"run {run} of job {job_id} holds a record that does not match its digest; the dispatch "
+                            "store is damaged")
+    return rec
+
+
 def _label(name: str, value: Any, high: int) -> str:
     if not isinstance(value, str) or not value or len(value) > high:
         raise DispatchError(f"{name} must be 1 to {high} characters")
@@ -892,15 +910,9 @@ class JobStore:
                                 json.dumps({"run": record.run, "step": failure.step, "note": failure.note},
                                            sort_keys=True))
                 else:
-                    passed: set[int] = set()
-                    for r, text in conn.execute("SELECT run, record FROM run_records WHERE job_id = ?", (job.id,)):
-                        try:
-                            result = json.loads(text)["verifier"]["result"]
-                        except (TypeError, ValueError, KeyError):
-                            raise JobStoreError(f"run {r} of job {job.id} holds a record that cannot be read; the "
-                                                "dispatch store is damaged") from None
-                        if result == "pass":
-                            passed.add(r)
+                    passed = {r for r, text, digest in conn.execute(
+                        "SELECT run, record, digest FROM run_records WHERE job_id = ?", (job.id,))
+                        if _stored_record(job.id, r, text, digest).verifier["result"] == "pass"}
                     if passed == set(range(template.k)):
                         self._apply(conn, job.id, "verified", "verifier_pass", stamp,
                                     json.dumps({"runs": template.k}, sort_keys=True))
@@ -924,25 +936,11 @@ class JobStore:
         """Job ``job_id``'s run records, by run, each re-checked against the digest written beside it: a record whose
         bytes are not its canonical form, or whose digest is not the one stored, is a :class:`JobStoreError`, never
         skipped. The one source of the records a land reads."""
-        from levain.dispatch.adopt import ArtifactRecord, artifact_digest
-
         with self._swept() as (conn, _stamp):
             job = self._must_load(conn, job_id)
             rows = conn.execute("SELECT run, record, digest FROM run_records WHERE job_id = ? ORDER BY run",
                                 (job.id,)).fetchall()
-        out = []
-        for run, text, digest in rows:
-            try:
-                fields = json.loads(text)
-                rec = ArtifactRecord(**fields) if isinstance(fields, dict) else None
-            except (TypeError, ValueError):
-                rec = None
-            if rec is None or rec.problem() is not None or rec.job_id != job.id or rec.run != run or \
-                    canonical(rec.to_mapping()) != text or artifact_digest(rec) != digest:
-                raise JobStoreError(f"run {run} of job {job.id} holds a record that does not match its digest; the "
-                                    "dispatch store is damaged")
-            out.append(rec)
-        return out
+        return [_stored_record(job.id, run, text, digest) for run, text, digest in rows]
 
     def get(self, job_id: str) -> Job | None:
         """The job ``job_id`` after a sweep, or ``None``."""

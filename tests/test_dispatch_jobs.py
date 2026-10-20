@@ -1238,7 +1238,10 @@ def test_a_staging_writer_that_finds_the_job_failed_deletes_its_staged_refs(stor
     assert store.get(job.id).state == "failed" and staged_refs(repo, job) == []
 
 
-@pytest.mark.parametrize("text", ["not json", '{"run": 0}', '{"verifier": []}', "[]"])
+@pytest.mark.parametrize("text", ["not json", '{"run": 0}', '{"verifier": []}', "[]",
+                                  # a row that only says pass is not a record (L3 r2 G2): the pass count reads rows
+                                  # with run_records' own check
+                                  '{"verifier":{"result":"pass"}}'])
 def test_an_unreadable_stored_record_in_the_pass_count_is_a_damaged_store(tmp_path, clock, repo, text):
     store = new_store(tmp_path, clock)
     job, _ = at_state(store, repo, "verifying")
