@@ -1860,13 +1860,8 @@ body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 .panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
 .panel.ck-collapsed > :not(.phead) { display: none; }
 body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
-/* a card whose place CSS `order` pins (a fold line, Recent episodes on the Board, the Build jobs / edits / loops rows) would take a move as a no-op: no move buttons, collapse stays */
-body.ke .panel.ck-fold .ck-lay-up, body.ke .panel.ck-fold .ck-lay-down,
-body.ke[data-mode="board"] [data-ck-panel="episodes"] .ck-lay-up, body.ke[data-mode="board"] [data-ck-panel="episodes"] .ck-lay-down,
-body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"] .ck-lay-down,
-body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] .ck-lay-down,
-body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] .ck-lay-down,
-body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] .ck-lay-up, body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] .ck-lay-down { display: none; }
+/* a card whose place CSS `order` pins would take a move as a no-op: the page marks its box (one set of keys in dashboard_core.js), no move buttons, collapse stays */
+.ck-lay.ck-nomove .ck-lay-up, .ck-lay.ck-nomove .ck-lay-down { display: none; }
 body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
 body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
 body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }

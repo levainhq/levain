@@ -216,3 +216,103 @@ def test_the_controls_are_keyboard_reachable_buttons_with_names_at_phone_width(t
     assert len(btns) == 3 and all(t == "BUTTON" and ty == "button" and label and shown for t, ty, label, shown in btns), btns
     assert no_hscroll is True, "the controls must not widen the page at 390"
     assert resets == [], resets      # nothing saved: no reset control at all
+
+
+# ---- fix2 (L3 round 1: N1 to N6) ----
+TAB = "(m) => { document.querySelector('[data-mode-tab=\"' + m + '\"]').click(); return new Promise(r => setTimeout(r, 300)).then(() => 1); }"
+SEQ = ("(() => [...document.querySelectorAll('.ck-zgrid .panel')].filter(p => p.getClientRects().length > 0)"
+       ".map(p => { const r = p.getBoundingClientRect(); return [Math.round(r.top), Math.round(r.left), p.dataset.ckPanel]; })"
+       ".sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(x => x[2]).join(','))()")
+DRAFT = "(() => { const ta = document.querySelector('.tray-dump-ta'); ta.value = 'half a thought'; return !!ta; })()"
+SHOWN_MOVES = ("[...document.querySelectorAll('.ck-zgrid .ck-lay-up, .ck-zgrid .ck-lay-down')]"
+               ".filter(b => !b.disabled && b.getClientRects().length > 0)")
+
+
+@needs_browser
+def test_no_enabled_move_is_a_no_op_in_any_tab_by_the_visible_sequence(tmp_path: Path) -> None:
+    """N1: a neighbour is a VISIBLE, MOVABLE card in rendered order. Morning shows the Tray alone (Now is another tab's card)."""
+    steps: list = []
+    for m in ("morning", "board", "build"):
+        steps += [{"eval": f"({TAB})('{m}')"},
+                  {"eval": "(async () => { const seq = () => " + SEQ + "; const res = [];"
+                           f" const n = {SHOWN_MOVES}.length;"
+                           f" for (let i = 0; i < n; i++) {{ const b = {SHOWN_MOVES}[0]; if (!b) break;"
+                           " const before = seq(); b.click(); await new Promise(r => setTimeout(r, 400));"
+                           f" res.push(['{m}', b.getAttribute('aria-label'), before !== seq()]); break; }}"
+                           f" return [res, {SHOWN_MOVES}.length]; }})()"}]
+    out = _run(tmp_path, steps)
+    morning, board, build = out[1], out[3], out[5]
+    assert morning[1] == 0, morning                                      # the Tray alone: it has nothing visible to swap with
+    assert board[0] and all(ch for _m, _l, ch in board[0]), board        # a move shown on the Board moves something you can see
+    assert build[1] == 0, build
+
+
+@needs_browser
+def test_an_unsaved_draft_disables_the_layout_controls_and_nothing_is_written(tmp_path: Path) -> None:
+    """N2 + N3: the gate is checked before any write; while a draft is open the controls are disabled with a reason."""
+    out = _run(tmp_path, [
+        {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE, {"eval": STORED},     # a saved layout, so Reset exists
+        {"eval": DRAFT},
+        # no input event yet: the click itself must refuse
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); "
+                 "document.querySelector('[data-layout-reset]').click(); 1"},
+        SETTLE, {"eval": STORED}, {"eval": STACKS},
+        {"eval": "document.querySelector('.tray-dump-ta').dispatchEvent(new Event('input', {bubbles: true})); new Promise(r => setTimeout(r, 200)).then(() => 1)"},
+        {"eval": f"[...{PANEL % 'now'}.querySelectorAll('.ck-lay-btn')].map(b => [b.disabled, b.title])"},
+        {"eval": "[...document.querySelectorAll('[data-layout-reset]')].map(b => [b.disabled, b.title])"},
+    ])
+    saved, after, stacks, btns, resets = out[2], out[6], out[7], out[9], out[10]
+    assert saved["collapsed"] == ["tray"], saved
+    assert after == saved, (saved, after)                                 # no write: no stale order, no stale Reset
+    assert stacks["left"] == ["tray", "now"], stacks
+    assert btns and all(d and "finish or cancel the edit first" in t for d, t in btns), btns
+    assert resets and all(d and "finish or cancel the edit first" in t for d, t in resets), resets
+
+
+@needs_browser
+def test_a_card_with_an_open_edit_row_is_not_folded(tmp_path: Path) -> None:
+    out = _run(tmp_path, [
+        {"eval": f"(() => {{ const b = {PANEL % 'tray'}.querySelector(':scope > .pbody'); const d = document.createElement('div'); d.className = 'text-editor';"
+                 " d.innerHTML = '<textarea class=\"edit-ta\" data-orig=\"x\">x</textarea>'; b.appendChild(d); return 1; })()"},
+        {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), {STORED}]"},
+    ])
+    assert out[-1] == [False, None], out[-1]
+
+
+@needs_browser
+def test_the_handlers_resolve_the_card_and_grid_at_click_time(tmp_path: Path) -> None:
+    """N4: a surviving (adopted) panel is moved by its key now, not the key of the render that built its buttons."""
+    out = _run(tmp_path, [
+        {"eval": f"{PANEL % 'now'}.dataset.ckCard = 'keep'; {PANEL % 'now'}.querySelector('.ck-lay-up').disabled = false; "
+                 f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); 1"},
+        SETTLE, {"eval": STACKS}, {"eval": STORED},
+    ])
+    stacks = out[-2]
+    assert stacks["right"] == ["keep", "loops"] and stacks["left"] == ["tray", "now"], stacks
+
+
+@needs_browser
+def test_storage_that_refuses_writes_still_lets_the_controls_work_for_the_pages_life(tmp_path: Path) -> None:
+    """N5: an in-memory layout backs the page when setItem throws."""
+    out = _run(tmp_path, [
+        {"eval": "Storage.prototype.setItem = () => { throw new Error('quota'); }; 1"},
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); 1"}, SETTLE, {"eval": STACKS},
+        {"eval": "document.getElementById('refresh').click(); new Promise(r => setTimeout(r, 800)).then(() => 1)"}, {"eval": STACKS},
+        {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('[data-layout-reset]').length > 0]"},
+    ])
+    assert out[3]["left"] == ["now", "tray"], out[3]
+    assert out[5]["left"] == ["now", "tray"], out[5]                      # survives a redraw
+    assert out[-1] == [True, True], out[-1]
+
+
+@needs_browser
+def test_a_zone_id_is_never_interpolated_into_a_selector(tmp_path: Path) -> None:
+    """N6: nodes are found by comparing dataset values."""
+    out = _run(tmp_path, [
+        {"eval": "window.__errs = []; window.addEventListener('error', e => window.__errs.push(String(e.message))); 1"},
+        {"eval": f"(() => {{ const p = {PANEL % 'now'}; p.closest('.ck-zgrid').dataset.ckZone = 'op\"]x'; p.querySelector('.ck-lay-up').click(); return 1; }})()"},
+        SETTLE, {"eval": "window.__errs"},
+    ])
+    assert out[-1] == [], out[-1]

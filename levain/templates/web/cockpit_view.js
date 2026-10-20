@@ -1734,7 +1734,11 @@
   // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
   const LAYOUT_KEY = "levain_cockpit_layout_v1";
   const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
+  // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
+  let memLayout = null, memStale = false;
+  const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
   function readLayout() {
+    if (memStale && memLayout) return copyLayout(memLayout);
     const out = { zones: Object.create(null), collapsed: [] };
     let v = null;
     try { v = JSON.parse(root.localStorage.getItem(LAYOUT_KEY)); } catch (_) { return out; }
@@ -1751,9 +1755,10 @@
   function writeLayout(l) {
     const zones = {};
     for (const z of Object.keys(l.zones)) zones[z] = { order: l.zones[z] };
-    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); } catch (_) { /* the page still moved */ }
+    memLayout = copyLayout(l);
+    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
   }
-  function resetLayout() { try { root.localStorage.removeItem(LAYOUT_KEY); } catch (_) { /* nothing was kept */ } }
+  function resetLayout() { memLayout = null; memStale = false; try { root.localStorage.removeItem(LAYOUT_KEY); } catch (_) { /* nothing was kept */ } }
   // the stored names first, in their stored order; every key the page has and the store does not name follows in the order it came
   function layoutOrder(zoneId, keys) {
     const stored = readLayout().zones[zoneId] || [];
@@ -2226,8 +2231,10 @@
     });
     document.addEventListener("click", (ev) => {
       if (!(ev.target && ev.target.closest && ev.target.closest("[data-layout-reset]"))) return;
+      const D = root.LevainDashboard;
+      if (D && D.hasUnsavedEdit && D.hasUnsavedEdit()) return;   // the gate comes before the write: a draft or a running job keeps the layout as it is
       resetLayout();
-      if (root.LevainDashboard && root.LevainDashboard.redraw) root.LevainDashboard.redraw();
+      if (D && D.redraw) root.LevainDashboard.redraw();
     });
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
