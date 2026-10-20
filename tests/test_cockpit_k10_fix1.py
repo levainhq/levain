@@ -101,7 +101,8 @@ def test_the_repaint_signature_follows_what_is_drawn_to_the_decimal_and_the_day(
     base = _value_for_signature()
     rate, age, clock = _value_for_signature(), _value_for_signature(), _value_for_signature()
     cent, subcent = _value_for_signature(), _value_for_signature()
-    base["tasks"][0]["cost"] = {"usd": 1.234, "tokens": 5000, "source": "ledger"}
+    for v in (base, rate, age, clock):
+        v["tasks"][0]["cost"] = {"usd": 1.234, "tokens": 5000, "source": "ledger"}
     cent["tasks"][0]["cost"] = {"usd": 1.24, "tokens": 5000, "source": "ledger"}        # $1.23 -> $1.24 is drawn
     subcent["tasks"][0]["cost"] = {"usd": 1.2341, "tokens": 5000, "source": "ledger"}   # $1.23 either way: not drawn
     rate["nodes"][0]["rate"] = 3.4                      # the Agents lens draws one decimal: 3.1 -> 3.4 is visible
