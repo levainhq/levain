@@ -683,14 +683,17 @@ def _required_spellings(spec: str | Path, what: str) -> list[Path]:
     """
     s = str(spec)
     raw = Path.home() / s[2:] if s == "~" or s.startswith("~/") else Path(s)
-    try:
-        raw.parent.resolve()
-        raw.resolve()
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ConfinementError(
-            f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
-            "refusing to build the floor (fail-closed)"
-        ) from exc
+    # Strict, because non-strict resolve stopped reporting a symlink loop in Python 3.13.
+    for path in (raw.parent, raw):
+        try:
+            path.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError):
+            pass  # absent: protected lexically, as an absent persistence path always was
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"the protected persistence path {raw} ({what}) cannot be resolved ({exc}) — "
+                "refusing to build the floor (fail-closed)"
+            ) from exc
     return _spellings(spec)
 
 

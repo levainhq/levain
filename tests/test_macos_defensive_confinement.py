@@ -331,6 +331,22 @@ def test_unresolvable_env_git_config_refuses_the_floor(tmp_path, monkeypatch) ->
                           deny_standard_creds=False)
 
 
+def test_required_spellings_refuses_a_loop_and_allows_an_absent_path(tmp_path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    with pytest.raises(conf.ConfinementError, match=r"loop target.*fail-closed"):
+        conf._required_spellings(loop, "loop target")
+    with pytest.raises(conf.ConfinementError, match=r"under a loop.*fail-closed"):
+        conf._required_spellings(loop / "child", "under a loop")
+
+    absent = tmp_path / "absent" / "deeper"
+    assert absent in conf._required_spellings(absent, "absent")
+
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert dangling in conf._required_spellings(dangling, "dangling")
+
+
 def test_symlinked_agent_roots_deny_lexical_and_resolved_targets(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
