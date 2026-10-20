@@ -6,16 +6,20 @@ place that computes "a line was set"; these tests drive the real entry points th
 """
 from __future__ import annotations
 
+import ast
 import json
-import re
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from anneal_memory import Store
 
 from levain import cli
+from levain import dashboard
 from levain.dashboard import AnnealPaths, run_state, write_state
 from levain.writes import EditError, WriteScope, apply_edit
 
@@ -59,6 +63,7 @@ def test_the_same_call_twice_writes_one_episode_and_refreshes_the_stamp(root: Pa
     first = _line(root)["state_set_at"]
     res = _set(root, "Dinner and some light flow work")
     assert res["episode"] == "unchanged" and len(_episodes(root)) == 1
+    assert _set(root, "Dinner and some light flow work")["episode"] == "unchanged" and len(_episodes(root)) == 1
     assert _line(root)["state_set_at"] >= first and _line(root)["state"] == "Dinner and some light flow work"
 
 
@@ -72,6 +77,12 @@ def test_a_clear_writes_no_episode(root: Path) -> None:
     _set(root, "something")
     res = _set(root, "   ")
     assert res["episode"] == "cleared" and len(_episodes(root)) == 1
+
+
+def test_a_cleared_line_set_again_is_a_new_setting(root: Path) -> None:
+    _set(root, "back again")
+    _set(root, "")
+    assert _set(root, "back again")["episode"] == "written" and len(_episodes(root)) == 2
 
 
 def test_an_expired_line_set_again_is_a_new_setting(root: Path) -> None:
@@ -163,16 +174,137 @@ def test_a_bare_write_state_records_no_episode(root: Path) -> None:
     assert done.episode == "no_store" and _episodes(root) == []
 
 
+def test_a_retry_after_a_locked_store_delivers_the_episode_the_first_try_lost(root: Path) -> None:
+    """L1 WARNING F1: 'unchanged' was keyed on the LINE, so re-setting the text whose episode failed
+    returned unchanged and the felt episode was never written."""
+    holder = sqlite3.connect(str(root / ".levain" / "memory.db"), timeout=0, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        with pytest.warns(RuntimeWarning):
+            assert _set(root, "set while locked")["episode"] == "failed"
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert _episodes(root) == []
+    assert _set(root, "set while locked")["episode"] == "written"        # the retry the CLI's note invites
+    assert [e.content for e in _episodes(root)] == ["set while locked"]
+    assert _set(root, "set while locked")["episode"] == "unchanged"      # now a true duplicate
+    assert len(_episodes(root)) == 1
+
+
+def test_a_line_set_before_the_store_existed_gets_its_episode_once_it_does(tmp_path: Path) -> None:
+    assert _set(tmp_path, "before init")["episode"] == "no_store"
+    (tmp_path / ".levain").mkdir(exist_ok=True)
+    with Store(str(tmp_path / ".levain" / "memory.db")):
+        pass
+    assert _set(tmp_path, "before init")["episode"] == "written"
+    assert [e.content for e in _episodes(tmp_path)] == ["before init"]
+
+
+def test_a_death_between_the_line_and_the_episode_is_repaired_by_the_next_set(root: Path) -> None:
+    """The line landed, the process died before the episode: the next set of the same text writes it."""
+    dashboard._write_context_line(root / ".levain" / "context.json", "state", "died here", source="web")
+    assert _episodes(root) == []
+    assert _set(root, "died here")["episode"] == "written"
+
+
+def test_an_old_episode_of_the_same_text_does_not_stand_for_a_later_setting(root: Path) -> None:
+    """The store's episode must be for THIS setting of the line (at or after its set time)."""
+    _set(root, "again")
+    _set(root, "other")
+    assert _set(root, "again")["episode"] == "written"
+    assert sorted(e.content for e in _episodes(root)) == ["again", "again", "other"]
+
+
+def test_a_stale_writers_episode_never_outranks_the_newer_lines(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L1 WARNING F2: the episode was stamped by ``record()`` after the lock was released, so a slow
+    writer's older line left the NEWEST episode contradicting the live line. Driven through
+    ``write_state`` itself (``apply_edit`` serialises in-process; two processes do not)."""
+    real = dashboard._record_state_episode
+
+    def slow(*args, **kwargs):
+        if "x" in args:
+            time.sleep(0.8)         # the first writer's episode lands after the second's
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_record_state_episode", slow)
+    ctx, db = root / ".levain" / "context.json", root / ".levain" / "memory.db"
+    first = threading.Thread(target=write_state, args=(ctx, "x"), kwargs={"episodic_db": db})
+    first.start()
+    time.sleep(0.3)
+    write_state(ctx, "y", episodic_db=db)
+    first.join()
+    assert sorted(e.content for e in _episodes(root)) == ["x", "y"]
+    newest = max(_episodes(root), key=lambda e: e.timestamp)
+    assert newest.content == _line(root)["state"] == "y"
+
+
+def test_the_episode_is_stamped_with_the_instant_the_line_is(root: Path) -> None:
+    _set(root, "stamped")
+    (ep,) = _episodes(root)
+    at = dashboard.datetime.fromisoformat(_line(root)["state_set_at"])
+    assert ep.timestamp == at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def test_the_episode_joins_anneals_audit_chain_alongside_other_writers(root: Path) -> None:
+    """L2 F3: ``audit=False`` rested on a false premise (the audit chain takes concurrent writers
+    across processes). Threads and a second process set distinct lines at once; every episode has
+    its audit record and the chain's seq numbers run unbroken."""
+    code = ("import sys; from pathlib import Path; from levain.writes import WriteScope, apply_edit;"
+            "apply_edit(WriteScope.from_install_root(Path(sys.argv[1])), {'kind':'operator_state','text':'from a process'})")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(root)], cwd=str(REPO),
+                            env={**__import__("os").environ, "PYTHONPATH": str(REPO)})
+    threads = [threading.Thread(target=_set, args=(root, f"line {i}")) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert proc.wait(timeout=60) == 0
+    assert len(_episodes(root)) == 4
+    records = [json.loads(line) for line in (root / ".levain" / "memory.audit.jsonl").read_text().splitlines()]
+    assert [r["seq"] for r in records] == list(range(4)) and {r["event"] for r in records} == {"record"}
+
+
+def _calls_to_write_state(tree: ast.AST) -> list[ast.Call]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and ((isinstance(n.func, ast.Name) and n.func.id == "write_state")
+                 or (isinstance(n.func, ast.Attribute) and n.func.attr == "write_state"))]
+
+
+def _names_a_store(call: ast.Call) -> bool:
+    """A call passes ``episodic_db=`` and it is not the literal None."""
+    return any(kw.arg == "episodic_db" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+               for kw in call.keywords)
+
+
 def test_every_write_state_call_in_the_package_names_its_store() -> None:
     """The class closes by a bound: a new entry point that calls ``write_state`` without
-    ``episodic_db`` would set a line no dream can read, so each call in levain/ must name one."""
-    calls = 0
+    ``episodic_db`` (or with the literal None) would set a line no dream can read, so each call in
+    levain/ must name one, whether it is spelled ``write_state(``, ``dashboard.write_state(`` or an
+    aliased import."""
+    sites = []
     for path in sorted((REPO / "levain").rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for m in re.finditer(r"(?<![\w.])write_state\(", text):
-            if text[max(0, m.start() - 4):m.start()] == "def ":
-                continue
-            calls += 1
-            span = text[m.start():text.index(")\n", m.start())]
-            assert "episodic_db" in span, f"{path.relative_to(REPO)}: {span!r}"
-    assert calls >= 2
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases = {a.asname for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                   for a in n.names if a.name == "write_state" and a.asname}
+        for call in _calls_to_write_state(tree) + [
+                n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id in aliases]:
+            sites.append(path.relative_to(REPO))
+            assert _names_a_store(call), f"{path.relative_to(REPO)}:{call.lineno} calls write_state without a store"
+    assert {p.name for p in sites} >= {"dashboard.py", "writes.py"}
+
+
+@pytest.mark.parametrize("source", [
+    "write_state(p, 'x')",
+    "write_state(p, 'x', episodic_db=None)",
+    "dashboard.write_state(p, 'x')",
+    "dashboard.write_state(p, 'x', episodic_db=None)",
+    "ws(p, 'x', source='cli')",
+])
+def test_the_source_guard_catches_the_shapes_the_old_regex_missed(source: str) -> None:
+    tree = ast.parse("from levain.dashboard import write_state as ws\n" + source)
+    calls = _calls_to_write_state(tree) or [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                                           and isinstance(n.func, ast.Name) and n.func.id == "ws"]
+    assert calls and not any(_names_a_store(c) for c in calls)
+    assert _names_a_store(ast.parse("dashboard.write_state(p, 'x', episodic_db=scope.db)").body[0].value)

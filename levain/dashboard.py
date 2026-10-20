@@ -737,9 +737,9 @@ def state_from_data(data: Any, now: datetime) -> State:
     return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta), version=empty.version)
 
 
-def _write_context_line(context_json: Path, key: str, text: str, *, source: str) -> None:
+def _write_context_line(context_json: Path, key: str, text: str, *, source: str) -> "datetime | None":
     """Merge-preserving atomic write of one ``{key, key_set_at, key_source}`` triple
-    (the body of ``write_state``)."""
+    (the body of ``write_state``). Returns the instant it stamped, None for a clear."""
     text = " ".join(text.split())  # collapse whitespace; "" → clear
     data: dict[str, Any] = {}
     try:
@@ -749,9 +749,10 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
                 data = existing
     except (OSError, ValueError):
         data = {}  # corrupt → start fresh; don't fail the operator's set
-    if text:
+    stamp = datetime.now(timezone.utc) if text else None
+    if stamp is not None:
         data[key] = text
-        data[f"{key}_set_at"] = datetime.now(timezone.utc).isoformat()
+        data[f"{key}_set_at"] = stamp.isoformat()
         data[f"{key}_source"] = source
     else:
         # CLEAR: POP all three keys — the exact shape the CLI/sensor clear writes
@@ -779,6 +780,7 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+    return stamp
 
 
 class StateLockUnavailable(RuntimeError):
@@ -787,7 +789,7 @@ class StateLockUnavailable(RuntimeError):
 
 
 @contextmanager
-def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
+def _state_lock(context_json: Path, *, required: bool, suffix: str = ".lock") -> Iterator[None]:
     """An exclusive lock held across one state write, on a sidecar of the file's REAL path (so a
     symlinked context file and its target share one lock, and the atomic ``os.replace`` of the file
     never swaps the locked inode). ``write_state`` takes it, so every writer that sets the line
@@ -801,7 +803,7 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
             raise StateLockUnavailable("this platform has no flock: a version-bound state write is refused")
         yield
         return
-    lock = os.path.realpath(context_json) + ".lock"
+    lock = os.path.realpath(context_json) + suffix
     # where flock exists every writer takes the lock or does not write: one unlocked write could land
     # between a checked writer's compare and its write and be overwritten unseen
     os.makedirs(os.path.dirname(lock), exist_ok=True)
@@ -826,7 +828,8 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
 class StateWrite:
     """What one ``write_state`` did beyond the line itself: the felt episode it owed.
     ``episode`` is ``written`` (one new episode), ``unchanged`` (the live line already read
-    this text: a re-set refreshes the stamp and writes no episode), ``cleared`` (a clear sets
+    this text and the store already holds its episode: a re-set refreshes the stamp and writes no
+    second one), ``cleared`` (a clear sets
     nothing), ``no_store`` (no episodic store to write to) or ``failed`` (the line is set, the
     episode is not; ``episode_error`` says why)."""
 
@@ -839,23 +842,53 @@ STATE_EPISODE_SOURCE = "levain-state"
 STATE_EPISODE_TAGS = ("felt", "state")
 
 
-def _record_state_episode(episodic_db: Path, text: str, source: str) -> StateWrite:
+def _store_holds_state_episode(store: Any, text: str, since: datetime) -> bool:
+    """True when the store holds a ``levain-state`` episode carrying ``text`` stamped at or after
+    ``since`` (the live line's own set time): the episode that line owes already exists."""
+    for ep in store.recall(source=STATE_EPISODE_SOURCE, limit=50).episodes:     # newest first
+        try:
+            at = datetime.fromisoformat(ep.timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        if at < since:
+            break
+        if ep.content == text:
+            return True
+    return False
+
+
+def _record_state_episode(context_json: Path, episodic_db: Path, text: str, source: str, *,
+                          stamp: datetime, since: datetime) -> StateWrite:
     """Append the one ``observation`` episode, tagged ``felt,state``, that carries the line
     verbatim: an input the consolidate reads, never a write into the felt layer. Fail-soft: the
     line is already set, so any fault here is reported in the result, never raised. A store
-    that does not exist is not created for a state line."""
+    that does not exist is not created for a state line.
+
+    The episode carries ``stamp``, the instant the line itself was stamped under the state lock,
+    so a late writer's episode never outranks a newer line's. The episode is skipped only if the
+    store already HOLDS one for this text stamped at or after ``since``, so a line whose episode
+    failed (locked store, a death between the two writes) gets it on the retry. The check and the
+    append run under a second lock, so N identical requests write one. Known edge: a clear, then a
+    set of the same text whose episode fails, then a re-set within one expiry window of an older
+    episode of that text, reads that older episode as this run's."""
     if not episodic_db.is_file():
         return StateWrite(text, "no_store")
     try:
         from anneal_memory import Store   # lazy, as the view's own read
 
-        # audit=False: anneal's audit sidecar is a single-writer hash chain, and a consolidate may
-        # hold it; this append is a plain WAL INSERT and needs no chain entry
-        with Store(str(episodic_db), audit=False) as store:
-            store.record(
-                content=text, episode_type="observation", source=STATE_EPISODE_SOURCE,
-                metadata={"tags": list(STATE_EPISODE_TAGS), "state_source": source},
-            )
+        # a lock of its own, never the state lock: a store held busy (up to its 5 s wait) must not
+        # hold up the next line set
+        with _state_lock(context_json, required=False, suffix=".episode.lock"):
+            with Store(str(episodic_db)) as store:
+                if _store_holds_state_episode(store, text, since):
+                    return StateWrite(text, "unchanged")
+                store.record(
+                    content=text, episode_type="observation", source=STATE_EPISODE_SOURCE,
+                    metadata={"tags": list(STATE_EPISODE_TAGS), "state_source": source},
+                    timestamp=stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                )
     except Exception as exc:   # noqa: BLE001: a secondary effect never fails the state write
         return StateWrite(text, "failed", f"{type(exc).__name__}: {exc}")
     return StateWrite(text, "written")
@@ -883,9 +916,9 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
     This is the ONE place "a state line was set" is computed. Given ``episodic_db`` it also
     appends ONE ``observation`` episode tagged ``felt,state`` carrying the line verbatim, AFTER
     the line is written and outside the lock (never an episode without the line); none for a
-    clear, and none when the live line already read this text (decided under the lock, so a
-    retried request writes the line again, as before, and no second episode). A writer that
-    passes no ``episodic_db`` records no episode."""
+    clear, and none when the live line already read this text AND the store already holds its
+    episode (so a retry after a failed episode delivers it, and N identical requests write one).
+    A writer that passes no ``episodic_db`` records no episode."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
@@ -893,14 +926,21 @@ def write_state(context_json: Path, text: str, *, source: str = "cli",
         if check is not None:
             check()
         prior = _read_state(context_json, datetime.now(timezone.utc))
-        _write_context_line(context_json, "state", collapsed, source=source)
-    if not collapsed:
+        stamp = _write_context_line(context_json, "state", collapsed, source=source)
+    if stamp is None:
         return StateWrite("", "cleared")
-    if prior is not None and prior.text == collapsed:
-        return StateWrite(collapsed, "unchanged")
     if episodic_db is None:
         return StateWrite(collapsed, "no_store")
-    return _record_state_episode(episodic_db, collapsed, source)
+    since = stamp       # a new setting owes an episode stamped at or after its own instant
+    if prior is not None and prior.text == collapsed and prior.set_at:
+        # the live line read this text: a re-set refreshes the stamp, so the run it continues may
+        # have begun up to one expiry window before it; an episode from that run stands for it
+        try:
+            was = datetime.fromisoformat(prior.set_at)
+            since = (was if was.tzinfo else was.replace(tzinfo=timezone.utc)) - timedelta(hours=STATE_EXPIRES_AFTER_HOURS)
+        except ValueError:
+            pass
+    return _record_state_episode(context_json, episodic_db, collapsed, source, stamp=stamp, since=since)
 
 
 @dataclass
