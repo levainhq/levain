@@ -744,12 +744,16 @@ class CoordStore:
                 self._close(conn, dependent, f"the thread it is about ({thread_id}) closed", "service", now)
 
     def _ended(self, conn: sqlite3.Connection, thread_id: str, now: str) -> None:
-        """A thread went done or closed (T7: done kills its envelope). No-op here; the envelope store (C2) narrows every
-        envelope bound to the thread, inside the same transaction."""
+        # T7, done kills its envelope: on every path that ends a thread, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.end_thread(conn, thread_id, now)
 
     def _split_done(self, conn: sqlite3.Connection, drop_id: str, thread_ids: list[str], now: str) -> None:
-        """A drop's first split was written, inside its transaction. No-op here; the envelope store (C2) binds a
-        structured envelope the drop carried."""
+        # a structured envelope the drop carried binds at its first split, whichever class opened the file
+        from levain.coordinator.envelopes import EnvelopeStore
+
+        EnvelopeStore.bind_on_split(conn, drop_id, thread_ids, now)
 
     @staticmethod
     def _dependents(conn: sqlite3.Connection, thread_id: str) -> list[str]:

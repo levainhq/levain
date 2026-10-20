@@ -432,3 +432,125 @@ def test_authority_refusal_is_not_in_force_for_a_live_envelope(ctx, structured_t
     _d, b, t = structured_thread
     assert ctx.live(b["envelope_id"], t) is None
     assert ctx.store.authority_refusal(b["envelope_id"], t.thread_id) == NOT_IN_FORCE
+
+
+# --- L1/L2 round 1 findings, each pinned (C2a fix commit) -------------------------------------------------------
+
+def test_a_plain_coordstore_ending_the_thread_still_kills_its_envelope(ctx, structured_thread):
+    # L1 HIGH 2: C1's CLI opens a plain CoordStore on the same file; T7 must hold whichever class ended the thread
+    from levain.coordinator.store import CoordStore
+    _d, b, t = structured_thread
+    plain = CoordStore(ctx.store.directory, clock=lambda: NOW)
+    plain.set_state(t.thread_id, "closed", by="operator")
+    assert ctx.rows("SELECT kind, by FROM envelope_attenuations") == [("thread_done", "service")]
+    assert "is done" in ctx.live(b["envelope_id"], t)
+
+
+def test_a_plain_coordstore_split_binds_the_structured_envelope(ctx):
+    from levain.coordinator.store import CoordStore
+    d, _fresh, b, _signed = ctx.structured("rename the heading")
+    plain = CoordStore(ctx.store.directory, clock=lambda: NOW)
+    (t,) = plain.split(d.drop_id, [Part("work", "heading")])
+    assert ctx.rows("SELECT envelope_id, thread_id, rev FROM envelope_binds") == [(b["envelope_id"], t.thread_id, 1)]
+
+
+@pytest.mark.parametrize("state", ["done", "closed"])
+def test_a_worded_envelope_never_binds_an_ended_thread(ctx, state):
+    # L1 HIGH 1: a bind after the end would never get a thread_done row, and a reopen would revive it
+    d, t = ctx.plain_thread("tidy the docs")
+    if state == "done":
+        ctx.store.set_state(t.thread_id, "working", by="coordinator")
+    ctx.store.set_state(t.thread_id, state, by="coordinator" if state == "done" else "operator")
+    t = ctx.store.thread(t.thread_id)
+    _b, signed = ctx.worded(d, t, lands=[ctx.land("main")])
+    with pytest.raises(CoordError, match="reopen it before signing"):
+        ctx.accept(signed)
+
+
+@pytest.mark.parametrize("candidate", ["src/../.git/hooks/pre-commit", "src//x", "./src/x", "src/./x",
+                                       "src/.GIT/hooks/x", "src/café"])
+def test_a_candidate_path_is_held_to_the_signed_paths_shape(candidate):
+    # L1 MED 6 / L2 MED: path_within validates the candidate, not only the allowed side
+    assert env.path_within(candidate, ("src/",)) is False
+
+
+@pytest.mark.parametrize("path", [".git/hooks/x", ".GIT/config", "sub/.git/hooks/x"])
+def test_a_whole_repo_scope_never_reaches_a_git_directory(path):
+    assert env.path_within(path, (".",)) is False
+
+
+def test_a_signed_where_path_into_dot_git_is_refused_at_any_depth_and_case(ctx):
+    d = ctx.plain("x")
+    for p in (".GIT/hooks/", "sub/.git/config"):
+        b = ctx.body(d.drop_id, d.words, where=[{"repo": ctx.path, "paths": [p]}], lands=[])
+        with pytest.raises(env.EnvelopeError, match=r"\.git"):
+            env.parse_body(canonical(b))
+
+
+def test_a_job_stops_when_the_chains_current_head_is_killed(ctx):
+    # L1 MED 5 / L2 MED: the head's liveness is the third condition (C0 §4.5)
+    d, t = ctx.plain_thread("refactor the readme")
+    bv, sv = ctx.worded(d, t, lands=[ctx.land("main")])
+    ctx.accept(sv)
+    bw, sw = ctx.worded(d, t, lands=[ctx.land("main")],
+                        supersedes={"envelope_id": bv["envelope_id"], "digest": env.envelope_digest(bv)})
+    ctx.accept(sw)
+    assert ctx.store.chain_live_refusal(bv["envelope_id"], t.thread_id, authority=ctx.snap) is None
+    ctx.store.attenuate(bw["envelope_id"], "kill")
+    assert ctx.live(bv["envelope_id"], t) is None
+    assert "chain's current envelope is not live" in ctx.store.chain_live_refusal(
+        bv["envelope_id"], t.thread_id, authority=ctx.snap)
+
+
+def test_a_supersede_that_edits_only_criteria_does_not_strand_the_land(ctx):
+    # L2 MED: effects match by target; criteria from every chain member hold together
+    d, t = ctx.plain_thread("trim the readme")
+    v_land = ctx.land("main", criteria=[{"max_files": 5}])
+    bv, sv = ctx.worded(d, t, lands=[v_land])
+    ctx.accept(sv)
+    bx, sx = ctx.worded(d, t, lands=[ctx.land("main", criteria=[{"max_files": 10}])],
+                        supersedes={"envelope_id": bv["envelope_id"], "digest": env.envelope_digest(bv)})
+    ctx.accept(sx)
+    assert ctx.store.ceiling_refusal(bv["envelope_id"], t.thread_id, effect=("lands", v_land)) is None
+    assert ctx.store.ceiling_criteria(bv["envelope_id"], t.thread_id, "lands", v_land) == [
+        [{"max_files": 5}], [{"max_files": 10}]]
+
+
+def test_a_verifier_that_cannot_run_still_keeps_the_words(ctx, monkeypatch):
+    # L1 MED 3 / L2: a fault on this machine is not a verdict, and never costs the drop
+    from levain.authority import VerifierUnavailable
+
+    def broken(*_a, **_k):
+        raise VerifierUnavailable("ssh-keygen is missing")
+
+    monkeypatch.setattr(env, "verify_link_sig", broken)
+    d, fresh, _b, _s = ctx.structured("keep these words")
+    assert fresh and d.envelope_id is None and d.words == "keep these words"
+    assert "could not be checked on this machine" in ctx.store.envelope_refused(d.drop_id)
+
+
+def test_a_drop_carrying_an_envelope_needs_an_authority_snapshot(ctx):
+    b = ctx.body("dr-" + secrets.token_hex(16), "w")
+    with pytest.raises(CoordError, match="authority snapshot"):
+        ctx.store.accept_drop("w", surface="cli", source=ctx.src, envelope=ctx.sign(b))
+
+
+@pytest.mark.parametrize("onto", ["a..b", "Main", "nope"])
+def test_a_land_onto_must_pass_f11s_branch_check(ctx, onto):
+    # L1 MED 4 / L2 LOW: C0 §4.3 "onto passes F11's branch_problem"
+    d, t = ctx.plain_thread("land somewhere")
+    _b, signed = ctx.worded(d, t, lands=[ctx.land(onto)])
+    with pytest.raises(CoordError, match="a land onto"):
+        ctx.accept(signed)
+
+
+def test_stop_earlier_at_the_current_stop_writes_nothing(ctx, structured_thread):
+    # L1 LOW 10: a repeated tap is a no-op, like a second kill
+    _d, b, _t = structured_thread
+    assert ctx.store.attenuate(b["envelope_id"], "stop_earlier", b["stop_at"]) is False
+
+
+def test_an_attenuation_with_a_non_text_value_is_a_coord_error(ctx, structured_thread):
+    _d, b, _t = structured_thread
+    with pytest.raises(CoordError):
+        ctx.store.attenuate(b["envelope_id"], "drop_effect", ["x"])

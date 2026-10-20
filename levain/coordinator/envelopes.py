@@ -44,6 +44,8 @@ from levain.coordinator import envelope as env
 from levain.coordinator.store import (
     SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256,
 )
+from levain.authority import VerifierUnavailable
+from levain.dispatch.adopt import branch_problem
 from levain.dispatch.contract import MAX_LIFETIME
 
 __all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStore"]
@@ -142,6 +144,10 @@ class EnvelopeStore(CoordStore):
         for w in body["where"]:
             if _git_toplevel(w["repo"]) != w["repo"]:
                 raise CoordError(f"where repo {w['repo'][:120]} is not a git work tree's top, by its real path")
+        for land in body["lands"]:
+            problem = branch_problem(land["repo"], land["onto"])
+            if problem is not None:
+                raise CoordError(f"a land onto {land['onto'][:80]}: {problem}")
         return body, authority.key(payload["signer_fp"]).key_class
 
     @staticmethod
@@ -196,12 +202,26 @@ class EnvelopeStore(CoordStore):
              env.envelope_digest(body), canonical(dict(payload)), signature, payload["signer_fp"], signer_class,
              None if sup is None else sup["envelope_id"], body["stop_at"], now))
 
-    def _bind_checked(self, conn: sqlite3.Connection, now: str, envelope_id: str, body: Mapping[str, Any],
-                      binds: Sequence[tuple[str, int]]) -> None:
-        """Supersede CAS over the covered threads, then the bind rows (C0 §4.3)."""
+    @classmethod
+    def _bind_checked(cls, conn: sqlite3.Connection, now: str, envelope_id: str, body: Mapping[str, Any],
+                      binds: Sequence[tuple[str, int, str]]) -> None:
+        """Every bind's checks, then the supersede CAS over the covered threads, then the bind rows (C0 §4.3). Each
+        ``(thread_id, rev, members_sha256)`` must be the thread's CURRENT, non-empty revision (the sha recomputed from
+        its members), holding the envelope's drop, on a thread that is not done or closed: an envelope never binds
+        where no end would reach it, so reopening a thread revives nothing (C0 §4.5). Every bind path comes here."""
+        for thread_id, rev, msha in binds:
+            t = cls._thread(conn, thread_id)
+            if t.rev != rev or members_sha256(t.members) != msha or t.members_sha256 != msha:
+                raise CoordError(f"thread {thread_id} moved since the echo (revision {t.rev}, not {rev}); echo again")
+            if not t.members:
+                raise CoordError(f"thread {thread_id} holds no drops; nothing to bind")
+            if t.state in ("done", "closed"):
+                raise CoordError(f"thread {thread_id} is {t.state}; reopen it before signing an envelope for it")
+            if body["drop_id"] not in t.members:
+                raise CoordError(f"thread {thread_id} does not hold the envelope's drop")
         sup = body["supersedes"]
-        for thread_id, _rev in binds:
-            head = self._head(conn, thread_id)
+        for thread_id, _rev, _msha in binds:
+            head = cls._head(conn, thread_id)
             if sup is None:
                 if head is not None:
                     raise CoordError(f"thread {thread_id} already has envelope {head.envelope_id}; a new envelope "
@@ -209,9 +229,9 @@ class EnvelopeStore(CoordStore):
             elif head is None or head.envelope_id != sup["envelope_id"] or head.digest != sup["digest"]:
                 raise CoordError(f"the envelope supersedes {sup['envelope_id']}, which is not thread {thread_id}'s "
                                  "current envelope; echo again")
-        for thread_id, rev in binds:
+        for thread_id, rev, _msha in binds:
             conn.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, ?, ?, ?, ?)",
-                         (envelope_id, thread_id, rev, self._next_gseq(conn, now), now))
+                         (envelope_id, thread_id, rev, cls._next_gseq(conn, now), now))
 
     def accept_envelope(self, body_text: str, payload: Mapping[str, Any], signature: str, *,
                         authority: AuthoritySnapshot) -> tuple[Envelope, bool]:
@@ -226,18 +246,8 @@ class EnvelopeStore(CoordStore):
                 return stored, False
             drop = self._must_drop(conn, body["drop_id"])
             self._admit(conn, now, body, payload, drop)
-            binds: list[tuple[str, int]] = []
-            for b in body["binds"]:
-                t = self._must_thread(conn, b["thread_id"])
-                if t.rev != b["rev"] or members_sha256(t.members) != b["members_sha256"] \
-                        or t.members_sha256 != b["members_sha256"]:
-                    raise CoordError(f"thread {t.thread_id} moved since the echo (revision {t.rev}, not {b['rev']}); "
-                                     "echo again")
-                if not t.members:
-                    raise CoordError(f"thread {t.thread_id} holds no drops; nothing to bind")
-                if body["drop_id"] not in t.members:
-                    raise CoordError(f"thread {t.thread_id} does not hold the envelope's drop")
-                binds.append((t.thread_id, t.rev))
+            binds = [(self._must_thread(conn, b["thread_id"]).thread_id, b["rev"], b["members_sha256"])
+                     for b in body["binds"]]
             self._insert(conn, now, body, payload, signature, signer_class)
             self._bind_checked(conn, now, body["envelope_id"], body, binds)
             return self._envelope(conn, body["envelope_id"]), True
@@ -248,9 +258,13 @@ class EnvelopeStore(CoordStore):
         """A drop, optionally carrying a STRUCTURED envelope signed at send (T4): ``envelope = (body_text, payload,
         signature)``, whose body names the drop id. Drop and envelope are written in one transaction. An envelope that
         fails any check never costs the words: the drop is stored plain and its delivered drop receipt says why the
-        envelope was not taken (C0 §3.1: a phone offline past the skew gets "sign it again")."""
+        envelope was not taken (:meth:`envelope_refused`). A resend of the same ``outbox_id`` returns the stored drop
+        as it was (C1's outbox rule), so "sign it again" for a stored drop is the coordinator's WORDED echo over its
+        thread [seat: a structured envelope is only ever written in the drop's insert, C0 §3.1]."""
         if envelope is None:
             return super().accept_drop(words, surface=surface, outbox_id=outbox_id, sent_at=sent_at, source=source)
+        if not isinstance(authority, AuthoritySnapshot):
+            raise CoordError("a drop carrying an envelope needs the authority snapshot to verify it against")
         refused: str | None = None
         body: dict[str, Any] | None = None
         try:
@@ -260,6 +274,9 @@ class EnvelopeStore(CoordStore):
                 raise CoordError("a drop carries only a structured envelope; a worded one is the coordinator's echo")
         except (CoordError, ValueError, TypeError) as exc:
             refused, body = str(exc)[:300], None
+        except VerifierUnavailable as exc:
+            # a fault on this machine, never a verdict: the words are still kept, and the receipt says why
+            refused, body = f"the signature could not be checked on this machine ({str(exc)[:200]})", None
 
         def carry(conn: sqlite3.Connection, now: str, **drop: Any) -> Drop:
             if body is None:
@@ -267,6 +284,9 @@ class EnvelopeStore(CoordStore):
             probe = Drop(body["drop_id"], drop["surface"], drop["outbox_id"], drop["words"], drop["sha"],
                          drop["sent_at"], now, drop["source"], body["envelope_id"])
             try:
+                if conn.execute("SELECT 1 FROM drops WHERE drop_id = ?", (body["drop_id"],)).fetchone() is not None:
+                    raise EnvelopeConflict(f"drop {body['drop_id']} is already stored; an envelope signed for it "
+                                           "arrives only with it")
                 if self._envelope(conn, body["envelope_id"]) is not None:
                     raise EnvelopeConflict(f"envelope {body['envelope_id']} is already stored; its id is never reused "
                                            "(for another drop or another body)")
@@ -280,15 +300,35 @@ class EnvelopeStore(CoordStore):
         return super().accept_drop(words, surface=surface, outbox_id=outbox_id, sent_at=sent_at, source=source,
                                    _carry=carry)
 
-    def _split_done(self, conn: sqlite3.Connection, drop_id: str, thread_ids: list[str], now: str) -> None:
-        drop = self._drop(conn, drop_id)
-        if drop.envelope_id is None or len(thread_ids) != 1:
+    # --- the store's own hooks: C1's CoordStore calls these from every split and every end, whichever class opened
+    # the file, so no opener (C1's CLI builds a plain CoordStore) can skip T7 or the structured bind
+    @staticmethod
+    def _has_envelopes(conn: sqlite3.Connection) -> bool:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envelope_binds'").fetchone() \
+            is not None
+
+    @classmethod
+    def bind_on_split(cls, conn: sqlite3.Connection, drop_id: str, thread_ids: list[str], now: str) -> None:
+        """A drop's first split: its structured envelope binds when the split is exactly one thread holding that drop
+        alone at revision 1 (C0 §4.3)."""
+        if not cls._has_envelopes(conn) or len(thread_ids) != 1:
             return
-        t = self._thread(conn, thread_ids[0])
-        if t.rev == 1 and t.members == (drop_id,):
-            stored = self._envelope(conn, drop.envelope_id)
-            if stored is not None and self._head(conn, t.thread_id) is None:
-                self._bind_checked(conn, now, stored.envelope_id, stored.body, [(t.thread_id, 1)])
+        drop = cls._drop(conn, drop_id)
+        if drop.envelope_id is None:
+            return
+        t = cls._thread(conn, thread_ids[0])
+        stored = cls._envelope(conn, drop.envelope_id)
+        if stored is not None and t.rev == 1 and t.members == (drop_id,) and cls._head(conn, t.thread_id) is None:
+            cls._bind_checked(conn, now, stored.envelope_id, stored.body, [(t.thread_id, 1, t.members_sha256)])
+
+    @classmethod
+    def end_thread(cls, conn: sqlite3.Connection, thread_id: str, now: str) -> None:
+        """T7: a thread gone done or closed kills its envelopes, inside the transaction that ended it."""
+        if not cls._has_envelopes(conn):
+            return
+        for (envelope_id,) in conn.execute("SELECT envelope_id FROM envelope_binds WHERE thread_id = ? ORDER BY gseq",
+                                           (thread_id,)).fetchall():
+            cls._attenuate(conn, now, envelope_id, "thread_done", "", thread_id, "service")
 
     # --- narrowing -----------------------------------------------------------------------------------------------
     def attenuate(self, envelope_id: str, kind: str, value: str = "", *, thread_id: str | None = None,
@@ -298,20 +338,24 @@ class EnvelopeStore(CoordStore):
         one bound thread. True when a row was written; a narrowing already in force writes nothing (False)."""
         if kind not in ("kill", "stop_earlier", "drop_effect"):
             raise CoordError("an attenuation you write is kill, stop_earlier or drop_effect")
+        if not isinstance(envelope_id, str) or not isinstance(value, str) \
+                or not (thread_id is None or isinstance(thread_id, str)):
+            raise CoordError("an attenuation names an envelope id, a text value and at most one thread id")
         by = self._actor(by, ("operator",))
         with self._write() as (conn, now):
             return self._attenuate(conn, now, envelope_id, kind, value, thread_id, by)
 
-    def _attenuate(self, conn: sqlite3.Connection, now: str, envelope_id: str, kind: str, value: str,
+    @classmethod
+    def _attenuate(cls, conn: sqlite3.Connection, now: str, envelope_id: str, kind: str, value: str,
                    thread_id: str | None, by: str) -> bool:
-        stored = self._envelope(conn, envelope_id)
+        stored = cls._envelope(conn, envelope_id)
         if stored is None:
             raise CoordError(f"no envelope {str(envelope_id)[:40]}")
         if thread_id is not None and conn.execute(
                 "SELECT 1 FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
                 (envelope_id, thread_id)).fetchone() is None:
             raise CoordError(f"envelope {envelope_id} is not bound to thread {str(thread_id)[:40]}")
-        rows = self._attenuations(conn, envelope_id, thread_id)
+        rows = cls._attenuations(conn, envelope_id, thread_id)
         if kind in ("kill", "thread_done"):
             if not isinstance(value, str) or value:
                 raise CoordError(f"a {kind} carries no value")
@@ -322,7 +366,9 @@ class EnvelopeStore(CoordStore):
                 at = parse_stamp(value)
             except (ConsentError, TypeError):
                 raise CoordError("stop_earlier names a UTC timestamp") from None
-            if at >= self._stop(stored, rows):
+            if at == cls._stop(stored, rows):
+                return False
+            if at > cls._stop(stored, rows):
                 raise CoordError("stop_earlier names a time before the envelope's current stop (a later one is a "
                                  "widening, which needs a new signed envelope)")
         else:
@@ -333,14 +379,8 @@ class EnvelopeStore(CoordStore):
                 return False
         conn.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) "
                      "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     (envelope_id, thread_id, kind, value, by, self._next_gseq(conn, now), now))
+                     (envelope_id, thread_id, kind, value, by, cls._next_gseq(conn, now), now))
         return True
-
-    def _ended(self, conn: sqlite3.Connection, thread_id: str, now: str) -> None:
-        # T7: done (or a close) kills the thread's envelopes, inside the transaction that ended it
-        for (envelope_id,) in conn.execute("SELECT envelope_id FROM envelope_binds WHERE thread_id = ? ORDER BY gseq",
-                                           (thread_id,)).fetchall():
-            self._attenuate(conn, now, envelope_id, "thread_done", "", thread_id, "service")
 
     # --- reading -------------------------------------------------------------------------------------------------
     @staticmethod
@@ -456,7 +496,7 @@ class EnvelopeStore(CoordStore):
                 eff = self._effective(conn, eid, thread_id)
                 if effect is not None:
                     kind, obj = effect
-                    if env.effect_identity(kind, obj) not in {env.effect_identity(kind, e) for e in eff[kind]}:
+                    if env.effect_key(kind, obj) not in {env.effect_key(kind, e) for e in eff[kind]}:
                         return f"envelope {eid} does not hold that {kind[:-1]}"
                 if scope is not None:
                     repo, paths = scope
@@ -468,10 +508,46 @@ class EnvelopeStore(CoordStore):
                             return f"envelope {eid} does not reach {p[:120]} in {repo[:120]}"
         return None
 
-    def authority_refusal(self, envelope_id: str, thread_id: str, **_: Any) -> str:
+    def envelope_refused(self, drop_id: str) -> str | None:
+        """Why the envelope a drop carried was not taken (its delivered drop receipt's line); None when it was taken
+        or the drop carried none."""
+        for r in self.drop_receipts(drop_id):
+            if r.body.get("stage") == "delivered" and "envelope_refused" in r.body:
+                return r.body["envelope_refused"]
+        return None
+
+    def chain_live_refusal(self, envelope_id: str, thread_id: str, *, authority: AuthoritySnapshot) -> str | None:
+        """Why a job bound to ``envelope_id`` may not continue for ``thread_id``: ``envelope_id`` itself not live, or the
+        current head of its supersede chain not live (C0 §4.5: both, plus the ceiling); None when both are."""
+        refused = self.live_refusal(envelope_id, thread_id, authority=authority)
+        if refused is not None:
+            return refused
+        with read_transaction(self._connect) as conn:
+            head = self._chain(conn, envelope_id, thread_id)[-1]
+        if head == envelope_id:
+            return None
+        refused = self.live_refusal(head, thread_id, authority=authority)
+        return None if refused is None else f"the chain's current envelope is not live: {refused}"
+
+    def ceiling_criteria(self, envelope_id: str, thread_id: str, kind: str,
+                         effect: Mapping[str, Any]) -> list[list[dict[str, Any]]] | None:
+        """For a land, every criteria list in the chain that targets ``effect``'s key, all of which must hold together
+        (a supersede that edits criteria narrows by conjunction); None when some member does not hold it."""
+        if self.ceiling_refusal(envelope_id, thread_id, effect=(kind, effect)) is not None:
+            return None
+        key = env.effect_key(kind, effect)
+        with read_transaction(self._connect) as conn:
+            return [e.get("criteria", []) for eid in self._chain(conn, envelope_id, thread_id)
+                    for e in self._effective(conn, eid, thread_id)[kind] if env.effect_key(kind, e) == key]
+
+    def authority_refusal(self, envelope_id: str, thread_id: str, *, authority: AuthoritySnapshot | None = None,
+                          effect: tuple[str, Mapping[str, Any]] | None = None,
+                          scope: tuple[str, Sequence[str]] | None = None) -> str:
         """What every caller that would act on an envelope reads today: :data:`NOT_IN_FORCE`. Before S1 no row in this
         file is authority (C0 §2), so this never returns None; S1's cutover replaces it with live + ceiling, read in the
-        transaction of the write it authorises (C0 §5)."""
+        transaction of the write it authorises (C0 §5): :meth:`chain_live_refusal`, then :meth:`ceiling_refusal` and
+        :meth:`ceiling_criteria`. The budget is a gauge, never part of the ceiling (T6, *"the thread budget is a
+        GAUGE"*), so a successor's smaller budget does not narrow a running job here; its meter is C6's."""
         return NOT_IN_FORCE
 
     def envelopes_of(self, thread_id: str) -> list[Envelope]:

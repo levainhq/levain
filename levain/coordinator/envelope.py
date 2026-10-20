@@ -36,8 +36,8 @@ from levain.dispatch.registry import CRITERION_INT_MAX, CRITERION_KEYS
 
 __all__ = [
     "BODY_FORMAT", "BODY_KEYS", "BODY_MAX", "BUDGET_KEYS", "BUDGET_MAX", "EFFECT_LISTS", "EnvelopeError",
-    "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE", "SIGN_TIER", "effect_identity", "envelope_digest",
-    "parse_body", "refusal", "sign_message", "sign_payload",
+    "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE", "SIGN_TIER", "effect_identity", "effect_key",
+    "envelope_digest", "parse_body", "path_within", "refusal", "sign_message", "sign_payload",
 ]
 
 BODY_FORMAT = "levain-thread-envelope/1"
@@ -123,14 +123,24 @@ def _rel_path(value: Any, name: str) -> str:
     if p.startswith("/") or "\\" in p:
         raise EnvelopeError(f"{name} {p[:80]!r} is relative to its repo, with forward slashes")
     parts = p[:-1].split("/") if p.endswith("/") else p.split("/")
-    if any(s in ("", ".", "..") for s in parts) or parts[0] == ".git":
-        raise EnvelopeError(f"{name} {p[:80]!r} has an empty, '.', '..' or .git segment")
+    if any(s in ("", ".", "..") for s in parts):
+        raise EnvelopeError(f"{name} {p[:80]!r} has an empty, '.' or '..' segment")
+    if any(s.casefold() == ".git" for s in parts):
+        # any depth, any case: on a case-insensitive disk .GIT is .git, and a hook there runs outside every gate
+        raise EnvelopeError(f"{name} {p[:80]!r} reaches into a .git directory")
     return p
 
 
-def path_within(path: str, allowed: tuple[str, ...]) -> bool:
+def path_within(path: Any, allowed: tuple[str, ...]) -> bool:
     """True when the repo-relative file or directory ``path`` lies inside one of ``allowed`` (``"."`` is the whole
-    repo; ``dir/`` a directory; anything else one exact file). Byte for byte, never casefolded (C0 §4.3)."""
+    repo; ``dir/`` a directory; anything else one exact file). Byte for byte, never casefolded (C0 §4.3). The
+    CANDIDATE is held to the same shape as a signed path (NFC, no empty, '.', '..' or .git segment): a path that is not
+    one is never inside anything, so ``src/../.git/hooks/x`` is not under ``src/`` and nothing reaches a .git dir."""
+    try:
+        if path == "." or _rel_path(path, "a path") != path:
+            return False
+    except EnvelopeError:
+        return False
     for a in allowed:
         if a == "." or path == a or (a.endswith("/") and path.startswith(a)):
             return True
@@ -248,6 +258,7 @@ def parse_body(text: Any) -> dict[str, Any]:
         if repo not in scope:
             raise EnvelopeError(f"lands[{i}].repo is not one of the envelope's where repos")
         onto = _text(land["onto"], f"lands[{i}].onto")
+        # the shape only; F11's branch_problem (it reads the repo) is the store's check at acceptance
         if onto.startswith(("refs/", "-")) or onto.casefold().startswith("levain/"):
             raise EnvelopeError(f"lands[{i}].onto is a bare branch name outside levain/")
         if land["from"] == "source":
@@ -292,6 +303,20 @@ def parse_body(text: Any) -> dict[str, Any]:
 def envelope_digest(body: Mapping[str, Any]) -> str:
     """``sha256:<hex>`` over the body's canonical bytes: the one digest the CLI, the phone page and every check use."""
     return "sha256:" + hashlib.sha256(canonical_bytes(dict(body))).hexdigest()
+
+
+def effect_key(kind: str, effect: Mapping[str, Any]) -> tuple[str, ...]:
+    """What an effect TARGETS, criteria aside: a land's (repo, onto), a push's (repo, remote, url, branch), a
+    publish's (package, index, version). The ceiling matches effects by this key, so a supersede that only edits a
+    land's criteria is the same land (its criteria then hold together, C0 §4.5); a narrowing names the exact signed
+    object by :func:`effect_identity`."""
+    if kind == "lands":
+        return (kind, effect["repo"], effect["onto"])
+    if kind == "pushes":
+        return (kind, effect["repo"], effect["remote"], effect["url"], effect["branch"])
+    if kind == "publishes":
+        return (kind, effect["package"], effect["index"], effect["version"])
+    raise EnvelopeError(f"an effect is one of {list(EFFECT_LISTS)}")
 
 
 def effect_identity(kind: str, effect: Mapping[str, Any]) -> str:
