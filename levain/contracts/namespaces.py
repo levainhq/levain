@@ -39,6 +39,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-dispatch-config": ("reserved", "levain/dispatch/control.py",
                                "a human-signed dispatch configuration item (templates, verifiers, provider policy, "
                                "route map, adoption rules) under a monotonic generation"),
+    "levain-dispatch-authorise": ("reserved", "levain/dispatch/adopt.py",
+                                  "the operator's signed authorisation to land one verified dispatch run on one "
+                                  "branch (F11 (A))"),
     "levain-allowed-signers": ("reserved", "levain/qbroker/signers.py",
                                "the dispatch trust root's signature over the answer-signer snapshot "
                                "(CONTRACT c6 §3.7)"),
