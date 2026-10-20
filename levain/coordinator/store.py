@@ -82,7 +82,8 @@ _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")      # a SHA-1 or a SHA-256 repo
 # (from, to) -> who may take the step. The coordinator claims work and its end; you close (from the review queue)
 # and reopen; the service closes a thread that is not work once it is done, and one a regroup left empty
 _EDGES: dict[tuple[str, str], frozenset[str]] = {
-    ("open", "working"): frozenset({"coordinator"}),
+    # the service takes it only in a merge, moving the claim on the merged-away thread's work to the one it joins
+    ("open", "working"): frozenset({"coordinator", "service"}),
     ("open", "done"): frozenset({"coordinator"}),
     ("working", "done"): frozenset({"coordinator"}),
     ("done", "closed"): frozenset({"operator", "service"}),
@@ -235,7 +236,7 @@ def _sibling(part: Any) -> bool:
 def _sibling_index(part: Part, n: int) -> int:
     """``about="@N"`` (1-based) names the N-th part of the same split: the work thread an ask in one drop concerns."""
     raw = part.about[1:]
-    if not raw.isdigit() or not 1 <= int(raw) <= n:
+    if re.fullmatch(r"[0-9]{1,4}", raw) is None or not 1 <= int(raw) <= n:
         raise CoordError(f"about @N names a part of this split, 1 to {n} (got {part.about[:20]!r})")
     return int(raw) - 1
 
@@ -273,6 +274,7 @@ def check_source(source: Source) -> Source:
             or unshowable.first_hidden(source.repo, allow="", selectors=False) is not None:
         raise CoordError("a drop's source repo is an absolute path")
     if not isinstance(source.ref, str) or not source.ref.startswith("refs/heads/") or len(source.ref) > 1024 \
+            or source.ref == "refs/heads/" or source.ref.endswith("/") \
             or unshowable.first_hidden(source.ref, allow="", selectors=False) is not None:
         raise CoordError("a drop's source ref is a branch, refs/heads/<name>")
     if not isinstance(source.head, str) or _OID.fullmatch(source.head) is None:
@@ -445,8 +447,9 @@ class CoordStore:
                 raise CoordError(f"other threads are about {other}; it cannot be merged away")
             if b.repo and not a.repo:
                 self._event(conn, into, "repo", b.repo, f"merged from {other}", by, now)
-            if b.state == "working" and a.state == "open":      # the claim on other's work moves with it
-                self._event(conn, into, "state", "working", f"merged from {other}", "service", now)
+            if b.state == "working" and a.state == "open":      # the claim on other's work moves with it (_EDGES)
+                assert "service" in _EDGES[("open", "working")]
+                self._event(conn, into, "state", "working", f"claim carried from {other} by a merge", "service", now)
             self._revise(conn, into, set(a.members) | set(b.members), "resplit", now)
             self._revise(conn, other, (), "resplit", now)
             self._close(conn, other, f"merged into {into} by {by}", "service", now)
@@ -456,8 +459,8 @@ class CoordStore:
 
     def detach(self, thread_id: str, drop_id: str, *, by: str = "operator") -> Thread:
         """Take one drop out of a thread (a new revision without it). A thread left with no drops is closed by the
-        service, its cause naming who emptied it. The drop must stay in at least one other thread that is not closed: a
-        drop is never orphaned."""
+        service, its cause naming who emptied it. The drop must stay in at least one other open or working thread: a
+        drop is never left only in finished ones."""
         by = self._actor(by, ("coordinator", "operator"))
         with self._write() as (conn, now):
             self._must_drop(conn, drop_id)
@@ -467,7 +470,7 @@ class CoordStore:
             if drop_id not in t.members:
                 raise CoordError(f"drop {drop_id} is not in thread {thread_id}")
             if not [x for x in self._threads_of(conn, drop_id)
-                    if x != thread_id and self._thread(conn, x).state != "closed"]:
+                    if x != thread_id and self._thread(conn, x).state in ("open", "working")]:
                 raise CoordError(f"drop {drop_id} is in no other open thread; add it to one before detaching it")
             left = set(t.members) - {drop_id}
             self._revise(conn, thread_id, left, "resplit", now)
@@ -560,6 +563,20 @@ class CoordStore:
             self._must_drop(conn, drop_id)
             return [self._thread(conn, t) for t in self._threads_of(conn, drop_id)]
 
+    def drop_view(self, drop_id: str) -> tuple[Drop, list[Thread], list[Reply]]:
+        """A drop, the threads it is in and its drop receipts, read in ONE transaction (one consistent snapshot)."""
+        with read_transaction(self._connect) as conn:
+            drop = self._must_drop(conn, drop_id)
+            return (drop, [self._thread(conn, t) for t in self._threads_of(conn, drop_id)],
+                    self._receipts(conn, drop_id, None))
+
+    def thread_view(self, thread_id: str) -> tuple[Thread, list[tuple[int, tuple[str, ...], str, str]],
+                                                   list[tuple[int, str, str, str, str, str]]]:
+        """A thread with every revision and event, read in ONE transaction."""
+        with read_transaction(self._connect) as conn:
+            t = self._must_thread(conn, thread_id)
+            return t, self._revisions(conn, thread_id), self._events(conn, thread_id)
+
     def drop_receipts(self, drop_id: str) -> list[Reply]:
         """Every drop receipt of ``drop_id``, oldest first."""
         with read_transaction(self._connect) as conn:
@@ -570,18 +587,26 @@ class CoordStore:
         """``(rev, members, members_sha256, cause)`` for every revision of a thread, oldest first."""
         with read_transaction(self._connect) as conn:
             self._must_thread(conn, thread_id)
-            return [(r[0], tuple(json.loads(r[1])), r[2], r[3]) for r in conn.execute(
-                "SELECT rev, members, members_sha256, cause FROM thread_revisions WHERE thread_id = ? ORDER BY rev",
-                (thread_id,))]
+            return self._revisions(conn, thread_id)
 
     def events(self, thread_id: str) -> list[tuple[int, str, str, str, str, str]]:
         """``(seq, field, value, cause, by, at)`` for every event of a thread, oldest first."""
         with read_transaction(self._connect) as conn:
             self._must_thread(conn, thread_id)
-            return list(conn.execute("SELECT seq, field, value, cause, by, at FROM thread_events WHERE thread_id = ? "
-                                     "ORDER BY seq", (thread_id,)))
+            return self._events(conn, thread_id)
 
     # --- inside a transaction ------------------------------------------------------------------------------------
+    @staticmethod
+    def _revisions(conn: sqlite3.Connection, thread_id: str) -> list[tuple[int, tuple[str, ...], str, str]]:
+        return [(r[0], tuple(json.loads(r[1])), r[2], r[3]) for r in conn.execute(
+            "SELECT rev, members, members_sha256, cause FROM thread_revisions WHERE thread_id = ? ORDER BY rev",
+            (thread_id,))]
+
+    @staticmethod
+    def _events(conn: sqlite3.Connection, thread_id: str) -> list[tuple[int, str, str, str, str, str]]:
+        return list(conn.execute("SELECT seq, field, value, cause, by, at FROM thread_events WHERE thread_id = ? "
+                                 "ORDER BY seq", (thread_id,)))
+
     @staticmethod
     def _actor(by: Any, allowed: Iterable[str]) -> str:
         allowed = tuple(allowed)

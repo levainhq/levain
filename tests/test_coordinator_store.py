@@ -389,3 +389,26 @@ def test_an_ask_closed_with_its_work_reopens_only_after_the_work(store):
         store.set_state(a.thread_id, "open", by="operator")
     store.set_state(w.thread_id, "open", by="operator")
     assert store.set_state(a.thread_id, "open", by="operator").state == "open"
+
+
+# --- L3 final ------------------------------------------------------------------------------------------------------
+
+def test_final_round_bounds(store, monkeypatch, tmp_path, capsys):
+    import io
+    from levain.coordinator import cli as ccli
+    from levain.coordinator.store import WORDS_MAX
+    d, _ = store.accept_drop(TWO, surface="cli")
+    with pytest.raises(CoordError, match="about @N"):
+        store.split(d.drop_id, [Part(kind="ask", title="x", about="@²"), work("y")])
+    with pytest.raises(CoordError, match="refs/heads/<name>"):
+        store.accept_drop("no branch name", surface="cli", source=Source("cwd", "/tmp/r", "refs/heads/", "a" * 40))
+    x, y = store.split(d.drop_id, [work("x"), work("y")])
+    store.set_state(y.thread_id, "done", by="coordinator")
+    with pytest.raises(CoordError, match="no other open thread"):
+        store.detach(x.thread_id, d.drop_id)
+    assert ccli._shown("a‮b") == '"a⟨U+202E⟩b"'
+    q = tmp_path / "q2"
+    q.mkdir(mode=0o700)
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"x" * (WORDS_MAX * 4 + 3))))
+    assert main(["drop", "--queue-dir", str(q), "-"]) == 1
+    assert "at most" in capsys.readouterr().err

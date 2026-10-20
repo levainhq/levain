@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from levain.coordinator.store import (KINDS, STATES, CoordError, CoordStore, Drop, Part, Source, Thread,
+from levain import unshowable
+from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, CoordStore, Drop, Part, Source, Thread,
                                       check_source)
 from levain.dispatch.jobs import JobStoreError
 
@@ -42,7 +43,8 @@ def _git(cwd: str, *args: str) -> str | None:
         return None
     if cp.returncode != 0:
         return None
-    return cp.stdout.decode("utf-8", "surrogateescape").strip()
+    out = cp.stdout.decode("utf-8", "surrogateescape")
+    return out[:-1] if out.endswith("\n") else out          # git's terminator only: a path may end in a space
 
 
 def cwd_source(cwd: str | None = None) -> Source:
@@ -93,6 +95,12 @@ def _thread_line(t: Thread) -> str:
     return f"  {t.thread_id}  {t.kind.upper():5} {t.state:7} rev {t.rev}  {t.title}{about}"
 
 
+def _shown(words: str) -> str:
+    """Words for a terminal: quoted, with every character that would not show as itself (a control, a bidi override)
+    marked by its code point. The stored words stay verbatim; this is only what a text listing prints."""
+    return json.dumps(unshowable.mark(words), ensure_ascii=False)
+
+
 def _emit(out: Any, as_json: bool, obj: Any, text: str) -> None:
     out.write((json.dumps(obj, ensure_ascii=False, indent=2) if as_json else text) + "\n")
 
@@ -101,7 +109,10 @@ def _read_words(args: argparse.Namespace) -> str:
     """The words: one argument kept as typed, several joined by one space, or ``-`` alone for stdin (strict UTF-8, one
     trailing newline dropped, so ``echo words | levain drop -`` stores what ``levain drop words`` does)."""
     if args.words == ["-"]:
-        raw = sys.stdin.buffer.read()
+        cap = WORDS_MAX * 4 + 2          # the most bytes WORDS_MAX characters can take, and a newline
+        raw = sys.stdin.buffer.read(cap + 1)
+        if len(raw) > cap:
+            raise CoordError(f"a drop is at most {WORDS_MAX} characters; stdin holds more")
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -166,16 +177,14 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
         store = _store(args)
-        drop = store.drop(args.drop_id)
-        threads = store.threads_of(args.drop_id)
-        receipts = store.drop_receipts(args.drop_id)
+        drop, threads, receipts = store.drop_view(args.drop_id)
     except _REFUSED as exc:
         print(f"levain drops show: {exc}", file=sys.stderr)
         return 1
     obj = {**_drop_row(drop), "threads": [_thread_row(t) for t in threads],
            "drop_receipts": [{"reply_id": r.reply_id, "at": r.at, **r.body} for r in receipts]}
     text = (f"{drop.drop_id}  {drop.surface}  received {drop.received_at}, {_where(drop)}\n"
-            f"  words (verbatim, data): {json.dumps(drop.words, ensure_ascii=False)}\n"
+            f"  words (verbatim, data): {_shown(drop.words)}\n"
             + ("\n".join(_thread_line(t) for t in threads) if threads else "  not split yet")
             + "\n  drop receipts: " + ", ".join(f"{r.body.get('stage')} {r.at}" for r in receipts))
     _emit(out, args.json, obj, text)
@@ -190,7 +199,7 @@ def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
         print(f"levain drops list: {exc}", file=sys.stderr)
         return 1
     _emit(out, args.json, [_drop_row(d) for d in drops],
-          "\n".join(f"{d.drop_id}  {d.received_at}  {json.dumps(d.words[:80], ensure_ascii=False)}" for d in drops)
+          "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}" for d in drops)
           or "no drops")
     return 0
 
@@ -206,9 +215,7 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
                   "\n".join(_thread_line(t) for t in threads) or "no open threads")
             return 0
         if cmd == "show":
-            t = store.thread(args.thread_id)
-            revs = store.revisions(args.thread_id)
-            events = store.events(args.thread_id)
+            t, revs, events = store.thread_view(args.thread_id)
             obj = {**_thread_row(t), "revisions": [{"rev": r, "members": list(m), "members_sha256": s, "cause": c}
                                                    for r, m, s, c in revs],
                    "events": [{"seq": e[0], "field": e[1], "value": e[2], "cause": e[3], "by": e[4], "at": e[5]}
