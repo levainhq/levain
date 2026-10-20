@@ -40,6 +40,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -68,9 +69,11 @@ _LABEL_MAX = 200
 _BLOCKS_MAX = 300
 _TEXT_MAX = 4000
 _N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
-# how long the hook's reads and its claim wait on a lock another writer holds: past it the answers wait for the
-# session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is not this)
+# how long the hook's read and its claim together wait on a lock another writer holds, by the wall clock: past it
+# the answers wait for the session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is
+# not this). One deadline, not SQLite's busy_timeout per step: that counts the sleeps it asked for, not time passed
 HOOK_BUSY_MS = 2000
+_RETRY_SECONDS = 0.025
 
 
 class QuestionStoreError(RuntimeError):
@@ -324,8 +327,35 @@ class QuestionStore:
             yield conn
 
     @contextmanager
-    def _peek(self) -> Iterator[sqlite3.Connection | None]:
-        """Every read: a snapshot opened read-only, waiting at most :data:`HOOK_BUSY_MS` on a lock; it never
+    def _write_by(self, deadline: float) -> Iterator[sqlite3.Connection]:
+        """As :meth:`_write`, but the write lock is waited for until ``deadline`` (``time.monotonic()``) by the wall
+        clock: SQLite is told not to wait at all, and ``BEGIN IMMEDIATE`` is retried here. Past the deadline the
+        lock's own ``OperationalError`` is raised."""
+        conn = self._connect(busy_ms=0)
+        try:
+            while True:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) and "busy" not in str(exc):
+                        raise
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise
+                    time.sleep(min(_RETRY_SECONDS, left))
+            try:
+                yield conn
+            except BaseException:
+                _rollback(conn)
+                raise
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _peek(self, busy_ms: int = HOOK_BUSY_MS) -> Iterator[sqlite3.Connection | None]:
+        """Every read: a snapshot opened read-only, waiting at most ``busy_ms`` on a lock; it never
         creates, sets up or writes the store, so a tool call with nothing to deliver takes no write lock. ``None``
         when there is no store yet (no file, an empty one, or one a filer has not set up); a store of another
         format raises :class:`QuestionStoreError`."""
@@ -337,10 +367,10 @@ class QuestionStore:
             yield None
             return
         self._check_directory()
-        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=HOOK_BUSY_MS / 1000,
+        conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=busy_ms / 1000,
                                isolation_level=None)
         try:
-            conn.execute(f"PRAGMA busy_timeout = {HOOK_BUSY_MS}")
+            conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
             conn.execute("BEGIN")
             have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in have else None
@@ -502,11 +532,12 @@ class QuestionStore:
         key = (agent, agent_session_id)
         where = (" WHERE q.agent = ? AND q.agent_session_id = ? AND a.question_id IS NOT NULL AND "
                  + _DELIVERABLE + " ORDER BY a.rowid")
+        deadline = time.monotonic() + HOOK_BUSY_MS / 1000      # the read and the claim share it
         with self._peek() as conn:                            # read-only: no write lock when nothing is due
             if conn is None or not conn.execute(_select(conn) + where, key).fetchall():
                 return []
         out: list[Question] = []
-        with self._write(busy_ms=HOOK_BUSY_MS) as conn:
+        with self._write_by(deadline) as conn:
             stamp = utc_stamp(_now_utc(self._clock))
             for row in conn.execute(_select(conn) + where, key).fetchall():   # re-read under the lock
                 q = self._question_of(row)
