@@ -2001,7 +2001,7 @@ def _claude_code_files(
     # that serves memory is structurally the one levain imports.
     mcp_text = _fill(mcp_text, {"INSTALL_DIR": _string_body(str(install)),
                                 "PYTHON": _string_body(python_path)})
-    mcp_text = _with_band_server(mcp_text, adapter_root, python_path)
+    mcp_text = _with_levain_servers(mcp_text, adapter_root, python_path)
     return {
         install / "CLAUDE.md": claude_md,
         install / ".claude" / "settings.json": settings_text,
@@ -2014,16 +2014,24 @@ def _claude_code_files(
 # exactly anneal_memory, because host_guard.cc_mcp_config (Levain's own hands' confinement check) asserts that.
 BAND_SERVER = "levain_band"
 _BAND_ARGS = ("-P", "-m", "levain.consent.band_mcp", "--agent")
+# The dispatch door (levain.dispatch.mcp): the planner's filing door, registered beside the band in the same workspace
+# .mcp.json and by the same rule. It never signs and confers no authority; Claude Code still asks before each call,
+# since no settings allow-rule names its tools. Codex is not registered yet (its config.toml block, env and approval
+# mode are a separate ruling).
+DISPATCH_SERVER = "levain_dispatch"
+_DISPATCH_ARGS = ("-P", "-m", "levain.dispatch.mcp", "--agent")
 
 
-def _with_band_server(mcp_text: str, adapter_root: Path, python_path: str) -> str:
-    """The rendered workspace ``.mcp.json`` text with the ``levain_band`` server from
-    ``mcp.band.template.json`` merged into its ``mcpServers`` (two-space JSON, one trailing newline)."""
+def _with_levain_servers(mcp_text: str, adapter_root: Path, python_path: str) -> str:
+    """The rendered workspace ``.mcp.json`` text with the ``levain_band`` server from ``mcp.band.template.json``,
+    then the ``levain_dispatch`` server, merged into its ``mcpServers`` (two-space JSON, one trailing newline)."""
     band_text = _fill((adapter_root / "mcp.band.template.json").read_text(encoding="utf-8"),
                       {"PYTHON": _string_body(python_path)})
     try:
         tree, band_tree = json.loads(mcp_text), json.loads(band_text)
         tree["mcpServers"].update(band_tree["mcpServers"])
+        tree["mcpServers"][DISPATCH_SERVER] = {"type": "stdio", "command": python_path,
+                                               "args": [*_DISPATCH_ARGS, "claude_code"]}
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise InitError(f"the claude-code MCP templates could not be merged: {e}") from e
     return json.dumps(tree, indent=2, ensure_ascii=False) + "\n"
@@ -3872,6 +3880,17 @@ def _levain_render_variant(
             else:
                 for tree in (y, v):
                     tree["mcpServers"].pop(BAND_SERVER, None)
+            # The dispatch door, the same rule again; a render from before it carries no entry.
+            if DISPATCH_SERVER in x["mcpServers"]:
+                if not _is_levain_launcher({"mcp_servers": {DISPATCH_SERVER: x["mcpServers"][DISPATCH_SERVER]}},
+                                           None, server=DISPATCH_SERVER, agent="claude_code"):
+                    return False
+                for tree in (x, y, v):
+                    tree["mcpServers"][DISPATCH_SERVER].pop("command", None)
+                    tree["mcpServers"][DISPATCH_SERVER].pop("args", None)
+            else:
+                for tree in (y, v):
+                    tree["mcpServers"].pop(DISPATCH_SERVER, None)
         except (KeyError, TypeError, AttributeError, ValueError):
             return False
 
@@ -5295,7 +5314,18 @@ def _is_levain_launcher(parsed: dict | None, store: str | None, *, server: str =
 
     With ``server="levain_band"`` (QMCP R-q21) the question band's server instead: a Python interpreter and
     `-P -m levain.consent.band_mcp --agent <agent>`, nothing else (``agent`` one of the band's agents, and when
-    given, that one). ``store`` is not read for it: the band names no store."""
+    given, that one). ``store`` is not read for it: the band names no store. With ``server="levain_dispatch"`` the
+    dispatch door the same way: `-P -m levain.dispatch.mcp --agent <agent>`, nothing else."""
+    if server == DISPATCH_SERVER:
+        from levain.dispatch.capability import AGENTS
+
+        table = ((parsed or {}).get("mcp_servers") or {}).get(DISPATCH_SERVER) or {}
+        command, args = table.get("command"), table.get("args")
+        if not isinstance(command, str) or not isinstance(args, list) or len(args) != len(_DISPATCH_ARGS) + 1:
+            return False
+        return (tuple(args[:-1]) == _DISPATCH_ARGS and args[-1] in AGENTS
+                and (agent is None or args[-1] == agent)
+                and _PYTHON_NAME.fullmatch(Path(command).name) is not None)
     if server == BAND_SERVER:
         from levain.consent.band import _AGENT_NAMES
 

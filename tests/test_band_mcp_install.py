@@ -61,7 +61,7 @@ def _config(tmp_path: Path) -> Path:
 def test_the_workspace_mcp_json_registers_the_band_with_its_argv(make_install):
     install = make_install()
     servers = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
-    assert set(servers) == {"anneal_memory", "levain_band"}
+    assert set(servers) == {"anneal_memory", "levain_band", "levain_dispatch"}
     b = servers["levain_band"]
     assert b["type"] == "stdio" and b["args"] == [*BAND_ARGS, "claude_code"]
     assert inst._PYTHON_NAME.fullmatch(Path(b["command"]).name)
@@ -521,3 +521,57 @@ def test_doctor_band_row_warns_on_a_lookalike_interpreter_and_on_extra_keys(make
                       encoding="utf-8")
     (row,) = _band_rows(doctor._check_codex(cx))
     assert row.warn and "carries env" in row.detail, row
+
+
+# ---- the dispatch door (levain_dispatch, BUILD_wire item 3) ------------------------------------------------------
+
+DISPATCH_ARGS = ["-P", "-m", "levain.dispatch.mcp", "--agent"]
+
+
+def test_the_workspace_mcp_json_registers_the_dispatch_door_beside_the_band(make_install, tmp_path):
+    install = make_install()
+    servers = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    d = servers["levain_dispatch"]
+    assert d == {"type": "stdio", "command": servers["levain_band"]["command"], "args": [*DISPATCH_ARGS, "claude_code"]}
+    # every write stayed in the scratch homes
+    assert str(tmp_path) in str(install) and not (tmp_path / "codex-home" / "config.toml").exists()
+
+
+def test_a_pre_dispatch_render_with_no_record_is_refreshed_to_carry_the_door(make_install):
+    install = make_install()
+    mcp = install / ".mcp.json"
+    package = mcp.read_text(encoding="utf-8")
+    old = json.loads(package)
+    del old["mcpServers"]["levain_dispatch"]                    # this release's render before the door
+    mcp.write_text(json.dumps(old, indent=2), encoding="utf-8")
+    install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
+    r, _out = _refresh(install)
+    assert ".mcp.json" in r.refreshed and mcp.read_text(encoding="utf-8") == package
+
+
+def test_an_operator_edited_dispatch_entry_is_kept_and_reported(make_install):
+    install = make_install()
+    mcp = install / ".mcp.json"
+    data = json.loads(mcp.read_text(encoding="utf-8"))
+    data["mcpServers"]["levain_dispatch"]["command"] = "/opt/wrap/levain-dispatch"
+    mcp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    before = mcp.read_text(encoding="utf-8")
+    install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
+    r, out = _refresh(install)
+    assert r.review == [".mcp.json"] and "yours is kept" in out
+    assert mcp.read_text(encoding="utf-8") == before
+
+
+def test_is_levain_launcher_reads_the_dispatch_shape():
+    def t(command, args):
+        return {"mcp_servers": {"levain_dispatch": {"command": command, "args": args}}}
+
+    ok = inst._is_levain_launcher
+    assert ok(t("/v/bin/python3", [*DISPATCH_ARGS, "claude_code"]), None, server="levain_dispatch",
+              agent="claude_code")
+    assert not ok(t("/v/bin/python3", [*DISPATCH_ARGS, "claude_code"]), None, server="levain_dispatch",
+                  agent="codex")
+    assert not ok(t("/v/bin/python3", [*BAND_ARGS, "claude_code"]), None, server="levain_dispatch")
+    assert not ok(t("/usr/bin/wrapper", [*DISPATCH_ARGS, "claude_code"]), None, server="levain_dispatch")
+    assert not ok(t("/v/bin/python3", [*DISPATCH_ARGS, "claude_code", "--dispatch-dir", "/x"]), None,
+                  server="levain_dispatch")
