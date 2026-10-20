@@ -16,10 +16,13 @@ Two kill domains:
 - :class:`CgroupProcs` (Linux) drives the session cgroup (§7.3): ``cgroup.freeze`` + ``frozen 1``,
   ``cgroup.kill`` + ``populated 0``; its proof is ``populated 0`` AND the uid sweep's.
 
-Every signal goes through :func:`signal_checked`: pin the pid (Linux: a pidfd, so a pid that dies and
+Linux: every signal goes through :func:`signal_checked`: pin the pid (a pidfd, so a pid that dies and
 is reused after the check cannot receive it), re-read it, and send only if it is still the same
 process (start time) of the target uid (§7.1's "live check (uid + start time) of any process before
-a signal").
+a signal"). macOS has no pidfd, so it never signals a pid at all (codex r1 3, plan §2e 4): a forked child
+drops to the target uid (:func:`levain.slot.wall.drop_and_assert`) and calls ``kill(-1, sig)``
+(:func:`signal_as_uid`); a process that is not root can signal only its own uid's processes, so no pid
+reuse can hand the signal to anyone else. The per-pid listing stays: it is what the proofs read.
 
 Every OS act is a seam (:class:`ProcSeams`): the process listing, one pid's read, the pin / signal,
 the cgroup file read / write, the clock and the sleep. The unit suite drives a fake table.
@@ -43,7 +46,7 @@ from typing import Callable, Iterable
 
 from levain.firing.hands import HostOS
 from levain.slot import Refused, write_all
-from levain.slot.wall import CGROUP_ROOT
+from levain.slot.wall import CGROUP_ROOT, drop_and_assert
 
 #: CONTRACT §11 V12: the freeze / kill bound. END's own copy is ``end.V12_SECONDS`` (a test keeps them one).
 V12_SECONDS = 10.0
@@ -106,12 +109,15 @@ class ProcSeams:
     """The OS acts. ``listing()`` = every process on the host; ``probe(pid)`` = one pid now (``None`` =
     gone); ``pin(pid)`` -> a handle the signal goes to (raises ``ProcessLookupError`` when gone);
     ``send(handle, sig)`` (raises ``ProcessLookupError`` when gone); ``unpin(handle)``; ``read(path)`` /
-    ``write(path, text)`` for cgroup files (``FileNotFoundError`` when absent)."""
+    ``write(path, text)`` for cgroup files (``FileNotFoundError`` when absent). ``signal_uid(uid, sig)``:
+    when set (macOS), a sweep signals every process of the uid at once AS the uid, never a pid, and
+    returns whether the signal was sent; ``pin`` / ``send`` are then never used."""
     listing: Callable[[], Iterable[Proc]]
     probe: Callable[[int], Proc | None]
     pin: Callable[[int], object]
     send: Callable[[object, int], None]
     unpin: Callable[[object], None] = _unpinned
+    signal_uid: Callable[[int, int], bool] | None = None
     read: Callable[[str], str] = _read_text
     write: Callable[[str, str], None] = _write_text
     clock: Callable[[], float] = time.monotonic
@@ -192,9 +198,14 @@ def _sweep(uid: int, sig: int, done: Callable[[list[Proc]], bool], target: Calla
             confirm = None
         if seams.clock() >= deadline:
             return False
-        for p in procs:
-            if target(p) and signal_checked(p, uid, sig, seams):
+        targets = [p for p in procs if target(p)]
+        if targets and seams.signal_uid is not None:
+            if seams.signal_uid(uid, sig):
                 confirm = None
+        else:
+            for p in targets:
+                if signal_checked(p, uid, sig, seams):
+                    confirm = None
         if confirm is None:
             seams.sleep(delay)
             delay = min(delay * 2, POLL_MAX_S)
@@ -284,6 +295,7 @@ class CgroupProcs:
         return got
 
     def freeze(self, uid: int, bound_s: float) -> bool:
+        # The freeze proof is cgroup-scoped (comp r1 5); kill + no_process are what cover every process of the uid.
         return self._act("cgroup.freeze", "frozen", "1", uid, bound_s)
 
     def kill(self, uid: int, bound_s: float) -> bool:
@@ -438,12 +450,61 @@ class _LibProc:
         return out
 
 
+#: The child's exit status when it signalled; anything else means nothing was sent (a refused drop: 70).
+SIGNAL_SENT = 0
+
+
+def signal_child(uid: int, sig: int, *, drop: Callable[[int], None] | None = None,
+                 kill: Callable[[int, int], None] = os.kill) -> None:
+    """The signalling child's whole job, in this order (plan §2e 4): DROP to ``uid`` with the one drop
+    (:func:`levain.slot.wall.drop_and_assert`: groups exactly ``{uid}``, gid ``uid`` (§1.1: gid == uid), real
+    and effective ids, saved where the host reads them, all ``uid`` != 0, ``seteuid(0)`` proven to fail),
+    THEN ``kill(-1, sig)``. A drop that is not proven raises before the kill, so nothing is signalled as root.
+    ``kill(-1)`` from a process that is not root reaches only processes of its own uid, never itself."""
+    (drop or _drop_to)(uid)
+    kill(-1, sig)
+
+
+def _drop_to(uid: int) -> None:
+    drop_and_assert(uid, uid, (uid,), nproc=None)
+
+
+def signal_as_uid(uid: int, sig: int, *, fork: Callable[[], int] = os.fork,
+                  waitpid: Callable[[int, int], tuple[int, int]] = os.waitpid,
+                  child: Callable[[int, int], None] = signal_child,
+                  exit: Callable[[int], None] = os._exit) -> bool:
+    """macOS's signal (codex r1 3): fork; the child runs :func:`signal_child` and ``_exit``s
+    :data:`SIGNAL_SENT`, or 70 if the drop or the kill raised (ESRCH included: nothing of the uid to signal);
+    the parent reaps it. Returns whether the child signalled. Only root can run it (the drop; a target of 0
+    is refused by the drop itself, ``drop-to-root``, and the sweeps that call this ran :func:`check_target`)."""
+    pid = fork()
+    if pid == 0:   # the child: never returns into the parent's stack
+        code = SIGNAL_SENT
+        try:
+            child(uid, sig)
+        except BaseException:   # noqa: BLE001
+            code = 70
+        finally:
+            exit(code)
+    _, status = waitpid(pid, 0)
+    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == SIGNAL_SENT
+
+
+def _never_pin(pid: int) -> object:
+    raise OSError(errno.ENOTSUP, "macOS signals by uid (signal_as_uid), never a pid")
+
+
+def _never_send(handle: object, sig: int) -> None:
+    raise OSError(errno.ENOTSUP, "macOS signals by uid (signal_as_uid), never a pid")
+
+
 def darwin_seams() -> ProcSeams:
-    """Residue: macOS has no pidfd, so between the live check and ``kill(pid)`` a pid could die and be
-    reused. macOS hands out pids in increasing order up to 99999 before wrapping, so the reuse needs
-    ~10^5 forks inside two adjacent syscalls: one known edge, not built against."""
+    """libproc for the listing and the probe; :func:`signal_as_uid` for every signal. ``pin`` / ``send``
+    refuse, so no code path can send a per-pid signal as root on macOS (the pid-reuse window codex r1 3
+    named is not narrowed, it is gone)."""
     lp = _LibProc()
-    return ProcSeams(listing=lp.listing, probe=lp.probe, pin=lambda pid: pid, send=os.kill)
+    return ProcSeams(listing=lp.listing, probe=lp.probe, pin=_never_pin, send=_never_send,
+                     signal_uid=signal_as_uid)
 
 
 def default_seams(host: HostOS | None = None) -> ProcSeams:
@@ -451,7 +512,7 @@ def default_seams(host: HostOS | None = None) -> ProcSeams:
     return darwin_seams() if host == "darwin" else linux_seams()
 
 
-__all__ = ["CgroupProcs", "POLL_FIRST_S", "POLL_MAX_S", "Proc", "ProcSeams", "RUN", "STOP", "UNKNOWN",
+__all__ = ["CgroupProcs", "POLL_FIRST_S", "POLL_MAX_S", "Proc", "ProcSeams", "RUN", "SIGNAL_SENT", "STOP", "UNKNOWN",
            "UidProcs", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams", "end_seams",
            "linux_listing", "linux_probe", "linux_seams", "parse_bsdinfo", "parse_linux_proc", "scrub",
-           "signal_checked"]
+           "signal_as_uid", "signal_checked", "signal_child"]

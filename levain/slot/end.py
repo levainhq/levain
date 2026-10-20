@@ -14,22 +14,29 @@ THIS session at alloc's ``lease_seq``, else HELD ``failed_step:"slot-not-ours"``
 which CAS edges :func:`end_session` sends; every proof (freeze, kill, no process left, for EVERY uid the
 session holds) and every idempotent act runs on every call, so a forged state can make root send a
 wrong edge (CONTROL refuses it), never skip a proof or signal another session's processes. The one
-exception destroys nothing: a record already RETAINED makes END return at once, unproven (a forged one
-only leaves that session unended until the next real read).
+exception destroys nothing: a record already RETAINED makes END return at once, unproven, ONLY when root's
+own retained object for the session is whole (:func:`retained_whole`); a RETAINED record without one is
+not believed and END runs from its proofs as for REVOKED (codex r1 1), so a forged RETAINED cannot let
+teardown SCRUB and release a slot whose work was never retained.
 
-One END per session at a time: :func:`end_session` and :func:`reconcile_session` hold root's try-lock
-``L/alloc/<session>.lock`` (held = ``end-busy``; the reaper or helper retries). A CAS CONTROL does not
-take is never a step failure (L2 M5): see :func:`send_cas`.
+Locks, always in this order (§3.5 LOCK ORDER: pool -> slot -> session END lock): :func:`end_session` and
+:func:`reconcile_session` hold the slot's ``L/slots/{e,v}<n>/lock`` (:func:`slot_lock`), then root's
+per-session try-lock ``L/alloc/<session>.lock`` (held = ``end-busy``; the reaper or helper retries). The
+slot lock is held across the slot check, every proof and every act (codex r1 2): SCRUBBED and prepare take
+the same lock, so a slot cannot be released and re-leased between END's check and its signals. A CAS
+CONTROL does not take is never a step failure (L2 M5): see :func:`send_cas`.
 
-Root reads no bytes the session could not (L2 H2): a file hard-linked to a path outside the tree is
-hashed and copied by a reader dropped to the session's uid, and one that uid cannot read is recorded
-and never copied. Metadata, strip and chown address every entry from its walk dirfd, never by a full
-path (L2 M2).
+Root reads no bytes the session could not (L2 H2, codex r1 4): a file hard-linked to a path outside the
+tree, and any inode a session uid does not own whatever its link count, is hashed (and, outside-linked,
+copied) by a reader dropped to a session uid, and one that uid cannot read is recorded and never copied;
+root never reads such an inode's metadata. ONE classification (:func:`classify`), computed by the manifest
+step and stored beside it, is what the meta and tree steps read. Metadata, strip and chown address every
+entry from its walk dirfd, never by a full path (L2 M2).
 
 Every root-only act is an injected seam with a real default: the freeze, kill and process proof
 (the defaults here refuse, which lands HELD; the real ones are :func:`levain.slot.proc.end_seams`'s),
-``chown``, the metadata reader and strip, the session-uid reader, root's slot state read, the clock,
-CONTROL's ``cas``. The manifest walk is real
+``chown``, the metadata reader and strip, the tree flush (``sync``), the session-uid reader, root's slot
+state read, the clock, CONTROL's ``cas``. The manifest walk is real
 code over dirfds with ``O_NOFOLLOW``.
 """
 from __future__ import annotations
@@ -51,16 +58,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Collection, Iterator, Mapping, Sequence
 
-from levain.contracts import canon
+from levain.contracts import ContractError, canon
 from levain.slot import Refused, stage, wall, write_all
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES
 # The §7.3 states END sends; records owns the names (the full set and its legal edges).
 from levain.slot.records import (CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED, parse_slot_state,
                                  read_record)
-from levain.slot.root_intent import (INTENT_PHASES, Cas, Fault, Phase, PhaseFailed, Plan, RootIntent,
-                                     atomic_write, begin, fsync_dir, intent_path, read_root_intent,
-                                     reconcile, sweep_temps, temp_path)
+from levain.slot.root_intent import (INTENT_PHASES, TIMESTAMP_RE, Cas, Fault, Phase, PhaseFailed, Plan,
+                                     RootIntent, atomic_write, begin, fsync_dir, intent_path, read_root_intent,
+                                     reconcile, sweep_temps, temp_path, unlink_durable)
 
 # --- values (CONTRACT §11) -------------------------------------------------------------------------
 
@@ -80,6 +87,11 @@ LINK_COPY_BYTES = 2 << 30
 CAS_RETRY_SECONDS = V12_SECONDS
 CAS_BACKOFF_FIRST = 0.01
 CAS_BACKOFF_MAX = 1.0
+# DECISION: END waits for the slot lock on V23's order with a doubling backoff, as the helper's own flock
+# waits do; past it, ``slot-locked`` is raised for the caller to retry.
+SLOT_LOCK_WAIT_S = 10.0
+SLOT_LOCK_FIRST_S = 0.02
+SLOT_LOCK_MAX_S = 0.5
 
 MANIFEST_FORMAT = "levain-end-manifest/1"
 META_FORMAT = "levain-retention-meta/1"
@@ -107,6 +119,23 @@ LINKCOPY = "linkcopy"
 #: as ``size:0, digest:""`` (a file's digest is never empty otherwise) and the tree holds an empty 0600
 #: placeholder at its path: the entry is recorded, its bytes never copied, never root's.
 UNREAD = (0, "")
+#: ``L/retained/<s>/classes.jsonl``: the manifest step's ONE classification of the tree's inodes
+#: (:func:`classify`), read back by the meta and tree steps (codex r1 4). DECISION: a root working file
+#: beside the manifest, removed by the ``commit`` step, so the retained object stays §7.4's list.
+CLASSES = "classes.jsonl"
+#: A regular file some of whose links lie outside the tree: read by a session uid, copied, the copy placed.
+OUTSIDE = "outside"
+#: Any other inode a session uid does not own: its bytes read by a session uid only (hashed, never copied),
+#: its metadata never read by root, whatever its link count.
+UNOWNED = "unowned"
+#: The session-uid reader's answer for a file its uid may not open (EACCES / EPERM), END's own name beside
+#: stage's ``staging-missing`` (ENOENT) and ``staging-not-regular`` (ELOOP, not a regular file).
+LINK_UNREADABLE = "link-unreadable"
+#: The reader answers that mean "this uid cannot read it" and land :data:`UNREAD` (comp r1 2); every other
+#: answer (stage's ``staging-open-failed`` for EMFILE, EIO, ENOMEM ... included) is ``link-reader-failed``.
+UNREAD_ANSWERS = frozenset({"staging-missing", "staging-not-regular", LINK_UNREADABLE})
+#: DECISION: an UNOWNED file is hashed, never copied, so the copy cap does not bound it; the V2 time budget does.
+HASH_ONLY_CAP = (1 << 63) - 1
 
 _CHUNK = 1 << 20
 _LINK_TMP = b".levain-link."
@@ -219,6 +248,11 @@ class EndFacts:
     @property
     def slot_state(self) -> Path:
         return self.slot.slot_dir(self.store) / "state"
+
+    @property
+    def slot_lock(self) -> Path:
+        """The slot's flock, the one prepare, SCRUBBED and END take (§3.5)."""
+        return self.slot.lock_path(self.store)
 
     @property
     def parks(self) -> bool:
@@ -409,6 +443,7 @@ class LinkCount:
     nlink: int
     seen: int
     size: int
+    regular: bool = True
 
 
 class _Budget:
@@ -502,25 +537,79 @@ def tree_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
                               skip_credentials=skip_credentials))
 
 
+def _count_link(links: dict[tuple[int, int], LinkCount], e: Entry) -> None:
+    """Count ``e`` if it is a non-directory with more than one link, of ANY type (comp r1 4: a Linux symlink
+    or a macOS fifo can be hard-linked outside the tree too)."""
+    if not stat.S_ISDIR(e.st.st_mode) and e.st.st_nlink > 1:
+        lc = links.setdefault((e.st.st_dev, e.st.st_ino),
+                              LinkCount(e.st.st_nlink, 0, e.st.st_size, stat.S_ISREG(e.st.st_mode)))
+        lc.seen += 1
+
+
 def _count_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
     links: dict[tuple[int, int], LinkCount] = {}
     for e in walk(root, extra):
-        if stat.S_ISREG(e.st.st_mode) and e.st.st_nlink > 1:
-            lc = links.setdefault((e.st.st_dev, e.st.st_ino), LinkCount(e.st.st_nlink, 0, e.st.st_size))
-            lc.seen += 1
+        _count_link(links, e)
     return links
 
 
 def foreign_links(root: Path, extra: Mapping[bytes, Path] | None = None) -> dict[tuple[int, int], LinkCount]:
-    """The regular files some of whose links lie outside ``root`` (+ ``extra``): ``nlink`` greater than
-    the links the walk sees. Known before any mutation (plan §2i 4)."""
+    """The non-directory inodes, of any type, some of whose links lie outside ``root`` (+ ``extra``):
+    ``nlink`` greater than the links the walk sees. Root never strips or chowns one (comp r1 4)."""
     return {k: lc for k, lc in _count_links(root, extra).items() if lc.seen < lc.nlink}
 
 
 def outside_link_bytes(links: Mapping[tuple[int, int], LinkCount]) -> int:
-    """Bytes END will copy: one copy per inode some of whose links lie outside the tree, linked into each
-    of its in-tree paths."""
-    return sum(lc.size for lc in links.values() if lc.seen < lc.nlink)
+    """Bytes END will copy: one copy per regular file some of whose links lie outside the tree, linked into
+    each of its in-tree paths."""
+    return sum(lc.size for lc in links.values() if lc.regular and lc.seen < lc.nlink)
+
+
+def classify(root: Path, extra: Mapping[bytes, Path] | None, uids: Collection[int]
+             ) -> tuple[dict[tuple[int, int], str], dict[tuple[int, int], LinkCount]]:
+    """ONE classification of the frozen tree's inodes, by one walk, before a byte is read (codex r1 4):
+    :data:`OUTSIDE` for a regular file some of whose links lie outside the tree, :data:`UNOWNED` for any
+    other inode whose owner is not one of ``uids`` (the session's), whatever its link count. Returns it with
+    the outside-linked counts (for the copy cap). A NON-regular inode linked outside the tree refuses
+    ``tree-shared-special`` (comp r1 4): it has no copy, and root never strips or chowns a shared inode."""
+    uids = frozenset(uids)
+    links: dict[tuple[int, int], LinkCount] = {}
+    classes: dict[tuple[int, int], str] = {}
+    for e in walk(root, extra):
+        _count_link(links, e)
+        if e.st.st_uid not in uids:
+            classes[(e.st.st_dev, e.st.st_ino)] = UNOWNED
+    outside = {k: lc for k, lc in links.items() if lc.seen < lc.nlink}
+    for key, lc in outside.items():
+        if not lc.regular:
+            raise Refused("tree-shared-special", f"inode {key[0]}-{key[1]}: a non-regular inode linked outside "
+                                                 f"the tree ({lc.seen} of {lc.nlink} links in it)")
+        classes[key] = OUTSIDE
+    return classes, outside
+
+
+def _write_classes(path: Path, classes: Mapping[tuple[int, int], str], cap: int) -> None:
+    """DECISION: under V17's meta cap (a budget refusal, ``meta-byte-cap``): it is metadata about the tree."""
+    _stream_jsonl(path, ({"dev": k[0], "ino": k[1], "class": c} for k, c in sorted(classes.items())), cap,
+                  "meta-byte-cap")
+
+
+def read_classes(facts: "EndFacts") -> dict[tuple[int, int], str]:
+    """The manifest step's classification, as stored; absent or not one = ``classes-missing`` (HELD at the
+    phase that needed it), never a recompute."""
+    p = facts.retained / CLASSES
+    try:
+        data = _read_durable(p)
+        out: dict[tuple[int, int], str] = {}
+        for line in data.splitlines():
+            rec = canon.parse(line)
+            if (not isinstance(rec, dict) or set(rec) != {"dev", "ino", "class"}
+                    or rec["class"] not in (OUTSIDE, UNOWNED)):
+                raise ValueError(line[:80])
+            out[(int(rec["dev"]), int(rec["ino"]))] = rec["class"]   # type: ignore[arg-type]
+    except (OSError, ValueError) as e:
+        raise Refused("classes-missing", f"{p}: {e}") from None
+    return out
 
 
 def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) -> None:
@@ -528,9 +617,15 @@ def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) 
     fsync(dir)); past ``cap`` bytes refuses ``cap_name`` with the temp removed and ``path`` untouched."""
     tmp = temp_path(path)
     fd = os.open(tmp, _O_NEW, 0o600)
+    try:
+        fh = os.fdopen(fd, "wb", buffering=_CHUNK)
+    except BaseException:   # the file object never took the fd: close it here (glm r1 LOW)
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
     ok = False
     try:
-        with os.fdopen(fd, "wb", buffering=_CHUNK) as fh:
+        with fh:
             total = 0
             for rec in records:
                 line = canon.canonical_bytes(rec) + b"\n"
@@ -551,8 +646,25 @@ def _stream_jsonl(path: Path, records: Iterator[dict], cap: int, cap_name: str) 
 # --- the session-uid reader (L2 H2) ----------------------------------------------------------------
 
 #: ``run_as(uid, gid, fn, wfd, keep)``: run ``fn(wfd)`` as ``uid``/``gid`` with the ``keep`` fds left
-#: open, owning ``wfd`` (closing it when ``fn`` ends). Returns the running reader (stage's ``Reader``).
+#: open, owning ``wfd`` (closing it when ``fn`` ends). Returns the running reader: stage's ``Reader`` whose
+#: ``wait()`` returns the reader's exit status (0 = it ended cleanly; anything else, ``None`` included, is a
+#: failed reader, comp r1 1).
 SessionRunAs = Callable[[int, int, Callable[[int], None], int, Sequence[int]], "stage.Reader"]
+
+
+class _Forked(stage._Forked):
+    """stage's forked reader, whose ``wait()`` also returns the exit status (a signal = 128 + its number)."""
+
+    code: int | None = None
+
+    def wait(self) -> int | None:   # type: ignore[override]
+        if not self._reaped:
+            _, status = os.waitpid(self.pid, 0)
+            self._reaped = True
+            self.code = os.waitstatus_to_exitcode(status)
+            if self.code < 0:
+                self.code = 128 - self.code
+        return self.code
 
 
 def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: Sequence[int] = ()) -> stage.Reader:
@@ -573,7 +685,7 @@ def fork_run_as(uid: int, gid: int, fn: Callable[[int], None], wfd: int, keep: S
         finally:
             os._exit(code)
     os.close(wfd)
-    return stage._Forked(pid)
+    return _Forked(pid)
 
 
 def _reader_uid(facts: EndFacts, e: Entry) -> int:
@@ -583,20 +695,38 @@ def _reader_uid(facts: EndFacts, e: Entry) -> int:
     return owner if owner in facts.uids else facts.slot_uid
 
 
-def read_as_session(facts: EndFacts, seams: "EndSeams", e: Entry, out_fd: int, cap: int,
+def session_reader(dirfd: int, name: bytes, cap: int, wfd: int) -> None:
+    """The session-uid reader's whole job, after the drop (comp r1 2, END-side: stage.py folds every open
+    errno but ENOENT / ELOOP into one ``staging-open-failed``). One probe open as the reader's uid, with
+    stage's own flags, answers :data:`LINK_UNREADABLE` for EACCES / EPERM, the only "this uid may not read
+    it" errnos; anything else falls to :func:`levain.slot.stage.reader`, whose open names absent and not
+    regular and folds the rest into ``staging-open-failed``, which END takes as a failed reader (HELD, retried)."""
+    try:
+        fd = os.open(name, stage._O_READ, dir_fd=dirfd)
+    except OSError as err:
+        if err.errno in (errno.EACCES, errno.EPERM):
+            return stage._send_refusal(wfd, LINK_UNREADABLE)
+    else:
+        os.close(fd)
+    stage.reader(dirfd, name, cap, "link-copy-cap", wfd)   # type: ignore[arg-type]
+
+
+def read_as_session(facts: EndFacts, seams: "EndSeams", e: Entry, out_fd: int | None, cap: int,
                     budget: _Budget) -> tuple[int, str]:
-    """``e``'s bytes, read by :func:`levain.slot.stage.reader` in a process dropped to a session uid and
-    streamed into ``out_fd``: ``(bytes copied, their digest)``, or :data:`UNREAD` when that uid cannot read
-    it (absent, not regular, open refused). A reader that ends without an answer (its drop not proven,
-    say) is ``link-reader-failed``, never UNREAD, so a broken drop cannot turn readable work into
-    placeholders. DECISION: what the reader read is what is recorded and copied, so a file an outside owner
-    grows or truncates meanwhile keeps the bytes read."""
+    """``e``'s bytes, read by :func:`session_reader` in a process dropped to a session uid and streamed into
+    ``out_fd`` (``None``: hashed only): ``(bytes read, their digest)``, or :data:`UNREAD` when that uid
+    cannot read it (absent, not regular, EACCES / EPERM: :data:`UNREAD_ANSWERS`). Anything else is
+    ``link-reader-failed`` (HELD, retried), never UNREAD and never a kept file (comp r1 1): a reader that
+    ends without an answer (its drop not proven, say), any other open errno, a short read (fewer bytes
+    than its ``S`` header promised), a missing end mark, or a reader whose exit status is not 0, so neither a
+    broken drop nor a transient error can turn readable work into placeholders or truncated copies.
+    DECISION: what the reader read is what is recorded and copied, so a file an outside owner grows meanwhile
+    keeps the bytes read (the reader's ``X`` end mark)."""
     uid = _reader_uid(facts, e)
     rfd, wfd = os.pipe()
     proc = None
     try:
-        proc = seams.run_as(uid, uid, lambda w: stage.reader(e.dirfd, e.name, cap, "link-copy-cap", w), wfd,
-                            (e.dirfd,))
+        proc = seams.run_as(uid, uid, lambda w: session_reader(e.dirfd, e.name, cap, w), wfd, (e.dirfd,))
         wfd = -1   # run_as owns it now
         pipe = stage._Pipe(rfd, budget.deadline, budget.clock, stage.POLL_SLICE_S)
         tag = pipe.exactly(1)
@@ -605,25 +735,35 @@ def read_as_session(facts: EndFacts, seams: "EndSeams", e: Entry, out_fd: int, c
             name = pipe.exactly(ln[0]).decode("ascii", "replace") if ln else ""
             if name == "link-copy-cap":
                 raise Refused("link-copy-cap", f"{e.path!r} is past {cap} bytes")
-            if name in ("staging-missing", "staging-not-regular", "staging-open-failed"):
-                return UNREAD
-            raise Refused("link-reader-failed", name)
-        head = pipe.exactly(8) if tag == b"S" else b""
-        if len(head) != 8:
-            raise Refused("link-reader-failed", f"{e.path!r}: no answer from the reader")
-        accepted = struct.unpack(">Q", head)[0]
-        if accepted > cap:
-            raise Refused("link-copy-cap", f"{e.path!r}: {accepted} > {cap}")
-        h, n = hashlib.sha256(), 0
-        while n < accepted:
-            chunk = pipe.read(min(_CHUNK, accepted - n))
-            if not chunk:
-                break
-            write_all(out_fd, chunk)
-            h.update(chunk)
-            n += len(chunk)
-            budget.tick()
-        return n, "sha256:" + h.hexdigest()
+            if name not in UNREAD_ANSWERS:
+                raise Refused("link-reader-failed", f"{e.path!r}: {name}")
+            got = UNREAD
+        else:
+            head = pipe.exactly(8) if tag == b"S" else b""
+            if len(head) != 8:
+                raise Refused("link-reader-failed", f"{e.path!r}: no answer from the reader")
+            accepted = struct.unpack(">Q", head)[0]
+            if accepted > cap:
+                raise Refused("link-copy-cap", f"{e.path!r}: {accepted} > {cap}")
+            h, n = hashlib.sha256(), 0
+            while n < accepted:
+                chunk = pipe.read(min(_CHUNK, accepted - n))
+                if not chunk:
+                    break
+                if out_fd is not None:
+                    write_all(out_fd, chunk)
+                h.update(chunk)
+                n += len(chunk)
+                budget.tick()
+            if n != accepted:
+                raise Refused("link-reader-failed", f"{e.path!r}: a short read, {n} of {accepted} bytes")
+            if pipe.exactly(1) not in (b"X", b"E"):
+                raise Refused("link-reader-failed", f"{e.path!r}: the reader sent no end mark")
+            got = (n, "sha256:" + h.hexdigest())
+        code = proc.wait()
+        if code != 0:
+            raise Refused("link-reader-failed", f"{e.path!r}: the reader exited {code}")
+        return got
     except Refused as err:
         if proc is not None:
             proc.kill()
@@ -931,12 +1071,12 @@ def default_strip() -> Strip:
 def iter_meta(root: Path, *, extra: Mapping[bytes, Path] | None = None, reader: MetaReader,
               note: Callable[[str], None], skip: Collection[tuple[int, int]] = ()) -> Iterator[dict]:
     """``{path_b64, acl?, flags?, xattrs?}`` for every entry that carries any of the three. ``skip``: the
-    outside-linked inodes, whose metadata is their outside owner's and is never read by root.
-    DECISION: an entry with none gets no line, so meta stays within V17's 64 MiB beside a full
-    manifest."""
+    classified inodes (:func:`classify`, any type: outside-linked, or not a session uid's), whose metadata
+    root never reads. DECISION: an entry with none gets no line, so meta stays within V17's 64 MiB beside a
+    full manifest."""
     skip = frozenset(skip)
     for e in walk(root, extra):
-        if stat.S_ISREG(e.st.st_mode) and (e.st.st_dev, e.st.st_ino) in skip:
+        if (e.st.st_dev, e.st.st_ino) in skip:
             continue
         rec = reader(e, note)
         if rec:
@@ -946,6 +1086,10 @@ def iter_meta(root: Path, *, extra: Mapping[bytes, Path] | None = None, reader: 
 # --- chown + the outside-link copies ---------------------------------------------------------------
 
 Chown = Callable[[int, bytes, int, int], None]
+
+#: The errnos of a placement the filesystem refuses for good (an immutable entry or directory: EPERM / EACCES;
+#: a link count at its limit: EMLINK): the one class of placement failure that is noted, not raised.
+_PLACE_REFUSED = frozenset({errno.EPERM, errno.EACCES, errno.EMLINK})
 
 
 def os_chown(dirfd: int, name: bytes, uid: int, gid: int) -> None:
@@ -958,8 +1102,11 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
     manifest step's: the bytes the session uid read and hashed), so an in-tree link set stays one inode
     and the outside file is no longer shared (root never chowns a shared inode, plan §2g 2). Redone after a
     crash: an entry already placed (its inode is a staged copy's) is left, a temp link this step made and
-    did not rename is removed, and the staging dir goes last. A link that cannot be placed (an immutable
-    directory, say) is noted and stays shared: unstripped, unchowned."""
+    did not rename is removed, and the staging dir goes last. Only a placement the filesystem REFUSES
+    (:data:`_PLACE_REFUSED`: an immutable directory or file, a link count at its limit) is noted, and that
+    entry stays shared: unstripped, unchowned. Every other failure (ENOSPC, EIO, a failed fsync) propagates,
+    so the tree phase stays journaled and the reserve's retry runs (codex r1 7); a temp link whose rename
+    failed is removed first, so none is left in the retained tree."""
     sdir = facts.retained / LINKCOPY
     try:
         sfd = os.open(sdir, _DIR_FLAGS)
@@ -988,11 +1135,22 @@ def _place_link_copies(facts: EndFacts, tree: Path, note: Callable[[str], None])
             tmp = _LINK_TMP + secrets.token_hex(8).encode("ascii")
             try:
                 os.link(src, tmp, src_dir_fd=sfd, dst_dir_fd=e.dirfd)
-                os.rename(tmp, e.name, src_dir_fd=e.dirfd, dst_dir_fd=e.dirfd)
-                os.fsync(e.dirfd)
             except OSError as err:
+                if err.errno not in _PLACE_REFUSED:
+                    raise
                 note(f"link {e.abspath!r}: not replaced by its copy ({err.strerror or err}); left unstripped, "
                      f"unchowned")
+                continue
+            try:
+                os.rename(tmp, e.name, src_dir_fd=e.dirfd, dst_dir_fd=e.dirfd)
+            except OSError as err:
+                os.unlink(tmp, dir_fd=e.dirfd)
+                if err.errno not in _PLACE_REFUSED:
+                    raise
+                note(f"link {e.abspath!r}: not replaced by its copy ({err.strerror or err}); left unstripped, "
+                     f"unchowned")
+                continue
+            os.fsync(e.dirfd)
         for nb in staged:
             os.unlink(nb, dir_fd=sfd)
         os.fsync(sfd)
@@ -1025,6 +1183,30 @@ def unbuilt_no_process(uid: int) -> bool:
     raise Refused("seam-unbuilt", "no_process: pass levain.slot.proc.end_seams(host, cgroup)")
 
 
+def sync_tree(tree: Path) -> None:
+    """The tree step's metadata (setid bits cleared, xattrs / ACLs / flags stripped, owners root) durable
+    before the journal leaves ``tree`` (codex r1 5). DECISION: one filesystem-wide flush rather than an fsync
+    per mutated inode (V1 allows 2 M). Linux: ``syncfs(2)`` on the tree's filesystem (libc's; ``sync(2)`` where
+    libc has none). macOS: ``sync(2)``, then ``F_FULLFSYNC`` on the tree directory, which also asks the
+    device to flush its write cache. A failure raises (HELD at ``tree``, redone)."""
+    fd = os.open(tree, _DIR_FLAGS)
+    try:
+        if sys.platform == "darwin":
+            os.sync()
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)   # type: ignore[attr-defined]
+            return
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        syncfs = getattr(libc, "syncfs", None)
+        if syncfs is None:
+            os.sync()
+            return
+        syncfs.argtypes = [ctypes.c_int]
+        if syncfs(fd) != 0:
+            raise _oserr("syncfs")
+    finally:
+        os.close(fd)
+
+
 def read_slot_state(path: Path) -> bytes | None:
     """Root's own slot state file (§3.5 Pool, root 0644 in a root dir), ``None`` when absent; a link or a
     non-regular file refuses."""
@@ -1043,6 +1225,7 @@ class EndSeams:
     meta_reader: MetaReader = field(default_factory=default_meta_reader)
     strip: Strip = field(default_factory=default_strip)
     chown: Chown = os_chown
+    sync: Callable[[Path], None] = sync_tree
     run_as: SessionRunAs = fork_run_as
     slot_state: Callable[[Path], "bytes | None"] = read_slot_state
     root_uid: int = 0
@@ -1120,41 +1303,51 @@ def _init_step(facts: EndFacts, seams: EndSeams) -> None:
 
 
 def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
-    """The manifest of the frozen tree, durable, before any mutation. An outside-linked inode (L2 H2) is
-    read once, by the session-uid reader, into ``L/retained/<s>/linkcopy/<dev>-<ino>`` (the copy keeps its
-    mode less setuid/setgid; an UNREAD one is an empty 0600 placeholder), and that read is what the
-    manifest hashes. The copy cap is checked before anything is read."""
-    foreign = foreign_links(facts.live, facts.extra)
-    copy = outside_link_bytes(foreign)
+    """The manifest of the frozen tree, durable, before any mutation. First the ONE classification
+    (:func:`classify`), stored as ``classes.jsonl``. An :data:`OUTSIDE` inode (L2 H2) is read once, by the
+    session-uid reader, into ``L/retained/<s>/linkcopy/<dev>-<ino>`` (the copy keeps its mode less
+    setuid/setgid; an UNREAD one is an empty 0600 placeholder); an :data:`UNOWNED` file is read once by it and
+    hashed, never copied (codex r1 4); that read is what the manifest records. The copy cap is checked
+    before anything is read, and is ONE budget across every reader: each gets only what the reads before it
+    left (codex r1 8), so files an outside holder grows after the sum cannot stage past it."""
+    classes, outside = classify(facts.live, facts.extra, facts.uids)
+    copy = outside_link_bytes(outside)
     if copy > caps.link_copy_bytes:
         raise Refused("link-copy-cap", f"{copy} bytes hard-linked outside the tree > {caps.link_copy_bytes}")
     _clear_linkcopy(facts, seams)
+    _write_classes(facts.retained / CLASSES, classes, caps.meta_bytes)
     sfd = -1
-    if foreign:
+    if outside:
         os.mkdir(facts.retained / LINKCOPY, 0o700)
         fsync_dir(facts.retained)
         sfd = os.open(facts.retained / LINKCOPY, _DIR_FLAGS)
     staged: dict[tuple[int, int], tuple[int, str]] = {}
+    copied = 0
 
     def read_foreign(e: Entry, budget: _Budget) -> tuple[int, str]:
+        nonlocal copied
         key = (e.st.st_dev, e.st.st_ino)
         if key not in staged:
-            out = os.open(_staged_name(key), _O_NEW, 0o600, dir_fd=sfd)
-            try:
-                got = read_as_session(facts, seams, e, out, caps.link_copy_bytes, budget)
-                os.fchmod(out, 0o600 if got == UNREAD else stat.S_IMODE(e.st.st_mode) & ~_SETID)
-                os.fsync(out)
-            finally:
-                os.close(out)
+            if classes[key] == OUTSIDE:
+                out = os.open(_staged_name(key), _O_NEW, 0o600, dir_fd=sfd)
+                try:
+                    got = read_as_session(facts, seams, e, out, caps.link_copy_bytes - copied, budget)
+                    os.fchmod(out, 0o600 if got == UNREAD else stat.S_IMODE(e.st.st_mode) & ~_SETID)
+                    os.fsync(out)
+                finally:
+                    os.close(out)
+                copied += got[0]
+            else:
+                got = read_as_session(facts, seams, e, None, HASH_ONLY_CAP, budget)
             if got == UNREAD:
-                seams.note(f"link {e.abspath!r}: the session uid cannot read it; recorded, not copied")
+                seams.note(f"{classes[key]} {e.abspath!r}: the session uid cannot read it; recorded, not copied")
             staged[key] = got
         return staged[key]
 
     try:
         _stream_jsonl(facts.retained / "manifest.jsonl",
                       iter_manifest(facts.live, extra=facts.extra, caps=caps, clock=seams.clock,
-                                    credentials=facts.parked_paths, foreign=foreign, read_foreign=read_foreign),
+                                    credentials=facts.parked_paths, foreign=classes, read_foreign=read_foreign),
                       caps.manifest_bytes, "manifest-byte-cap")
         if sfd >= 0:
             os.fsync(sfd)
@@ -1165,9 +1358,11 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
 
 
 def _meta_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
+    """The metadata of every entry the manifest step's classification left to root: the STORED one, never a
+    recompute (codex r1 4: an outside link removed between the two steps cannot hand root the inode)."""
     _stream_jsonl(facts.retained / "meta.jsonl",
                   iter_meta(facts.live, extra=facts.extra, reader=seams.meta_reader, note=seams.note,
-                            skip=foreign_links(facts.live, facts.extra)),
+                            skip=read_classes(facts)),
                   caps.meta_bytes, "meta-byte-cap")
 
 
@@ -1205,8 +1400,13 @@ def _rename_durable(src: Path, dst: Path) -> None:
 def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
     """Rename the session's work into ``tree/`` (and macOS ``/var/folders/<slot>`` into
     ``tree/.levain-var-folders/``), link the staged copies over the outside-linked files, strip (setuid /
-    setgid included), then chown root. Each sub-step is idempotent; every session uid is proven dead, so
-    nothing changes under the walks, and every call is on a walk dirfd or an fd of the entry (L2 M2)."""
+    setgid included), then chown root, then flush it all (:attr:`EndSeams.sync`) before the journal may
+    leave ``tree`` (codex r1 5). Each sub-step is idempotent; a redo whose rename already happened still
+    fsyncs both parents before going on (codex r1 6). Every session uid is proven dead, so nothing changes
+    under the walks, and every call is on a walk dirfd or an fd of the entry (L2 M2). An inode a path outside
+    the tree still shares (a copy that could not be placed) is never stripped or chowned, and a shared
+    non-regular one refuses ``tree-shared-special`` (comp r1 4). An :data:`UNOWNED` inode has only its
+    setuid / setgid cleared, by fd: root reads none of its metadata (codex r1 4)."""
     tree = facts.tree
     if os.path.lexists(facts.live):
         if os.path.lexists(tree):
@@ -1214,6 +1414,9 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
         _rename_durable(facts.live, tree)
     elif not (os.path.isdir(tree) and not os.path.islink(tree)):
         raise Refused("tree-missing", str(tree))
+    else:
+        fsync_dir(facts.live.parent)   # the rename happened; its durability may not have
+        fsync_dir(tree.parent)
     seams.fault("retain:tree:renamed")
 
     vf = facts.var_folders
@@ -1228,6 +1431,10 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
             except OSError as e:
                 seams.note(f"strip {vf}: flags not cleared ({e.strerror or e})")
         _rename_durable(vf, dest)
+    elif vf is not None and os.path.isdir(dest) and not os.path.islink(dest):
+        if os.path.isdir(vf.parent):
+            fsync_dir(vf.parent)
+        fsync_dir(dest.parent)
     seams.fault("retain:tree:var-folders")
 
     # DECISION: the outside-link copies are placed before the strip (§7.4 names rename, strip, fchown),
@@ -1235,9 +1442,18 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
     _place_link_copies(facts, tree, seams.note)
     seams.fault("retain:tree:links")
 
-    shared = set(foreign_links(tree))
+    classes = read_classes(facts)
+    shared = foreign_links(tree)
+    special = [k for k, lc in shared.items() if not lc.regular]
+    if special:
+        raise Refused("tree-shared-special", f"inode {special[0][0]}-{special[0][1]} is linked outside the tree")
     for e in walk(tree):
-        if (e.st.st_dev, e.st.st_ino) not in shared:
+        key = (e.st.st_dev, e.st.st_ino)
+        if key in shared:
+            continue
+        if classes.get(key) == UNOWNED:
+            _clear_setid_only(e)
+        else:
             seams.strip(e, seams.note)
     seams.fault("retain:tree:stripped")
 
@@ -1250,11 +1466,30 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
         if (e.st.st_dev, e.st.st_ino) not in shared:
             seams.chown(e.dirfd, e.name, seams.root_uid, seams.root_gid)
     fsync_dir(tree)
+    seams.sync(tree)
+
+
+def _clear_setid_only(e: Entry) -> None:
+    """An :data:`UNOWNED` entry's strip: setuid / setgid off by fd before root's chown (a gate, as in the
+    full strip), no xattr, ACL or flag read. DECISION: its other metadata stays as found."""
+    m = e.st.st_mode
+    if not ((stat.S_ISREG(m) or stat.S_ISDIR(m)) and m & _SETID):
+        return
+    fd = _entry_fd(e)
+    if fd is None:
+        return
+    try:
+        _clear_setid(fd, e)
+    finally:
+        os.close(fd)
 
 
 def _commit_step(facts: EndFacts, seams: EndSeams) -> None:
     """Root's ``retained_at`` (0644; the dispatch retention age clock, §3.5), written once: a redo
-    keeps the first one, so HELD or crash time never moves it."""
+    keeps the first one, so HELD or crash time never moves it. First the classification goes: the journal is
+    past ``tree`` (forward only), so no step that reads it can run again, and the retained object is §7.4's
+    list exactly."""
+    unlink_durable(facts.retained / CLASSES)
     p = facts.retained / "retained_at"
     if not os.path.lexists(p):
         atomic_write(p, (seams.now() + "\n").encode("ascii"), 0o644)
@@ -1307,7 +1542,8 @@ def park_move(facts: EndFacts) -> None:
     Only a non-directory is moved; absent = already parked or never made. A ``keep/`` entry already there
     is never replaced (``keep-occupied``, HELD park), so a planted file cannot overwrite a parked login;
     ``keep/`` is root-only, so the check and the rename cannot race. keep/ (root 0700, install's) is made
-    if it is missing (DECISION)."""
+    if it is missing (DECISION). A redo that finds the source gone and ``keep/`` holding it (a rename whose
+    fsyncs did not finish) still fsyncs both directories (codex r1 6)."""
     cred = facts.credential
     if cred is None or not os.path.isdir(facts.live):
         return
@@ -1319,6 +1555,9 @@ def park_move(facts: EndFacts) -> None:
         try:
             st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
         except FileNotFoundError:
+            if os.path.lexists(facts.keep / os.fsdecode(name)):
+                os.fsync(dfd)
+                fsync_dir(facts.keep)
             return
         if stat.S_ISDIR(st.st_mode):
             return
@@ -1419,6 +1658,7 @@ class Reserve:
             return True
         if free_bytes() <= floor:
             return False
+        created = not os.path.lexists(self.path)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             os.fchmod(fd, 0o600)
@@ -1436,6 +1676,8 @@ class Reserve:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if created:   # the new name is durable too, or a crash leaves no reserve to give (glm r1 LOW)
+            fsync_dir(self.path.parent)
         return cur >= self.size
 
 
@@ -1480,6 +1722,67 @@ def check_slot_ours(facts: EndFacts, seams: EndSeams) -> None:
     if (st.slot != facts.slot or st.state != "leased" or st.session != facts.session
             or facts.lease_seq is None or st.lease_seq != facts.lease_seq):
         raise Refused("slot-not-ours", f"{facts.slot.tag} is {st.state} to {st.session} at lease {st.lease_seq}")
+
+
+@contextmanager
+def slot_lock(facts: EndFacts, seams: EndSeams) -> Iterator[bool]:
+    """The slot's ``L/slots/{e,v}<n>/lock`` flock (§3.5), taken BEFORE :func:`end_lock` (the order pool ->
+    slot -> session END lock; END never holds the pool lock), and held across the slot check, the freeze,
+    kill and no-process proofs and every act after them (codex r1 2). SCRUBBED takes the same lock (after the
+    pool lock) and re-checks the lease under it, so a slot END proved ours cannot be released and re-leased
+    while END signals its uids. prepare only TRIES it under the pool lock, so a slot END holds is passed over
+    and prepare never waits on END. Waited for up to :data:`SLOT_LOCK_WAIT_S`, else ``slot-locked`` (raised,
+    never HELD: the caller retries). Yields whether the slot exists: DECISION no slot directory means no slot
+    state either, so END lands ``slot-not-ours`` with nothing signalled. A lock file missing from a slot
+    directory is made (root 0600, the file install makes)."""
+    path = facts.slot_lock
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except FileNotFoundError:
+        yield False
+        return
+    except OSError as e:
+        raise Refused("bad-root", f"{path}: {e.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not seams.owner_ok(st):
+            raise Refused("bad-root", f"{path} is not a regular file with the expected owner")
+        deadline = None
+        delay = SLOT_LOCK_FIRST_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                now = seams.clock()
+                deadline = now + SLOT_LOCK_WAIT_S if deadline is None else deadline
+                if now >= deadline:
+                    raise Refused("slot-locked", f"{facts.slot.tag} held past {SLOT_LOCK_WAIT_S:g} s") from None
+                seams.sleep(delay)
+                delay = min(delay * 2, SLOT_LOCK_MAX_S)
+        yield True
+    finally:
+        os.close(fd)   # closing the only descriptor releases the flock
+
+
+def retained_whole(facts: EndFacts, seams: EndSeams) -> bool:
+    """Whether root's OWN retained object for the session exists and is whole: ``L/retained/<s>/`` a real
+    directory, ``tree/`` a real directory, ``object.json`` a regular file that parses as THIS session's
+    ``levain-retained-object/1``, ``retained_at`` a regular file holding one contract timestamp, each with
+    the expected owner (root). Only this lets END take a RETAINED record at its word (codex r1 1)."""
+    r = facts.retained
+    try:
+        for p, ok in ((r, stat.S_ISDIR), (r / "tree", stat.S_ISDIR), (r / "object.json", stat.S_ISREG),
+                      (r / "retained_at", stat.S_ISREG)):
+            st = os.lstat(p)
+            if not ok(st.st_mode) or not seams.owner_ok(st):
+                return False
+        obj = canon.parse(_read_durable(r / "object.json"))
+        stamp = _read_durable(r / "retained_at")
+    except (OSError, ContractError):
+        return False
+    return (isinstance(obj, dict) and obj.get("format") == OBJECT_FORMAT and obj.get("session") == facts.session
+            and stamp.endswith(b"\n") and TIMESTAMP_RE.fullmatch(stamp[:-1].decode("ascii", "replace")) is not None)
 
 
 @contextmanager
@@ -1536,13 +1839,43 @@ def _reconcile(facts: EndFacts, seams: EndSeams, caps: Caps) -> RootIntent | Non
                      fault=seams.fault, retry=seams.retry, owner_ok=seams.owner_ok)
 
 
-def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps()) -> RootIntent | None:
+#: The retain phases whose step reads or changes the session tree (or follows one that did, ``object``): a
+#: journal at one of them is finished only after :func:`reconcile_session` proves the slot ours and every
+#: session uid dead again (comp r1 3). DECISION: not ``init`` (a mkdir of root's own directory, before any
+#: read) and not ``commit`` (it writes root's ``retained_at`` and CASes; the tree is done): a crash between
+#: the RETAINED CAS and the journal delete leaves a ``commit`` journal that SCRUBBED may already have
+#: outlived, and finishing it must not need a slot that is no longer the session's.
+PROVEN_PHASES = ("manifest", "meta", "object", "tree")
+
+
+def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
+                      held_attempts: int | None = None) -> RootIntent | None:
     """The reaper's step 2 / helper start for one session: finish its journal, from the journal and
-    the filesystem only, under root's per-session lock. It runs no freeze, kill or process proof: a
-    journal exists only once END proved them (the retain and park journals are begun after the kill's
-    proof). Raises :class:`PhaseFailed` (journal left at the phase), ``Refused`` (``end-busy`` included)
-    or :class:`CasNotSent`."""
-    with end_lock(facts, seams):
+    the filesystem only, under the slot lock then root's per-session lock (:func:`slot_lock`). A retain
+    journal at a :data:`PROVEN_PHASES` phase is finished only after the proofs END runs (the slot ours,
+    then freeze, kill and no process for EVERY session uid): the journal outlives END's own proofs (HELD
+    at ``tree``, a later pass), and a process of a session uid could have appeared since (comp r1 3). A proof
+    that fails CASes HELD with that step as ``failed_step`` (``held_attempts`` one past the record's), as
+    :func:`end_session` does, and raises its refusal: nothing is reconciled. Raises :class:`PhaseFailed`
+    (journal left at the phase), ``Refused`` (``end-busy`` and ``slot-locked`` included) or
+    :class:`CasNotSent`."""
+    with slot_lock(facts, seams) as locked, end_lock(facts, seams):
+        ri = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
+        if ri is not None and ri.intent == "retain" and ri.phase in PROVEN_PHASES:
+            step = "slot-not-ours"
+            try:
+                if not locked:
+                    raise Refused("slot-not-ours", f"no {facts.slot.slot_dir(facts.store)}")
+                check_slot_ours(facts, seams)
+                step = "freeze"
+                _prove_frozen(facts, seams)
+                step = "kill"
+                _prove_dead(facts, seams)
+            except Exception as e:   # noqa: BLE001 - an unproven step is HELD
+                seams.note(f"reconcile {facts.session}: {step} not proven: {e}")
+                attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
+                send_cas(seams, HELD, {"failed_step": step, "held_attempts": attempts + 1})
+                raise
         try:
             return _reconcile(facts, seams, caps)
         except PhaseFailed as e:
@@ -1559,40 +1892,57 @@ def _prove(ok: Callable[[], bool], what: str, seams: EndSeams, bound: float | No
         raise Refused(f"{what}-unproven", f"past the {bound:g} s bound")
 
 
+def _prove_frozen(facts: EndFacts, seams: EndSeams) -> None:
+    for uid in facts.uids:
+        _prove(lambda u=uid: seams.freeze(u, V12_SECONDS), "freeze", seams, V12_SECONDS)
+
+
+def _prove_dead(facts: EndFacts, seams: EndSeams) -> None:
+    for uid in facts.uids:
+        _prove(lambda u=uid: seams.kill(u, V12_SECONDS), "kill", seams, V12_SECONDS)
+    for uid in facts.uids:
+        _prove(lambda u=uid: seams.no_process(u), "kill", seams, None)
+
+
 def end_session(facts: EndFacts, seams: EndSeams, *, record_state: str, failed_step: str | None = None,
                 held_attempts: int | None = None, caps: Caps = Caps()) -> str:
     """Drive one session through END from ``record_state`` (and ``failed_step`` for HELD); returns the
     state it leaves the record in (RETAINED or HELD). Every proof and idempotent act runs every call;
     the record's state only chooses which CAS edges are sent (see the module docstring). A landing in
     HELD sends ``held_attempts`` one past the record's (§7.3: the reaper's backoff and doctor read it).
-    Raises ``end-busy`` (another END or reconciliation holds the session) and :class:`CasNotSent`."""
+    Raises ``end-busy`` (another END or reconciliation holds the session), ``slot-locked`` and
+    :class:`CasNotSent`. A RETAINED record is taken at its word only with root's own retained object whole
+    (:func:`retained_whole`); otherwise END starts as from REVOKED (codex r1 1): the proofs run, and CONTROL
+    refuses the FROZEN edge out of RETAINED (:class:`CasNotSent`), so teardown never reaches SCRUBBED."""
     if record_state == RETAINED:
-        return RETAINED
-    start = _RESUME.get(failed_step or "") if record_state == HELD else _START.get(record_state)
+        if retained_whole(facts, seams):
+            return RETAINED
+        seams.note(f"END {facts.session}: the record says RETAINED and root holds no whole retained object")
+        start: int | None = _START[REVOKED]
+    else:
+        start = _RESUME.get(failed_step or "") if record_state == HELD else _START.get(record_state)
     if start is None:
         raise Refused("not-ending", f"{record_state} / {failed_step}")
     attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
-    with end_lock(facts, seams):
-        return _end_locked(facts, seams, start, attempts + 1, caps)
+    with slot_lock(facts, seams) as locked, end_lock(facts, seams):
+        return _end_locked(facts, seams, start, attempts + 1, caps, locked)
 
 
-def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, caps: Caps) -> str:
+def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, caps: Caps, locked: bool) -> str:
     def cas(target: str, fields: Mapping[str, object]) -> None:
         send_cas(seams, target, fields)
 
     step = "slot-not-ours"
     try:
+        if not locked:
+            raise Refused("slot-not-ours", f"no {facts.slot.slot_dir(facts.store)}")
         check_slot_ours(facts, seams)
         step = "freeze"
-        for uid in facts.uids:
-            _prove(lambda u=uid: seams.freeze(u, V12_SECONDS), "freeze", seams, V12_SECONDS)
+        _prove_frozen(facts, seams)
         if start <= 0:
             cas(FROZEN, {})
         step = "kill"
-        for uid in facts.uids:
-            _prove(lambda u=uid: seams.kill(u, V12_SECONDS), "kill", seams, V12_SECONDS)
-        for uid in facts.uids:
-            _prove(lambda u=uid: seams.no_process(u), "kill", seams, None)
+        _prove_dead(facts, seams)
         if start <= 1:
             cas(DEAD, {})
 
@@ -1643,7 +1993,9 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
     return HELD
 
 
-__all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED", "Caps",
+__all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED",
+           "Caps", "HASH_ONLY_CAP", "LINK_UNREADABLE", "OUTSIDE", "PROVEN_PHASES", "SLOT_LOCK_WAIT_S", "UNOWNED",
+           "UNREAD_ANSWERS", "classify", "read_classes", "retained_whole", "session_reader", "slot_lock", "sync_tree",
            "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
            "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT", "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve",
            "UNREAD", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES", "V17_META_BYTES", "V1_INODES", "V2_SECONDS",
