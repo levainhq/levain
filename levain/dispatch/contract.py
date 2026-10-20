@@ -50,8 +50,8 @@ from levain.dispatch import ContractRefused
 from levain.dispatch.policy import ProviderPolicy, path_text_problem
 
 __all__ = [
-    "BUDGET_KEYS", "FORMAT", "GOAL_MAX_BYTES", "GRANTABLE", "MAX_LIFETIME", "NEW", "PathEntry", "ResolvedContract",
-    "ResolvedTemplate", "SUBMISSION_KEYS", "git_env", "parse_contract", "resolve_contract",
+    "BUDGET_KEYS", "FORMAT", "GOAL_MAX_BYTES", "GRANTABLE", "GitUnavailable", "MAX_LIFETIME", "NEW", "PathEntry",
+    "ResolvedContract", "ResolvedTemplate", "SUBMISSION_KEYS", "git_env", "parse_contract", "resolve_contract",
 ]
 
 FORMAT = "levain-dispatch-contract/1"
@@ -88,9 +88,13 @@ def _refuse(message: str) -> ContractRefused:
     return ContractRefused(message)
 
 
-class _GitUnavailable(ContractRefused):
+class GitUnavailable(ContractRefused):
     """git could not run at all (it timed out or could not start): a fault on this machine, not in the submission, so
     a caller that reads input faults from a refusal must never report it as one."""
+
+
+# the name this class had while it was private, kept so a caller written against it still catches it
+_GitUnavailable = GitUnavailable
 
 
 def _text_problem(text: str, what: str) -> str | None:

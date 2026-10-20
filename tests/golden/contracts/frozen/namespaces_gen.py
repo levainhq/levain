@@ -27,6 +27,7 @@ DOC = {
         {"namespace": "levain-consent-ruling", "status": "shipped", "owner": "levain/consent/record.py"},
         {"namespace": "levain-consent-away", "status": "shipped", "owner": "levain/consent/record.py"},
         {"namespace": "levain-dispatch-contract", "status": "reserved", "owner": "levain/dispatch/sign.py"},
+        {"namespace": "levain-dispatch-cancel", "status": "reserved", "owner": "levain/dispatch/sign.py"},
         {"namespace": "levain-dispatch-config", "status": "reserved", "owner": "levain/dispatch/control.py"},
         {"namespace": "levain-allowed-signers", "status": "reserved", "owner": "levain/qbroker/signers.py"},
     ],

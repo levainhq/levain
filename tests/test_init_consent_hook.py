@@ -19,6 +19,11 @@ from levain.consent.adapters import claude_code, codex
 from levain.install import refresh_adapter
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture)
 
+from tests.test_subfolder_hooks import cc_local_layout  # noqa: E402,F401  (fixture)
+
+# levain's hooks live in settings.local.json in these tests: a git-root workspace's layout (test_subfolder_hooks)
+pytestmark = pytest.mark.usefixtures("cc_local_layout")
+
 
 def _cj(tmp_path: Path) -> Path:
     return tmp_path / "codex-home" / "hooks.json"
@@ -41,14 +46,14 @@ def _row(results, name: str):
 
 def test_claude_code_init_wires_the_consent_hook(make_install):
     cc = make_install("cc")
-    (group,) = _consent_groups(cc / ".claude" / "settings.json")
+    (group,) = _consent_groups(cc / ".claude" / "settings.local.json")
     script = cc / "activation" / "hooks" / "consent_claude_code.py"
     assert group == {"matcher": "*", "hooks": [{
         "type": "command", "command": claude_code.hookrun_command(sys.executable, script),
         "timeout": claude_code.hook_timeout(claude_code.DEFAULT_MAX_HOLD)}]}
     assert script.is_file()
     # the other hooks are untouched by the merge
-    hooks = json.loads((cc / ".claude" / "settings.json").read_text())["hooks"]
+    hooks = json.loads((cc / ".claude" / "settings.local.json").read_text())["hooks"]
     assert {"SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop"} <= set(hooks)
 
 
@@ -71,7 +76,7 @@ def test_codex_init_wires_the_consent_hook_in_the_global_file(make_install, tmp_
 @pytest.mark.parametrize("adapter", ["claude-code", "codex"])
 def test_init_and_update_render_the_same_bytes(make_install, tmp_path, adapter):
     install = make_install("x", adapter=adapter)
-    target = install / ".claude" / "settings.json" if adapter == "claude-code" else _cj(tmp_path)
+    target = install / ".claude" / "settings.local.json" if adapter == "claude-code" else _cj(tmp_path)
     before = target.read_bytes()
     r = refresh_adapter(install, apply=True, emit=lambda _l: None)
     assert r.refreshed == [] and r.review == [], r
@@ -79,8 +84,9 @@ def test_init_and_update_render_the_same_bytes(make_install, tmp_path, adapter):
 
 
 def test_a_render_with_another_interpreter_is_still_levains(make_install):
-    """The consent command carries the interpreter, so a file rendered on another machine differs only at a
-    per-machine leaf (_levain_render_variant), as the other hook commands do."""
+    """The consent command carries the interpreter, and lives with the other hooks in settings.local.json, so
+    settings.json renders the same bytes on every machine and only levain's hook entries differ (levain's own,
+    decided by doctor.levain_hook_handler, not by the interpreter)."""
     cc = make_install("cc")
     root = inst._templates_root
     with root() as templates_root:
@@ -89,9 +95,11 @@ def test_a_render_with_another_interpreter_is_still_levains(make_install):
         seed = [inst.SeedEntry(name="world.md", path=templates_root / "seed" / "world.md", mode="render")]
         want = inst._claude_code_files(*args, sys.executable, seed, [])[cc / ".claude" / "settings.json"]
         other = inst._claude_code_files(*args, "/opt/other/python3", seed, [])[cc / ".claude" / "settings.json"]
-        variant = inst._claude_code_files(*args, inst._VARIABLE, seed, [])[cc / ".claude" / "settings.json"]
-    assert other != want
-    assert inst._levain_render_variant(other, want, variant, install=cc)
+        hooks = inst.claude_code_local_hooks(cc, adapter_root, "/opt/other/python3")
+    assert other == want
+    (group,) = hooks["PermissionRequest"]
+    assert group["hooks"][0]["command"].startswith("/opt/other/python3 ")
+    assert all(doctor.levain_hook_handler(h, cc) for gs in hooks.values() for g in gs for h in g["hooks"])
 
 
 @pytest.mark.parametrize("adapter", ["claude-code", "codex"])
@@ -110,14 +118,14 @@ def test_the_codex_owner_test_still_reads_the_consent_command(make_install):
 def _make_pre_consent(cc: Path) -> Path:
     """Turn a fresh claude-code install into one made before the consent hook: no entry, no script, receipts and
     pin saying so."""
-    settings = cc / ".claude" / "settings.json"
+    settings = cc / ".claude" / "settings.local.json"
     doc = json.loads(settings.read_text())
     del doc["hooks"]["PermissionRequest"]
     text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
     settings.write_text(text, encoding="utf-8")
     rec = cc.joinpath(*inst.ADAPTER_RECEIPT_REL)
     data = json.loads(rec.read_text())
-    data["files"][".claude/settings.json"] = hashlib.sha256(text.encode()).hexdigest()
+    data["files"][inst.CC_LOCAL_HOOKS_KEY] = hashlib.sha256(inst._canonical_hooks(doc["hooks"])).hexdigest()
     rec.write_text(json.dumps(data))
     script = cc / "activation" / "hooks" / "consent_claude_code.py"
     script.unlink()
@@ -131,11 +139,11 @@ def _make_pre_consent(cc: Path) -> Path:
 
 def test_update_wires_a_pre_consent_install_and_keeps_the_pin(make_install):
     cc = make_install("cc")
-    want = (cc / ".claude" / "settings.json").read_bytes()
+    want = (cc / ".claude" / "settings.local.json").read_bytes()
     settings = _make_pre_consent(cc)
     assert _row(doctor._check_claude_code(cc), "Claude Code consent hook").warn
     r = refresh_adapter(cc, apply=True, emit=lambda _l: None)
-    assert ".claude/settings.json" in r.refreshed and "activation/hooks/consent_claude_code.py" in r.refreshed, r
+    assert ".claude/settings.local.json (levain's hooks)" in r.refreshed and "activation/hooks/consent_claude_code.py" in r.refreshed, r
     assert settings.read_bytes() == want
     wired = _row(doctor._check_claude_code(cc), "Claude Code consent hook")  # no key: the Q10 floor's WARN (L2-7)
     assert wired.detail.startswith("wired to this install, but no active key") and "LEVAIN_UNCONFINED=1" in wired.hint
@@ -147,10 +155,10 @@ def test_update_stages_an_edited_settings_file_and_doctor_says_where(make_instal
     cc = make_install("cc")
     settings = _make_pre_consent(cc)
     doc = json.loads(settings.read_text())
-    doc["env"] = {"MINE": "1"}  # the operator's edit: no longer what levain last wrote
+    doc["hooks"]["Stop"][0]["hooks"][0]["timeout"] = 5  # the operator's edit of levain's own entry
     settings.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     r = refresh_adapter(cc, apply=True, emit=lambda _l: None)
-    assert ".claude/settings.json" in r.review, r
+    assert ".claude/settings.local.json" in r.review, r
     assert "PermissionRequest" not in json.loads(settings.read_text())["hooks"]
     row = _row(doctor._check_claude_code(cc), "Claude Code consent hook")
     assert row.warn and "staged" in row.hint and "pending" in row.hint, row
@@ -240,7 +248,7 @@ def test_init_reports_the_agent_version_and_renders_anyway(make_install, monkeyp
     (line,) = lines
     assert line.startswith("  consent hook (Claude Code): wired; ")
     assert ("is a tested version" in line) is tested and ("WARN" in line) is (not tested), line
-    assert _consent_groups(cc / ".claude" / "settings.json")
+    assert _consent_groups(cc / ".claude" / "settings.local.json")
 
 
 def test_codex_init_says_trust_and_machine_wide(make_install, monkeypatch):
@@ -286,7 +294,7 @@ def test_canary_findings_cover_the_init_shape(make_install):
     cc = make_install("cc")
     names = [f.name for f in doctor_findings(cc)]
     assert names == ["consent hook (Claude Code)"], names  # the version row (no version in tests: a WARN)
-    settings = cc / ".claude" / "settings.json"
+    settings = cc / ".claude" / "settings.local.json"
     doc = json.loads(settings.read_text())
     del doc["hooks"]["PermissionRequest"]
     settings.write_text(json.dumps(doc))
@@ -383,7 +391,7 @@ def _init(tmp_path, capsys, name, adapter, **kw):
 def test_consent_hook_off_wires_nothing_and_update_keeps_it_off(make_install, tmp_path, capsys, adapter):
     rc, install, out = _init(tmp_path, capsys, "x", adapter, force=False, consent_hook="off")
     assert rc == 0, out
-    target = install / ".claude" / "settings.json" if adapter == "claude-code" else _cj(tmp_path)
+    target = install / ".claude" / "settings.local.json" if adapter == "claude-code" else _cj(tmp_path)
     assert _consent_groups(target) == []
     assert json.loads((install / ".levain" / "config.json").read_text())["consent_hook"] == "off"
     assert "consent hook: off" in out
@@ -411,7 +419,7 @@ def test_init_force_without_the_flag_keeps_off(make_install, tmp_path, capsys):
     assert rc == 0
     rc, _, out = _init(tmp_path, capsys, "x", "claude-code", force=True)
     assert rc == 0, out
-    assert _consent_groups(install / ".claude" / "settings.json") == []
+    assert _consent_groups(install / ".claude" / "settings.local.json") == []
 
 
 def test_a_bad_consent_hook_value_is_refused_before_anything_is_written(make_install, tmp_path, capsys):
@@ -437,7 +445,7 @@ def test_a_moved_claude_install_s_consent_command_falls_through(make_install, tm
     import subprocess
 
     cc = make_install("cc")
-    (group,) = _consent_groups(cc / ".claude" / "settings.json")
+    (group,) = _consent_groups(cc / ".claude" / "settings.local.json")
     cmd = group["hooks"][0]["command"]
     os.rename(cc, tmp_path / "moved")
     r = subprocess.run(["/bin/sh", "-c", cmd], input="{}", capture_output=True, text=True, timeout=60)

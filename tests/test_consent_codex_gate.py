@@ -114,13 +114,14 @@ def test_with_no_key_a_codex_config_patch_is_a_plain_deny_unless_default_or_unco
     # codex r3 HIGH: benign headers in many directories whose git query blocks, then .codex/hooks.json. The gate
     # call's git budget is ONE (the description and the classification share it), a blocked query is cut at the
     # deadline and tags its header, so the patch is denied well inside Codex's hook timeout instead of running
+    from levain import host_guard
     from levain.consent.adapters import claude_code as cc
 
     fake = tmp_path / "fake-git"
     fake.write_text('#!/bin/sh\ncase "$2" in *slow*) exec /bin/sleep 5;; esac\n'
                     'echo "fatal: not a git repository (or any of the parent directories): .git" >&2\nexit 128\n')
     fake.chmod(0o755)
-    monkeypatch.setattr(cc, "_GIT_BINARY", [str(fake)])
+    monkeypatch.setattr(host_guard, "_GIT_BINARY", [str(fake)])
     headers = []
     for i in range(20):
         (tmp_path / f"slow{i}").mkdir()
