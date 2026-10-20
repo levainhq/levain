@@ -38,7 +38,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   call is counted, read-only ones too. When a session passes a limit, its next call waits and you get one ping:
   **Extend** (that limit doubles and the call goes on) or **End**. End, or no answer before the hold runs out, stops
   the session (Claude Code's turn ends; Codex has every later call refused) until you extend it, from the phone or with
-  `levain limits extend <session>`. Nothing is ever cut off silently, and the agent is told a
+  `levain limits extend <session>`, which also resumes it. Nothing is ever cut off silently, and the agent is told a
   budget you set stopped it, not a fault. The defaults sit well above a heavy day's sessions: 3,000 calls, 12 active
   hours, 15M fresh tokens, 600M cache-read tokens, one call 8 times in any 10. Change them with
   `levain limits set <limit> <value>` (per agent with `--agent`); see the counts with `levain limits show`; `levain
