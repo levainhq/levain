@@ -1442,6 +1442,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _register_webpush(subparsers)
 
+    from levain.slot.launch import register as _register_session
+
+    _register_session(subparsers)
+
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 

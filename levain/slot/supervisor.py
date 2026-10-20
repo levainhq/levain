@@ -1,0 +1,1009 @@
+"""The interactive supervisor: the operator uid's process for ONE session (CONTRACT §1 "interactive supervisor", §3.1,
+§5.1, §5.4 step 1; BUILD_PLAN §2c 5, §2c 9, §2d 5 + C5, §6).
+
+It holds two things the slot must never reach: the LEASE (the CONTROL connection, CLOEXEC, never passed to a child,
+§3.1 4) and the operator's TERMINAL (the slot's bytes reach it only through :class:`TermFilter`). In order:
+
+1. the repo layer, before any lease or staging write: ``--repo`` is a git work tree the operator owns on a named
+   branch; :func:`operator_clone` makes the §2c 5 clone (tracked files only, no shared inode, remotes and their
+   credentials stripped) into a private temp dir; :func:`repo_layer_docs` reads its ``.claude/settings.json`` +
+   ``.claude/settings.local.json`` from the commit and :func:`levain.slot.render.repo_loosening_refusals` refuses by
+   key name. The slot clones exactly the bundle made from THIS clone, so what was checked is what launches.
+2. the render blob's inputs (base-map routes, the operator's git identity), so a launch that cannot render is refused
+   before it takes a slot.
+3. ``LEASE-OPEN`` (§3.1 1), then the runtime helper through sudo: ``prepare`` (stdin ``{lease_nonce}``), the bundle
+   into the staging dir prepare returned (:func:`levain.slot.stage.make_bundle`), ``render`` (stdin the §5.3 blob),
+   ``start`` INSIDE a pty this process allocates (§2d 5), relayed both ways, then ``teardown``. A refusal at any step
+   is printed by name and, once a session exists, teardown still runs. SIGINT / SIGTERM / SIGHUP end the session the
+   same way (teardown, then the lease closes).
+
+Every helper call answers exactly one canonical JSON line (§5 preamble) that :func:`parse_helper_line` reads; ``start``
+answers on the pty after the vendor's own bytes, so :func:`start_result` reads it from the stream's tail.
+
+The firewall self-probe (§2c 9: "the launcher connects off-list AS the slot uid and refuses to start if it succeeds")
+needs the slot's uid, which only root can take, and §5.1 has no verb for it: :attr:`Seams.firewall_probe` is the
+named seam, ``None`` until a helper verb exists, and every launch says it did not run.
+"""
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import IO, Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from levain import unshowable
+from levain.contracts import ContractError, canon
+from levain.slot import Refused, layout
+from levain.slot.grammar import SESSION_RE
+from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
+
+# --- the terminal filter (BUILD_PLAN §2e 14, §6: titles pass, OSC 52 and report sequences are stripped) ---------------
+#
+# The invariant: everything the filter EMITS, the operator's terminal parses exactly as the filter did, so the terminal
+# is in its ground state between any two emissions. It emits only ground text (no ESC, no ENQ, no C1 control in either
+# form), and COMPLETE sequences it parsed and approved. Whatever it drops, the terminal never sees, so a dropped prefix
+# cannot leave the terminal mid-sequence. A UTF-8 character is emitted whole, never split across two writes.
+
+_G, _ESC, _ESC_I, _CSI, _CSI_IGN, _OSC, _OSC_ESC, _STR, _STR_ESC = range(9)
+
+ESC, BEL, CAN, SUB, ENQ = 0x1B, 0x07, 0x18, 0x1A, 0x05
+
+#: CSI requests that make the operator's terminal ANSWER into the slot: (private prefix, intermediates, final).
+_CSI_REPORTS = frozenset({
+    ("", "", "c"), (">", "", "c"), ("=", "", "c"),     # DA1, DA2, DA3
+    ("", "", "n"), ("?", "", "n"),                      # DSR, CPR, DECXCPR, the DEC private status reports
+    ("", "$", "p"), ("?", "$", "p"),                    # DECRQM (ANSI, DEC)
+    (">", "", "q"),                                     # XTVERSION
+    ("", "", "x"),                                      # DECREQTPARM
+    ("?", "", "u"),                                     # the kitty keyboard flags query
+    ("", "$", "u"), ("", "$", "w"),                     # DECRQTSR, DECRQPSR
+    ("?", "", "S"), ("?", "", "m"),                     # XTSMGRAPHICS, XTQMODKEYS
+    ("", "*", "y"),                                     # DECRQCRA (a checksum of screen contents)
+})
+#: XTWINOPS (``CSI Ps t``) with these first parameters REPORTS (window state, sizes, the icon label, the title).
+_WINOPS_REPORTS = frozenset({11, 13, 14, 15, 16, 18, 19, 20, 21})
+#: DECISION: OSC is an ALLOWLIST (fail closed: an unknown OSC is a terminal-specific feature, and some of those write
+#: the clipboard or move files, iTerm2's 1337 among them). Titles (0, 1, 2), cwd (7), hyperlinks (8), notifications
+#: (9, 777) and prompt marks (133) pass; colour SETS pass, colour QUERIES (a ``?`` field) do not.
+_OSC_PASS = frozenset({0, 1, 2, 7, 8, 9, 133, 777})
+_OSC_COLOUR = frozenset({4, 104, *range(10, 20), *range(110, 120)})
+_ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
+_CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
+_OSC_MAX = 8192       # DECISION: an OSC payload past this is discarded to its terminator, never buffered further
+_ESC_I_MAX = 8
+
+
+class TermFilter:
+    """An incremental filter over the slot's output bytes. :meth:`feed` returns what may reach the terminal now;
+    :meth:`flush` (at EOF) releases a held partial UTF-8 character and drops any unfinished sequence."""
+
+    def __init__(self) -> None:
+        self._st = _G
+        self._seq = bytearray()      # the sequence being parsed (dropped or emitted whole)
+        self._u8 = bytearray()       # a multibyte UTF-8 character still arriving
+        self._need = 0
+        self._cp = 0
+        self._taint = False          # the OSC being parsed is dropped at its terminator
+        self._over = False           # the OSC payload passed _OSC_MAX: discard to the terminator
+
+    # -- the UTF-8 layer: whole code points, or one stray byte ------------------------------------------------------
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        i, n = 0, len(data)
+        while i < n:
+            if self._st == _G and self._need == 0:
+                m = _ASCII_RUN.match(data, i)
+                if m:
+                    out += m.group()
+                    i = m.end()
+                    continue
+            self._byte(data[i], out)
+            i += 1
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        out = bytearray()
+        if self._need:
+            self._broken(out)
+        self._st, self._seq = _G, bytearray()
+        return bytes(out)
+
+    def _byte(self, b: int, out: bytearray) -> None:
+        if self._need:
+            if 0x80 <= b <= 0xBF:
+                self._u8.append(b)
+                self._cp = (self._cp << 6) | (b & 0x3F)
+                self._need -= 1
+                if self._need == 0:
+                    raw, cp = bytes(self._u8), self._cp
+                    self._u8 = bytearray()
+                    self._unit(cp, raw, out)
+                return
+            self._broken(out)
+        if b < 0x80:
+            self._unit(b, bytes((b,)), out)
+        elif 0xC2 <= b <= 0xDF:
+            self._u8, self._need, self._cp = bytearray((b,)), 1, b & 0x1F
+        elif 0xE0 <= b <= 0xEF:
+            self._u8, self._need, self._cp = bytearray((b,)), 2, b & 0x0F
+        elif 0xF0 <= b <= 0xF4:
+            self._u8, self._need, self._cp = bytearray((b,)), 3, b & 0x07
+        else:
+            self._stray(b, out)
+
+    def _broken(self, out: bytearray) -> None:
+        """A multibyte character cut short: its bytes are stray, one by one (the terminal shows U+FFFD)."""
+        held, self._u8, self._need = bytes(self._u8), bytearray(), 0
+        for x in held:
+            self._stray(x, out)
+
+    def _stray(self, b: int, out: bytearray) -> None:
+        # A raw 0x80-0x9F is an 8-bit C1 control to a terminal not decoding UTF-8: dropped. Any other stray byte is
+        # text (the terminal draws U+FFFD), so it is a text unit in ground and taints whatever sequence it lands in.
+        if 0x80 <= b <= 0x9F:
+            return
+        self._unit(-1, bytes((b,)), out)
+
+    # -- the sequence layer -----------------------------------------------------------------------------------------
+
+    def _unit(self, cp: int, raw: bytes, out: bytearray) -> None:
+        if 0x80 <= cp <= 0x9F:
+            return                    # a C1 control as a code point: dropped in every state (never a string end)
+        st = self._st
+        if st == _G:
+            if cp == ESC:
+                self._st, self._seq = _ESC, bytearray(raw)
+            elif cp != ENQ:           # ENQ asks for the answerback string
+                out += raw
+        elif st == _ESC:
+            self._esc(cp, raw, out)
+        elif st == _ESC_I:
+            if 0x20 <= cp <= 0x2F and len(self._seq) < _ESC_I_MAX:
+                self._seq += raw
+            elif 0x30 <= cp <= 0x7E:
+                out += self._seq + raw
+                self._ground()
+            else:
+                self._abort(cp, raw, out)
+        elif st in (_CSI, _CSI_IGN):
+            self._csi(cp, raw, out)
+        elif st in (_OSC, _OSC_ESC):
+            self._osc(cp, raw, out)
+        else:
+            self._string(cp, raw, out)
+
+    def _ground(self) -> None:
+        self._st, self._seq = _G, bytearray()
+
+    def _abort(self, cp: int, raw: bytes, out: bytearray) -> None:
+        """The sequence so far is dropped; ESC starts a new one, CAN / SUB cancel, anything else is ground again."""
+        self._ground()
+        if cp in (CAN, SUB):
+            return
+        self._unit(cp, raw, out)
+
+    def _esc(self, cp: int, raw: bytes, out: bytearray) -> None:
+        if cp == 0x5B:                                  # [
+            self._st, self._seq = _CSI, bytearray(b"\x1b[")
+        elif cp == 0x5D:                                # ]
+            self._st, self._seq, self._taint, self._over = _OSC, bytearray(b"\x1b]"), False, False
+        elif cp in (0x50, 0x58, 0x5E, 0x5F):            # DCS (DECRQSS, XTGETTCAP, DECUDK, tmux passthrough), SOS, PM, APC
+            self._st, self._seq = _STR, bytearray()
+        elif 0x20 <= cp <= 0x2F:
+            self._st = _ESC_I
+            self._seq += raw
+        elif 0x30 <= cp <= 0x7E:
+            if cp != 0x5A:                              # ESC Z = DECID, the old DA request
+                out += self._seq + raw
+            self._ground()
+        else:
+            self._abort(cp, raw, out)
+
+    def _csi(self, cp: int, raw: bytes, out: bytearray) -> None:
+        if 0x40 <= cp <= 0x7E:
+            seq = bytes(self._seq) + raw
+            keep = self._st == _CSI and not _csi_is_report(seq)
+            self._ground()
+            if keep:
+                out += seq
+            return
+        if not 0x20 <= cp <= 0x3F:
+            self._abort(cp, raw, out)
+            return
+        if self._st == _CSI_IGN:
+            return
+        self._seq += raw
+        body = bytes(self._seq[2:])
+        if len(self._seq) > _CSI_MAX or not _csi_shape(body):
+            self._st = _CSI_IGN                         # malformed: consumed to its final byte and dropped
+
+    def _osc(self, cp: int, raw: bytes, out: bytearray) -> None:
+        if self._st == _OSC_ESC:
+            if cp == 0x5C:                              # ESC \ = ST
+                self._osc_end(b"\x1b\\", out)
+            else:
+                self._ground()
+                self._unit(ESC, b"\x1b", out)
+                self._unit(cp, raw, out)
+            return
+        if cp == BEL:
+            self._osc_end(b"\x07", out)
+        elif cp == ESC:
+            self._st = _OSC_ESC
+        elif cp in (CAN, SUB):
+            self._ground()
+        else:
+            if cp < 0x20 or cp == 0x7F or cp < 0:
+                self._taint = True                      # DECISION: a control or a broken byte in the payload
+            if self._over:
+                return
+            if len(self._seq) + len(raw) > _OSC_MAX:
+                self._over = self._taint = True
+                self._seq = bytearray(b"\x1b]")
+                return
+            self._seq += raw
+
+    def _osc_end(self, term: bytes, out: bytearray) -> None:
+        seq, keep = bytes(self._seq), not self._taint and _osc_allowed(bytes(self._seq[2:]))
+        self._ground()
+        if keep:
+            out += seq + term
+
+    def _string(self, cp: int, raw: bytes, out: bytearray) -> None:
+        """DCS / SOS / PM / APC: every byte dropped as it arrives (nothing buffered), to ST."""
+        if self._st == _STR_ESC:
+            if cp == 0x5C:
+                self._ground()
+            else:
+                self._st = _STR
+                if cp == ESC:
+                    self._st = _STR_ESC
+            return
+        if cp == ESC:
+            self._st = _STR_ESC
+        elif cp in (CAN, SUB):
+            self._ground()
+
+
+def _csi_shape(body: bytes) -> bool:
+    """A CSI body so far: an optional private marker FIRST, then parameter bytes, then intermediates."""
+    seen_inter = False
+    for k, b in enumerate(body):
+        if 0x20 <= b <= 0x2F:
+            seen_inter = True
+        elif seen_inter:
+            return False
+        elif b in b"<=>?" and k != 0:
+            return False
+    return True
+
+
+def _csi_is_report(seq: bytes) -> bool:
+    body, final = seq[2:-1], chr(seq[-1])
+    prefix = chr(body[0]) if body[:1] in (b"<", b"=", b">", b"?") else ""
+    rest = body[1:] if prefix else body
+    inter = bytes(b for b in rest if 0x20 <= b <= 0x2F).decode("ascii")
+    params = bytes(b for b in rest if 0x30 <= b <= 0x3F).decode("ascii")
+    if (prefix, inter, final) in _CSI_REPORTS:
+        return True
+    if (prefix, inter, final) == ("", "", "t"):
+        first = params.split(";")[0].split(":")[0]
+        return (int(first) if first.isdigit() else 0) in _WINOPS_REPORTS
+    return False
+
+
+def _osc_allowed(payload: bytes) -> bool:
+    num, _, rest = payload.partition(b";")
+    if not num.isdigit() or len(num) > 5:
+        return False
+    n = int(num)
+    if n in _OSC_PASS:
+        return True
+    if n in _OSC_COLOUR:
+        return b"?" not in rest.split(b";")
+    return False
+
+
+# --- spawning: the lease fd never reaches a child (§3.1 4) ------------------------------------------------------------
+
+def _take_ctty() -> None:   # pragma: no cover - runs in the forked child, between fork and exec
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def spawn(argv: Sequence[str], *, stdin: Any, stdout: Any, stderr: Any, lease_fds: Collection[int],
+          ctty: bool = False, env: Optional[Mapping[str, str]] = None) -> "subprocess.Popen[bytes]":
+    """Every child gets EXACTLY fds 0, 1, 2 (``close_fds`` with no ``pass_fds``; for ``start`` those three are its pty
+    slave) in its own session (``ctty``: the slave becomes its controlling terminal, so sudo's ``use_pty`` sees a
+    terminal). Refused before any fork when a lease fd would be one of the three or could be inherited."""
+    for fd in lease_fds:
+        if fd in (stdin, stdout, stderr):
+            raise Refused("lease-fd-to-child", f"fd {fd}")
+        if os.get_inheritable(fd):
+            raise Refused("lease-fd-inheritable", f"fd {fd}")
+    return subprocess.Popen(list(argv), stdin=stdin, stdout=stdout, stderr=stderr, close_fds=True, pass_fds=(),
+                            start_new_session=True, preexec_fn=_take_ctty if ctty else None,
+                            env=None if env is None else dict(env))
+
+
+# --- the helper's answers (§5 preamble: one canonical JSON line) -----------------------------------------------------
+
+def _answer(line: bytes, verb: str) -> Dict[str, object]:
+    try:
+        obj = canon.parse(line)
+    except ContractError:
+        raise Refused("helper-output-malformed", verb) from None
+    if type(obj) is not dict or canon.canonical_bytes(obj) != line:
+        raise Refused("helper-output-malformed", verb)
+    if obj.get("ok") is True:
+        return {k: v for k, v in obj.items() if k != "ok"}
+    if obj.get("ok") is False and set(obj) == {"ok", "refused"} and type(obj["refused"]) is str:
+        raise Refused(obj["refused"], f"runtime helper {verb}")
+    raise Refused("helper-output-malformed", verb)
+
+
+def parse_helper_line(data: bytes, verb: str) -> Dict[str, object]:
+    """Exactly one newline-terminated canonical JSON line: ``{"ok":true,…}`` -> its fields; ``{"ok":false,"refused":
+    <name>}`` -> ``Refused(<name>)``; anything else (none, two, not canonical) -> ``helper-output-malformed``."""
+    if not data.endswith(b"\n") or data.count(b"\n") != 1:
+        raise Refused("helper-output-malformed" if data else "helper-silent", verb)
+    return _answer(data[:-1], verb)
+
+
+def start_result(tail: bytes) -> Dict[str, object]:
+    """``start``'s line, read off the END of the pty stream: it follows the vendor's last byte (which may not end
+    its own line), and the ptys between add ``\\r``. The rightmost ``{`` on the last non-empty line whose suffix is
+    one canonical object is the answer. DECISION: only the printed outcome rests on it; teardown runs either way."""
+    lines = [ln.strip() for ln in tail.replace(b"\r", b"").split(b"\n") if ln.strip()]
+    if lines:
+        last = lines[-1]
+        i = last.rfind(b"{")
+        while i >= 0:
+            try:
+                return _answer(last[i:], "start")
+            except Refused as e:
+                if e.name != "helper-output-malformed":
+                    raise
+            i = last.rfind(b"{", 0, i)
+    raise Refused("start-result-unreadable", "start")
+
+
+# --- the repo layer (§5.4 1, BUILD_PLAN §2c 5) -------------------------------------------------------------------------
+
+#: The repo-relative names CC reads as the project's settings layers (render.repo_loosening_refusals' keys).
+REPO_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
+SETTINGS_CAP = 1 << 20          # DECISION: a settings file past 1 MiB is refused malformed, never parsed
+_REGULAR = (b"100644", b"100755")
+
+
+def _git_env() -> Dict[str, str]:
+    from levain.slot.stage import _git_env as env      # the bundle's own scrubbed git environment: one definition
+
+    return env()
+
+
+def _git(argv: Sequence[str], *, git: str, run: Callable[..., subprocess.CompletedProcess], refusal: str,
+         check: bool = True) -> subprocess.CompletedProcess:
+    p = run([git, "-c", "core.hooksPath=/dev/null", *argv], env=_git_env(), capture_output=True)
+    if check and p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace") if isinstance(p.stderr, bytes) else (p.stderr or "")
+        raise Refused(refusal, f"{argv[0] if argv[0] != '-C' else argv[2]}: {err.strip()[:200]}")
+    return p
+
+
+def _out(p: subprocess.CompletedProcess) -> str:
+    return (p.stdout.decode("utf-8", "replace") if isinstance(p.stdout, bytes) else p.stdout).strip()
+
+
+def repo_toplevel(path: Path, *, uid: int, git: str = "git",
+                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+                  stat: Callable[[str], os.stat_result] = os.stat) -> Tuple[Path, str]:
+    """``--repo``'s work-tree top level and its branch. Refused ``repo-not-a-work-tree`` (bare, absent, not git),
+    ``repo-not-owned`` (the top level's owner is not the operator), ``repo-detached-head`` (DECISION: the bundle names
+    a branch, so a detached HEAD has none to launch)."""
+    if not Path(path).is_dir():
+        raise Refused("repo-not-a-work-tree", str(path)[:200])
+    p = _git(["-C", str(path), "rev-parse", "--is-inside-work-tree", "--show-toplevel"], git=git, run=run,
+             refusal="repo-not-a-work-tree", check=False)
+    lines = _out(p).splitlines()
+    if p.returncode != 0 or len(lines) != 2 or lines[0] != "true":
+        raise Refused("repo-not-a-work-tree", str(path)[:200])
+    top = Path(lines[1])
+    if stat(str(top)).st_uid != uid:
+        raise Refused("repo-not-owned", str(top)[:200])
+    b = _git(["-C", str(top), "symbolic-ref", "--quiet", "--short", "HEAD"], git=git, run=run,
+             refusal="repo-detached-head", check=False)
+    branch = _out(b)
+    if b.returncode != 0 or not branch:
+        raise Refused("repo-detached-head", str(top)[:200])
+    return top, branch
+
+
+def operator_clone(repo: Path, branch: str, dest: Path, *, git: str = "git",
+                   run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """The §2c 5 clone of ``repo``'s ``branch`` into ``dest`` (which must not exist): ``--no-local --no-hardlinks
+    --template= --single-branch`` with hooks off, so tracked files only and no inode shared with the operator's repo;
+    then its ``origin`` removed (the remote URL, with any credential in it, and the branch's upstream go with it).
+    DECISION: ``--no-checkout`` as :func:`levain.slot.stage.make_bundle`'s own clone (no work tree, so no filter,
+    fsmonitor or checkout hook of the operator's config runs). Returns the commit checked and bundled."""
+    if type(branch) is not str or not branch or branch.startswith("-"):
+        raise Refused("bad-branch", str(branch)[:64])
+    _git(["clone", "--no-local", "--no-hardlinks", "--template=", "--single-branch", "--no-checkout",
+          "--branch", branch, "--", str(repo), str(dest)], git=git, run=run, refusal="clone-failed")
+    _git(["-C", str(dest), "remote", "remove", "origin"], git=git, run=run, refusal="clone-failed")
+    return _out(_git(["-C", str(dest), "rev-parse", "--verify", "HEAD^{commit}"], git=git, run=run,
+                     refusal="clone-failed"))
+
+
+def _fold(name: str) -> str:
+    # DECISION: a case- and normalization-insensitive store (APFS by default) checks `.Claude/Settings.json` out
+    # where CC reads `.claude/settings.json`, so every spelling that folds to a settings name is checked.
+    return unicodedata.normalize("NFD", name).casefold()
+
+
+def _ls_tree(clone: Path, treeish: str, *, git: str, run: Callable[..., subprocess.CompletedProcess]
+             ) -> List[Tuple[bytes, bytes, bytes, str]]:
+    p = _git(["-C", str(clone), "ls-tree", "-z", treeish], git=git, run=run, refusal="repo-settings-malformed")
+    out = []
+    for ent in p.stdout.split(b"\0"):
+        if not ent:
+            continue
+        meta, _, name = ent.partition(b"\t")
+        mode, typ, sha = meta.split(b" ")
+        out.append((mode, typ, sha, name.decode("utf-8", "surrogateescape")))
+    return out
+
+
+def _no_dup(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def repo_layer_docs(clone: Path, *, git: str = "git",
+                    run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> Dict[str, Any]:
+    """The clone's committed settings layers, parsed: repo-relative name -> JSON value, for every tree entry whose
+    name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
+    such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
+    repeats a key (DECISION: two values for one key is refused, not resolved)."""
+    want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
+    docs: Dict[str, Any] = {}
+    for mode, typ, sha, name in _ls_tree(clone, "HEAD", git=git, run=run):
+        if _fold(name) != _fold(".claude"):
+            continue
+        if typ != b"tree":
+            raise Refused("repo-settings-malformed", f"{name}: not a directory ({mode.decode()})")
+        for m2, t2, s2, n2 in _ls_tree(clone, sha.decode(), git=git, run=run):
+            if _fold(n2) not in want:
+                continue
+            path = f"{name}/{n2}"
+            if t2 != b"blob" or m2 not in _REGULAR:
+                raise Refused("repo-settings-malformed", f"{path}: not a regular file ({m2.decode()})")
+            size = _out(_git(["-C", str(clone), "cat-file", "-s", s2.decode()], git=git, run=run,
+                             refusal="repo-settings-malformed"))
+            if not size.isdigit() or int(size) > SETTINGS_CAP:
+                raise Refused("repo-settings-malformed", f"{path}: over {SETTINGS_CAP} bytes")
+            blob = _git(["-C", str(clone), "cat-file", "blob", s2.decode()], git=git, run=run,
+                        refusal="repo-settings-malformed").stdout
+            try:
+                docs[path] = json.loads(blob.decode("utf-8"), object_pairs_hook=_no_dup)
+            except (UnicodeDecodeError, ValueError):
+                raise Refused("repo-settings-malformed", f"{path}: not JSON") from None
+    return docs
+
+
+def check_repo_layer(docs: Mapping[str, Any]) -> None:
+    from levain.slot.render import repo_loosening_refusals
+
+    bad = repo_loosening_refusals(docs)
+    if bad:
+        raise bad[0]
+
+
+# --- the render blob's inputs (§5.3) ---------------------------------------------------------------------------------
+
+#: DECISION: §4.3's route policy carries no vendor, and the base map holds every vendor's brokered and passthrough
+#: routes, so a route belongs to a vendor when one of its hosts (``hosts`` + ``upstream.host``) is that vendor's.
+VENDOR_HOSTS: Mapping[str, frozenset] = {
+    "claude": frozenset({"api.anthropic.com", "console.anthropic.com", "claude.ai", "platform.claude.com"}),
+    "codex": frozenset({"api.openai.com", "auth.openai.com", "chatgpt.com"}),
+}
+_AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
+
+
+def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes) -> List[Mapping[str, Any]]:
+    try:
+        raw = read(path)
+    except OSError as e:
+        raise Refused("base-map-unreadable", f"{path}: {e.strerror or e}") from None
+    try:
+        obj = canon.parse(raw)
+    except ContractError:
+        raise Refused("base-map-malformed", str(path)) from None
+    if type(obj) is not dict or obj.get("format") != layout.BASE_ROUTES_FORMAT or type(obj.get("routes")) is not list:
+        raise Refused("base-map-malformed", str(path))
+    return [r for r in obj["routes"] if type(r) is dict]
+
+
+def _hosts(route: Mapping[str, Any]) -> set:
+    hs = {h for h in route.get("hosts", ()) if type(h) is str} if type(route.get("hosts")) is list else set()
+    up = route.get("upstream")
+    if type(up) is dict and type(up.get("host")) is str:
+        hs.add(up["host"])
+    return hs
+
+
+def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tuple[str, ...]:
+    """Every ``egress`` route of the base map (the git hosts and registries) plus EXACTLY ONE route of the auth's
+    type for this vendor (§5.3: ≤ 1 brokered + ≤ 1 passthrough per vendor; render refuses a brokered session without
+    its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name."""
+    need = _AUTH_ROUTE[auth]
+    egress = [r["route"] for r in base if r.get("type") == "egress" and type(r.get("route")) is str]
+    mine = [r["route"] for r in base if r.get("type") == need and type(r.get("route")) is str
+            and _hosts(r) & VENDOR_HOSTS[vendor]]
+    if not mine:
+        raise Refused(f"no-route:{auth}", f"{vendor}: the base map has no {need} route")
+    if len(mine) > 1:
+        raise Refused(f"route-ambiguous:{auth}", f"{vendor}: {', '.join(sorted(mine))}")
+    return tuple(sorted(set(egress))) + (mine[0],)
+
+
+def git_identity(repo: Path, *, git: str = "git",
+                 run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> Optional[Dict[str, str]]:
+    """The operator's own ``user.name`` / ``user.email`` as git resolves them for ``repo`` (DECISION: repo-local
+    config included: it is his file). ``None`` when either is unset (the slot then has no identity to commit with)."""
+    vals = []
+    for key in ("user.name", "user.email"):
+        p = _git(["-C", str(repo), "config", "--get", key], git=git, run=run, refusal="git-identity", check=False)
+        if p.returncode != 0 or not _out(p):
+            return None
+        vals.append(_out(p))
+    return {"name": vals[0], "email": vals[1]}
+
+
+#: DECISION: no hook in a session-2 render: the runtime helper holds no hook templates yet (``Seams.hook_templates``
+#: is empty), so naming one is refused ``hook-template-missing``, and Codex hooks are refused ``hooks-not-wired``.
+HOOKS_BY_AUTH: Mapping[str, Tuple[str, ...]] = {"brokered": (), "passthrough": ()}
+
+
+def render_blob(vendor: str, auth: str, routes: Sequence[str], identity: Optional[Mapping[str, str]],
+                label: Optional[str]) -> bytes:
+    """The §5.3 blob as canonical bytes, checked by the helper's own grammar before it is sent. A ``repo_label`` the
+    grammar refuses is dropped (DECISION: it is display only); a git identity it refuses is ``git-identity-invalid``."""
+    blob: Dict[str, object] = {"format": RENDER_FORMAT, "vendor": vendor, "routes": list(routes),
+                               "hooks": list(HOOKS_BY_AUTH[auth])}
+    if identity is not None:
+        blob["git_identity"] = dict(identity)
+        try:
+            parse_stdin("render", canon.canonical_bytes(blob))
+        except Refused:
+            raise Refused("git-identity-invalid", "git config user.name / user.email") from None
+    if label is not None:
+        try:
+            parse_stdin("render", canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": vendor, "routes": [],
+                                                         "repo_label": label}))
+            blob["repo_label"] = label
+        except Refused:
+            pass
+    data = canon.canonical_bytes(blob)
+    parse_stdin("render", data)
+    return data
+
+
+# --- the session ----------------------------------------------------------------------------------------------------
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+_INPUT_MAX = 1 << 20       # DECISION: operator input buffered ahead of the pty; past this, his stdin waits
+START_GRACE_S = 10.0       # DECISION: after teardown, how long `start` gets to return before it is signalled
+
+
+def _host() -> str:
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    raise Refused("unsupported-host", sys.platform)
+
+
+@dataclass(frozen=True)
+class Request:
+    vendor: str                  # claude | codex
+    repo: Path
+    auth: str = "brokered"       # brokered | passthrough
+    kind: str = "interactive"    # interactive | login
+    slot: Optional[int] = None
+
+
+@dataclass
+class Seams:
+    """Every act with a real default. ``helper`` is the argv prefix the verbs follow (tests run a fake helper script
+    there, no sudo); ``firewall_probe(session)`` is §2c 9's seam (``None``: no helper verb exists, said at launch)."""
+
+    host: str = field(default_factory=_host)
+    helper: Optional[Sequence[str]] = None
+    client_factory: Optional[Callable[[Path], Any]] = None
+    control_socket: Optional[Path] = None
+    store: Optional[Path] = None
+    base_map: Optional[Path] = None
+    git: str = "git"
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run
+    spawn: Callable[..., "subprocess.Popen[bytes]"] = spawn
+    openpty: Callable[[], Tuple[int, int]] = os.openpty
+    stdin: int = 0
+    stdout: int = 1
+    err: Optional[IO[str]] = None
+    uid: Callable[[], int] = os.getuid
+    env: Optional[Mapping[str, str]] = None
+    firewall_probe: Optional[Callable[[str], None]] = None
+    tmp_parent: Optional[Path] = None
+    start_grace_s: float = START_GRACE_S
+
+    def __post_init__(self) -> None:
+        if self.helper is None:
+            self.helper = ("sudo", "-n", str(layout.runtime_helper_path(self.host)))   # type: ignore[arg-type]
+        if self.control_socket is None:
+            self.control_socket = layout.RUN[self.host] / "control" / "control.sock"   # type: ignore[index]
+        if self.store is None:
+            self.store = layout.STORE[self.host]                                        # type: ignore[index]
+        if self.base_map is None:
+            self.base_map = layout.base_routes_path(self.host)                          # type: ignore[arg-type]
+        if self.client_factory is None:
+            from levain.slot.control_client import ControlClient
+
+            self.client_factory = ControlClient
+
+
+class Supervisor:
+    def __init__(self, req: Request, seams: Optional[Seams] = None) -> None:
+        self.req = req
+        self.s = seams or Seams()
+        self.err = self.s.err or sys.stderr
+        self.lease: Any = None
+        self.session: Optional[str] = None
+        self.stop_signal: Optional[int] = None
+        self._wake_r = self._wake_w = -1
+        self._old: Dict[int, Any] = {}
+        self._proc: Optional["subprocess.Popen[bytes]"] = None
+        self._master = self._slave = -1
+
+    # -- small ------------------------------------------------------------------------------------------------------
+
+    def say(self, msg: str) -> None:
+        self.err.write("levain: " + unshowable.mark(msg, allow="") + "\n")
+        self.err.flush()
+
+    def _lease_fds(self) -> Tuple[int, ...]:
+        return (self.lease.fileno(),) if self.lease is not None else ()
+
+    def _check(self) -> None:
+        if self.stop_signal is not None:
+            raise Refused("stopped", signal.Signals(self.stop_signal).name)
+
+    def helper(self, *args: str, stdin: bytes = b"") -> Dict[str, object]:
+        """One verb off the pty: stdin and stdout are pipes, stderr is read and shown escaped (root's refusal detail
+        may quote a slot-made name)."""
+        argv = [*self.s.helper, *args]                                                  # type: ignore[misc]
+        p = self.s.spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         lease_fds=self._lease_fds(), env=self.s.env)
+        out, err = p.communicate(stdin)
+        for line in err.decode("utf-8", "replace").splitlines()[-5:]:
+            if line.strip():
+                self.say("  " + line.strip())
+        return parse_helper_line(out, args[0])
+
+    # -- signals ----------------------------------------------------------------------------------------------------
+
+    def _on_stop(self, signum: int, _frame: object) -> None:
+        if self.stop_signal is None:
+            self.stop_signal = signum
+        self._poke()
+
+    def _on_winch(self, _signum: int, _frame: object) -> None:
+        self._poke(b"w")
+
+    def _poke(self, b: bytes = b"s") -> None:
+        if self._wake_w >= 0:
+            try:
+                os.write(self._wake_w, b)
+            except OSError:
+                pass
+
+    def _install(self) -> None:
+        self._wake_r, self._wake_w = os.pipe()
+        for fd in (self._wake_r, self._wake_w):
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        for sig in STOP_SIGNALS:
+            self._old[sig] = signal.signal(sig, self._on_stop)
+        self._old[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, self._on_winch)
+
+    def _restore(self) -> None:
+        for sig, h in self._old.items():
+            signal.signal(sig, h)
+        self._old.clear()
+        for fd in (self._wake_r, self._wake_w):
+            if fd >= 0:
+                os.close(fd)
+        self._wake_r = self._wake_w = -1
+
+    # -- the run ------------------------------------------------------------------------------------------------------
+
+    def run(self) -> int:
+        self._install()
+        tmp = None
+        try:
+            if self.s.uid() == 0:
+                raise Refused("supervisor-is-root", "run `levain session` as yourself; it asks sudo for the helper")
+            top, branch = repo_toplevel(self.req.repo, uid=self.s.uid(), git=self.s.git, run=self.s.run)
+            tmp = Path(tempfile.mkdtemp(prefix="levain-session-", dir=self.s.tmp_parent))
+            clone = tmp / "clone"
+            commit = operator_clone(top, branch, clone, git=self.s.git, run=self.s.run)
+            check_repo_layer(repo_layer_docs(clone, git=self.s.git, run=self.s.run))
+            routes = pick_routes(read_base_map(self.s.base_map), self.req.vendor, self.req.auth)   # type: ignore[arg-type]
+            identity = git_identity(top, git=self.s.git, run=self.s.run)
+            if identity is None:
+                self.say("no git user.name / user.email for this repo: the session cannot commit as you")
+            blob = render_blob(self.req.vendor, self.req.auth, routes, identity, top.name)
+            self._check()
+            self.say(f"{self.req.vendor} on {top} ({branch} at {commit[:12]})")
+            return self._leased(clone, branch, blob)
+        except Refused as e:
+            self.say(f"refused {e.name}" + (f": {e.detail}" if e.detail else ""))
+            return 1
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+            if self.lease is not None:
+                self.lease.close()
+                self.lease = None
+            self._restore()
+
+    def _leased(self, clone: Path, branch: str, blob: bytes) -> int:
+        self.lease = self.s.client_factory(self.s.control_socket)                       # type: ignore[misc]
+        if os.get_inheritable(self.lease.fileno()):
+            raise Refused("lease-fd-inheritable", "the CONTROL connection")
+        nonce = self.lease.open_lease()
+        self._check()
+        args = ["prepare", "egress", self.req.kind, self.req.vendor, self.req.auth]
+        if self.req.slot is not None:
+            args.append(str(self.req.slot))
+        prep = self.helper(*args, stdin=canon.canonical_bytes({"lease_nonce": nonce}))
+        session = prep.get("session")
+        if type(session) is not str or not SESSION_RE.fullmatch(session):
+            raise Refused("prepare-answer-malformed", "session")
+        self.session = session
+        ok = False
+        try:
+            staging = self.s.store / "staging" / session                                 # type: ignore[operator]
+            if prep.get("staging") != str(staging):
+                raise Refused("prepare-answer-malformed", "staging")
+            slot = prep.get("slot")
+            self.say(f"session {session} on slot {slot.get('index') if type(slot) is dict else '?'}")
+            self._check()
+            from levain.slot.stage import make_bundle
+
+            make_bundle(clone, branch, staging / "repo.bundle", git=self.s.git, run=self.s.run,
+                        tmp_parent=self.s.tmp_parent)
+            self._check()
+            self.helper("render", session, stdin=blob)
+            self._check()
+            if self.s.firewall_probe is None:
+                self.say("firewall self-probe not run: the runtime helper has no verb for it yet (BUILD_PLAN §2c 9)")
+            else:
+                self.s.firewall_probe(session)
+            self._check()
+            ok = self._start(session)
+        except Refused as e:
+            self.say(f"refused {e.name}" + (f": {e.detail}" if e.detail else ""))
+        finally:
+            # Teardown runs while the pty master is still open: closing it first would hang up `start` (sudo relays
+            # the SIGHUP) before END has frozen the slot. Only then does `start` get its grace, and the master close.
+            ok = self._teardown(session) and ok
+            self._end_start()
+        return 0 if ok and self.stop_signal is None else 1
+
+    def _teardown(self, session: str) -> bool:
+        try:
+            out = self.helper("teardown", session)
+        except Refused as e:
+            self.say(f"teardown refused {e.name}: session {session} stays leased; nothing in it was removed")
+            return False
+        state = out.get("state")
+        if state == "RETAINED":
+            where = self.s.store / "retained" / session / "tree"                         # type: ignore[operator]
+            self.say(f"session {session} ended RETAINED: the work is kept at {where}")
+            return True
+        live = self.s.store / "live" / session                                           # type: ignore[operator]
+        self.say(f"session {session} ended {state}: a step did not prove, the slot stays leased and the work stays "
+                 f"in {live}")
+        return False
+
+    # -- start inside the pty (§2d 5) --------------------------------------------------------------------------------
+
+    def _start(self, session: str) -> bool:
+        """``start`` with its stdio = a pty slave this process allocated (§2d 5, C5), relayed until the vendor exits
+        or a stop signal. The master and the process are left to :meth:`_end_start`, after teardown."""
+        master, slave = self.s.openpty()
+        # The supervisor keeps its own slave copy open until after teardown: macOS discards a pty's unread bytes
+        # once the last slave closes, which would take `start`'s answer line with it. The relay ends on the
+        # helper's exit with the master drained, never on the slave's EOF.
+        self._master, self._slave = master, slave
+        tty_in = os.isatty(self.s.stdin)
+        saved = None
+        try:
+            if tty_in:
+                try:
+                    termios.tcsetattr(slave, termios.TCSANOW, termios.tcgetattr(self.s.stdin))
+                except termios.error:
+                    pass
+            self._winsize(master)
+            proc = self.s.spawn([*self.s.helper, "start", session], stdin=slave, stdout=slave,  # type: ignore[misc]
+                                stderr=slave, lease_fds=self._lease_fds(), ctty=True, env=self.s.env)
+            self._proc = proc
+            if tty_in:
+                saved = termios.tcgetattr(self.s.stdin)
+                tty.setraw(self.s.stdin)
+            tail = self._relay(master, proc)
+        finally:
+            if saved is not None:
+                termios.tcsetattr(self.s.stdin, termios.TCSAFLUSH, saved)
+        if self.stop_signal is not None:
+            self.say(f"{signal.Signals(self.stop_signal).name}: ending session {session}")
+            return False
+        code = proc.wait()
+        try:
+            res = start_result(tail)
+        except Refused as e:
+            self.say(f"start refused {e.name}")
+            return False
+        self.say(f"{self.req.vendor} exited {res.get('exit')}" + ("" if code == 0 else f" (helper exit {code})"))
+        return code == 0
+
+    def _winsize(self, master: int) -> None:
+        if not os.isatty(self.s.stdin):
+            return
+        try:
+            ws = fcntl.ioctl(self.s.stdin, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+
+    def _write(self, fd: int, data: bytes) -> bool:
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(fd, view)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                select.select([], [fd], [], 1.0)
+                continue
+            except OSError:
+                return False
+            view = view[n:]
+        return True
+
+    def _relay(self, master: int, proc: "subprocess.Popen[bytes]") -> bytes:
+        """operator stdin -> pty master; pty master -> :class:`TermFilter` -> operator stdout. Ends when the helper
+        exited and the master is drained (or the master reads EOF / EIO), or on a stop signal. Returns the stream's
+        raw tail (where ``start``'s line is)."""
+        filt = TermFilter()
+        tail = bytearray()
+        stdin_open, out_open = True, True
+        pending = bytearray()      # operator input the pty has not taken yet
+        # The master is non-blocking and the operator's input is buffered: a blocking write of a large paste would
+        # wait on the vendor while the vendor waits on us to read its output (Node writes a TTY synchronously).
+        os.set_blocking(master, False)
+        while self.stop_signal is None:
+            rl = [master, self._wake_r] + ([self.s.stdin] if stdin_open and len(pending) < _INPUT_MAX else [])
+            try:
+                ready, writable, _ = select.select(rl, [master] if pending else [], [], 0.5)
+            except InterruptedError:
+                continue
+            if self._wake_r in ready:
+                try:
+                    pokes = os.read(self._wake_r, 64)
+                except BlockingIOError:
+                    pokes = b""
+                if b"w" in pokes:
+                    self._winsize(master)
+            if master in writable and pending:
+                try:
+                    del pending[:os.write(master, pending)]
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    pending.clear()
+                    stdin_open = False
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except BlockingIOError:
+                    data = None
+                except OSError as e:
+                    if e.errno != errno.EIO:
+                        raise
+                    data = b""
+                if data == b"":
+                    break
+                if data:
+                    tail = (tail + data)[-8192:]
+                    if out_open:
+                        out_open = self._write(self.s.stdout, filt.feed(data))
+            if stdin_open and self.s.stdin in ready:
+                try:
+                    data = os.read(self.s.stdin, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    pending += data
+                else:
+                    stdin_open = False
+            if not ready and not writable and proc.poll() is not None:
+                break
+        if out_open:
+            self._write(self.s.stdout, filt.flush())
+        return bytes(tail)
+
+    def _end_start(self) -> None:
+        """After teardown: teardown ended the vendor (END freezes and kills the slot's processes), so ``start``
+        returns on its own; the master is drained (never shown) meanwhile so a full pty cannot block it, and it is
+        signalled only if it outlives :attr:`Seams.start_grace_s`. Then the master closes."""
+        proc, master, slave = self._proc, self._master, self._slave
+        self._proc, self._master, self._slave = None, -1, -1
+        try:
+            deadline = time.monotonic() + self.s.start_grace_s
+            signalled = False
+            while proc is not None and proc.poll() is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    if signalled:
+                        self.say("start did not exit after teardown")
+                        break
+                    proc.terminate()
+                    signalled, deadline = True, time.monotonic() + self.s.start_grace_s
+                    continue
+                if master < 0:
+                    try:
+                        proc.wait(timeout=min(0.2, left))
+                    except subprocess.TimeoutExpired:
+                        pass
+                elif select.select([master], [], [], min(0.2, left))[0]:
+                    try:
+                        data = os.read(master, 65536)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        data = b""
+                    if not data:
+                        os.close(master)
+                        master = -1
+        finally:
+            for fd in (slave, master):
+                if fd >= 0:
+                    os.close(fd)
+
+
+def run_session(req: Request, seams: Optional[Seams] = None) -> int:
+    return Supervisor(req, seams).run()
+
+
+__all__ = ["HOOKS_BY_AUTH", "REPO_SETTINGS", "Request", "STOP_SIGNALS", "Seams", "Supervisor", "TermFilter",
+           "VENDOR_HOSTS", "check_repo_layer", "git_identity", "operator_clone", "parse_helper_line", "pick_routes",
+           "read_base_map", "render_blob", "repo_layer_docs", "repo_toplevel", "run_session", "spawn",
+           "start_result"]
