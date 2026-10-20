@@ -36,8 +36,8 @@ it returns but ``"T2"``/``"T3"``, and any exception from it, refuses the land.
 
 Known edge (F11 §8): until S1 places principals, every actor is the operator's uid, so a planner can merge a staged
 ref itself and skip all of this; F11 is the path Levain records, not a boundary, until then. Known edge (F11 §10): the
-contract's expiry and a ``max_age_hours`` criterion are judged at the land's one stamp, taken before the floor, so a land
-that straddles the bound by its own duration authorises once. Stdlib only.
+contract's expiry and a ``max_age_hours`` criterion are judged at the land's one stamp, taken before the floor, so a
+land that straddles the bound by its own duration authorises once. Stdlib only.
 """
 from __future__ import annotations
 
