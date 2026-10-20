@@ -57,6 +57,12 @@ STAGE_EXIT = 121
 
 #: DECISION: the fd the spec pipe's read end sits on in the stage. Closed before the target's exec.
 SPEC_FD = 3
+#: DECISION: the fd ``start``'s "exec happened" pipe (§5.1 start) sits on through the launch hops: the stage keeps
+#: it, marks it close-on-exec just before it execs the target (so its EOF at the helper = the target's exec) and
+#: writes one byte to it on any refusal (EOF with no byte = exec happened). Never one of the target's fds.
+EXEC_FD = 4
+#: DECISION: the front's fixed argv from root (lane F3 b): at most this many strings of at most 4 KiB, no NUL.
+_FRONT_ARGS = 16
 
 SPEC_CAP = 64 * 1024
 ENV_CAP = 64 * 1024
@@ -148,6 +154,7 @@ class Spec:
     argv: Tuple[str, ...]
     resolve: bool
     keep_fds: Tuple[int, ...]
+    exec_fd: Optional[int] = None
 
     def to_json(self) -> bytes:
         from levain.contracts import canon
@@ -156,11 +163,12 @@ class Spec:
             "format": SPEC_FORMAT, "target": self.target, "uid": self.uid, "gid": self.gid,
             "groups": list(self.groups), "nproc": self.nproc, "env_file": self.env_file,
             "extra_env": dict(self.extra_env), "profile": self.profile, "cwd": self.cwd,
-            "argv": list(self.argv), "resolve": self.resolve, "keep_fds": list(self.keep_fds)})
+            "argv": list(self.argv), "resolve": self.resolve, "keep_fds": list(self.keep_fds),
+            "exec_fd": self.exec_fd})
 
 
 _SPEC_KEYS = frozenset({"format", "target", "uid", "gid", "groups", "nproc", "env_file", "extra_env", "profile",
-                        "cwd", "argv", "resolve", "keep_fds"})
+                        "cwd", "argv", "resolve", "keep_fds", "exec_fd"})
 
 
 def _is_int(v: object) -> bool:
@@ -204,6 +212,8 @@ def _check_spec(s: Spec) -> None:
         raise Refused("spec-malformed", f"keep_fds {list(s.keep_fds)!r}")
     if len(s.keep_fds) > (1 if s.target in _ONE_EXTRA_FD else 0):
         raise Refused("fd-off-list", f"{s.target} keeps {list(s.keep_fds)!r}")
+    if s.exec_fd is not None and (s.exec_fd != EXEC_FD or s.target != "vendor" or s.exec_fd in s.keep_fds):
+        raise Refused("spec-malformed", f"exec_fd {s.exec_fd!r}: only the vendor's, on {EXEC_FD}, never kept")
 
 
 def parse_spec(data: bytes) -> Spec:
@@ -224,7 +234,7 @@ def parse_spec(data: bytes) -> Spec:
         raise Refused("spec-malformed", "types")
     s = Spec(obj["target"], obj["uid"], obj["gid"], tuple(obj["groups"]), obj["nproc"], obj["env_file"],
              tuple(sorted(obj["extra_env"].items())), obj["profile"], obj["cwd"], tuple(obj["argv"]),
-             obj["resolve"], tuple(obj["keep_fds"]))
+             obj["resolve"], tuple(obj["keep_fds"]), obj["exec_fd"])
     _check_spec(s)
     return s
 
@@ -273,7 +283,7 @@ def _check_step_argv(argv: Sequence[str]) -> None:
 def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str, int], shared: Mapping[str, int],
                 argv: Sequence[str] = (), env_file: Optional[str] = None, profile: Optional[str] = None,
                 extra_env: Optional[Mapping[str, str]] = None, keep_fds: Iterable[int] = (),
-                front_module: Optional[str] = None) -> Spec:
+                front_module: Optional[str] = None, exec_fd: Optional[int] = None) -> Spec:
     """The stage's spec for ``target`` of ``slot``'s ``session``. Every path is derived from the session id
     (§5: no argv token or stdin field is a path); ``env_file`` / ``profile`` may only name a file in the
     rendered layer ``<S>/root/`` (lane B renders them; this module takes their paths, never their text).
@@ -286,7 +296,10 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
       is child 0700, unreadable to it by design (§5.6 step 3).
     * ``forwarder`` (Linux): Levain's TCP->unix relay, cwd ``<S>/tmp``.
     * ``front``: drop + assert only (§8.2 last sentence): no profile, no ``RLIMIT_NPROC`` (V3 is per SLOT),
-      no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe).
+      no env file; its env is ``extra_env`` alone, cwd ``/``, one extra fd (the GO pipe). ``argv`` is the front
+      module's FIXED arguments, root's (never slot-supplied), appended after the module.
+
+    ``exec_fd`` (vendor only): :data:`EXEC_FD`, ``start``'s exec-happened pipe (see the constant).
     """
     from levain.slot.layout import IMPORT_TREE, RUN
     from levain.slot.root_tree import ROOT_PYTHON, VENDOR_PREFIX
@@ -327,9 +340,11 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
         argv = module_argv(host, "levain.slot.forwarder", "--port", str(FORWARDER_PORT), "--unix", str(sock))
         cwd = S / "tmp"
     else:   # front
-        if argv:
-            raise Refused("spec-malformed", "the front's argv is its module's")
-        argv = module_argv(host, front_module or "")
+        if len(argv) > _FRONT_ARGS or not all(
+                isinstance(a, str) and "\x00" not in a and len(a.encode("utf-8", "surrogatepass")) <= _STEP_ARG_BYTES
+                for a in argv):
+            raise Refused("spec-malformed", f"the front's fixed argv: <= {_FRONT_ARGS} strings of <= 4 KiB, no NUL")
+        argv = module_argv(host, front_module or "", *argv)
         cwd = PurePosixPath("/")
 
     slot_target = target != "front"
@@ -345,7 +360,7 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     elif profile is not None:
         raise Refused("spec-malformed", f"{host} {target}: no profile on this path")
     spec = Spec(target, who.uid, who.gid, who.groups, NPROC if slot_target else None, env_file,
-                tuple(sorted((extra_env or {}).items())), profile, str(cwd), argv, resolve, tuple(keep_fds))
+                tuple(sorted((extra_env or {}).items())), profile, str(cwd), argv, resolve, tuple(keep_fds), exec_fd)
     _check_spec(spec)
     return spec
 
@@ -833,6 +848,7 @@ class OsCalls:
     list_fds: Callable = _list_fds
     close: Callable = os.close
     set_inheritable: Callable = os.set_inheritable
+    write_fd: Callable = os.write
     access_x: Callable = _access_x
     execve: Callable = os.execve
     dup2: Callable = os.dup2
@@ -967,6 +983,7 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
     Returns :data:`STAGE_EXIT` on any refusal or error, having exec'd nothing; a real ``execve`` never
     returns."""
     c = os_calls or real_os_calls()
+    spec = None
     try:
         spec = parse_spec(c.read_fd(spec_fd, SPEC_CAP))
         drop_and_assert(spec.uid, spec.gid, spec.groups, nproc=spec.nproc, os_calls=c)
@@ -988,16 +1005,33 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
         path = _resolve(argv[0], env, c) if spec.resolve else argv[0]
         if spec.profile is not None:
             path, argv = SANDBOX_EXEC, [SANDBOX_EXEC, "-f", spec.profile, path] + argv[1:]
-        _close_fds(frozenset({0, 1, 2}) | frozenset(spec.keep_fds), c)
+        exec_keep = frozenset() if spec.exec_fd is None else frozenset({spec.exec_fd})
+        _close_fds(frozenset({0, 1, 2}) | frozenset(spec.keep_fds) | exec_keep, c)
+        if spec.exec_fd is not None:
+            c.set_inheritable(spec.exec_fd, False)     # closed BY the exec: its EOF is the exec happening
         c.execve(path, argv, env)
     except Refused as e:
         _say(err, f"levain wall: refused {e.name}" + (f": {e.detail}" if e.detail else ""))
+        _exec_failed(spec, c)
         return STAGE_EXIT
     except Exception as e:   # anything unforeseen: still no exec. The type and errno only: never a value.
         code = getattr(e, "errno", None)
         _say(err, f"levain wall: refused stage-error: {type(e).__name__}" + (f" errno {code}" if code else ""))
+        _exec_failed(spec, c)
         return STAGE_EXIT
+    _exec_failed(spec, c)
     return STAGE_EXIT
+
+
+def _exec_failed(spec: Optional[Spec], c: OsCalls) -> None:
+    """One byte on the exec pipe: the helper then reads "no exec", never an EOF it would take for one. A spec
+    that never parsed names no pipe; the stage's exit closes it with no byte (a known edge: the helper reads
+    that as the exec, and the vendor's exit status says STAGE_EXIT)."""
+    if spec is not None and spec.exec_fd is not None:
+        try:
+            c.write_fd(spec.exec_fd, b"!")
+        except OSError:
+            pass
 
 
 def _say(err, line: str) -> None:
@@ -1040,7 +1074,7 @@ if __name__ == "__main__":
     os._exit(main(sys.argv[1:]))
 
 
-__all__ = ["FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
+__all__ = ["EXEC_FD", "FORWARDER_PORT", "LinuxLaunch", "NPROC", "OsCalls", "Principal", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
            "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
            "drop_and_assert", "exec_launch", "expected_slot_rules", "launch_spec", "linux_launch_argv",
            "linux_view_args", "macos_egress_ready", "macos_launch_argv", "module_argv", "parse_env", "parse_spec",

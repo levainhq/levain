@@ -6,18 +6,18 @@
 :mod:`levain.slot.runtime_grammar` and runs the verb. Every refusal is :func:`runtime_grammar.refusal_line` and a
 non-zero exit, raised before the next act: nothing after the refusing check acts.
 
-Verbs built here: ``prepare``, ``render``, ``resume``, ``status``. ``start``, ``teardown`` and ``confirm-identity``
-register in :data:`VERB_HANDLERS` from their own lane; until then (and for ``adopt-open`` / ``discard`` /
-``restore``, session 5's) a verb answers ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers
-``verb-unbuilt:ticket`` (session 2f's).
+Verbs built here: ``prepare``, ``render``, ``resume``, ``status``; ``start`` and ``teardown`` dispatch to
+:mod:`levain.slot.start`. ``confirm-identity`` (session 2f's) and ``adopt-open`` / ``discard`` / ``restore``
+(session 5's) answer ``verb-unbuilt:<verb>``. A ticketed (dispatch) ``prepare`` answers ``verb-unbuilt:ticket``
+(session 2f's).
 
 Every root filesystem act goes through a dirfd: the store root is opened once with ``O_DIRECTORY|O_NOFOLLOW`` and
 every path below it is reached one component at a time with ``O_NOFOLLOW`` (§5 preamble), so no argv token, stdin
 field or planted link names a path. Every OS act a unit test cannot do as a non-root user is a field of
 :class:`Seams` with a real default (owners are recorded, not applied, in the tests).
 
-The slot state file ``L/slots/{e,v}<n>/state`` (``levain-slot-state/1``, §3.5 Pool) is read and written here
-because ``prepare`` is its first writer built (§2.1 also names install, END, SCRUBBED and ``replenish``).
+The slot state file ``L/slots/{e,v}<n>/state`` (``levain-slot-state/1``, §3.5 Pool) has ONE definition,
+:mod:`levain.slot.records`; ``prepare`` (lease) and ``teardown`` (SCRUBBED) read and write it through it.
 """
 from __future__ import annotations
 
@@ -33,10 +33,11 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
+from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import stage as ST
@@ -48,8 +49,6 @@ from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInp
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
 PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
-SLOT_STATE_FORMAT = "levain-slot-state/1"
-SLOT_STATES = ("leased", "scrubbed", "reusable", "retired")
 
 EXIT_OK = 0
 EXIT_REFUSED = 1       # DECISION: every refusal by name
@@ -153,29 +152,14 @@ def _default_client(path: Path):
 
 
 def proc_identity(pid: int) -> Optional[Tuple[int, int]]:
-    """``(uid, start)`` of a live process, or None. Linux: real uid from ``/proc/<pid>/status``, start = field 22
-    of ``/proc/<pid>/stat`` (clock ticks since boot). macOS: ``ps -o uid=,lstart=``, start as epoch seconds.
-    DECISION: these are the start-time units the front registration carries (§3.3 ``front:{uid, pid, start}``);
-    keys' peer check (session 3b) must read the same units."""
-    if sys.platform == "darwin":
-        r = subprocess.run(["/bin/ps", "-o", "uid=,lstart=", "-p", str(int(pid))], capture_output=True, text=True,
-                           timeout=10, env={"LC_ALL": "C"})
-        parts = r.stdout.split(None, 1) if r.returncode == 0 else []
-        if len(parts) != 2:
-            return None
-        try:
-            started = int(time.mktime(time.strptime(parts[1].strip(), "%a %b %d %H:%M:%S %Y")))
-            return int(parts[0]), started
-        except ValueError:
-            return None
-    try:
-        with open(f"/proc/{int(pid)}/stat", encoding="ascii", errors="replace") as fh:
-            start = int(fh.read().rsplit(")", 1)[-1].split()[19])
-        with open(f"/proc/{int(pid)}/status", encoding="ascii", errors="replace") as fh:
-            uid = next(int(line.split()[1]) for line in fh if line.startswith("Uid:"))
-    except (OSError, ValueError, IndexError, StopIteration):
+    """``(real uid, start)`` of a live process, or None: proc.py's probe (macOS libproc, microseconds; Linux
+    ``/proc/<pid>/stat`` field 22, clock ticks), the ONE start-time source, so MINT's ``front.start`` and every
+    later live check (keys' peer check, END, SCRUBBED) read the same units. A pid whose facts cannot be read
+    counts as unknown (None): nothing is signalled on it."""
+    p = PR.default_seams().probe(int(pid))
+    if p is None or p.state == PR.UNKNOWN or not p.uids:
         return None
-    return uid, start
+    return p.uids[0], p.start
 
 
 def _sigkill_and_reap(pid: int) -> None:
@@ -240,6 +224,88 @@ def spawn_front(argv: Sequence[str], spec_json: bytes, go_rfd: int) -> int:
     return pid
 
 
+def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], exec_w: Optional[int],
+                 detach: bool) -> int:
+    """``start``'s fork through the wall (§5.1 start, §5.4 step 3, §9.1): the child keeps fds 0/1/2 (the helper's
+    own stdio, sudo's pty; ``detach``: ``/dev/null`` + ``setsid``, the forwarder), the spec pipe (moved to
+    ``SPEC_FD`` by :func:`wall.exec_launch`) and, when ``exec_w`` is given, the exec pipe's write end on
+    :data:`wall.EXEC_FD`, which the stage closes at its exec of the target (EOF = exec happened) and writes one
+    byte to on any refusal. Every other fd is closed. Only root can run it (a VM row)."""
+    spec_r, spec_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:   # pragma: no cover - the root child; exercised only in the VM (2g)
+        hi_exec = -1
+        try:
+            if detach:
+                os.setsid()
+                null = os.open("/dev/null", os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                if null > 2:
+                    os.close(null)
+            hi_spec = fcntl.fcntl(spec_r, fcntl.F_DUPFD, 32)
+            keep = [hi_spec]
+            if exec_w is not None:
+                hi_exec = fcntl.fcntl(exec_w, fcntl.F_DUPFD, 32)
+                os.dup2(hi_exec, wall.EXEC_FD)
+                keep.append(wall.EXEC_FD)
+            _close_fds_except(keep)
+            wall.exec_launch(argv, hi_spec, cgroup=cgroup)
+        except BaseException:   # noqa: BLE001 - the child never returns into the helper's stack
+            pass
+        if exec_w is not None:
+            try:
+                os.write(wall.EXEC_FD, b"!")
+            except OSError:
+                pass
+        os._exit(70)
+    os.close(spec_r)
+    try:
+        write_all(spec_w, spec_json)
+    finally:
+        os.close(spec_w)
+    return pid
+
+
+def wait_child(pid: int) -> int:
+    """Wait for the helper's own child and return its exit status (DECISION: a signal-killed child answers
+    ``128 + signal``, the shell's convention). SIGINT and SIGQUIT are ignored while waiting: the terminal's
+    Ctrl-C reaches the vendor (same pty), and the helper must outlive it to answer its one line."""
+    old = [(sig, signal.signal(sig, signal.SIG_IGN)) for sig in (signal.SIGINT, signal.SIGQUIT)]
+    try:
+        while True:
+            try:
+                _, status = os.waitpid(pid, 0)
+                break
+            except InterruptedError:
+                continue
+    finally:
+        for sig, h in old:
+            signal.signal(sig, h)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
+
+
+def make_cgroup(path: str) -> None:
+    """Linux: the session's cgroup (§7.3), made by ``start`` before the first process joins it (wall's
+    :func:`exec_launch` proves the join). DECISION: one that exists (a start that died after making it) is used."""
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+
+
+def stub_front_args(host: str, slot: SlotId) -> Tuple[str, ...]:
+    """The FIXED argv root gives the session-2 front, ``levain.broker.stub`` (§5.1 render (4), lane F3 b): the
+    Linux unix shape on ``R/gw/slot<n>/gw.sock`` (§2.2), the macOS TCP shape on ``gwport_n``. Nothing in it is
+    slot- or session-supplied. DECISION: its log is ``/dev/null`` (the stub has nothing a session needs kept)."""
+    if host == "darwin":
+        return ("--port", str(RD.gwport_for(host, slot)), "--log", "/dev/null")
+    sock = RUN[host] / "gw" / f"slot{slot.index}" / "gw.sock"
+    return ("--unix", str(sock), "--slot", str(slot.index), "--log", "/dev/null")
+
+
 def wake_reaper(run: Path) -> None:
     """A wake on ``R/reaper/wake.sock`` (§2.2, §3.5 Pool: ``prepare`` wakes the sync). Best effort: content is
     ignored and a lost wake costs one V11 interval."""
@@ -287,8 +353,20 @@ class Seams:
     wake_reaper: Optional[Callable[[], None]] = None
     hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
     front_module: str = FRONT_MODULE
+    front_args: Callable[[str, SlotId], Sequence[str]] = stub_front_args
     lock_wait_s: float = LOCK_WAIT_S
     at: Callable[[str], None] = lambda step: None
+    # start / teardown (levain.slot.start):
+    spawn: Callable[[Sequence[str], bytes, Optional[str], Optional[int], bool], int] = spawn_target
+    wait: Callable[[int], int] = wait_child
+    egress_ready: Callable[[SlotId, Mapping[str, int]], None] = wall.macos_egress_ready
+    netns_names: Callable[[], Iterable[str]] = wall.read_netns_names
+    host_links: Callable[[], Mapping[str, Optional[str]]] = wall.read_host_links
+    make_cgroup: Callable[[str], None] = make_cgroup
+    #: proc.ProcSeams for END's freeze / kill / proof and SCRUBBED (None = the host's real process table).
+    proc_seams: Optional[object] = None
+    #: EndSeams fields a test replaces (owner_ok, meta_reader, strip, chown, run_as, ...); empty in production.
+    end_overrides: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def L(self) -> Path:
@@ -540,60 +618,12 @@ def base_route_types(store: Store) -> Dict[str, str]:
 # --- the slot state file (§3.5 Pool) ---------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class SlotState:
-    """``levain-slot-state/1``. ``rev`` +1 on EVERY write, never reset; ``lease_seq`` +1 on every lease."""
-
-    slot: SlotId
-    rev: int
-    lease_seq: int
-    state: str
-    dispatch_eligible: bool
-    changed_at: str
-    session: Optional[str] = None
-
-
-_SLOT_STATE_KEYS = frozenset({"format", "class", "index", "rev", "lease_seq", "state", "session",
-                              "dispatch_eligible", "changed_at"})
-
-
-def slot_state_bytes(s: SlotState) -> bytes:
-    rec: Dict[str, object] = {"format": SLOT_STATE_FORMAT, "class": s.slot.slot_class, "index": s.slot.index,
-                              "rev": s.rev, "lease_seq": s.lease_seq, "state": s.state,
-                              "dispatch_eligible": s.dispatch_eligible, "changed_at": s.changed_at}
-    if s.session is not None:
-        rec["session"] = s.session
-    return canon.canonical_bytes(rec)
-
-
-def parse_slot_state(data: bytes, slot: SlotId) -> SlotState:
-    """Strict: exact keys, canonical bytes, the file's own (class, index). DECISION: ``session`` is required when
-    ``leased`` and allowed in any state (END may leave it naming the session it served)."""
-    obj = _canon_obj(data, "slot-state")
-    missing = (_SLOT_STATE_KEYS - {"session"}) - set(obj)
-    if set(obj) - _SLOT_STATE_KEYS or missing or obj["format"] != SLOT_STATE_FORMAT:
-        raise Refused("slot-state-malformed", slot.tag)
-    if obj["class"] != slot.slot_class or obj["index"] != slot.index or obj["state"] not in SLOT_STATES \
-            or type(obj["dispatch_eligible"]) is not bool:
-        raise Refused("slot-state-malformed", slot.tag)
-    for k in ("rev", "lease_seq"):
-        R._uint(obj[k], f"slot-state.{k}")
-    R.check_timestamp(obj["changed_at"], "slot-state.changed_at")
-    session = obj.get("session")
-    if session is not None:
-        R.check_session(session, "slot-state.session")
-    if obj["state"] == "leased" and session is None:
-        raise Refused("slot-state-malformed", f"{slot.tag}: leased with no session")
-    return SlotState(slot, obj["rev"], obj["lease_seq"], obj["state"], obj["dispatch_eligible"],
-                     obj["changed_at"], session)
-
-
-@dataclass(frozen=True)
 class SlotView:
     """What the pick reads of one slot under the pool lock: its state file, which vendors' credential ``keep/``
     holds (by name: §2.1 keep files are moved, never opened), and its baseline's vendor (``"?"`` when the file
     exists but does not parse; ``None`` when absent)."""
 
-    state: Optional[SlotState]
+    state: Optional[R.SlotState]
     slot: SlotId
     credentials: frozenset = frozenset()
     baseline: Optional[str] = None
@@ -621,10 +651,18 @@ def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
     return v if v in VENDORS else "?"
 
 
+def parse_slot_state_of(data: bytes, slot: SlotId) -> R.SlotState:
+    """records' parse, plus the file's own (class, index) must be the directory it sits in."""
+    st = R.parse_slot_state(data)
+    if st.slot != slot:
+        raise Refused("slot-state-malformed", f"{slot.tag} holds {st.slot.tag}'s state")
+    return st
+
+
 def read_view(store: Store, slot: SlotId) -> SlotView:
     with store.dir("slots", slot.tag) as sfd:
         raw = read_at(sfd, "state", f"slots/{slot.tag}/state")
-        state = parse_slot_state(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
+        state = parse_slot_state_of(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
         creds: frozenset = frozenset()
         baseline = None
         if slot.slot_class == "egress":
@@ -646,8 +684,9 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
     """§5.1 prepare + §3.5 Pool's point-of-use rules, PURE over the views read under the pool lock.
 
     Operator: ``no-baseline:<slot>`` for ``passthrough`` + kind != ``login`` when no REUSABLE slot holds this
-    vendor's credential AND a baseline; then the named slot if REUSABLE, else (passthrough) the lowest credential +
-    baseline slot, else the lowest REUSABLE (verifier: the lowest free pair). Ticketed: no ``<slot>`` argument,
+    vendor's credential AND a baseline; then the named slot if REUSABLE (a named slot that is not is refused
+    ``slot-not-reusable:<tag>``, never replaced: naming it asks for its credential), else (passthrough) the lowest
+    credential + baseline slot, else the lowest REUSABLE (verifier: the lowest free pair). Ticketed: no ``<slot>`` argument,
     never a slot whose ``keep/`` holds a credential or that has a baseline, and ``operator-slot-reserved`` if
     taking the slot would leave no reusable credential-free egress slot."""
     mine = sorted((v for v in views if v.slot.slot_class == slot_class), key=lambda v: v.slot.index)
@@ -669,6 +708,7 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
         for v in reusable:
             if v.slot.index == named:
                 return v.slot
+        raise Refused(f"slot-not-reusable:{SlotId(slot_class, named).tag}", "the named slot is not reusable")
     if auth == "passthrough":
         held = [v for v in reusable if v.holds(vendor)]
         if held:
@@ -717,7 +757,7 @@ class Leased:
     """A slot ``prepare`` took: its new state (written) and its HELD slot lock fd (released after ATTACH)."""
 
     slot: SlotId
-    state: SlotState
+    state: R.SlotState
     lock_fd: int
 
     def release(self) -> None:
@@ -757,7 +797,7 @@ def lease_slot(store: Store, *, slot_class: str, kind: str, vendor: str, auth: s
                 new = replace(old, rev=old.rev + 1, lease_seq=old.lease_seq + 1, state="leased", session=session,
                               changed_at=R.timestamp(seams.clock()))
                 seams.at("slot-leased")
-                store.replace(("slots", slot.tag), "state", slot_state_bytes(new), mode=0o644)
+                store.replace(("slots", slot.tag), "state", R.slot_state_bytes(new), mode=0o644)
             except BaseException:
                 os.close(lock)
                 raise
@@ -1030,13 +1070,15 @@ def render_step3_files(run: RenderRun) -> None:
 
 def front_launch(run: RenderRun) -> Tuple[Tuple[str, ...], bytes]:
     """wall's FRONT path (§8.2 last sentence): drop + assert to ``_levain_gw<n>``, no profile, no ``asuser``; the
-    program is ``seams.front_module`` and its one extra fd is the GO pipe on :data:`GO_FD`."""
+    program is ``seams.front_module`` with root's fixed ``seams.front_args``, and its one extra fd is the GO pipe
+    on :data:`GO_FD`."""
     ctx, a = run.ctx, run.alloc
     seams = ctx.seams
     gw = a.slot.accounts[1]
     spec = wall.launch_spec(seams.host, "front", slot=a.slot, session=a.session, ids={gw: run.front_uid},
                             shared={"levain-gwfronts": seams.group_gid("levain-gwfronts")},
-                            extra_env={GO_FD_ENV: str(GO_FD)}, keep_fds=(GO_FD,), front_module=seams.front_module)
+                            argv=tuple(seams.front_args(seams.host, a.slot)), extra_env={GO_FD_ENV: str(GO_FD)},
+                            keep_fds=(GO_FD,), front_module=seams.front_module)
     if seams.host == "darwin":
         argv = wall.macos_launch_argv(spec)
     else:
@@ -1198,8 +1240,21 @@ def status(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 
 
 #: verb -> handler(ctx, request, stdin blob) -> the ok line's fields. Lanes register their verbs here.
+def _start(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    from levain.slot import start as SS
+
+    return SS.start(ctx, req, blob)
+
+
+def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    from levain.slot import start as SS
+
+    return SS.teardown(ctx, req, blob)
+
+
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
+    "start": _start, "teardown": _teardown,
 }
 
 
@@ -1285,10 +1340,10 @@ def _read_stdin() -> bytes:
 
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "PREPARE_RESULT_FORMAT", "RENDER_STEPS",
-           "RenderRun", "SLOT_STATE_FORMAT", "SLOT_STATES", "Seams", "SlotState", "SlotView", "Store",
-           "VERB_HANDLERS", "configured_slots", "kill_front", "lease_slot", "main", "parse_slot_state", "pick_slot",
-           "prepare", "proc_identity", "read_view", "render", "render_layer_rows", "resume", "run",
-           "session_dir_rows", "slot_state_bytes", "spawn_front", "status"]
+           "RenderRun", "Seams", "SlotView", "Store", "VERB_HANDLERS", "configured_slots", "kill_front",
+           "lease_slot", "main", "make_cgroup", "parse_slot_state_of", "pick_slot", "prepare", "proc_identity",
+           "read_view", "render", "render_layer_rows", "resume", "run", "session_dir_rows", "spawn_front",
+           "spawn_target", "status", "stub_front_args", "wait_child"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
