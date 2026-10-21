@@ -1010,6 +1010,9 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
         if name is None:
             print(f"--tailscale: {why}", file=sys.stderr)
             return 2
+    if link_file is not None and token_file is not None and link_file.resolve() == token_file.resolve():
+        print("--link-file and --token-file are one file: the link would overwrite the kept token", file=sys.stderr)
+        return 2
     try:
         token = _kept_token(token_file) if token_file is not None else None
         httpd = make_phone_server(queue_dir, name, port=port, token=token, sign_namespaces=sign_namespaces)
@@ -1038,11 +1041,20 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
             print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
             httpd.server_close()
             return 1
+    import signal
+
+    def _stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt        # a service stop (TERM, HUP) unwinds like Ctrl+C, so the link file goes
+
+    main = threading.current_thread() is threading.main_thread()      # signal handlers are the main thread's only
+    before = {s: signal.signal(s, _stop) for s in (signal.SIGTERM, signal.SIGHUP)} if main else {}
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        for s, h in before.items():
+            signal.signal(s, h)
         httpd.server_close()
         if link_file is not None:
             _drop_link_file(link_file)
@@ -1051,7 +1063,7 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
 
 def _drop_link_file(path: Path) -> None:
     """``--link-file`` removed when this run stops, so no caller builds a link to a server that is gone; left alone
-    when it names another run (a later server wrote it)."""
+    when it names another run (a later server wrote it). A kill -9 or a crash leaves it: a caller checks its pid."""
     try:
         if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
             path.unlink()
