@@ -26,13 +26,13 @@ from levain.contracts.canon import canonical_bytes
 from levain.qbroker import wire
 from levain.qbroker.broker import Broker, Resolved
 from levain.qbroker.control import ControlResolver
+from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, request_of
 from levain.qbroker.server import SlotListener, peer_uid
 from levain.qbroker.signers import RETRY_FLOOR, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, QueueStore
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
-HEAD = {"size": 0, "root": "0" * 64}
 D64 = "sha256:" + "d" * 64
 
 
@@ -153,11 +153,16 @@ def row_of(L, request_id):
     return QueueStore(L / "queue").read_request(request_id)
 
 
+def head_of(L):
+    """The broker's receipts head now: what the operator's answer signs."""
+    return Receipts(L / "queue").head()
+
+
 def write_answer(L, request_id, key, decision="allow", signed_at=None, sign=True, **override):
     row = row_of(L, request_id)
     payload = answer_payload(queue_id=row["queue_id"], request=request_of(row["request"]), decision=decision,
                              signer_fp=key.fp, signed_at=utc_stamp(signed_at or NOW + timedelta(seconds=5)),
-                             receipts_head=HEAD)
+                             receipts_head=head_of(L))
     payload.update(override)
     signature = key.sign(answer_message(payload), ANSWER_NAMESPACE) if sign else ""
     (L / "queue" / "answers" / f"{request_id}.json").write_bytes(
@@ -256,13 +261,16 @@ def test_no_verb_takes_an_answer_or_a_row_from_a_hook(broker, op):
 
 # --- ANSWER? ---------------------------------------------------------------------------------------------------
 
-def test_pending_then_a_verified_allow_then_deny(L, broker, keys):
+def test_pending_then_a_verified_allow_and_the_first_decision_stands(L, broker, keys):
     rid = filed(broker)
     assert ask(broker, rid)["pending"] is True
     write_answer(L, rid, keys["operator"])
     assert ask(broker, rid)["decision"] == "allow"
+    # an answer row replaced under the broker naming the other decision is refused: the receipts recorded allow
     write_answer(L, rid, keys["operator"], decision="deny")
-    assert ask(broker, rid)["decision"] == "deny"
+    assert ask(broker, rid)["refused"] == "answer-refused"
+    write_answer(L, rid, keys["operator"])
+    assert ask(broker, rid)["decision"] == "allow"
 
 
 def test_an_answer_signed_by_a_key_not_in_the_snapshot_is_refused(L, broker, keys):
@@ -276,7 +284,7 @@ def test_an_answer_signed_by_one_key_naming_another_is_refused(L, broker, keys):
     row = row_of(L, rid)
     payload = answer_payload(queue_id=row["queue_id"], request=request_of(row["request"]), decision="allow",
                              signer_fp=keys["operator"].fp, signed_at=utc_stamp(NOW + timedelta(seconds=5)),
-                             receipts_head=HEAD)
+                             receipts_head=head_of(L))
     sig = keys["stranger"].sign(answer_message(payload), ANSWER_NAMESPACE)
     (L / "queue" / "answers" / f"{rid}.json").write_bytes(
         canonical_bytes({"format": ANSWER_ROW_FORMAT, "payload": payload, "signature": sig}))
@@ -373,9 +381,11 @@ def test_a_t3_allow_needs_a_t3_class_signer_and_a_deny_does_not(L, broker, keys)
     assert ask(broker, rid)["refused"] == "answer-refused"
     write_answer(L, rid, keys["operator"], decision="deny")
     assert ask(broker, rid)["decision"] == "deny"
+    # a decided request stays decided: the allow is asked on a request of its own
+    other = filed(broker, fields=hook_fields("t3b", tier="T3"))
     write_signers(L, keys, 2, [keys["operator"].signer(key_class="laptop-presence", custody="passphrase")])
-    write_answer(L, rid, keys["operator"])
-    assert ask(broker, rid)["decision"] == "allow"
+    write_answer(L, other, keys["operator"])
+    assert ask(broker, other)["decision"] == "allow"
 
 
 @pytest.mark.parametrize("change", [
@@ -606,8 +616,8 @@ def test_a_poll_storm_costs_one_verify_and_one_resolve(L, broker, resolver, keys
     for _ in range(30):
         assert ask(broker, rid)["decision"] == "allow"
     assert len(verifies) == 1 and len(resolver.calls) == 1
-    write_answer(L, rid, keys["operator"], decision="deny")          # a new answer file: verified again
-    assert ask(broker, rid)["decision"] == "deny" and len(verifies) == 2
+    write_answer(L, rid, keys["operator"])                           # a new answer file: verified again
+    assert ask(broker, rid)["decision"] == "allow" and len(verifies) == 2
     write_signers(L, keys, 2, [keys["stranger"].signer()])           # a new snapshot: verified again, refused
     assert ask(broker, rid)["refused"] == "answer-refused" and len(verifies) == 3
 

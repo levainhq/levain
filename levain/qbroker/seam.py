@@ -11,15 +11,17 @@ around that call, and nothing else:
 - namespaces: a snapshot signer lists the namespaces it may sign in; one that may not sign in
   ``levain-consent-answer`` is refused here, before the shared check (which has no such step).
 
-THE GRANT ROW. :func:`grant_allow_refusal` is the one check an ``ANSWER?`` makes of the broker's own
-``levain-queue-grant-allow/1`` row (:mod:`levain.qbroker.grants`): its exact keys, and that it names this request and
-this run's contract digest. It is read only from the directory the broker alone writes, and only as that format; an
+THE GRANT ROW. :func:`grant_allow_refusal` is the one check made of the broker's own ``levain-queue-grant-allow/1``
+row (:mod:`levain.qbroker.grants`), by ``ANSWER?``, by the filing's receipts and by the start-time reconcile (that one
+without the hold-time check): its exact keys, and that it names this request and this run's contract digest. It is read only from the directory the broker alone writes, and only as that format; an
 answer row, and a payload in either grant format, is never read as the other (:func:`answer_refusal` refuses a grant
-format by name before the shared check).
+format by name before the shared check). The row signs no receipts head: its receipt in the broker's log names it
+as the authority (:meth:`levain.qbroker.receipts.Receipts.granted`).
 
-The receipts head: a broker request has no receipt log, so the head is checked for its shape only (what the
-shared check does; the apply-time ``head_refusal`` has no log to read here). The unchained answer format is never
-accepted (``unchained_ok`` stays off).
+The receipts head: the shared check reads its shape; a head of size 0 is refused here (it attests nothing: the
+empty tree's root is fixed). Whether it is a head of the broker's own receipts log is the apply-time
+``head_refusal``, run inside the write that records the decision (:meth:`levain.qbroker.receipts.Receipts.decided`).
+The unchained answer format is never accepted (``unchained_ok`` stays off).
 
 Stdlib only.
 """
@@ -74,18 +76,25 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
         signer = signers.key(payload.get("signer_fp"))
         if signer is not None and ANSWER_NAMESPACE not in signer.namespaces:
             return f"the signer may not sign in {ANSWER_NAMESPACE}"
-    return consent_queue.answer_refusal(request, row.get("queue_id"), payload, signature, signers,
-                                        ssh_keygen=ssh_keygen)
+    why = consent_queue.answer_refusal(request, row.get("queue_id"), payload, signature, signers,
+                                       ssh_keygen=ssh_keygen)
+    if why is None and payload["receipts_head"]["size"] == 0:
+        return "the answer's receipts head is of size 0: it attests nothing"
+    return why
 
 
-def grant_allow_refusal(row: Mapping[str, Any], grant: Any, now: datetime) -> str | None:
-    """Why ``grant`` is not the broker's allow for the request ``row`` holds; ``None`` when it is."""
+def grant_allow_refusal(row: Mapping[str, Any], grant: Any, now: datetime, *, check_hold: bool = True) -> str | None:
+    """Why ``grant`` is not the broker's allow for the request ``row`` holds; ``None`` when it is. The one judge of a
+    grant row: ANSWER?, the filing's receipts, the replay repair and the start-time reconcile all ask it. ``check_hold=False``
+    (the start-time reconcile and the replay repair) skips the hold-time check, so a row whose hold ended before the broker
+    restarted or the repair ran is judged on the
+    rest; ``now`` is then not read."""
     if not isinstance(grant, Mapping) or set(grant) != GRANT_ROW_KEYS or grant.get("format") != GRANT_ROW_FORMAT:
         return f"the grant row is not a {GRANT_ROW_FORMAT} record"
     request = request_of(row.get("request"))
     if request is None:
         return "the request row's seal does not match its fields"
-    if request.expires_at <= utc_stamp(now):
+    if check_hold and request.expires_at <= utc_stamp(now):
         return f"the request's hold ended {request.expires_at}"
     if grant["request_id"] != request.id:
         return "the grant row names another request"
