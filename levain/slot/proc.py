@@ -336,9 +336,9 @@ def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: Pr
     ``child_uid`` owns a process; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does,
     and the slot stays leased. A bootout launchctl did not report done (an error or past the shared deadline) is
     ``Refused("scrub-domain-remains:<uid>")``: the process scan cannot see agents launchd would start again. The
-    bootouts share one deadline, ``bound_s``, since the caller holds the pool lock. The domain goes after END's kill, so it also takes the per-user agents launchd
-    started for the uid while END ran: on a long END they appeared after END's own proof had passed and only SCRUB
-    refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
+    bootouts share one deadline, ``bound_s``, since the caller holds the pool lock. The domain goes after END's
+    kill, so it also takes the per-user agents launchd started for the uid while END ran: on a long END they
+    appeared after END's own proof had passed and only SCRUB refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
     u = UidProcs(seams)
     uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
     u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
@@ -556,7 +556,7 @@ def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> bool:
         raise Refused("bad-target-uid", repr(uid))
     try:
         r = subprocess.run(["/bin/launchctl", "bootout", f"user/{uid}"], capture_output=True, cwd="/",
-                           env=child_env(), timeout=max(timeout, 0.1))
+                           env=child_env(), timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0
