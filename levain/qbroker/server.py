@@ -14,15 +14,14 @@ import logging
 import os
 import socket
 import stat
-import sys
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 from levain.qbroker import wire
-from levain.qbroker.peercred import peer_uid
 from levain.qbroker.broker import Broker
+from levain.qbroker.peercred import peer_uid
 
 __all__ = ["IDLE_TIMEOUT", "MAX_CONNECTIONS", "SlotListener", "peer_uid", "socket_path"]
 
@@ -34,6 +33,8 @@ MAX_CONNECTIONS = 16
 IDLE_TIMEOUT = 60.0
 # after an accept() error that is not the listener's own close (EMFILE, ECONNABORTED), the pause before the next
 ACCEPT_BACKOFF = 0.1
+
+
 def socket_path(run_dir: Path | str, slot: int) -> Path:
     return Path(run_dir) / "qb" / f"slot{slot}" / "q.sock"
 
