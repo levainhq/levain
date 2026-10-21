@@ -55,6 +55,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from levain.contracts import canon
 from levain.slot import Refused, wall
 from levain.slot import end as E
 from levain.slot import proc as PR
@@ -294,7 +295,8 @@ class CheckFailed(Exception):
 
 
 #: DECISION: the read set's caps (§5.4, a ticket's read set: at most 512 paths of at most 1024 bytes each), restated
-#: here because the root interpreter cannot import the dispatch package. A clone holding more fails the check.
+#: here because the root interpreter cannot import the dispatch package. A clone holding more entries, or a longer
+#: path, fails the check.
 READSET_PATHS_MAX, READSET_PATH_BYTES = 512, 1024
 #: One ``ls-files -s -z`` record's fixed bytes: ``<mode 6> SP <sha 40> SP <stage 1> TAB`` and the closing NUL.
 _LS_FIXED = 6 + 1 + 40 + 1 + 1 + 1 + 1
@@ -340,6 +342,9 @@ def parse_ls_files(out: bytes) -> List[IndexEntry]:
         m = _LS_RECORD.fullmatch(rec)
         if m is None:
             raise CheckFailed(f"(b) ls-files: a malformed record {rec[:96]!r}")
+        if len(m.group(4)) > READSET_PATH_BYTES:
+            raise CheckFailed(f"(b) ls-files: a path of {len(m.group(4))} bytes, past the read set's "
+                              f"{READSET_PATH_BYTES}: {m.group(4)[:96]!r}")
         try:
             path = m.group(4).decode("utf-8")
         except UnicodeDecodeError:
@@ -395,17 +400,18 @@ def check_worktree(repo_fd: int, entries: Sequence[IndexEntry]) -> int:
     return total
 
 
-def hash_batches(paths: Sequence[str], cap: int = wall.HASH_ARGV_CAP) -> List[List[str]]:
-    """``paths`` in order, cut into ``hash-object`` batches whose whole argv is at most ``cap`` bytes (V9: a fixed
-    cap, never sysconf arithmetic)."""
-    base = wall.argv_bytes(wall.HASH_OBJECT_PREFIX)
+def hash_batches(paths: Sequence[str], base: int, cap: int = wall.SPEC_CAP) -> List[List[str]]:
+    """``paths`` in order, cut into ``hash-object`` batches whose ``clone-check`` spec serialises to at most ``cap``
+    bytes (the stage's spec cap; V9: a fixed cap, never sysconf arithmetic). ``base``: that spec's size with the
+    bare :data:`wall.HASH_OBJECT_PREFIX` argv; each path adds its JSON string, escaping included, and one comma,
+    exactly as ``Spec.to_json`` writes the argv list."""
     out: List[List[str]] = []
     cur: List[str] = []
     size = base
     for p in paths:
-        n = wall.argv_bytes((p,))
+        n = len(canon.canonical_bytes(p)) + 1
         if base + n > cap:
-            raise CheckFailed(f"(b) {_name(p)}: one path past the {cap}-byte argv cap")
+            raise CheckFailed(f"(b) {_name(p)}: one path past the {cap}-byte spec cap")
         if cur and size + n > cap:
             out.append(cur)
             cur, size = [], base
@@ -435,7 +441,12 @@ def check_attributes(sfd: int) -> None:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise CheckFailed("(a) info/attributes: not a regular file")
-            got = os.read(fd, len(want) + 1)
+            got = b""
+            while len(got) <= len(want):   # one byte past the line proves it holds nothing more
+                b = os.read(fd, len(want) + 1 - len(got))
+                if not b:
+                    break
+                got += b
         finally:
             os.close(fd)
         if got != want:
@@ -455,13 +466,14 @@ def _hash_ids(out: bytes, n: int) -> List[str]:
 
 
 def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes], no_process: Callable[[], bool],
-                *, cap: int = wall.HASH_ARGV_CAP) -> Optional[CheckStats]:
+                *, spec_base: Callable[[], int], cap: int = wall.SPEC_CAP) -> Optional[CheckStats]:
     """§5.4 step 3 after a zero clone exit, in order: for kind ``dispatch`` the slot uid has no process (V4); for
     ``dispatch|planner|verifier`` (a) :func:`check_attributes`; for ``dispatch`` only (V3) (b): ``ls-files -s -z``
     run as the slot (``run(argv, bound)`` returns its stdout or raises :class:`CheckFailed`), parsed and checked
-    here, every worktree entry lstat'ed fd-relative, then ``hash-object --no-filters`` in batches of at most
-    ``cap`` argv bytes, every id equal to its entry's blob, in order; then no slot-uid process again (V4). Any
-    failure raises :class:`CheckFailed`. ``interactive|login``: no check (None)."""
+    here, every worktree entry lstat'ed fd-relative, then ``hash-object --no-filters`` in batches whose spec is at
+    most ``cap`` bytes (``spec_base()``: :func:`hash_batches`' base), every id equal to its entry's blob, in order;
+    then no slot-uid process again (V4). Any failure raises :class:`CheckFailed`. ``interactive|login``: no check
+    (None)."""
     if kind not in RD.READSET_KINDS:
         return None
     window = kind == "dispatch"
@@ -482,7 +494,7 @@ def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes
         size = check_worktree(repo, entries)
     finally:
         os.close(repo)
-    batches = hash_batches([ent.path for ent in entries], cap)
+    batches = hash_batches([ent.path for ent in entries], spec_base(), cap)
     got: List[str] = []
     for batch in batches:
         got += _hash_ids(run(wall.hash_object_argv(batch), ID_LINE_BYTES * len(batch)), len(batch))
@@ -509,6 +521,13 @@ def _run_check(ctx: H.Ctx, a: R.Alloc, argv: Tuple[str, ...], bound: int) -> byt
     return out
 
 
+def _hash_spec_base(ctx: H.Ctx, a: R.Alloc) -> int:
+    """The ``clone-check`` spec's serialised size with the bare ``hash-object`` prefix as its argv: every field the
+    batch's spec carries besides its paths (:func:`hash_batches`)."""
+    spec = _spec(ctx, a, "clone-check", argv=wall.ls_files_argv())
+    return len(replace(spec, argv=wall.HASH_OBJECT_PREFIX).to_json())
+
+
 def _no_slot_process(ctx: H.Ctx, a: R.Alloc) -> bool:
     """proc.py's END proof, unchanged (Linux the session cgroup; macOS the uid sweep): no process of the slot uid."""
     seams = ctx.seams
@@ -518,13 +537,26 @@ def _no_slot_process(ctx: H.Ctx, a: R.Alloc) -> bool:
     return no_process(a.slot_uid)
 
 
+def _discard_clone(ctx: H.Ctx, a: R.Alloc, what: str) -> Optional[str]:
+    """The kill domain killed, then ``<S>/repo`` emptied (so the start can be retried). Never raises an Exception
+    over the caller's error: a failure to empty is noted and returned (the next start's own ``_fresh_repo``
+    removes what is left; no clone marker is written either way)."""
+    _kill_quiet(ctx, a, what)   # macOS: a stray slot-uid process could still write into repo
+    try:
+        with ctx.store.dir("live", a.session) as sfd:
+            _fresh_repo(ctx, a, sfd)
+    except Exception as e:   # noqa: BLE001 - the caller's error is the answer
+        why = f"{type(e).__name__}" + (f" errno {e.errno}" if isinstance(e, OSError) else "")
+        _note(f"{a.session}: {what}: <S>/repo was not emptied: {why}")
+        return why
+    return None
+
+
 def _clone_failed(ctx: H.Ctx, a: R.Alloc, detail: str) -> None:
-    """The ``clone-failed`` path: the kill domain killed, ``<S>/repo`` emptied (so the start can be retried), no
-    clone marker; then the refusal."""
-    _kill_quiet(ctx, a, "clone-failed")   # macOS: a stray slot-uid process could still write into repo
-    with ctx.store.dir("live", a.session) as sfd:
-        _fresh_repo(ctx, a, sfd)
-    raise Refused("clone-failed", detail)
+    """The ``clone-failed`` path: :func:`_discard_clone`, no clone marker; then the refusal, naming a repo left
+    unemptied."""
+    why = _discard_clone(ctx, a, "clone-failed")
+    raise Refused("clone-failed", detail if why is None else f"{detail}; <S>/repo not emptied ({why})")
 
 
 # --- start (§5.1) ------------------------------------------------------------------------------------------------------
@@ -568,20 +600,23 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         _clone_failed(ctx, a, f"exit {code}")
     if a.kind in RD.READSET_KINDS:
         seams.at("clone-check")
+        passed, detail, why = False, "", None
         try:
             with ctx.store.dir("live", a.session) as sfd:
                 clone_check(sfd, a.kind, lambda av, bound: _run_check(ctx, a, av, bound),
-                            lambda: _no_slot_process(ctx, a))
+                            lambda: _no_slot_process(ctx, a), spec_base=lambda: _hash_spec_base(ctx, a))
+            passed = True
         except (CheckFailed, Refused, OSError) as err:
             # A listing or launch refusal inside the check is a failed check too: the clone is never kept unproven.
             detail = str(err) if isinstance(err, CheckFailed) else (
                 f"check: {err.name}" if isinstance(err, Refused) else f"check: {type(err).__name__} errno {err.errno}")
-            _clone_failed(ctx, a, detail[:512])
-        except BaseException:
-            _kill_quiet(ctx, a, "clone-check")
-            with ctx.store.dir("live", a.session) as sfd:
-                _fresh_repo(ctx, a, sfd)
-            raise
+        finally:
+            # Any other error (an internal bug, an interrupt) propagates as itself: the discard never raises over it.
+            if not passed:
+                why = _discard_clone(ctx, a, "clone-check")
+        if not passed:
+            raise Refused("clone-failed",
+                          detail[:512] if why is None else f"{detail[:448]}; <S>/repo not emptied ({why})")
     E.mark_cloned(ctx.store.path, a.session)
 
     if egress and seams.host == "linux":

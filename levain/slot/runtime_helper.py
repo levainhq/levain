@@ -25,7 +25,7 @@ import errno
 import fcntl
 import os
 import re
-import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -339,14 +339,18 @@ def wait_child(pid: int) -> int:
     finally:
         for sig, h in old:
             signal.signal(sig, h)
+    return _exit_code(status)
+
+
+def _exit_code(status: int) -> int:
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return os.WEXITSTATUS(status)
 
 
 #: DECISION: the bound on one post-clone check child (``ls-files`` or one ``hash-object`` batch), from its spawn to
-#: its stdout's EOF. Past it the child is killed and the check fails: a stdout another process still holds open
-#: never stalls ``start``.
+#: its exit (its stdout's EOF, then its reaping). Past it the child is killed and the check fails: a stdout another
+#: process still holds open, or a child that closed its stdout and runs on, never stalls ``start``.
 CHECK_S = 300.0
 
 
@@ -358,23 +362,48 @@ def drain(fd: int, bound: int, *, deadline_s: float = CHECK_S,
     end = monotonic() + deadline_s
     chunks: List[bytes] = []
     size = 0
+    with selectors.DefaultSelector() as sel:   # not select.select: any fd number, 1024 and past it included
+        sel.register(fd, selectors.EVENT_READ)
+        while True:
+            left = end - monotonic()
+            if left <= 0 or not sel.select(left):
+                raise Refused("check-timeout", f"no EOF within {deadline_s:g}s")
+            b = os.read(fd, min(65536, bound - size + 1))
+            if not b:
+                return b"".join(chunks)
+            size += len(b)
+            if size > bound:
+                raise Refused("check-output-over-bound", f"more than {bound} bytes")
+            chunks.append(b)
+
+
+def reap_within(pid: int, deadline_s: float, *, monotonic: Callable[[], float] = time.monotonic,
+                sleep: Callable[[float], None] = time.sleep) -> int:
+    """The helper's own child ``pid`` reaped within ``deadline_s`` (its exit status as :func:`wait_child` answers
+    it); past it the child is killed and reaped, then ``check-timeout``. Polled (``WNOHANG``), as no portable call
+    waits on one pid with a timeout."""
+    end = monotonic() + deadline_s
+    nap = 0.001
     while True:
-        left = end - monotonic()
-        if left <= 0 or not select.select([fd], [], [], left)[0]:
-            raise Refused("check-timeout", f"no EOF within {deadline_s:g}s")
-        b = os.read(fd, min(65536, bound - size + 1))
-        if not b:
-            return b"".join(chunks)
-        size += len(b)
-        if size > bound:
-            raise Refused("check-output-over-bound", f"more than {bound} bytes")
-        chunks.append(b)
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except InterruptedError:
+            continue
+        if done:
+            return _exit_code(status)
+        if monotonic() >= end:
+            _sigkill_and_reap(pid)
+            raise Refused("check-timeout", f"the check child did not exit within {deadline_s:g}s")
+        sleep(nap)
+        nap = min(nap * 2, 0.05)
 
 
 def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], bound: int) -> Tuple[int, bytes]:
     """A post-clone check child (§5.4 step 3, wall's ``clone-check`` target) by :func:`spawn_target`'s path, its
-    stdout on a pipe root drains while it runs (:func:`drain`); its exit status and that output. A drain that
-    refuses kills and reaps the child first, then raises. Only root can run it (a VM row)."""
+    stdout on a pipe root drains while it runs (:func:`drain`), then the child reaped (:func:`reap_within`), both
+    within one :data:`CHECK_S` from the spawn; its exit status and that output. A drain that refuses kills and reaps
+    the child first, then raises. Only root can run it (a VM row)."""
+    end = time.monotonic() + CHECK_S
     out_r, out_w = os.pipe()
     try:
         pid = spawn_target(argv, spec_json, cgroup, None, False, stdout_w=out_w)
@@ -384,13 +413,13 @@ def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str],
     finally:
         os.close(out_w)
     try:
-        data = drain(out_r, bound)
+        data = drain(out_r, bound, deadline_s=end - time.monotonic())
     except BaseException:
         os.close(out_r)
         _sigkill_and_reap(pid)
         raise
     os.close(out_r)
-    return wait_child(pid), data
+    return reap_within(pid, end - time.monotonic()), data
 
 
 def make_cgroup(path: str, *, mkdir: Callable[[str, int], None] = os.mkdir,
@@ -1731,7 +1760,7 @@ def _read_stdin() -> bytes:
 __all__ = ["BASE_ROUTES_FORMAT", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
            "FRONT_MODULE", "GO_BYTE", "GO_FD", "GO_FD_ENV", "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",
-           "CHECK_S", "capture_target", "configured_slots", "drain", "ENTRY_ENV", "entry_env",
+           "CHECK_S", "capture_target", "configured_slots", "drain", "reap_within", "ENTRY_ENV", "entry_env",
            "create_alloc", "create_at", "kill_front", "lease_slot", "main", "make_cgroup", "open_slot_owned_dir",
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",

@@ -282,10 +282,9 @@ def module_argv(host: str, module: str, *args: str) -> Tuple[str, ...]:
 #: §5.4 step 3 (V4): every clone and check argv runs no hook and no automatic gc or maintenance, so no git
 #: process outlives the one root waits for.
 _GIT_PREFIX = (GIT, "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false")
-#: §5.4 step 3 (b): every ``hash-object`` batch's argv up to its first path.
+#: §5.4 step 3 (b): every ``hash-object`` batch's argv up to its first path. A batch is bounded by its spec's
+#: serialised size (:data:`SPEC_CAP`, which the stage enforces), never by a separate argv cap.
 HASH_OBJECT_PREFIX = _GIT_PREFIX + ("hash-object", "--no-filters", "--")
-#: §5.4 step 3 (V9): a fixed cap on one ``hash-object`` batch's argv bytes (every string plus its NUL).
-HASH_ARGV_CAP = 128 * 1024
 
 
 def clone_argv(session_dir: PurePosixPath, kind: str) -> Tuple[str, ...]:
@@ -313,18 +312,11 @@ def ls_files_argv() -> Tuple[str, ...]:
 
 def hash_object_argv(paths: Sequence[str]) -> Tuple[str, ...]:
     """§5.4 step 3 (b): the worktree bytes of ``paths`` hashed with no attribute applied, the paths as argv after
-    ``--`` (no ``--stdin-paths``, so no quoting protocol). At least one path, no NUL, the whole argv within
-    :data:`HASH_ARGV_CAP`."""
-    argv = HASH_OBJECT_PREFIX + tuple(paths)
-    if not paths or not all(isinstance(p, str) and p and "\x00" not in p for p in paths) \
-            or argv_bytes(argv) > HASH_ARGV_CAP:
+    ``--`` (no ``--stdin-paths``, so no quoting protocol). At least one path, no NUL; the batch's size is its
+    spec's, bounded by :data:`SPEC_CAP` (:func:`launch_spec` refuses a spec past it)."""
+    if not paths or not all(isinstance(p, str) and p and "\x00" not in p for p in paths):
         raise Refused("spec-malformed", f"hash-object batch of {len(paths)} paths")
-    return argv
-
-
-def argv_bytes(argv: Sequence[str]) -> int:
-    """An argv's size as the kernel counts its strings: each one's bytes plus its NUL."""
-    return sum(len(a.encode("utf-8", "surrogateescape")) + 1 for a in argv)
+    return HASH_OBJECT_PREFIX + tuple(paths)
 
 
 def _check_clone_check_argv(argv: Sequence[str]) -> None:
@@ -439,6 +431,9 @@ def launch_spec(host: str, target: str, *, slot, session: str, ids: Mapping[str,
     spec = Spec(target, who.uid, who.gid, who.groups, NPROC if slot_target else None, env_file,
                 tuple(sorted((extra_env or {}).items())), profile, str(cwd), argv, resolve, tuple(keep_fds), exec_fd)
     _check_spec(spec)
+    size = len(spec.to_json())
+    if size > SPEC_CAP:   # the stage would refuse it as malformed; refused here by name, before any fork
+        raise Refused("spec-over-cap", f"{target} spec of {size} bytes, past {SPEC_CAP}")
     return spec
 
 
@@ -1312,9 +1307,9 @@ if __name__ == "__main__":
     os._exit(main(sys.argv[1:]))
 
 
-__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "HASH_ARGV_CAP", "HASH_OBJECT_PREFIX",
+__all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "FORWARDER_PORT", "HASH_OBJECT_PREFIX",
            "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
-           "Spec", "TARGETS", "argv_bytes", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
+           "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_profile_text", "clone_argv",
            "drop_and_assert", "exec_launch", "expected_slot_rules", "hash_object_argv", "launch_spec",
            "linux_launch_argv", "linux_view_args", "ls_files_argv", "macos_egress_ready", "macos_launch_argv",
            "module_argv", "parse_env", "parse_spec", "pf_printed", "principal", "read_host_links", "read_netns_names",

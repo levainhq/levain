@@ -13,10 +13,14 @@ import shutil
 import subprocess
 from dataclasses import replace
 
+import pytest
+
 from levain.contracts import canon
+from levain.dispatch import contract as DC
 from levain.slot import render as RD
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
+from levain.slot import start as SS
 from levain.slot import wall
 from levain.slot.layout import STORE
 from tests.test_slot_s2f2_runtime_helper import _blob
@@ -48,9 +52,24 @@ def _bundle(tmp) -> bytes:
     return (tmp / "rs.bundle").read_bytes()
 
 
+def _bundle_of(tmp, files) -> bytes:
+    """A bundle (``HEAD`` + ``readset``) whose one commit holds ``files`` ({path: bytes}, all 100644), its index
+    built with ``update-index --cacheinfo`` (no worktree, so a path's length is never the host's to refuse)."""
+    src = tmp / "src"
+    _git("init", "-q", "--template=", "-b", "readset", str(src), cwd=tmp)
+    for path, data in files.items():
+        sha = _git("hash-object", "-w", "--stdin", cwd=src, inp=data).decode().strip()
+        _git("update-index", "--add", "--cacheinfo", f"100644,{sha},{path}", cwd=src)
+    tree = _git("write-tree", cwd=src).decode().strip()
+    _git("update-ref", "refs/heads/readset", _git("commit-tree", tree, "-m", "one", cwd=src).decode().strip(), cwd=src)
+    _git("bundle", "create", "-q", str(tmp / "rs.bundle"), "HEAD", "readset", cwd=src)
+    return (tmp / "rs.bundle").read_bytes()
+
+
 class RealGit:
     """The wall's clone and clone-check targets as real git: each spec's argv, cwd and env file (the store path
-    mapped to the test's store) run as the test user; the check children's stdout through the helper's own drain."""
+    mapped to the test's store) run as the test user; the check children's stdout through the helper's own drain.
+    Every spec is first parsed as the stage parses it (``wall.parse_spec``: its cap and shape)."""
 
     def __init__(self, w, la) -> None:
         self.w, self.la = w, la
@@ -81,6 +100,7 @@ class RealGit:
         return pid
 
     def capture(self, argv, spec_json, cgroup, bound):
+        wall.parse_spec(spec_json)
         spec = canon.parse(spec_json)
         self.captures.append({"argv": tuple(argv), "spec": spec, "cgroup": cgroup, "bound": bound})
         p = self._run(spec)
@@ -91,15 +111,15 @@ class RealGit:
         return p.wait(timeout=60), out
 
 
-def _dispatch_rendered(tmp_path):
-    """A rendered ``dispatch`` session whose staged bundle is :data:`FILES`' read set."""
+def _dispatch_rendered(tmp_path, files=None):
+    """A rendered ``dispatch`` session whose staged bundle is :data:`FILES`' read set (or ``files``')."""
     w, la, table = _world(tmp_path)
     line = w.prepare()
     assert line["ok"], line
     s = w.session = line["session"]
     a = w.alloc(s)
     (w.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(replace(a, kind="dispatch")))
-    w.stage(s, _bundle(tmp_path))
+    w.stage(s, _bundle(tmp_path) if files is None else _bundle_of(tmp_path, files))
     assert w.main(["render", s], _blob())[1]["ok"]
     return w, la, table, s
 
@@ -150,3 +170,33 @@ def test_slot_clone_missing_template_refused(tmp_path):
     assert not (w.L / "alloc" / f"{s}.cloned").exists()
     assert [r["target"] for r in la.spawns] == ["clone"] and g.captures == []
     assert w.state(s).state == R.RENDERED
+
+
+def test_slot_clone_check_batches_fit_the_spec_cap(tmp_path):
+    """V9 against the stage's real bound: a legal read set of 64 nested 1023-byte paths (the longest this macOS host
+    checks out; PATH_MAX counts its NUL) makes ``hash-object`` specs that ``wall.parse_spec`` accepts, every one at
+    most ``SPEC_CAP``. Reproduced first: the 128 KiB argv cap built one 66,089-byte spec, the stage refused it
+    ``spec-malformed`` and ``start`` turned a good clone into ``clone-failed``."""
+    dirs = "/".join(c * 200 for c in "pqrs")
+    files = {f"{dirs}/{i:03d}".ljust(1023, "x"): f"{i}\n".encode() for i in range(64)}
+    w, la, _, s = _dispatch_rendered(tmp_path, files)
+    g = RealGit(w, la)
+    assert w.main(["start", s])[1]["ok"], w.last_err
+    hashed = [x for x in g.captures if x["spec"]["argv"][7] == "hash-object"]
+    sizes = [len(canon.canonical_bytes(x["spec"])) for x in hashed]
+    assert len(hashed) >= 2 and max(sizes) <= wall.SPEC_CAP, sizes
+    assert [p for x in hashed for p in x["spec"]["argv"][len(wall.HASH_OBJECT_PREFIX):]] == sorted(files)
+    assert (w.L / "alloc" / f"{s}.cloned").exists()
+
+
+def test_slot_clone_check_refuses_a_path_past_the_read_set_cap():
+    """codex r1 MED: an ``ls-files`` record whose path is past the read set's 1024 bytes is refused by name before
+    it is decoded; start.py's restated caps equal the contract's, so a drift fails here. Reproduced first: a
+    1025-byte nested path parsed as one entry and passed."""
+    assert (SS.READSET_PATHS_MAX, SS.READSET_PATH_BYTES) == (DC.PATHS_MAX, DC.PATH_MAX_BYTES)
+    head = "/".join(c * 200 for c in "pqrs") + "/"
+    ok, long = head.ljust(1024, "x"), head.ljust(1025, "x")
+    rec = b"100644 " + b"0" * 40 + b" 0\t"
+    assert [e.path for e in SS.parse_ls_files(rec + ok.encode() + b"\0")] == [ok]
+    with pytest.raises(SS.CheckFailed, match="a path of 1025 bytes, past the read set's 1024"):
+        SS.parse_ls_files(rec + ok.encode() + b"\0" + rec + long.encode() + b"\0")
