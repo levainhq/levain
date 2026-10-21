@@ -486,12 +486,19 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
     assert inst.persisted_role(target) == "coordinator"
     assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
     assert [r for r in allow(target) if r.startswith("Bash(")] == bash
-    # a live install made by plain init and then named as the coordinator's is used as is: nothing pre-approved
+    # a live install made by plain init and then named as the coordinator's is REFUSED, never marked (door r2 (a)):
+    # the door is open in an unmarked directory, and marking the operator's install would door his own sessions
     plain = tmp_path / "plain"
     answers = tmp_path / "answers.json"
     answers.write_text(json.dumps(cl._install_answers()))
     assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
-    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain))
+    before = CoordStore(qdir).coord_setting()
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain), rc=1)
+    assert "not a coordinator's own" in out.err and "leave out --cwd" in out.err
+    assert CoordStore(qdir).coord_setting() == before                  # nothing recorded
+    # the workspace that already has the role is reused as is
+    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(target))
+    assert CoordStore(qdir).coord_setting().cwd == str(target)
     assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
     assert "enabledMcpjsonServers" not in json.loads((plain.resolve() / ".claude" / "settings.json").read_text())
     assert inst.persisted_role(plain.resolve()) is None

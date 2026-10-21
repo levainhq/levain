@@ -1075,6 +1075,16 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                                          emit=lambda line: print(line, file=log, flush=True))
     if not live:
         raise CoordError(f"not set: the consent hook is not live in {target}: {detail}")
+    from levain.coordinator.door import marked
+
+    if not marked(target):
+        # A live install Levain did not make for the coordinator is the operator's own: the door is open there, so a
+        # coordinator launched into it would run his commands. It is never marked here either, since marking it would
+        # door his own sessions in it. A fresh directory gets its own marked install.
+        raise CoordError(f"not set: {target} is a Levain install, but not a coordinator's own (its "
+                         ".levain/config.json records no coordinator role), and a coordinator runs only in its own "
+                         f"workspace; leave out --cwd to use {default_coordinator_dir()}, or name a missing or empty "
+                         "directory for Levain to set up")
     got = store.coord_set_agent("claude", model=args.model, cwd=str(target))
     remedy = trust_remedy(target)
     _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "trust": remedy},
@@ -1220,7 +1230,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "trust list: run the printed line once and accept the prompt.")
     ca.add_argument("agent", choices=("claude", "codex", "none"))
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
-                    help="The directory the coordinator runs in (default: <levain home>/coordinator).")
+                    help="The directory the coordinator runs in (default: <levain home>/coordinator): a missing or "
+                         "empty one, which Levain sets up, or a coordinator workspace Levain set up before. Your own "
+                         "Levain install is refused.")
     ca.add_argument("--model", default=None, help="The model the session runs (default: Claude Code's own).")
     cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending coordinator's).")
     cl.add_argument("launch_id", nargs="?", default=None, metavar="LAUNCH_ID")

@@ -128,6 +128,17 @@ def workspace(cwd: str | None = None) -> Path | None:
     return None
 
 
+def marked(directory: Path) -> bool:
+    """Whether ``directory`` itself (never an ancestor) is a coordinator workspace by the record the door reads. A
+    directory or record that cannot be read is not one: this answers whether a coordinator may run there, so an
+    unreadable answer refuses. A coordinator never runs in a directory this does not hold for (head ruling 1021-18
+    door r2): an unmarked directory is the operator's, and the door is open there."""
+    try:
+        return _marked(Path(directory))
+    except OSError:
+        return False
+
+
 def refusal(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str | None:
     """Why this command is refused here (the message, with its ``levain <path>:`` prefix), or None to run it."""
     ws = workspace()

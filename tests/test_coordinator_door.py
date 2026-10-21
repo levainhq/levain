@@ -87,3 +87,24 @@ def test_a_launch_in_another_store_is_doored_by_where_it_runs(tmp_path, monkeypa
     monkeypatch.chdir(_workspace(tmp_path))
     assert main(_RECORD) == 1
     assert "levain team record: `levain team record` is the operator's" in capsys.readouterr().err
+
+
+def test_a_codex_coordinator_workspace_is_marked_by_the_one_role_render(tmp_path, capsys, monkeypatch):
+    """Reproduced (door/repro_fix2_BEFORE.txt case 2): the install render refused the coordinator role for codex
+    ("for the claude-code adapter only"), so a Codex coordinator's workspace carried no record and the door was open."""
+    import json
+
+    from levain import host_guard as hg
+    from levain import install as inst
+    from levain.coordinator import door
+    from tests.test_init_answers import _filled
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(hg, "load_managed_settings", lambda platform=None: [])
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    ws = tmp_path / "codex-coordinator"
+    assert inst.run_init(ws, "codex", force=False, answers_file=answers, role="coordinator") == 0
+    assert inst.persisted_role(ws) == "coordinator" and door.marked(ws)
+    assert door.workspace(str(ws)) == ws
