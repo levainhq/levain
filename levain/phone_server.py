@@ -41,6 +41,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import os
 import json
 import re
 import secrets
@@ -972,7 +973,7 @@ def tailscale_name(timeout: float = 5.0) -> "tuple[str | None, str]":
 
 
 def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port: int,
-                     sign_namespaces: "tuple[str, ...]" = ()) -> int:
+                     sign_namespaces: "tuple[str, ...]" = (), link_file: Path | None = None) -> int:
     """``levain consent phone``: serve the phone port until interrupted."""
     if name is None:
         if not tailscale:
@@ -997,6 +998,16 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
         print(f"  signs requests in {sign_dir(queue_dir)} in namespace(s) {', '.join(sign_namespaces)}", flush=True)
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
     print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
+    if link_file is not None:
+        # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
+        from levain.consent.sign import _write_over
+
+        try:
+            _write_over(link_file, json.dumps({"page": page, "phone_token": httpd.phone_token, "pid": os.getpid()}) + "\n")
+        except OSError as exc:
+            print(f"--link-file: cannot write {link_file}: {exc.strerror or exc}", file=sys.stderr)
+            httpd.server_close()
+            return 1
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

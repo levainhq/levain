@@ -113,3 +113,5 @@ button.quiet { font-size: 13px; font-weight: 600; padding: 8px 14px; min-height:
 .cmd button { flex: 0 0 auto; }
 textarea.words { width: 100%; box-sizing: border-box; margin-top: var(--sp-4); font: 15px/1.4 var(--round); color: inherit;
                  background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); padding: 10px; }
+.req.sign.linked { outline: 2px solid currentColor; outline-offset: 2px; }   /* the card a #sign=<id> link opened on */
+.req.sign .actions .option { flex: 1 1 100%; text-align: left; }           /* a choice: one option per row, read whole */
