@@ -813,12 +813,13 @@ def _counted_outcome(row: _Row) -> tuple[str, str, str] | None:
     the terminal row), else ``None``. Parsed only for a withdrawn or expired row: no other state uses one."""
     if row.rstate not in ("withdrawn", "expired") or row.outcome is None:
         return None
+    if row.outcome not in _OUTCOMES:
+        # the queue's CHECK allows only these; anything else is a raw writer's. It is ignored, never mapped: mapping
+        # it would turn damaged data into a receipt of an action that ran. Checked before the time comparison so the
+        # result never depends on timing.
+        return None
     if _stamp(row.closed, "dialog outcome time", row.seq) - _stamp(row.created, "stamp", row.seq) >= SETTLE:
         return None
-    if row.outcome not in _OUTCOMES:
-        # the queue's CHECK allows only these; anything else is a raw writer's, and mapping it would turn damaged
-        # data into a receipt of an action that ran
-        raise ExportError(f"receipt {row.seq}: its dialog outcome {row.outcome!r} is not one the queue writes")
     if row.outcome != "did_not_run" and _TOOL_STATUS.get(row.oevent) is None:
         raise ExportError(f"receipt {row.seq}: its dialog outcome was closed by {row.oevent!r}, not a tool event")
     return row.outcome, row.closed, row.oevent
