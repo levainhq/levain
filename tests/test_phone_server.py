@@ -273,14 +273,16 @@ def test_redeems_count_only_failures_a_device_store_fault_is_503_and_app_reads_t
             os.chmod(db, 0o600)
         assert _call(url + "/webpush/record", token=dev["token"])[0] == 200
 
-        held = [httpd.request_gate.acquire(blocking=False) for _ in range(4)]
+        # the server replies before its handler's finally frees the slot, so the last request may still hold one: wait
+        held = [httpd.request_gate.acquire(timeout=5) for _ in range(4)]
         try:
             assert all(held)
             assert _call(url + "/webpush/record")[0] == 503 and _call(url + "/app/state.json")[0] == 503
             assert _call(url + "/sw.js", token=None)[0] == 200                       # static stays ungated
         finally:
-            for _ in held:
-                httpd.request_gate.release()
+            for got in held:
+                if got:
+                    httpd.request_gate.release()
 
 
 def test_a_device_store_that_cannot_be_stat_ed_is_503_never_an_unknown_token(tmp_path: Path) -> None:

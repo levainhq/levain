@@ -326,6 +326,7 @@ STORE_DIRS = {
     "export/dispatch": ("_levain_export", "levain-dispatch-export", 0o2750),
     "queue/requests": ("_levain_qbroker", "levain-queue", 0o750),
     "queue/answers": ("OP", "levain-queue", 0o770),
+    "contracts": ("_levain_dispatch", "levain-queue", 0o2750),
     "policy": ("R", "R", 0o755), "lineage": ("_levain_control", "levain-lineage", 0o750),
     "keys": ("_levain_keys", "_levain_keys", 0o700), "routes": ("R", "R", 0o755),
     "routes/dispatch": ("_levain_control", "_levain_keys", 0o750),
