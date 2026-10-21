@@ -107,7 +107,7 @@ def clock():
 SESSION_A = Resolved(session="sess-a", kind="interactive", run=None)
 SESSION_B = Resolved(session="sess-b", kind="interactive", run=None)
 RUN = {"run_id": "run-1", "job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "c" * 64,
-       "model_requested": "sonnet"}
+       "model_requested": "sonnet", "repo_root": "/private/var/levain/live/sess-2/repo"}
 
 
 @pytest.fixture

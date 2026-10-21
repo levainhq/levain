@@ -58,6 +58,12 @@ Signature checks tell a refusal from a fault by class: a signature or cancel tha
 run (:class:`levain.authority.VerifierUnavailable`) is raised as itself, and nothing is written. An authority log
 that is readable but refused (not initialised, its anchor refuses it) is a :class:`SignatureRefused`.
 
+THE PUBLISHED CONTRACT (W2-c2, CONTRACT §26 S1-b). A store given ``published_dir`` keeps that directory holding the
+signed record of every live signed job (:mod:`levain.dispatch.published`): written once :meth:`JobStore.sign` has
+committed the signature, removed once the job is terminal, re-synced after every operation (:meth:`JobStore.sweep`
+and each operation's sweep included), so a crash between a commit and the file is repaired by the next call. A
+publish that fails is logged and never fails the operation: the broker then finds no record and every grant queues.
+
 Known edge: until S1 places the control principal (design §8), the store is an operator-uid file, so any process of
 that uid can write it; no executor exists in this slice, so no run rests on it. The filing agent is the name the
 filing door was given (a flag or the agent's own environment), kept for the signer to read, never proven. Stdlib
@@ -68,6 +74,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -87,6 +94,7 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.consent.queue import AuthoritySource
 from levain.dispatch import ContractRefused, DispatchError
+from levain.dispatch import published
 from levain.dispatch import sign as dsign
 from levain.dispatch.contract import ResolvedContract, ResolvedTemplate, parse_contract, resolve_contract
 from levain.dispatch.policy import ProviderPolicy
@@ -99,6 +107,8 @@ __all__ = [
     "CAUSES", "DB_NAME", "EDGES", "FORMAT", "STATES", "TERMINAL", "UNSIGNED_LEASE", "CapabilityRefused", "Job",
     "JobStore", "JobStoreError", "SignatureRefused", "Transition", "TransitionRefused", "default_dispatch_dir",
 ]
+
+log = logging.getLogger("levain.dispatch.jobs")
 
 DB_NAME = "dispatch.db"
 FORMAT = "levain-dispatch-jobs/3"
@@ -430,8 +440,10 @@ class JobStore:
 
     def __init__(self, directory: Path | str | None = None, *,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 ssh_keygen: Path | str | None = None) -> None:
+                 ssh_keygen: Path | str | None = None, published_dir: Path | str | None = None) -> None:
         self.directory = Path(directory) if directory is not None else default_dispatch_dir()
+        # where the signed contracts of live jobs are published for the queue broker (None: nowhere)
+        self.published_dir = None if published_dir is None else Path(published_dir)
         self.path = self.directory / DB_NAME
         self._clock = clock
         self._ssh_keygen = ssh_keygen
@@ -517,12 +529,39 @@ class JobStore:
         what it reads is current. Each transaction reads the clock only AFTER its ``BEGIN IMMEDIATE`` holds the
         lock, so a lock wait can never date a check or a transition at a time already past; the operation's stamp is
         the one its sweep used, and is yielded for its transition."""
-        with self._write() as conn:
-            self._sweep(conn, self._stamp())
-        with self._write() as conn:
-            stamp = self._stamp()
-            self._sweep(conn, stamp)
-            yield conn, stamp
+        try:
+            with self._write() as conn:
+                self._sweep(conn, self._stamp())
+            with self._write() as conn:
+                stamp = self._stamp()
+                self._sweep(conn, stamp)
+                yield conn, stamp
+        finally:
+            # after the commit (or the refusal: the first sweep committed either way)
+            self._publish()
+
+    def _publish(self) -> None:
+        """Sync :attr:`published_dir` to the live signed jobs; a failure is logged, never raised."""
+        if self.published_dir is None:
+            return
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"SELECT j.id, j.digest, j.contract, j.filed_at, j.unsigned_until, j.expires_at, s.payload, "
+                    f"s.signature FROM jobs j JOIN signatures s ON s.job_id = j.id JOIN ({_CURRENT}) c "
+                    f"ON c.job_id = j.id WHERE c.to_state NOT IN ({','.join('?' * len(TERMINAL))}) ORDER BY j.id",
+                    sorted(TERMINAL)).fetchall()
+                store_id = self._store_id(conn)
+            finally:
+                conn.close()
+            live = [published.record(digest=digest, contract=text, payload=json.loads(payload), signature=sig,
+                                     store_id=store_id, job_id=job_id, filed_at=filed_at,
+                                     unsigned_lease_end=unsigned_until, expires_at=expires_at)
+                    for job_id, digest, text, filed_at, unsigned_until, expires_at, payload, sig in rows]
+            published.sync(self.published_dir, live)
+        except Exception:   # noqa: BLE001 - the broker fails closed on a missing record; this store's op stands
+            log.exception("dispatch: the signed contracts could not be published to %s", self.published_dir)
 
     # --- reading, inside a transaction ---------------------------------------------------------------------------
     @staticmethod
@@ -590,8 +629,11 @@ class JobStore:
         """Fail every lapsed job not yet authorised (cause ``lease_lapsed``) at the store's own clock; returns their
         ids. It takes no caller time: a time ahead of the clock would fail live jobs, and a failure is final. The
         clock is read once the write lock is held."""
-        with self._write() as conn:
-            return self._sweep(conn, self._stamp())
+        try:
+            with self._write() as conn:
+                return self._sweep(conn, self._stamp())
+        finally:
+            self._publish()
 
     def _idem_row(self, filer_session: str, idem_key: str) -> tuple[str, str, str] | None:
         with self._write() as conn:

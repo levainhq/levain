@@ -42,14 +42,15 @@ from levain.consent.policy import AGENT_FILE_TOOLS, targets
 from levain.contracts.canon import canonical_bytes
 from levain.dispatch.contract import GRANTABLE, NEW, PathEntry, ResolvedContract
 
-__all__ = ["Allow", "DIGEST_PREFIX", "Queue", "grant_decision", "grant_paths", "no_follow_check", "path_bound_digest",
-           "write_list_match"]
+__all__ = ["Allow", "DIGEST_PREFIX", "Queue", "grant_decision", "grant_paths", "input_bound_digest", "no_follow_check",
+           "path_bound_digest", "paths_decision", "write_list_match"]
 
 DIGEST_PREFIX = "pb1:"
 # the input keys a grantable call may carry; any other key is a field whose meaning this parse cannot tell
 _INPUT_KEYS = {"Write": frozenset({"file_path", "content"}),
                "Edit": frozenset({"file_path", "old_string", "new_string", "replace_all"}),
                PATCH_TOOL: frozenset({"command"})}
+_SHA256_HEX = frozenset("0123456789abcdef")
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
@@ -69,10 +70,19 @@ def path_bound_digest(tool_name: str, paths: Sequence[str], tool_input: Any) -> 
     """``pb1:`` + sha256 of the canonical bytes of ``{"tool", "paths", "input"}``, ``input`` being
     :func:`levain.cockpit.consent.value_sha256` of ``tool_input``. ``paths`` must be sorted strings, each once (one
     meaning, one digest): ValueError otherwise; ConsentError when ``tool_input`` is outside JCS (a float)."""
+    return input_bound_digest(tool_name, paths, value_sha256(tool_input))
+
+
+def input_bound_digest(tool_name: str, paths: Sequence[str], input_sha256: str) -> str:
+    """:func:`path_bound_digest` from the input's hash (64 lowercase hex, what ``value_sha256`` returns) instead of
+    the input: what a party that holds only the hash (the queue broker, from a REQUEST's ``grant`` member) recomputes.
+    ValueError for unsorted or repeated paths, or a hash that is not 64 lowercase hex."""
     paths = list(paths)
     if not all(isinstance(p, str) for p in paths) or paths != sorted(set(paths)):
         raise ValueError("paths must be sorted strings, each once")
-    body = {"tool": tool_name, "paths": paths, "input": value_sha256(tool_input)}
+    if not isinstance(input_sha256, str) or len(input_sha256) != 64 or not set(input_sha256) <= _SHA256_HEX:
+        raise ValueError("the input hash is 64 lowercase hex")
+    body = {"tool": tool_name, "paths": paths, "input": input_sha256}
     return DIGEST_PREFIX + hashlib.sha256(canonical_bytes(body)).hexdigest()
 
 
@@ -178,7 +188,30 @@ def grant_decision(contract: ResolvedContract, agent: str, tool_name: str, tool_
         return Queue(f"the call could not be read: {type(exc).__name__}")
 
 
-def _decide(contract: Any, agent: Any, tool_name: Any, tool_input: Any, root: Any) -> Allow | Queue:
+def paths_decision(contract: ResolvedContract, agent: str, tool_name: str, paths: Sequence[str], *,
+                   root: str) -> Allow | Queue:
+    """:func:`grant_decision` for a caller that holds the call's paths and not its input: the queue broker, whose
+    paths come from a REQUEST's ``grant`` member and are bound to the sealed request by its ``pb1:`` digest
+    (:func:`input_bound_digest`), never trusted on their own. ``paths`` must be what :func:`grant_paths` returns for a
+    grantable call of ``agent``: absolute strings, sorted, each once, and exactly one for a tool that names one
+    ``file_path``. Then the same checks in the same order. Never raises."""
+    try:
+        early = _preflight(contract, agent, tool_name, root)
+        if early is not None:
+            return early
+        if tool_name not in GRANTABLE or tool_name not in AGENT_FILE_TOOLS.get(agent, frozenset()):
+            return Queue(f"{tool_name[:40]} is not a grantable file tool of {agent[:40]}")
+        if not isinstance(paths, (list, tuple)) or not paths or not all(isinstance(p, str) for p in paths) \
+                or list(paths) != sorted(set(paths)) or not all(posixpath.isabs(p) for p in paths):
+            return Queue("the paths are not absolute strings, sorted, each once")
+        if tool_name != PATCH_TOOL and len(paths) != 1:
+            return Queue(f"a {tool_name} call names one file_path")
+        return _check_paths(contract, tool_name, tuple(paths), root)
+    except Exception as exc:        # the caller's fallback is the queue
+        return Queue(f"the call could not be read: {type(exc).__name__}")
+
+
+def _preflight(contract: Any, agent: Any, tool_name: Any, root: Any) -> Queue | None:
     if not isinstance(contract, ResolvedContract):
         return Queue("the contract is not a resolved dispatch contract")
     if not isinstance(agent, str) or not isinstance(tool_name, str):
@@ -188,9 +221,20 @@ def _decide(contract: Any, agent: Any, tool_name: Any, tool_input: Any, root: An
     if (not isinstance(root, str) or "\0" in root or not posixpath.isabs(root) or posixpath.normpath(root) != root
             or root == "/"):
         return Queue("the worktree root is not an absolute, normalised directory path")
+    return None
+
+
+def _decide(contract: Any, agent: Any, tool_name: Any, tool_input: Any, root: Any) -> Allow | Queue:
+    early = _preflight(contract, agent, tool_name, root)
+    if early is not None:
+        return early
     paths = grant_paths(agent, tool_name, tool_input, root)
     if paths is None:
         return Queue(f"the {str(tool_name)[:40]} input is not read whole, so what it touches cannot be told")
+    return _check_paths(contract, tool_name, paths, root)
+
+
+def _check_paths(contract: ResolvedContract, tool_name: str, paths: tuple[str, ...], root: str) -> Allow | Queue:
     checks = []
     for p in paths:
         if posixpath.normpath(p) != p or not p.startswith(root + "/"):
