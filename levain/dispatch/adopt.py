@@ -936,15 +936,16 @@ def _finish(store: JobStore, job: Job) -> Landing:
 
 
 def _taken(store: JobStore, job: Job) -> Landing | None:
-    """Where another land already took ``job``, as this land reports it: an ``authorised`` job is finished from ITS
-    intent (the authorisation written first is the authority), ``adopted`` and a ``base_moved`` failure are said as
-    they are; anything else is ``None``. The one classification for every point a land can find its job moved."""
+    """A ``job`` already past the floor (another land took it, or it was settled before this land ran), as this land
+    reports it: an ``authorised`` job is finished from ITS intent (the authorisation written first is the authority),
+    ``adopted`` and a ``base_moved`` failure are said as they are; anything else is ``None``. The one classification
+    for every point a land can find its job moved."""
     if job.state == "authorised":
         return _finish(store, job)
     if job.state == "adopted":
-        return Landing(outcome="adopted", job=job, message="another land adopted this job")
+        return Landing(outcome="adopted", job=job, message="the job is already adopted")
     if job.state == "failed" and job.history[-1].cause == "base_moved":
-        return Landing(outcome="failed", job=job, message="another land found the base moved")
+        return Landing(outcome="failed", job=job, message="the job failed: its base moved")
     return None
 
 
