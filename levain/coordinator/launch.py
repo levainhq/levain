@@ -239,8 +239,13 @@ def _queued(store: CoordStore) -> list[Any]:
 
 
 def _brief_text(store: CoordStore, launch: Any) -> str:
+    from levain.install import coordinator_levain
+
     q = shlex.quote(str(store.directory))
     tail = f"--queue-dir {q}"
+    # the one spelling the coordinator install's allow rules name (install.coordinator_levain): a session that runs
+    # these exactly as written is not asked, and a bare `levain` is neither pre-approved nor sure to be on its PATH
+    lv = coordinator_levain(sys.executable)
     lines = [
         f"# Levain {launch.role} brief: launch {launch.launch_id}",
         "",
@@ -252,21 +257,21 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "One session holds the coordinator role at a time. Every thread write you make carries the lease token, and is "
         "refused once the lease is lost or past its until.",
         "",
-        f"- Claim it first: `levain coord claim --launch {launch.launch_id} --session {launch.session_key} {tail}`. "
+        f"- Claim it first: `{lv} coord claim --launch {launch.launch_id} --session {launch.session_key} {tail}`. "
         "It prints your token N.",
-        f"- Keep it while you work: `levain coord beat --token N {tail}` (each beat holds it "
+        f"- Keep it while you work: `{lv} coord beat --token N {tail}` (each beat holds it "
         f"{int(LEASE_TTL.total_seconds() // 60)} more minutes).",
-        f"- See it: `levain coord status {tail}`.",
-        f"- Hand it back when you stop: `levain coord release --by coordinator --token N {tail}`.",
+        f"- See it: `{lv} coord status {tail}`.",
+        f"- Hand it back when you stop: `{lv} coord release --by coordinator --token N {tail}`.",
         "",
         "## Your writes",
         "",
         f"Every write goes `--by coordinator --token N {tail}`:",
         "",
-        f"- split a drop into threads: `levain drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
+        f"- split a drop into threads: `{lv} drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
-        f"- move or fix a thread: `levain thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
-        f"- read: `levain drops list {tail}`, `levain drops show DROP_ID {tail}`, `levain thread list {tail}`.",
+        f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
+        f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
         "",
         "## The drops waiting",
         "",
@@ -283,7 +288,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         words = json.dumps(unshowable.mark(d.words), ensure_ascii=False)
         lines.append(f"- `{d.drop_id}` ({d.surface}, {d.received_at}, {where}): {words}")
     lines.append("")
-    lines.append(f"More: `levain drops list {tail}`.")
+    lines.append(f"More: `{lv} drops list {tail}`.")
     return "\n".join(lines) + "\n"
 
 

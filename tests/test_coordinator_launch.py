@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -192,8 +194,17 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert stat.S_IMODE(brief.stat().st_mode) == 0o600
     text = brief.read_text()
     assert launch_id in text and ln.session_key in text and '"please fix the flaky test"' in text
-    assert f"levain coord claim --launch {launch_id} --session {ln.session_key}" in text
+    from levain import install as inst
+    lv = inst.coordinator_levain(sys.executable)
+    assert f"`{lv} coord claim --launch {launch_id} --session {ln.session_key}" in text
     assert "--by coordinator --token N" in text and "DATA" in text
+    # every levain command the brief gives is one the coordinator install's allow rules match as written (Claude Code
+    # matches a rule against the command's own spelling: a bare `levain` would be asked about, 1021+11's real launch)
+    prefixes = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst.coordinator_allow(sys.executable)]
+    commands = [c for c in re.findall(r"`([^`]+)`", text) if "-m levain" in c or c.startswith("levain")]
+    assert len(commands) >= 8 and "levain coord" not in text.replace(f"{lv} coord", "")
+    for command in commands:
+        assert any(command.startswith(p + " ") for p in prefixes), command
     # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says
     assert store.coord_claim(launch_id, ln.session_key) == store.coord_status()["lease"]["token"]
 
@@ -462,7 +473,9 @@ def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_i
     _main(qdir, capsys, "coord", "agent", "claude")
     target = (tmp_home / ".levain" / "coordinator").resolve()
     bash = [r for r in allow(target) if r.startswith("Bash(")]
-    assert bash == ["Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]
+    lv = inst.coordinator_levain(sys.executable)
+    assert lv == f"{shlex.quote(sys.executable)} -P -m levain"
+    assert bash == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
     assert inst.persisted_role(target) == "coordinator"
     assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
     assert [r for r in allow(target) if r.startswith("Bash(")] == bash

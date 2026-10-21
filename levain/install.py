@@ -2042,7 +2042,7 @@ def _claude_code_settings(install: Path, adapter_root: Path, python_path: str,
             _apply_messaging(text, persisted_messaging(install),
                              keep_from=install / ".claude" / "settings.json"))
     text = _apply_consent_hook(text, python_path, install, "claude-code")
-    text = _apply_role(text, persisted_role(install))
+    text = _apply_role(text, persisted_role(install), python_path)
     if not local:
         return text, {}
     doc = json.loads(text)
@@ -2756,7 +2756,22 @@ def persisted_consent_hook(install: Path) -> str:
 # other command asks as in any install. The role is meant for an install `levain coord agent` made itself, never a
 # live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
 ROLE_CHOICES = ("coordinator",)
-COORDINATOR_ALLOW = ("Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)")
+COORDINATOR_VERBS = ("coord", "drops", "thread")
+
+
+def coordinator_levain(python_path: str) -> str:
+    """The command a coordinator runs levain by: ``python_path -P -m levain``, quoted for the shell. The launch brief
+    and the allow rules both take it from here, because Claude Code matches an allow rule against the command as
+    written (a bare ``levain coord status`` does not match a rule naming the interpreter, nor the reverse), and a
+    background session's PATH comes from Claude Code's own supervisor, not from Levain, so a bare ``levain`` is not
+    a name the session can be relied on to find. ``-P`` keeps the session's directory off ``sys.path``."""
+    return f"{shlex.quote(python_path)} -P -m levain"
+
+
+def coordinator_allow(python_path: str) -> tuple[str, ...]:
+    """The coordinator's allow rules, one per verb, each naming :func:`coordinator_levain`."""
+    command = coordinator_levain(python_path)
+    return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
 
 
 def persisted_role(install: Path) -> str | None:
@@ -2803,12 +2818,13 @@ def _write_role(install: Path, role: str, emit: Callable[[str], None]) -> None:
         _atomic_write_text(config_path, json.dumps({**existing, "role": role}, indent=2, ensure_ascii=False) + "\n")
     except OSError as e:
         raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
-    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(COORDINATOR_ALLOW)} without asking)")
+    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(sys.executable))} "
+         "without asking)")
 
 
-def _apply_role(settings_text: str, role: str | None) -> str:
-    """``settings_text`` (a rendered Claude Code settings.json) with the coordinator's allow rules appended to
-    ``permissions.allow`` when ``role`` is ``coordinator``; unchanged otherwise."""
+def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
+    """``settings_text`` (a rendered Claude Code settings.json) with the coordinator's allow rules for
+    ``python_path`` appended to ``permissions.allow`` when ``role`` is ``coordinator``; unchanged otherwise."""
     if role != "coordinator":
         return settings_text
     doc = json.loads(settings_text)
@@ -2816,7 +2832,7 @@ def _apply_role(settings_text: str, role: str | None) -> str:
     allow = perms.setdefault("allow", []) if isinstance(perms, dict) else None
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
-    allow.extend(rule for rule in COORDINATOR_ALLOW if rule not in allow)
+    allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
