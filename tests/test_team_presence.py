@@ -332,3 +332,70 @@ def test_a_held_entry_publishes_once_it_counts_after_a_later_entry_went_out_past
     assert "bypassed" in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
     assert not git("for-each-ref", "refs/levain/held/", cwd=ana).strip()
     assert team("verify", repo=ana) == 0
+
+
+def test_an_interrupted_write_on_a_fido_clone_is_signed_only_after_it_is_named_on_a_terminal(tmp_path, monkeypatch,
+                                                                                            capsys) -> None:
+    # reproduced on 9537e31a (teampres/fix4/repro_before.txt (R)): killed after the flush, before the commit, the next
+    # non-interactive sync committed the entry under an unnamed signature and published it
+    from levain.team import entry as E
+    from levain.team import transport as TR
+    from levain.team.ledger_api import open_ledger
+
+    class Killed(BaseException):
+        pass
+
+    def killed(self, message):
+        raise Killed
+
+    monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
+    pub, _flags = fido_key(tmp_path, monkeypatch)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com",
+                "--signing-key", str(pub), repo=ana) == 0
+    gl = open_ledger(TR.Repo.discover(ana))
+    with monkeypatch.context() as m:
+        m.setattr(TR.GitLedger, "_commit", killed)
+        with pytest.raises(Killed):
+            gl.append(E.build("ana", "decision", kind="ruling", owner="ana", paths=["a.py"], words="crashed",
+                              agent="human"), push=False)
+    wt, tip = gl.wt, ledger_tip(tmp_path)
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    err = capsys.readouterr().err
+    assert "decision ana-" in err and ": crashed" in err and "`levain team sync` in a terminal" in err
+    assert "crashed" not in git("log", "-p", "HEAD", cwd=wt) and git("status", "--porcelain", cwd=wt).strip()
+    assert ledger_tip(tmp_path) == tip
+
+    monkeypatch.setattr(TR, "_interactive", lambda: True)
+    assert team("sync", repo=ana) == 0
+    assert "to sign decision ana-" in capsys.readouterr().err
+    assert "crashed" in git("log", "-p", "levain-team-ledger", cwd=tmp_path / "origin.git")
+    assert [e["words"] for e in open_ledger(TR.Repo.discover(ana)).ledger().in_force] == ["crashed"]
+
+
+def test_a_team_change_committed_with_a_line_outside_an_entry_file_refuses_by_name(tmp_path, monkeypatch,
+                                                                                  capsys) -> None:
+    # reproduced on 9537e31a (teampres/fix4/repro_before.txt (J)): a sealed line at ledger/junk in one commit with a
+    # team change passed as appended ledger lines, and sync published it
+    from levain.team import transport as TR
+    from levain.team.ledger_api import open_ledger
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "k@test", "-f", str(tmp_path / "k")],
+                   check=True, capture_output=True)
+    ana = project(tmp_path)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--member", "ben=ben@ex.com",
+                "--signing-key", str(tmp_path / "k.pub"), "--allow-file-keys", repo=ana) == 0
+    assert record(ana, "first") == 0
+    wt = open_ledger(TR.Repo.discover(ana)).wt
+    line = next((wt / "ledger").rglob("*.jsonl")).read_text().splitlines()[0]
+    (wt / "ledger" / "junk").write_text(line + "\n")
+    git("add", "ledger/junk", cwd=wt)
+    with monkeypatch.context() as m:
+        m.setattr(TR.GitLedger, "_recover_dirty", lambda self: None)
+        assert team("member", "remove", "ben", "--no-push", repo=ana) == 0
+    head, tip = git("rev-parse", "HEAD", cwd=wt), ledger_tip(tmp_path)
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    assert "AND ledger/junk" in capsys.readouterr().err
+    assert git("rev-parse", "HEAD", cwd=wt) == head and not git("status", "--porcelain", cwd=wt).strip()
+    assert ledger_tip(tmp_path) == tip
