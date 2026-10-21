@@ -2514,7 +2514,18 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
                                "namespace beginning 'levain', one levain verifies in, or git, file or email is "
                                "refused.")
+    cs_phone.add_argument("--link-file", dest="link_file", type=Path, default=None,
+                          help="Also write this run's page link and phone token to FILE (JSON, mode 0600), for a "
+                               "caller that builds a link straight onto one sign request's card (#sign=<id>); removed "
+                               "when this run stops. Its token changes every run unless --token-file keeps it.")
+    cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
+                          help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
+                               "make one and write it, so a restart keeps the links the phone already holds.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
+
+    from levain.consent.sign_setting import add_parser as add_signed_answers_parser
+
+    add_signed_answers_parser(cs_sub)
 
 
 def _add_push_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -2584,7 +2595,9 @@ def _cmd_consent_phone(args: argparse.Namespace) -> int:
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
     return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
                             port=DEFAULT_PHONE_PORT if args.port is None else args.port,
-                            sign_namespaces=tuple(dict.fromkeys(args.sign_namespaces or ())))
+                            sign_namespaces=tuple(dict.fromkeys(args.sign_namespaces or ())),
+                            link_file=args.link_file.expanduser() if args.link_file is not None else None,
+                            token_file=args.token_file.expanduser() if args.token_file is not None else None)
 
 
 def _consent_queue_dir(args: argparse.Namespace) -> Path:

@@ -6,6 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
+- **A link straight onto one card.** `#sign=<id>` on the phone page opens it on that request. `levain consent phone --link-file` writes the page and token for a caller building such a link; `--token-file` keeps the token across restarts, so links you already hold keep working.
+- **Opt out of signed answers.** `levain consent signed-answers --set off|authority-only|all` (default authority-only) is read by a caller before it files: off files nothing; authority-only signs only answers that authorise an act.
+
 ## [0.11.13] — 2026-10-20
 
 ### Security
