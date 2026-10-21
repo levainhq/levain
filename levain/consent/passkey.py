@@ -40,7 +40,8 @@ import urllib.parse
 
 from levain.consent.record import ANSWER_NAMESPACE
 
-__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "answer_signature_problem", "b64url_decode", "challenge", "is_host_name", "key_application",
+__all__ = ["KEY_TYPE", "SIG_TYPE", "PasskeyError", "answer_signature_problem", "authority_signature_problem",
+           "b64url_decode", "challenge", "is_host_name", "key_application",
            "public_key_line", "to_sshsig"]
 
 KEY_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
@@ -220,8 +221,10 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     the key's own ``https://<host>`` (:func:`_client_origin`, which ``page_origin`` pins on ``localhost``). Among
     levain's own verifiers, the consent queue accepts a passkey's signature only in its answer, ruling and away-leave
     namespaces (it runs this check for all three), the authority replay accepts it on a ``revoke_grant`` link only
-    (and runs this check on it at every replay), and the broker refuses it for anything. The phone port's sign
-    requests (:mod:`levain.consent.sign`) also run this check, for a caller outside levain, in namespaces levain never verifies; so does dispatch (:mod:`levain.dispatch.sign`), for the operator's
+    (and runs :func:`authority_signature_problem`, this check with https required, at every replay), and the
+    broker refuses it for anything. The phone port's sign requests (:mod:`levain.consent.sign`) also run this
+    check, for a caller outside levain, in namespaces levain never verifies; so does dispatch
+    (:mod:`levain.dispatch.sign`), for the operator's
     signatures in its own namespaces (each one a ``levain-dispatch-`` row of ``levain/contracts/namespaces.py``). Its
     refusals therefore name a signature, never an answer."""
     try:
@@ -273,6 +276,21 @@ def answer_signature_problem(signature: str, public_key: str, page_origin: "str 
     except PasskeyError as exc:
         return str(exc)
     return None
+
+
+def authority_signature_problem(signature: str, public_key: str) -> str | None:
+    """Why ``signature`` is not a passkey signature the authority log takes, or None: :func:`answer_signature_problem`
+    with no ``localhost`` key at all. A link in the log is re-verified at every replay with no page to pin, and a
+    localhost origin then takes any port, so any program on this machine could have served the page that asked for
+    it. A key made on an https name is held to exactly ``https://<that name>``, the name its public key carries."""
+    try:
+        _key_blob, application = _key_parts(public_key)
+    except (ValueError, struct.error, UnicodeError, binascii.Error, PasskeyError):
+        return "the passkey's public key cannot be read"
+    if application == "localhost":
+        return ("a passkey made on localhost signs no authority link (its page is http on this machine, which any "
+                "program here can serve); sign it with a passkey made on the phone page's https name")
+    return answer_signature_problem(signature, public_key)
 
 
 def to_sshsig(public_key: str, authenticator_data: bytes, client_data_json: bytes, der_signature: bytes,
