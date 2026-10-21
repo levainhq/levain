@@ -1455,14 +1455,14 @@ def main(argv: list[str] | None = None) -> int:
         # The re-exec lifts --api-key before argparse sees it; a command without that option would
         # otherwise drop the key silently instead of rejecting it (L3 r2).
         parser.error("unrecognized arguments: --api-key")
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        # a session Levain launched keeps to the coordinator's door, in every tree (levain.coordinator.door)
-        from levain.coordinator.door import refusal
+    # inside the coordinator's workspace the CLI keeps to the coordinator's door, in every tree
+    # (levain.coordinator.door): decided by where this runs, never by a session variable
+    from levain.coordinator.door import refusal
 
-        refused = refusal(parser, args)
-        if refused is not None:
-            print(refused, file=sys.stderr)
-            return 1
+    refused = refusal(parser, args)
+    if refused is not None:
+        print(refused, file=sys.stderr)
+        return 1
     return args.func(args)
 
 

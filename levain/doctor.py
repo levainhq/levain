@@ -323,8 +323,8 @@ def _check_consent_limits() -> list[CheckResult]:
 
 def _check_host_awake() -> list[CheckResult]:
     """Why this host will or will not sleep (C7): whether the idle-sleep assertion is held for a working work thread.
-    Advisory: no row until a coordinator store exists (read only, never created here); never a failure, because
-    sleeping with nothing working is the machine's own setting."""
+    Advisory: no row until a coordinator store exists (read only, never created here), a warn row when one exists and
+    cannot be read; never a failure, because sleeping with nothing working is the machine's own setting."""
     from levain.install import _consent_queue_dir
 
     name = "host sleep"

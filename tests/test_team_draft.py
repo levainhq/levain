@@ -55,16 +55,24 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
         T.add_draft(store, "decision", words="x", by="coordinator", token=token + 1)
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     args = ["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana), "--queue-dir", str(qdir)]
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")      # a session Levain launched
+    monkeypatch.chdir(_coordinator_workspace(ana.parent))       # inside the coordinator's workspace
     assert levain_main(args) == 1                               # the coordinator's door refuses it
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before and T.get_draft(store, d["draft_id"])["state"] == "drafted"
-    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")                # the operator's own terminal
+    monkeypatch.chdir(ana.parent)                               # the operator's own terminal
     assert levain_main(args) == 0
     v = T.get_draft(store, d["draft_id"])
     assert v["state"] == "promoted" and v["ledger_id"]
     assert v["ledger_id"] in git("show", "levain-team-ledger:" + _ledger_file(ana), cwd=ana)
     with pytest.raises(CoordError):          # promoted once
         T.mark_promoted(store, d["draft_id"], "x-1")
+
+
+def _coordinator_workspace(root):
+    """A directory the coordinator install rendered: its ``.levain/config.json`` records the role."""
+    ws = root / "coordinator"
+    (ws / ".levain").mkdir(parents=True, exist_ok=True)
+    (ws / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    return ws
 
 
 def _ledger_file(ana):
@@ -86,21 +94,21 @@ def test_draft_rows_are_append_only_and_final(world):
 def test_a_launched_session_keeps_to_the_door_in_every_tree(world, tmp_path, monkeypatch, capsys):
     """Reproduced (door/door_probe_BEFORE.txt): a launched session's `team record` signed into the ledger as the
     human, and `coord take --queue-dir <empty dir>` took the role, because the door looked at three trees only and
-    only in the store the command named. Default-deny now, read from the default store too."""
+    only in the store the command named. Default-deny now, inside the coordinator's workspace."""
     ana, qdir, store, token = world
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))            # qdir is the default consent dir, as installed
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+    monkeypatch.chdir(_coordinator_workspace(tmp_path))
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     for argv in (["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana), "--no-push"],
                  ["envelope", "list", "--thread", "th-x"],
                  ["coord", "take", "--queue-dir", str(tmp_path / "empty")],
                  ["team", "draft", "add", "finding", "--summary", "s", "--by", "operator"]):
         assert levain_main(argv) == 1, argv
-        assert "session Levain launched" in capsys.readouterr().err, argv
+        assert "the coordinator's workspace" in capsys.readouterr().err, argv
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
     assert levain_main(["thread", "list"]) == 0
     assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
     assert levain_main(["team", "status", "--repo", str(ana)]) == 0
-    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")                # the operator: the same record runs
+    monkeypatch.chdir(tmp_path)                                 # the operator, outside it: the same record runs
     assert levain_main(["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana),
                         "--no-push"]) == 0
