@@ -144,7 +144,8 @@ def test_an_ended_hold_records_expired_once_and_never_after_a_decision(L, broker
     clock["now"] = NOW + timedelta(minutes=5)
     for _ in range(2):
         assert ask(broker, open_rid)["refused"] == "request-expired"
-        assert ask(broker, done)["refused"] == "request-expired"
+        # W2-c3: an answer signed in time is the decision whenever it is read, the hold ended or not
+        assert ask(broker, done)["decision"] == "allow"
     assert states(L, open_rid) == ["pending", "expired"]
     assert states(L, done) == ["pending", "allowed"]
 

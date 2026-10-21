@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 
@@ -27,8 +28,10 @@ from levain.dispatch.grant import (Allow, Queue, grant_paths, input_bound_digest
                                    paths_decision)
 from levain.dispatch.jobs import JobStore
 from levain.qbroker import grants
+from levain.qbroker import operator as qoperator
 from levain.qbroker.broker import Broker, Resolved, resolved_from
 from levain.qbroker.grants import contract_authority
+from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, GRANT_ROW_FORMAT, QueueStore
@@ -521,21 +524,54 @@ def _operator_answer(w, rid, decision, *, sign=True):
     row = QueueStore(w["L"] / "queue").read_request(rid)
     ap = answer_payload(queue_id=row["queue_id"], request=request_of(row["request"]), decision=decision,
                         signer_fp=w["keys"]["laptop"].fp, signed_at=utc_stamp(w["clock"].now),
-                        receipts_head={"size": 0, "root": "0" * 64})
+                        receipts_head=Receipts(w["L"] / "queue", create=False).head())
     sig = w["keys"]["laptop"].sign(answer_message(ap), ANSWER_NAMESPACE) if sign else "x"
     (w["L"] / "queue" / "answers" / f"{rid}.json").write_bytes(canonical_bytes(
         {"format": ANSWER_ROW_FORMAT, "payload": ap, "signature": sig}))
 
 
-def test_the_operators_signed_deny_outranks_a_grant_row(world):
-    """L3 r1 D."""
+def _receipts(w, rid):
+    conn = sqlite3.connect(f"file:{w['L'] / 'queue' / 'requests' / 'receipts.db'}?mode=ro", uri=True)
+    try:
+        return [(s, json.loads(f)) for s, f in conn.execute(
+            "SELECT state, face FROM receipts WHERE request_id = ? ORDER BY seq", (rid,))]
+    finally:
+        conn.close()
+
+
+def test_a_granted_request_has_its_own_receipt_and_reads_settled(world):
+    """Head ruling 1020+49 (the S2b-1 merge): pending then allowed, the grant row the authority, no signed head;
+    the operator lists it settled and is refused an answer payload."""
     b = broker(world)
     rid = b.handle(1, frame(world, "deny", "Write", cc(world, "src/a.py")))["request_id"]
     assert QueueStore(world["L"] / "queue").has_grant(rid) and ask(b, rid)["decision"] == "allow"
+    recs = _receipts(world, rid)
+    assert [s for s, _ in recs] == ["pending", "allowed"]
+    face = recs[1][1]
+    assert face["gate"] == {"verdict": "approved", "by": "binding", "binding_id": f"grant-{rid}"}
+    assert face["authority_scope"]["grantor"] == "binding"
+    assert face["authority_scope"]["binding_id"] == f"grant-{rid}"
+    assert face["authority_scope"]["grant"] == (f"contract-grant:{world['run']['contract_digest']} "
+                                                f"signer={world['keys']['phone'].fp}")
+    assert "receipts_head" not in json.dumps(face) and "signed-answer" not in json.dumps(face)
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    assert listed[rid].state == "allowed" and listed[rid].settled
+    with pytest.raises(qoperator.OperatorError, match="already allowed"):
+        qoperator.answer_payload(world["L"] / "queue", rid, "deny", world["keys"]["laptop"].fp,
+                                 now=world["clock"].now)
+
+
+def test_a_signed_deny_for_a_granted_request_is_refused_and_the_grant_stands(world):
+    """Head ruling 1020+49 (supersedes W2-c3 L3 r1 D, 'his deny wins'): a granted request is SETTLED; an answer
+    written past the operator library, signed by an enrolled key over the real head, is refused, never recorded."""
+    b = broker(world)
+    rid = b.handle(1, frame(world, "deny", "Write", cc(world, "src/a.py")))["request_id"]
+    before = _receipts(world, rid)
     _operator_answer(world, rid, "deny")
-    assert ask(b, rid)["decision"] == "deny"
+    assert ask(b, rid)["decision"] == "allow"
     assert broker(world).handle(1, {"v": 1, "op": "ANSWER?", "id": next(_ids), "cap": "cap-g",
-                                    "request_id": rid})["decision"] == "deny"
+                                    "request_id": rid})["decision"] == "allow"
+    assert _receipts(world, rid) == before
 
 
 def test_an_answer_that_is_not_authority_does_not_unseat_the_grant_and_refuses_alone(world):
