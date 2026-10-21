@@ -129,10 +129,8 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false"]
 
 
-# `levain team record` (every entry but the edit hook's ack) needs a signature with user presence (Phill 10-21 "12a").
-# A test-only seam: the suite signs with throwaway file keys and turns it off; the rule's own tests set it back. A team
-# turns the rule off for itself only through its counted ``allow_file_keys``.
-_REQUIRE_PRESENCE = True
+# `levain team record` (every entry but the edit hook's ack) needs a signature with user presence where the team refuses
+# file keys (Phill 10-21 "12a"); the rule and its test seam are tenure's (``presence_required``), judged on read.
 PRESENCE_REFUSAL = (
     "refused: a team entry is signed with a key that proves a person was present (Touch ID or a security key), and "
     "{why}. Fix: make a FIDO key (`ssh-keygen -t ecdsa-sk` or `-t ed25519-sk`; Touch ID through an sk provider "
@@ -154,7 +152,7 @@ def ledger_env(**extra: str) -> dict[str, str]:
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
-        input_text: str | None = None) -> subprocess.CompletedProcess:
+        input_text: str | None = None, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     # The allowlist plus what a fetch or push needs: proxies and CA bundles, git's own settings,
     # and the tokens gh's credential helper reads (levain.launch: never a copy of os.environ).
     env = child_env(*NETWORK, "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
@@ -165,6 +163,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true", GIT_NO_REPLACE_OBJECTS="1",
                GIT_GRAFT_FILE="/dev/null")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
+    env.update(extra_env or {})     # a signing call's environment (the FIDO provider, no passphrase prompt)
     try:
         cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
                             timeout=timeout, input=input_text,
@@ -504,9 +503,11 @@ class GitLedger:
             self.signing_pubkey()   # raises the how-to
         return S.sign_config(key)
 
-    def _sign_env(self) -> dict[str, str]:
+    def _sign_env(self, key: str | None = None) -> dict[str, str]:
+        """The signing environment for the key actually signing: ``key`` when given (init's genesis, before the key is
+        saved), else this clone's own. Pass it to every signing git call: a Touch ID key signs only with its provider."""
         from . import signing as S
-        return S.signing_env(self.signing_key)
+        return S.signing_env(key or self.signing_key)
 
     def _remember_own_key(self) -> None:
         fps = list(self.state().get("own_keys") or [])
@@ -542,7 +543,7 @@ class GitLedger:
         tip = rev or self.head()
         clone = self.clone()
         key = json.dumps(["derive-v1", T.RULES, S.CACHE_SCHEMA, tip, clone.pinned_root, clone.anchor,
-                          sorted(clone.accepted.items()), sorted(clone.distrust)])
+                          sorted(clone.accepted.items()), sorted(clone.distrust), T._REQUIRE_PRESENCE])
         if self._dcache and self._dcache[0] == key:
             return self._dcache[1]
         try:
@@ -795,7 +796,7 @@ class GitLedger:
         tree = git(["mktree"], top, input_text="\n".join(rows) + "\n").stdout.strip()
         cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(key), "commit-tree", "-S", tree, "-m", message],
                             cwd=str(top), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
-                            env=ledger_env(**self._sign_env()))
+                            env=ledger_env(**self._sign_env(key)))
         if cp.returncode != 0:
             raise TeamError(f"could not sign the genesis commit: {(cp.stderr or cp.stdout).strip()[-200:]}")
         return cp.stdout.strip()
@@ -1347,23 +1348,22 @@ class GitLedger:
                             f"{author} <this machine's public key>`, then `levain team sync` here (a member who lost "
                             "every key is invited again under a new handle)")
 
-    def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0, presence: bool = True) -> dict:
+    def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
         """Validate, seal and append one entry to this author's file for this clone; commit; push.
 
         A refusal (EntryError) writes nothing. A push failure leaves the entry committed locally and
         raises TeamError saying so; the next write or `levain team sync` pushes it.
 
-        ``presence`` (the default; Phill 10-21 "12a"): unless the team's counted ``allow_file_keys`` is on, the entry is
-        written only under a FIDO key (Touch ID, a security key) and only if the commit's signature carries the user
-        -presence flag; anything else is refused and nothing is written or pushed. A same-uid program can use a file or
-        agent key without the person; it cannot touch the key. False only for the edit hook's ack, an entry an agent
-        writes on each acknowledged edit and labels as its own.
+        Presence (Phill 10-21 "12a"): where the team refuses file keys, an entry counts only if the commit adding it is
+        signed with user presence (a FIDO key's touch); the derivation decides that on every read
+        (``tenure.presence_required``), so no caller can waive it. Here it is the tidy path: a key that can never
+        touch is refused before anything is written, and a commit the derivation does not count is undone.
         """
         # the whole append is one op, waited for up to its own lock_timeout (the hook's ack gives up in seconds and says
         # so): a pin moved between its validation and its commit filed it under another ledger (code L3 r7 codex 1)
         deadline = time.monotonic() + lock_timeout     # one budget for both waits (code L3 r8 complement 1)
         with self.op(timeout=lock_timeout):
-            return self._append_in_op(entry, push=push, deadline=deadline, presence=presence)
+            return self._append_in_op(entry, push=push, deadline=deadline)
 
     def _presence_key_problem(self) -> str | None:
         """Why this clone's signing key can never sign with user presence (None for a FIDO key)."""
@@ -1378,7 +1378,7 @@ class GitLedger:
             fp = "(unreadable)"
         return f"this clone signs with the {kind} key {fp}, which any program running as you can use without you"
 
-    def _append_in_op(self, entry: dict, *, push: bool, deadline: float, presence: bool = True) -> dict:
+    def _append_in_op(self, entry: dict, *, push: bool, deadline: float) -> dict:
         self.require_joined()
         self._require_own_key_in_force(entry["author"])
         left = deadline - time.monotonic()
@@ -1388,11 +1388,12 @@ class GitLedger:
         with self.lock(timeout=left):
             self._recover_dirty()
             self._dcache = None
-            need_presence = presence and _REQUIRE_PRESENCE and not self.derivation().team.allow_file_keys
+            from . import tenure as T
+            need_presence = T.presence_required(self.derivation().team.allow_file_keys, entry.get("type"))
             fido = self._presence_key_problem() is None
             if need_presence and not fido:
                 raise TeamError(PRESENCE_REFUSAL.format(why=self._presence_key_problem()))
-            if fido and not presence:
+            if fido and entry.get("type") == "ack":
                 # the edit hook's ack: a FIDO key would wait (up to the commit timeout) for a touch nobody was asked for
                 raise TeamError("not recorded: this clone signs with a security key or Touch ID, which asks for a touch "
                                 "on every signature, and an automatic acknowledgement never asks for one")
@@ -1424,10 +1425,15 @@ class GitLedger:
             before = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             git(["add", "--", str(path.relative_to(self.wt))], self.wt)
             self._commit(f"levain team: {sealed['type']} {sealed['id']}")
-            if need_presence:
-                self._require_presence_on_head(before)
             self._dcache = None
             d = self.derivation()
+            if sealed["hash"] in d.presence_refused:
+                # the derivation's own verdict, the one every reader reaches: not in force, so not kept (nothing pushed)
+                git(["reset", "-q", "--hard", before], self.wt, check=False)
+                self._dcache = None
+                raise TeamError(PRESENCE_REFUSAL.format(
+                    why="the commit was undone: the signature on it carries no user-presence flag (a key made with "
+                        "no-touch-required, or the touch was skipped)"))
             if d.judged != "full":
                 # frozen: an append still lands (it is WAITING, not enforced, until the owner resolves the freeze); the
                 # read-back is of the committed line itself
@@ -1446,20 +1452,6 @@ class GitLedger:
                 raise TeamError(f"recorded {sealed['id']} locally, but the push failed ({exc}); "
                                 "it goes out with the next write or `levain team sync`") from None
         return sealed
-
-    def _require_presence_on_head(self, before: str) -> None:
-        """The commit just written must carry user presence (a FIDO key made ``no-touch-required`` does not); if not,
-        the worktree goes back to ``before`` and the write is refused. Nothing has been pushed yet."""
-        from . import signing as S
-        head = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
-        v = S.verify_commit(self.wt, head)
-        if v.kind == "signed" and v.presence:
-            return
-        git(["reset", "-q", "--hard", before], self.wt, check=False)
-        why = (f"its signature could not be checked ({v.reason})" if v.kind == "indeterminate" else
-               "the signature on it carries no user-presence flag (a key made with no-touch-required, or the touch "
-               "was skipped)" if v.kind == "signed" else f"it is not signed ({v.reason})")
-        raise TeamError(PRESENCE_REFUSAL.format(why=f"the commit was undone: {why}"))
 
     def sync(self, *, push: bool = True) -> str:
         with self.op():      # the recovery too (code L3 r7 codex 1)
@@ -1618,6 +1610,13 @@ class GitLedger:
                     holders.add(v.team.owner)
             if not all(h is not None and fp in T.key_fps(v.tenure, h) for h in holders):
                 return False
+        # re-signed with a key that can never touch, a line the policy at the new parent refuses without presence would
+        # publish without counting (codex HIGH 3): the same rule the derivation applies, asked before the re-sign
+        if self._presence_key_problem() is not None:
+            added = git(["diff-tree", "-p", "--no-commit-id", "-r", c, "--", "ledger/"], self.wt).stdout.splitlines()
+            types = {T._parsed(ln[1:]).get("type") for ln in added if ln.startswith("+") and not ln.startswith("+++")}
+            if any(T.presence_required(v.team.allow_file_keys, t) for v in views for t in types):
+                return False
         return True
 
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
@@ -1652,12 +1651,16 @@ class GitLedger:
                            "the next sync retries them" if d.judged != "full" else
                            "replayed now they would be re-signed with this machine's key, which is not in force for "
                            "the folder they are filed under, and publish without counting. Confirm the key (`levain "
-                           "team key confirm`) from this machine, then `levain team sync`")
+                           "team key confirm`) from this machine, then `levain team sync`"
+                           if self._presence_key_problem() is None or d.team.allow_file_keys is not False else
+                           "the team now refuses file keys and they are signed with no user presence, so they would "
+                           "publish without counting; the owner runs `levain team file-keys allow`, or record them "
+                           "again with a Touch ID or security key")
                     self.warnings.append(f"{len(order) - n} unpublished entr(y/ies) kept back under refs/levain/held/: "
                                          + why)
                     return
                 cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
-                         check=False, timeout=timeout)
+                         check=False, timeout=timeout, extra_env=self._sign_env())
                 if cp.returncode != 0:
                     if cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
                                                       check=False).stdout.split() and \
@@ -1748,7 +1751,7 @@ class GitLedger:
                 git(["checkout", "-q", "--detach", remote_tip], self.wt, timeout=timeout)
                 for c in picks:
                     cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c],
-                             self.wt, check=False, timeout=timeout)
+                             self.wt, check=False, timeout=timeout, extra_env=self._sign_env())
                     if cp.returncode == 0:
                         continue
                     unmerged = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.split()
@@ -1949,6 +1952,39 @@ class GitLedger:
         with self.op(timeout=net_timeout):
             return self._sync_in_op(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout)
 
+    def _refuse_unpresent(self, rref: str, local: str) -> None:
+        """The one publish gate for the presence rule (codex HIGH 2 + 3): an unpublished entry the derivation does not
+        count for want of user presence (a kill between its commit and the writer's check, or a pick re-signed onto a
+        parent that refuses file keys) is never pushed. Nothing is pushed while one is there."""
+        if not self.pinned_root:
+            return
+        d = self.derivation()
+        if not d.presence_refused:
+            return
+        rng = [f"{rref}..{local}"] if self._has(rref) else [local]
+        fresh = set(git(["rev-list", *rng], self.wt).stdout.split())
+        ids = sorted(self._ids_of(d, {h for h in d.presence_refused if d.walk[d.line_pos[h]] in fresh}))
+        if ids:
+            drop = f"git -C {shlex.quote(str(self.wt))} reset -q --hard {shlex.quote(rref)}" if self._has(rref) else None
+            n = f"{len(ids)} unpublished entr{'y carries' if len(ids) == 1 else 'ies carry'}"
+            raise TeamError(f"not pushed: {n} no user presence and the team refuses file keys where they sit ("
+                            + ", ".join(ids[:5]) + (" ..." if len(ids) > 5 else "")
+                            + "), so they would publish without counting. Fix: the "
+                            "owner runs `levain team file-keys allow`; or drop this clone's unpublished entries"
+                            + (f" (`{drop}`; it drops every one of them)" if drop else "")
+                            + " and record them again with a Touch ID or security key")
+
+    @staticmethod
+    def _ids_of(d, hashes: set[str]) -> list[str]:
+        from . import tenure as T
+        out = []
+        for lines in d.files.values():
+            for text in lines:
+                obj = T._parsed(text)
+                if obj.get("hash") in hashes:
+                    out.append(str(obj.get("id") or obj.get("hash"))[:40])
+        return out
+
     def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float,
                     retries: int = _PUSH_RETRIES) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
@@ -1994,6 +2030,7 @@ class GitLedger:
                         return "up to date"
                     if git(["rev-list", "--merges", f"{rref}..{local}"], self.wt).stdout.strip():
                         raise TeamError("refusing to push a merge to the team ledger (it must stay linear)")
+                self._refuse_unpresent(rref, local)
                 cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:

@@ -240,8 +240,7 @@ def pretooluse(payload: dict) -> None:
         try:
             gl.append(E.build(handle, "ack", refs=d.ack, session=session, agent="claude-code",
                               summary=f"proceeded with an edit of {rel} after the ruling was shown"),
-                      push=False, lock_timeout=0.5,     # a short try; busy -> the note below, retried next edit
-                      presence=False)   # the agent's own receipt, labelled claude-code: never a touch per edit
+                      push=False, lock_timeout=0.5)     # a short try; busy -> the note below, retried next edit
         except (TeamError, E.EntryError) as exc:
             text += f"\n\n[team] acknowledgement not recorded: {I.oneline(str(exc))}"
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})

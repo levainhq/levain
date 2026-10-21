@@ -276,7 +276,9 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             f"<p class=\"sub teamline\">{who} · canon owner {_e(m['owner'])} · mode {_e(m['mode'])} · "
             f"{_e(m['canon_status'])}"
             + (" · <span class=\"warn\">file keys allowed (entries need no touch)</span>"
-               if m.get("allow_file_keys") else "")
+               if m.get("allow_file_keys") else
+               " · <span class=\"warn\">presence rule not chosen (entries need no touch): owner runs levain team "
+               "file-keys refuse</span>" if m.get("allow_file_keys") is None else "")
             + (f" · <span class=\"warn\">{m['problems']} integrity problem(s): run levain team verify</span>"
                if m["problems"] else "")
             + (f" · <span class=\"warn\">{_e(m['partial'])}</span>" if m.get("partial") else "") + "</p>"

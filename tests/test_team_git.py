@@ -99,7 +99,7 @@ def two(tmp_path):
     (pack / "judgment.toml").write_text(JUDGMENT)
     assert team("init", "--project", "ledgerline", "--owner", "ana", "--signing-key", str(KEYS["ana"]),
                 "--member", "ana=ana@ex.com", "--member", f"ben=ben@ex.com={KEYS['ben']}", "--client-owner", "Dana",
-                "--pack", str(pack), repo=ana) == 0
+                "--pack", str(pack), "--allow-file-keys", repo=ana) == 0   # file keys sign here, hooks run as children
     ben = clone(tmp_path, "ben", "ben@ex.com")
     assert join(ben, "ben") == 0
     return tmp_path, ana, ben
