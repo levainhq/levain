@@ -82,7 +82,7 @@ def objects(repo: str | Path) -> list[tuple[str, str]]:
 @pytest.fixture(scope="module")
 def built(world):
     root, repo, base, old_a, contract = world
-    rs = build_readset(str(repo), contract, dest(root, "built"))
+    rs = build_readset(str(repo), contract, dest(root, "built"), contract_digest=contract.digest)
     bundle = root / "built.bundle"
     make_bundle(rs.repo_dir, rs.branch, bundle)
     clone = root / "built-clone"
@@ -119,22 +119,22 @@ def test_one_parentless_commit_and_no_other_file_or_history(world, built):
 def test_a_rebuild_names_the_same_commit_and_leaves_no_index(world, built):
     root, repo, _, _, contract = world
     rs, _ = built
-    again = build_readset(str(repo), contract, dest(root, "again"))
+    again = build_readset(str(repo), contract, dest(root, "again"), contract_digest=contract.digest)
     assert (again.commit, again.tree) == (rs.commit, rs.tree)
     assert not os.path.exists(os.path.join(rs.repo_dir, "readset.index"))
     assert git(Path(rs.repo_dir), "log", "-1", "--format=%an %ae %at %s", BRANCH).strip() == \
         f"levain-dispatch levain-dispatch@localhost 0 levain read set {contract.digest}"
 
 
-def refusal(fn, *a) -> ReadSetRefused:
+def refusal(fn, *a, **kw) -> ReadSetRefused:
     with pytest.raises(ReadSetRefused) as ei:
-        fn(*a)
+        fn(*a, **kw)
     return ei.value
 
 
 def test_a_damaged_object_store_refuses_and_hands_nothing_on(tmp_path):
     # git hashes what it reads, so honest bytes always match their sha; a store whose loose object was overwritten is
-    # the case the byte check guards, and either git or the check refuses it by a readset name
+    # the case the byte check guards (cat-file does not rehash a loose object, so the check is what refuses it)
     import zlib
     repo = Path(os.path.realpath(tmp_path)) / "r"
     repo.mkdir()
@@ -152,29 +152,84 @@ def test_a_damaged_object_store_refuses_and_hands_nothing_on(tmp_path):
     loose.chmod(0o644)
     loose.write_bytes(zlib.compress(b"blob 6\x00a = 2\n"))
     d = dest(tmp_path, "damaged")
-    assert refusal(build_readset, str(repo), contract, d).name in ("readset-blob-mismatch", "readset-git-failed")
-    assert not os.path.exists(os.path.join(d, "readset.index"))
+    assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == \
+        "readset-blob-mismatch"
+    assert os.listdir(d) == []          # the partial scratch is removed: dest_dir is empty again for a retry
 
 
-def test_a_contract_edited_after_filing_refuses(world):
+def test_a_contract_edited_after_filing_refuses_on_the_filed_digest(world):
+    # the forge L1 ran: a VALID regular-file entry naming the repo's real .env blob (NEVER under the policy, so filing
+    # would have refused it). It parses to itself, so only the filed digest can tell it from the filed contract.
+    root, repo, base, _, contract = world
+    env_blob = git(repo, "rev-parse", f"{base}:.env").strip()
+    forged = dataclasses.replace(contract, read=(PathEntry(".env", "100644", env_blob),))
+    d = dest(root, "forged")
+    assert refusal(build_readset, str(repo), forged, d, contract_digest=contract.digest).name == \
+        "readset-digest-mismatch"
+    assert os.listdir(d) == []                                             # refused before any git work
+    assert refusal(build_readset, str(repo), {"read": []}, dest(root, "notc"),
+                   contract_digest=contract.digest).name == "readset-contract"
+
+
+def test_a_build_needs_the_filed_digest(world):
     root, repo, _, _, contract = world
-    forged = dataclasses.replace(contract, read=(PathEntry("src/a.py", "120000", "0" * 40),))
-    assert refusal(build_readset, str(repo), forged, dest(root, "forged")).name == "readset-contract"
-    assert refusal(build_readset, str(repo), {"read": []}, dest(root, "notc")).name == "readset-contract"
+    for i, wrong in enumerate(("sha256:" + "0" * 64, contract.digest.upper(), "", None)):
+        d = dest(root, f"wrong-{i}")
+        assert refusal(build_readset, str(repo), contract, d, contract_digest=wrong).name == "readset-digest-mismatch"
+    with pytest.raises(TypeError):
+        build_readset(str(repo), contract, dest(root, "nodigest"))              # required, keyword-only
+    rs = build_readset(str(repo), contract, dest(root, "right"), contract_digest=contract.digest)
+    assert git(Path(rs.repo_dir), "ls-tree", "-r", "--name-only", rs.commit).split() == ["src/a.py", "src/run.sh"]
 
 
 def test_the_repo_and_the_destination_are_checked(world):
     root, repo, _, _, contract = world
-    assert refusal(build_readset, str(root), contract, dest(root, "wrongrepo")).name == "readset-repo"
+    kw = {"contract_digest": contract.digest}
+    assert refusal(build_readset, str(root), contract, dest(root, "wrongrepo"), **kw).name == "readset-repo"
     full = dest(root, "full")
     Path(full, "x").write_text("x")
-    assert refusal(build_readset, str(repo), contract, full).name == "readset-dest"
-    assert refusal(build_readset, str(repo), contract, str(root / "missing")).name == "readset-dest"
-    assert refusal(build_readset, str(repo), contract, "relative").name == "readset-dest"
+    assert refusal(build_readset, str(repo), contract, full, **kw).name == "readset-dest"
+    assert refusal(build_readset, str(repo), contract, str(root / "missing"), **kw).name == "readset-dest"
+    assert refusal(build_readset, str(repo), contract, "relative", **kw).name == "readset-dest"
     inside = repo / "scratch"
     inside.mkdir()
-    assert refusal(build_readset, str(repo), contract, str(inside)).name == "readset-dest"
+    assert refusal(build_readset, str(repo), contract, str(inside), **kw).name == "readset-dest"
     assert not (repo / ".git/refs/heads/readset").exists()                 # the operator's repo is untouched
+
+
+def test_a_destination_inside_the_repo_by_a_symlinked_repo_path_refuses(tmp_path):
+    # L2 LOW-2: filing refuses a symlinked repo path, but the path can become one after filing (the repo moved and a
+    # link left in its place); a dest_dir inside the real target is still inside the operator's repo
+    top = Path(os.path.realpath(tmp_path))
+    repo = top / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src").mkdir()
+    (repo / "src/a.py").write_text("a = 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "c")
+    sub = {"template": "fix-lint", "goal": "g", "read": ["src/a.py"], "write": ["src/a.py"],
+           "base": git(repo, "rev-parse", "HEAD").strip(), "budget": {"tool_calls": 1, "tokens": 1, "dollars_cents": 1},
+           "grant": ["Edit"], "expires_at": utc_stamp(NOW + timedelta(hours=1)), "repo": str(repo)}
+    contract = resolve_contract(sub, resolve_template=lambda t: TEMPLATE, policy=POLICY, now=NOW)
+    moved = top / "moved"
+    repo.rename(moved)
+    repo.symlink_to(moved)
+    inside = moved / "scratch"
+    inside.mkdir()
+    assert refusal(build_readset, str(repo), contract, str(inside), contract_digest=contract.digest).name == \
+        "readset-dest"
+    assert os.listdir(inside) == []
+
+
+def test_an_unreadable_destination_is_a_refusal(world, monkeypatch):
+    root, repo, _, _, contract = world
+    d = dest(root, "unreadable")
+
+    def denied(path):
+        raise PermissionError(13, "denied", path)
+    monkeypatch.setattr("levain.dispatch.readset.os.listdir", denied)
+    assert refusal(build_readset, str(repo), contract, d, contract_digest=contract.digest).name == "readset-dest"
 
 
 def test_the_dispatch_session_env_has_no_operator_key_and_roots_under_the_slot():
