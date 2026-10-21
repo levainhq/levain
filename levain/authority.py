@@ -51,7 +51,9 @@ __all__ = [
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify",
-    "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem", "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem", "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
+    "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
+    "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
+    "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_problem",
     "genesis_policy", "inert_grant", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "presence_missing", "snapshot", "sshsig_public_key", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]

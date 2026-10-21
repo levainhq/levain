@@ -548,13 +548,14 @@ def request_outcomes(directory: Path | str, request_ids: "list[str]") -> dict[st
     """``{queue request id: outcome}`` for the calls levain answered at the gate with those requests (their ``pre``
     rows, one per call, ``window``'s rule): what each authorised call then did. A request with no row is absent.
     A true read: the ledger in ``directory`` is opened read-only (no schema, no permission change, no lock taken
-    for writing), and none there is no outcome at all. A ledger of another format raises
-    :class:`LedgerStoreError`."""
+    for writing), and none there is no outcome at all. The read waits a short, bounded time for a writer; a ledger
+    still locked after that answers ``{}`` (an outcome is decoration, so a hook holding the write lock costs the
+    caller the outcomes, never the read). A ledger of another format raises :class:`LedgerStoreError`."""
     path = Path(directory) / DB_NAME
     ids = sorted(set(request_ids))
     if not ids or not path.is_file():
         return {}
-    # a short busy wait: a page's read never stalls on a hook holding the database
+    # a short busy wait, then give up: a page's read does not hang on a hook holding the database
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
     try:
         conn.execute("BEGIN")
@@ -571,6 +572,10 @@ def request_outcomes(directory: Path | str, request_ids: "list[str]") -> dict[st
                 f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
         conn.execute("COMMIT")
         return out
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc) or "busy" in str(exc):
+            return {}
+        raise
     finally:
         conn.close()
 

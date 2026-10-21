@@ -253,7 +253,7 @@ def test_a_revoke_asked_from_a_listing_names_the_grant_it_showed(world) -> None:
     world.grant("cg-G")                                   # a different grant under the same id
     with pytest.raises(GrantRefused) as exc:
         world.gp.step("cg-G", "revoke-challenge", old)
-    assert (exc.value.status, exc.value.error) == (409, "grant-changed")
+    assert (exc.value.status, exc.value.error) == (409, "grant_changed")
     assert "is not the grant that was shown" in exc.value.message
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == ["cg-G"]
     # the new grant shows only its own answers (none), and a challenge naming it is built

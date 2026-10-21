@@ -4,7 +4,7 @@ The phone port (:mod:`levain.phone_server`) lists every grant the install's cock
 :func:`levain.consent.grants.grant_view` without its terminal line, plus the passkeys that may revoke) and carries one
 passkey ceremony (:meth:`GrantPhone.step`): ``revoke-challenge`` then ``revoke``.
 
-``revoke-challenge`` names the grant's ``instance`` as the listing showed it, and is refused ``grant-changed`` when
+``revoke-challenge`` names the grant's ``instance`` as the listing showed it, and is refused ``grant_changed`` when
 the grant under that id is no longer that one (renewed, or revoked and made again). It builds the ``revoke_grant``
 link on the server (:func:`levain.consent.grants.prepare_revoke`, judged by every rule of the log but the signature,
 on the head the instance was checked on) and HOLDS it, one per grant, for :data:`HOLD`; it answers with the
@@ -138,7 +138,7 @@ class GrantPhone:
             raise GrantRefused(409, "stale", "the authority log moved while this revoke was asked for: ask "
                                              "again") from None
         except GrantChanged as exc:
-            raise GrantRefused(409, "grant-changed", f"{exc}; nothing was signed") from None
+            raise GrantRefused(409, "grant_changed", f"{exc}; nothing was signed") from None
         except KeyError_ as exc:
             word = "not_found" if str(exc).startswith("no consent grant") else "refused"
             raise GrantRefused(404 if word == "not_found" else 409, word, str(exc)) from None
