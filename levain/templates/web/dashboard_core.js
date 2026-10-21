@@ -937,15 +937,15 @@
     stackColumns(grid);
     sec.appendChild(grid);
     board.appendChild(sec);
-    dashPass(grid); pairBoard(grid); memClips(grid);
-    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); pairBoard(grid); memClips(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
+    dashPass(grid); pairBoard(grid); memClips(grid); balanceStacks(grid);
+    if (typeof MutationObserver === "function") new MutationObserver(() => { dashPass(grid); pairBoard(grid); memClips(grid); balanceStacks(grid); scheduleLayout(); }).observe(grid, { childList: true, subtree: true });
     // a card folds or empties by a class set after the draw (markEmptyCards), which no childList mutation reports: the pairs and the
     // "Read all" feet follow it. Only a change to the classes pairBoard reads wakes it: the classes these passes write are not among them.
     if (typeof MutationObserver === "function") {
       const watched = (v) => CK_PAIR_SKIP.filter((c) => (" " + (v || "") + " ").indexOf(" " + c + " ") >= 0).join(" ");
       new MutationObserver((recs) => {
         // measureOverflow and memFoot toggle is-clipped / has-overflow on cards inside the grid: reacting to those would feed this observer forever
-        if (recs.some((r) => watched(r.oldValue) !== watched(r.target.getAttribute("class")))) { pairBoard(grid); memClips(grid); }
+        if (recs.some((r) => watched(r.oldValue) !== watched(r.target.getAttribute("class")))) { pairBoard(grid); memClips(grid); balanceStacks(grid); }
       }).observe(grid, { attributes: true, attributeFilter: ["class"], attributeOldValue: true, subtree: true });
     }
   }
@@ -1137,6 +1137,7 @@
   let ckRefreshTimer = null;
   function ckRefreshAll() {
     for (const g of document.querySelectorAll(".ck-zgrid")) {
+      balanceStacks(g); memClips(g);   // a tab switch shows a tab for the first time: its stacks and capped cards have heights only now
       if (!g._ckOrder) continue;
       const ctx = ckCtx(g);
       for (const p of ckPanels(g)) layoutControls(g, p, ctx);
@@ -1181,6 +1182,29 @@
     seq.forEach((n, i) => set(n, i === seq.length - 1 && seq.length % 2 === 1 ? "solo" : (i % 2 === 0 ? "l" : "r")));
   }
 
+  // The two Board stacks end where their own cards end, so a long right stack beside a short left one leaves a blank band under the
+  // left. When one stack is more than STACK_RATIO taller than the other, the taller stack's LAST card takes a cap that ends the two
+  // stacks together (never below STACK_FLOOR, never above its own cap), and its overflow goes behind the card's own "more" and focus
+  // view like every other capped card. The cap is a data attribute plus a custom property: neither is a class, so nothing watches it.
+  // It reads natural heights (the cap cleared first), so repeating it settles on the same answer.
+  const STACK_RATIO = 1.25, STACK_FLOOR = 300;
+  function balanceStacks(grid) {
+    if (!grid.classList.contains("ck-twocol")) return;
+    const cols = Array.from(grid.children).filter((n) => n.classList.contains("ck-col") && n.offsetParent !== null);
+    for (const n of grid.querySelectorAll(":scope > .ck-col > .panel[data-stack-cap]")) { n.removeAttribute("data-stack-cap"); n.style.removeProperty("--stack-cap"); }
+    if (cols.length !== 2 || Math.abs(cols[0].getBoundingClientRect().top - cols[1].getBoundingClientRect().top) > 2) return;   // one column: nothing sits beside anything
+    const hs = cols.map((c) => c.offsetHeight);
+    const t = hs[0] >= hs[1] ? 0 : 1;
+    if (hs[t] <= hs[1 - t] * STACK_RATIO) return;
+    const cards = Array.from(cols[t].children).filter((n) => n.classList.contains("panel") && n.offsetParent !== null && !CK_PAIR_SKIP.some((c) => n.classList.contains(c)));
+    if (cards.length < 2) return;
+    const last = cards[cards.length - 1];
+    const cap = Math.max(STACK_FLOOR, hs[1 - t] - (hs[t] - last.offsetHeight));
+    if (cap >= last.offsetHeight) return;
+    last.dataset.stackCap = "1";
+    last.style.setProperty("--stack-cap", cap + "px");
+  }
+
   // F6: a card the page caps (a neocortex section, a panel of the Crystallized | Cognition row) that clips its content ends in a
   // "Read all" foot that opens that card's focus view. The foot is built once and shown only while the card clips, so a card that
   // fits shows nothing. Which element clips (the card or its body) depends on the style, so both are measured, with the foot hidden
@@ -1211,7 +1235,7 @@
     if (memResizeWired || typeof window.addEventListener !== "function") return;
     memResizeWired = true;
     let t = null;
-    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => { for (const g of document.querySelectorAll(".ck-zgrid")) memClips(g); }, 150); });
+    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => { for (const g of document.querySelectorAll(".ck-zgrid")) { memClips(g); balanceStacks(g); } }, 150); });
   }
   function memClips(grid) {
     wireMemResize();
@@ -4241,8 +4265,11 @@
   }
   function needsHead(card, kindChip, agent, tail) {
     const head = el("div", "consent-head needs-head");
-    head.appendChild(kindChip);
-    head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
+    // the focus view's dialog title already names the tool or question number and the agent: its card head keeps only the rest
+    if (!card.classList.contains("is-full")) {
+      head.appendChild(kindChip);
+      head.appendChild(el("span", "needs-chip consent-agent", agent || "agent"));
+    }
     if (tail) head.appendChild(tail);
     card.appendChild(head);
   }
@@ -4355,7 +4382,7 @@
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
       return left;
     })());
-    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[1]);
+    if (c.tier) card.firstChild.insertBefore(el("span", "needs-chip", c.tier), card.firstChild.children[full ? 0 : 1]);
     const slot = el("div", "needs-body ext-meta", "reading the request…");
     card.appendChild(slot);
     if (c.id) consentBody(c, card).then((b) => drawConsentCard(card, slot, b));

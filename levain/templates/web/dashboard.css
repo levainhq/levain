@@ -1636,7 +1636,9 @@ body.ke .needs-details .consent-cmd { margin-top: var(--sp-2); }
 body.ke .needs-open-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
 body.ke .needs-open-row .needs-open { min-height: 32px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-4); cursor: pointer; margin: 0; }
 body.ke .needs-open-row .needs-open:hover, body.ke .needs-open-row .needs-open:focus-visible { color: var(--text); border-color: var(--label); }
-body.ke .needs-card.is-full { gap: var(--sp-4); border: 0; box-shadow: none; padding: var(--sp-4) var(--sp-5) var(--sp-5); background: none; max-width: none; }
+body.ke .needs-card.is-full { gap: var(--sp-4); border: 0; box-shadow: none; padding: var(--sp-6) var(--sp-6) var(--sp-6); background: none; max-width: none; }
+body.ke .needs-card.is-full .needs-head { justify-content: space-between; }
+body.ke .needs-card.is-full .needs-head > .needs-left:only-child { margin-left: 0; }
 body.ke .needs-sec-label { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--meta); margin-top: var(--sp-2); }
 body.ke .needs-card.is-full .needs-sec-label:first-child { margin-top: 0; }
 body.ke .consent-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--sp-2) var(--sp-4); margin: 0; padding: var(--sp-3); background: var(--card-2); border: 1px solid var(--hair); border-radius: var(--r-sm); }
@@ -2306,6 +2308,8 @@ body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: va
 body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
 /* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
 body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+/* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
+body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }
 body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
 body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
