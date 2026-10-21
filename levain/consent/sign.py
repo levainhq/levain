@@ -89,6 +89,8 @@ Known edges:
     same-uid writer can reorder or swap option texts before the listing, and the signature is then real over the
     text the operator tapped, under a key the caller filed for another text;
   - the title and requester are shown on the card but are not signed: the page says so;
+  - a deep link to a request past the first :data:`LIST_MAX` in name order finds no card (the page says it is not
+    open here);
   - look-alike letters and NFC vs NFD forms are not refused: a caller ships the exact message bytes as a file, never
     re-typed or normalised.
 """

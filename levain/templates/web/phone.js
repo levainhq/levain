@@ -24,6 +24,8 @@
   if (m) { token = decodeURIComponent(m[1]); store.set("sessionStorage", "levain-phone-token", token); }
   else token = store.get("sessionStorage", "levain-phone-token");
   if (m || fm) history.replaceState(null, "", location.pathname);
+  // a link opened on a page already showing (a fragment-only navigation does not reload it): read it afresh
+  window.addEventListener("hashchange", () => { if (/(?:^#|&)(?:sign|phone_token)=/.test(location.hash)) location.reload(); });
 
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
@@ -46,6 +48,7 @@
 
   let busy = 0;               // a ceremony in progress holds the list still
   let last = "";              // the last answer given here: an answered request leaves the list, its result stays
+  let lastId = "";            // the sign request that answer was for (the deep link's card, once answered here)
   const notes = new Map();    // request id -> [text, kind], kept across redraws
 
   function draw(data) {
@@ -77,9 +80,10 @@
     list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
                          ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
-    // said once: after the linked card is signed or denied here, the next redraw drops the link without a note
-    if (focus && !linked.length && !busy) {
-      if (!/^(signed|denied) /.test(last))
+    // said once: after the linked card is signed or denied here, the next redraw drops the link without a note; a
+    // listing the sign side could not give (a sign_note) keeps the link for the next one
+    if (focus && !linked.length && !busy && !data.sign_note) {
+      if (lastId !== focus)
         $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
       focus = "";
     }
@@ -476,6 +480,7 @@
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
           if (!a.ok) return say("not signed: " + why(a), "bad");
           last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
+          lastId = r.id;
           say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
               + a.body.namespace, "ok");
         });
@@ -493,6 +498,7 @@
     call("POST", "/sign/" + encodeURIComponent(r.id) + "/deny", { request_sha256: r.sha256 || "" }).then((a) => {
       if (!a.ok) return say("not denied: " + why(a), "bad");
       last = "denied " + (r.title || r.id);
+      lastId = r.id;
       say("denied", "ok");
     }).catch((e) => say("the deny failed (" + ((e && e.name) || "error") + "); it re-reads the queue to show where this stands", "bad"))
       .finally(() => { busy--; setTimeout(load, 1500); });
