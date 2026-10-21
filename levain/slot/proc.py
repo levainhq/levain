@@ -126,8 +126,9 @@ class ProcSeams:
     sleep: Callable[[float], None] = time.sleep
     self_uids: Callable[[], tuple[int, ...]] = _self_uids
     self_pid: Callable[[], int] = os.getpid
-    #: macOS: end the uid's per-user launchd domain (:func:`darwin_bootout`); ``None`` elsewhere.
-    domain_out: Callable[[int], None] | None = None
+    #: macOS: end the uid's per-user launchd domain within a timeout, answering whether launchctl said it did
+    #: (:func:`darwin_bootout`); ``None`` elsewhere.
+    domain_out: Callable[[int, float], bool] | None = None
 
 
 def check_target(uid: object, seams: ProcSeams) -> int:
@@ -333,15 +334,20 @@ def scrub(slot_uid: int, gw_uid: int, child_uid: int | None = None, *, seams: Pr
     """§7.3 SCRUBBED: ``SIGKILL`` every process of ``gw_uid`` (one front per slot, so the uid alone names
     it), then (macOS) end each uid's launchd domain, then require that none of ``slot_uid``, ``gw_uid`` and
     ``child_uid`` owns a process; else ``Refused("scrub-processes-remain:<uid>")`` naming the first that does,
-    and the slot stays leased. The domain goes after END's kill, so it also takes the per-user agents launchd
+    and the slot stays leased. A bootout launchctl did not report done (an error or past the shared deadline) is
+    ``Refused("scrub-domain-remains:<uid>")``: the process scan cannot see agents launchd would start again. The
+    bootouts share one deadline, ``bound_s``, since the caller holds the pool lock. The domain goes after END's kill, so it also takes the per-user agents launchd
     started for the uid while END ran: on a long END they appeared after END's own proof had passed and only SCRUB
     refused (levain-memory runs/s2-macos/RESULT_D1D2.md X1, X6), which is why the bootout is here and not in END."""
     u = UidProcs(seams)
     uids = [check_target(x, u.seams) for x in (slot_uid, gw_uid) + ((child_uid,) if child_uid is not None else ())]
     u.kill(gw_uid, bound_s)        # its answer is the proof below, not this sweep's bool
     if u.seams.domain_out is not None:
+        deadline = u.seams.clock() + bound_s
         for x in uids:
-            u.seams.domain_out(x)
+            left = deadline - u.seams.clock()
+            if left <= 0 or not u.seams.domain_out(x, left):
+                raise Refused(f"scrub-domain-remains:{x}", "launchctl did not report the uid's domain booted out")
     for x in uids:
         if not u.no_process(x):
             raise Refused(f"scrub-processes-remain:{x}", "a process of the uid survived")
@@ -539,19 +545,21 @@ def darwin_seams() -> ProcSeams:
                      signal_uid=signal_as_uid, domain_out=darwin_bootout)
 
 
-def darwin_bootout(uid: int) -> None:
+def darwin_bootout(uid: int, timeout: float = V12_SECONDS) -> bool:
     """``launchctl bootout user/<uid>``, as root: ends the uid's per-user launchd domain and every agent in it
     (lsd, trustd, distnoted, secd), which launchd otherwise keeps for the uid after END's kill
-    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. It answers nothing: the process
-    scan after it is the proof, so a failed or timed-out bootout only leaves that scan to refuse. Never use
-    ``launchctl print user/<uid>`` as a check: it re-creates an empty domain (same file, X3)."""
+    [measured: levain-memory runs/s2-macos/RESULT_D1D2.md X2 + X6, 2026-10-20]. ``True`` only on exit 0, which it
+    gives on an already-empty domain too (same file, X3); an error or ``timeout`` is ``False``. The process scan
+    after it is still the proof of no process. Never use ``launchctl print user/<uid>`` as a check: it re-creates
+    an empty domain (X3)."""
     if type(uid) is not int or uid <= 0:
         raise Refused("bad-target-uid", repr(uid))
     try:
-        subprocess.run(["/bin/launchctl", "bootout", f"user/{uid}"], capture_output=True, cwd="/", env=child_env(),
-                       timeout=30)
+        r = subprocess.run(["/bin/launchctl", "bootout", f"user/{uid}"], capture_output=True, cwd="/",
+                           env=child_env(), timeout=max(timeout, 0.1))
     except (OSError, subprocess.SubprocessError):
-        pass
+        return False
+    return r.returncode == 0
 
 
 def default_seams(host: HostOS | None = None) -> ProcSeams:

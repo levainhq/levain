@@ -5,6 +5,7 @@ END: SCRUB refused until `launchctl bootout user/<uid>`), raw_d/998_undo.txt (un
 alive). The VM re-run on the fix: runs/s3-macos-d1d2/."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -100,10 +101,11 @@ def _launchd_table():
     t.ignore_kill.update({210, 211, 212, 213})
     calls = []
 
-    def domain_out(uid):
+    def domain_out(uid, timeout):
         calls.append(("bootout", uid, sorted(p for p, q in t.procs.items() if uid in q.uids)))
         for pid in [p for p, q in t.procs.items() if uid in q.uids]:
             del t.procs[pid]
+        return True
     return t, calls, domain_out
 
 
@@ -128,14 +130,46 @@ def test_scrub_boots_out_every_uid_after_the_gateway_kill_then_proves():
 def test_a_failed_bootout_leaves_the_proof_to_refuse():
     t, _calls, _ = _launchd_table()
     seams = t.seams()
-    seams.domain_out = lambda uid: None                    # bootout did nothing: the scan still sees them
+    seams.domain_out = lambda uid, timeout: True           # launchctl said done, yet the scan still sees them
     with pytest.raises(Refused) as e:
         P.scrub(SLOT, GW, seams=seams, bound_s=1.0)
     assert e.value.name == f"scrub-processes-remain:{SLOT}"
 
 
+def test_a_bootout_launchctl_did_not_report_done_refuses_by_uid():
+    """L3 r1 (codex HIGH): a failed or timed-out bootout is not left to the scan, which cannot see agents launchd
+    would start again."""
+    t, _calls, domain_out = _launchd_table()
+    seams = t.seams()
+    seams.domain_out = lambda uid, timeout: (domain_out(uid, timeout) and uid != GW)
+    with pytest.raises(Refused) as e:
+        P.scrub(SLOT, GW, seams=seams, bound_s=1.0)
+    assert e.value.name == f"scrub-domain-remains:{GW}"
+
+
+def test_the_bootouts_share_one_deadline():
+    """L3 r1 (codex MED): SCRUB holds the pool lock; the bootouts together get bound_s, never one timeout each."""
+    t, _calls, domain_out = _launchd_table()
+    seams = t.seams()
+    given = []
+
+    def slow(uid, timeout):
+        given.append(timeout)
+        t.t += 0.6                                         # each bootout takes 0.6 s of a 1.0 s bound
+        return domain_out(uid, timeout)
+    seams.domain_out = slow
+    with pytest.raises(Refused) as e:
+        P.scrub(SLOT, GW, CHILD, seams=seams, bound_s=1.0)
+    assert e.value.name == f"scrub-domain-remains:{GW}" or e.value.name == f"scrub-domain-remains:{CHILD}"
+    assert given[0] <= 1.0 and all(b < a for a, b in zip(given, given[1:]))
+
+
 def test_darwin_seams_carry_the_bootout_and_linux_none():
     assert P.ProcSeams(listing=list, probe=lambda p: None, pin=id, send=lambda h, s: None).domain_out is None
+    if sys.platform == "darwin":
+        assert P.darwin_seams().domain_out is P.darwin_bootout
+    else:
+        assert P.linux_seams().domain_out is None
     with pytest.raises(Refused) as e:
         P.darwin_bootout(0)
     assert e.value.name == "bad-target-uid"
@@ -145,13 +179,16 @@ def test_darwin_seams_carry_the_bootout_and_linux_none():
 
 def test_undo_boots_out_before_the_kill_and_refuses_a_survivor_by_name():
     order = []
-    ok = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: order.append(("bootout", u)),
+    ok = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: order.append(("bootout", u)) or True,
                            kill_all=lambda u: (order.append(("kill", u)), (True, ""))[1],
                            none_left=lambda u: (order.append(("proof", u)), True)[1])
     assert ok == (True, "") and order == [("bootout", 3999), ("kill", 3999), ("proof", 3999)]
-    got = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: None, kill_all=lambda u: (True, ""),
+    got = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: True, kill_all=lambda u: (True, ""),
                             none_left=lambda u: False)
     assert got[0] is False and got[1].startswith("processes-remain:_levain_s0")
+    got = IH._end_processes("darwin", 3999, "_levain_s0", bootout=lambda u: False, kill_all=lambda u: (True, ""),
+                            none_left=lambda u: True)
+    assert got[0] is False and got[1].startswith("domain-remains:_levain_s0")
     order.clear()
     IH._end_processes("linux", 3999, "_levain_s0", bootout=lambda u: order.append("bootout"),
                       kill_all=lambda u: (True, ""), none_left=lambda u: True)
