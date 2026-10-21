@@ -27,7 +27,8 @@ it serves only these:
     on its own thread (:func:`levain.consent.band.deliver_answer`), as a ruling is.
 
 A proxy the operator runs (``tailscale serve``) puts it on an https name. Every data route needs this server's own
-token (``X-Levain-Phone-Token``), printed once in the phone link's fragment; it is not the cockpit's write token and
+token (``X-Levain-Phone-Token``), printed in the phone link's fragment (new each run, unless ``--token-file`` keeps
+it; delete that file to make a new one); it is not the cockpit's write token and
 opens nothing on the cockpit. The https name is configured, never read from a request: it is the WebAuthn rpId, and a
 passkey enrolled on it signs that name's hash, which ssh-keygen checks against the key's application.
 
@@ -47,6 +48,7 @@ import re
 import secrets
 import shlex
 import sqlite3
+import stat
 import sys
 import threading
 from datetime import datetime, timezone
@@ -979,11 +981,16 @@ def _kept_token(path: Path) -> str:
     from levain.consent.sign import _read_bytes, _write_new
 
     try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+            raise ValueError(f"--token-file: {path} is readable by others (mode {st.st_mode & 0o777:o}): chmod 600 it")
         token = _read_bytes(path).decode("utf-8").strip()
     except FileNotFoundError:
         token = secrets.token_urlsafe(32)
         _write_new(path, token + "\n")
         return token
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError(f"--token-file: cannot read {path}: {exc}") from None
     if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) is None:
@@ -1018,7 +1025,9 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
 
         print(f"  signs requests in {sign_dir(queue_dir)} in namespace(s) {', '.join(sign_namespaces)}", flush=True)
     page = f"http://localhost:{bound}/" if name == "localhost" else f"https://{name}/"
-    print(f"  open on the phone (a secret; it dies when this stops): {page}#phone_token={httpd.phone_token}", flush=True)
+    lives = (f"it is kept in {token_file} across restarts: delete that file to make a new one" if token_file is not None
+             else "it dies when this stops")
+    print(f"  open on the phone (a secret; {lives}): {page}#phone_token={httpd.phone_token}", flush=True)
     if link_file is not None:
         # for a caller that links straight onto one sign request's card (levain.consent.sign.deep_link)
         from levain.consent.sign import _write_over
@@ -1035,4 +1044,16 @@ def run_phone_server(queue_dir: Path, *, name: str | None, tailscale: bool, port
         pass
     finally:
         httpd.server_close()
+        if link_file is not None:
+            _drop_link_file(link_file)
     return 0
+
+
+def _drop_link_file(path: Path) -> None:
+    """``--link-file`` removed when this run stops, so no caller builds a link to a server that is gone; left alone
+    when it names another run (a later server wrote it)."""
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
