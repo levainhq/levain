@@ -22,13 +22,18 @@ from typing import Any
 
 from levain.authority import (CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, AuthorityError, StaleHead, UnsignedLink,
                               VerifierUnavailable, anchor_path, append, consent_grant, consent_grant_tool_problem,
-                              consent_resolved_workspace, inert_grant, prepare)
+                              consent_resolved_workspace, consent_revocable, inert_grant, prepare)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
 
-__all__ = ["INERT_NOTE", "ConsentGrant", "append_revoke", "create_grant", "grant_listing", "grant_view", "list_grants",
-           "list_inert_grants", "prepare_revoke", "revoke_command", "revoke_grant"]
+__all__ = ["INERT_NOTE", "ConsentGrant", "GrantChanged", "append_revoke", "create_grant", "grant_instance",
+           "grant_listing", "grant_view", "list_grants", "list_inert_grants", "prepare_revoke", "revoke_command",
+           "revoke_grant"]
+
+
+class GrantChanged(KeyError_):
+    """The grant under this id is no longer the one that was shown: renewed, or revoked and made again."""
 
 
 @dataclass(frozen=True)
@@ -116,38 +121,54 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
     """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, or one of a kind this levain does not
     know (:func:`list_inert_grants`); any enrolled key may. From the next decision on it answers nothing, and an
     answer it already gave is no longer delivered. Returns ``(seq, warning)``."""
-    db = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
+    db, _state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
     new = _append(db, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, sign=sign, clock=clock,
                   ssh_keygen=ssh_keygen)
     return new.seq, new.anchor_warning
 
 
 def _revocable(data_root: Path | str, grant_id: str, clock: Callable[[], datetime], ssh_keygen: Path | str,
-               marker_directory: Path | None) -> Any:
-    """The journal at ``data_root``, once its replay holds ``grant_id`` as a consent grant or an inert one."""
+               marker_directory: Path | None) -> tuple[Any, Any]:
+    """The journal at ``data_root`` and its replay, once that replay holds ``grant_id`` as a consent grant or an inert
+    one (:func:`levain.authority.consent_revocable`, the rule the replay holds a passkey's revoke to)."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
-    grant = state.policy.grants.get(grant_id)
-    if not consent_grant(grant) and not inert_grant(grant):
+    if not consent_revocable(state.policy.grants.get(grant_id)):
         raise KeyError_(f"no consent grant {grant_id!r}")
-    return db
+    return db, state
+
+
+def grant_instance(link: tuple[int, str] | None) -> str:
+    """The instance of a standing grant, from ``(seq, hash)`` of the link that created or last changed it
+    (:meth:`levain.authority.AuthoritySnapshot.grant_link`): ``"<seq>:<hash>"``. An id can be revoked and made
+    again; the instance cannot, so a revoke asked for from a listing names the grant that listing showed."""
+    return "" if link is None else f"{link[0]}:{link[1]}"
 
 
 def prepare_revoke(data_root: Path | str, grant_id: str, *, signer_fp: str, clock: Callable[[], datetime],
-                   ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                   instance: str | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                    marker_directory: Path | None = None) -> UnsignedLink:
     """The unsigned ``revoke_grant`` link for ``grant_id`` (what :func:`revoke_grant` would sign), for a signer that
     signs elsewhere: the phone's passkey. Judged now by every rule but the signature, so a link the log would refuse
-    (an unknown grant, a signer that may not sign it) is refused before anyone is asked to sign."""
-    db = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
+    (an unknown grant, a signer that may not sign it) is refused before anyone is asked to sign. With ``instance``
+    (:func:`grant_instance`, as a listing showed it) the grant must still be exactly that one, else
+    :class:`GrantChanged`. The link is prepared on the head that check read, or :class:`levain.authority.StaleHead`
+    is raised; :func:`append_revoke` appends it only on that same head, so what was checked is what is revoked."""
+    db, state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
+    if instance is not None and grant_instance(state.grant_link(grant_id)) != instance:
+        raise GrantChanged(f"grant {grant_id[:80]!r} is not the grant that was shown (it was renewed, or revoked and "
+                           "made again under the same id): look at it again before revoking it")
     try:
         with db.autocommit() as conn:
-            return prepare(conn, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, now=_now(clock),
+            link = prepare(conn, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, now=_now(clock),
                            ssh_keygen=ssh_keygen)
     except VerifierUnavailable:
         raise
     except AuthorityError as exc:
         raise KeyError_(str(exc)) from None
+    if (link.seq - 1, link.prev_hash) != (state.seq, state.head_hash):
+        raise StaleHead("the authority log moved while this revoke was prepared: ask again")
+    return link
 
 
 def append_revoke(data_root: Path | str, link: UnsignedLink, signature: str, *, clock: Callable[[], datetime],
@@ -195,9 +216,11 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     ONE cockpit those hooks verify against (the log the queue finds a grant in at decision time); none or more than
     one is a ``note`` and no rows. What a grant answered is read from the queue (the requests it allowed) and the
     ledger (whether each such call then ran): ``answered`` is ``{"count", "last_at", "recent"}``, ``recent`` the
-    newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``. Read-only: nothing is created.
-    Every string a grant's creator or an agent wrote is shown through ``visible``; ``id`` is also given as is, the
-    name a revoke route takes."""
+    newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``, counted for this instance of
+    the grant only (``instance``, :func:`grant_instance`: an answer by an earlier grant under the same id, or by
+    this one before a renew changed it, is not its own). Read-only: nothing is created. Every string a grant's
+    creator or an agent wrote is shown through ``visible``; ``id`` is also given as is, the name a revoke route
+    takes, and ``instance`` is what that route's challenge names."""
     from levain.cockpit.display_safe import visible
     from levain.consent.answering import hook_roots
     from levain.consent.listing import read_grant_evidence
@@ -208,12 +231,14 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
                 "note": ("no consent hook names a cockpit, so no grant is read here" if not roots else
                          "the consent hooks name more than one cockpit, so which grants answer is not one answer")}
     root = roots[0]
-    try:
-        consent, inert = grant_listing(root, now=now, ssh_keygen=ssh_keygen)
+    try:                            # one capture: the rows and their instances are of the same snapshot
+        state = _signing_authority(_capture(_journal(root), now, ssh_keygen))
     except KeyError_ as exc:        # no journal there, a governed root, a log that does not replay: said, not raised
         return {"root": visible(str(root)), "grants": [], "inert_note": INERT_NOTE, "note": visible(str(exc))}
-    ids = [g.id for g in consent] + [i[0] for i in inert]
-    evidence = read_grant_evidence(queue_dir, ids, recent=recent)
+    consent, inert = _split(state)
+    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert]}
+    evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items() if link is not None],
+                                   recent=recent)
     stamp = utc_stamp(now)
     rows: list[dict[str, Any]] = []
 
@@ -221,20 +246,21 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         got = evidence.get(gid) or {"count": 0, "last_at": "", "recent": []}
         return {**got, "recent": [{**c, "tool": visible(c["tool"]), "cwd": visible(c["cwd"])} for c in got["recent"]]}
 
+    def common(gid: str, kind: str, expires_at: str, seq: int | None) -> dict[str, Any]:
+        return {"id": gid, "id_shown": visible(gid), "kind": visible(kind), "expires_at": visible(expires_at),
+                "link_seq": seq, "instance": grant_instance(links[gid]), "answered": answered(gid),
+                "revoke": visible(revoke_command(gid, root))}
+
     for g in consent:
-        row: dict[str, Any] = {
-            "id": g.id, "id_shown": visible(g.id), "kind": g.kind,
-            "state": "live" if g.expires_at > stamp else "expired", "agent": g.agent,
-            "tools": [visible(t) for t in g.tools], "workspace": visible(g.workspace), "postures": list(g.postures),
-            "expires_at": g.expires_at, "link_seq": g.seq, "answered": answered(g.id),
-            "revoke": visible(revoke_command(g.id, root))}
+        row = {**common(g.id, g.kind, g.expires_at, g.seq), "state": "live" if g.expires_at > stamp else "expired",
+               "agent": visible(g.agent), "tools": [visible(t) for t in g.tools], "workspace": visible(g.workspace),
+               "postures": [visible(p) for p in g.postures]}
         if g.kind == CONSENT_MCP_GRANT_KIND:
-            row["mcp_fields"] = {visible(t): {visible(k): v for k, v in f.items()} for t, f in g.mcp_fields.items()}
+            row["mcp_fields"] = {visible(t): {visible(k): visible(v) for k, v in f.items()}
+                                 for t, f in g.mcp_fields.items()}
         rows.append(row)
     for gid, kind, expires_at, seq in inert:
-        rows.append({"id": gid, "id_shown": visible(gid), "kind": visible(kind), "state": "inert",
-                     "expires_at": expires_at, "link_seq": seq, "answered": answered(gid),
-                     "revoke": visible(revoke_command(gid, root))})
+        rows.append({**common(gid, kind, expires_at, seq), "state": "inert"})
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 
@@ -257,7 +283,11 @@ def grant_listing(data_root: Path | str, *, now: datetime, ssh_keygen: Path | st
     """``(consent grants, inert grants)`` from ONE capture and one snapshot, so a grant is in exactly one of them
     even while a link lands (two separate captures could show it twice or not at all)."""
     db = _journal(data_root, marker_directory=marker_directory)
-    state = _signing_authority(_capture(db, now, ssh_keygen))
+    return _split(_signing_authority(_capture(db, now, ssh_keygen)))
+
+
+def _split(state: Any) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None]]]:
+    """:func:`grant_listing` of one snapshot."""
     consent: list[ConsentGrant] = []
     inert: list[tuple[str, str, str, int | None]] = []
     for gid, g in sorted(state.policy.grants.items()):

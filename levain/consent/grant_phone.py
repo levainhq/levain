@@ -4,8 +4,10 @@ The phone port (:mod:`levain.phone_server`) lists every grant the install's cock
 :func:`levain.consent.grants.grant_view` without its terminal line, plus the passkeys that may revoke) and carries one
 passkey ceremony (:meth:`GrantPhone.step`): ``revoke-challenge`` then ``revoke``.
 
-``revoke-challenge`` builds the ``revoke_grant`` link on the server (:func:`levain.consent.grants.prepare_revoke`,
-judged by every rule of the log but the signature) and HOLDS it, one per grant, for :data:`HOLD`; it answers with the
+``revoke-challenge`` names the grant's ``instance`` as the listing showed it, and is refused ``grant-changed`` when
+the grant under that id is no longer that one (renewed, or revoked and made again). It builds the ``revoke_grant``
+link on the server (:func:`levain.consent.grants.prepare_revoke`, judged by every rule of the log but the signature,
+on the head the instance was checked on) and HOLDS it, one per grant, for :data:`HOLD`; it answers with the
 challenge (the SSHSIG signed-data blob of the link's message in the authority namespace) and ``line``, the link's
 record, which is exactly what is signed. The page never sends a link: ``revoke`` takes only the assertion, converts
 it (:func:`levain.consent.passkey.to_sshsig`, which checks the origin is the page's own) and appends the HELD link with
@@ -14,9 +16,11 @@ other bytes is refused there, and a head that moved since the challenge refuses 
 held link is taken on its first use, whatever the outcome.
 
 The page's token only opens the route: the authority is the passkey's signature, which the replay verifies. The one
-link a passkey may sign in the authority log is ``revoke_grant`` (:mod:`levain.authority`); it only ever narrows what
-an agent may do. ``keys`` and ``root`` are the server's callables over the ONE cockpit the queue's consent hooks name;
-either may raise :class:`levain.consent.sign.SignRefused`, answered with its status. Stdlib only.
+link a passkey may sign in the authority log is ``revoke_grant`` of a consent or inert grant (:mod:`levain.authority`);
+it only ever narrows what an agent may do. The log takes it only from a passkey made on an https name, so a phone
+port on ``localhost`` lists the grants with no signer and says why. ``keys`` and ``root`` are the server's callables
+over the ONE cockpit the queue's consent hooks name; either may raise :class:`levain.consent.sign.SignRefused`,
+answered with its status. Stdlib only.
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ __all__ = ["HOLD", "GrantPhone", "GrantRefused"]
 # how long a held link waits for its signature: a Face ID ceremony takes seconds
 HOLD = 120.0
 _ANSWER_KEYS = frozenset({"authenticator_data", "client_data_json", "signature"})
-_NEED = {"revoke-challenge": frozenset({"signer_fp"}), "revoke": _ANSWER_KEYS}
+_NEED = {"revoke-challenge": frozenset({"signer_fp", "instance"}), "revoke": _ANSWER_KEYS}
 
 
 class GrantRefused(Exception):
@@ -71,6 +75,9 @@ class GrantPhone:
         from levain.authority import AuthorityError
         from levain.consent.sign import SignRefused
 
+        if self.rp_id == "localhost":
+            return {}, ("a passkey made on localhost cannot revoke a grant (the authority log takes a passkey's revoke "
+                        "only from an https page): revoke from the laptop (levain consent grant revoke)")
         try:
             keys = self._keys()
         except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:
@@ -99,20 +106,21 @@ class GrantPhone:
         return {"grants": rows, "grants_note": view["note"] or note, "inert_note": view["inert_note"]}
 
     def step(self, grant_id: str, action: str, req: Any) -> dict[str, Any]:
-        """``/grant/<id>/revoke-challenge`` with ``{signer_fp}``, then ``/grant/<id>/revoke`` with the assertion."""
+        """``/grant/<id>/revoke-challenge`` with ``{signer_fp, instance}``, then ``/grant/<id>/revoke`` with the
+        assertion."""
         need = _NEED.get(action)
         if need is None:
             raise GrantRefused(404, "not_found", "no such route")
         if not isinstance(req, dict) or set(req) != need or not all(isinstance(req[k], str) for k in need):
             raise GrantRefused(400, "bad_request", f"the body must carry exactly {', '.join(sorted(need))}, as text")
         if action == "revoke-challenge":
-            return self._challenge(grant_id, req["signer_fp"])
+            return self._challenge(grant_id, req["signer_fp"], req["instance"])
         return self._revoke(grant_id, req)
 
-    def _challenge(self, grant_id: str, signer_fp: str) -> dict[str, Any]:
-        from levain.authority import NAMESPACE, VerifierUnavailable
+    def _challenge(self, grant_id: str, signer_fp: str, instance: str) -> dict[str, Any]:
+        from levain.authority import NAMESPACE, StaleHead, VerifierUnavailable
         from levain.cockpit.keys import KeyError_
-        from levain.consent.grants import prepare_revoke
+        from levain.consent.grants import GrantChanged, prepare_revoke
         from levain.consent.passkey import challenge
         from levain.consent.sign import SignRefused
 
@@ -121,16 +129,24 @@ class GrantPhone:
             raise GrantRefused(403, "not_a_signer", note or f"{signer_fp[:80]} is not a passkey enrolled for "
                                                            f"{self.rp_id} in the cockpit the consent hook names")
         try:
-            link = prepare_revoke(self._root(), grant_id, signer_fp=signer_fp, clock=self._clock)
+            link = prepare_revoke(self._root(), grant_id, signer_fp=signer_fp, clock=self._clock, instance=instance)
         except SignRefused as exc:
             raise GrantRefused(exc.status, "unavailable", str(exc)) from None
         except VerifierUnavailable as exc:
             raise GrantRefused(503, "unavailable", f"{exc}; nothing was signed") from None
+        except StaleHead:
+            raise GrantRefused(409, "stale", "the authority log moved while this revoke was asked for: ask "
+                                             "again") from None
+        except GrantChanged as exc:
+            raise GrantRefused(409, "grant-changed", f"{exc}; nothing was signed") from None
         except KeyError_ as exc:
             word = "not_found" if str(exc).startswith("no consent grant") else "refused"
             raise GrantRefused(404 if word == "not_found" else 409, word, str(exc)) from None
         with self._lock:
-            self._held[grant_id] = (link, signer_fp, self._monotonic() + HOLD)
+            now = self._monotonic()
+            # a lapsed hold is dropped here, so the held links never outgrow the grants being revoked right now
+            self._held = {g: h for g, h in self._held.items() if h[2] >= now}
+            self._held[grant_id] = (link, signer_fp, now + HOLD)
         return {"grant_id": grant_id, "rp_id": self.rp_id, "signer_fp": signer_fp, "line": link.record,
                 "challenge": _b64u(challenge(link.message, NAMESPACE))}
 

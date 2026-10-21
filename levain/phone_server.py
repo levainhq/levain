@@ -22,8 +22,9 @@ it serves only these:
     cancelled, or a recommended one's run authorised and landed, with a passkey, verified by the job store against the same one
     cockpit as the sign requests; ``consent.json`` lists the live jobs as ``dispatch_pending``, with ``dispatch_note``
     (why the store could not be read) and ``dispatch_overflow`` (:mod:`levain.dispatch.phone`).
-  - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a standing grant revoked with a passkey (the one
-    authority link a passkey may sign), the link built and held here and verified by the authority log itself;
+  - ``POST /grant/<id>/revoke-challenge`` and ``.../revoke``: a consent grant revoked with a passkey made on the
+    https name (the one authority link a passkey may sign), the challenge naming the grant's ``instance`` as listed,
+    the link built and held here and verified by the authority log itself;
     ``consent.json`` lists the grants as ``grants``, with ``grants_note`` and ``inert_note``
     (:mod:`levain.consent.grant_phone`).
   - ``GET /consent.json`` also lists ``questions`` (the open ones an agent filed, :mod:`levain.consent.questions`) and
@@ -128,14 +129,15 @@ def _sign_route(route: str) -> "tuple[str, str] | None":
 
 def _grant_route(route: str) -> "tuple[str, str] | None":
     """``(grant_id, action)`` for ``/grant/<id>/<action>``, else None. A grant's id is its creator's choice, so the
-    page sends encodeURIComponent(id); the decoded id is looked up in the log, never trusted further."""
+    page sends encodeURIComponent(id); the decoded id is looked up in the log, never trusted further. Its length is
+    the log's to bound, not the route's: any id a grant was made with can be revoked here."""
     if not route.startswith(_GRANT_PREFIX):
         return None
     from urllib.parse import unquote
 
     quoted, sep, action = route[len(_GRANT_PREFIX):].partition("/")
     gid = unquote(quoted)
-    if not sep or not gid or len(gid) > 200 or action not in _GRANT_ACTIONS:
+    if not sep or not gid or action not in _GRANT_ACTIONS:
         return None
     return gid, action
 

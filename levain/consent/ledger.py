@@ -69,7 +69,7 @@ from levain.consent.record import AGENTS, tool_input_digest
 
 __all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "PHASES", "STORE_FORMAT",
            "SUBAGENT_MARK", "WINDOW_SCOPE", "Call", "Ledger", "LedgerStoreError",
-           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile"]
+           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile", "request_outcomes"]
 
 DB_NAME = "ledger.db"
 STORE_FORMAT = "levain-authority-ledger/1"
@@ -470,19 +470,6 @@ class Ledger:
         return self._select(f"received_at >= ? AND received_at <= ? AND stamp IN ({marks})", (lo, hi, *DIGEST_STAMPS),
                             per_call=True)
 
-    def for_requests(self, request_ids: "list[str]") -> dict[str, str]:
-        """``{queue request id: outcome}`` for the calls levain answered at the gate with those requests (their ``pre``
-        rows, one per call, ``window``'s rule): what each authorised call then did. A request with no row is absent."""
-        ids = sorted(set(request_ids))
-        out: dict[str, str] = {}
-        with self._read() as conn:
-            for i in range(0, len(ids), 500):
-                chunk = ids[i:i + 500]
-                out.update(conn.execute(
-                    f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
-                    f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
-        return out
-
     def counts(self, since: str | datetime | None = None, until: str | datetime | None = None
                ) -> list[tuple[str, str, str, int]]:
         """``(agent, stamp, outcome, calls)`` over the window, sorted, one per call (``window``'s rule). No
@@ -555,6 +542,37 @@ def _codex_resolution(call: Call, policies: Mapping[str, Mapping[str, Any] | Non
         return _wait("turn_not_written")
     stamp = _stamps.codex_stamp(policy)
     return _final(stamp, policy, "unknown" if stamp in ("pending", "unknown") else "accepted")
+
+
+def request_outcomes(directory: Path | str, request_ids: "list[str]") -> dict[str, str]:
+    """``{queue request id: outcome}`` for the calls levain answered at the gate with those requests (their ``pre``
+    rows, one per call, ``window``'s rule): what each authorised call then did. A request with no row is absent.
+    A true read: the ledger in ``directory`` is opened read-only (no schema, no permission change, no lock taken
+    for writing), and none there is no outcome at all. A ledger of another format raises
+    :class:`LedgerStoreError`."""
+    path = Path(directory) / DB_NAME
+    ids = sorted(set(request_ids))
+    if not ids or not path.is_file():
+        return {}
+    # a short busy wait: a page's read never stalls on a hook holding the database
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=0.25)
+    try:
+        conn.execute("BEGIN")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if "meta" in tables else None
+        if fmt is None or fmt[0] != STORE_FORMAT or "calls" not in tables or "outcome" not in {
+                r[1] for r in conn.execute("PRAGMA table_info(calls)")}:
+            raise LedgerStoreError(f"store format {None if fmt is None else fmt[0]!r} is not {STORE_FORMAT!r}")
+        out: dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out.update(conn.execute(
+                f"SELECT request_id, outcome FROM {_PER_CALL} WHERE phase = 'pre' AND request_id IN "
+                f"({', '.join('?' for _ in chunk)})", chunk).fetchall())
+        conn.execute("COMMIT")
+        return out
+    finally:
+        conn.close()
 
 
 def reconcile(ledger: Ledger, *, give_up_after: timedelta | None = timedelta(hours=1),

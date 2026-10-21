@@ -27,12 +27,15 @@ from levain.consent.grants import create_grant, grant_listing
 from levain.consent.ledger import Ledger
 from levain.consent.passkey import challenge
 from levain.consent.queue import ConsentQueue, authority_source
-from tests.test_dispatch_phone import ORIGIN, RP, SoftPasskey, _b64u
+from tests.test_dispatch_phone import SoftPasskey, _b64u
 from tests.test_phone_server import _enrol
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 HOSTILE = "x; touch /tmp/pwned $(id) `id` 'q' -n"
+# the phone page's https name: the authority log takes a passkey's revoke only from a key made on one
+RP = "phone.example"
+ORIGIN = "https://phone.example"
 
 
 def _now() -> datetime:
@@ -48,7 +51,7 @@ def world(tmp_path: Path):
     root = tmp_path / "cockpit"
     root.mkdir()
     CockpitDB(root).set_install_class("reported")
-    phone = SoftPasskey()
+    phone = SoftPasskey(RP)
     conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
     _enrol(conn, root, laptop, lfp, {"op": "enrol", "fingerprint": lfp, "public_key": lpub,
                                      "class": "laptop-presence", "custody": "passphrase"})
@@ -73,7 +76,7 @@ def world(tmp_path: Path):
         return gid
 
     source = authority_source(root / "cockpit.db", anchor=auth.anchor_path(root))
-    gp = GrantPhone(qdir, RP, ORIGIN, lambda: {k.fingerprint: k for k in passkey_keys(source(), RP)}, lambda: root)
+    gp = GrantPhone(qdir, RP, None, lambda: {k.fingerprint: k for k in passkey_keys(source(), RP)}, lambda: root)
     queue = ConsentQueue(qdir, authority=source)
 
     def ask(name: str):
@@ -82,7 +85,11 @@ def world(tmp_path: Path):
                        cwd=str(ws), hold=timedelta(minutes=5))
         return r, policy.guarded_policy(r, queue, posture="default", tool_input=tool_input)
 
-    return SimpleNamespace(root=root, qdir=qdir, phone=phone, lfp=lfp, grant=grant, gp=gp, ask=ask, ws=ws)
+    def shown(gid: str) -> dict:
+        return {"signer_fp": phone.fp, "instance": {g["id"]: g for g in gp.listing()["grants"]}[gid]["instance"]}
+
+    return SimpleNamespace(root=root, qdir=qdir, phone=phone, lfp=lfp, grant=grant, gp=gp, ask=ask, ws=ws, shown=shown,
+                           laptop_sign=laptop_sign)
 
 
 def test_a_passkey_revokes_a_grant_from_the_phone_and_signs_no_other_link(world) -> None:
@@ -93,22 +100,22 @@ def test_a_passkey_revokes_a_grant_from_the_phone_and_signs_no_other_link(world)
     assert d is not None and d.via == "grant" and d.grant_id == gid
     gp, phone = world.gp, world.phone
     # a surface-token holder's assertion over OTHER bytes: the held link is refused by the log's own verify
-    gp.step(gid, "revoke-challenge", {"signer_fp": phone.fp})
-    forged = phone.assertion(_b64u(challenge(b"some other message", auth.NAMESPACE)))
+    gp.step(gid, "revoke-challenge", world.shown(gid))
+    forged = phone.assertion(_b64u(challenge(b"some other message", auth.NAMESPACE)), origin=ORIGIN)
     with pytest.raises(GrantRefused) as exc:
         gp.step(gid, "revoke", forged)
     assert exc.value.status == 403 and "does not verify" in exc.value.message
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [gid]
     # the real ceremony: what is shown (``line``) is the link that lands
-    c = gp.step(gid, "revoke-challenge", {"signer_fp": phone.fp})
+    c = gp.step(gid, "revoke-challenge", world.shown(gid))
     assert json.loads(c["line"])["op"] == "revoke_grant" and json.loads(c["line"])["grant_id"] == gid
-    got = gp.step(gid, "revoke", phone.assertion(c["challenge"]))
+    got = gp.step(gid, "revoke", phone.assertion(c["challenge"], origin=ORIGIN))
     assert got["revoked"] == gid and got["warning"] == ""
     conn = sqlite3.connect(world.root / "cockpit.db", isolation_level=None)
     try:
         snap = auth.snapshot(conn, cache=auth.ReplayCache())          # a fresh replay verifies every link again
         assert snap.seq == got["seq"] and gid not in snap.policy.grants
-        # every other op a passkey signs is still refused, with the old words
+        # every other op a passkey signs is still refused, in words that state the rule
         for op in ({"op": "enrol", "fingerprint": world.lfp, "public_key": "x", "class": "presence",
                     "custody": "passphrase"},
                    {"op": "create_grant", "grant": {"id": "g2", "kind": "consent", "agent": "claude_code",
@@ -116,15 +123,15 @@ def test_a_passkey_revokes_a_grant_from_the_phone_and_signs_no_other_link(world)
                                                     "postures": ["default"],
                                                     "expires_at": auth._stamp(_now() + timedelta(days=1))}},
                    {"op": "raise", "verb": "spore_touch", "tier": "T3"}):
-            with pytest.raises(auth.AuthorityError, match="a passkey key signs consent answers only, never an "
-                                                          "authority link"):
+            with pytest.raises(auth.AuthorityError, match="a passkey key signs consent answers and grant revokes "
+                                                          "only, never another authority link"):
                 auth.prepare(conn, op, signer_fp=phone.fp, now=_now(), cache=auth.ReplayCache())
     finally:
         conn.close()
     # the grant answers nothing from the next decision on, and a used challenge cannot be answered twice
     assert world.ask("b.txt")[1] is None
     with pytest.raises(GrantRefused) as exc:
-        gp.step(gid, "revoke", phone.assertion(c["challenge"]))
+        gp.step(gid, "revoke", phone.assertion(c["challenge"], origin=ORIGIN))
     assert exc.value.status == 409
 
 
@@ -168,3 +175,89 @@ def test_the_grants_read_shows_what_each_grant_answered_and_a_revoke_line_of_one
     phone_rows = world.gp.listing()
     assert phone_rows["grants_note"] == "" and all("revoke" not in g and g["signers"] == [world.phone.fp]
                                                    for g in phone_rows["grants"])
+
+
+def _raw_passkey_link(db: Path, phone: SoftPasskey, op: dict, origin: str) -> str:
+    """A link ``phone`` signed past every builder (WebAuthn over the exact link message), inserted as is: what a
+    fresh replay then says ("ACCEPTED", or its refusal)."""
+    from levain.consent import passkey as pk
+
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        s = auth.snapshot(conn, cache=auth.ReplayCache())
+        record = auth._canonical({**op, "format": auth.FORMAT, "store_id": s.store_id, "seq": s.seq + 1,
+                                  "at": auth._stamp(_now())})
+        a = phone.assertion(_b64u(challenge(auth._message(s.head_hash, record), auth.NAMESPACE)), origin=origin)
+        sig = pk.to_sshsig(phone.line, *(pk.b64url_decode(a[k], k) for k in ("authenticator_data", "client_data_json",
+                                                                            "signature")), namespace=auth.NAMESPACE)
+        conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (s.seq + 1, s.head_hash, record, phone.fp, sig,
+                                                   auth._link_hash(s.head_hash, record)))
+        try:
+            auth.snapshot(conn, cache=auth.ReplayCache())
+            return "ACCEPTED"
+        except auth.AuthorityError as exc:
+            return str(exc)
+    finally:
+        conn.close()
+
+
+def test_the_replay_takes_a_passkey_revoke_of_a_consent_grant_only_and_only_from_https(world, tmp_path) -> None:
+    """Reproduced on 3522dba2 (m17/repro_on_3522dba2.txt, HIGH1): a passkey-signed revoke_grant of an EGRESS grant,
+    inserted raw, was ACCEPTED by a fresh replay and removed the grant. And (m17/hardcheck_run.txt, 4b) a raw revoke
+    by a passkey made on localhost was accepted: a re-verification pins no port."""
+    egress = {"id": "eg-1", "entity": "e1", "remote_url": "git@github.com:x/y.git", "deploy_key_sha256": "ab" * 32,
+              "refspecs": ["refs/heads/main"], "verbs": ["push"],
+              "expires_at": auth._stamp(_now() + timedelta(days=1))}
+    conn = sqlite3.connect(world.root / "cockpit.db", isolation_level=None)
+    try:
+        auth.sign_and_append(conn, {"op": "create_grant", "grant": egress}, signer_fp=world.lfp,
+                             sign=world.laptop_sign, clock=_now, cache=auth.ReplayCache(),
+                             anchor=auth.anchor_path(world.root))
+    finally:
+        conn.close()
+    world.grant("cg-0123456789ab")
+    copy = tmp_path / "egress.db"
+    shutil.copy(world.root / "cockpit.db", copy)
+    got = _raw_passkey_link(copy, world.phone, {"op": "revoke_grant", "grant_id": "eg-1"}, ORIGIN)
+    assert "a passkey key revokes a consent grant or an inert one only, never grant 'eg-1'" in got
+    shutil.copy(world.root / "cockpit.db", copy)          # control: the same raw path on the consent grant lands
+    assert _raw_passkey_link(copy, world.phone, {"op": "revoke_grant", "grant_id": "cg-0123456789ab"},
+                             ORIGIN) == "ACCEPTED"
+    # a passkey made on localhost: enrolled, valid WebAuthn, and still refused by the replay
+    local = SoftPasskey("localhost")
+    conn = sqlite3.connect(world.root / "cockpit.db", isolation_level=None)
+    try:
+        _enrol(conn, world.root, world.root.parent / "laptop", world.lfp,
+               {"op": "enrol", "fingerprint": local.fp, "public_key": local.line, "class": "display-phone",
+                "custody": "passkey"})
+    finally:
+        conn.close()
+    shutil.copy(world.root / "cockpit.db", copy)
+    got = _raw_passkey_link(copy, local, {"op": "revoke_grant", "grant_id": "cg-0123456789ab"},
+                            "http://localhost:7428")
+    assert "a passkey made on localhost signs no authority link" in got
+
+
+def test_a_revoke_asked_from_a_listing_names_the_grant_it_showed(world) -> None:
+    """Reproduced on 3522dba2 (m17/repro_on_3522dba2.txt, MED2): the phone listed cg-G, the laptop revoked it and
+    made a different cg-G, and the phone's ceremony from the old listing revoked the NEW grant (seq 7)."""
+    world.grant("cg-G")
+    r, d = world.ask("a.txt")
+    assert d is not None and d.grant_id == "cg-G"
+    old = world.shown("cg-G")
+    assert {g["id"]: g for g in world.gp.listing()["grants"]}["cg-G"]["answered"]["count"] == 1
+    from levain.consent.grants import revoke_grant
+
+    revoke_grant(world.root, "cg-G", signer_fp=world.lfp, sign=world.laptop_sign, clock=_now)
+    world.grant("cg-G")                                   # a different grant under the same id
+    with pytest.raises(GrantRefused) as exc:
+        world.gp.step("cg-G", "revoke-challenge", old)
+    assert (exc.value.status, exc.value.error) == (409, "grant-changed")
+    assert "is not the grant that was shown" in exc.value.message
+    assert [g.id for g in grant_listing(world.root, now=_now())[0]] == ["cg-G"]
+    # the new grant shows only its own answers (none), and a challenge naming it is built
+    row = {g["id"]: g for g in world.gp.listing()["grants"]}["cg-G"]
+    assert row["instance"] != old["instance"] and row["answered"] == {"count": 0, "last_at": "", "recent": []}
+    c = world.gp.step("cg-G", "revoke-challenge", world.shown("cg-G"))
+    assert json.loads(c["line"])["grant_id"] == "cg-G"

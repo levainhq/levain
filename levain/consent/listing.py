@@ -253,33 +253,36 @@ def read_evidence(directory: Path | str | None = None, *, now: datetime, exclude
     return [KeyEvidence(a, t, c, int(n), last or "", bool(d), v == "grant") for a, t, c, n, last, d, v in rows]
 
 
-def read_grant_evidence(directory: Path | str | None, grant_ids: "list[str]", *, recent: int = 5
+def read_grant_evidence(directory: Path | str | None, grants: "list[tuple[str, int, str]]", *, recent: int = 5
                         ) -> dict[str, dict[str, Any]]:
-    """What each standing grant in ``grant_ids`` answered: ``{grant id: {"count", "last_at", "recent"}}``, from the
-    requests the queue allowed by that grant (``via = 'grant'``, the grant named in the stored answer), over the
-    queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at", "tool",
-    "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran (``accepted``,
-    ``refused``, ``unknown`` when the ledger holds no row for it). A grant that answered nothing is absent. Same
-    read-only rules as :func:`read_listing`; no queue (or no ledger) creates none. ``tool`` and ``cwd`` are the
-    agent's text, as stored: the caller shows them through ``visible``."""
+    """What each standing grant answered: ``{grant id: {"count", "last_at", "recent"}}`` for ``grants``, each
+    ``(id, seq, hash)`` of the link that created or last changed it. An answer counts for a grant only when its
+    stored answer names all three (``grant_id``, ``grant_seq``, ``grant_hash``), so a grant revoked and made again
+    under the same id starts with nothing. Read from the requests the queue allowed by a grant (``via = 'grant'``),
+    over the queue's whole history. ``recent`` holds the newest ``recent`` of them, each ``{"request_id", "at",
+    "tool", "cwd", "outcome"}``; ``outcome`` is the authority ledger's word for whether that call then ran
+    (``accepted``, ``refused``, ``unknown`` when the ledger holds no row for it). A grant that answered nothing is
+    absent. Same read-only rules as :func:`read_listing`, the ledger's too
+    (:func:`levain.consent.ledger.request_outcomes`); no queue (or no ledger) creates none. ``tool`` and ``cwd`` are
+    the agent's text, as stored: the caller shows them through ``visible``."""
     out: dict[str, dict[str, Any]] = {}
-    ids = sorted(set(grant_ids))
-    conn = _open_ro(directory) if ids else None
+    wanted_grants = sorted(set(grants))
+    conn = _open_ro(directory) if wanted_grants else None
     if conn is None:
         return out
     try:
         conn.execute("BEGIN")
         _check_format(conn)
-        gid_of = "json_extract(answer, '$.grant_id')"
-        for gid in ids:
-            n, last = conn.execute(
-                f"SELECT COUNT(*), MAX(decided_at) FROM requests WHERE via = 'grant' AND state = 'allowed' "
-                f"AND {gid_of} = ?", (gid,)).fetchone()
+        match = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
+                 "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")
+        for gid, seq, link_hash in wanted_grants:
+            n, last = conn.execute(f"SELECT COUNT(*), MAX(decided_at) FROM requests WHERE {match}",
+                                   (gid, seq, link_hash)).fetchone()
             if not n:
                 continue
             calls = conn.execute(
-                f"SELECT id, decided_at, tool_name, cwd FROM requests WHERE via = 'grant' AND state = 'allowed' "
-                f"AND {gid_of} = ? ORDER BY decided_at DESC, rowid DESC LIMIT ?", (gid, max(recent, 0))).fetchall()
+                f"SELECT id, decided_at, tool_name, cwd FROM requests WHERE {match} "
+                "ORDER BY decided_at DESC, rowid DESC LIMIT ?", (gid, seq, link_hash, max(recent, 0))).fetchall()
             out[gid] = {"count": int(n), "last_at": last or "",
                         "recent": [{"request_id": rid, "at": at, "tool": tool, "cwd": cwd, "outcome": "unknown"}
                                    for rid, at, tool, cwd in calls]}
@@ -288,15 +291,13 @@ def read_grant_evidence(directory: Path | str | None, grant_ids: "list[str]", *,
         conn.close()
     wanted = [c["request_id"] for g in out.values() for c in g["recent"]]
     if wanted:
-        from levain.consent.ledger import DB_NAME as LEDGER_DB, Ledger
+        from levain.consent.ledger import request_outcomes
         from levain.consent.queue import default_queue_dir
 
-        base = Path(directory) if directory is not None else default_queue_dir()
-        if (base / LEDGER_DB).is_file():
-            outcomes = Ledger(base, busy_seconds=0.25).for_requests(wanted)
-            for g in out.values():
-                for c in g["recent"]:
-                    c["outcome"] = outcomes.get(c["request_id"], "unknown")
+        outcomes = request_outcomes(Path(directory) if directory is not None else default_queue_dir(), wanted)
+        for g in out.values():
+            for c in g["recent"]:
+                c["outcome"] = outcomes.get(c["request_id"], "unknown")
     return out
 
 
