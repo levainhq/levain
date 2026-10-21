@@ -178,8 +178,9 @@ def _sigkill_and_reap(pid: int) -> None:
 
 
 def darwin_user_dir(uid: int, gid: int) -> str:
-    """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (render's ``var_folders``), from ``getconf
-    DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``). [not run: a 2g row]"""
+    """macOS: ``uid``'s ``/private/var/folders/<a>/<b>`` (alloc's ``var_folders``, read at prepare), from ``getconf
+    DARWIN_USER_DIR`` run AS that uid (``/var/folders/<a>/<b>/0/``); it CREATES the dir when absent [measured:
+    levain-memory runs/s2-macos/RESULT_D1D2.md X9, 2026-10-20], so it runs at prepare only."""
     r = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_DIR"], capture_output=True, text=True, timeout=10,
                        env={}, user=uid, group=gid, extra_groups=[])
     parts = [p for p in r.stdout.strip().split("/") if p] if r.returncode == 0 else []
@@ -1095,13 +1096,20 @@ def prepare(ctx: Ctx, req: RuntimeRequest, blob: PrepareInput) -> Dict[str, obje
         ids = slot_ids(ctx, slot)
         first, second = slot.accounts
         linux = seams.host == "linux"
+        folders = None
+        if seams.host == "darwin":
+            # Read ONCE, here, while the uid holds no session: getconf runs AS the uid and creates the dir when it
+            # is absent, so a later read (a re-run END after the dir moved) would re-create it (D1).
+            folders = (seams.var_folders(ids[first], ids[first]),) if slot.slot_class == "egress" else \
+                (seams.var_folders(ids[second], ids[second]), seams.var_folders(ids[first], ids[first]))
         alloc = R.Alloc(
             session=session, slot=slot, lease_seq=leased.state.lease_seq, slot_rev=leased.state.rev,
             slot_uid=ids[first], slot_gid=ids[first], kind=req.kind, vendor=req.vendor, auth=req.auth,
             operator_uid=ctx.operator_uid, supervisor_uid=ctx.sudo_uid, staging_uid=ctx.sudo_uid,
             created_at=R.timestamp(seams.clock()), boot_id=seams.boot_id(),
             child_uid=ids[second] if slot.slot_class == "none" else None,
-            netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None)
+            netns=slot.netns if linux else None, cgroup=R.cgroup_path(slot, session) if linux else None,
+            var_folders=folders)
         seams.at("alloc")
         try:
             create_alloc(ctx, alloc)
@@ -1194,8 +1202,9 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     assert owner is not None
     folders: Tuple[str, ...] = ()
     if seams.host == "darwin":
-        folders = (seams.var_folders(owner, owner),) if egress else \
-            (seams.var_folders(owner, owner), seams.var_folders(alloc.slot_uid, alloc.slot_gid))
+        if alloc.var_folders is None:
+            raise Refused("var-folders-unknown", alloc.session)
+        folders = tuple(alloc.var_folders)
     term = ctx.env.get("TERM")
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None

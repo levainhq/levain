@@ -27,6 +27,7 @@ from levain.contracts import canon
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units
+from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import runtime_helper as RH
 from levain.slot.intent import INTENT_PATH, Intent, install_lock, intent_remove_step, intent_write_step, read_intent
@@ -642,6 +643,22 @@ def _abandoned_setup(facts: HostFacts) -> Intent | None:
     return j
 
 
+def _end_processes(host: HostOS, uid: int, name: str, *, bootout: Callable[[int], None] = PR.darwin_bootout,
+                   kill_all: Callable[[int], tuple[bool, str]] = _kill_all,
+                   none_left: Callable[[int], bool] = lambda u: PR.UidProcs().no_process(u)) -> tuple[bool, str]:
+    """macOS first ends the uid's launchd domain, so no agent is respawned for it after the kill (an undo once
+    left a slot's distnoted running past rc 0: levain-memory runs/s2-macos/raw_d/998_undo.txt); then every
+    process is killed, and the proof (two scans, no process of the uid) refuses by the account's name."""
+    if host == "darwin":
+        bootout(uid)
+    ok, why = kill_all(uid)
+    if not ok:
+        return False, why
+    if not none_left(uid):
+        return False, f"processes-remain:{name}: a process of uid {uid} is running after the kill"
+    return True, ""
+
+
 def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, int],
               shared_groups: Iterable[str]) -> InstallPlan:
     """``accounts``: every live Levain account the directory service holds, name -> uid (== gid);
@@ -698,7 +715,8 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
     ]
     for name, uid in sorted(accounts.items()):
-        steps.append(Step(f"stop every process of {name}, and check they are gone", call=lambda u=uid: _kill_all(u)))
+        steps.append(Step(f"stop every process of {name}, and check they are gone",
+                          call=lambda u=uid, n=name: _end_processes(host, u, n)))
     for name in sorted(accounts):
         steps += tombstone_steps(host, name)
     steps += ungroup_steps(host, operator)
