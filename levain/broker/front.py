@@ -17,8 +17,12 @@ What it enforces, in order, before any upstream byte:
    reserved, documentation-range or otherwise not globally reachable, the whole CONNECT is `address-refused`.
    The upstream socket is then opened to one of THOSE validated addresses, never by name, so a resolver that
    answers differently a second time (DNS rebinding) never chooses where the bytes go.
-Only then does the front answer 200 and relay bytes both ways without reading them (end-to-end TLS). Each tunnel
-is logged at its close as host, address, route, whether the route is `subscription_passthrough`, and byte counts:
+5. the TLS ClientHello, which the client sends after the 200: its SNI must be the CONNECT host, and a hello with
+   no SNI, with an encrypted (ECH / ESNI) name, or that does not parse is refused by closing the tunnel with no
+   byte sent upstream. This stops domain fronting at the SNI; an HTTP Host header inside the TLS session is not
+   seen (closing that needs interception).
+Only then does the front forward the hello and relay bytes both ways without reading them (end-to-end TLS). Each
+tunnel is logged at its close as host, address, route, whether the route is `subscription_passthrough`, and byte counts:
 never a request line, a header or a payload byte.
 
 Why the address check lives here and not in the vendor sandbox: srt skips its resolved-address check on a
@@ -39,7 +43,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
-import h11
+try:
+    import h11
+except ImportError:   # an install without levain[isolation]: main() says so in one line
+    h11 = None  # type: ignore[assignment]
 
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
 
@@ -57,6 +64,9 @@ MAX_ADDRESSES = 16
 MAX_CONNS = 256
 #: DECISION: once one direction of a tunnel has ended cleanly, the other has this long to end before both close.
 HALF_CLOSE_S = 30.0
+#: DECISION (the head's number): a tunnel with no byte either way for this long is closed. Longer than any SSE
+#: keepalive gap known to us; TCP keepalive (set on both sockets) finds a dead peer, this finds a silent one.
+IDLE_S = 600.0
 _CHUNK = 65536
 #: after a refusal the front reads (and drops) at most this much, for at most DRAIN_S, so the close is not an RST
 #: that destroys the status line the client has not read yet.
@@ -320,7 +330,123 @@ def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, in
     return route, port
 
 
+# --- the TLS ClientHello (domain fronting) ----------------------------------------------------------------------
+# After the 200 the client's first bytes must be a TLS ClientHello whose SNI names the CONNECT host: without this
+# check a tunnel to an allowed host's address could carry a TLS session for any other name that address serves
+# (domain fronting). Only as much of the hello is parsed as that needs (RFC 8446 §4.1.2, RFC 6066 §3); it is then
+# forwarded byte for byte. A hello that does not parse is refused, never relayed.
+
+_TLS_HANDSHAKE = 22
+_TLS_RECORD_MAX = 1 << 14
+_CLIENT_HELLO = 1
+_EXT_SERVER_NAME = 0x0000
+#: encrypted_client_hello, and the draft ESNI codepoint: the name the server routes on is then encrypted, so the
+#: outer SNI proves nothing. Refused whole.
+_EXT_HIDDEN_NAME = (0xFE0D, 0xFFCE)
+#: DECISION: a ClientHello (all of its records) larger than this is refused rather than buffered.
+HELLO_CAP = 64 * 1024
+
+
+def _bad_hello() -> Refused:
+    return Refused("malformed", "tls-hello")
+
+
+class _Cursor:
+    def __init__(self, data: bytes) -> None:
+        self.data, self.pos = data, 0
+
+    def take(self, n: int) -> bytes:
+        if self.pos + n > len(self.data):
+            raise _bad_hello()
+        out = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return out
+
+    def uint(self, n: int) -> int:
+        return int.from_bytes(self.take(n), "big")
+
+    def vec(self, len_bytes: int) -> bytes:
+        return self.take(self.uint(len_bytes))
+
+    def done(self) -> bool:
+        return self.pos == len(self.data)
+
+
+async def read_client_hello(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
+    """Read whole TLS handshake records until they hold one complete ClientHello. Returns (the raw bytes read, to
+    forward verbatim; the ClientHello body). Anything else first, or anything after the hello in the same records,
+    is refused. EOF mid-hello raises IncompleteReadError."""
+    raw, hs = bytearray(), bytearray()
+    while True:
+        hdr = await reader.readexactly(5)
+        length = int.from_bytes(hdr[3:5], "big")
+        if hdr[0] != _TLS_HANDSHAKE or hdr[1] != 3 or not 0 < length <= _TLS_RECORD_MAX:
+            raise _bad_hello()
+        if len(raw) + 5 + length > HELLO_CAP:
+            raise _bad_hello()
+        frag = await reader.readexactly(length)
+        raw += hdr + frag
+        hs += frag
+        if len(hs) < 4:
+            continue
+        if hs[0] != _CLIENT_HELLO:
+            raise _bad_hello()
+        need = 4 + int.from_bytes(hs[1:4], "big")
+        if len(hs) < need:
+            continue
+        if len(hs) != need:
+            raise _bad_hello()
+        return bytes(raw), bytes(hs[4:])
+
+
+def client_hello_sni(body: bytes) -> str:
+    """The ClientHello's one host_name, lowercased. Refuses (host-not-allowed) a hello with no server_name and one
+    carrying an encrypted / hidden name extension; refuses (malformed) anything that does not parse, a repeated
+    extension, and a server_name list that is not exactly one host_name of printable ASCII."""
+    c = _Cursor(body)
+    c.take(2 + 32)    # legacy_version, random
+    c.vec(1)          # legacy_session_id
+    c.vec(2)          # cipher_suites
+    c.vec(1)          # legacy_compression_methods
+    if c.done():
+        raise Refused("host-not-allowed", "sni-missing")   # no extensions at all
+    exts = _Cursor(c.vec(2))
+    if not c.done():
+        raise _bad_hello()
+    seen: set[int] = set()
+    name: Optional[bytes] = None
+    while not exts.done():
+        typ = exts.uint(2)
+        data = exts.vec(2)
+        if typ in seen:
+            raise _bad_hello()
+        seen.add(typ)
+        if typ in _EXT_HIDDEN_NAME:
+            raise Refused("host-not-allowed", "sni-hidden")
+        if typ == _EXT_SERVER_NAME:
+            lst = _Cursor(data)
+            names = _Cursor(lst.vec(2))
+            if not lst.done() or names.uint(1) != 0:   # name_type host_name
+                raise _bad_hello()
+            name = names.vec(2)
+            if not names.done() or not name or any(b <= 0x20 or b >= 0x7F for b in name):
+                raise _bad_hello()
+    if name is None:
+        raise Refused("host-not-allowed", "sni-missing")
+    return name.decode("ascii").lower()
+
+
 # --- the server -----------------------------------------------------------------------------------------------
+
+def _keepalive(writer: asyncio.StreamWriter) -> None:
+    """SO_KEEPALIVE on a TCP stream (a unix socket has no use for it), so a peer that vanished is found."""
+    sock = writer.get_extra_info("socket")
+    if sock is not None and sock.family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+
 
 class Front:
     def __init__(self, policy: FrontPolicy, *, log_path: Optional[Path | str] = None,
@@ -331,10 +457,11 @@ class Front:
         self.slot_uid = slot_uid
         self._resolve = resolve
         self._connect = connect
+        #: every open stream, client and upstream alike: closed at shutdown.
         self.live: set[asyncio.StreamWriter] = set()
+        #: client connections being served: the MAX_CONNS count.
+        self.clients = 0
         self.bound: Optional[tuple[str, int]] = None
-        #: upstream connect attempts made (the contract rows' "upstream connections").
-        self.upstream_attempts = 0
 
     def _log(self, rec: dict) -> None:
         rec = {"at": round(time.time(), 3), "session": self.policy.session, **rec}
@@ -349,15 +476,17 @@ class Front:
             print(f"levain gw-front: log write failed ({e}): {line}", file=sys.stderr, end="")
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if len(self.live) >= MAX_CONNS:
+        if self.clients >= MAX_CONNS:
             writer.close()
             return
+        self.clients += 1
         self.live.add(writer)
         try:
             await self._serve(reader, writer)
         except (OSError, asyncio.IncompleteReadError):
             pass
         finally:
+            self.clients -= 1
             self.live.discard(writer)
             writer.close()
 
@@ -385,16 +514,41 @@ class Front:
         except Refused as r:
             await self._refuse(reader, writer, r)
             return
+        # The upstream is open before the 200 so an unreachable one is still answered 502 / 504. The ClientHello
+        # comes after the 200, so a refused hello leaves that connection opened with no byte sent on it.
+        _keepalive(writer)
+        _keepalive(uwriter)
+        self.live.add(uwriter)
         counts = {"up": 0, "down": 0}
+        relaying = False
         try:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
+            try:
+                hello, body = await asyncio.wait_for(read_client_hello(reader), HEAD_TIMEOUT_S)
+                if client_hello_sni(body) != route.host:
+                    raise Refused("host-not-allowed", "sni-mismatch")
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                self._log({"event": "refused", "refused": "malformed", "detail": "tls-hello-incomplete",
+                           "host": route.host, "address": addr})
+                return
+            except Refused as r:
+                # after the 200 there is no HTTP answer to give: the client sees the tunnel close
+                self._log({"event": "refused", "refused": r.name, "detail": r.detail, "host": route.host,
+                           "address": addr})
+                return
+            relaying = True
+            counts["up"] = len(hello)
+            uwriter.write(hello)
+            await uwriter.drain()
             await self._relay(reader, writer, ureader, uwriter, counts)
-        finally:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
+        finally:
             uwriter.close()
-            self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
-                       "host": route.host, "port": port, "address": addr,
-                       "bytes_up": counts["up"], "bytes_down": counts["down"]})
+            self.live.discard(uwriter)
+            if relaying:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
+                self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
+                           "host": route.host, "port": port, "address": addr,
+                           "bytes_up": counts["up"], "bytes_down": counts["down"]})
 
     async def _open_upstream(self, route: ConnectRoute, port: int):
         try:
@@ -414,7 +568,6 @@ class Front:
             raise Refused("address-refused", "; ".join(f"{a} {w}" for a, w in bad))
         timed_out = 0
         for addr in addrs:   # the validated addresses, never the name again
-            self.upstream_attempts += 1
             try:
                 ur, uw = await asyncio.wait_for(self._connect(addr, port), CONNECT_TIMEOUT_S)
                 return ur, uw, addr
@@ -427,10 +580,25 @@ class Front:
     async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict) -> None:
         """Copy both ways until both ends are done. A broken direction ends both; after one direction ends cleanly
         the other gets HALF_CLOSE_S to finish (a client that fully closed looks like a half-close from here, and an
-        upstream that never answers the FIN would otherwise hold the tunnel open)."""
+        upstream that never answers the FIN would otherwise hold the tunnel open). A tunnel on which NO byte has moved
+        in either direction for IDLE_S is broken: idle is judged for the tunnel, not per direction, because during a
+        long streamed response the client sends nothing while the upstream is still talking."""
+        loop = asyncio.get_running_loop()
+        last = [loop.time()]
+
         async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> bool:
             try:
-                while chunk := await src.read(_CHUNK):
+                while True:
+                    left = last[0] + IDLE_S - loop.time()
+                    if left <= 0:
+                        return False   # the whole tunnel has been quiet for IDLE_S
+                    try:
+                        chunk = await asyncio.wait_for(src.read(_CHUNK), left)
+                    except asyncio.TimeoutError:
+                        continue       # re-judged against the other direction's last byte
+                    if not chunk:
+                        break
+                    last[0] = loop.time()
                     counts[key] += len(chunk)
                     dst.write(chunk)
                     await dst.drain()
@@ -440,7 +608,6 @@ class Front:
             except (OSError, asyncio.IncompleteReadError):
                 return False
 
-        self.live.add(uwriter)
         tasks = {asyncio.ensure_future(pump(creader, uwriter, "up")),
                  asyncio.ensure_future(pump(ureader, cwriter, "down"))}
         try:
@@ -450,7 +617,6 @@ class Front:
         finally:
             cwriter.close()
             uwriter.close()
-            self.live.discard(uwriter)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -488,9 +654,12 @@ class Front:
         clear_stale_socket(path)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.bind(path)
+            old = os.umask(0o117)   # the socket is created 0660: no window at a wider mode
+            try:
+                s.bind(path)
+            finally:
+                os.umask(old)
             self.bound = (path, os.lstat(path).st_ino)
-            os.chmod(path, 0o660)
             return await asyncio.start_unix_server(self._handle, sock=s, limit=HEAD_CAP)
         except BaseException:
             s.close()
@@ -515,8 +684,7 @@ class Front:
         return await asyncio.start_server(self._handle, host=host, port=port, limit=HEAD_CAP)
 
 
-async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None,
-                    ready: Optional[Callable[[], None]] = None) -> None:
+async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[int] = None) -> None:
     """Serve until SIGTERM / SIGINT, then close every tunnel and the listener."""
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -524,8 +692,6 @@ async def run_front(front: Front, *, unix: Optional[str] = None, port: Optional[
         loop.add_signal_handler(sig, stop.set)
     server = await (front.serve_unix(unix) if unix is not None else front.serve_tcp(port))  # type: ignore[arg-type]
     try:
-        if ready is not None:
-            ready()
         await stop.wait()
     finally:
         server.close()
@@ -551,8 +717,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--go-fd", type=int, help="render's GO pipe: serve only after one byte arrives on it; EOF = exit "
                                               "without serving (CONTRACT §5.1 render (4)-(5b))")
     a = ap.parse_args(argv)
+    # every argument is checked before the GO fd is read: a bad one exits at once instead of after render's byte
     if a.unix is not None and a.slot_uid is None:
         ap.error("--unix needs --slot-uid")
+    if a.port is not None and a.slot_uid is not None:
+        ap.error("--slot-uid is the unix shape's peer check; the TCP shape (--port) takes none")
+    if a.port is not None and not GWPORT_BASE <= a.port < GWPORT_BASE + SLOTS:
+        ap.error(f"--port must be in the gateway range {GWPORT_BASE}..{GWPORT_BASE + SLOTS - 1}")
+    if h11 is None:
+        print("levain gw-front: the h11 parser is not installed; install levain[isolation]", file=sys.stderr)
+        return 2
     if os.geteuid() == 0:
         print("levain gw-front: refusing to run as root (it runs as the slot's _levain_gw<n>)", file=sys.stderr)
         return 2
@@ -562,7 +736,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"levain gw-front: policy refused: {e}", file=sys.stderr)
         return 2
     if a.go_fd is not None:
-        # The policy is read first (render writes it before it starts the front); nothing is bound until GO.
+        # The policy is read first: render is to write it before it starts the front (CONTRACT §4.3). Nothing is
+        # bound until GO.
         try:
             go = os.read(a.go_fd, 1)
         except OSError as e:
