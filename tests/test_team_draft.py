@@ -81,3 +81,28 @@ def test_draft_rows_are_append_only_and_final(world):
     c = sqlite3.connect(qdir / "dispatch.db")
     with pytest.raises(sqlite3.DatabaseError):
         c.execute("UPDATE team_drafts SET body = '{}'")
+
+
+def test_a_reserved_draft_is_signed_only_by_its_owner(world, tmp_path, monkeypatch, capsys):
+    """Replays fix_r2_promote_BEFORE.txt (B): a promote from the operator's second clone, made while the first held the
+    reservation, signed a second entry for the same draft."""
+    from levain.team import cli_draft
+    ana, qdir, store, token = world
+    git("clone", "-q", str(tmp_path / "origin.git"), "ana2", cwd=tmp_path)
+    ana2 = tmp_path / "ana2"
+    git("config", "user.email", "ana@ex.com", cwd=ana2)
+    assert levain_main(["team", "join", "--signing-key", str(tmp_path / "k.pub"), "--no-install", "--repo", str(ana2)]) == 0
+    d = T.add_draft(store, "finding", summary="one signature", by="operator")
+    other = []
+
+    def from_the_second_clone(draft_id):
+        monkeypatch.setattr(cli_draft, "_after_reserve", None)
+        other.append(levain_main(["team", "draft", "promote", draft_id, "--yes", "--no-push", "--repo", str(ana2),
+                                  "--queue-dir", str(qdir)]))
+    monkeypatch.setattr(cli_draft, "_after_reserve", from_the_second_clone)
+    assert levain_main(["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana),
+                        "--queue-dir", str(qdir)]) == 0
+    assert other == [2] and "in progress" in capsys.readouterr().err
+    signed = [c for c in (ana, ana2) for n in [_ledger_file(c)] if T.draft_agent(d["draft_id"]) in
+              git("show", "levain-team-ledger:" + n, cwd=c)]
+    assert signed == [ana] and T.get_draft(store, d["draft_id"])["state"] == "promoted"
