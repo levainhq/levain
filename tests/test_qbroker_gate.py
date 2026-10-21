@@ -269,6 +269,19 @@ def test_a_counter_past_its_failure_bound_is_limits_failed_not_over_limit(L, res
     assert "not a budget" in text and "limits.db" in text and "reached its" not in text
 
 
+def test_a_counter_that_cannot_write_its_failure_count_is_limits_failed_at_once(L, resolver, clock, monkeypatch):
+    # L3 r2 codex F2: a full disk under a valid 0700 dir; the failure count never sticks, so no bounded fail-open
+    from levain.consent import limits as consent_limits
+    d = L / "queue" / "requests" / qbroker.LIMITS_DIR
+    d.mkdir(mode=0o700)
+    (d / consent_limits.DB_NAME).mkdir()                 # a store that can never open
+    monkeypatch.setattr(consent_limits, "_fail_write", lambda *a, **k: False)
+    b = limited(L, resolver, clock, {"calls": 100})
+    got = [gate(b) for _ in range(3)]
+    assert [g["gate"] for g in got] == ["limits-failed"] * 3
+    assert "could not be written" in got[0]["reason"]
+
+
 def test_parallel_gates_draw_their_own_bucket_never_answer_s(L, resolver, clock):
     # F5 (s2b2_fix1_run/RUN_before.txt: a parallel batch past ANSWER_BURST was refused rate-limited and denied)
     import threading
@@ -327,6 +340,9 @@ def test_gate_check_texts_and_one_retry():
     over = broker_client.gate_check(Scripted([{"gate": "over-limit", "kind": "calls"}]), **kw)
     assert "tool calls limit" in over and "limits settings" in over
     assert "levain limits extend" not in over                  # F7: a slot has no Extend
+    for kind in ("no-such-kind", None):                   # L3 r2 complement LOW 1: never "its a limit"
+        odd = broker_client.gate_check(Scripted([{"gate": "over-limit", "kind": kind}]), **kw)
+        assert "reached a configured limit" in odd and "its a limit" not in odd
     failed = broker_client.gate_check(Scripted([{"gate": "limits-failed", "reason": "disk full"}]), **kw)
     assert "disk full" in failed and "limits.db" in failed and "not a budget" in failed
     sleeps = []

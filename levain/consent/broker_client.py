@@ -274,7 +274,7 @@ SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversibl
                   "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
 # an over-limit GATE: Q13's budget words, with what the operator can do for a slot (the local
 # ``levain limits extend`` is not a slot's: the broker reads its limits from its own settings, and has no Extend hold)
-SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session reached its {label} limit. This is not "
+SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session reached {limit}. This is not "
                   "a fault and not a denial of the work. Do not try to continue it another way; the session goes on "
                   "only when the operator raises that limit in the queue broker's limits settings, or starts a new "
                   "session.")
@@ -308,7 +308,9 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
         return SLOT_HALT_TEXT.format(r=detail)
     if verdict == GATE_FAILED:
         return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
-    return SLOT_OVER_TEXT.format(label=limits.LABELS.get(detail or "", "a"))
+    label = limits.LABELS.get(detail) if isinstance(detail, str) else None
+    # an unknown or missing kind names no budget it cannot name (L3 r2 complement LOW 1: "reached its a limit")
+    return SLOT_OVER_TEXT.format(limit=f"its {label} limit" if label else "a configured limit")
 
 
 def grant_member(agent: str, tool_name: str, tool_input: Any, root: str) -> dict[str, Any] | None:

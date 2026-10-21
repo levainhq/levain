@@ -30,7 +30,8 @@ FAILING OPEN, BOUNDED. A brake must not stop all work on a passing disk error: w
 proceeds and the verdict says ``not_counting``. A runaway that filled the disk is exactly when the brake is needed, so
 after :data:`FAIL_DENY_AFTER` consecutive failed writes in one root every call is denied until a write succeeds. The
 failure count lives in a small fixed-size file per root, pre-allocated at the root's first counted call and overwritten
-in place, so updating it needs no new disk blocks.
+in place, so updating it needs no new disk blocks. A failure whose count cannot be written at all is denied at once:
+the bound could not be held otherwise.
 
 Known edges (one line each):
 
@@ -311,10 +312,14 @@ def count_call(queue_dir: Path | str, agent: str, session: str, event: Mapping[s
         if halt is not None:            # a halt is never lifted by the store failing to take the count
             return Verdict("halted", kind=halt["kind"], halt=halt, reason=f"{type(exc).__name__}")
         n = _fail_read(fail) + 1
-        _fail_write(fail, n, create=True)    # made here too: a store that never worked is still capped
+        # made here too: a store that never worked is still capped. A count that cannot be kept (a full disk or a
+        # read-only filesystem under a valid directory) would read 1 on every call and fail open forever, so the
+        # bound cannot be held and the call is denied now (L3 r2 codex F2)
+        kept = _fail_write(fail, n, create=True)
         why = f"{type(exc).__name__}: {exc}"[:300]
-        if n >= FAIL_DENY_AFTER:
-            return Verdict("fail_deny", reason=f"the limits store {qdir / DB_NAME} failed {n} times in a row ({why}); "
+        if not kept or n >= FAIL_DENY_AFTER:
+            times = f"failed {n} times in a row" if kept else "failed and its failure count could not be written"
+            return Verdict("fail_deny", reason=f"the limits store {qdir / DB_NAME} {times} ({why}); "
                                                "the operator fixes or moves that file aside (a full disk, a store of "
                                                "another levain version, a corrupt file) and the next call is counted")
         return Verdict("not_counting", reason=f"the limits store failed ({why})")
