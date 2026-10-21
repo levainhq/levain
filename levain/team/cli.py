@@ -562,6 +562,8 @@ def register(subparsers) -> None:
     mr.add_argument("--no-push", action="store_true")
     mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(open_ledger(_repo(a)), a)))
     cli_tenure.register(sub, add)
+    from . import cli_draft
+    cli_draft.register(sub, add)
 
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
     p.add_argument("pack_dir")
