@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 
@@ -48,7 +48,7 @@ from levain.broker.stub import peer_uid as kernel_peer_uid
 from levain.contracts import ContractError, canon
 from levain.slot import Refused
 from levain.slot import records as R
-from levain.slot.layout import session_repo
+from levain.slot.layout import STORE, session_repo
 from levain.slot.runtime_grammar import HANDLE_BYTES, _handle, _keys
 
 CONTROL_FORMAT = "levain-control/1"
@@ -346,20 +346,21 @@ class Conn:
     lease: Lease | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Handles:
     """§3.2: what ``MINT`` minted for a session, held in CONTROL's memory only (they die at REVOKED, and a
-    CONTROL restart revokes every live session, so no handle needs to outlive the process)."""
+    CONTROL restart revokes every live session, so no handle needs to outlive the process). ``queue_cap_digest``
+    is computed once, here: ``QUEUE-RESOLVE`` compares digests and never hashes a cap under the lock."""
 
     token: str | None = None
     queue_cap: str | None = None
+    #: the digest the broker resolves the cap by (c6: ``sha256:`` + hex over its UTF-8 bytes).
+    queue_cap_digest: str | None = field(default=None, init=False, compare=False, repr=False)
 
-    @property
-    def queue_cap_digest(self) -> str | None:
-        """The digest the broker resolves the cap by (c6: ``sha256:`` + hex over its UTF-8 bytes)."""
-        if self.queue_cap is None:
-            return None
-        return "sha256:" + hashlib.sha256(self.queue_cap.encode("utf-8")).hexdigest()
+    def __post_init__(self) -> None:
+        if self.queue_cap is not None:
+            object.__setattr__(self, "queue_cap_digest",
+                               "sha256:" + hashlib.sha256(self.queue_cap.encode("utf-8")).hexdigest())
 
 
 def _default_is_brokered(claims: Mapping[str, object]) -> bool:
@@ -421,8 +422,11 @@ class Control:
                  sleep: Callable[[float], None] = time.sleep) -> None:
         if type(operator_uid) is not int or operator_uid <= ROOT_UID:
             raise Refused("bad-config", f"operator uid {operator_uid!r}")
-        if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid in (ROOT_UID, operator_uid)):
+        if qbroker_uid is not None and (type(qbroker_uid) is not int or qbroker_uid <= ROOT_UID
+                                        or qbroker_uid == operator_uid):
             raise Refused("bad-config", f"qbroker uid {qbroker_uid!r}")
+        if host not in STORE:
+            raise Refused("bad-config", f"host {host!r}")
         self.store = store
         self.qbroker_uid = qbroker_uid
         self._run_facts = run_facts
@@ -989,9 +993,10 @@ class Control:
             return {"session": session, "kind": kind}
         if kind != "dispatch":
             raise Refused("kind-not-queued")
-        facts = self._run_facts(session)
-        if facts is None:
+        got = self._run_facts(session)
+        if got is None:
             raise Refused("run-unknown")
+        facts = dict(got) if isinstance(got, Mapping) else got   # one snapshot: checked and relayed are the same
         if not _run_facts_ok(facts):
             raise Refused("run-malformed")
         run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS)}
