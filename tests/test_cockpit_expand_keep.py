@@ -65,11 +65,26 @@ BOARD = "#board"
 NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 
 
-def _assert_held(v: list[Any], opened: list[Any], held: list[Any], scroll: Any, why: str) -> None:
-    key, panel, scrolled = opened
+MODAL = "#levain-modal"
+# K10 folds board bodies behind "N more": the list that scrolls lives in the panel's focus modal, opened as a reader opens it
+OPEN_EPISODES_MODAL = ("[...document.querySelectorAll('#board .panel')].find(p => p.dataset.panelId === 'episodes'"
+                       " || /^Recent episodes/.test(p.querySelector('h2').textContent)).querySelector('.pexpand').click(); 1")
+
+
+def _assert_board_held(opened: list[Any], held: list[Any], why: str) -> None:
+    """A row drawn on the board stays open and closable in its panel. The board card itself no longer scrolls
+    (K10 folds it behind "N more"), so the reading place is asserted in the focus modal instead."""
+    key, panel, _scrolled = opened
     assert held == [[key, True, "true", True, panel]], f"{why}: the row is not open and closable in its panel: {held} (opened {opened})"
-    assert scrolled > 0, f"the body was never scrolled, the scroll check proves nothing: {opened}"
-    assert abs(scroll - scrolled) <= 2, f"{why}: the scroll moved from {scrolled} to {scroll}"
+
+
+def _assert_modal_held(opened: list[Any], before: list[Any], held: list[Any], scroll: Any, why: str) -> None:
+    """The focus modal's expanded row is still open and closable, and its list kept its place (within a few px)."""
+    key, _panel, scrolled = opened
+    assert before and before[0][:4] == [key, True, "true", True], f"{why}: the row was not open in the modal to begin with: {before}"
+    assert scrolled > 0, f"the modal body was never scrolled, the scroll check proves nothing: {opened}"
+    assert held and held[0][:4] == [key, True, "true", True], f"{why}: the modal lost the open row: {held} (opened {opened})"
+    assert scroll is not None and abs(scroll - scrolled) <= 3, f"{why}: the modal scroll moved from {scrolled} to {scroll}"
 
 
 @needs_browser
@@ -86,10 +101,22 @@ def test_refresh_keeps_an_expanded_row(tmp_path: Path) -> None:
             {"eval": "new Promise(r => setTimeout(r, 600))"},
             {"eval": _held(BOARD)},
             {"eval": _scroll_of(BOARD)},
+            # the modal side, where the scrolling list now lives
+            {"eval": OPEN_EPISODES_MODAL},
+            {"until": f"document.querySelector('{MODAL} .row.has-more') && 1"},
+            {"eval": COUNT_RENDERS},
+            {"eval": _open_in(MODAL)},
+            {"eval": _held(MODAL)},
+            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"until": "window.__r >= 1 && 1"},
+            {"eval": "new Promise(r => setTimeout(r, 600))"},
+            {"eval": _held(MODAL)},
+            {"eval": _scroll_of(MODAL)},
         ])
     v = out["values"]
     assert v[3] == [[v[2][0], True, "true", True, "episodes"]], v
-    _assert_held(v, v[2], v[7], v[8], "the refresh")
+    _assert_board_held(v[2], v[7], "the refresh")
+    _assert_modal_held(v[12], v[13], v[17], v[18], "the refresh")
 
 
 @needs_browser
@@ -116,13 +143,23 @@ def test_a_store_write_keeps_an_expanded_row(tmp_path: Path) -> None:
                 {"eval": "new Promise(r => setTimeout(r, 600))"},
                 {"eval": _held(BOARD)},
                 {"eval": _scroll_of(BOARD)},
+                {"eval": OPEN_EPISODES_MODAL},
+                {"until": f"document.querySelector('{MODAL} .row.has-more') && 1"},
+                {"eval": _open_in(MODAL)},
+                {"eval": _held(MODAL)},
+                {"eval": "window.__r = 0; 1"},
+                {"until": "window.__r >= 1 && 1", "ms": 30000},
+                {"eval": "new Promise(r => setTimeout(r, 600))"},
+                {"eval": _held(MODAL)},
+                {"eval": _scroll_of(MODAL)},
             ])
         finally:
             stop.set()
             t.join(timeout=5)
     v = out["values"]
     assert v[3] is True or v[3] == 1, f"the board was never drawn again: {v}"
-    _assert_held(v, v[2], v[5], v[6], "a store write")
+    _assert_board_held(v[2], v[5], "a store write")
+    _assert_modal_held(v[9], v[10], v[14], v[15], "a store write")
 
 
 def _things(state: dict[str, Any], names: list[str], search: bool = False) -> Any:
