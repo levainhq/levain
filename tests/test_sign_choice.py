@@ -50,18 +50,21 @@ def passkey(tmp_path: Path):
     signer = Signer(tmp_path, (NS,), RP, lambda: {key.fingerprint: key})
     signer.page_origin = ORIGIN
 
+    def assertion(challenge: str) -> dict:
+        auth = hashlib.sha256(RP.encode()).digest() + bytes([0x05]) + (1).to_bytes(4, "big")
+        cdj = json.dumps({"type": "webauthn.get", "challenge": challenge, "origin": ORIGIN, "crossOrigin": False},
+                         separators=(",", ":")).encode()
+        der = priv.sign(auth + hashlib.sha256(cdj).digest(), ec.ECDSA(hashes.SHA256()))
+        return {"authenticator_data": _b64u(auth), "client_data_json": _b64u(cdj), "signature": _b64u(der)}
+
     def sign(rid: str, choice: "str | None") -> dict:
         row = next(r for r in signer.listing([key.fingerprint]) if r["id"] == rid)
         req = {"signer_fp": key.fingerprint, "request_sha256": row["sha256"]}
         if choice is not None:
             req["choice"] = choice
-        c = signer.challenge(rid, req)
-        auth = hashlib.sha256(RP.encode()).digest() + bytes([0x05]) + (1).to_bytes(4, "big")
-        cdj = json.dumps({"type": "webauthn.get", "challenge": c["challenge"], "origin": ORIGIN, "crossOrigin": False},
-                         separators=(",", ":")).encode()
-        der = priv.sign(auth + hashlib.sha256(cdj).digest(), ec.ECDSA(hashes.SHA256()))
-        return signer.answer(rid, {"authenticator_data": _b64u(auth), "client_data_json": _b64u(cdj),
-                                   "signature": _b64u(der)})
+        return signer.answer(rid, assertion(signer.challenge(rid, req)["challenge"]))
+
+    sign.assertion = assertion
 
     (tmp_path / "allowed").write_text(f'x namespaces="{NS}" {line}\n')
     return signer, key, sign
@@ -181,3 +184,47 @@ def test_a_kept_token_survives_a_restart(tmp_path: Path) -> None:
     path.write_text("short\n")
     with pytest.raises(ValueError, match="holds no token"):
         _kept_token(path)
+
+
+def test_an_answer_for_option_a_after_a_challenge_for_b_records_nothing(tmp_path: Path, passkey) -> None:
+    """L1 r1: a real passkey assertion over option (a)'s challenge, answered while (b) is the bound one, verifies over
+    (b)'s bytes or not at all: it is refused and nothing is recorded; (b) then signs as (b)."""
+    signer, key, sign = passkey
+    _file(tmp_path, "np-ab000001-aaaa")
+    [row] = signer.listing([key.fingerprint])
+    base = {"signer_fp": key.fingerprint, "request_sha256": row["sha256"]}
+    ca = signer.challenge("np-ab000001-aaaa", {**base, "choice": "a"})
+    cb = signer.challenge("np-ab000001-aaaa", {**base, "choice": "b"})
+    assert ca["challenge"] != cb["challenge"]
+    with pytest.raises(SignRefused):
+        signer.answer("np-ab000001-aaaa", sign.assertion(ca["challenge"]))
+    assert not (tmp_path / "sign" / "np-ab000001-aaaa.signed.json").exists()
+    assert signer.answer("np-ab000001-aaaa", sign.assertion(cb["challenge"]))["choice"] == "b"
+
+
+def test_an_option_padded_with_spaces_is_refused(tmp_path: Path, passkey) -> None:
+    signer, key, _ = passkey
+    _file(tmp_path, "np-pad00001-aaaa", options=[{"key": "a", "text": "approve"}, {"key": "b", "text": "approve "}])
+    [row] = signer.listing([key.fingerprint])
+    assert "space" in row["refused"]
+
+
+def test_a_token_file_readable_by_others_is_refused(tmp_path: Path) -> None:
+    from levain.phone_server import _kept_token
+
+    path = tmp_path / "token"
+    path.write_text("x" * 43 + "\n")
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="readable by others"):
+        _kept_token(path)
+
+
+def test_the_link_file_goes_when_its_run_stops(tmp_path: Path) -> None:
+    from levain.phone_server import _drop_link_file
+
+    mine, theirs = tmp_path / "mine.json", tmp_path / "theirs.json"
+    mine.write_text(json.dumps({"page": "p", "phone_token": "t", "pid": os.getpid()}))
+    theirs.write_text(json.dumps({"page": "p", "phone_token": "t", "pid": os.getpid() + 1}))
+    _drop_link_file(mine)
+    _drop_link_file(theirs)
+    assert not mine.exists() and theirs.exists()
