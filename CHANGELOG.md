@@ -11,6 +11,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   asking, and nothing else.** Those commands grant no authority (a signed envelope still does), and every other
   command asks you as it does in any install. Claude Code applies this only once you have trusted the directory. A
   live install you point it at with `--cwd` is used as is, with nothing pre-approved.
+  - Those commands name the Python that set the install up (`<python> -P -m levain coord ...`), because a background
+    session does not reliably have `levain` on its PATH.
+  - Levain's own MCP servers (anneal_memory, levain_band, levain_dispatch) are approved in that install, so a
+    coordinator starting in the background no longer waits on Claude Code's "new MCP servers found" dialog, which
+    nobody can answer there. A server you add yourself still asks.
+
+### Known edges
+- A coordinator started by a different Levain than the one that set up `~/.levain/coordinator` asks before each of
+  its commands; run `levain update --path ~/.levain/coordinator` from the Levain that starts it.
 
 ## [0.11.14] — 2026-10-21
 
