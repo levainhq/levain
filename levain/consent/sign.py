@@ -10,16 +10,31 @@ A caller (a script on the laptop) writes a sign request into ``<queue_dir>/sign/
     {"format": "levain-sign-request/1", "id": "<id>", "namespace": "<ns>", "message": "<text>",
      "title": "<text>", "requester": "<text>", "expires_at": "<UTC timestamp>"}
 
-(written whole: a temporary file, then a rename). ``levain consent phone --sign-namespace NS`` lists the unexpired
+(written whole: a temporary file, then a rename). Or a CHOICE request, one card with several options, of which the
+operator signs exactly one::
+
+    {"format": "levain-sign-choice/1", ... the same seven keys ...,
+     "options": [{"key": "a", "text": "<text>"}, {"key": "b", "text": "<text>"}]}
+
+A choice request's signature is over the message with the chosen option appended as its last line, so a verifier reads
+the decision from the bytes that verified, never from a file beside them (:func:`choice_line`, :func:`signed_bytes`,
+:func:`parse_choice`)::
+
+    <message> + "\n" + "levain-sign-choice/1 chosen (<key>): <text>"
+
+``levain consent phone --sign-namespace NS`` lists the unexpired
 requests in the namespaces it was given; the operator reads the whole message on the phone and signs it with an
 enrolled passkey, or denies it. A file in the sign directory that is not a well-formed sign request is listed as
 refused, with the reason, never skipped. The result lands beside the request:
 
   - ``<id>.sig``: the armored SSHSIG over the message's UTF-8 bytes, in the request's namespace;
-  - ``<id>.signed.json``: ``{signer_fp, public_key, namespace, message_sha256, signed_at}``, written last: it is the
+  - ``<id>.signed.json``: ``{signer_fp, public_key, namespace, message_sha256, signed_at}`` (for a choice request also
+    ``choice``, the key, and ``signed_message``, the exact text signed; ``message_sha256`` is that text's), written
+    last: it is the
     completion marker, and only its presence makes a request signed. A ``.sig`` without it is the orphan of an
     answer that did not finish, and the next successful answer replaces it;
-  - ``<id>.denied``: ``{at, request_sha256}``, when the operator denied it: the version of the request the page
+  - ``<id>.denied``: ``{at, request_sha256}``, when the operator denied it (for a choice request: none of its
+    options): the version of the request the page
     showed (the file's SHA-256, or for a file that could not be read a version taken from its metadata), sent back
     with the deny, which a request changed since is refused. The request file is never deleted here, so a caller
     can tell a denial from an expiry.
@@ -36,7 +51,12 @@ The rules, each a refusal before anything is signed:
     message, title or requester holding a control character other than newline and tab, a Unicode format character
     (bidi controls, zero-width characters), a line or paragraph separator, a space other than U+0020, or a
     private-use or unassigned code point is listed as refused and never signed, since each can render differently
-    from its bytes;
+    from its bytes; no message holds :data:`CHOICE_MARK` (only levain writes the choice line, so a plain statement
+    can never verify as a choice); a choice request has 2 to :data:`OPTIONS_MAX` options, each key
+    ``[a-z0-9]{1,8}`` and each text one line (no newline or tab) of at most 200 characters, keys and texts distinct;
+  - the operator signs the option tapped: the challenge names the option's key, and the challenge, the answer and the
+    files written are bound to that key; a challenge for a key the request does not offer, or a choice request's
+    challenge naming none, is refused;
   - the operator signs what was shown: the listing carries each request file's SHA-256, the page sends it back with
     the challenge, and a challenge that names another (the file changed since it was listed) or none is refused;
   - the signer is an active passkey enrolled on this server's https name in the cockpit the queue's consent hook
@@ -83,10 +103,14 @@ from typing import Any
 
 from levain import unshowable
 
-__all__ = ["LIST_MAX", "MESSAGE_MAX", "REFUSED_NAMESPACES", "REQUEST_FORMAT", "SIGN_DIR", "SignRefused", "SignRequest",
-           "Signer", "namespace_problem", "read_request", "sign_dir", "state_of"]
+__all__ = ["CHOICE_FORMAT", "CHOICE_MARK", "LIST_MAX", "MESSAGE_MAX", "OPTIONS_MAX", "REFUSED_NAMESPACES",
+           "REQUEST_FORMAT", "SIGN_DIR", "SignRefused", "SignRequest", "Signer", "choice_line", "deep_link",
+           "namespace_problem", "parse_choice", "read_request", "sign_dir", "signed_bytes", "state_of"]
 
 REQUEST_FORMAT = "levain-sign-request/1"
+CHOICE_FORMAT = "levain-sign-choice/1"
+CHOICE_MARK = CHOICE_FORMAT + " chosen "   # opens the choice line; refused inside any message, so only levain writes it
+OPTIONS_MAX = 8                    # buttons on one card
 SIGN_DIR = "sign"
 MESSAGE_MAX = 8 * 1024             # bytes of UTF-8: a statement a person reads whole on a phone
 _TEXT_MAX = 200                    # characters of a title or a requester
@@ -96,6 +120,8 @@ _SCAN_MAX = 4096                   # directory entries one listing looks at
 _ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _NAMESPACE = re.compile(r"[a-z0-9][a-z0-9.-]{2,63}")
 _KEYS = frozenset({"format", "id", "namespace", "message", "title", "requester", "expires_at"})
+_CHOICE_KEYS = _KEYS | {"options"}
+_OPTION_KEY = re.compile(r"[a-z0-9]{1,8}")
 # ssh's conventional namespaces: git's commit signing (levain's team ledger verifies in it), file and email
 REFUSED_NAMESPACES = frozenset({"git", "file", "email"})
 
@@ -132,6 +158,60 @@ def _text_problem(text: str, what: str) -> str | None:
     return None
 
 
+def choice_line(key: str, text: str) -> str:
+    """The line a choice request's signature appends to its message for option ``key`` with text ``text``."""
+    return f"{CHOICE_MARK}({key}): {text}"
+
+
+def parse_choice(signed: bytes) -> "tuple[str, str, str]":
+    """``(message, key, text)`` read back from the bytes a choice signature covers (the verified bytes, never a file
+    beside them). :class:`ValueError` when they are not a message followed by one choice line."""
+    text = signed.decode("utf-8")
+    message, sep, last = text.rpartition("\n")
+    m = re.fullmatch(re.escape(CHOICE_MARK) + r"\(([a-z0-9]{1,8})\): ([^\n]+)", last)
+    if not sep or m is None or CHOICE_MARK in message:
+        raise ValueError("not a message followed by one levain choice line")
+    return message, m.group(1), m.group(2)
+
+
+def deep_link(page: str, request_id: str, token: str | None = None) -> str:
+    """The phone page link that opens straight onto sign request ``request_id``'s card: ``page`` (the printed
+    ``https://<name>/``) with ``#sign=<id>``, and this run's ``phone_token`` first when given (a browser that has not
+    opened this run's link needs it; the fragment never reaches the server or its logs)."""
+    from urllib.parse import quote
+
+    if _ID.fullmatch(request_id or "") is None:
+        raise ValueError(f"{str(request_id)[:80]!r} is not a sign request id")
+    parts = ([f"phone_token={quote(token, safe='')}"] if token else []) + [f"sign={request_id}"]
+    return page.split("#", 1)[0] + "#" + "&".join(parts)
+
+
+def _options_problem(options: object) -> "tuple[tuple[tuple[str, str], ...], str | None]":
+    """``(options, None)`` as ``((key, text), ...)``, or ``((), why)`` for a choice request's options that are not
+    2 to :data:`OPTIONS_MAX` distinct one-line options."""
+    if not isinstance(options, list) or not 2 <= len(options) <= OPTIONS_MAX:
+        return (), f"a choice request has a list of 2 to {OPTIONS_MAX} options"
+    got: list[tuple[str, str]] = []
+    for o in options:
+        if not isinstance(o, dict) or set(o) != {"key", "text"} or not all(isinstance(o[k], str) for k in o):
+            return (), 'each option is {"key": <text>, "text": <text>}'
+        key, text = o["key"], o["text"]
+        if _OPTION_KEY.fullmatch(key) is None:
+            return (), f"option key {key[:20]!r} is not [a-z0-9]{{1,8}}"
+        if not text or len(text) > _TEXT_MAX:
+            return (), f"option {key}'s text is empty or over {_TEXT_MAX} characters"
+        hidden = unshowable.first_hidden(text, allow="")
+        if hidden is not None:
+            return (), (f"option {key}'s text holds U+{ord(hidden[1]):04X} "
+                        f"({unicodedata.name(hidden[1], 'unnamed')}), which can show differently from what is signed")
+        if CHOICE_MARK in text:
+            return (), f"option {key}'s text holds {CHOICE_MARK.strip()!r}"
+        got.append((key, text))
+    if len({k for k, _ in got}) != len(got) or len({t for _, t in got}) != len(got):
+        return (), "a choice request's option keys and texts are each distinct"
+    return tuple(got), None
+
+
 @dataclass(frozen=True)
 class SignRequest:
     """One sign request file as read: its version (its bytes' SHA-256, or for a file that could not be read one
@@ -146,6 +226,21 @@ class SignRequest:
     requester: str
     expires_at: "datetime | None"
     refused: str | None = None          # why it is never signable, shown to the operator in place of its text
+    options: "tuple[tuple[str, str], ...]" = ()   # a choice request's (key, text) in file order; () for a plain one
+
+
+def signed_bytes(request: SignRequest, choice: str | None) -> bytes:
+    """The bytes a signature on ``request`` covers: a plain request's message, or a choice request's message with the
+    line for option ``choice`` appended. :class:`SignRefused` for a choice that does not fit the request."""
+    if not request.options:
+        if choice is not None:
+            raise SignRefused(f"sign request {request.id} offers no options: its challenge names none", 400)
+        return request.message.encode("utf-8")
+    text = dict(request.options).get(choice) if isinstance(choice, str) else None
+    if text is None:
+        raise SignRefused(f"sign request {request.id} offers options "
+                          f"{', '.join(k for k, _ in request.options)}: the challenge names one of them", 400)
+    return (request.message + "\n" + choice_line(choice, text)).encode("utf-8")
 
 
 def sign_dir(queue_dir: Path) -> Path:
@@ -214,10 +309,12 @@ def read_request(queue_dir: Path, request_id: str) -> SignRequest:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
         return refused("it is not UTF-8 JSON", digest)
-    if not isinstance(data, dict) or set(data) != _KEYS:
-        return refused(f"a sign request has exactly the keys {sorted(_KEYS)}", digest, data)
-    if data["format"] != REQUEST_FORMAT:
-        return refused(f"format {str(data['format'])[:40]!r} is not {REQUEST_FORMAT!r}", digest, data)
+    if not isinstance(data, dict) or set(data) not in (_KEYS, _CHOICE_KEYS):
+        return refused(f"a sign request has exactly the keys {sorted(_KEYS)}, and a choice request also "
+                       "'options'", digest, data)
+    want = CHOICE_FORMAT if "options" in data else REQUEST_FORMAT
+    if data["format"] != want:
+        return refused(f"format {str(data['format'])[:40]!r} is not {want!r}", digest, data)
     if data["id"] != request_id:
         return refused("its id is not its file name", digest, data)
     if not all(isinstance(data[k], str) for k in ("namespace", "message", "title", "requester")):
@@ -227,17 +324,22 @@ def read_request(queue_dir: Path, request_id: str) -> SignRequest:
     except SignRefused as exc:
         return refused(str(exc), digest, data)
     namespace, message, title, requester = data["namespace"], data["message"], data["title"], data["requester"]
-    problem = namespace_problem(namespace)
-    if problem is None and len(message.encode("utf-8", "surrogatepass")) > MESSAGE_MAX:
-        problem = f"the message is over {MESSAGE_MAX} bytes"
+    options, problem = _options_problem(data["options"]) if "options" in data else ((), None)
+    problem = namespace_problem(namespace) or problem
+    longest = max((len(("\n" + choice_line(k, t)).encode("utf-8")) for k, t in options), default=0)
+    if problem is None and len(message.encode("utf-8", "surrogatepass")) + longest > MESSAGE_MAX:
+        problem = f"the message{' with its longest choice line' if options else ''} is over {MESSAGE_MAX} bytes"
     if problem is None and not message:
         problem = "the message is empty"
+    if problem is None and CHOICE_MARK in message:
+        problem = f"the message holds {CHOICE_MARK.strip()!r}, which only levain writes"
     if problem is None and (len(title) > _TEXT_MAX or len(requester) > _TEXT_MAX):
         problem = f"the title or requester is over {_TEXT_MAX} characters"
     for text, what in ((message, "message"), (title, "title"), (requester, "requester")):
         problem = problem or _text_problem(text, what)
     return SignRequest(id=request_id, sha256=digest, namespace=namespace if _NAMESPACE.fullmatch(namespace) else "",
-                       message=message, title=title, requester=requester, expires_at=expires_at, refused=problem)
+                       message=message, title=title, requester=requester, expires_at=expires_at, refused=problem,
+                       options=options if problem is None else ())
 
 
 def _stat_version(path: Path) -> str:
@@ -335,7 +437,8 @@ class Signer:
         self.queue_dir, self.namespaces, self.rp_id, self._keys = Path(queue_dir), tuple(namespaces), rp_id, keys
         self.page_origin: str | None = None
         self._lock = threading.Lock()
-        self._challenged: dict[str, tuple[str, str]] = {}    # request id -> (file sha256, signer fp) at challenge
+        # request id -> (file sha256, signer fp, chosen option key or None) at challenge
+        self._challenged: dict[str, tuple[str, str, str | None]] = {}
 
     def _ours(self, request: SignRequest) -> bool:
         """A request in a namespace this port signs, or a refused one whose namespace no signer could own (malformed,
@@ -409,9 +512,12 @@ class Signer:
                 rows.append({"id": rid, "namespace": request.namespace, "refused": request.refused,
                              "sha256": request.sha256, "signers": []})
                 continue
-            rows.append({"id": rid, "title": request.title, "message": request.message, "namespace": request.namespace,
-                         "requester": request.requester, "expires_at": request.expires_at.isoformat(),
-                         "sha256": request.sha256, "signers": signers})
+            row = {"id": rid, "title": request.title, "message": request.message, "namespace": request.namespace,
+                   "requester": request.requester, "expires_at": request.expires_at.isoformat(),
+                   "sha256": request.sha256, "signers": signers}
+            if request.options:     # the exact line each option's signature appends, so the page shows what is signed
+                row["options"] = [{"key": k, "text": t, "line": choice_line(k, t)} for k, t in request.options]
+            rows.append(row)
         listed = {r["id"] for r in rows if not r.get("refused")}
         with self._lock:
             for rid in [rid for rid in self._challenged if rid not in listed]:
@@ -419,14 +525,18 @@ class Signer:
         return {"rows": rows, "overflow": len(names) - read + (1 if more else 0)}
 
     def challenge(self, request_id: str, req: Any) -> dict[str, Any]:
-        """``{signer_fp, request_sha256}`` -> the WebAuthn challenge for the request's message, bound to the file as
-        it is now. ``request_sha256`` is the listing's ``sha256`` for the request the page showed: a file that
-        changed since it was listed is refused (409), so the operator never signs bytes the page did not show."""
+        """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key) -> the WebAuthn
+        challenge for the bytes signed (:func:`signed_bytes`), bound to the file as it is now and to that option.
+        ``request_sha256`` is the listing's ``sha256`` for the request the page showed: a file that changed since it
+        was listed is refused (409), so the operator never signs bytes the page did not show."""
         from levain.consent.passkey import challenge
 
-        if not isinstance(req, dict) or "signer_fp" not in req or not set(req) <= {"signer_fp", "request_sha256"}:
-            raise SignRefused("request keys must be ['request_sha256', 'signer_fp']", 400)
+        if not isinstance(req, dict) or "signer_fp" not in req or not set(req) <= {"signer_fp", "request_sha256",
+                                                                                   "choice"}:
+            raise SignRefused("request keys must be ['request_sha256', 'signer_fp'] and, for a choice request, "
+                              "'choice'", 400)
         request = self._open(request_id)
+        message = signed_bytes(request, req.get("choice"))
         if not req.get("request_sha256"):
             raise SignRefused(f"the challenge for sign request {request_id} names no listed version: reload and "
                               "read it again", 409)
@@ -437,8 +547,8 @@ class Signer:
         if not isinstance(fp, str) or fp not in self._keys():
             raise SignRefused(f"{str(fp)[:80]} is not an active passkey enrolled for {self.rp_id}")
         with self._lock:
-            self._challenged[request_id] = (request.sha256, fp)
-        return {"challenge": _b64u(challenge(request.message.encode("utf-8"), request.namespace)), "rp_id": self.rp_id}
+            self._challenged[request_id] = (request.sha256, fp, req.get("choice"))
+        return {"challenge": _b64u(challenge(message, request.namespace)), "rp_id": self.rp_id}
 
     def answer(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{authenticator_data, client_data_json, signature}`` (base64url) -> the signature verified and recorded:
@@ -466,7 +576,7 @@ class Signer:
         key = self._keys().get(bound[1])
         if key is None:
             raise SignRefused(f"{bound[1]} is no longer an active passkey enrolled for {self.rp_id}")
-        message = request.message.encode("utf-8")
+        message = signed_bytes(request, bound[2])
         try:
             signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                                   b64url_decode(req["client_data_json"], "client_data_json"),
@@ -494,13 +604,16 @@ class Signer:
                 del self._challenged[request_id]
                 raise SignRefused(changed, 409)
             d, signed_at = sign_dir(self.queue_dir), utc_stamp(_now())
+            record = {"signer_fp": key.fingerprint, "public_key": key.public_key, "namespace": request.namespace,
+                      "message_sha256": hashlib.sha256(message).hexdigest(), "signed_at": signed_at}
+            if bound[2] is not None:
+                record.update(choice=bound[2], signed_message=message.decode("utf-8"))
             _publish(_write_over, d / f"{request_id}.sig", signature, "")   # over an orphan: never a 409
-            _publish(_write_new, d / f"{request_id}.signed.json", json.dumps({
-                "signer_fp": key.fingerprint, "public_key": key.public_key, "namespace": request.namespace,
-                "message_sha256": hashlib.sha256(message).hexdigest(), "signed_at": signed_at}) + "\n",
-                f"sign request {request_id} is already signed")
+            _publish(_write_new, d / f"{request_id}.signed.json", json.dumps(record) + "\n",
+                     f"sign request {request_id} is already signed")
             del self._challenged[request_id]
-        return {"id": request_id, "signer_fp": key.fingerprint, "namespace": request.namespace, "signed_at": signed_at}
+        done = {"id": request_id, "signer_fp": key.fingerprint, "namespace": request.namespace, "signed_at": signed_at}
+        return done if bound[2] is None else {**done, "choice": bound[2]}
 
     def deny(self, request_id: str, req: Any) -> dict[str, Any]:
         """``{request_sha256}`` (the listing's ``sha256`` for the row the page showed) -> ``<id>.denied``, which

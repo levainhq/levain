@@ -15,12 +15,15 @@
     set(area, k, v) { try { window[area].setItem(k, v); } catch (e) { /* kept in memory only */ } },
   };
 
-  // the token arrives once in the link's fragment; it is kept for this tab and taken out of the address bar
+  // the token arrives once in the link's fragment; it is kept for this tab and taken out of the address bar.
+  // `sign=<id>` in the fragment (levain.consent.sign.deep_link) opens the page on that sign request's card
   let token = null;
+  const fm = /(?:^#|&)sign=([A-Za-z0-9_-]{8,64})(?:&|$)/.exec(location.hash);
+  let focus = fm ? fm[1] : "";
   const m = /(?:^#|&)phone_token=([^&]+)/.exec(location.hash);
-  if (m) { token = decodeURIComponent(m[1]); store.set("sessionStorage", "levain-phone-token", token);
-           history.replaceState(null, "", location.pathname); }
+  if (m) { token = decodeURIComponent(m[1]); store.set("sessionStorage", "levain-phone-token", token); }
   else token = store.get("sessionStorage", "levain-phone-token");
+  if (m || fm) history.replaceState(null, "", location.pathname);
 
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.get);
@@ -68,8 +71,15 @@
     $("status").textContent = (waiting ? waiting + " waiting on you" : qnote || dnote ? "can't tell what is waiting on you" : "nothing is waiting on you")
       + (qnote ? " \u00b7 agent questions unavailable: " + qnote : "") + (dnote ? " \u00b7 dispatch jobs unavailable: " + dnote : "")
       + unread + (last ? " \u00b7 last: " + last : "");
-    list.replaceChildren(...asks.map(questionCard), ...signs.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
+    // a deep-linked sign request comes first and is scrolled to, once; one not listed is said, never silently lost
+    const linked = focus ? signs.filter((r) => r.id === focus) : [];
+    const rest = linked.length ? signs.filter((r) => r.id !== focus) : signs;
+    list.replaceChildren(...linked.map((r) => signCard(r, data.sign_note, true)), ...asks.map(questionCard),
+                         ...rest.map((r) => signCard(r, data.sign_note)), ...jobs.map(dispatchCard),
                          ...rows.map((r) => row(r, false)), ...gaps.map((r) => row(r, true)));
+    if (focus && !linked.length && !busy)
+      $("status").textContent += " \u00b7 the linked sign request " + focus + " is not open here (signed, denied, expired or not filed)";
+    if (linked.length && !draw.scrolled) { draw.scrolled = true; list.firstChild.scrollIntoView({ block: "start" }); }
     const enrolled = Array.isArray(data.enrolled) ? data.enrolled : [];
     const local = mine();
     const ours = enrolled.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
@@ -368,8 +378,8 @@
   // refused); a request the server refused (a character that can show differently from its bytes, a malformed file)
   // shows only why, and can be denied. A note kept across redraws belongs to the version it was made on: a changed
   // file drops it, and what the server says of the request now (refused, no passkey) is shown, never kept
-  function signCard(r, signNote) {
-    const card = el("article", "req sign");
+  function signCard(r, signNote, linked) {
+    const card = el("article", "req sign" + (linked ? " linked" : ""));
     const head = el("div", "req-head");
     head.append(el("span", "tool", r.refused ? "sign request (refused)" : (r.title || "(untitled)")),
                 el("span", "tier", "sign"), el("span", "meta", r.namespace || ""));
@@ -389,15 +399,30 @@
     }
     const actions = el("div", "actions");
     const signers = Array.isArray(r.signers) ? r.signers : [];
+    // a choice request: one button per option; the tap signs the message with that option's line appended (the
+    // server's `line`, shown under the options, is exactly what is appended)
+    const options = !r.refused && Array.isArray(r.options) ? r.options : [];
     if (!r.refused) {
       if (!signers.length && !kept) show(signNote || "no passkey is enrolled for this name");
-      const b = el("button", "allow", "sign with Face ID");
-      b.type = "button";
-      b.disabled = !usable || !signers.length;
-      b.addEventListener("click", () => signWith(r, signers, say, show, actions));
-      actions.appendChild(b);
+      const go = (choice) => () => signWith(r, signers, say, show, actions, choice);
+      if (!options.length) {
+        const b = el("button", "allow", "sign with Face ID");
+        b.type = "button";
+        b.disabled = !usable || !signers.length;
+        b.addEventListener("click", go(undefined));
+        actions.appendChild(b);
+      }
+      for (const o of options) {
+        const b = el("button", "allow option", "(" + o.key + ") " + o.text);
+        b.type = "button";
+        b.disabled = !usable || !signers.length;
+        b.addEventListener("click", go(o.key));
+        actions.appendChild(b);
+      }
+      if (options.length) card.appendChild(el("div", "where", "an option signs the message with its line appended: "
+        + options.map((o) => o.line).join(" | ")));
     }
-    const d = el("button", "deny", "deny");
+    const d = el("button", "deny", options.length ? "deny all" : "deny");
     d.type = "button";
     d.addEventListener("click", () => signDeny(r, say));
     actions.appendChild(d);
@@ -405,28 +430,30 @@
     return card;
   }
 
-  function signWith(r, signers, say, show, actions) {
+  function signWith(r, signers, say, show, actions, choice) {
     const local = mine();
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say);
-    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say);
+    if (known.length === 1) return signAnswer(r, known[0], local[known[0]], say, choice);
+    if (!known.length && signers.length === 1) return signAnswer(r, signers[0], null, say, choice);
     const choices = known.length ? known : signers;
     show("more than one passkey is enrolled for this name; pick the one this phone holds:");
     for (const old of actions.querySelectorAll(".pick")) old.remove();
     for (const fp of choices) {
       const p = el("button", "quiet pick", fp.slice(0, 18) + "…");
       p.type = "button";
-      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say));
+      p.addEventListener("click", () => signAnswer(r, fp, known.length ? local[fp] : null, say, choice));
       actions.appendChild(p);
     }
   }
 
-  function signAnswer(r, fp, rawId, say) {
+  function signAnswer(r, fp, rawId, say, choice) {
     if (busy) return;
     busy++;
     const base = "/sign/" + encodeURIComponent(r.id) + "/";
-    say("asking for the challenge…");
-    call("POST", base + "challenge", { signer_fp: fp, request_sha256: r.sha256 }).then((c) => {
+    const body = { signer_fp: fp, request_sha256: r.sha256 };
+    if (choice !== undefined) body.choice = choice;
+    say(choice !== undefined ? "asking for the challenge for (" + choice + ")…" : "asking for the challenge…");
+    call("POST", base + "challenge", body).then((c) => {
       if (!c.ok) return say(why(c), "bad");
       say("confirm with your passkey to sign…");
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
@@ -440,8 +467,9 @@
           // signed; no reply, a proxy error or any 5xx may follow a signature the server already wrote
           if (!a.ok && (a.status === 0 || a.status >= 500)) return say("result unknown (" + why(a) + "): reload to see whether it was signed", "bad");
           if (!a.ok) return say("not signed: " + why(a), "bad");
-          last = "signed " + (r.title || r.id);
-          say("signed · by " + a.body.signer_fp + " in " + a.body.namespace, "ok");
+          last = "signed " + (a.body.choice ? "(" + a.body.choice + ") " : "") + (r.title || r.id);
+          say("signed" + (a.body.choice ? " (" + a.body.choice + ")" : "") + " · by " + a.body.signer_fp + " in "
+              + a.body.namespace, "ok");
         });
       }, (e) => {
         if (rawId && e && e.name === "NotAllowedError") forget(fp);
