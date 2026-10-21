@@ -73,7 +73,6 @@ class HostFacts:
     operator_uid: int | None = None                   # setup: the uid ``--operator`` resolves to
     operator_record: Mapping[str, object] | None = None   # parsed ``L/policy/operator``, or None
     live_leases: int = 0
-    live_sessions: tuple[str, ...] = ()                # what ``live_leases`` counts (the refusal names them)
     used_ids: frozenset[int] = frozenset()            # every uid and gid in use on the host
     existing_names: frozenset[str] = frozenset()      # every user and group name on the host
     retired: frozenset[int] = frozenset()             # the retired-ids file
@@ -91,6 +90,8 @@ class HostFacts:
     #: For each name the journal lists that is present on the host, the id it holds there (the uid of
     #: an account, the gid of a group): a journaled name at its journaled id is Levain's (§25).
     host_ids: Mapping[str, int] = field(default_factory=dict)
+    #: What ``live_leases`` counts (the refusal names them); last, so positional construction keeps its meaning.
+    live_sessions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -286,8 +287,9 @@ class Quiesce:
 
     def live(self) -> tuple[str, ...]:
         """What the live-lease count counts: the live sessions, plus ``slot <name>`` per :meth:`busy_slots` when held."""
-        busy = tuple(f"slot {b}" for b in self.busy_slots()) if self.held else ()
-        return live_lease_sessions(self.store / "sessions") + busy
+        sessions = live_lease_sessions(self.store / "sessions")   # first, as before: a session's live record is
+        # read before the slot locks, so one going from its record to END's lock is seen at one end or the other
+        return sessions + (tuple(f"slot {b}" for b in self.busy_slots()) if self.held else ())
 
     def live_leases(self) -> int:
         return len(self.live())
@@ -312,9 +314,9 @@ def quiesce_step(host: HostOS, *, store: Path | None = None) -> Step:
             return True, "no install run is quiescing this store"
         if not q.hold():
             return False, f"{L / 'slots' / 'pool.lock'} is missing after the rows that make it"
-        n = q.live_leases()
-        if n:   # nothing can lease before the runtime rule exists; a lease here is one this setup cannot see past
-            return False, f"live-lease: {n} lease(s) are live"
+        leased = q.live()
+        if leased:   # nothing can lease before the runtime rule exists; a lease here is one this setup cannot see past
+            return False, f"live-lease: {_lease_list(leased)}"
         return True, ""
 
     return Step(f"hold {L / 'slots' / 'pool.lock'} to the end of this run (no prepare leases beneath it)", call=take)
@@ -915,14 +917,24 @@ def live_lease_sessions(sessions: Path) -> tuple[str, ...]:
 
 
 def count_live_leases(sessions: Path) -> int:
+    """How many leases :func:`live_lease_sessions` finds."""
     return len(live_lease_sessions(sessions))
 
 
 def _live_lease_why(verb: str, facts: HostFacts) -> str:
     """The refusal names the sessions (VM-Y Y7a: an operator met ``live-lease`` with no session named; a lease
     stays live until that session's END, even when its holder has died)."""
-    names = f": {', '.join(facts.live_sessions)}" if facts.live_sessions else ""
-    return f"{verb} refuses while {facts.live_leases} lease(s) are live{names}; end each session first"
+    return f"{verb} refuses while {facts.live_leases} lease(s) are live" + (
+        f": {_lease_list(facts.live_sessions)}" if facts.live_sessions else "")
+
+
+def _lease_list(leased: Sequence[str]) -> str:
+    """Sessions are named for the operator to end; a ``slot <name>`` is a prepare or END in flight, to wait out."""
+    sessions = [x for x in leased if not x.startswith("slot ")]
+    slots = [x for x in leased if x.startswith("slot ")]
+    parts = ([f"session(s) {', '.join(sessions)} (end each first)"] if sessions else []) + (
+        [f"{', '.join(slots)} busy (a prepare or END in flight; retry)"] if slots else [])
+    return "; ".join(parts)
 
 
 def slots_in_service(store: RH.Store) -> dict[str, tuple[int, ...]]:

@@ -527,3 +527,22 @@ def test_live_lease_refusal_names_the_sessions(tmp_path):
         IH.preflight(IH.parse_install_argv(["undo"]), facts)
     assert e.value.name == "live-lease"
     assert S1 in str(e.value) and "s-2222222222222222" in str(e.value)
+
+
+def test_lease_list_tells_sessions_from_busy_slots():
+    """L3 r1 (complement): a busy slot is a prepare or END in flight, not a session to end."""
+    assert IH._lease_list((S1,)) == f"session(s) {S1} (end each first)"
+    assert IH._lease_list(("slot e0",)) == "slot e0 busy (a prepare or END in flight; retry)"
+    assert IH._lease_list((S1, "slot e0")) == (f"session(s) {S1} (end each first); "
+                                               "slot e0 busy (a prepare or END in flight; retry)")
+
+
+def test_quiesce_reads_session_records_before_slot_locks(tmp_path, monkeypatch):
+    """L3 r1 (codex HIGH): a session going from its live record to END's slot lock must be seen at one end."""
+    order = []
+    monkeypatch.setattr(IH, "live_lease_sessions", lambda d: order.append("sessions") or ())
+    q = IH.Quiesce(tmp_path)
+    monkeypatch.setattr(IH.Quiesce, "held", property(lambda self: True))
+    monkeypatch.setattr(IH.Quiesce, "busy_slots", lambda self: order.append("slots") or [])
+    assert q.live() == ()
+    assert order == ["sessions", "slots"]
