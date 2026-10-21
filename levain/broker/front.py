@@ -63,6 +63,10 @@ _CHUNK = 65536
 _DRAIN_CAP = 1024 * 1024
 _DRAIN_S = 1.0
 
+#: the alloc kinds of an egress-class session, the only ones with a front (CONTRACT §3.5, §5.3).
+SESSION_KINDS = ("interactive", "login", "dispatch", "planner")
+#: the kinds a dispatch ticket renders; their routes are the ticket's route + egress routes only (CONTRACT §3.5).
+DISPATCH_KINDS = ("dispatch", "planner")
 ROUTE_TYPES = ("egress", "subscription_passthrough", "brokered")
 CONNECT_TYPES = ("egress", "subscription_passthrough")
 _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
@@ -106,18 +110,29 @@ class ConnectRoute:
 @dataclass(frozen=True)
 class FrontPolicy:
     session: str
+    kind: str
     connect: Mapping[str, ConnectRoute]   # host -> the one route that admits it
 
-    def passthrough_hosts(self) -> frozenset[str]:
-        return frozenset(h for h, r in self.connect.items() if r.passthrough)
+
+def _is_inet_aton_spelling(h: str) -> bool:
+    try:
+        socket.inet_aton(h)
+    except OSError:
+        return False
+    return True
 
 
 def _hosts(route: str, raw: object) -> list[str]:
+    """The one host grammar, for CONNECT hosts and a brokered route's `upstream.host` alike: a lowercase IDNA A-label
+    name of two or more labels, with no trailing dot and no port. A host that is an address in disguise is refused
+    too: a last label of digits only, and any spelling `socket.inet_aton` accepts as IPv4 (hex, octal, short forms
+    such as 0x7f.0x1), because the system resolver would turn it into that address without a lookup."""
     if not isinstance(raw, list) or not raw:
         raise PolicyError(f"route {route}: hosts must be a non-empty list")
     out = []
     for h in raw:
-        if not isinstance(h, str) or not _HOSTNAME.match(h) or h.rsplit(".", 1)[1].isdigit():
+        if (not isinstance(h, str) or not _HOSTNAME.match(h) or h.rsplit(".", 1)[1].isdigit()
+                or _is_inet_aton_spelling(h)):
             raise PolicyError(f"route {route}: host {h!r} is not a lowercase A-label host name")
         out.append(h)
     return out
@@ -126,16 +141,19 @@ def _hosts(route: str, raw: object) -> list[str]:
 def load_policy(data: bytes) -> FrontPolicy:
     """Parse the front's policy file (render's `R/gw/slot<n>/session.json`, CONTRACT §4.3 "the front's view").
     Refuses: an unknown key, any `credential` field (the front holds no key), a duplicate route id, a host admitted
-    by two CONNECT routes (so whether a tunnel is passthrough is never ambiguous), and a CONNECT host that is also a
-    brokered route's host (a brokered session's vendor API traffic must go through the data plane, never a tunnel)."""
+    by two CONNECT routes (so whether a tunnel is passthrough is never ambiguous), a CONNECT host that is also a
+    brokered route's host (a brokered session's vendor API traffic must go through the data plane, never a tunnel),
+    and a `subscription_passthrough` route in a dispatch-ticket session (CONTRACT §4.1: dispatch may NEVER use one)."""
     try:
         doc = json.loads(data)
     except (ValueError, UnicodeDecodeError) as e:
         raise PolicyError(f"not JSON: {e}") from None
-    if not isinstance(doc, dict) or set(doc) != {"format", "session", "routes"}:
-        raise PolicyError("top level must be exactly {format, session, routes}")
+    if not isinstance(doc, dict) or set(doc) != {"format", "kind", "session", "routes"}:
+        raise PolicyError("top level must be exactly {format, kind, session, routes}")
     if doc["format"] != POLICY_FORMAT:
         raise PolicyError(f"format must be {POLICY_FORMAT}")
+    if doc["kind"] not in SESSION_KINDS:
+        raise PolicyError(f"kind {doc['kind']!r} not in {SESSION_KINDS}")
     if not isinstance(doc["session"], str) or not doc["session"]:
         raise PolicyError("session must be a non-empty string")
     if not isinstance(doc["routes"], list):
@@ -164,9 +182,12 @@ def load_policy(data: bytes) -> FrontPolicy:
             if "hosts" in pol:
                 brokered_hosts.update(_hosts(route, pol["hosts"]))
             up = pol.get("upstream")
-            if isinstance(up, dict) and isinstance(up.get("host"), str):
-                brokered_hosts.add(up["host"].lower())
+            if not isinstance(up, dict):
+                raise PolicyError(f"route {route}: a brokered route's upstream must be an object")
+            brokered_hosts.update(_hosts(route, [up.get("host")]))
             continue
+        if typ == "subscription_passthrough" and doc["kind"] in DISPATCH_KINDS:
+            raise PolicyError(f"route {route}: a {doc['kind']} session may not carry a subscription_passthrough route")
         for h in _hosts(route, pol.get("hosts")):
             if h in connect:
                 raise PolicyError(f"host {h} admitted by two routes ({connect[h].route}, {route})")
@@ -174,7 +195,7 @@ def load_policy(data: bytes) -> FrontPolicy:
     both = sorted(brokered_hosts & set(connect))
     if both:
         raise PolicyError(f"CONNECT routes admit brokered hosts {both}")
-    return FrontPolicy(doc["session"], connect)
+    return FrontPolicy(doc["session"], doc["kind"], connect)
 
 
 # --- addresses ------------------------------------------------------------------------------------------------
