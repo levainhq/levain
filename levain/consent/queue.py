@@ -120,6 +120,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 import warnings
@@ -151,7 +152,7 @@ from levain.consent.record import (
     ruling_message, ruling_payload, tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "INVOCATIONS", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
+__all__ = ["DB_NAME", "INVOCATIONS", "MODEL_MAX", "MODEL_UNKNOWN", "PRIOR_FORMAT", "REFUSED_BUSY_MS", "REFUSED_KINDS", "REFUSED_PER_REQUEST",
            "REFUSED_REASONS", "REFUSED_UNENROLLED_PER_REQUEST", "REFUSED_SUBREASONS", "RULED_ALLOW_LAPSE", "RULING_SKEW", "SNOOZE_MAX_MINUTES",
            "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "AwayMark", "ConsentQueue", "Decision",
            "ANSWER_KEYS", "Gapped", "Marked", "QueueStoreError", "Reping", "Ruling", "StoreNotCurrent",
@@ -192,6 +193,12 @@ RULING_SKEW = timedelta(minutes=2)
 SNOOZE_MAX_MINUTES = 7 * 24 * 60
 # how the agent's session was invoked, recorded for a later resume (``claude -p``, a terminal, ``claude --bg``)
 INVOCATIONS: tuple[str, ...] = ("-p", "interactive", "bg")
+#: The longest model string a request records. A model id is agent-controlled text a reader shows, so only the
+#: ASCII alphabet real ids use is recorded (see :func:`_model_of`); anything else is recorded as unknown.
+MODEL_MAX = 200
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,%d}" % (MODEL_MAX - 1), re.ASCII)
+#: What :meth:`ConsentQueue.model` reports for a model no source has given (DISPATCH F5: never inferred, never copied).
+MODEL_UNKNOWN = "unknown"
 _RESUME_KEYS = frozenset({"permission_mode", "invocation", "codex_pid", "cwd", "config_dir", "claude_pid",
                           "claude_started", "claude_flags", "codex_flags"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
@@ -313,6 +320,15 @@ _SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'resume metadata is written once'); END",
     "CREATE TRIGGER IF NOT EXISTS resume_meta_kept BEFORE DELETE ON resume_meta "
     "BEGIN SELECT RAISE(ABORT, 'resume metadata is never deleted'); END",
+    # the model the agent's own hook payload named at filing (DISPATCH F5), unsigned and never authority: it is the
+    # agent's claim, so it stays beside the sealed request and outside the receipts log. No row: unknown. A table a
+    # store made before it gains on its next open; the format is unchanged, so an older levain ignores it
+    "CREATE TABLE IF NOT EXISTS request_models (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
+    "model_requested TEXT NOT NULL, source TEXT NOT NULL CHECK (source IN ('hook')), created_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS request_models_frozen BEFORE UPDATE ON request_models "
+    "BEGIN SELECT RAISE(ABORT, 'a request model is written once'); END",
+    "CREATE TRIGGER IF NOT EXISTS request_models_kept BEFORE DELETE ON request_models "
+    "BEGIN SELECT RAISE(ABORT, 'request models are never deleted'); END",
     # a ruled allow taken by the call it pre-authorised: at most once
     "CREATE TABLE IF NOT EXISTS ruled_takes (request_id TEXT PRIMARY KEY REFERENCES requests(id), "
     "taken_at TEXT NOT NULL, event TEXT)",
@@ -432,6 +448,13 @@ def _migrate_from_prior(conn: sqlite3.Connection) -> None:
     if after != before:
         raise QueueStoreError(f"the migration from {PRIOR_FORMAT} copied {after} rows of {before}")
     conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
+
+
+def _model_of(value: Any) -> str | None:
+    """``value`` as a model string to record, or ``None``: a string that is wholly a model id in the ASCII alphabet
+    of :data:`_MODEL_RE` (so at most :data:`MODEL_MAX` characters, and no control, bidirectional or unpaired-surrogate
+    character can pass)."""
+    return value if isinstance(value, str) and _MODEL_RE.fullmatch(value) else None
 
 
 # how deep a signed record may nest when it is copied: an answer or ruling nests one level (``receipts_head``), so
@@ -933,7 +956,7 @@ class ConsentQueue:
 
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
              hold: timedelta, tier: str = "T2", event_id: str | None = None,
-             resume: Mapping[str, Any] | None = None) -> ExternalGateRequest:
+             resume: Mapping[str, Any] | None = None, model: Any = None) -> ExternalGateRequest:
         """File one gate an agent is waiting on; its hold (``expires_at``) ends ``hold`` after now, after which no
         answer applies and only the hook's :meth:`mark_undecided` does until it expires. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
@@ -945,8 +968,11 @@ class ConsentQueue:
         start time and the option names on its command line (never their values) as the OS reported them,
         ``codex_flags`` the same option names for a Codex process, ``cwd`` the directory the session was started in,
         ``config_dir`` the agent's config directory, ``None`` for its default), written with the request in its transaction and
-        read back by :meth:`resume_meta`; unsigned, never authority."""
+        read back by :meth:`resume_meta`; unsigned, never authority. ``model`` is the model the agent's own hook
+        payload named, recorded beside the request in the same transaction and read back by :meth:`model`; one
+        that is not a usable string (:func:`_model_of`) is recorded as nothing. Unsigned, never authority."""
         meta = self._resume_record(resume)
+        named = _model_of(model)
         if tier not in _TIER_NEEDS:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
@@ -969,6 +995,9 @@ class ConsentQueue:
                 if meta is not None:
                     conn.execute("INSERT INTO resume_meta (request_id, meta, created_at) VALUES (?, ?, ?)",
                                  (request.id, meta, request.received_at))
+                if named is not None:
+                    conn.execute("INSERT INTO request_models (request_id, model_requested, source, created_at) "
+                                 "VALUES (?, ?, 'hook', ?)", (request.id, named, request.received_at))
         except sqlite3.IntegrityError:
             raise ConsentError(f"request {request.id} (event {event}) is already filed: one event is filed once"
                                ) from None
@@ -986,6 +1015,18 @@ class ConsentQueue:
         except ValueError:
             return None
         return got if isinstance(got, dict) else None
+
+    def model(self, request_id: str) -> dict[str, str]:
+        """The model on the request (DISPATCH F5): ``requested``, the model the agent's hook payload named at filing
+        (``source`` ``"hook"``: the agent's own claim, unsigned), or :data:`MODEL_UNKNOWN` with ``source`` ``"none"``
+        when it named none; ``answered`` is :data:`MODEL_UNKNOWN`, since only a gateway's response metadata can
+        say which model answered and none is read here. Never authority, and outside the receipts log."""
+        with self._read() as conn:
+            row = conn.execute("SELECT model_requested, source FROM request_models WHERE request_id = ?",
+                               (request_id,)).fetchone()
+        if row is None:
+            return {"requested": MODEL_UNKNOWN, "answered": MODEL_UNKNOWN, "source": "none"}
+        return {"requested": row[0], "answered": MODEL_UNKNOWN, "source": row[1]}
 
     # --- reading -------------------------------------------------------------------------------------
     @staticmethod
