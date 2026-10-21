@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.14] — 2026-10-21
+
 ### Added
 - **Choice sign requests.** A caller can file one card with 2-8 options (`levain-sign-choice/1`). You tap one on the phone and sign it with your passkey; the signature covers the message with your choice as its last line, so a verifier reads the decision from the signed bytes, checked with stock `ssh-keygen -Y verify`.
   - A card can carry the caller's recommendation (`recommended`, one of its option keys). The phone marks it and never
