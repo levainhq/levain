@@ -8,8 +8,8 @@ them) and writes only ``answers/<request_id>.json``:
   CONTROL; the request's ``agent``, ``agent_session_id``, ``cwd`` and ``display`` are the hook's own claims and are
   returned under ``claims``, never as identity. A row that is not whole by
   :func:`levain.qbroker.broker.stored_request` (its broker labels not the shape the broker writes among them) is
-  skipped here and refused by :func:`answer_payload` and :func:`write_answer`. Its state is the last one the broker's receipts record for it (a decision the broker accepted reads
-  settled), ``expired`` once the hold has ended with none, and ``filing`` while it has no receipt at all: such a row
+  skipped here and refused by :func:`answer_payload` and :func:`write_answer`. Its state is the last one the
+  broker's receipts record for it (a decision the broker accepted reads settled), ``expired`` once the hold has ended with none, and ``filing`` while it has no receipt at all: such a row
   is not answerable (the broker records no decision without the filing).
 - :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0), for a
   ``pending`` request only.

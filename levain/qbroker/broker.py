@@ -49,8 +49,7 @@ from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueSto
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "SLOT_CLASS", "Broker", "Resolved", "Resolver", "resolved_from",
-           "stored_request",
-           "slot_ref"]
+           "slot_ref", "stored_request"]
 
 log = logging.getLogger("levain.qbroker")
 
@@ -194,6 +193,8 @@ class Broker:
             request = stored_request(row, store.queue_id)
             if request is not None:
                 filed.append(request)
+            # counted even when stored_request refused the row: a malformed row that names a session still holds its
+            # quota and a pending place until its hold ends (it is never filed or answered), the cautious side
             session, run = row.get("session"), row.get("run")
             if not isinstance(session, str) or (run is not None and not (
                     isinstance(run, Mapping) and isinstance(run.get("run_id"), str))):
