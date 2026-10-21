@@ -450,6 +450,38 @@ def test_coord_agent_sets_up_the_install(tmp_home, qdir, fake, capsys):
     assert next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])["cwd"] == str(target)
 
 
+def test_the_coordinator_install_pre_approves_its_own_three_verbs_and_a_reused_install_gets_none(
+        tmp_home, qdir, tmp_path, capsys):
+    # np-6843ca07 (a), signed: the coordinator's own install pre-approves only levain coord / drops / thread
+    from levain import install as inst
+    from levain.cli import main as levain_main
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    bash = [r for r in allow(target) if r.startswith("Bash(")]
+    assert bash == ["Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]
+    assert inst.persisted_role(target) == "coordinator"
+    assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
+    assert [r for r in allow(target) if r.startswith("Bash(")] == bash
+    # a live install made by plain init and then named as the coordinator's is used as is: nothing pre-approved
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain))
+    assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
+    assert inst.persisted_role(plain.resolve()) is None
+    capsys.readouterr()
+    # a damaged or hand-edited record never reads as the role
+    config = target / ".levain" / "config.json"
+    for body in ("{not json", '["coordinator"]', '{"role": "Coordinator"}'):
+        config.write_text(body)
+        assert inst.persisted_role(target) is None, body
+
+
 def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, tmp_path, capsys):
     busy = tmp_path / "busy"
     busy.mkdir()

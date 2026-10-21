@@ -19,6 +19,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `~/.levain/coordinator` (or `--cwd DIR`) a Levain install for Claude Code when it is not one, records the choice, and
   prints the one line that trusts that directory in Claude Code, which you run once. `levain coord agent none` (and
   no choice at all) means drops only queue for you.
+  - An install `levain coord agent` makes lets its coordinator run `levain coord`, `levain drops` and `levain thread`
+    without asking, and nothing else: those commands grant no authority (a signed envelope still does), and every
+    other command asks you as it does in any install. Claude Code applies this only once you have trusted the
+    directory. A live install you point it at with `--cwd` is used as is, with nothing pre-approved.
 - **`levain coord launch`: start the coordinator a drop asked for.** It starts a Claude Code session in the background
   in the coordinator's directory, only when that install's consent hook is wired, and prints the `claude attach` line,
   or why it did not start. `levain drop` and `levain coord wake` now do this themselves when they are the ones that

@@ -289,6 +289,7 @@ def run_init(
     consent_hook: str | None = None,
     memory_load: Sequence[str] | None = None,
     default_grants: str = "ask",
+    role: str | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -568,6 +569,7 @@ def run_init(
                     require_empty=not force,
                     messaging=messaging,
                     consent_hook=consent_hook,
+                    role=role,
                     memory_load=memory_load_default,
                     memory_load_by_adapter=memory_load_by_adapter,
                 )
@@ -632,6 +634,7 @@ def apply_init(
     require_empty: bool = False,
     messaging: str | None = None,
     consent_hook: str | None = None,
+    role: str | None = None,
     memory_load: str | None = None,
     memory_load_by_adapter: Mapping[str, str] | None = None,
 ) -> InitResult:
@@ -659,7 +662,7 @@ def apply_init(
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
-            messaging=messaging, consent_hook=consent_hook,
+            messaging=messaging, consent_hook=consent_hook, role=role,
             memory_load=memory_load, memory_load_by_adapter=memory_load_by_adapter,
         )
 
@@ -679,6 +682,7 @@ def _apply_init(
     emit: Callable[[str], None] = print,
     messaging: str | None = None,
     consent_hook: str | None = None,
+    role: str | None = None,
     memory_load: str | None = None,
     memory_load_by_adapter: Mapping[str, str] | None = None,
 ) -> InitResult:
@@ -807,6 +811,9 @@ def _apply_init(
     if consent_hook is not None and chosen in CONSENT_HOOK_SCRIPTS:
         # Recorded BEFORE the render: every render (init's, the receipt's, update's) reads the recorded choice.
         _write_consent_hook_choice(install, consent_hook, emit)
+    if role is not None and chosen == "claude-code":
+        # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role
+        _write_role(install, role, emit)
     review = _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit, messaging=messaging,
@@ -2031,6 +2038,7 @@ def _claude_code_settings(install: Path, adapter_root: Path, python_path: str,
             _apply_messaging(text, persisted_messaging(install),
                              keep_from=install / ".claude" / "settings.json"))
     text = _apply_consent_hook(text, python_path, install, "claude-code")
+    text = _apply_role(text, persisted_role(install))
     if not local:
         return text, {}
     doc = json.loads(text)
@@ -2737,6 +2745,75 @@ def persisted_consent_hook(install: Path) -> str:
     if "consent_hook" not in config:
         return "on"
     return config["consent_hook"] if config["consent_hook"] in CONSENT_HOOK_CHOICES else "off"
+
+
+# The coordinator's own install (np-6843ca07 (a), signed by the operator 2026-10-21): Claude Code runs its own
+# coordinator verbs without asking, and only those; they grant nothing (a signed envelope still does), and every
+# other command asks as in any install. The role is meant for an install `levain coord agent` made itself, never a
+# live install it reuses (tests/test_coordinator_launch.py "a_reused_install_gets_none" pins that).
+ROLE_CHOICES = ("coordinator",)
+COORDINATOR_ALLOW = ("Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)")
+
+
+def persisted_role(install: Path) -> str | None:
+    """The role ``.levain/config.json`` records (``role``), else ``None``. A file that cannot be read as a JSON
+    object, or a value that is not a role (a hand edit), is ``None``: what may hold a role is never read as one
+    that pre-approves more."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    path = install.joinpath(*LEVAIN_CONFIG_REL)
+    if not os.path.lexists(path):
+        return None
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    value = config.get("role")
+    return value if value in ROLE_CHOICES else None
+
+
+def _write_role(install: Path, role: str, emit: Callable[[str], None]) -> None:
+    """Record ``role`` in ``.levain/config.json``, so `levain update` and `init --force` render it again. Raises
+    InitError when it cannot be recorded."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    if role not in ROLE_CHOICES:
+        raise InitError(f"unknown install role {role!r}")
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing: dict = {}
+    if os.path.lexists(config_path):
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError) as e:
+            raise InitError(f".levain/config.json is unreadable, so the install role cannot be recorded ({e}); "
+                            "fix it, then re-run.") from e
+        if not isinstance(existing, dict):
+            raise InitError(".levain/config.json is not a JSON object, so the install role cannot be recorded; "
+                            "fix it, then re-run.")
+    if existing.get("role") == role:
+        return
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(config_path, json.dumps({**existing, "role": role}, indent=2, ensure_ascii=False) + "\n")
+    except OSError as e:
+        raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
+    emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(COORDINATOR_ALLOW)} without asking)")
+
+
+def _apply_role(settings_text: str, role: str | None) -> str:
+    """``settings_text`` (a rendered Claude Code settings.json) with the coordinator's allow rules appended to
+    ``permissions.allow`` when ``role`` is ``coordinator``; unchanged otherwise."""
+    if role != "coordinator":
+        return settings_text
+    doc = json.loads(settings_text)
+    perms = doc.setdefault("permissions", {})
+    allow = perms.setdefault("allow", []) if isinstance(perms, dict) else None
+    if not isinstance(allow, list):
+        raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
+    allow.extend(rule for rule in COORDINATOR_ALLOW if rule not in allow)
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
 def _write_consent_hook_choice(install: Path, choice: str, emit: Callable[[str], None]) -> None:

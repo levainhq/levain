@@ -211,7 +211,7 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
         emit(f"setting up {target} as a Levain install for Claude Code (levain init, non-interactive)")
         with contextlib.redirect_stdout(sys.stderr):
             code = inst.run_init(target, "claude-code", force=False, answers_file=answers_file,
-                                 default_grants="no")
+                                 default_grants="no", role="coordinator")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     target = target.resolve()
