@@ -870,9 +870,14 @@ def test_a_land_reads_the_records_the_verifier_wrote_and_takes_none_from_its_cal
     for to, cause in (("signed", "signature"), ("running", "slot_taken"), ("verifying", "runs_exited")):
         j = jstore._transition(j.id, to, cause)
     tree = make_tree(path, base, A_FIX, tmp_path)
+    from levain.dispatch.verifier_report import VerifierRun
     for i in (0, 1):
-        r = tvr.vrun(j.id, i)
-        raw, digest = tvr.envelope(r, tvr.body(("pass", "pass")))
+        # the template signs control's BB_ENTRY (the shipped output_compare driver, one step), so the run carries it
+        e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}   # the run carries the entry without the registry-only fields
+        r = VerifierRun(job_id=j.id, run=i, session=f"v-{i}", ticket=f"t-{i}", verifier=e,
+                        steps=tuple(tc.BB_ENTRY["steps"]),
+                        driver_input_digest=e["driver_input_digest"], input_bundle_digest="sha256:" + "e" * 64)
+        raw, digest = tvr.envelope(r, tvr.body(("pass",)))
         j = jstore.record_verification(r, envelope=raw, event=tvr.event(r, at=VERIFIED_AT,
                                                                          verifier_report_digest=digest),
                                         repo=str(path), tree=tree,
