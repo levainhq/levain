@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from levain.cockpit.consent import utc_stamp, value_sha256
-from levain.consent.record import GRANT_ANSWER_FORMAT
+from levain.consent.record import ANSWER_NAMESPACE, GRANT_ANSWER_FORMAT, answer_message, answer_payload
 from levain.contracts.canon import canonical_bytes, parse
 from levain.dispatch import published
 from levain.dispatch import sign as dsign
@@ -26,9 +26,10 @@ from levain.dispatch.contract import parse_contract
 from levain.dispatch.grant import (Allow, Queue, grant_paths, input_bound_digest, path_bound_digest,
                                    paths_decision)
 from levain.dispatch.jobs import JobStore
+from levain.qbroker import grants
 from levain.qbroker.broker import Broker, Resolved, resolved_from
 from levain.qbroker.grants import contract_authority
-from levain.qbroker.seam import answer_refusal, grant_allow_refusal
+from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, GRANT_ROW_FORMAT, QueueStore
 from tests.test_consent_queue import Key, Log
@@ -108,7 +109,8 @@ def world(tmp_path, keys):
     os.symlink("docs_real", root / "docs")
     run = {"run_id": "run-1", "job_id": job.id, "run_index": 0, "contract_digest": job.digest,
            "model_requested": "sonnet", "repo_root": str(root)}
-    w = {"L": L, "store": store, "job": job, "cap": cap, "root": str(root), "run": run, "keys": keys,
+    w = {"L": L, "store": store, "job": job, "cap": cap, "root": str(root), "run": run, "keys": keys, "log": log,
+         "repo": repo, "base": base,
          "clock": Clock(BNOW), "contract": L / "contracts" / published.file_name(job.digest)}
     w["genuine"] = w["contract"].read_bytes()
     return w
@@ -421,11 +423,26 @@ def test_the_contract_authority_holds_contract_signers_only(world):
 # --- the run object -----------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("root", [None, "relative/repo", "/", "/a/../b", "/a/", "/a\0b", 7])
-def test_a_dispatch_run_without_a_canonical_repo_root_does_not_resolve(world, root):
+def test_a_dispatch_run_with_a_non_canonical_repo_root_does_not_resolve(world, root):
     run = dict(world["run"], repo_root=root)
     assert resolved_from({"session": "s", "kind": "dispatch", "run": run}) is None
-    run.pop("repo_root")
-    assert resolved_from({"session": "s", "kind": "dispatch", "run": run}) is None
+
+
+def test_a_five_key_run_resolves_files_and_never_takes_a_grant(world, caplog):
+    """L3 r1 F: CONTROL's run without repo_root (the shape before W2-c2) is valid; only the grant needs the root."""
+    run5 = {k: v for k, v in world["run"].items() if k != "repo_root"}
+    assert resolved_from({"session": "s", "kind": "dispatch", "run": run5}).run == run5
+    assert resolved_from({"session": "s", "kind": "dispatch", "run": dict(run5, extra=1)}) is None
+    b = Broker(QueueStore(world["L"] / "queue"), OneResolver(Resolved(session="sess-5", kind="dispatch", run=run5)),
+               SignersSource(world["L"] / "policy", world["L"] / "routes" / "trust.pub"), clock=world["clock"],
+               contracts=world["L"] / "contracts", contracts_owner=os.getuid())
+    plain = frame(world, "five-plain", "Write", cc(world, "src/b.py"))
+    plain.pop("grant")
+    got = b.handle(1, plain)
+    assert got["ok"] is True and ask(b, got["request_id"])["pending"] is True
+    caplog.set_level("INFO", logger="levain.qbroker")
+    assert outcome(world, b, frame(world, "five-grant", "Write", cc(world, "src/a.py"))) == "queued"
+    assert "CONTROL named no worktree root" in caplog.text
 
 
 # --- dispatch publishing ----------------------------------------------------------------------------------------
@@ -486,3 +503,138 @@ def test_paths_decision_holds_the_paths_to_grant_paths_shape(world):
         assert isinstance(paths_decision(contract, agent, tool, paths, root=r), Queue), (agent, tool, paths)
     assert isinstance(paths_decision(contract, "codex", "apply_patch", [f"{r}/src/a.py", f"{r}/src/new.py"],
                                      root=r), Allow)
+
+
+# --- L3 r1 fixes (W2C2_L3_r1_TRIAGE.md; the RUN_r2.txt cases) -------------------------------------------------------
+
+def _file_and_sign(w, write, goal):
+    store, keys = w["store"], w["keys"]
+    job, cap = store.file(submission(w["repo"], w["base"], read=["src/a.py"], write=write,
+                                     grant=["Edit", "Write", "apply_patch"], goal=goal),
+                          resolve_template=registry(), policy=POLICY, filer_session="planner-r2")
+    p = dsign.sign_payload(job, signer_fp=keys["phone"].fp, signed_at=store._clock.now)
+    return store.sign(job.id, p, keys["phone"].sign(dsign.sign_message(p), dsign.DISPATCH_SIGN_NAMESPACE),
+                      w["log"].source), cap
+
+
+def _operator_answer(w, rid, decision, *, sign=True):
+    row = QueueStore(w["L"] / "queue").read_request(rid)
+    ap = answer_payload(queue_id=row["queue_id"], request=request_of(row["request"]), decision=decision,
+                        signer_fp=w["keys"]["laptop"].fp, signed_at=utc_stamp(w["clock"].now),
+                        receipts_head={"size": 0, "root": "0" * 64})
+    sig = w["keys"]["laptop"].sign(answer_message(ap), ANSWER_NAMESPACE) if sign else "x"
+    (w["L"] / "queue" / "answers" / f"{rid}.json").write_bytes(canonical_bytes(
+        {"format": ANSWER_ROW_FORMAT, "payload": ap, "signature": sig}))
+
+
+def test_the_operators_signed_deny_outranks_a_grant_row(world):
+    """L3 r1 D."""
+    b = broker(world)
+    rid = b.handle(1, frame(world, "deny", "Write", cc(world, "src/a.py")))["request_id"]
+    assert QueueStore(world["L"] / "queue").has_grant(rid) and ask(b, rid)["decision"] == "allow"
+    _operator_answer(world, rid, "deny")
+    assert ask(b, rid)["decision"] == "deny"
+    assert broker(world).handle(1, {"v": 1, "op": "ANSWER?", "id": next(_ids), "cap": "cap-g",
+                                    "request_id": rid})["decision"] == "deny"
+
+
+def test_an_answer_that_is_not_authority_does_not_unseat_the_grant_and_refuses_alone(world):
+    b = broker(world)
+    granted = b.handle(1, frame(world, "bad-g", "Write", cc(world, "src/a.py")))["request_id"]
+    _operator_answer(world, granted, "deny", sign=False)
+    assert ask(b, granted)["decision"] == "allow"
+    queued = b.handle(1, frame(world, "bad-q", "Write", cc(world, "src/b.py")))["request_id"]
+    _operator_answer(world, queued, "deny", sign=False)
+    assert ask(b, queued)["refused"] == "answer-refused"
+
+
+def test_a_snapshot_read_that_raises_queues_the_call(world, caplog):
+    """L3 r1 I."""
+    b = broker(world)
+
+    def boom():
+        raise OSError("half-written snapshot")
+    b._signers.current = boom
+    caplog.set_level("INFO", logger="levain.qbroker")
+    got = b.handle(1, frame(world, "snap-raise", "Write", cc(world, "src/a.py")))
+    assert got["ok"] is True and not QueueStore(world["L"] / "queue").has_grant(got["request_id"])
+    assert "the signer snapshot could not be read (OSError)" in caplog.text
+
+
+def test_one_write_that_fails_still_removes_a_cancelled_jobs_record(world, caplog):
+    """L3 r1 A: removals run first and each write in its own guard; the failure is logged."""
+    job_a, cap_a = _file_and_sign(world, ["src/b.py"], "Job A: fix b.py.")
+    path_a = world["L"] / "contracts" / published.file_name(job_a.digest)
+    assert path_a.exists()
+    job_b, _ = world["store"].file(submission(world["repo"], world["base"], read=["src/a.py"], write=["src/run.sh"],
+                                              grant=["Write"], goal="Job B: fix run.sh."),
+                                   resolve_template=registry(), policy=POLICY, filer_session="planner-r2")
+    blocker = world["L"] / "contracts" / published.file_name(job_b.digest)
+    blocker.mkdir()
+    (blocker / "x").write_text("x")
+    p = dsign.sign_payload(job_b, signer_fp=world["keys"]["phone"].fp, signed_at=world["store"]._clock.now)
+    world["store"].sign(job_b.id, p, world["keys"]["phone"].sign(dsign.sign_message(p),
+                                                                  dsign.DISPATCH_SIGN_NAMESPACE), world["log"].source)
+    caplog.set_level("ERROR", logger="levain.dispatch")
+    assert world["store"].cancel_by_planner(job_a.id, cap_a).state == "cancelled"
+    assert not path_a.exists() and world["contract"].exists()
+    assert f"{blocker.name} could not be written" in caplog.text
+
+
+def test_a_removal_that_fails_stops_no_other_removal_or_write(world, tmp_path):
+    d = world["L"] / "contracts"
+    stuck = d / ("a" * 64 + ".json")
+    stuck.mkdir()
+    (stuck / "x").write_text("x")
+    stray = d / ("b" * 64 + ".json")
+    stray.write_bytes(b"{}")
+    os.unlink(world["contract"])
+    failures = published.sync(d, [_rec(world)])
+    assert [f for f in failures if stuck.name in f and "could not be removed" in f] and len(failures) == 1
+    assert not stray.exists() and world["contract"].read_bytes() == world["genuine"]
+
+
+def test_sync_fsyncs_the_directory_after_removals(world, monkeypatch):
+    """L3 r1 C."""
+    d = world["L"] / "contracts"
+    (d / ("c" * 64 + ".json")).write_bytes(b"{}")
+    synced = []
+    real = os.fsync
+
+    def spy(fd):
+        synced.append(os.fstat(fd).st_ino)
+        return real(fd)
+    monkeypatch.setattr(published.os, "fsync", spy)
+    assert published.sync(d, [_rec(world)]) == []
+    assert os.stat(d).st_ino in synced
+
+
+def test_sync_removes_its_own_stale_temp_names_only(world):
+    """L3 r1 J."""
+    d = world["L"] / "contracts"
+    old, young, other = d / ".tmp-123-0123456789abcdef", d / ".tmp-124-fedcba9876543210", d / ".tmp-notours"
+    for p in (old, young, other):
+        p.write_bytes(b"x")
+    past = old.stat().st_mtime - published.TMP_STALE - 1
+    os.utime(old, (past, past))
+    assert published.sync(d, [_rec(world)]) == []
+    assert not old.exists() and young.exists() and other.exists()
+
+
+def test_a_record_over_the_brokers_bound_is_not_published(world, tmp_path):
+    """L3 r1 H: a contract text under the door's limit, all quotes, doubles when embedded."""
+    from levain.dispatch.cli import _CONTRACT_MAX
+    d = tmp_path / "big"
+    d.mkdir()
+    fat = dict(_rec(world), digest="sha256:" + "1" * 64, contract='"' * (_CONTRACT_MAX - 4096))
+    assert len(canonical_bytes(fat)) > grants.PUBLISHED_MAX
+    failures = published.sync(d, [fat])
+    assert os.listdir(d) == [] and len(failures) == 1 and "over the broker's" in failures[0]
+
+
+def test_a_store_logs_a_record_it_will_not_publish_and_withdraws_it(world, monkeypatch, caplog):
+    monkeypatch.setattr(grants, "PUBLISHED_MAX", len(world["genuine"]) - 1)
+    caplog.set_level("ERROR", logger="levain.dispatch")
+    world["store"].get(world["job"].id)
+    assert not world["contract"].exists()
+    assert "not published, so its calls queue" in caplog.text

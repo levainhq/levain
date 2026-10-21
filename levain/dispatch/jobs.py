@@ -62,7 +62,9 @@ THE PUBLISHED CONTRACT (W2-c2, CONTRACT §26 S1-b). A store given ``published_di
 signed record of every live signed job (:mod:`levain.dispatch.published`): written once :meth:`JobStore.sign` has
 committed the signature, removed once the job is terminal, re-synced after every operation (:meth:`JobStore.sweep`
 and each operation's sweep included), so a crash between a commit and the file is repaired by the next call. A
-publish that fails is logged and never fails the operation: the broker then finds no record and every grant queues.
+publish that fails is logged and never fails the operation: a write that fails leaves the broker no record for that
+job (its grants queue); a removal that fails leaves a terminal job's record until the next call removes it or its
+expiry ends it (the known edges in :func:`levain.dispatch.published.sync`).
 
 Known edge: until S1 places the control principal (design §8), the store is an operator-uid file, so any process of
 that uid can write it; no executor exists in this slice, so no run rests on it. The filing agent is the name the
@@ -559,7 +561,8 @@ class JobStore:
                                      store_id=store_id, job_id=job_id, filed_at=filed_at,
                                      unsigned_lease_end=unsigned_until, expires_at=expires_at)
                     for job_id, digest, text, filed_at, unsigned_until, expires_at, payload, sig in rows]
-            published.sync(self.published_dir, live)
+            for line in published.sync(self.published_dir, live):
+                log.error("dispatch: publishing to %s: %s", self.published_dir, line)
         except Exception:   # noqa: BLE001 - the broker fails closed on a missing record; this store's op stands
             log.exception("dispatch: the signed contracts could not be published to %s", self.published_dir)
 

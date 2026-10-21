@@ -58,14 +58,15 @@ def request_of(fields: Any) -> ExternalGateRequest | None:
 
 def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers: SignersSnapshot | None,
                    now: datetime, *, ssh_keygen: Path | str | None = None) -> str | None:
-    """Why ``payload``/``signature`` is not authority for the request ``row`` holds; ``None`` when it is."""
+    """Why ``payload``/``signature`` is not authority for the request ``row`` holds; ``None`` when it is. The hold is
+    the answer's own ``signed_at`` before the request's ``expires_at`` (:func:`levain.consent.queue.answer_refusal`),
+    never the time it is read: an answer signed in time is authority when read after the hold ended. ``now`` is not
+    read (kept so every refusal here takes one signature)."""
     if signers is None:
         return "the answer-signer snapshot is missing or unverifiable: no answer is authority"
     request = request_of(row.get("request"))
     if request is None:
         return "the request row's seal does not match its fields"
-    if request.expires_at <= utc_stamp(now):
-        return f"the request's hold ended {request.expires_at}"
     if isinstance(payload, Mapping) and payload.get("format") in _NOT_ANSWERS:
         return f"a {payload.get('format')} record is not a queue answer"
     if isinstance(payload, Mapping):

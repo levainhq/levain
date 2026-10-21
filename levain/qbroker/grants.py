@@ -17,7 +17,8 @@ failure being a :class:`~levain.dispatch.grant.Queue` (the request is filed as a
 4. :func:`levain.dispatch.sign.refusal` passes with an authority built from the answer-signer snapshot's entries that
    list :data:`CONTRACT_NAMESPACE` ONLY (:func:`contract_authority`; each fingerprint computed from its ``key_b64``);
 5. a Codex call queues unless its ``cwd`` is the run's ``repo_root`` (Codex joins patch headers to ITS cwd);
-6. :func:`levain.dispatch.grant.paths_decision` with root = the run's ``repo_root`` (from CONTROL).
+6. :func:`levain.dispatch.grant.paths_decision` with root = the run's ``repo_root`` (from CONTROL; a run without one
+   queues).
 
 Known edge (CONTRACT §26 S1-b): the job's ``store_id``, ``filed_at`` and ``unsigned_lease_end`` are dispatch's
 unsigned word, so dispatch can replay a contract the operator signed for that ``job_id`` until its ``expires_at``;
@@ -54,7 +55,9 @@ __all__ = ["CONTRACT_NAMESPACE", "GRANT_KEYS", "PUBLISHED_MAX", "Granted", "cont
 
 CONTRACT_NAMESPACE = dsign.DISPATCH_SIGN_NAMESPACE
 # CONTRACT §26 S1-b: the contract text is at most what the dispatch door accepts; 64 KiB more holds the payload, the
-# signature (a passkey's included) and the job fields
+# signature (a passkey's included) and the job fields. Dispatch measures each record's final bytes against this same
+# constant and does not publish one over it (levain.dispatch.published.sync), so escaping cannot make a record it
+# wrote unreadable here
 PUBLISHED_MAX = _CONTRACT_MAX + 64 * 1024
 GRANT_KEYS = frozenset({"paths", "input"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -219,6 +222,8 @@ def decide(*, kind: str, run: Mapping[str, Any] | None, request: ExternalGateReq
             return Queue(got)
         contract, signer_fp = got
         root = run.get("repo_root")
+        if not isinstance(root, str):
+            return Queue("CONTROL named no worktree root (repo_root) for the run")
         if request.agent == _CODEX and request.cwd != root:
             return Queue("Codex reads patch paths against its cwd, and the cwd is not the run's worktree root")
         verdict = paths_decision(contract, request.agent, request.tool_name, paths, root=root)
