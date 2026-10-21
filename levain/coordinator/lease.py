@@ -53,8 +53,8 @@ from levain.coordinator.store import CoordError, _append_only, next_gseq
 __all__ = [
     "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat", "claim",
-    "claim_spawn", "end_launch", "fence", "launch", "lease", "launches", "release", "request_launch", "set_agent",
-    "setting", "status", "take", "wake", "wake_state",
+    "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch", "lease", "launches",
+    "release", "request_launch", "set_agent", "setting", "status", "take", "unspawned", "wake", "wake_state",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -183,6 +183,7 @@ class Launch:
     harness_session_id: str | None
     cause: str
     at: str
+    pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
 
 
 @dataclass(frozen=True)
@@ -322,12 +323,12 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
                      f"FROM launches WHERE {where} = ?", (arg,)).fetchone()
     if r is None:
         return None
-    events = conn.execute("SELECT kind, until, harness_session_id, cause FROM launch_events WHERE launch_id = ? "
-                          "ORDER BY seq", (r[0],)).fetchall()
+    events = conn.execute("SELECT kind, until, harness_session_id, cause, pinned_envelope_id FROM launch_events "
+                          "WHERE launch_id = ? ORDER BY seq", (r[0],)).fetchall()
     until = next((e[1] for e in events if e[0] == "pending"), None)
-    hsid = next((e[2] for e in events if e[0] == "active"), None)
+    hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9])
+                  hsid, events[-1][3], r[9], pin)
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:
@@ -409,11 +410,28 @@ def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness
                     cause="requested")
 
 
+def _head_envelope(conn: sqlite3.Connection, thread_id: str) -> str | None:
+    """Thread ``thread_id``'s head envelope (the one most recently bound to it, as
+    :meth:`levain.coordinator.envelopes.EnvelopeStore.head` reads it), or None: none bound, or a store with no
+    envelope tables."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envelope_binds'").fetchone() is None:
+        return None
+    row = conn.execute("SELECT envelope_id FROM envelope_binds WHERE thread_id = ? ORDER BY gseq DESC LIMIT 1",
+                       (thread_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_session_id: str,
-             argv_sha256: str | None = None, pinned_envelope_id: str | None = None) -> tuple[Launch, str | None]:
+             argv_sha256: str | None = None) -> tuple[Launch, str | None]:
     """``pending`` -> ``active`` if the latest event is that pending row, ``now`` is before its ``until`` and its
     token is still the live lease's. Otherwise the launch is written ``expired`` or ``failed`` (in this transaction,
-    which commits) and the reason returned: ``(launch, None)`` on activation, ``(launch, reason)`` when refused."""
+    which commits) and the reason returned: ``(launch, None)`` on activation, ``(launch, reason)`` when refused.
+
+    THE PIN (C0 §3.4): a worker launch whose threads are exactly ``[T]`` records T's head envelope at this moment on
+    its ``active`` row, in this transaction; it and every job it files run under that envelope, which later
+    successors and attenuations can only narrow. A coordinator launch, a worker holding several threads, and a
+    thread with no envelope pin nothing (no envelope authority). The pin is the head as bound, live or not: whether
+    it is still in force is the predicate's question at each use (§4.5), never this one's."""
     ln = _must_launch(conn, launch_id)
     hsid = _line("harness session id", harness_session_id)
     if hsid is None:
@@ -428,8 +446,9 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
         _launch_event(conn, now, launch_id, "failed", "lease lost before active")
         return _launch_row(conn, "launch_id", launch_id), (f"launch {launch_id} was asked for under lease token "
                                                            f"{ln.token}, which is no longer live")
+    pin = _head_envelope(conn, ln.threads[0]) if ln.role == "worker" and len(ln.threads) == 1 else None
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
-                  argv_sha256=_line("argv sha256", argv_sha256), pinned_envelope_id=pinned_envelope_id)
+                  argv_sha256=_line("argv sha256", argv_sha256), pinned_envelope_id=pin)
     if ln.role == "coordinator" and held.holder == ln.session_key:
         # the bootstrap claim was written with the pending launch's until: the active session now holds a full TTL
         _event(conn, now, "beat", held.holder, token=held.token, until=_plus(now, LEASE_TTL), cause="active",
@@ -453,6 +472,36 @@ def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, ca
         _event(conn, now, "release", held.holder, token=held.token, until=None, cause=f"launch {kind}",
                by="service")
     return _launch_row(conn, "launch_id", launch_id)
+
+
+def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
+    """The watcher saw ``launch_id``'s session missing from its harness's list: an ``active`` launch is written
+    ``ended``, cause ``0 turns`` for a coordinator that wrote no lease row as coordinator since its ``active`` (a
+    death), else ``gone``. The check and the write are one transaction. None when the launch is no longer active."""
+    ln = _must_launch(conn, launch_id)
+    if ln.state != "active":
+        return None
+    cause = "gone"
+    if ln.role == "coordinator":
+        active_gseq = conn.execute("SELECT gseq FROM launch_events WHERE launch_id = ? AND kind = 'active'",
+                                   (launch_id,)).fetchone()[0]
+        wrote = conn.execute("SELECT 1 FROM lease_events WHERE holder = ? AND by = 'coordinator' AND gseq > ?",
+                             (ln.session_key, active_gseq)).fetchone() is not None
+        cause = "gone" if wrote else "0 turns"
+    return end_launch(conn, now, launch_id, "ended", cause)
+
+
+def unspawned(conn: sqlite3.Connection) -> list[Launch]:
+    """Pending launches no process has claimed the spawn of, oldest first."""
+    return [ln for ln in _in_state(conn, "pending") if conn.execute(
+        "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None]
+
+
+def by_harness_session(conn: sqlite3.Connection, harness_session_id: str) -> Launch | None:
+    """The launch whose ``active`` row recorded ``harness_session_id`` (a session Levain started), or None."""
+    row = conn.execute("SELECT launch_id FROM launch_events WHERE kind = 'active' AND harness_session_id = ? "
+                       "ORDER BY gseq DESC LIMIT 1", (harness_session_id,)).fetchone()
+    return None if row is None else _launch_row(conn, "launch_id", row[0])
 
 
 def _in_state(conn: sqlite3.Connection, state: str, role: str | None = None) -> list[Launch]:

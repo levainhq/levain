@@ -1015,10 +1015,32 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
                   got.attach if got.started else _outcome_text(got))
             return 0 if got.started else 1
         if cmd == "wake":
+            # a pending launch has a starter wherever it is written: the wake starts the one it wrote, as a drop does
             ln = store.coord_wake()
+            got = None
+            if ln is not None:
+                from levain.coordinator.launch import launch_session
+
+                got = launch_session(store, ln.launch_id)
             st = store.coord_status()
-            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}" if ln is not None
-                                       else f"no launch asked for: {st['why']}"))
+            st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
+                                                      "refusal": got.refusal, "remedy": got.remedy}
+            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}\n{_outcome_text(got)}"
+                                       if ln is not None else f"no launch asked for: {st['why']}"))
+            return 0 if got is None or got.started else 1
+        if cmd == "watch":
+            from levain.coordinator.launch import watch, watch_once
+
+            if args.once:
+                lines = watch_once(store)
+                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
+                return 0
+            if args.every < 1:
+                raise CoordError("--every is at least 1 second")
+            try:
+                watch(store, every=args.every, emit=lambda line: print(line, file=out, flush=True))
+            except KeyboardInterrupt:
+                return 0
             return 0
         st = store.coord_status()
     except _REFUSED as exc:
@@ -1199,7 +1221,14 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca.add_argument("--model", default=None, help="The model the session runs (default: Claude Code's own).")
     cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending coordinator's).")
     cl.add_argument("launch_id", nargs="?", default=None, metavar="LAUNCH_ID")
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl):
+    cwa = c_sub.add_parser(
+        "watch", help="Keep the coordinator's sessions honest: start pending launches, end the gone, beat the live.",
+        description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
+                    "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
+                    "whose session is, and stops a session whose launch ended. Only sessions Levain started.")
+    cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
+    cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa):
         common(p)
         p.set_defaults(func=run_coord)
 

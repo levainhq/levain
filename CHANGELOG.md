@@ -18,14 +18,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   no choice at all) means drops only queue for you.
 - **`levain coord launch`: start the coordinator a drop asked for.** It starts a Claude Code session in the background
   in the coordinator's directory, only when that install's consent hook is wired, and prints the `claude attach` line,
-  or why it did not start. `levain drop` now does this itself when its drop is the one that asked.
+  or why it did not start. `levain drop` and `levain coord wake` now do this themselves when they are the ones that
+  asked.
+- **`levain coord watch`: keep the coordinator's sessions honest.** Leave it running (`--every S`, or `--once` for one
+  pass): it starts any coordinator a drop from the phone or the cockpit asked for, ends a launch whose session is
+  gone, keeps the role with a coordinator whose session is still running, and stops a session whose launch ended
+  (you took over, or it lost the role). It touches only the sessions Levain started.
 
 ### Known edges
 - A coordinator launch that fails (an untrusted directory, a session that never appears) counts against the
   coordinator: after three in a row Levain stops starting them until you run `levain coord take` or
   `levain coord release`.
-- `levain coord wake` asks for a coordinator without starting it: run `levain coord launch` within 5 minutes, or
-  the request lapses and counts as one of those three.
+- A drop from the phone or the cockpit asks for a coordinator without starting it: with no `levain coord watch`
+  running, run `levain coord launch` within 5 minutes, or the request lapses and counts as one of those three.
 
 ## [0.11.13] — 2026-10-20
 

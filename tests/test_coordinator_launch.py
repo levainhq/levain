@@ -1,7 +1,7 @@
-"""Starting a launch's session (C3b; C0 §3.4, §7 L2 L8). Built from the runs in project_memory
-1020-coordinator/c3/: run_c3b_first_a.txt (the trust refusal, by realpath), run_c3b_first_b.txt (the spawn, the first
-agents row with no pid and no status, stop) and run_owed2_claude_bg.txt (--bg ignores --session-id). A fake ``claude``
-on PATH replays those outputs; no test here ever spawns the real one."""
+"""Starting a launch's session, and watching it (C3b; C0 §3.4, §7 L2 L8 L9). Built from what C3b's runs measured on
+Claude Code 2.1.305 (1020+50): the trust refusal, by realpath; the spawn, the first agents row with no pid and no
+status, stop; --bg ignoring --session-id. A fake ``claude`` on PATH replays those outputs; no test here ever spawns
+the real one."""
 from __future__ import annotations
 
 import json
@@ -50,8 +50,11 @@ if args[:1] == ["--bg"]:
     print(f"  claude attach {HID}    open in this terminal")
     sys.exit(0)
 if args == ["agents", "--json"]:
+    if (here / "agents_fail").exists():
+        print("error: could not reach the sessions", file=sys.stderr); sys.exit(1)
+    extra = json.loads((here / "others.json").read_text()) if (here / "others.json").exists() else []
     if not state.exists():
-        print("[]"); sys.exit(0)
+        print(json.dumps(extra)); sys.exit(0)
     s = json.loads(state.read_text())
     row = {{"id": "{HID}", "cwd": s["cwd"], "kind": "background", "startedAt": 1792552347854,
            "sessionId": "{SID}", "name": s["name"], "state": "working"}}
@@ -59,7 +62,7 @@ if args == ["agents", "--json"]:
         row.update(pid=54960, status="busy")      # the first row right after the spawn has neither
     s["reads"] += 1
     state.write_text(json.dumps(s))
-    print(json.dumps([row], indent=2)); sys.exit(0)
+    print(json.dumps(extra + [row], indent=2)); sys.exit(0)
 if args[:1] == ["stop"]:
     state.unlink(missing_ok=True)
     print(f"stopped {{args[1]}}"); sys.exit(0)
@@ -150,7 +153,11 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert ln.state == "active" and ln.harness_session_id == SID
     (argv,) = fake.spawns()
     name = f"levain-coordinator-{launch_id.removeprefix('ln-')}"
-    brief = cl.brief_path(store, launch_id)
+    brief = cl.brief_path(ln)
+    # inside the session's own trusted workspace (R2), never the drops in argv
+    assert brief == workdir.resolve() / ".levain" / "briefs" / f"{launch_id}.md"
+    assert stat.S_IMODE(brief.parent.stat().st_mode) == 0o700
+    assert not any("please fix the flaky test" in a for a in argv)
     # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
     assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
     assert len(argv) == 8 and str(brief) in argv[7]
@@ -427,3 +434,182 @@ def test_coord_agent_none_and_codex(qdir, capsys):
     assert CoordStore(qdir).coord_setting().agent == "none"
     out = _main(qdir, capsys, "coord", "agent", "codex", rc=1)
     assert "only claude is built" in out.err
+
+
+# --- the brief's directory (R2) --------------------------------------------------------------------------------
+def test_a_linked_briefs_directory_refuses_the_launch(store, fake, live_hook, workdir, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (workdir / ".levain").mkdir()
+    (workdir / ".levain" / "briefs").symlink_to(elsewhere)
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "not a private directory" in got.refusal
+    assert fake.spawns() == [] and list(elsewhere.iterdir()) == []
+
+
+# --- the watcher (levain coord watch) --------------------------------------------------------------------------
+@pytest.fixture
+def clock(store, monkeypatch):
+    t = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(store, "_clock", lambda: t[0])
+    return t
+
+
+def started(store):
+    got = cl.launch_session(store, woken(store))
+    assert got.started, got
+    return store.launch(got.launch_id)
+
+
+def test_watch_starts_a_pending_launch_nobody_started(store, fake, live_hook):
+    # a drop from the phone or the cockpit writes the pending launch and starts nothing
+    store.accept_drop("from the phone", surface="cli")
+    (pending,) = store.launches_unspawned()
+    lines = cl.watch_once(store)
+    assert f"launch {pending.launch_id} started: claude attach {HID}" in lines
+    assert store.launch(pending.launch_id).state == "active"
+    # the next pass finds nothing to start, and the one-spawner row stands
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launches_unspawned() == []
+
+
+def test_watch_leaves_a_launch_another_process_is_starting(store, fake, live_hook, qdir):
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None        # someone else won the spawn
+    cl.watch_once(store)
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_a_listed_silent_holder_keeps_the_lease_across_a_ttl(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    first = store.coord_status()["lease"]
+    assert first["holder"] == ln.session_key and first["live"]
+    for _ in range(4):                                  # 4 x 20 min: well past one LEASE_TTL with no beat of its own
+        clock[0] += timedelta(minutes=20)
+        lines = cl.watch_once(store)
+        assert any(line.startswith(f"lease {first['token']} held by {ln.launch_id}: beat") for line in lines), lines
+    held = store.coord_status()["lease"]
+    assert held["token"] == first["token"] and held["live"] and held["holder"] == ln.session_key
+    assert store.launch(ln.launch_id).state == "active"
+
+
+def test_an_unlisted_holder_loses_the_lease_and_dies_at_0_turns(store, fake, live_hook, clock, qdir):
+    from datetime import timedelta
+
+    ln = started(store)
+    (fake.dir / "state.json").unlink()                  # the session went away (crashed, or stopped by hand)
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "0 turns"
+    assert store.coord_status()["lease"] is None                       # released with its end
+    assert rows(qdir, "SELECT by, cause FROM lease_events ORDER BY seq DESC LIMIT 1") == [("service", "launch ended")]
+    # 0 turns is a death: the next drop waits out the backoff
+    assert store.coord_status()["wake"] == "backoff"
+
+
+def test_an_unlisted_holder_that_wrote_ends_gone(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)     # it did something as coordinator
+    (fake.dir / "state.json").unlink()
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "gone"
+    assert store.coord_status()["wake"] == "wake"       # not a death
+
+
+def test_an_unreadable_list_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    (fake.dir / "state.json").unlink()
+    (fake.dir / "agents_fail").write_text("")
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert "claude agents --json could not be read: no session observed" in lines
+    assert store.launch(ln.launch_id).state == "active" and fake.stops() == []
+
+
+def test_an_ended_launch_still_listed_is_stopped_and_no_other_session_is_touched(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    other = {"id": "9f00aa11", "sessionId": "9f00aa11-0000-4000-8000-000000000000", "name": "levain-coordinator-x",
+             "cwd": "/elsewhere", "kind": "background", "state": "done", "status": "idle"}
+    (fake.dir / "others.json").write_text(json.dumps([other]))
+    ln = started(store)
+    store.coord_take()                                  # you took over: its launch is ended, its session still runs
+    assert store.launch(ln.launch_id).state == "ended"
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended (takeover): claude stop {HID}: stopped {HID}" in lines
+    assert fake.stops() == [["stop", HID]]              # never the session Levain did not start
+    cl.watch_once(store)
+    assert fake.stops() == [["stop", HID]]              # gone from the list: nothing more to stop
+    assert store.coord_status()["lease"]["holder"] == "operator"
+
+
+def test_watch_runs_its_passes(store, fake, live_hook, monkeypatch):
+    monkeypatch.setattr(cl.time, "sleep", lambda s: None)
+    store.accept_drop("later", surface="cli")
+    out: list[str] = []
+    cl.watch(store, every=5, emit=out.append, passes=2)
+    assert len(fake.spawns()) == 1 and any("started" in line for line in out)
+
+
+def test_levain_coord_watch_once_and_wake(store, qdir, fake, live_hook, capsys):
+    out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert out.out.strip() == "nothing to do"
+    # a wake starts the launch it wrote (R1), as a drop does
+    out = _main(qdir, capsys, "coord", "wake")
+    assert "asked for coordinator launch" in out.out and f"started: claude attach {HID}" in out.out
+    assert len(fake.spawns()) == 1
+    out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert "beat to" in out.out
+
+
+def test_levain_coord_wake_exits_1_when_its_launch_is_refused(store, qdir, fake, live_hook, capsys):
+    fake.mode("trust")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "not started: workspace not trusted" in out.out and "&& claude" in out.out
+
+
+# --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
+from tests.test_coordinator_envelope import _lease, ctx, keys, repo, snapshot, structured_thread  # noqa: E402,F401
+
+
+def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structured_thread):
+    _d, b, t = structured_thread
+    st = ctx.store
+    token = _lease(st)
+    _d2, t2 = ctx.plain_thread("a thread with no envelope")
+    one = st.launch_request(token, harness="claude", threads=[t.thread_id])
+    two = st.launch_request(token, harness="claude", threads=[t.thread_id, t2.thread_id])
+    bare = st.launch_request(token, harness="claude", threads=[t2.thread_id])
+    coord = st.launch_request(token, harness="claude", role="coordinator")
+    for i, ln in enumerate((one, two, bare, coord)):
+        got, refused = st.launch_activate(ln.launch_id, harness_session_id=f"sid-{i}")
+        assert refused is None and got.state == "active"
+    assert st.launch(one.launch_id).pinned_envelope_id == b["envelope_id"] == st.head(t.thread_id).envelope_id
+    # several threads carry no envelope authority; a thread with none and the coordinator pin nothing
+    assert [st.launch(ln.launch_id).pinned_envelope_id for ln in (two, bare, coord)] == [None, None, None]
+    assert ctx.rows(f"SELECT kind, pinned_envelope_id FROM launch_events WHERE launch_id = '{one.launch_id}' "
+                    "ORDER BY seq") == [("pending", None), ("active", b["envelope_id"])]
+
+
+def test_a_store_without_envelopes_pins_nothing(qdir, tmp_path):
+    from levain.coordinator.store import Part
+
+    s = CoordStore(qdir)
+    d, _ = s.accept_drop("plain words", surface="cli")
+    token = s.coord_take()
+    (t,) = s.split(d.drop_id, [Part("work", "w")], by="operator")
+    ln = s.launch_request(token, harness="claude", threads=[t.thread_id])
+    got, refused = s.launch_activate(ln.launch_id, harness_session_id="sid-x")
+    assert refused is None and got.pinned_envelope_id is None

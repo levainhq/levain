@@ -717,6 +717,39 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             return lease.launch(conn, launch_id)
 
+    # --- what the watcher reads and writes (levain coord watch) --------------------------------------------------
+    def launches_unspawned(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.unspawned(conn)
+
+    def launches_active(self) -> list[Any]:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease._in_state(conn, "active")
+
+    def launch_by_harness_session(self, harness_session_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.by_harness_session(conn, harness_session_id)
+
+    def launch_end_unlisted(self, launch_id: str) -> Any:
+        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_unlisted(conn, now, launch_id)
+
+    def coord_lease(self) -> Any:
+        """The lease as it stands (live or past its until), or None; nothing written."""
+        from levain.coordinator import lease
+
+        with read_transaction(self._connect) as conn:
+            return lease.lease(conn, self._stamp())
+
     # --- reading -------------------------------------------------------------------------------------------------
     def drop(self, drop_id: str) -> Drop:
         with read_transaction(self._connect) as conn:
